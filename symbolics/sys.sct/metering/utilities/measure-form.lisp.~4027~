@@ -1,0 +1,749 @@
+;;; -*- Package: METERING; Base: 10; Mode: LISP; Syntax: Common-lisp; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+; still need to do:
+;;; allow explicit buckets, and range, and use clipped-histogram.
+;;; allow random form to normalize against. (questionable)
+;;; 
+
+;; eventually, this should be in histograms, and return 't if it does not have either a 
+;; uniform, or gaussian distribution.
+(defun non-standard-histogram-distribution (ignore) nil)
+
+(defmacro wrap-time (hold-time &body form)
+  `(let ((,hold-time (sys:%microsecond-clock)))
+     ,@form
+     (sys:%32-bit-difference
+       (sys:%microsecond-clock)
+       ,hold-time)))
+
+(defun time-too-long-for-without-interrupts? (time count)
+  (when (and
+	  (> (* count time) (* 1000000. 60. 5.))
+	  (not (progn
+		 (format *query-io*
+			 "~&Basic time: ~D microseconds. Count: ~D. (predicted time: ~D secs)"
+			 time count (floor (* time count) 1000000.))
+		 (fquery
+		   nil
+		   "Do you really want interrupts locked out for more than 5 minutes? "))))
+    (error "Aborting measuring to avoid without-interrupts")))
+
+(defmacro with-form-measured ((&key (no-ints 't)
+				    verbose
+				    values
+				    (time-limit 1 time-limit-provided)
+				    count-limit)
+			      &body form
+			      &environment env)
+  (let ((-count- (or count-limit '#:-count-)))
+    (multiple-value-bind (declarations body)
+	(sys:find-body-declarations form env)
+      `(progn
+	 ,@(when (and values (constantp values))
+	     `((ignore ,verbose)))
+	 ,(when time-limit-provided
+	    `(when (and (not (null ,time-limit))
+			(and (not (null ,count-limit))))
+	       (error ":TIME-LIMIT and :COUNT-LIMIT are mutually exclusive keywords.")))
+	 (unless (or ,time-limit ,count-limit)
+	   (error ":TIME-LIMIT and :COUNT-LIMIT cannot both be NIL."))
+	 (let ((-time-limit- (* (or ,time-limit 1) 1000000.))
+	       ,@(unless count-limit
+		   `((,-count- 0))))
+	   ,(when no-ints
+	      `(when (and ,no-ints (not -time-limit-))
+		 (time-too-long-for-without-interrupts?
+		   ;; get a rough idea, but don't expand this inline, so disassembly is
+		   ;; clearer.
+		   (wrap-time -start-time-
+		     (funcall #'(lambda ()
+				  ,@declarations
+				  (compiler:for-effect ,@body))))
+		   ,count-limit)))
+	   (multiple-value-bind (h
+				 ,(if (and (constantp values) values) 'ignore 'loop-time1)
+				 loop-times)
+	       (process:without-preemption-if ,no-ints
+		 (let ((h (make-data-collector 'metering:modal-histogram :name "Measure-form")))
+		   ;; save the sum of loop times for sanity check.
+		   (loop with -start-time- = (si:%microsecond-clock)
+			 for -number-of-iterations- from 0
+			 until (if ,count-limit
+				   (>= -number-of-iterations- ,count-limit)
+				   (> (time-difference (si:%microsecond-clock)
+						       -start-time-)
+				      -time-limit-))
+			 do (metering:collect-data
+			      h
+			      (wrap-time -start-time-
+				,@declarations
+				(compiler:for-effect ,@body)))
+			 finally (progn
+						; Ignore these so calling with :COUNT-LIMIT doesn't give spurious compiler errors.
+				   -start-time- -time-limit-
+						; Now do something useful.
+				   (unless ,count-limit
+				     (setf ,-count- -number-of-iterations-))))
+		   (values h
+			   ,(unless (and (constantp values) values)
+			      `(time-empty-loop ,-count- nil))
+			   (time-empty-loop ,-count- 't))))
+	     ,(if (constantp values)
+		  (if values
+		      `(values (average h) h loop-times)
+		      `(report-time-of-form
+			 ,-count- loop-time1 loop-times h ,verbose))
+		  `(if ,values
+		       (values (average h) h loop-times)
+		       (report-time-of-form
+			 ,-count- loop-time1 loop-times h ,verbose)))))))))
+
+(defmacro measure-time-of-form ((&key (no-ints 't) verbose values time-limit count-limit)
+				&body form)
+  "Measure elapsed and accumulated time of the timing loop without the form.  Subtract out cost of timing."
+  (let ((meter-function
+	  (compile
+	    `|measure-time-of-form-internal|
+	    `(lambda ()
+	       (with-form-measured (,@(unless (and (constantp no-ints) no-ints)
+					`(:no-ints ,no-ints))
+				    ,@(when verbose
+					`(:verbose ,verbose))
+				    ,@(when values
+					`(:values ,values))
+				    ,@(when time-limit
+					`(:time-limit ,time-limit))
+				    ,@(when count-limit
+					`(:count-limit ,count-limit)))
+				   ,@form)))))
+    `(funcall ',meter-function)))
+
+(defmacro define-metering-function (name args (&key (no-ints t no-ints-provided)
+						    (verbose nil verbose-provided)
+						    (values nil values-provided)
+						    (count-limit nil count-limit-provided)
+						    (time-limit nil time-limit-provided))
+				    &body form)
+  (let* ((added-keywords `(,@(unless no-ints-provided `((no-ints 't)))
+			   ,@(unless verbose-provided `(verbose))
+			   ,@(unless values-provided `(values))
+			   ,@(unless time-limit-provided `(time-limit))
+			   ,@(unless count-limit-provided `(count-limit))))
+	 (arglist (loop with keys-seen = nil
+			with rest-arg-seen = nil
+			for arg in args
+			append (cond ((eq arg '&key)
+				      (setq keys-seen 't)
+				      `(&key ,@added-keywords))
+				     #||
+				     ((and (eq arg '&rest) (not keys-seen))
+				      (setq keys-seen 't)
+				      `(&key ,@added-keywords &rest))
+				     ||#
+				     ((eq arg '&rest)
+				      (setq rest-arg-seen 't)
+				      (ncons arg))
+				     (t (ncons arg)))
+			  into arglist
+			finally (return (if keys-seen
+					    arglist
+					    (if (and rest-arg-seen
+						     (y-or-n-p
+ "&REST args and &KEY args are incompatible, unless the entire REST arg consists of keyword-~@
+  value pairs.  Do you want to suppress the metering keywords? "))
+						(progn
+						  (setq no-ints-provided 't
+							verbose-provided 't
+							values-provided 't
+							time-limit-provided 't
+							count-limit-provided 't)
+						  arglist)
+						(append arglist
+							(cons '&key added-keywords)))))))
+	 (no-ints-name (if no-ints-provided no-ints 'no-ints))
+	 (verbose-name (if verbose-provided verbose 'verbose))
+	 (values-name (if values-provided values 'values))
+	 (time-limit-name (if time-limit-provided time-limit 'time-limit))
+	 (count-limit-name (if count-limit-provided count-limit 'count-limit)))
+    `(compile ',name
+	      '(lambda ,arglist
+		 (progn
+		   (unless (or ,count-limit-name ,time-limit-name)
+		     (setq ,time-limit-name 1))
+		   (with-form-measured (:no-ints ,no-ints-name
+				      :values ,values-name
+				      :verbose ,verbose-name
+				      :count-limit ,count-limit-name
+				      :time-limit ,time-limit-name)
+		   ,@form))))))
+
+(zwei:defindentation (define-metering-function 2 3 3 1))
+
+;; old version of measure-time-of-form.
+#||
+; This repeats D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")form0 for 1count0 times.  It measures elapsed time, and it measures each 
+; evaluation of form and adds it to an accumulated total.
+; measure-time-of-form tries to normalize its results by measuring the cost of the timing code
+; and subtracting it out.  It normalizes it two different ways, and compares the result so
+; that if it is wierd, you are informed.
+;; count 	is number of times that the form is repeated.
+;; args		is a list of all free references inside form
+;; no-ints	when non-null run tests inside a without-interrupts.
+;; verbose	when non-null displays histogram of time, rather than just average.
+;; name		when non-null, measure-time-of-form creates a function named <name> that
+;;		will time this form, rather than actually timing it itself.
+;; values	when non-null, don't print, just return 
+;; 		(values average histogram loop-histogram)
+(defmacro measure-time-of-form (count (&key (no-ints 't) verbose name args values) &body form)
+  "Measure elapsed and accumulated time of the timing loop without the form.  Subtract out cost of timing."
+  (let ((start (gensym))
+	show-histograms
+	count-name
+	no-ints-name
+	(reference-index (member 'cl-user:mtf-index args))
+	(arglist (remove 'cl-user:mtf-index args))
+	(call-list (remove 'cl-user:mtf-index args)))
+    ;; Kludge!
+    (flet ((am-i-in-the-compiler? () (boundp 'compiler:*function-list*))
+	   (get-number-argument (arg)
+	     (if (numberp arg)
+		 arg
+		 (let ((new-name (if (symbolp arg) arg (gensym))))
+		   (push new-name arglist)
+		   (push arg call-list)
+		   new-name)))
+	   (get-boolean-argument (arg)
+	     (if (constantp arg)
+		 (if arg 't nil)
+		 (let ((new-name (if (symbolp arg) arg (gensym))))
+		   (push new-name arglist)
+		   (push arg call-list)
+		   new-name))))
+      (if (am-i-in-the-compiler?)
+	  (setq count-name count no-ints-name no-ints show-histograms verbose)
+	  ;; Do these forms in the revers of the order you want them to be in the arglist.
+	  ;; Blech!  Are we writing ugly-dumb code, yet?
+	  (setq show-histograms (get-boolean-argument verbose)))
+	  (setq no-ints-name (get-boolean-argument no-ints))
+	  (setq count-name (get-number-argument count))
+      (let ((text-of-body
+	      `(progn
+		 (when ,no-ints-name
+		   (time-too-long-for-without-interrupts?
+		     (wrap-time ,start
+		       (let (,@(when reference-index `((cl-user:mtf-index 0)))) ,@form))
+		     ,count-name))
+		 (multiple-value-bind (h loop-time1 loop-times)
+		     (let ((si:inhibit-scheduling-flag
+			     (or ,no-ints-name si:inhibit-scheduling-flag)))
+		       (macrolet ((time-repeated-form (histogram &rest forms)
+				    `(loop repeat ,',count-name
+					     ,@,(when reference-index
+						  '(for cl-user:mtf-index from 0))
+					   do (metering:collect-data
+						,histogram
+						(wrap-time ,',start ,@forms)))))
+			 ;; save the sum of loop times for sanity check.
+			 (let* ((loop-time1 (time-empty-loop ,count-name nil))
+				(h (make-instance 'metering:modal-histogram)))
+			   (time-repeated-form h ,@form)
+			   (values h loop-time1 (time-empty-loop ,count-name 't)))))
+		   ,(if values
+			`(values (/ (float (send h :total) ,count-name)
+				    h
+				    loop-times))
+			`(report-time-of-form
+			   ,count-name loop-time1 loop-times h ,show-histograms))))))
+      (if (am-i-in-the-compiler?)
+	  text-of-body
+	  `(let ((real-name (or ',name '|measure-time-of-form|)))
+	     (compile
+	       real-name
+	       '(lambda ,arglist
+		  ,text-of-body))
+	     ,(if name
+		  'real-name
+		  `(|measure-time-of-form| ,@call-list))))))))
+||#
+
+(defresource metering-histograms ()
+  :constructor (make-data-collector 'metering:modal-histogram :name "Measure Clock")
+  :initializer (metering:reset object))
+
+(defun time-empty-loop (count histogram-p)
+  (let (h)
+    (unwind-protect
+	(progn
+	  (setf h
+		(if histogram-p
+		    (make-data-collector 'metering:modal-histogram :name "Measure Clock")
+		    (allocate-resource 'metering-histograms)))
+	  (loop repeat count do
+	    (metering:collect-data h (wrap-time start-time)))
+	  (if histogram-p
+	      h
+	      (send h :total)))
+      (when (and (not histogram-p) h)
+	(deallocate-resource 'metering-histograms h)))))
+
+;; If the time spent isn't at least this 
+;; factor times as long as the time spent measuring the clock overhead, then the data is
+;; considered too noisy to be presented as a single number -- the entire histogram is always
+;; presented.
+(defvar *tolerable-clock-overhead-factor* 3)
+;; We measure the clock twice, if it varies by more than this, then the machine probably 
+;; isn't stable enough to be used for metering.  Warn the user.
+(defvar *tolerable-clock-Variation* .05)
+
+(defun report-time-of-form (count loop-time h-loop h verbose)
+  (let ((total (total h))
+	(loop-total (total h-loop)))
+    (dw::with-output-as-presentation
+      (:stream *standard-output* :single-box 't :object h :type 'metering-results)
+      (format t "~&Average time: ~A microseconds.  " (average h)))
+    (dw::with-output-as-presentation
+      (:stream *standard-output* :single-box nil :object h-loop :type 'metering-results)
+      (format t "(Avg clock overhead: ~A microseconds.)" (average h-loop)))
+    (let* ((delta-loop-time (abs (- loop-time loop-total)))
+	   (variation (/ (float delta-loop-time) (max loop-time loop-total 1))))
+      (when (> variation *tolerable-clock-variation*)
+	(sys:with-indentation (*standard-output* 14)
+	  (format *standard-output*
+		  "~&A second sampling of the clock overhead yielded a total of ~D microseconds in ~D repeats"
+		  loop-time count)
+	  (format *standard-output*
+		  "~&  for an average of ~F microseconds. (~,2,2F% change)"
+		  (if (zerop count) 0.0 (/ (float loop-time) count))
+		  variation))))
+    (when (or verbose (non-standard-histogram-distribution h))
+      (format *standard-output* "~&Histogram of time of form")
+      (with-character-size (:smaller *standard-output*)
+	(format *standard-output* "  (buckets are in units of microseconds)"))
+      (metering:display-collector h *standard-output*))
+    (sys:with-indentation (*standard-output* 4)
+      (when (> (* *tolerable-clock-overhead-factor* loop-total) total)
+	(when (or verbose
+		  (non-standard-histogram-distribution h-loop))
+	  (fresh-line *standard-output*)
+	  (format *standard-output* "~%Histogram of times of empty loop")
+	  (metering:display-collector h-loop *standard-output*))))))
+
+(defun test-time-empty-loop (count)
+  (let ((total (si:without-interrupts
+		 (loop repeat count
+		       sum (wrap-time x)))))
+    (values (/ (float total) count) total)))
+
+
+;;;; More general metering stuff
+
+(defvar *control-form-metering*
+	(make-instance 'basic-control :name "Form Metering" :keep 't))
+
+(set-scope-of-control *control-form-metering* 't)
+(defmacro with-form-metered ((&key (no-ints nil) verbose values
+				   (time-limit 1 time-limit-provided) count-limit
+				   data)
+			     &body form
+			     &environment env)
+  (let ((count (or count-limit '#:count)))
+    (multiple-value-bind (declarations body)
+	(sys:find-body-declarations form env)
+      `(progn
+	 ,@(when (and values (constantp values)) `((ignore ,verbose)))
+	 (unless ,data
+	   (error "No requests of data to meter"))
+	 ,(when time-limit-provided
+	    `(when (and (not (null ,time-limit)) (and (not (null ,count-limit))))
+	       (error ":TIME-LIMIT and :COUNT-LIMIT are mutually exclusive keywords.")))
+	 (unless (or ,time-limit ,count-limit)
+	   (error ":TIME-LIMIT and :COUNT-LIMIT cannot both be NIL."))
+	 (let ((time-limit (* (or ,time-limit 1) 1000000.))
+	       ,@(unless count-limit
+		   `((,count 0))))
+	   ,(when no-ints
+	      `(when (and ,no-ints (not time-limit))
+		 (time-too-long-for-without-interrupts?
+		   (wrap-time start-time (funcall #'(lambda ()
+						      ,@declarations
+						      (compiler:for-effect ,@body))))
+		   ,count-limit)))
+	   (clear-trigger 'measure-form)
+	   (clear-trigger 'measure-overhead-of-form)
+	   (let* ((data ,(if (constantp data)
+			     (if (listp (eval data)) data `(ncons ,data))
+			     `(if (listp ,data) ,data (ncons ,data))))
+		  (generator-description
+		    (loop for generator in data
+			  collect (if (listp generator)
+				      (if (member :keywords generator)
+					  generator
+					  (append generator
+						  `(:keywords (:overhead
+								(:name ,(first generator))))))
+				      (list generator :keywords `(:overhead (:name ,generator))))))
+		  (generated-values
+		    (progn
+		      (generate-data-at-trigger 'measure-form generator-description)
+		      (generate-data-at-trigger 'measure-overhead-of-form
+						generator-description)))
+		  (component-description (if (=  (length generated-values) 1)
+					     `((,(first generated-values) 'modal-histogram))
+					     (loop for generator in generated-values
+						   collect (list generator 'modal-histogram))))
+		  (collector-name
+		    ,(let ((*print-length* 4) (*print-level* 3) (*print-pretty* nil))
+		       (format nil "~S" (if (= (length form) 1) (first form) form))))
+		  (collector
+		    (if (= (length generated-values) 1)
+			(make-data-collector 'modal-histogram
+					     :name (first generated-values))
+			(make-data-collector 'record :name collector-name
+					     :component-description component-description)))
+		  (overhead-collector
+		    (if (= (length generated-values) 1)
+			(make-data-collector 'modal-histogram :name collector-name)
+			(make-data-collector 'record :name collector-name
+					     :component-description component-description)))
+		  (collector-description
+		    (if (= (length generated-values) 1)
+			`((,collector ,(first generated-values)))
+			`(((,collector) ,@(loop for generator in generated-values
+						collect (list generator generator))))))
+		  (overhead-collector-description
+		    (if (= (length generated-values) 1)
+			`((,overhead-collector ,(first generated-values)))
+			`(((,overhead-collector)
+			   ,@(loop for generator in generated-values
+				   collect (list generator generator)))))))
+	     ;; save the sum of loop times for sanity check.
+	     (collect-data-from-trigger 'measure-form collector-description)
+	     (collect-data-from-trigger
+	       'measure-overhead-of-form overhead-collector-description)
+	     (set-scope-of-control *control-form-metering* 't)
+	     (process:without-preemption-if ,no-ints
+	       (loop with start-time = (si:%microsecond-clock)
+		     for number-of-iterations from 0
+		     until (if ,count-limit
+			       (>= number-of-iterations ,count-limit)
+			       (> (time-difference (si:%microsecond-clock)
+						   start-time)
+				  ,time-limit))
+		     do (meter-form (measure-form) ()
+			    (locally ,@declarations
+				     (compiler:for-effect ,@body)))
+		     finally (unless ,count-limit
+			       (setf ,count number-of-iterations)))
+	       (loop repeat ,count do (meter-form (measure-overhead-of-form) ()
+					  (compiler:for-effect)))
+	       (clear-trigger 'measure-form)
+	       (clear-trigger 'measure-overhead-of-form))
+	     ,(if (constantp values)
+		  (if values
+		      `(values collector overhead-collector)
+		      `(report-form-metering
+			 collector overhead-collector component-description ,verbose))
+		  `(if ,values
+		       (values collector overhead-collector)
+		       (report-form-metering
+			 collector overhead-collector component-description ,verbose)))))))))
+
+
+(defmacro measure-performance-of-form
+	  ((&key (no-ints 't) verbose values time-limit count-limit
+		 (data 'real-time))
+	   &body form)
+  "Measure elapsed and accumulated time of the timing loop without the form.  Subtract out cost of timing."
+  (let ((meter-function
+	  (compile
+	    `|measure-performance-of-form-internal|
+	    `(lambda ()
+	       (with-form-metered (,@(unless (and (constantp no-ints) no-ints)
+				       `(:no-ints ,no-ints))
+				   ,@(when verbose
+				       `(:verbose ,verbose))
+				   ,@(when values
+				       `(:values ,values))
+				   ,@(when time-limit
+				       `(:time-limit ,time-limit))
+				   ,@(when count-limit
+				       `(:count-limit ,count-limit)))
+				  :data ,data
+				  ,@form)))))
+    `(funcall ',meter-function)))
+
+
+(defmacro define-performance-metering-function
+	  (name args (&key (no-ints t no-ints-provided)
+			   (verbose nil verbose-provided)
+			   (values nil values-provided)
+			   (count-limit nil count-limit-provided)
+			   (time-limit nil time-limit-provided)
+			   (data 'real-time data-provided))
+	   &body form)
+  (let* ((added-keywords `(,@(unless no-ints-provided `((no-ints 't)))
+			   ,@(unless verbose-provided `(verbose))
+			   ,@(unless values-provided `(values))
+			   ,@(unless time-limit-provided `(time-limit))
+			   ,@(unless count-limit-provided `(count-limit))
+			   ,@(unless data-provided `((data 'real-time)))))
+	 (arglist (loop with keys-seen = nil
+			with rest-arg-seen = nil
+			for arg in args
+			append (cond ((eq arg '&key)
+				      (setq keys-seen 't)
+				      `(&key ,@added-keywords))
+				     #||
+				     ((and (eq arg '&rest) (not keys-seen))
+				      (setq keys-seen 't)
+				      `(&key ,@added-keywords &rest))
+				     ||#
+				     ((eq arg '&rest)
+				      (setq rest-arg-seen 't)
+				      (ncons arg))
+				     (t (ncons arg)))
+			  into arglist
+			finally (return (if keys-seen
+					    arglist
+					    (if (and rest-arg-seen
+						     (y-or-n-p
+ "&REST args and &KEY args are incompatible, unless the entire REST arg consists of keyword-
+  value pairs.  Do you want to suppress the metering keywords?"))
+						(progn
+						  (setq no-ints-provided 't
+							verbose-provided 't
+							values-provided 't
+							time-limit-provided 't
+							count-limit-provided 't
+							data-provided 't)
+						  arglist)
+						(append arglist
+							(cons '&key added-keywords)))))))
+	 (no-ints-name (if no-ints-provided no-ints 'no-ints))
+	 (verbose-name (if verbose-provided verbose 'verbose))
+	 (values-name (if values-provided values 'values))
+	 (time-limit-name (if time-limit-provided time-limit 'time-limit))
+	 (count-limit-name (if count-limit-provided count-limit 'count-limit))
+	 (data-name (if data-provided data 'data)))
+    `(compile ',name
+	      '(lambda ,arglist
+		 (progn
+		   (unless (or ,count-limit-name ,time-limit-name)
+		     (setq ,time-limit-name 1))
+		   ;(setq ,data-name (or ,data-name 'real-time))
+		   (with-form-metered (:no-ints ,no-ints-name
+				       :values ,values-name
+				       :verbose ,verbose-name
+				       :count-limit ,count-limit-name
+				       :time-limit ,time-limit-name
+				       :data #||(or ,data-name 'real-time) ||# ,data-name)
+		   ,@form))))))
+
+
+
+(define-performance-metering-function create-metering-points () ())
+
+(add-initialization 'setup-define-metering-function-controls
+		    '(progn
+		       (control-trigger *control-form-metering* 'measure-form)
+		       (control-trigger *control-form-metering* 'measure-overhead-of-form))
+		    ()
+		    '*metering-load-initializations*)
+
+;; But for DW lossage, the Right Way to present the data...
+#+ignore
+(defun report-form-metering (data overhead-data description verbose
+			     &key (stream *standard-output*))
+  (ignore verbose) ;; for the time being.
+  (fresh-line)
+  (formatting-table (stream)
+    (formatting-column-headings (stream)
+      (loop for title in `("Data" "With Form" "Empty loop")
+	    do (formatting-cell (stream) (write-string title stream))))
+    (formatting-column (stream)
+      (formatting-cell (stream) (write-string "  " stream))
+      (if (hierarchical-p data)
+	  (decompose-component-description
+	    data #'(lambda (name type)
+		     (ignore type)
+		     (formatting-cell (stream) (princ name stream))))
+	  (formatting-cell (stream) (princ (collector-name data) stream))))
+    (flet
+      ((output-results (stream collector)
+	 (formatting-column (stream)
+	   (formatting-table (stream)
+	     (formatting-column-headings (stream :underline-p 't)
+	       (loop for title in '("Total" "Average") do
+		 (formatting-cell (stream) (write-string title stream))))
+	     (decompose-components
+	       (if (hierarchical-p collector)
+		   (collect-data-for-value collector)
+		   collector)
+	       #'(lambda (component slot)
+		   (ignore slot)
+		   (dw::with-output-as-presentation
+		     (:stream stream :object component :type 'metering-results)
+		     (formatting-row (stream)
+		       (formatting-cell (stream) (princ (total component) stream))
+		       (formatting-cell (stream) (princ (average component) stream))))))))))
+      (output-results stream data)
+      (output-results stream overhead-data))))
+
+;;instead, we use:
+#-ignore
+(defun report-form-metering (data overhead-data description verbose
+			     &key (stream *standard-output*))
+  (ignore verbose) ;; for the time being.
+  (fresh-line)
+  (formatting-table (stream)
+    (formatting-column-headings (stream)
+      (loop for title in `("Data" #+ignore "Form Total" "Form Average" #+ignore "Empty loop Total" "Empty loop average")
+	    do (formatting-cell (stream) (write-string title stream))))
+    (labels ((get-components (collector)
+	       (if (hierarchical-p collector)
+		   (collect-data-for-value collector)
+		   collector))
+	     (get-component-description (collector)
+	       (if (hierarchical-p collector)
+		   (collector-component-description collector)
+		   description))
+	     (output-component (stream component)
+	       (dw:with-output-as-presentation
+		 (:stream stream :object component :type 'metering-results)
+		 #+ignore (formatting-cell (stream) (princ (total component) stream))
+		 (formatting-cell (stream)
+		   (format stream "~,2F~:[(~,2F)~;~*~]~:[Œ~,2F~;~*~]"
+			   (reasonable-average component)
+			   (= (reasonable-average component) (average component))
+			   (average component)
+			   (zerop (standard-deviation component))
+			   (standard-deviation component))))))
+      (decompose-components
+	(get-components data)
+	#'(lambda (component slot)
+	    (formatting-row (stream)
+	      (formatting-cell (stream)
+		(write-string (string (or (car slot) (caar description))) stream))
+	      (output-component stream component)
+	      (let ((component (get-component-from-components
+				 (or (car slot) (caar description))
+				 (get-components overhead-data)
+				 (get-component-description overhead-data))))
+		(output-component stream component))))
+	(get-component-description data)))))
+
+
+
+(defmacro with-part-of-form-measured ((&key (no-ints 't) verbose values
+					    (time-limit 1 time-limit-provided) count-limit)
+				      &body form)
+  (let ((count (or count-limit '#:count))
+	(histogram-name (gensym)))
+    `(macrolet ((form-to-measure (&body body)
+		  `(progn
+		     (metering:collect-data ,',histogram-name (wrap-time start-time ,@body))
+		     (values))))
+       ,@(when (and values (constantp values)) `((ignore ,verbose)))
+       ,(when time-limit-provided
+	  `(when (and (not (null ,time-limit)) (and (not (null ,count-limit))))
+	     (error ":TIME-LIMIT and :COUNT-LIMIT are mutually exclusive keywords.")))
+       (unless (or ,time-limit ,count-limit)
+	 (error ":TIME-LIMIT and :COUNT-LIMIT cannot both be NIL."))
+       (let ((time-limit (* (or ,time-limit 1) 1000000.))
+	     (,histogram-name
+	      (make-data-collector 'metering:modal-histogram :name "Measure-form"))
+
+	     ,@(unless count-limit
+		 `((,count 0))))
+	 ,(when no-ints
+	    `(when (and ,no-ints (not time-limit))
+	       (time-too-long-for-without-interrupts?
+		 (wrap-time start-time
+		   ,@form)
+		 ,count-limit)))
+	 (reset-collector ,histogram-name)
+	 (multiple-value-bind (h
+			       ,(if (and (constantp values) values) 'ignore 'loop-time1)
+			       loop-times)
+	     (let ((si:inhibit-scheduling-flag
+		      (or ,no-ints si:inhibit-scheduling-flag)))
+	       (macrolet ((time-repeated-form (count &rest forms)
+			    `(loop repeat ,count
+				   do ,@forms))
+			  (time-form-for-elapsed-time (time-limit &rest forms)
+			    `(loop with start-time = (si:%microsecond-clock)
+				   until (> (time-difference (si:%microsecond-clock)
+							     start-time)
+					    ,time-limit)
+				   for number-of-iterations from 1
+				   do ,@forms
+				   finally (setf ,',count number-of-iterations))))
+		 ;; save the sum of loop times for sanity check.
+		 (if ,count-limit
+		     (time-repeated-form ,count-limit ,@form)
+		     (time-form-for-elapsed-time time-limit ,@form))
+		 (values ,histogram-name
+			 ,(unless (and (constantp values) values)
+			    `(time-empty-loop ,count nil))
+			 (time-empty-loop ,count 't))))
+	   ,(if (constantp values)
+		(if values
+		    `(values (average h) h loop-times)
+		    `(report-time-of-form
+		       ,count loop-time1 loop-times h ,verbose))
+		`(if ,values
+		     (values (average h) h loop-times)
+		     (report-time-of-form
+		       ,count loop-time1 loop-times h ,verbose))))))))

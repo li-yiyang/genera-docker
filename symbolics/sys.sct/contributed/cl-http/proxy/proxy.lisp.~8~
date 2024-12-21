@@ -1,0 +1,280 @@
+;;;-*- Syntax: Ansi-Common-Lisp; Base: 10; Mode: lisp; Package: http -*-
+
+;;; (C) Copyright 1996-1997, Christopher R. Vincent & John C. Mallery
+;;;     All Rights Reserved.
+;;;
+;;;------------------------------------------------------------------- 
+;;;
+;;; CL-HTTP PROXY SERVER
+;;;
+;;; Questions
+;;; 
+;;; 1. How are response codes logged? Proxy logging would be desirable. Check netscape docs.
+;;; 2. Are client conditions passed through correctly?
+;;; 3. How are non-continuable client conditions handled?
+;;; 4. What happens when a server error occurs upstream?
+;;; 5. Why don't we handle http 1.1 post and put?
+;;; 6. The previous proxy version seemed rather slow on my powerbook serving netscape.
+;;;      We should meter the proxy service and see where the time is going.
+
+(in-package :http)
+
+;;------------------------------------------------------------------- 
+;;;
+;;; COMPUTING HEADERS
+;;; 
+
+(define proxy-version ()
+  "Returns the proxy version, for example \"(CL-HTTP/41.4)\""
+  (destructuring-bind (major minor &rest port-version-numbers)
+                      (www-utils:%server-version-info)
+    (declare (ignore port-version-numbers))
+    ; shorter than entire server info string
+    (format nil "(cl-http/~D.~D)" major minor)))
+
+(defun proxy-via-header (&optional (comments-p t))
+  "Returns a value that can be appended to a Via header."
+  (if comments-p
+    (or *proxy-via-header*
+        (setf *proxy-via-header* `(,(intern-keyword *http-version*) ,*local-host-domain-name* ,(proxy-version))))
+    ; short version, no comments
+    (or *proxy-via-header-no-comments*
+        (setf *proxy-via-header-no-comments* `(,(intern-keyword *http-version*) ,*local-host-domain-name* nil)))))
+
+(defconstant *response-status-codes-with-no-entity* '(100 204 304)
+  "Response status codes that do return entity bodies.")
+
+(declaim (inline status-code-implies-entity-p))
+
+(defun response-status-code-implies-entity-p (code)
+  "Returns whether a status code implies a message body."
+  (not (member code *response-status-codes-with-no-entity*)))
+
+(defun compute-via-header (header)
+  "Returns a new Via header list including the local host." 
+  (let ((new (proxy-via-header *preserve-via-header-comments-p*)))
+    ; Destructively strip comments off existing entries
+    (unless *preserve-via-header-comments-p* 
+      (dolist (item header)
+        (setf (third item) nil)))
+    `(,new ,. header)))
+
+;; All other headers are end-to-end by default. (:proxy-connection is Netscape only)
+(defconstant *hop-by-hop-headers* 
+  '(:connection :keep-alive :public :proxy-authenticate :te :trailer :transfer-encoding :upgrade :proxy-connection))
+
+(defun proxy-header-plist (header-alist)
+  "Converts HEADER-ALIST, a header alist, into a property list of (keyword value).
+Removes connection level headers"
+  (loop for (key . value) in header-alist
+        unless (member key *hop-by-hop-headers*)
+          collect key
+          and collect value))
+
+(defun compute-proxy-request-headers (header-alist http-version &key header-plist)
+  "Returns a translated header-plist for HEADER-ALIST, appends HEADER-PLIST."
+  (declare (ignore http-version))
+  (let ((request-headers `(,.(proxy-header-plist header-alist) .,header-plist)))
+    ;; append the via header
+    (with-header-values (via) header-alist
+      (setf (getf request-headers :via) (compute-via-header via)))
+    request-headers))
+
+(define-generic proxy-request-headers (server)
+  (:documentation "Returns a header plist  for use in the remote request."))
+
+(defmethod proxy-request-headers ((server proxy-server-mixin))
+  (compute-proxy-request-headers (server-headers server) (server-http-version server))) 
+
+(defun compute-proxy-response-headers (header-alist http-version)
+  "Returns a translated header-plist for HEADER-ALIST."
+  (declare (ignore http-version))
+  (let ((response-headers (proxy-header-plist header-alist)))
+    ;; add or append headers 
+    (with-header-values (date via) header-alist
+      (unless date 
+        (setf (getf response-headers :date) (get-universal-time)))
+      (setf (getf response-headers :via) (compute-via-header via)))
+    response-headers))
+
+(define-generic proxy-response-headers (client server)
+  (:documentation "Returns a header plist for use in the response to a client."))
+
+(defmethod proxy-response-headers ((client basic-client-mixin) (server proxy-server-mixin))
+  (compute-proxy-response-headers (client-response-headers client) (client-connection-version client)))
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; SIMPLE PROXY RELAY
+;;; 
+
+(declaim (inline proxy-relay-transfer-encoding))
+
+(defun proxy-relay-transfer-encoding (content-length http-version)
+  (if (or content-length (member http-version '(:http/0.9 :http/1.0))) :fixed-length :chunked))
+
+(defun proxy-relay-simple-request (server method request-http-version)
+  (let* ((request-url (server-url server))
+         (request-stream (server-stream server))
+         (client-request-headers (proxy-request-headers server)))
+    (declare (dynamic-extent client-request-headers))
+    (with-http-request (request-url method :request-headers client-request-headers)
+      (let* ((client-status (client-status client))
+             (client-response-headers (client-response-headers client))
+             (response-headers (proxy-response-headers client server)))
+        (declare (dynamic-extent response-headers))
+        (with-transfer-decoding* (remote-stream request-url http-version :headers client-response-headers :copy-mode :binary)
+          (send-status-line request-stream client-status (client-reason client))
+          (cond ((response-status-code-implies-entity-p client-status)
+                 (let* ((response-content-length (get-header :content-length client-response-headers))
+                        (transfer-encoding (proxy-relay-transfer-encoding response-content-length request-http-version))
+                        (response-headers `(,.response-headers ,@(case transfer-encoding
+                                                                   (:chunked '(:transfer-encoding :chunked))))))
+                   (declare (dynamic-extent response-headers))
+                   (write-headers request-stream response-headers t)
+                   ;; Send the entity body
+                   (with-transfer-encoding (request-stream transfer-encoding)
+                     (stream-copy-until-eof remote-stream request-stream :binary))))
+                (t (write-headers request-stream response-headers t))))))))
+
+(defun proxy-relay-request-with-entity (server method request-http-version)
+  (labels ((ensure-content-length-handled (headers)
+             (unless (getf headers :content-length)
+               (setf (getf headers :transfer-encoding) :chunked))
+             headers)
+           (send-data (from-stream to-stream url headers content-length from-http-version to-http-version)
+             ;; Send 100 code to continue as appropriate
+             (case from-http-version
+               ((:http/1.0 :http/0.9))
+               (t (report-status-continue from-stream)
+                  (send-cr-line-feed from-stream) 
+                  (force-output from-stream)))
+             ;; transfer the body
+             (with-binary-stream (from-stream :input)
+               (with-binary-stream (to-stream :output)
+                 (with-transfer-decoding* (from-stream url from-http-version :headers headers :copy-mode :binary)
+                   (with-transfer-encoding (to-stream (proxy-relay-transfer-encoding content-length to-http-version))
+                     (stream-copy-until-eof from-stream to-stream :binary)))))))
+    (declare (inline ensure-content-length-handled))
+    (let* ((request-url (server-url server))
+           (request-headers (server-headers server))
+           (request-content-length (get-header :content-length request-headers))
+           (client-request-headers (ensure-content-length-handled (proxy-request-headers server)))
+           (request-stream (server-stream server)))
+      (declare (dynamic-extent client-request-headers))
+      (with-http-request
+        (request-url method 
+                     :request-headers client-request-headers
+                     :request-body (send-data request-stream remote-stream request-url request-headers 
+                                              request-content-length request-http-version http-version)) 
+        (let* ((client-status (client-status client))
+               (client-response-headers (client-response-headers client))
+               (response-headers (proxy-response-headers client server)))
+          (declare (dynamic-extent response-headers))
+          (with-transfer-decoding* (remote-stream request-url http-version :headers client-response-headers :copy-mode :binary)
+            (send-status-line request-stream client-status (client-reason client))
+            (cond ((response-status-code-implies-entity-p client-status)
+                   (let* ((response-content-length (get-header :content-length client-response-headers))
+                          (transfer-encoding (proxy-relay-transfer-encoding response-content-length request-http-version))
+                          (response-headers `(,.response-headers ,@(case transfer-encoding
+                                                                     (:chunked '(:transfer-encoding :chunked))))))
+                     (declare (dynamic-extent response-headers))
+                     (write-headers request-stream response-headers t)
+                     (with-transfer-encoding (request-stream transfer-encoding)
+                       (stream-copy-until-eof remote-stream request-stream :binary))))
+                  (t (write-headers request-stream response-headers t)))))))))
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; PROXY METHODS 
+;;; 
+
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :get)) request-http-version)
+  (if *proxy-caching-p*
+      (invoke-proxy-cache-service server method request-http-version)
+      (proxy-relay-simple-request server method request-http-version)))
+
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :head)) request-http-version)
+  (declare (ignore request-http-version))
+  (let ((client-request-headers (proxy-request-headers server))
+        (request-stream (server-stream server)))
+    (declare (dynamic-extent client-request-headers))
+    (with-http-request (uri :head :request-headers client-request-headers)
+      remote-stream   ;ignore
+      (let ((response-headers (proxy-response-headers client server)))
+        (declare (dynamic-extent response-headers))
+        (send-status-line request-stream (client-status client) (client-reason client))
+        (write-headers request-stream response-headers t)))))
+
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :delete)) request-http-version)
+  (proxy-relay-simple-request server method request-http-version))
+
+;; Can't handle * correctly until intern-url handles hosts w/out paths (e.g. http://wilson.ai.mit.edu)
+;; Should relay error response entities.
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :options)) request-http-version)
+  (declare (ignore request-http-version))
+  (flet ((message-allow-headers (headers)      ; edit allow header for access through proxy
+           (let ((allow (get-header-object :allow headers)))
+             (when allow
+               (setf (%header-value allow) (intersection *proxy-methods* (header-value allow) :test #'eql))))))
+    (declare (inline message-allow-headers))
+    (let ((client-request-headers (proxy-request-headers server))
+          (request-stream (server-stream server)))
+      (declare (dynamic-extent client-request-headers))
+      (With-http-request (uri :options :request-headers client-request-headers)
+        remote-stream    ;ignore
+        (send-status-line request-stream (client-status client) (client-reason client))
+        ;; must precede computing response headers
+        (message-allow-headers *headers*) 
+        (let ((response-headers (proxy-response-headers client server)))
+          (declare (dynamic-extent response-headers))
+          (write-headers request-stream response-headers t))))))
+
+;; For now just use 1.0 unless we already have a 1.1 connection to the server.
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :post)) request-http-version)
+  (let ((*client-http-version* "HTTP/1.0"))
+    (proxy-relay-request-with-entity server method request-http-version)))
+
+;; For now just use 1.0 unless we already have a 1.1 connection to the server.
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :put)) request-http-version)
+  (let ((*client-http-version* "HTTP/1.0"))
+    (proxy-relay-request-with-entity server method request-http-version)))
+
+(defmethod invoke-proxy-service ((server proxy-server-mixin) (uri url) (method (eql :trace)) request-http-version)
+  (declare (ignore request-http-version))
+  (flet ((set-max-forwards (value headers)
+           (let ((maxf (get-header-object :max-forwards headers)))
+             (setf (%header-value maxf) value))))
+    (let ((request-url uri)
+          (request-headers (server-headers server))
+          (request-stream (server-stream server)))
+      (with-header-values (max-forwards) request-headers
+        (cond ;; bounce the trace back
+         ((and max-forwards (<= max-forwards 0))    
+          (with-chunked-transfer-encoding
+            (request-stream '(:message :http) :status :success :location request-url :cache-control '(:no-cache t))
+            (let ((header-plist (proxy-header-plist request-headers)))
+              (declare (dynamic-extent header-plist))
+              (write-headers request-stream header-plist t))))
+         ;; Pass the request through
+         (t (set-max-forwards (1- max-forwards) request-headers) ; decrement max-forwards
+            (let ((request-headers (proxy-request-headers server)))
+              (declare (dynamic-extent request-headers))
+              (with-http-request (request-url :trace :request-headers request-headers)
+                (let* ((client-status (client-status client))
+                       (client-response-headers (client-response-headers client))
+                       (response-headers (proxy-response-headers client server)))
+                  (declare (dynamic-extent response-headers))
+                  (with-transfer-decoding* (remote-stream request-url http-version :headers client-response-headers :copy-mode :binary)
+                    (send-status-line request-stream client-status (client-reason client))
+                    (cond ((response-status-code-implies-entity-p client-status)
+                           (let* ((response-content-length (get-header :content-length client-response-headers))
+                                  (transfer-encoding (proxy-relay-transfer-encoding response-content-length http-version))
+                                  (response-headers `(,.response-headers ,@(case transfer-encoding
+                                                                             (:chunked '(:transfer-encoding :chunked))))))
+                             (write-headers request-stream response-headers t)
+                             (with-transfer-encoding (request-stream transfer-encoding)
+                               (stream-copy-until-eof remote-stream request-stream :binary))))
+                          (t (write-headers request-stream response-headers t)))))))))))))
+
+(pushnew :cl-http-proxy *features*)

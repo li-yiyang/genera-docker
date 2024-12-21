@@ -1,0 +1,1153 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: NFS; Base: 10; Lowercase: Yes; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;;; operating-system-dependent (osd) client stuff.
+
+(defflavor unix-nfs-access-path-mixin
+	((mtab nil)
+	 (reading-mtab-file nil)
+	 (automount-directories nil)
+	 (reading-automount-file nil)
+	 (automount-files nil)
+	 (automount-master nil))
+	()
+  (:functions automount-dispatch)
+  (:required-flavors nfs-access-path-mixin)
+  (:required-methods fap-max-unix-component-length)
+  (:abstract-flavor))
+
+(defvar *nfs-use-mtab* t
+  "Enable the use of /etc/mtab on hosts to provide shadowing NFS mounts.")
+
+(defun-in-flavor (decode-sun-mtab-line unix-nfs-access-path-mixin) (line)
+  (let ((info (loop for start first 0 then (1+ end)
+		    for end = (string-search-char #\sp line :start start)
+		    for substring = (substring line start end)
+		    unless (zerop (length substring)) collect substring
+		    while end)))
+    (when (= (length info) 6)
+      (destructuring-bind (dev dir fstype options n1 n2) info
+	(declare (ignore n1 n2 options))
+	(selector fstype string=
+	  (("nfs") (values dir dev))
+	  (("4.2") (values dir dir)))))))
+
+(defun-in-flavor (decode-ultrix-mtab-line unix-nfs-access-path-mixin) (line)
+  (let ((info (loop for start first 0 then (1+ end)
+		    for end = (string-search-char #\: line :start start)
+		    for substring = (substring line start end)
+		    while end
+		    collect substring)))
+    (when (= (length info) 7)
+      (destructuring-bind (dev dir rw n1 n2 fstype options) info
+	(declare (ignore rw n1 n2 options))
+	;; Make the pathname of the form /foo@bar be of the form bar:/foo
+	(let ((pos (string-search-char #\@ dev)))
+	  (when (and pos (< pos (1- (length dev))) (> pos 0))
+	    (setq dev (string-append  (substring dev (1+ pos)) ":" (substring dev 0 pos)))))
+	(selector fstype string=
+	  (("nfs") (values dir dev))
+	  (("ufs") (values dir dir)))))))
+
+(defun-in-flavor (decode-mtab-line unix-nfs-access-path-mixin) (line)
+  (setq line (string-trim '(#\space #\tab #.(code-char (char-to-ascii #\tab))) line))
+  (if (and (not (zerop (length line)))
+	   (char= #\: (aref line (1- (length line)))))
+      (decode-ultrix-mtab-line line)
+    (decode-sun-mtab-line line)))
+
+(defun-in-flavor (process-mtab-line unix-nfs-access-path-mixin) (line default-dir)
+  (multiple-value-bind (dirspec devspec) (decode-mtab-line line)
+    (when (and dirspec devspec)
+      (let* ((dev devspec)			;No parse to increase speed
+	     (dir (parse-mtab-dir-pathname dirspec default-dir)))
+	;; put an entry in the mount hash table, but don't
+	;; give it an fhandle. we will defer doing the
+	;; actual mount until such time that we need to
+	(fap-add-mount-entry self dir dev dev nil nil :mtab)))))
+
+(defconstant *filename-nfs-mount-point-registry-alist*
+	     '(("/etc/fstab" . :fstab)
+	       ("/etc/mtab" . :mtab)))
+
+;(compiler:function-defined 'rpc::nfs-mount-points)
+
+(defun-in-flavor (mtab-file-data-rpc unix-nfs-access-path-mixin) (pathname mtime errorp)
+  (declare (values data mtime))
+  (let* ((string-for-host (send pathname :string-for-host))
+	 (registry (cdr (assoc string-for-host *filename-nfs-mount-point-registry-alist*
+			       :test #'string=))))
+    (if (or (null registry) (not (variable-boundp #'rpc::nfs-mount-points)))
+	(values nil -1)
+      (condition-case-if (not errorp) ()
+	   (multiple-value-bind (unix-string unix-mtime)
+	       (let ((*udp-call-timeout* (* 15 60)))
+		 (rpc::nfs-mount-points
+		   registry (or mtime 0)
+		   :transport-agent transport-agent))
+	     ;; Translate the unix string
+	     (let ((string unix-string)
+		   (table *unix-translation-table*))
+	       (declare (sys:array-register string table))
+	       (loop for i below (length string)
+		     for char = (aref string i)
+		     do (setf (aref string i) (code-char (aref table (char-code char))))))
+	     (values
+	       (loop for start first 0 then (1+ end)
+		     for end = (string-search-exact-char #\Return unix-string :start start)
+		     for line = (substring unix-string start end)
+		     unless (zerop (length line))
+		       collect line
+		     until (null end))
+	       unix-mtime))
+	 ((rpc-error network-error)
+	  (values nil -1))))))
+
+(defun-in-flavor (mtab-write-date unix-nfs-access-path-mixin) (pathname errorp)
+  (condition-case-if (not errorp) (error)
+       (let ((dir-pathname (send pathname :directory-pathname-as-file)))
+	 (getf (cdr (with-dir-fhandle-cache-validity-checking-inhibited (self dir-pathname)
+		      (with-dir-contents-cache-validity-checking-inhibited
+			(self dir-pathname)
+			(send self :properties pathname))))
+	       :creation-date))
+     ((sys:network-error nfs-error rpc-error)
+      nil)))
+
+
+(defun-in-flavor (mtab-file-data-file unix-nfs-access-path-mixin) (pathname mtime errorp)
+  (declare (values data mtime))
+  (letf ((reading-mtab-file t))
+    (if (and mtime (eql mtime (mtab-write-date pathname errorp)))
+	(values nil mtime)
+      (condition-case-if (not errorp) ()
+	   (with-open-stream (stream (fs:file-access-path-open
+				       self pathname pathname
+				       :direction :input
+				       :element-type 'character
+				       :if-does-not-exist :error))
+	     (values (loop for (line eofp) = (multiple-value-list (send stream :line-in))
+			   unless (zerop (length line))
+			     collect line
+			   until eofp)
+		     (send stream :creation-date)))
+	 ((rpc-error fs:pathname-error fs:file-error)
+	  (values nil -1))))))
+
+(defun-in-flavor (mtab-file-data unix-nfs-access-path-mixin) (pathname mtime errorp)
+  (multiple-value-bind (rpc-data rpc-mtime)
+      (mtab-file-data-rpc pathname mtime errorp)
+    (if (not (member rpc-mtime '(0 -1)))
+	(values rpc-data rpc-mtime)
+      (multiple-value-bind (file-data file-mtime)
+	  (mtab-file-data-file pathname mtime errorp)
+	(if (not (member file-mtime '(0 -1)))
+	    (values file-data file-mtime)
+	  (values nil mtime))))))
+
+(defun-in-flavor (read-mtab-file unix-nfs-access-path-mixin) (where errorp)
+  (let ((old-mtime (and (eq (second mtab) where) (fourth mtab))))
+    (condition-case-if (not errorp) (error)
+	 (multiple-value-bind (mtab-info mtime)
+	     (mtab-file-data where old-mtime errorp)
+	   (if (and (eql old-mtime mtime) (listp (third mtab)))
+	       (setq mtab-info (third mtab))
+	     (loop with default-dir = (fs:make-pathname :host fs:host :directory :root)
+		   for line in mtab-info
+		   do (process-mtab-line line default-dir)))
+	   (setq mtab (list (time:time) where mtab-info mtime)))
+       (fs:pathname-error
+	 (setq mtab (list (time:time) where error old-mtime))
+	 nil))))
+
+(defparameter *mtab-validity-time* (* 5 60 60))
+
+(defun-in-flavor (need-to-read-mtab-file unix-nfs-access-path-mixin) ()
+  (and (null reading-mtab-file)
+       *nfs-use-mtab*
+       (let ((mtab mtab))
+	 (or (null mtab)
+	     (not (numberp (first mtab)))
+	     (time:time-elapsed-p *mtab-validity-time* (first mtab))))))
+
+(defparameter *mtab-files* '("/etc/mtab" "/etc/fstab"))
+
+(defun-in-flavor (maybe-read-mtab-file unix-nfs-access-path-mixin) ()
+  (unwind-protect-case ()
+      (when (need-to-read-mtab-file)
+	(loop for where in *mtab-files*
+	      thereis (read-mtab-file
+			(fs:parse-pathname where fs:host (send fs:host :sample-pathname))
+			nil)))
+    (:abort
+      (setq mtab nil))))
+
+;;; UNIX pseudoversion stuff
+
+(defun-in-flavor (prune-candidates-of-pseudoversions unix-nfs-access-path-mixin)
+		 (candidates)
+  (declare (values pruned-candidates))
+  ;; Prune out all candidates than end with the pseudoversion suffix.  If we
+  ;; end up with no resulting candidates, then they all had pseudoversion
+  ;; suffixes, so do no pruning.
+  (or (loop with suffix-length = (string-length fs:*unix-version-suffix*)
+	    for pair in candidates
+	    for (pathname) = pair
+	    for string = (fap-nfs-filename-string-for-host self pathname)
+	    for string-length = (length string)
+	    unless (and (not (numberp (send pathname :version)))
+			(> string-length suffix-length)
+			(string= string fs:*unix-version-suffix*
+				 :start1 (- string-length suffix-length)))
+	      collect pair)
+      candidates))
+
+(defwhopper (complete-from-candidates unix-nfs-access-path-mixin)
+	    (pathname candidates default direction new-ok)
+  (continue-whopper pathname (prune-candidates-of-pseudoversions candidates) default
+		    direction new-ok))
+
+(defwhopper (fap-delete-excess-versions unix-nfs-access-path-mixin) (pathname count)
+  (if (numberp (send pathname :version))
+      (continue-whopper pathname count)
+    (let* ((no-version-pathname (send pathname :new-version nil))
+	   (no-version-filename (fap-nfs-filename-string-for-host self no-version-pathname))
+	   (wild-filename (string-append no-version-filename
+					 fs:*unix-version-prefix*
+					 "*"
+					 fs:*unix-version-suffix*))
+	   (wildpath (fap-nfs-parse-filename self wild-filename pathname))
+	   (sorted-list
+	     (sort (cdr (send self :directory-list wildpath '(:fast)))
+		   #'>
+		   :key #'(lambda (entry)
+			    (let* ((pathname (first entry))
+				   (version (send pathname :version)))
+			      (or (and (numberp version) version)
+				  (fs:parse-unix-version
+				    (fap-nfs-filename-string-for-host self pathname))
+				  most-positive-fixnum)))))
+	   (complete-list (delete-duplicates (cons pathname sorted-list) :from-end t))
+	   (delete-list (nthcdr (max 0 count) complete-list)))
+      (when delete-list
+	(error-restart (error "Retry DELETE of ~A" (caar delete-list))
+	  (loop while delete-list
+		for path = (caar delete-list)
+		do (condition-case ()
+			(send self :delete path)
+		      ((fs:file-not-found fs:access-error)))
+		   (pop delete-list)))))))
+
+(defparameter *interpret-tilde-in-unix-parse-namestring* t)
+
+(defun-in-flavor (tilde-homedir fs:unix-family-pathname-mixin) (tilde-name)
+  (if (string= tilde-name "")
+      (send (send (send (send fs:host :file-access-path) :homedir self t)
+		  :directory-pathname-as-file)
+	    :string-for-host)
+    (multiple-value-bind (homedir defaulted-p)
+	(rpc:username->homedir
+	  (rpc:host-unix-name-lookup-access-path fs:host)
+	  tilde-name)
+      (if defaulted-p
+	  (error 'rpc::unknown-unix-user :user-name tilde-name :host fs:host)
+	;; The string we looked up that is now in homedir might not really be
+	;; a truename.  This could cause problems later.  Since we just touched
+	;; the file connection to find this homedir, take advantage of the open
+	;; connection and get the truename now.
+	(let* ((pathname (cl:parse-namestring homedir fs:host))
+	       (truename (probe-file pathname)))
+	  (if (or ;; It could be that the info in the registry points to nothing at all.
+		  ;; in that case, just deal with it syntactically without arguing.
+	          (not truename)
+		  ;; Or it could be that probing returns the same pathname.  In that case,
+		  ;; the info in the registry was exactly right, so just return it.
+		  (eq pathname truename))
+	      homedir
+	      (send truename :string-for-host)))))))
+
+;;; Handle tilde at the start of a UNIX pathname namestring just like csh does
+(defwhopper (:parse-namestring fs:unix-family-pathname-mixin)
+	    (host-specified namestring &optional (start 0) (end (string-length namestring)))
+  (setq start (or (string-search-not-char #\sp namestring :start start :end end) end))
+  (when *interpret-tilde-in-unix-parse-namestring*
+    (let* ((host-name (when host-specified
+			(let ((host-end
+				(string-search-char #\: namestring :start start :end end))
+			      (host-start start))
+			  (when host-end
+			    (setq start (1+ host-end))
+			    (substring namestring host-start host-end)))))
+	   (dev (if (eq fs:device :unspecific)
+		    :unspecific
+		  (let ((dev-end (string-search-char #\: namestring :start start :end end))
+			(dev-start start))
+		    (when dev-end
+		      (setq start (1+ dev-end))
+		      (substring namestring dev-start dev-end))))))
+      (when (and start
+		 (> end start)
+		 (char= (aref namestring start) #\~)
+		 (not (string= sys:user-id "")))
+	;; This namestring starts with a tilde.  
+	(let* ((tilde-start (1+ start))
+	       (tilde-end (or (string-search-char #\/ namestring :start tilde-start :end end)
+			      end))
+	       (tilde-name (substring namestring tilde-start tilde-end))
+	       (homedir (tilde-homedir tilde-name)))
+	  (setq namestring (string-append
+			     (if (stringp host-name) (string-append host-name ":") "")
+			     (if (stringp dev) (string-append dev ":") "")
+			     homedir (substring namestring tilde-end end)))
+	  (setq start 0 end (string-length namestring))))))
+  (continue-whopper host-specified namestring start end))
+
+(defmethod (fap-nfs-parse-pathname unix-nfs-access-path-mixin) (string &optional relative-to-host)
+  (let ((*interpret-tilde-in-unix-parse-namestring* nil))
+    (fs:parse-pathname
+      string
+      (or relative-to-host fs:host)
+      nil)))
+
+(defmethod (fap-nfs-parse-filename unix-nfs-access-path-mixin)
+	   (string directory-pathname)
+  (fap-nfs-parse-pathname 
+    self
+    (string-append
+      (fap-nfs-pathname-string-for-host
+	self
+	(send (send directory-pathname :directory-pathname-as-file) :pathname-as-directory))
+      string)))
+
+(defmethod (fap-nfs-pathname-string-for-host unix-nfs-access-path-mixin) (pathname)
+  (send pathname :string-for-host))
+
+(defmethod (fap-nfs-filename-string-for-host unix-nfs-access-path-mixin) (pathname)
+  (send pathname :string-for-dired))
+
+(defmethod (fap-nfs-temporary-pathname unix-nfs-access-path-mixin) (pathname counter)
+  (fap-nfs-parse-filename
+    self
+    (let* ((prefix (format nil "nfs~2,'0D." counter))
+	   (filename (fap-nfs-filename-string-for-host self pathname))
+	   (too-much (- (+ (string-length prefix) (string-length filename))
+			(fap-max-unix-component-length self))))
+      (string-append prefix (if (plusp too-much) (substring filename too-much) filename)))
+    pathname))
+
+(defmethod (fap-close-finish-rename-pathname unix-nfs-access-path-mixin)
+	   (pathname counter)
+  (let ((filename (fap-nfs-filename-string-for-host self pathname))
+	(max-component-length (fap-max-unix-component-length self)))
+    (if (or (numberp (send pathname :version))
+	    (fs:parse-unix-version filename))
+	(fap-nfs-temporary-pathname self pathname counter)
+      (let* ((vers
+	       (loop with wildpath =
+		       (send pathname :new-pathname :name :wild :type :wild :version :wild)
+		     for (pn) in (cdr (send self :directory-list wildpath '(:fast)))
+		     for fn = (fap-nfs-filename-string-for-host self pn)
+		     for (vers new-end) = (multiple-value-list (fs:parse-unix-version fn))
+		     when (and (numberp vers)
+			       (or (string= (substring fn 0 new-end) filename)
+				   (and (= (string-length fn) max-component-length)
+					(> (string-length filename) new-end)
+					(string= (substring fn 0 new-end)
+						 (substring filename 0 new-end)))))
+		       maximize vers))
+	     (suffix (format nil "~A~D~A" fs:*unix-version-prefix* (+ vers counter)
+			     fs:*unix-version-suffix*))
+	     (too-much (- (+ (string-length suffix) (string-length filename))
+			  max-component-length)))
+	(fap-nfs-parse-filename
+	  self
+	  (string-append (if (plusp too-much)
+			     (substring filename 0 (- (string-length filename) too-much))
+			   filename)
+			 suffix)
+	  pathname)))))
+
+(defmethod (fap-nfs-mount-string-for-host unix-nfs-access-path-mixin) (pathname)
+  (fap-nfs-pathname-string-for-host
+    self
+    (if (root-directory-as-file-p pathname)
+	(root-directory pathname)
+	pathname)))
+
+(defmethod (fap-max-unix-component-length unix-nfs-access-path-mixin) ()
+  (typecase (send fs:host :sample-pathname)
+    (fs:unix42-pathname-mixin fs:*unix42-max-component-length*)
+    (t 14)))
+
+(defmethod (fap-pathname-for-creation unix-nfs-access-path-mixin)
+	   (pathname unversioned-pathname)
+  (if (fs:pathname-unix-newest-version-should-be-explicit pathname)
+      pathname
+    unversioned-pathname))
+
+(defmethod (fap-get-newest-version unix-nfs-access-path-mixin)
+	   (pathname dir-fhandle dir-mtime dir-ctime outputp)
+  (let ((highver (fap-highest-existing-version-number
+		   self pathname dir-fhandle dir-mtime dir-ctime)))
+    (send pathname :new-version
+	  (if outputp
+	      (if (or (not (fs:pathname-unix-newest-version-should-be-explicit pathname))
+		      (= highver most-positive-fixnum))
+		  :newest
+		(1+ highver))
+	    (if (zerop highver)
+		(if (fs:pathname-unix-newest-version-should-be-explicit pathname)
+		    1
+		  :newest)
+	      (if (= highver most-positive-fixnum)
+		  :newest
+		highver))))))
+
+(defwhopper (fap-highest-existing-version-number unix-nfs-access-path-mixin)
+	    (pathname dir-fhandle dir-mtime dir-ctime)
+  (or (and (or (null dir-mtime)
+	       (null dir-ctime)
+	       (multiple-value-bind (ignore found-p mtime ctime)
+		   (dir-contents-cache-lookup
+		     (send pathname :directory-pathname-as-file) dir-mtime dir-ctime)
+		 (setq dir-mtime mtime dir-ctime ctime)
+		 (null found-p)))
+	   (let ((path (send pathname :new-version :newest)))
+	     (with-nfs-fhandle (fhandle)
+	       (condition-case ()
+		    (when (fap-stat (nfs-fap path 'fap-highest-existing-version-number)
+				    path path dir-fhandle fhandle
+				    'fap-highest-existing-version-number)
+		      most-positive-fixnum)
+		  (fs:file-not-found)))))
+      (continue-whopper pathname dir-fhandle dir-mtime dir-ctime)))
+
+;;;  Automount support
+
+(defun-in-flavor (tokenize-line unix-nfs-access-path-mixin) (line)
+  (loop with set = '(#\sp #\return #\tab #\line
+		     #.(code-char (char-to-ascii #\return))
+		     #.(code-char (char-to-ascii #\tab))
+		     #.(code-char (char-to-ascii #\line)))
+	for lastpos first 0 then pos
+	while lastpos
+	for startpos = (string-search-not-set set line :start lastpos)
+	while startpos
+	for pos = (string-search-set set line :start startpos)
+	collect (substring line startpos pos)))
+
+(defun-in-flavor (canonicalize-automount-map-name unix-nfs-access-path-mixin) (map)
+  (if (string-search-char #\/ map)
+      (parse-mtab-dir-pathname
+	map (fs:make-pathname :host fs:host :raw-directory :root))
+    map))
+
+(defun-in-flavor (parse-automount-master-tokens unix-nfs-access-path-mixin) (tokens)
+  (when (>= (length tokens) 2)
+    (destructuring-bind (directory map . rest) tokens
+      (list (if (string= directory "/-")
+		:direct
+	      (parse-mtab-dir-pathname
+		directory (fs:make-pathname :host fs:host :raw-directory :root)))
+	    (canonicalize-automount-map-name map)
+	    (if rest (first rest) "")))))
+
+(defun-in-flavor (yp-automount-master unix-nfs-access-path-mixin) (map)
+  (let* ((unlap (fap-unix-name-lookup-access-path self))
+	 (order (yellow-pages-order unlap map)))
+    (unless (and automount-master
+		 (stringp (first automount-master))
+		 (string= (first automount-master) map)
+		 (eql (second automount-master) order))
+      (setq automount-master
+	    (list map
+		  order
+		  (when order
+		    (loop for (key val) in (yellow-pages-list unlap map)
+			  for tokens = (tokenize-line (string-append key " " val))
+			  for parse = (parse-automount-master-tokens tokens)
+			  when parse collect parse)))))
+    (third automount-master)))
+
+(defun-in-flavor (automount-file-write-date unix-nfs-access-path-mixin) (pathname)
+  (condition-case (error)
+       (letf ((reading-automount-file t))
+	 (let ((dir-pathname (send pathname :directory-pathname-as-file)))
+	   (getf (cdr (with-dir-fhandle-cache-validity-checking-inhibited (self dir-pathname)
+			(with-dir-contents-cache-validity-checking-inhibited
+			  (self dir-pathname)
+			  (send self :properties pathname))))
+		 :creation-date)))
+     ((sys:network-error nfs-error rpc-error)
+      nil)))
+
+(defun-in-flavor (read-automount-file-line unix-nfs-access-path-mixin) (stream)
+  (declare (values line eofp))
+  (loop with so-far = ""
+	for (untrimmed-line eofp) = (multiple-value-list (send stream :line-in))
+	for line = (string-trim '(#\space #\tab #.(code-char (char-to-ascii #\tab)))
+				untrimmed-line)
+	for length = (length line)
+	for comment-p = (and (not (zerop length)) (char= (aref line 0) #\#))
+	for continued-p = (and (not (zerop length)) (char= (aref line (1- length)) #\\))
+	when comment-p
+	  do (setq length 0 line "" continued-p nil)
+	when continued-p
+	  do (setq length (1- length) line (substring line 0 length))
+	when (or eofp
+		 (and (not continued-p)
+		      (not (zerop length))))
+	  return (values (string-append so-far " " line) eofp)
+	when continued-p
+	  do (setq so-far (string-append so-far " " line))))
+
+(defun-in-flavor (read-automount-file unix-nfs-access-path-mixin) (where errorp)
+  (letf ((reading-automount-file t))
+    (condition-case-if (not errorp) (error)
+	 (with-open-stream (stream (fs:file-access-path-open
+				     self where where 
+				     :direction :input
+				     :element-type 'character
+				     :if-does-not-exist :error))
+	   (values
+	     (send stream :truename)
+	     (send stream :creation-date)
+	     (loop for (line eofp) = (multiple-value-list (read-automount-file-line stream))
+		   for tokens = (tokenize-line line)
+		   when tokens collect tokens
+		   until eofp)))
+       ((rpc-error fs:pathname-error fs:file-error)
+	(values error (automount-file-write-date where) nil)))))
+
+(defun-in-flavor (file-automount-master unix-nfs-access-path-mixin) (pathname)
+  (unless (and automount-master
+	       (eq (first automount-master) pathname)
+	       (eql (second automount-master) (automount-file-write-date pathname)))
+    (multiple-value-bind (truename write-date data)
+	(read-automount-file pathname t)
+      (declare (ignore truename))
+      (setq automount-master
+	    (list pathname
+		  write-date
+		  (loop for tokens in data
+			for parse = (parse-automount-master-tokens tokens)
+			when parse collect parse)))))
+  (third automount-master))
+
+(defun-in-flavor (parse-automount-command unix-nfs-access-path-mixin) (line)
+  (let ((tokens (tokenize-line line))
+	(master-name "auto.master")
+	(master-list nil)
+	(defpath (fs:make-pathname :host fs:host :raw-directory :root)))
+    ;; The special 1-token case
+    (when (= (length tokens) 1)
+      (let ((token (pop tokens)))
+	(when (char-equal (aref token 0) #\N)
+	  (setq master-name nil))))
+    ;; Switches
+    (loop while (and tokens (char-equal (aref (first tokens) 0) #\-))
+	  for token = (pop tokens)
+	  do (selector token string=
+	       ("-m" (setq master-name nil))
+	       ("-n" ())
+	       ("-T" ())
+	       ("-v" ())
+	       ("-D" (pop tokens))
+	       ("-f" (setq master-name (parse-mtab-dir-pathname (pop tokens) defpath)))
+	       ("-M" (pop tokens))
+	       ("-tl" (pop tokens))
+	       ("-tm" (pop tokens))
+	       ("-tw" (pop tokens))))
+    ;; Directories
+    (loop while tokens
+	  for directory = (parse-mtab-dir-pathname (pop tokens) defpath)
+	  for map = (canonicalize-automount-map-name (pop tokens))
+	  for options =
+	      (if (and tokens (char-equal (aref (first tokens) 0) #\-))
+		  (pop tokens)
+		"")
+	  do (setq master-list (nconc master-list (list (list directory map options)))))
+    ;; Append the master database
+    (typecase master-name
+      (string
+	(setq master-list (nconc master-list (yp-automount-master master-name))))
+      (pathname
+	(setq master-list (nconc master-list (file-automount-master master-name)))))
+    master-list))
+
+(defun-in-flavor (get-automount-directories unix-nfs-access-path-mixin) ()
+  (let ((new-automount-directories nil))
+    (unwind-protect-case ()
+	(progn 
+	  (send fs:host :check-validity)
+	  (setq new-automount-directories
+		(loop for (indicator value) in (send fs:host :user-property)
+		      when (eq indicator :nfs-automount)
+			append (parse-automount-command value)))
+	  (loop with dev = (format nil "~(~A~):(pid unknown)" (send fs:host :short-name))
+		for (dir) in new-automount-directories
+		when (pathnamep dir)
+		  do (fap-add-mount-entry self dir dev dev nil nil :automount)))
+      (:normal 
+	(setq automount-directories (list (time:time) (copy-tree new-automount-directories))))
+      (:abort
+	(setq automount-directories nil)))))
+
+(defparameter *automount-directories-validity-time* (* 5 60 60))
+
+(defun-in-flavor (maybe-get-automount-directories unix-nfs-access-path-mixin) ()
+  (when (and (not reading-automount-file)
+	     (let ((automount-directories automount-directories))
+	       (or (null automount-directories)
+		   (not (numberp (first automount-directories)))
+		   (time:time-elapsed-p
+		     *automount-directories-validity-time*
+		     (first automount-directories)))))
+    (get-automount-directories)))
+
+(defflavor nfs-enoent-directory-automount
+	((reason nil))
+	(fs:directory-not-found nfs-error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (:report-without-pathname nfs-enoent-directory-automount) (stream)
+  (format stream "Directory not found in automount directory")
+  (when reason (apply #'format stream reason)))
+
+(compile-flavor-methods nfs-enoent-directory-automount)
+
+(defun-in-flavor (passwd-automount unix-nfs-access-path-mixin)
+		 (dir pathname map options errorp directp)
+  (declare (values dir dev entrypoint fhandle fs-plist type)
+	   (ignore map options directp))
+  (let ((username (fap-nfs-filename-string-for-host self dir)))
+    (multiple-value-bind (homedir defaulted-p)
+	(username->homedir (fap-unix-name-lookup-access-path self) username)
+      (if (or (null homedir) defaulted-p)
+	  (when errorp
+	    (error 'nfs-enoent-directory-automount
+		   :reason `("~&No passwd information found for username ~S." ,username)
+		   :pathname pathname
+		   :operation 'passwd-automount))
+	(let* ((directory (parse-mtab-dir-pathname homedir dir))
+	       (hostname (fap-nfs-filename-string-for-host
+			   self (send directory :directory-pathname-as-file)))
+	       (host (lookup-mtab-host fs:host hostname nil)))
+	  (if (null host)
+	      (when errorp
+		(error 'nfs-enoent-directory-automount
+		       :reason `("~&Unknown host ~S." ,hostname)
+		       :pathname pathname
+		       :operation 'passwd-automount))
+	    (let* ((devdir (fs:make-pathname
+			     :host host
+			     :raw-directory (send directory :raw-directory)))
+		   (dev (send devdir :directory-pathname-as-file))
+		   (entrypoint (fs:merge-pathnames devdir directory)))
+	      (values dir dev entrypoint nil nil nil))))))))
+
+(defun-in-flavor (find-deepest-export unix-nfs-access-path-mixin)
+		 (host dir pathname)
+  (let* ((root (make-pathname :host host :directory :root))
+	 (truename (true-pathname-like dir root pathname))
+	 (fap (nfs-access-path-for-host host nil 'host-automount))
+	 (exports (fap-nfs-exports fap))
+	 (directories
+	   (loop for export in exports
+		 collect (parse-mtab-dir-pathname export root))))
+    (deepest-directory-containing truename directories)))
+
+(defun-in-flavor (hosts-automount unix-nfs-access-path-mixin)
+		 (dir pathname map options errorp directp)
+  (declare (values dir dev entrypoint fhandle fs-plist type)
+	   (ignore map options directp))
+  (let ((hostname (fap-nfs-filename-string-for-host self dir))
+	(pathname (as-dir pathname)))
+    (let ((host (lookup-mtab-host fs:host hostname errorp)))
+      (if (null host)
+	  (when errorp
+	    (error 'nfs-enoent-directory-automount
+		   :reason `("~&No host information found for hostname ~S." ,hostname)
+		   :pathname pathname
+		   :operation 'hosts-automount))
+	(let ((dev (find-deepest-export host dir pathname)))
+	  (if (null dev)
+	      (when errorp
+		(error 'nfs-enoent-directory-automount
+		       :reason `("~&It isn't contained by any exported filesystem of ~A."
+				 ,host)
+		       :pathname pathname
+		       :operation 'hosts-automount))
+	    (values
+	      (as-file
+		(send (as-dir dir) :new-raw-directory
+		      (let ((devdir (send (as-dir dev) :raw-directory))
+			    (dirdir (send (as-dir dir) :raw-directory)))
+			(or (append (if (listp dirdir) dirdir nil)
+				    (if (listp devdir) devdir nil))
+			    :root))))
+	      dev dev nil nil nil)))))))
+
+(defun-in-flavor (null-automount unix-nfs-access-path-mixin)
+		 (dir pathname map options errorp directp)
+  (declare (values dir dev entrypoint fhandle fs-plist type)
+	   (ignore dir pathname map options errorp directp))
+  nil)
+
+(defun-in-flavor (parse-automount-location-field unix-nfs-access-path-mixin)
+		 (dir key location errorp)
+  (declare (values dev entrypoint))
+  (when (string-search-char #\& location)
+    ;; Do '&' substitution.
+    ;; Don't worry about quoting right now.
+    (loop for start first 0 then (1+ pos)
+	  for pos = (string-search-char #\& location :start start)
+	  collect (substring location start pos) into strings
+	  until (null pos)
+	  collect key into strings
+	  finally (setq location (apply #'string-append strings))))
+  (let* ((first-colon (string-search-char #\: location))
+	 (second-colon (and first-colon
+			    (string-search-char #\: location :start (1+ first-colon))))
+	 (mountpoint-string (substring location 0 second-colon))
+	 (dev (parse-mtab-dev-pathname mountpoint-string dir errorp))
+	 (entrypoint
+	   (if second-colon
+	       (parse-mtab-dev-pathname
+		 (string-append mountpoint-string "/" (substring location (1+ second-colon)))
+		 dir errorp)
+	     dev)))
+    (when (and dev entrypoint)
+      (values dev entrypoint))))
+
+(defun-in-flavor (parse-automount-tokens unix-nfs-access-path-mixin)
+		 (dir pathname key tokens errorp)
+  (declare (values mounts)
+	   (ignore pathname errorp))
+  (let ((mounts nil)
+	(devs nil)
+	(entrypoints nil)
+	(relative "/")
+	(relative-dir dir))
+    (flet ((finish ()
+	     (when devs
+	       (let* ((rdevs (reverse devs))
+		      (rentrypoints
+			(if (every #'eq devs entrypoints)
+			    rdevs
+			  (reverse entrypoints))))
+		 (push (list relative-dir rdevs rentrypoints) mounts)))))
+      (dolist (token tokens)
+	(let ((char (aref token 0)))
+	  (selector char char=
+	    (#\- nil)
+	    (#\/
+	     (finish)
+	     (setq devs nil entrypoints nil relative token)
+	     (if (string= relative "/")
+		 (setq relative-dir dir)
+	       (setq relative-dir
+		     (fap-nfs-parse-pathname
+		       self
+		       (string-append
+			 (fap-nfs-pathname-string-for-host self dir)
+			 relative)))))
+	    (otherwise
+	      (multiple-value-bind (dev entrypoint)
+		  (parse-automount-location-field relative-dir key token nil)
+		(push dev devs)
+		(push entrypoint entrypoints))))))
+      (finish))
+    (reverse mounts)))
+
+(defun-in-flavor (find-automount-mount unix-nfs-access-path-mixin)
+		 (dir pathname key mounts errorp)
+  (declare (values mount)
+	   (ignore key errorp))
+  (cond ((null mounts) nil)
+	((and (null (rest mounts)) 
+	      (eq (first (first mounts)) dir)
+	      (first mounts)))
+	(t
+	 (assoc (deepest-directory-containing (as-dir pathname) (mapcar #'first mounts))
+		mounts))))
+
+(defun-in-flavor (tokenized-line-automount unix-nfs-access-path-mixin)
+		 (dir pathname key tokens errorp)
+  (declare (values dir dev entrypoint fhandle fs-plist type))
+  (let* ((mounts (parse-automount-tokens dir pathname key tokens errorp))
+	 (mount (find-automount-mount dir pathname key mounts errorp))
+	 (type nil))
+    (when mount 
+      (when (rest mounts)
+	(setq type (list :multiple dir))
+	(dolist (mount mounts)
+	  (destructuring-bind (dir devs entrypoints) mount
+	    (fap-add-mount-entry
+	      self dir
+	      (if (rest devs) devs (first devs))
+	      (if (rest entrypoints) entrypoints (first entrypoints))
+	      nil nil type))))
+      (destructuring-bind (dir devs entrypoints) mount
+	(cond (devs
+	       (values dir
+		       (if (rest devs) devs (first devs))
+		       (if (rest entrypoints) entrypoints (first entrypoints))
+		       nil nil type))
+	      (errorp
+	       (error 'nfs-enoent-directory-automount
+		      :reason
+		      `("~&None of the automount location fields could be parsed.")
+		      :pathname (as-dir pathname)
+		      :operation 'tokenized-line-automount)))))))
+
+(defun-in-flavor (yp-automount unix-nfs-access-path-mixin)
+		 (dir pathname map options errorp directp)
+  (declare (values dir dev entrypoint)
+	   (ignore options))
+  (let* ((key (if directp
+		  (fap-nfs-pathname-string-for-host self dir)
+		(fap-nfs-filename-string-for-host self dir)))
+	 (unlap (fap-unix-name-lookup-access-path self))
+	 (line (or (yellow-pages-lookup unlap map key)
+		   (yellow-pages-lookup unlap map "*"))))
+    (if (null line)
+	(when (and errorp (not directp))
+	  (error 'nfs-enoent-directory-automount
+		 :reason `("~&The Yellow Pages Lookup failed for the key ~S in the map ~S."
+			   ,key ,map)
+		 :pathname (as-dir pathname)
+		 :operation 'yp-automount))
+      (tokenized-line-automount dir pathname key (tokenize-line line) errorp))))
+
+(defparameter *automount-file-validity-time* (* 5 60 60))
+
+(defun-in-flavor (need-to-read-automount-file unix-nfs-access-path-mixin) (where)
+  (and (null reading-automount-file)
+       (let ((automount (assoc where automount-files)))
+	 (or (null automount)
+	     (not (numberp (second automount)))
+	     (and (time:time-elapsed-p *automount-file-validity-time* (second automount))
+		  (progn (setf (second automount) (time:time)) 
+			 (or (errorp (third automount))
+			     (not (eql (automount-file-write-date (third automount))
+				       (fourth automount))))))))))
+
+(defun-in-flavor (maybe-read-automount-file unix-nfs-access-path-mixin) (where)
+  (unwind-protect-case ()
+      (when (need-to-read-automount-file where)
+	(multiple-value-bind (truename-or-error write-date data)
+	    (read-automount-file where nil)
+	  (pushnew (list where (time:time) truename-or-error write-date data)
+		   automount-files :key #'first :replace t)))
+    (:abort
+      (setq automount-files (delete where automount-files :key #'first)))))
+
+(defun-in-flavor (file-automount unix-nfs-access-path-mixin)
+		 (dir pathname file options errorp directp)
+  (declare (values dir dev entrypoint))
+  (let* ((defpath (fs:make-pathname :host fs:host :raw-directory :root))
+	 (path (fs:parse-pathname file nil defpath)))
+    (maybe-read-automount-file path)
+    (let ((automount-file (assoc path automount-files)))
+      (if (null automount-file)
+	  (when errorp
+	    (error 'nfs-enoent-directory-automount
+		   :reason `("~&No automount file info for ~A." ,path)
+		   :pathname (as-dir pathname)
+		   :operation 'file-automount))
+	(destructuring-bind (where time truewhere write-date lines) automount-file
+	  (declare (ignore where time write-date))
+	  (loop with basename =
+		  (if directp
+		      (fap-nfs-pathname-string-for-host self dir)
+		    (fap-nfs-filename-string-for-host self dir))
+		for tokens in lines
+		for key = (first tokens)
+		when (and (= (length tokens) 1)
+			  (stringp key)
+			  (> 1 (string-length key))
+			  (char= (aref key 0) #\+))
+		  return
+		    (automount-dispatch
+		      dir pathname (canonicalize-automount-map-name (substring key 1))
+		      options errorp directp)
+		when (and (stringp key)
+			  (or (string= basename key)
+			      (string= "*" key)))
+		  return (tokenized-line-automount dir pathname basename (rest tokens) errorp)
+		finally
+		  (when (and errorp (not directp))
+		    (error 'nfs-enoent-directory-automount
+			   :reason `("~&No line with basename ~S could be found in ~A."
+				     ,basename ,truewhere)
+			   :pathname (as-dir pathname)
+			   :operation 'file-automount))))))))
+
+(defun-in-flavor (automount-dispatch unix-nfs-access-path-mixin)
+		 (dir pathname map options errorp directp)
+  (declare (values dir dev entrypoint))
+  (funcall (cond ((pathnamep map) #'file-automount)
+		 ((string= map "-passwd") #'passwd-automount)
+		 ((string= map "-hosts") #'hosts-automount)
+		 ((string= map "-null") #'null-automount)
+		 (t #'yp-automount))
+	   dir pathname map options errorp directp))
+
+(defwhopper (fap-lookup-mount-entry unix-nfs-access-path-mixin) (dir fhandle pathname)
+  (multiple-value-bind (dirout dev entrypoint fhandle fs-plist type)
+      (continue-whopper dir fhandle pathname)
+    (if (or dirout reading-automount-file)
+	(values dirout dev entrypoint fhandle fs-plist type)
+      (multiple-value-bind (dir dev entrypoint fhandle fs-plist type)
+	  (let* ((dpaf (send dir :directory-pathname-as-file))
+		 (info (or (assoc dpaf (second automount-directories))
+			   (assoc :direct (second automount-directories)))))
+	    (when info
+	      (destructuring-bind (key map options) info
+		(automount-dispatch dir pathname map options t (eq key :direct)))))
+	(when dir
+	  (fap-add-mount-entry self dir dev entrypoint fhandle fs-plist type)
+	  (values dir dev entrypoint fhandle fs-plist type))))))
+
+(defmethod (fap-mount-checks unix-nfs-access-path-mixin :after) ()
+  (maybe-read-mtab-file)
+  (maybe-get-automount-directories))
+
+(defmethod (fap-mount-point-reset unix-nfs-access-path-mixin :after) ()
+  (setq automount-directories nil)
+  (setq automount-files nil)
+  (setq automount-master nil)
+  (setq mtab nil))
+
+;;; Turn on UNIX versions
+(neti:enable-unix-versions)
+
+(defflavor nonunix-nfs-access-path-mixin ((unix-pathname nil))
+	   ()
+  (:required-flavors nfs-access-path-mixin)
+  (:abstract-flavor))
+
+(defun-in-flavor (unix-pathname nonunix-nfs-access-path-mixin) ()
+  (or unix-pathname
+      (setq unix-pathname (make-instance 'fs:unix42-pathname :host fs:host))))
+
+(defmethod (fap-nfs-parse-pathname nonunix-nfs-access-path-mixin) (string)
+  (multiple-value-bind (device directory name type ignore)
+      (let ((*interpret-tilde-in-unix-parse-namestring* nil))
+	(send (unix-pathname) :parse-namestring nil string))
+    (fap-nfs-parse-filename
+      self
+      (if (or (null name) (eq name :unspecific))
+	  (if (or (null type) (eq type :unspecific))
+	      ""
+	    (string-append "." type))
+	(if (or (null type) (eq type :unspecific))
+	    name
+	  (string-append name "." type)))
+      (fs:make-pathname :host fs:host :raw-device device :raw-directory directory))))
+
+(defmethod (fap-nfs-parse-filename nonunix-nfs-access-path-mixin)
+	   (string directory-pathname)
+  (multiple-value-bind (ignore ignore name type version)
+      (send directory-pathname :parse-namestring nil string)
+    (send directory-pathname :new-pathname :raw-name name :raw-type type :version version)))
+
+(defmethod (fap-nfs-pathname-string-for-host nonunix-nfs-access-path-mixin) (pathname)
+  (with-output-to-string (stream)
+    (fs:unix-device-string-out stream (send pathname :raw-device))
+    (fs:unix-directory-string-out
+      stream
+      (send pathname :raw-directory)
+      (send (unix-pathname) :directory-separator))
+    (princ (fap-nfs-filename-string-for-host self pathname) stream)))
+
+(defmethod (fap-nfs-filename-string-for-host nonunix-nfs-access-path-mixin) (pathname)
+  (send pathname :string-for-dired))
+
+(defmethod (fap-nfs-temporary-pathname nonunix-nfs-access-path-mixin) (pathname counter)
+  (send pathname :new-pathname :name (format nil "NFS~3,'0D" counter) :type "TMP"))
+
+(defmethod (fap-nfs-mount-string-for-host nonunix-nfs-access-path-mixin) (pathname)
+  (fap-nfs-pathname-string-for-host self pathname))
+
+(defmethod (fap-close-finish-rename-pathname nonunix-nfs-access-path-mixin)
+	   (pathname counter)
+  (fap-nfs-temporary-pathname self pathname counter))
+
+(defmethod (fap-pathname-for-creation nonunix-nfs-access-path-mixin)
+	   (pathname unversioned-pathname)
+  (declare (ignore unversioned-pathname))
+  pathname)
+
+(defmethod (fap-get-newest-version nonunix-nfs-access-path-mixin)
+	   (pathname dir-fhandle dir-mtime dir-ctime outputp)
+  (let ((highver (fap-highest-existing-version-number
+		   self pathname dir-fhandle dir-mtime dir-ctime)))
+    (send pathname :new-version
+	  (if outputp
+	      (if (= highver most-positive-fixnum)
+		  :newest
+		(1+ highver))
+	    (if (zerop highver)
+		1
+	      (if (= highver most-positive-fixnum)
+		  :newest
+		highver))))))
+
+
+
+(defflavor lispm-nfs-access-path-mixin () (nonunix-nfs-access-path-mixin)
+  (:abstract-flavor))
+
+(defmethod (fap-nfs-temporary-pathname lispm-nfs-access-path-mixin) (pathname counter)
+  (fap-nfs-parse-filename
+    self
+    (let* ((prefix (format nil "nfs~2,'0D." counter))
+	   (filename (fap-nfs-filename-string-for-host self pathname))
+	   (too-much (- (+ (string-length prefix) (string-length filename)) 14)))
+      (string-append prefix (if (plusp too-much) (substring filename too-much) filename)))
+    pathname))
+
+
+(defflavor vms-nfs-access-path-mixin () (nonunix-nfs-access-path-mixin)
+  (:abstract-flavor))
+
+(defun-in-flavor (tokenize-user-property vms-nfs-access-path-mixin) (line)
+  (loop with set = '(#\sp #\return #\tab #\line #\,)
+	for lastpos first 0 then pos
+	while lastpos
+	for startpos = (string-search-not-set set line :start lastpos)
+	while startpos
+	for pos = (string-search-set set line :start startpos)
+	collect (substring line startpos pos)))
+
+(defun-in-flavor (device-mount-binding vms-nfs-access-path-mixin) (pathname)
+  (loop with device = (send pathname :raw-device)
+	for user-property in (send (send pathname :host) :user-property)
+	for (key val) = user-property
+	when (eq key :nfs-mount-binding)
+	  thereis (destructuring-bind (dev dir) (tokenize-user-property val)
+		    (and (string-equal dev device) dir))
+	finally (return (string-append "/" (string-downcase device)))))
+
+(defmethod (fap-nfs-pathname-string-for-host vms-nfs-access-path-mixin) (pathname)
+  (string-downcase
+    (with-output-to-string (stream)
+      (let ((directory (send pathname :raw-directory))
+	    (name (send pathname :raw-name))
+	    (type (send pathname :raw-type))
+	    (version (send pathname :version)))
+	(unless (or (null directory)
+		    (and (listp directory)
+			 (eq (first directory) :relative)))
+	  (princ (device-mount-binding pathname) stream))
+	(unless (and (eq directory :root)
+		     (stringp name)
+		     (string= name "000000")
+		     (stringp type)
+		     (string= type "DIR")
+		     (eql version 1))
+	  (fs:unix-directory-string-out
+	    stream directory (send (unix-pathname) :directory-separator))
+	  (princ (fap-nfs-filename-string-for-host self pathname) stream))))))
+
+(defmethod (fap-nfs-filename-string-for-host vms-nfs-access-path-mixin) (pathname)
+  (string-downcase (send pathname :string-for-dired)))
+
+(defmethod (fap-nfs-parse-pathname vms-nfs-access-path-mixin) (string &optional relative-to-host)
+  (let ((string string)
+	(device nil)
+	(real-host (or relative-to-host fs:host)))
+    (loop for user-property in (send real-host :user-property)
+	  for (key val) = user-property
+	  when (eq key :nfs-mount-binding)
+	    thereis
+	      (destructuring-bind (dev dir) (tokenize-user-property val)
+		(cond ((and ( (string-length string) (string-length dir))
+			    (char= (aref dir (1- (string-length dir))) #\/)
+			    (string= dir string :end2 (string-length dir)))
+		       (setq device dev)
+		       (setq string (substring string (1- (string-length dir)))))
+		      ((and (> (string-length string) (string-length dir))
+			    (char= (aref string (string-length dir)) #\/)
+			    (string= dir string :end2 (string-length dir)))
+		       (setq device dev)
+		       (setq string (substring string (string-length dir))))))
+	  finally
+	    (when (and (not (zerop (string-length string)))
+		       (char= (aref string 0) #\/))
+	      (let ((slashpos (string-search-char #\/ string :start 1)))
+		(if slashpos
+		    (setq device (substring string 1 slashpos)
+			  string (substring string slashpos))
+		  (setq device (substring string 1) string "")))))
+    (if (zerop (string-length string))
+	(fs:make-pathname :host real-host :device device :directory :root
+			  :name "000000" :type "DIR" :version 1)
+      (multiple-value-bind (ignore directory name type ignore)
+	  (let ((*interpret-tilde-in-unix-parse-namestring* nil))
+	    (send (unix-pathname) :parse-namestring nil string))
+	(fap-nfs-parse-filename
+	  self
+	  (if (or (null name) (eq name :unspecific))
+	      (if (or (null type) (eq type :unspecific))
+		  ""
+		(string-append "." type))
+	    (if (or (null type) (eq type :unspecific))
+		name
+	      (string-append name "." type)))
+	  (fs:make-pathname :host real-host :device device :directory directory))))))

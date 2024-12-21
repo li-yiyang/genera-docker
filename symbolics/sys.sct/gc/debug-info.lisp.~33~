@@ -1,0 +1,2789 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SYSTEM-INTERNALS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; EQness is important for source locators.
+(defconst *debug-info-types-not-to-copy*
+	  '(:interpreted-form :read-correspondences
+	    si:unsharable-constants si:writable-constants))
+
+(defvar *debug-info-mode* nil)
+
+(define-gc-optimization compress-debug-info symbolics-system-release
+  ;; This has to come before GC-PATHNAMES since FUNCTION-SPEC-LIKELY-PACKAGE uses pathnames.
+  (:order (:before fs:gc-pathnames))
+  (:documentation "Compress or remove debugging info, as specified by the :DEBUG-INFO option.")
+  (:before-flip (ignore)
+    (let* ((debug-info (immediate-gc-option :debug-info))
+	   (compress-debug-info nil)
+	   (remove-debug-info nil)
+	   (retain-macros t)
+	   #+share-compiled-functions
+	   (share-compiled-functions nil))
+      (setq *debug-info-mode* debug-info)	;Enable same mode as new files loaded.
+      (cl:ecase debug-info
+	((nil))
+	(:compress
+	  (setq compress-debug-info t))
+	(:compress-without-macros
+	  (setq compress-debug-info t
+		retain-macros nil))
+	((:remove :remove-all)
+	  (setq remove-debug-info t)
+	  #+share-compiled-functions
+	  (setq share-compiled-functions t)))
+      (when debug-info
+	(cond (remove-debug-info
+	       (remove-all-debug-info (neq debug-info :remove-all))
+	       (remove-debugging-related-junk))
+	      (compress-debug-info
+	       (multiple-value-bind (macro-table constants-table package-table)
+		   (build-common-name-tables-if-necessary)
+		 (compress-all-debug-info
+		   retain-macros macro-table constants-table package-table))))
+	(compact-all-debug-info)
+	(weaken-debug-info-strings))
+      #+share-compiled-functions
+      (when share-compiled-functions
+	(share-equal-compiled-functions))))
+  (:after-reclaim-oldspace (ignore)
+    (let ((debug-info (immediate-gc-option :debug-info)))
+      (when (memq debug-info '(:compress :compress-without-macros))
+	(compress-remaining-debug-info-strings))
+      (when (or debug-info
+		(eq (immediate-gc-option :mode) 'symbolics-system-release))
+	;; This is pretty random...
+	(do-area-regions (region debug-info-area)
+	  (shorten-region region))))))
+
+;;; Called by fasloader to preserve important information in correct form.
+(defun standardize-extra-info (function extra-info)
+  (unless (assoc 'clos-internals:mapping-table-family (cdr extra-info))
+    ;; If the function is for a CLOS method, CLOS will move some information out of
+    ;; the extra info into the method.  It will call this function.
+    (cl:ecase *debug-info-mode*
+      ((nil)
+       (let ((uncopied (loop for i from 1 for list on (cdr extra-info)
+			     when (memq (caar list) *debug-info-types-not-to-copy*)
+			       collect (list (car list) i)
+			       and do (setf (car list) nil))))
+	 (setq extra-info (si:copytree-and-leaves extra-info debug-info-area))
+	 (loop for (entry index) in uncopied do
+	   (setf (nth index extra-info) entry))))
+      ((:compress :compress-without-macros)
+       (setq extra-info (compress-extra-info function extra-info
+					     (eq *debug-info-mode* :compress))))
+      ((:remove :remove-all)
+       (setq extra-info (remove-debug-info-from-extra-info function extra-info
+							   (eq *debug-info-mode* :remove))))))
+  extra-info)
+
+;;;; Debug info.
+
+;;; Extra-info is transformed into an list of mostly fixnums.  The first
+;;; word is a bitmask controlling the decoding of the remaining elements.
+
+(defmacro define-bits (&rest names-and-nbits)
+  `(progn . ,(loop with position = 0
+		   for (name nbits) on names-and-nbits by 'cddr
+		   when (cl:consp nbits)
+		     do (psetq nbits (first nbits)
+			       position (second nbits))
+		   collect `(defconstant ,name (byte ,nbits ,position))
+		   do (incf position nbits))))
+
+(define-bits
+
+  ;; Function has one of the common idioms for its first few elements of local map.
+  %%debug-info-common-local-map #+3600 3 #+IMach 4
+
+  ;; Function's locals are interned in some package other than the symbol-name of the function,
+  ;; because of globalization or something like that.
+  ;;--- This of course requires action when things are globalized to fix any function by that
+  ;;name's compressed debugging info.
+  %%debug-info-local-name-package 1
+
+  ;; Function has more local map.  Next several data words encode it.  See below for details of
+  ;; that encoding.
+  %%debug-info-more-local-map 1
+
+  ;; The local map was too complicated to be encoded into single words (for instance it had
+  ;; variables with very long extent).  It comes as a data word.
+  %%debug-info-complicated-local-map 1
+
+  ;; Function has a declared arglist.  Next data word is that.
+  %%debug-info-declared-arglist 1
+
+  ;; Function's arglist (or real-arglist in the case there's a declared one) can easily
+  ;; be deduced from its local map and args info.
+  %%debug-info-simple-arglist 1
+
+  ;; There is a values declaration.  Next data word is that.
+  %%debug-info-values 1
+
+  ;; Function uses some of the commonly expanded macros.
+  ;; Next word or two is a bitmask of those.
+  %%debug-info-common-macros-expanded 1
+
+  ;; Function has more expanded macros.  Next data word is list.
+  %%debug-info-more-macros-expanded 1
+
+  ;; Function has instance variable instructions.  Next few data words are an encoding
+  ;; of those (see below).
+  %%debug-info-instance-variable-instructions 1
+
+  ;; Function's function-parent can easily be deduced from its function spec and parent
+  ;; type.  Parent type is in a byte of second data word.
+  %%debug-info-simple-function-parent 4
+
+  ;; Function uses some of the common constants.  Next data word is a bitmask of those.
+  %%debug-info-common-constants 1
+
+  ;; Function uses some more constants.  Next data word is a list.
+  %%debug-info-more-constants 1
+
+  ;; Function has lexical variable instructions.  Next few data words are an encoding
+  ;; of those (see below).
+  %%debug-info-lexical-variable-instructions 1
+
+  ;; Function has internal functions in the constants table in the correct order.
+  %%debug-info-simple-internal-function-offsets 1
+
+  ;; Function has a lexical map.  Same RLE.
+  %%debug-info-lexical-map 1
+
+  ;; Function has a captive map.
+  %%debug-info-captive-map 1
+
+  ;; Function has some more debugging info.  Rest of list is that.
+  %%debug-info-more-debug-info (1 31))
+
+;;;--- This could also deduce constant initializations by looking
+;;;--- at the instructions, and simple initializations to values of previous
+;;;--- variables.
+;;; Is this functions arglist easily deduced from the local map?
+
+#+3600
+(defun function-has-simple-arglist-p (function &optional local-map arglist-elem)
+  (unless local-map
+    (let ((debug-info (debugging-info function)))
+      (setq local-map (cdr (assq :local-map debug-info))
+	    arglist-elem (or (assq 'real-arglist debug-info)
+			     (assq 'arglist debug-info)))))
+  (macrolet ((no-go () `(return-from function-has-simple-arglist-p nil)))
+    (let ((arglist arglist-elem))
+      (unless arglist
+	(no-go))
+      (setq arglist (cdr arglist))		;Flush indicator
+      (let ((info (%args-info function))
+	    (slot 0))
+	(labels ((check-for (thing)
+		   (unless (and arglist (eq (pop arglist) thing))
+		     (no-go)))
+		 (check-slot ()
+		   (check-for (cdr (assq slot local-map)))
+		   (incf slot)))
+	  (dotimes (ignore (ldb %%arg-desc-min-args info))
+	    (check-slot))
+	  (let ((n-opt (- (ldb %%arg-desc-max-args info)
+			  (ldb %%arg-desc-min-args info))))
+	    (when (plusp n-opt)
+	      (check-for '&optional)
+	      (dotimes (ignore n-opt)
+		(check-slot)))
+	    (when (ldb-test %%arg-desc-rest-arg info)
+	      (check-for '&rest)
+	      (check-slot)))))
+      (unless (null arglist)
+	(no-go)))
+    t))
+
+#+imach
+(defun function-has-simple-arglist-p (function &optional variable-creation-alist arglist-elem)
+  (unless variable-creation-alist
+    (let ((debug-info (debugging-info function)))
+      (setq variable-creation-alist (cdr (assq :variable-creation-alist debug-info))
+	    arglist-elem (or (assq 'real-arglist debug-info)
+			     (assq 'arglist debug-info)))))
+  (macrolet ((no-go () `(return-from function-has-simple-arglist-p nil)))
+    (let ((arglist arglist-elem))
+      (unless arglist
+	(no-go))
+      (setq arglist (cdr arglist))		;Flush indicator
+      (let ((info (%args-info function)))
+	(labels ((check-for (thing)
+		   (unless (and arglist (eq (pop arglist) thing))
+		     (no-go))))
+	  (let ((required (cdr (assq 0 variable-creation-alist))))
+	    (unless (= (cl:length required) (ldb %%arg-desc-min-args info))
+	      (no-go))
+	    (mapc #'check-for required))
+	  (let ((n-opt (- (ldb %%arg-desc-max-args info)
+			  (ldb %%arg-desc-min-args info))))
+	    (when (plusp n-opt)
+	      (check-for '&optional)
+	      (loop repeat n-opt
+		    for stack from 2 by 2
+		    as vars = (cdr (assq stack variable-creation-alist)) do
+		(when (cdr vars) (no-go))
+		(check-for (car vars))))
+	    (when (ldb-test %%arg-desc-rest-arg info)
+	      (check-for '&rest)
+	      (let ((vars (cdr (assq (+ (* n-opt 2) 2) variable-creation-alist))))
+		(when (cdr vars) (no-go))
+		(check-for (car vars)))))))
+      (unless (null arglist)
+	(no-go)))
+    t))
+
+;;; Inverse of the above
+#+3600
+(defun function-simple-arglist (function &optional (local-map nil lm-p))
+  (unless lm-p
+    (let ((debug-info (debugging-info function)))
+      (setq local-map (cdr (assq :local-map debug-info)))))
+  (args-info-simple-arglist (%args-info function) local-map))
+
+#+imach
+(defun function-simple-arglist (function &optional (variable-creation-alist nil vca-p))
+  (unless vca-p
+    (let ((debug-info (debugging-info function)))
+      (setq variable-creation-alist (cdr (assq :variable-creation-alist debug-info)))))
+  (args-info-simple-arglist (%args-info function) variable-creation-alist))
+
+(defvar *single-arg-name-standin* '#:arg)
+(defvar *rest-arg-name-standin* '#:args)
+(defvar *sequential-arg-name-standins* (make-array 10 :fill-pointer 0))
+
+#+3600
+(defun args-info-simple-arglist (info local-map)
+  (stack-let ((result (make-array 20 :fill-pointer 0)))
+    (let ((slot 0))
+      (labels ((add-it (thing)
+		 (cl:vector-push-extend thing result))
+	       (add-slot (&optional rest-p)
+		 (add-it (let ((entry (assq slot local-map)))
+			   (cond (entry (cdr entry))
+				 ((and (zerop slot)
+				       (= (ldb %%arg-desc-max-args info) 1))
+				  *single-arg-name-standin*)
+				 (rest-p *rest-arg-name-standin*)
+				 (t (when ( slot (fill-pointer
+						    *sequential-arg-name-standins*))
+				      (loop for n from (fill-pointer
+							 *sequential-arg-name-standins*)
+						  to slot
+					    do (array-push-extend
+						 *sequential-arg-name-standins*
+						 (make-symbol (format nil "ARG~D" (1+ n))))))
+				    (aref *sequential-arg-name-standins* slot)))))
+		 (incf slot)))
+	(dotimes (ignore (ldb %%arg-desc-min-args info))
+	  (add-slot))
+	(let ((n-opt (- (ldb %%arg-desc-max-args info)
+			(ldb %%arg-desc-min-args info))))
+	  (when (plusp n-opt)
+	    (add-it '&optional)
+	    (dotimes (ignore n-opt)
+	      (add-slot))))
+	(when (ldb-test %%arg-desc-rest-arg info)
+	  (add-it '&rest)
+	  (add-slot t))))
+    (cl:coerce result 'list)))
+
+#+imach
+(defun args-info-simple-arglist (info variable-creation-alist)
+  (stack-let ((result (make-array 20 :fill-pointer 0)))
+    (let ((slot 0))
+      (macrolet ((add-it (thing)
+		   `(cl:vector-push-extend ,thing result)))
+	(labels ((add-slot (entry &optional rest-p)
+		   (add-it (cond (entry)
+				 ((and (zerop slot)
+				       (= (ldb %%arg-desc-max-args info) 1))
+				  *single-arg-name-standin*)
+				 (rest-p *rest-arg-name-standin*)
+				 (t (when ( slot (fill-pointer
+						    *sequential-arg-name-standins*))
+				      (loop for n from (fill-pointer
+							 *sequential-arg-name-standins*)
+						  to slot
+					    do (array-push-extend
+						 *sequential-arg-name-standins*
+						 (make-symbol (format nil "ARG~D" (1+ n))))))
+				    (aref *sequential-arg-name-standins* slot))))
+		   (incf slot)))
+	  (loop repeat (ldb %%arg-desc-min-args info)
+		for l = (cdr (cl:assoc 0 variable-creation-alist)) then (cdr l)
+		do (add-slot (car l)))
+	  (let ((n-opt (- (ldb %%arg-desc-max-args info)
+			  (ldb %%arg-desc-min-args info))))
+	    (when (plusp n-opt)
+	      (add-it '&optional)
+	      (loop for j from 2 to (* n-opt 2) by 2 do
+		(add-slot (cadr (cl:assoc j variable-creation-alist)))))
+	    (when (ldb-test %%arg-desc-rest-arg info)
+	      (add-it '&rest)
+	      (add-slot (cadr (cl:assoc (+ (* n-opt 2) 2) variable-creation-alist)))))))
+      (cl:coerce result 'list))))
+
+;;; Can the function parent of this function be deduced from its name together with the
+;;; parent's function spec type?
+(cl:defparameter *simple-function-parent-types*
+  ;;Cannot use #( in ZL.
+  (cl:coerce '(cp:define-command defuprim defdouble defcomplex cli::define-type-predicate
+	       cl:defstruct defstruct defflavor defresource format:defformat
+	       define-presentation-type)
+	     'cl:vector))
+
+(cl:assert (< (cl:length *simple-function-parent-types*)
+	   (ash 1 (byte-size %%debug-info-simple-function-parent))))
+
+(defun function-simple-function-parent-type (function-name arglist function-parent-elem)
+  (when function-parent-elem
+    (scl:destructuring-bind (ignore parent-fspec &optional (parent-type 'defun))
+	function-parent-elem
+      (loop while (and (cl:consp function-name)
+		       (eq (first function-name) :internal))
+	    do (setq function-name (second function-name)))
+      (when (cl:case parent-type
+	      ((cp:define-command defuprim defdouble defcomplex
+		cli::define-type-predicate)
+	       (cl:equal function-name parent-fspec))
+	      ((cl:defstruct defstruct defflavor)
+	       (if (and (symbolp function-name)
+			(or (cl:string= function-name "COPY-" :end1 5)
+			    (cl:string= function-name "MAKE-" :end1 5)))
+		   (eq parent-fspec
+		       (intern-soft (substring function-name 5)
+				    (symbol-package function-name)))
+		   (eq (first (last arglist)) parent-fspec)))
+	      ((defresource)
+	       (and (cl:consp function-name)
+		    (eq (first function-name) :property)
+		    (cl:equal (second function-name) parent-fspec)
+		    (memq (third function-name) '(resource-constructor
+						  resource-parametizer
+						  resource-deinitializer))))
+	      ((format:defformat)
+	       (and (cl:consp function-name)
+		    (eq (first function-name) :property)
+		    (cl:equal (second function-name) parent-fspec)
+		    (memq (third function-name) '(format:ctl-one-arg
+						  format:ctl-multi-arg
+						  format:ctl-no-arg))))
+	      ((define-presentation-type)
+	       (and (cl:consp function-name)
+		    (eq (first function-name) 'dw::presentation-function)
+		    (cl:equal (second function-name) parent-fspec))))
+	(1+ (cl:position parent-type *simple-function-parent-types*))))))
+
+;;; Inverse of above
+(defun function-simple-function-parent-fspec (function-name parent-type arglist)
+  (loop while (and (cl:consp function-name)
+		   (eq (first function-name) :internal))
+	do (setq function-name (second function-name)))
+  (cl:ecase parent-type
+    ((cp:define-command defuprim defdouble defcomplex cli::define-type-predicate)
+     function-name)
+    ((cl:defstruct defstruct defflavor)
+     (if (and (symbolp function-name)
+	      (or (cl:string= function-name "COPY-" :end1 5)
+		  (cl:string= function-name "MAKE-" :end1 5)))
+	 (intern (substring function-name 5) (symbol-package function-name))
+	 (first (last arglist))))
+    ((defresource format:defformat define-presentation-type)
+     (second function-name))))
+
+;;; Are the internal functions in the correct order?
+#+3600
+(defun function-has-simple-internal-function-offsets-p (function internal-offsets)
+  (let ((cca (compiled-function-cca function)))
+    (dotimes (i (cca-n-objects cca))
+      (when (cl:typep (cca-object cca i) 'compiled-function)
+	(unless (eql i (pop internal-offsets))
+	  (return-from function-has-simple-internal-function-offsets-p nil)))))
+  t)
+
+#+IMach
+(defun function-has-simple-internal-function-offsets-p (function internals)
+  (do-compiled-function-instructions (instruction nil :skip-entry-instruction t
+						      :prefetch t
+						      :bar 1)
+				     function
+    (when (and (or (type-member instruction dtp-compiled-function)
+		   (and (type-member instruction dtp-call-compiled-even
+						 dtp-call-compiled-even-prefetch
+						 dtp-call-compiled-odd
+						 dtp-call-compiled-odd-prefetch)
+			(progn (saving-registers-for-effect (%register-bar-1)
+				 (setq instruction (%find-structure-header instruction)))
+			       t)))
+	       (not (zerop (%p-ldb %%entry-instruction-internal-function-p instruction)))
+	       (neq (pop internals) instruction))
+      (return-from function-has-simple-internal-function-offsets-p nil)))
+  (null internals))
+
+;;; Inverse of the above.
+#+3600
+(defun function-simple-internal-function-offsets (function)
+  (let ((cca (compiled-function-cca function)))
+    (loop for i below (cca-n-objects cca)
+	  when (cl:typep (cca-object cca i) 'compiled-function)
+	    collect i)))
+
+#+IMach
+(defun function-simple-internal-function-offsets (function)
+  (poor-man/'s-with-collection (internals)
+    (do-compiled-function-instructions (instruction nil :skip-entry-instruction t
+							:prefetch t)
+				       function
+      (when (and (or (type-member instruction dtp-compiled-function)
+		     (and (type-member instruction dtp-call-compiled-even
+				       dtp-call-compiled-even-prefetch
+				       dtp-call-compiled-odd
+				       dtp-call-compiled-odd-prefetch)
+			  (progn (saving-registers-for-effect (%register-bar-1)
+				   (setq instruction (%find-structure-header instruction)))
+				 t)))
+		 (not (zerop (%p-ldb %%entry-instruction-internal-function-p instruction))))
+	(collect-internals instruction)))
+    internals))
+
+#+3600
+;;; Common first few arguments.
+(cl:defparameter *function-common-local-map-initial-subsequences*
+  #.(cl:coerce '(()						;Used specially.
+		 (self self-mapping-table flavor::.generic. flavor::.daemon-caller-args.)
+		 (self self-mapping-table flavor::.generic. args)
+		 (self self-mapping-table flavor::.generic.)	;Methods
+		 (compiler:.lexical-environment-pointer.)
+		 (.form. .env.)			;Macros
+		 (ignore))
+	       'cl:vector))
+
+#+3600
+(cl:assert (< (cl:length *function-common-local-map-initial-subsequences*)
+	      (ash 1 (byte-size %%debug-info-common-local-map))))
+
+#+3600
+(defun local-map-initial-subsequence (local-map)
+  (when (null local-map)
+    (return-from local-map-initial-subsequence
+      (values 1 nil)))
+  (loop for j from 1 below (cl:length *function-common-local-map-initial-subsequences*) do
+    (block no-match
+      (let ((map local-map))
+	(loop for i from 0
+	      for var in (aref *function-common-local-map-initial-subsequences* j)
+	      do
+	  (unless map
+	    (return-from no-match))
+	  (let ((elem (pop map)))
+	    (unless (and (= (first elem) i) (eql (cdr elem) var))
+	      (return-from no-match))))
+	(return-from local-map-initial-subsequence
+	  (values (1+ j) map)))))
+  (values nil local-map))
+
+#+IMach
+;;; Common variable-creation-alist entries.
+;;; Elements here are a list of (initial-arg-names rest-arg-name).  NIL is special.
+(cl:defparameter *common-variable-creation-alist-entries*
+  #.(cl:vector '()
+	       '((sys:self-mapping-table self)		  flavor::.daemon-caller-args.)
+	       '((sys:self-mapping-table self)		  zl:args)
+	       '((sys:self-mapping-table self)		  ignore)
+	       '((sys:self-mapping-table self)		  nil)
+	       '((si:.form. si:.env.)			  nil)
+	       '((compiler:.lexical-environment-pointer.) ignore)
+	       '((compiler:.lexical-environment-pointer.) nil)
+	       '((si:form)				  nil)
+	       '((si:stream)				  ignore)
+	       '((si:stream)				  nil)
+	       '(nil					  ignore)))
+
+#+IMach
+(cl:assert (< (cl:length *common-variable-creation-alist-entries*)
+	      (ash 1 (byte-size %%debug-info-common-local-map))))
+
+#+IMach
+(defun variable-creation-alist-common-entries (variable-creation-alist args-info)
+  (when (null variable-creation-alist)
+    (return-from variable-creation-alist-common-entries
+      (values 1 nil)))
+  (let* ((rest-pc (+ (* (- (ldb %%arg-desc-max-args args-info)
+			   (ldb %%arg-desc-min-args args-info)) 2) 2))
+	 (rest-elem (and (ldb-test %%arg-desc-rest-arg args-info)
+		    (cl:assoc rest-pc variable-creation-alist)))
+	 (rest (cdr rest-elem))
+	 (zero-elem (cl:assoc 0 variable-creation-alist))
+	 (zero (cdr zero-elem))
+	 (common *common-variable-creation-alist-entries*))
+    (declare (sys:array-register common))
+    (loop for j from 1 below (cl:length common) do
+      (let ((spec (aref common j))
+	    (zero zero) (rest rest))
+	(when (and (loop for arg in (car spec) always (and zero (eq (pop zero) arg)))
+		   (or (null (cadr spec))
+		       (and rest (eq (pop rest) (cadr spec)))))
+	  (let ((alist variable-creation-alist))
+	    (when (car spec)
+	      (setq alist (if zero
+			      (cl:substitute `(0 . ,zero) zero-elem alist)
+			      (cl:remove zero-elem alist))))
+	    (when (cadr spec)
+	      (setq alist (if rest
+			      (cl:substitute `(,rest-pc . ,rest) rest-elem alist)
+			      (cl:remove rest-elem alist))))
+	    (return-from variable-creation-alist-common-entries
+	      (values (1+ j) alist))))))
+    (values nil variable-creation-alist)))
+
+#+IMach
+;; This is destructive.
+(defun merge-variable-creation-alist-common-entries
+       (variable-creation-alist args-info index)
+  (when (zerop index)
+    (return-from merge-variable-creation-alist-common-entries variable-creation-alist))
+  (destructuring-bind (zero rest) (aref *common-variable-creation-alist-entries* index)
+    (when zero
+      (let ((elem (cl:assoc 0 variable-creation-alist)))
+	(if elem
+	    (setf (cdr elem) (append zero (cdr elem)))
+	  ;; Preserve the alist ordering.
+	  (push (cons 0 zero) variable-creation-alist))))
+    (when rest
+      (let* ((rest-pc (+ (* (- (ldb %%arg-desc-max-args args-info)
+			       (ldb %%arg-desc-min-args args-info)) 2) 2))
+	     (elem (cl:assoc rest-pc variable-creation-alist)))
+	(if elem
+	    (push rest (cdr elem))
+	  ;; Preserve the alist ordering.
+	  (push (list rest-pc rest) variable-creation-alist)
+	  (setq variable-creation-alist (sortcar variable-creation-alist #'<)))))
+    variable-creation-alist))
+
+#+IMach
+;;--- Temporary kludge to support functions dumped before System 416.85.
+(defun canonicalize-variable-creation-alist (function &optional ignore)
+  (let* ((extra-info (cca-extra-info (compiled-function-cca function)))
+	 (vca (cl:assoc :variable-creation-alist (cdr extra-info))))
+    (when vca
+      (setf (cdr vca)
+	    (ilc:canonicalize-variable-creation-alist (cdr vca)))
+      (if (null (cdr vca))
+	  (cl:delete vca extra-info)
+	(loop for elem in (cdr vca) do
+	  (loop for sublist on (cdr elem) as var = (car sublist) do
+	    (when (symbolp var)
+	      (let* ((pname (get-pname var))
+		     (length (cl:length pname)))
+		(when (and (> length 16)
+			   (eql (aref pname 0) #/.)
+			   (%string= pname (- length 15) "-FUNCTION-CELL." 0 15))
+		  (setf (car sublist)
+			(let ((*package* (symbol-package var)))
+			  (list (cl:read-from-string pname t nil
+				  :start 1 :end (- length 15))))))))))))))
+		    
+
+;;; What package are local variables for this function going to be in?
+(defun function-spec-likely-package (function-spec &optional check-source-file)
+  (let ((function-spec function-spec))
+    (loop while (cl:consp function-spec)
+	  do (setq function-spec (cl:case (first function-spec)
+				   ((flavor:shared-combined)
+				    (first function-spec))
+				   ((flavor:method flavor:ncwhopper flavor:combined
+				     flavor:wrapper flavor:whopper flavor:defun-in-flavor)
+				    (third function-spec))
+				   ((:property)
+				    (let ((symbol (second function-spec)))
+				      (if (keywordp symbol)
+					  (third function-spec)
+					  symbol)))
+				   (otherwise (second function-spec)))))
+    (when (symbolp function-spec)
+      (let ((pkg (symbol-package function-spec)))
+	(when (and pkg (neq pkg pkg-keyword-package) (not (pkg-locked pkg)))
+	  (return-from function-spec-likely-package pkg)))))
+  (when check-source-file
+    ;; Only try this during special phase, which is alright, since we
+    ;; always remember the result then.
+    (let ((source-file (let ((function-spec function-spec)
+			     (type 'defun))
+			 (cl:loop
+			    (unless (validate-function-spec function-spec)
+			      (return nil))
+			    (let ((file (get-source-file-name function-spec type)))
+			      (when file
+				(return file)))
+			    (multiple-value (function-spec type)
+			      (ignore-errors	;Function spec system too messed up to get
+						;things right, even with the above check.
+				(function-parent function-spec type)))
+			    (when (null function-spec)
+			      (return nil))))))
+      (when source-file
+	(let ((pkg (send source-file :get :package)))
+	  (when pkg
+	    (setq pkg (cl:find-package pkg))
+	    (when pkg
+	      (return-from function-spec-likely-package
+		(values pkg t)))))))))
+
+;;; This could do intern-soft to see whether the symbol is visible in the package, but
+;;; since globalized or shared symbols aren't ever useless, there's no point is not
+;;; leaving them as symbols.
+(defun symbol-in-package-p (symbol pkg)
+  (and pkg (eq symbol (intern-local-soft (get-pname symbol) pkg))))
+
+(defvar *common-name-table* (make-array 256 :fill-pointer 0))
+(defvar *common-name-hash-table* (cl:make-hash-table :test #'cl:string=))
+(defvar *common-symbol-table* (make-array 256 :fill-pointer 0))
+(defvar *common-symbol-hash-table* (cl:make-hash-table))
+(defvar *common-macro-table* (make-array 63 :fill-pointer 0))
+(defvar *common-constant-table* (make-array 63 :fill-pointer 0))
+
+(defun build-common-name-tables-if-necessary ()
+  (declare (values macro-table constants-table package-table))
+  (let (macro-table constants-table package-table)
+    (when (zerop (fill-pointer *common-name-table*))
+      (with-progress-report ("building tables of common variable names")
+	(multiple-value (macro-table constants-table nil nil package-table)
+	  (build-common-name-tables))))
+    (values macro-table constants-table package-table)))
+
+(defun build-common-name-tables ()
+  (declare (values macro-table constants-table name-table symbol-table package-table))
+  (let ((macros (cl:make-hash-table :size 8000))
+	(constants (cl:make-hash-table :size 8000))
+	(names (cl:make-hash-table :test #'cl:string= :size 8000))
+	(symbols (cl:make-hash-table :size 8000))
+	(packages (cl:make-hash-table :size 1000)))
+    (map-compiled-functions t nil "building common name tables"
+      #'(lambda (function cca)
+	  (ignore cca)
+	  #+IMach (canonicalize-variable-creation-alist function)
+	  (let ((debug-info (debugging-info function)))
+	    (loop for elem in debug-info as (type . stuff) = elem do
+	      (cl:case type
+		(:macros-expanded
+		  (dolist (macro (car stuff))
+		    (incf (cl:gethash macro macros 0))))
+		(:constants-open-coded
+		  (loop for (constant . value) in (car stuff) do
+		    (ignore value)
+		    (incf (cl:gethash constant constants 0))))
+		#+3600
+		(:local-map
+		  (let ((pkg (let ((name (compiled-function-name function)))
+			       (multiple-value-bind (pkg special-p)
+				   (function-spec-likely-package name t)
+				 (when special-p
+				   (setf (gethash name packages) pkg))
+				 pkg))))
+		    (multiple-value (nil stuff)
+		      (local-map-initial-subsequence stuff))
+		    (loop for (slot . things) in stuff do
+		      (flet ((add-thing (thing)
+			       (if (and thing (symbol-in-package-p thing pkg))
+				   (incf (cl:gethash (get-pname thing) names 0))
+				   (incf (cl:gethash thing symbols 0)))))
+			(ignore slot)
+			(if (atom things)	;nil is that symbol, meaning unnamed.
+			    (add-thing things)
+			    (loop for (thing code) in things do (ignore code)
+								(add-thing thing)))))))
+		#+IMach
+		(:variable-creation-alist
+		  (let ((pkg (let ((name (compiled-function-name function)))
+			       (multiple-value-bind (pkg special-p)
+				   (function-spec-likely-package name t)
+				 (when special-p
+				   (setf (gethash name packages) pkg))
+				 pkg))))
+		    (multiple-value (nil stuff)
+		      (variable-creation-alist-common-entries stuff (%args-info function)))
+		    (flet ((add-thing (thing)
+			     (cl:typecase thing
+			       (cl:symbol)
+			       (cl:cons (setq thing (car thing)))
+			       (otherwise (return-from add-thing nil)))
+			     (when thing
+			       (if (symbol-in-package-p thing pkg)
+				   (incf (cl:gethash (get-pname thing) names 0))
+				   (incf (cl:gethash thing symbols 0))))))
+		      (loop for (nil . variables) in stuff do
+			(mapc #'add-thing variables))))))))))
+    (flet ((do-untable (table common-table common-hash-table threshold)
+	     ;; STACK-LET tends to overflow the data stack here.
+	     (using-system-temporary-area
+	       (let ((untable (make-array (* (send table :filled-elements) 2)
+					  :fill-pointer 0 :area system-temporary-area)))
+		 (maphash #'(lambda (name count)
+			      (when (> count threshold)
+				(cl:vector-push-extend count untable)
+				(cl:vector-push-extend name untable)))
+			  table)
+		 (sort-grouped-array untable 2 #'>)
+		 (setf (fill-pointer common-table) 0)
+		 (when common-hash-table
+		   (clrhash common-hash-table))
+		 (loop for j below (fill-pointer untable) by 2
+		       for i below (array-total-size common-table) do
+		   (when (cl:vector-push (aref untable (1+ j)) common-table)
+		     (when common-hash-table
+		       (setf (gethash (aref untable (1+ j)) common-hash-table) i))))))))
+      (do-untable macros *common-macro-table* nil 100)
+      (do-untable constants *common-constant-table* nil 100)
+      (do-untable names *common-name-table* *common-name-hash-table* 100)
+      (do-untable symbols *common-symbol-table* *common-symbol-hash-table* 100))
+    (dotimes (j (fill-pointer *common-constant-table*))
+      (setf (aref *common-constant-table* j)
+	    (cons (aref *common-constant-table* j)
+		  (symeval (aref *common-constant-table* j)))))
+    (values macros constants names symbols packages)))
+
+(defun common-symbol-encoding (variable pkg)
+  (let ((index (gethash variable *common-symbol-hash-table*)))
+    (when index
+      (return-from common-symbol-encoding index)))
+  (let ((string-p (and (not (boundp variable))
+		       (not (fboundp variable))
+		       (null (plist variable))
+		       (symbol-in-package-p variable pkg))))
+    (when string-p
+      (values (gethash (get-pname variable) *common-name-hash-table*) string-p))))
+
+(defmacro do-debug-info-strings ((string-var &key (sublist '.list.)
+						  (progress-note nil)
+						  (type ''cl:string))
+				 &body body)
+  `(do-debug-info-strings-internal #'(lambda (,sublist)
+				       (let ((,string-var (car ,sublist)))
+					 (when (cl:typep ,string-var ,type)
+					   . ,body)))
+				   ,progress-note))
+
+
+
+;;; Map over all compressed strings allowing them to be replaced with a further encoding.
+(defun do-debug-info-strings-internal (compressor progress-note)
+  (flet ((do-arglist (compressed-arglist)
+	   (loop for sublist = compressed-arglist then (cdr sublist)
+		 until (atom sublist) do
+	     (let ((entry (car sublist)))
+	       (if (atom entry)
+		   (funcall compressor sublist)
+		 (funcall compressor entry)
+		 (when (and (cl:consp (cdr entry))
+			    (cl:consp (cddr entry)))
+		   (funcall compressor (cddr entry))))))))
+    (map-compiled-functions t nil (format nil progress-note "compiled function")
+      #'(lambda (function cca)
+	  (when (function-same-as-function-from-name function)
+	    (destructuring-bind (name . debug-info) (cca-extra-info cca)
+	      (when (and (cl:consp name) (eq (first name) ':internal))
+		(let ((place (cdddr name)))
+		  (when place
+		    (funcall compressor place))))
+	      (let ((flags (pop debug-info)))
+		(when (cl:integerp flags)	;Compressed format.
+		  (when (ldb-test %%debug-info-local-name-package flags)
+		    (pop debug-info))		;Flush this string.
+		  (cl:mapl compressor debug-info)
+		  (let ((debug-info debug-info))
+		    (flet ((next-list ()
+			     (loop while debug-info
+				   as elem = (pop debug-info)
+				   when (cl:consp elem)
+				     return elem)))
+		      (when (ldb-test %%debug-info-complicated-local-map flags)
+			(let ((compressed-local-map (next-list)))
+			  (dolist (elem compressed-local-map)
+			    (if (atom (cdr elem))
+				(setf (cdr elem) (with-stack-list (place (cdr elem))
+						   (funcall compressor place)
+						   (car place)))
+				(dolist (elem (cdr elem))
+				  (funcall compressor elem)
+				  (let ((place (cddr elem)))
+				    (when (and place (stringp (car place)))
+				      (funcall compressor place))))))))
+		      (when (ldb-test %%debug-info-declared-arglist flags)
+			(do-arglist (next-list)))
+		      (when (ldb-test %%debug-info-values flags)
+			(cl:mapl compressor (next-list)))))))))))
+    (tv:dolist-noting-progress (generic *all-generic-function-names*
+					(format nil progress-note "generic function"))
+      (when (and (setq generic (flavor:find-generic-function generic nil))
+		 (flavor::generic-function-compressed-debugging-info generic))
+	(do-arglist (generic-function-arglist generic))
+	(let ((debug-info (generic-function-debugging-info generic)))
+	  (dolist (type '(arglist :method-arglist))
+	    (let ((elem (assq type debug-info)))
+	      (when elem
+		(do-arglist elem))))
+	  (let ((values (assq 'values debug-info)))
+	    (when values
+	      (cl:mapl compressor (cdr values)))))))))
+
+;;; Former symbols that have been unintered are encoded as their names.  These are encoded
+;;; as byte strings of 5-bit bytes, provided all the characters in the name are in the
+;;; restricted character set, which is true for most all symbols.  If the string is less than
+;;; seven characters long, the encoding is a word with the sign bit and 30 low bits of those
+;;; characters.  In this case, the 0th character, 0 is not permitted as it marks the end.
+;;; Otherwise, the string is a subsequence of a huge fixnum array, densely packed.
+;;; The pointer is 7 bits of length and 24 bits of byte position, with the sign bit off.
+;;; Often these 32-bit words are represented as single-floats to allow distinguishing from
+;;; other integers that can occupy the same position in the compressed information.
+(defvar *compressed-pname-array* nil)
+(cl:defparameter *compressed-pname-characters* "0123.-ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+(defvar *weak-debug-info-strings* nil)
+(defvar *strong-debug-info-strings* nil)
+
+(defun weaken-debug-info-strings ()
+  (using-system-temporary-area
+    (let ((table (cl:make-hash-table :area system-temporary-area :size 20000
+				     :mutating nil :ignore-gc t :locking nil))
+	  (index 0)
+	  (length 20000))
+      (setq *weak-debug-info-strings* (make-array length :area system-weakspace-area))
+      (do-debug-info-strings (string :sublist sublist
+				     :progress-note "Weakening ~A debug-info strings")
+	(when (and (< (cl:length string) 128)
+		   (loop for char being the array-elements of string
+			 always (%string-search-exact-char
+				  char *compressed-pname-characters* 0 32)))
+	  ;; String is compressible
+	  (let ((encoding (gethash string table)))
+	    (setf (car sublist)
+		  (or encoding
+		      (prog1 (setf (gethash string table)
+				   (%flonum index))
+			     (unless (< index length)
+			       (adjust-array-size *weak-debug-info-strings*
+						  (incf length 1000)))
+			     (setf (aref *weak-debug-info-strings* index) string)
+			     (incf index)))))))
+      (let* ((area reordering-list-area)
+	     (weak *weak-debug-info-strings*)
+	     (strong (make-array index :area area)))
+	(declare (array-register weak strong))
+	(loop for i below index do
+	  (setf (aref strong i)
+		(cl:copy-seq (aref weak i) area)))
+	(setq *strong-debug-info-strings* strong)))))
+
+(defun compress-remaining-debug-info-strings ()
+  (cl:assert (null *compressed-pname-array*))
+  (with-progress-report ("Compressing remaining debug-info strings")
+    (using-system-temporary-area
+      (let* ((array-length 1000)
+	     (array (cl:make-array array-length :element-type 'cl:fixnum
+						:area system-temporary-area))
+	     (index 0) (word-index 0) (word 0) (byte-position 0))
+	(do-debug-info-strings (string
+				 :sublist sublist
+				 :type 'cl:single-float
+				 :progress-note "Compressing remaining ~A debug-info strings")
+	  (unless (ldb-test (byte 8 24) (%fixnum string))	;Already expanded
+	    (let ((loc (aloc *weak-debug-info-strings* (%fixnum string))))
+	      (if (location-boundp loc)
+		  ;; string wasn't GC'd, store it back into debug-info.
+		  (setf (car sublist) (location-contents loc))
+		;; string was GC'd.  Store in new encoding.
+		(let ((real-string (aref *strong-debug-info-strings* (%fixnum string))))
+		  (unless (cl:typep real-string 'cl:single-float)
+		    (let ((length (cl:length real-string)))
+		      (cond ((and ( length 6)
+				  (or (zerop length)
+				      (not (eql (aref real-string 0)
+						(aref *compressed-pname-characters* 0)))))
+			     (let ((value (%logdpb 1 (byte 1 31) 0)))
+			       (loop for index below length
+				     for position downfrom (* (1- length) 5) by 5 do
+				 (setf (ldb (byte 5 position) value)
+				       (%string-search-exact-char (aref real-string index)
+					 *compressed-pname-characters* 0 32)))
+			       (setq real-string (%flonum value))
+			       (setf (aref *strong-debug-info-strings* (%fixnum string))
+				     real-string)))
+			    (t (dotimes (string-index length)
+				 (let ((byte (%string-search-exact-char
+					       (aref real-string string-index)
+					       *compressed-pname-characters* 0 32)))
+				   (setf (%logldb (byte (min 5 (- 32 byte-position))
+							byte-position)
+						  word)
+					 byte)
+				   (incf byte-position 5)
+				   (when ( byte-position 32)
+				     (unless (< word-index array-length)
+				       (setq array (adjust-array-size array
+						     (incf array-length 100))))
+				     (setf (aref array word-index) word)
+				     (incf word-index)
+				     (decf byte-position 32)
+				     (setq word (if (plusp byte-position)
+						    (ldb (byte byte-position
+							       (- 5 byte-position))
+							 byte)
+						    0)))))
+			       (setq real-string (%flonum (%logdpb length (byte 7 24) index)))
+			       (incf index length)
+			       (setf (aref *strong-debug-info-strings* (%fixnum string))
+				     real-string)))))
+		  (setf (car sublist) real-string))))))
+	(when (plusp byte-position)
+	  (unless (< word-index array-length)
+	    (setq array (adjust-array-size array (incf array-length))))
+	  (setf (aref array word-index) word)
+	  (incf word-index))
+	(setq array (adjust-array-size array word-index))
+	(setq *compressed-pname-array* (cl:copy-seq array debug-info-area))
+	(let ((weak *weak-debug-info-strings*)
+	      (strong *strong-debug-info-strings*))
+	  (declare (array-register strong))
+	  (tv:dotimes-noting-progress (i (array-length *strong-debug-info-strings*)
+					 "Verifying pname encoding")
+	    (let ((loc (aloc weak i)))
+	      (when (location-boundp loc)
+		(let ((encoded (location-contents loc)))
+		  (unless (string= (if (stringp encoded) encoded
+				       (expand-compressed-pname-string encoded))
+				   (aref strong i))
+		    (error "pname encoding error")))))))
+	(setq *weak-debug-info-strings* nil
+	      *strong-debug-info-strings* nil)
+	nil))))
+
+(defun expand-compressed-pname-string (compressed)
+  (cond (*strong-debug-info-strings*
+	 ;;--- Maybe this should just signal an error?
+	 (let ((loc (locf (aref *weak-debug-info-strings* compressed))))
+	   (if (location-boundp loc)
+	       (location-contents loc)
+	       (cl:copy-seq (aref *strong-debug-info-strings* compressed)
+			    working-storage-area))))
+	((minusp compressed)			;Short
+	 (stack-let ((result (cl:make-array 6 :element-type 'cl:string-char))
+		     (max 0))
+	   (loop for i below 6
+		 for position from 0 by 5
+		 as byte = (ldb (byte 5 position) compressed)
+		 do (setf (aref result i) (aref *compressed-pname-characters* byte))
+		 when (plusp byte) do (setq max (1+ i)))
+	   (string-nreverse (substring result 0 max))))
+	(t (let* ((length (%logldb (byte 7 24) compressed))
+		  (index (ldb (byte 24 0) compressed))
+		  (array *compressed-pname-array*)
+		  (result (cl:make-array length :element-type 'cl:string-char)))
+	     (declare (array-register array result))
+	     (multiple-value-bind (word-index byte-position)
+		 (floor (* index 5) 32)
+	       (let ((word (aref array word-index)))
+		 (dotimes (string-index length)
+		   (let ((byte (%logldb (byte (min 5 (- 32 byte-position)) byte-position)
+					word)))
+		     (incf byte-position 5)
+		     (when ( byte-position 32)
+		       (incf word-index)
+		       (decf byte-position 32)
+		       (when (or (plusp byte-position)
+				 (< string-index (1- length)))
+			 (setq word (aref array word-index))
+			 (when (plusp byte-position)
+			   (setf (ldb (byte byte-position (- 5 byte-position)) byte) word))))
+		     (setf (aref result string-index) (aref *compressed-pname-characters* byte))))))
+	     result))))
+
+#||
+(defun print-compressed-pnames ()
+  (multiple-value-bind (word-index byte-position length )
+      (values 0 0 cl:most-positive-fixnum)
+    (let* ((array *compressed-pname-array*)
+	   (word (aref array word-index)))
+      (dotimes (string-index length)
+	(when (zerop (mod string-index 80)) (tyo #\return))
+	(let ((byte (%logldb (byte (min 5 (- 32 byte-position)) byte-position) word)))
+	  (incf byte-position 5)
+	  (when ( byte-position 32)
+	    (incf word-index)
+	    (decf byte-position 32)
+	    (when (or (plusp byte-position)
+		      (< string-index (1- length)))
+	      (setq word (aref array word-index))
+	      (when (plusp byte-position)
+		(setf (ldb (byte byte-position (- 5 byte-position)) byte) word))))
+	  (tyo (aref *compressed-pname-characters* byte)))))))
+
+
+(defun check-pname-compression (entry-table)
+  (maphash #'(lambda (string compression)
+	       (unless (symbolp compression)
+		 (cl:assert (cl:string= (expand-compressed-pname-string compression) string))))
+	   entry-table))
+||#
+
+;;; Really this wants something stronger than let-subst that really substitutes in more
+;;; cases rather than punting to let.
+(defun simplify-inline-form (inline-form &optional hash-table)
+  (multiple-value-bind (lambda-list ovars nvars)
+      (standin-lambda-list (lt::inline-form-lambda-list inline-form))
+    (let ((form (lt:let-subst ovars nvars (lt::inline-form-form inline-form))))
+      (when hash-table
+	(multiple-value-bind (new-inline-form found-p)
+	    (with-stack-list (key lambda-list form)
+	      (gethash key hash-table))
+	  (when found-p
+	    (return-from simplify-inline-form
+	      new-inline-form))))
+      (setq inline-form (lt:construct-inline-form (lt::inline-form-name inline-form)
+						  lambda-list (list form)))
+      (when hash-table
+	(setf (gethash (list lambda-list form) hash-table) inline-form))))
+  inline-form)
+
+(defun standin-lambda-list (ll)
+  (declare (values lambda-list ovars nvars))
+  (let ((slot 0)
+	(result (copylist ll))
+	(rindex 0)
+	(ovars nil)
+	(nvars nil))
+    (labels ((next-slot (type)
+	       (cond ((eq type :rest) *rest-arg-name-standin*)
+		     ((and (zerop slot)
+			   (= (ldb %%arg-desc-max-args (args-info-from-lambda-list ll)) 1))
+		      *single-arg-name-standin*)
+		     (t
+		      (when ( slot (fill-pointer *sequential-arg-name-standins*))
+			(loop for n from (fill-pointer *sequential-arg-name-standins*) to slot
+			      do (array-push-extend
+				   *sequential-arg-name-standins*
+				   (make-symbol (format nil "ARG~D" (1+ n))))))
+		      (prog1 (aref *sequential-arg-name-standins* slot)
+			     (incf slot))))))
+      (lt:map-over-lambda-list ll
+			       #'(lambda (sublist type)
+				   (loop until (eq sublist (nthcdr rindex ll))
+					 do (incf rindex))
+				   (if (eq type :key)	;Name makes a difference.
+				       (when (listp (car sublist))
+					 (let ((init (cdar sublist)))
+					   (when init
+					     (setq init (cdar (setf (nth rindex result)
+								    (copylist (car sublist)))))
+					     (setf (first init)
+						   (lt:let-subst ovars nvars (first init))))))
+				       (let ((var (next-slot type)))
+					 (cond ((atom (car sublist))
+						(setf (nth rindex result) var)
+						(push (car sublist) ovars))
+					       (t
+						(let ((init (copylist (cdr (car sublist)))))
+						  (when init
+						    (setf (first init)
+							  (lt:let-subst ovars nvars
+									(first init))))
+						  (setf (nth rindex result)
+							(cons var init))) 
+						(push (caar sublist) ovars)))
+					 (push var nvars))))))
+    (values result (nreverse ovars) (nreverse nvars))))
+
+;;; Unfortunately, there don't seem to be any.  Wired declarations are
+;;; needed by metering, combined method derivation is still checked,
+;;; even though redundant, and who-calls looks at the mapping table
+;;; stuff mainly for use by the bin loader.
+(cl:defparameter *debug-info-types-to-discard* ())
+
+(defun compress-all-debug-info (&optional retain-macros macro-table constants-table
+				package-table)
+  (with-progress-report ("compressing debugging info")
+    (map-compiled-functions t nil "compressing debugging info"
+      #'(lambda (function cca)
+	  (let ((extra-info (cca-extra-info cca)))
+	    (when (cl:consp (second extra-info))	;Not already compressed
+	      (setq extra-info (compress-extra-info function extra-info
+						    retain-macros macro-table
+						    constants-table package-table))
+	      (setf (cca-extra-info cca) extra-info)))))
+    (dolist (generic *all-generic-function-names*)
+      (when (setq generic (flavor:find-generic-function generic nil))
+	(compress-generic-function-debugging-info generic)))))
+
+(defun compress-extra-info (function &optional (extra-info
+						 (cca-extra-info
+						   (compiled-function-cca function)))
+					       (retain-macros t)
+					       (macro-count-hash-table nil)
+					       (constants-count-hash-table nil)
+					       (special-package-hash-table nil))
+  (scl:destructuring-bind (name . debug-info) extra-info
+    (stack-let ((data-array (make-array 300 :fill-pointer 0))
+		(types-processed (make-array 100 :fill-pointer 0))
+		(info-mask 0)
+		(arglist nil)
+		(local-package nil))
+      (macrolet ((processing-types (vars-and-types &body body)
+		   `(let ,(loop for (var type) in vars-and-types
+				collect `(,var (assq ,type debug-info)))
+		      (block skip-processing-type
+			(macrolet ((skip-processing-type ()
+				     `(return-from skip-processing-type nil)))
+			  . ,body))))
+		 #||	;Compiler cannot compile this one.
+		 (processing-type ((variable type-name) &body body)
+		   (once-only (type-name)
+		     `(processing-types ((,variable ,type-name))
+			(when ,variable
+			  (progn . ,body)
+			  (type-processed ,type-name)))))
+		 ||#
+		 (processing-type ((variable type-name) &body body)
+		   (once-only (type-name)
+		     `(let ((,variable (assq ,type-name debug-info)))
+			(block skip-processing-type
+			  (macrolet ((skip-processing-type ()
+				       `(return-from skip-processing-type nil)))
+			    (when ,variable
+			      (progn . ,body)
+			      (type-processed ,type-name)))))))
+		 )
+	(labels ((type-processed (type-name)
+		   (cl:vector-push-extend type-name types-processed))
+		 (add-data (data)
+		   (cl:vector-push-extend data data-array))
+		 (set-byte (byte value)
+		   (unless (zerop (lsh info-mask (- (byte-position byte))))
+		     (cl:cerror "Try to go on anyway"
+				"Trying to set a bit before one already set.
+This probably means something is screwed up."))
+		   (setf (%logldb byte info-mask) value))
+		 (set-bit (bit)
+		   (set-byte bit 1))
+		 (compress-symbol-number-sequence (type-name bit local-p singleton-p)
+		   (processing-type (sequence type-name)
+		     (loop for ((variable . positions) . more-sequence) on (cdr sequence) do
+		       (multiple-value-bind (index string-p)
+			   (and local-p (common-symbol-encoding variable local-package))
+			 ;; First word is either packed
+			 ;;   (16) position (8) index (1) string-p (1) end-of-sequence
+			 ;; or variable name or symbol.  When not packed, second word is
+			 ;; position if singleton, else succeeding words are byte string
+			 ;; with #o377 being end of all, #o376 end of this subsequence
+			 ;;  and #o375 prefixing large numbers.
+			 (if (and index (null (cdr positions)) (< (car positions) 1_16))
+			     (add-data (%logdpb (if more-sequence 0 1)
+						    (byte 1 31)
+						    (dpb (if string-p 1 0)
+							 (byte 1 30)
+							 (dpb index (byte 8 16)
+							      (car positions)))))
+			   (add-data (compress-encoded-symbol variable index string-p nil))
+			   (cond (singleton-p
+				  (cl:assert (null (cdr positions)))
+				  (add-data (%logdpb (if more-sequence 0 1)
+							 (byte 1 31)
+							 (first positions))))
+				 (t
+				  (let ((byte-pos 0)
+					(word 0))
+				    (flet ((add-byte (byte)
+					     (setf (%logldb (byte 8 byte-pos) word) byte)
+					     (incf byte-pos 8)
+					     (when ( byte-pos 32)
+					       (add-data word)
+					       (setq word 0)
+					       (decf byte-pos 32)))
+					   (force-out ()
+					     (when (plusp byte-pos)
+					       (add-data word))))
+				      (dolist (position positions)
+					(loop while ( position #o375)
+					      do (add-byte #o375)
+						 (decf position #o375))
+					(add-byte position))
+				      (add-byte (if more-sequence #o376 #o377))
+				      (force-out))))))))
+		     (set-bit bit)))
+		 )
+	  (processing-types ((local-map #+3600 :local-map #+IMach :variable-creation-alist)
+			     (declared-arglist 'arglist)
+			     (real-arglist 'real-arglist))
+	    (block local-map
+	      (multiple-value-bind (common-map more-local-map)
+		  (and local-map
+		       #+3600  (local-map-initial-subsequence (cdr local-map))
+		       #+IMach (variable-creation-alist-common-entries
+				 (cdr local-map) (%args-info function)))
+		(when common-map
+		  (set-byte %%debug-info-common-local-map common-map))
+		(when (or more-local-map
+			  (assq 'values debug-info)
+			  (assq :lexical-variable-instructions debug-info)
+			  (assq :lexical-map debug-info)
+			  (assq :captive-map debug-info)
+			  (and (cl:consp name) (eq (first name) ':internal) (cdddr name)
+			       (symbolp (fourth name))))
+		  ;; If we'll need a package for local symbols, compute it and maybe remember.
+		  (setq local-package (function-spec-likely-package name))
+		  (when (and (null local-package) special-package-hash-table)
+		    (setq local-package (gethash name special-package-hash-table))
+		    (when local-package
+		      (set-bit %%debug-info-local-name-package)
+		      (add-data (pkg-name local-package)))))
+		(when more-local-map
+		  #+3600
+		  (let ((current-slot 0)
+			(start-index (fill-pointer data-array))
+			(start-of-last-entry nil))
+		    ;; Entries are (20) pcs (8) index (3) slot-increment (1) string-p. 
+		    ;; If slot-increment is 6 or 7, then index is really the increment
+		    ;; and next word has the variable name or string.  In the 7 case, a
+		    ;; lexical function name follows.
+		    (dolist (elem more-local-map)
+		      (labels ((local-map-too-hairy ()
+				 (setf (ldb %%debug-info-common-local-map info-mask) 0)
+				 (setf (fill-pointer data-array) start-index)
+				 (set-bit %%debug-info-complicated-local-map)
+				 (let ((compressed-local-map (copytree (cdr local-map))))
+				   (dolist (elem compressed-local-map)
+				     (if (atom (cdr elem))
+					 (setf (cdr elem) (compress-symbol-typed
+							    (cdr elem)
+							    local-package))
+					 (dolist (elem (cdr elem))
+					   (setf (car elem) (compress-symbol-typed
+							      (car elem)
+							      local-package))
+					   (when (and (cddr elem) (symbolp (third elem)))
+					     (setf (third elem)
+						   (compress-symbol-typed (third elem)
+									  local-package
+									  nil))))))
+				   (add-data compressed-local-map))
+				 (return-from local-map))
+			       (add-entry (variable slot &optional (low-pc 0) high-pc
+								   lexical-function-name
+							 &aux (pcs low-pc))
+				 (when ( low-pc 1_10)
+				   (local-map-too-hairy))
+				 (when high-pc
+				   (when ( high-pc 1_10)
+				     (local-map-too-hairy))
+				   ;;+++ Maybe should encode delta-pc instead of high-pc?
+				   (setf (ldb (byte 10 10) pcs) high-pc))
+				 (multiple-value-bind (index string-p)
+				     (common-symbol-encoding variable local-package)
+				   (let* ((delta (- slot current-slot))
+					  (slot-class delta))
+				     (when (or (minusp delta) ( delta 256))
+				       (local-map-too-hairy))
+				     (when (or (null index) lexical-function-name
+					       (> slot-class 1))
+				       (setq slot-class (if lexical-function-name 3 2)
+					     index delta))
+				     (setq start-of-last-entry (fill-pointer data-array))
+				     (add-data (dpb (if string-p 1 0)
+						    (byte 1 30)
+						    (dpb slot-class (byte 2 28)
+							 (dpb index (byte 8 20) pcs))))
+				     (when ( slot-class 2)
+				       (add-data (compress-encoded-symbol
+						   variable nil string-p nil)))
+				     (when (= slot-class 3)
+				       (multiple-value-bind (index string-p)
+					   (common-symbol-encoding lexical-function-name
+								   local-package)
+					 (add-data
+					   (compress-encoded-symbol
+					     lexical-function-name index string-p nil))))
+				     (setq current-slot slot)))))
+			(scl:destructuring-bind (slot . variables) elem
+			  (if (atom variables)
+			      (add-entry variables slot)
+			      (dolist (elem variables)
+				(multiple-value-bind (variable low-pc high-pc function-name)
+				    (l-lisp-compiler:decode-one-local-description elem)
+				  (add-entry variable slot low-pc high-pc function-name)))))))
+		    (setf (%logldb (byte 1 31) (aref data-array start-of-last-entry)) 1)
+		    (set-bit %%debug-info-more-local-map))
+
+;; Format for compressed :VARIABLE-CREATION-ALIST
+;; Each entry takes 18 bits.  Two entries are compressed into one word using
+;; 32 bits of immediate data type and 4 bits of tag (the low bits of dtp-packed-instruction).
+;; You tell the extent of the encoded information by looking for the first
+;; word which is not dtp-packed-instruction-*.  All variables or strings
+;; referenced by the packed information follow it in one block, not interspersed.
+;; 
+;; An entry looks like
+;;   1 bit format
+;;      0      13 bits DPC,   4 bits dispatch
+;;      1      7 bits DPC,    1 bit string-p, 1 bit function-p, 8 bits Index
+;;   Dispatch is
+;;      0     End of encoded information at halfword boundary.  DPC is also zero in this case.
+;;      1-12  Numeric entry
+;;      13    Just increment PC
+;;      14    Variable follows
+;;      15    Function follows
+
+		  #+IMach
+		  (stack-let ((last-pc 0)
+			      (last-entry nil)
+			      (data (make-array 100 :fill-pointer 0))
+			      (start-index (fill-pointer data-array)))
+		    (labels ((too-hairy ()
+			       (setf (ldb %%debug-info-common-local-map info-mask) 0)
+			       (setf (fill-pointer data-array) start-index)
+			       (set-bit %%debug-info-complicated-local-map)
+			       (let ((compressed-local-map (copytree (cdr local-map))))
+				 (dolist (entry compressed-local-map)
+				   (loop for sublist on (cdr entry)
+					 as elem = (car sublist) do
+				     (cl:etypecase elem
+				       (cl:symbol
+					(setf (car sublist)
+					      (compress-symbol-typed elem local-package)))
+				       (cl:cons
+					(setf (car sublist)
+					      (compress-symbol-typed
+						(car elem) local-package)))
+				       (cl:fixnum
+					 (setf (car sublist) (%small-ratio elem))))))
+				 (add-data compressed-local-map))
+			       (return-from local-map))
+			     (add-entry-internal (entry)
+			       (if (null last-entry)
+				   (setq last-entry entry)
+				 (add-data (%set-tag (%logdpb entry (byte 14 18) last-entry)
+						     (logior (ldb (byte 4 14) entry)
+							     dtp-packed-instruction-60)))
+				 (setq last-entry nil)))
+			     (add-entry (dpc name)
+			       ;; Check range of DPC
+			       (when ( dpc 1_13) (too-hairy))	;Shouldn't ever happen.
+			       (let ((functionp (when (cl:consp name)
+						  (setq name (car name))
+						  t)))
+				 (cond ((fixnump name)
+					(unless ( 1 name 12) (too-hairy))
+					(add-entry-internal
+					  (dpb dpc (byte 13 4) name)))
+				       ((symbolp name)
+					(multiple-value-bind (index string-p)
+					    (common-symbol-encoding name local-package)
+					  (cond ((and (< dpc 1_7) index)
+						 (add-entry-internal
+						   (dpbs 1 (byte 1 17)
+							 dpc (byte 7 10)
+							 (if string-p 1 0) (byte 1 9)
+							 (if functionp 1 0) (byte 1 8)
+							 index)))
+						((null index)
+						 (add-entry-internal
+						   (dpb dpc (byte 13 4) (if functionp 15 14)))
+						 (cl:vector-push-extend
+						   (compress-encoded-symbol name nil string-p)
+						   data))
+						(t (add-entry-internal
+						     (dpb dpc (byte 13 4) 13))
+						   (add-entry-internal
+						     (dpbs 1 (byte 1 17)
+							   (if string-p 1 0) (byte 1 9)
+							   (if functionp 1 0) (byte 1 8)
+							   index))))))
+				       (t (too-hairy))))))
+		      (dolist (elem more-local-map)
+			(scl:destructuring-bind (pc . variables) elem
+			  (loop for variable in variables do
+			    (add-entry (- pc last-pc) variable)
+			    (setq last-pc pc))))
+		      (when last-entry (add-entry-internal 0))
+		      (cl:map nil #'add-data data)
+		      (set-bit %%debug-info-more-local-map)))
+		  )))
+	    (type-processed #+3600 :local-map #+IMach :variable-creation-alist)
+	    
+	    (setq arglist (or real-arglist declared-arglist))
+	    (let ((simple-p (and arglist
+				 (function-has-simple-arglist-p function (cdr local-map)
+								arglist))))
+	      (when (or real-arglist (and arglist (not simple-p)))
+		(set-bit %%debug-info-declared-arglist)
+		;; The only reason for encoding the arglist is to free up more useless
+		;; symbols.  We can only do this for things known to be variables, since
+		;; value initializations might well be strings.
+		(add-data (compress-arglist (cdr declared-arglist) local-package))
+		(type-processed 'arglist))
+	      (when simple-p
+		(set-bit %%debug-info-simple-arglist)
+		(type-processed (if real-arglist 'real-arglist 'arglist)))
+	      (when (and real-arglist (not simple-p))
+		;; Will not be known at load time.
+		(setq arglist nil))))
+  
+	  (processing-type (values 'values)
+	    (add-data (compress-symbol-list (cdr values) local-package))
+	    (set-bit %%debug-info-values))
+
+	  (processing-type (macros :macros-expanded)
+	    (when retain-macros
+	      (stack-let ((more-macros (make-array (length (cadr macros)) :fill-pointer 0))
+			  (first-word 0)
+			  (second-word 0))
+		(dolist (macro (cadr macros))
+		  (let ((index (cl:position macro *common-macro-table*)))
+		    (if index
+			(if ( index 31)
+			    (setf (%logldb (byte 1 (- index 31)) second-word) 1)
+			    (setf (%logldb (byte 1 index) first-word) 1))
+			(cl:vector-push-extend macro more-macros))))
+		(unless (and (zerop first-word) (zerop second-word))
+		  (set-bit %%debug-info-common-macros-expanded)
+		  (if (zerop second-word)
+		      (add-data first-word)
+		     (setf (%logldb (byte 1 31) first-word) 1)
+		     (add-data first-word)
+		     (add-data second-word)))
+		(unless (zerop (fill-pointer more-macros))
+		  (when macro-count-hash-table
+		    ;; Put common macros near the end so that maybe they can share some more.
+		    (cl:sort more-macros #'< :key #'(lambda (macro)
+						      (gethash macro macro-count-hash-table))))
+		  (set-bit %%debug-info-more-macros-expanded)
+		  (add-data (let ((default-cons-area debug-info-area))
+			      (cl:coerce more-macros 'list)))))))
+  
+	  (compress-symbol-number-sequence :instance-variable-instructions
+					   %%debug-info-instance-variable-instructions
+					   nil nil)
+  
+	  (processing-type (function-parent 'function-parent)
+	    (let ((type (and arglist
+			     (function-simple-function-parent-type name (cdr arglist)
+								   function-parent))))
+	      (when (null type)
+		(skip-processing-type))
+	      (set-byte %%debug-info-simple-function-parent type)))
+  
+	  (processing-type (constants :constants-open-coded)
+	    (when retain-macros
+	      (stack-let ((more-constants (make-array (length (cadr constants))
+						      :fill-pointer 0))
+			  (first-word 0)
+			  (second-word 0))
+		(dolist (elem (cadr constants))
+		  (scl:destructuring-bind (constant . value) elem
+		    (let ((index (cl:position constant *common-constant-table* :key #'car)))
+		      (if (and index (eq value (cdr (aref *common-constant-table* index))))
+			  (if ( index 31)
+			      (setf (%logldb (byte 1 (- index 31)) second-word) 1)
+			      (setf (%logldb (byte 1 index) first-word) 1))
+			  (cl:vector-push-extend elem more-constants)))))
+		(unless (and (zerop first-word) (zerop second-word))
+		  (set-bit %%debug-info-common-constants)
+		  (if (zerop second-word)
+		      (add-data first-word)
+		     (setf (%logldb (byte 1 31) first-word) 1)
+		     (add-data first-word)
+		     (add-data second-word)))
+		(unless (zerop (fill-pointer more-constants))
+		  (when constants-count-hash-table
+		    (cl:sort more-constants #'<
+			     :key #'(lambda (elem)
+				      (gethash (car elem) constants-count-hash-table))))
+		  (set-bit %%debug-info-more-constants)
+		  (add-data (let ((default-cons-area debug-info-area))
+			      (cl:coerce more-constants 'list)))))))
+	    
+	  (compress-symbol-number-sequence :lexical-variable-instructions
+					   %%debug-info-lexical-variable-instructions
+					   t nil)
+	  (processing-type (internal-functions #+3600  :internal-function-offsets
+					       #+IMach :internal-functions)
+	    (if (function-has-simple-internal-function-offsets-p function
+								 (cdr internal-functions))
+		(set-bit %%debug-info-simple-internal-function-offsets)
+		(skip-processing-type)))
+  
+	  (compress-symbol-number-sequence :lexical-map %%debug-info-lexical-map t t)
+	  (compress-symbol-number-sequence :captive-map %%debug-info-captive-map t t)
+  
+	  (let ((more-p nil))
+	    (dolist (elem debug-info)
+	      (let ((type (car elem)))
+		(unless (or (cl:find type types-processed)
+			    (cl:member type *debug-info-types-to-discard*))
+		  (add-data elem)
+		  (type-processed type)
+		  (setq more-p t))))
+	    (when more-p
+	      (set-bit %%debug-info-more-debug-info)))
+
+	  (when (and (cl:consp name) (eq (first name) ':internal) (cdddr name)
+		     (symbolp (fourth name)))
+	    (setq name (copylist name debug-info-area))
+	    (setf (fourth name) (compress-symbol-typed (fourth name) local-package)))))
+
+      (let ((result (cl:make-list (+ (fill-pointer data-array) 2)
+				  :area debug-info-area)))
+	(setf (nth 0 result) name)
+	(setf (nth 1 result) info-mask)
+	(cl:replace result data-array :start1 2)
+	result))))
+
+(defun generic-function-likely-package (generic-function)
+  (or (function-spec-likely-package (generic-function-name generic-function))
+      (function-spec-likely-package
+	(first (last (generic-function-flavors generic-function))))))
+
+(defun compress-generic-function-debugging-info (generic-function)
+  (unless (flavor::generic-function-compressed-debugging-info generic-function)
+    (let ((local-package (generic-function-likely-package generic-function))
+	  (debug-info (copylist (generic-function-debugging-info generic-function)
+				debug-info-area)))
+      (when local-package
+	(setf (generic-function-arglist generic-function)
+	      (compress-arglist (generic-function-arglist generic-function) local-package))
+	(let ((values (assq 'values debug-info)))
+	  (when values
+	    (cl:nsubstitute (cons 'values (compress-symbol-list (cdr values) local-package))
+			    values debug-info)))
+	(dolist (type '(arglist :method-arglist))
+	  (let ((elem (assq type debug-info)))
+	    (when elem
+	      (cl:nsubstitute (cons type (compress-arglist (cdr elem) local-package))
+			      elem debug-info))))
+	(setf (generic-function-debugging-info generic-function) debug-info)
+	(setf (flavor::generic-function-compressed-debugging-info generic-function) t)))))
+
+(defun compress-arglist (arglist local-package)
+  (let ((compressed-arglist (copytree arglist debug-info-area)))
+    (loop for sublist = compressed-arglist then (cdr sublist)
+	  until (atom sublist) do
+      (let ((entry (car sublist)))
+	(if (atom entry)
+	    (compress-symbol-sublist sublist local-package)
+	  (compress-symbol-sublist entry local-package)
+	  (when (and (cl:consp (cdr entry))
+		     (cl:consp (cddr entry)))
+	    (compress-symbol-sublist (cddr entry) local-package)))))
+    compressed-arglist))
+
+(defun compress-symbol-list (list local-package)
+  (let ((compressed-list (copylist list debug-info-area)))
+    (loop for sublist = compressed-list then (cdr sublist)
+	  until (atom sublist) do
+      (compress-symbol-sublist sublist local-package))
+    compressed-list))
+
+(defun compress-symbol-sublist (sublist local-package)
+  (when (symbolp (car sublist))
+    (setf (car sublist) (compress-symbol-typed (car sublist) local-package))))
+
+(defun compress-symbol-typed (symbol local-package &optional (integer-okay t))
+  (multiple-value-bind (index string-p)
+      (common-symbol-encoding symbol local-package)
+    (compress-encoded-symbol symbol index string-p integer-okay)))
+
+(defun compress-encoded-symbol (symbol index string-p &optional (integer-okay t))
+  (cond ((and index integer-okay) (%logdpb (if string-p 1 0) (byte 1 31) index))
+	(string-p (get-pname symbol))
+	(t symbol)))
+
+
+(defun expand-extra-info (function extra-info)
+  (stack-let* ((list-remaining extra-info)
+	       (name (pop list-remaining))
+	       (info-word (pop list-remaining))
+	       (arglist nil) (local-map 'unknown) (local-package)
+	       (result (make-array 100 :fill-pointer 0)))
+    (labels ((next-data ()
+	       (cl:assert (not (null list-remaining)))
+	       (pop list-remaining))
+	     (get-byte (byte)
+	       (when (cl:logtest info-word (1- (ash 1 (byte-position byte))))
+		 (cl:cerror "Try to go on"
+			    "Trying to test a bit above an unhandled bit.
+This probably means something is screwed up."))
+	       (prog1 (%logldb byte info-word)
+		      (setf (%logldb byte info-word) 0)))
+	     (test-bit (bit)
+	       (not (zerop (get-byte bit))))
+	     (add-type (elem)
+	       (cl:vector-push-extend elem result))
+	     (expand-symbol-number-sequence (bit type singleton-p)
+	       (when (test-bit bit)
+		 (stack-let ((sequence (make-array 10 :fill-pointer 0))
+			     (at-end-p nil))
+		   (cl:loop
+		     (stack-let ((variable nil)
+				 (positions (make-array 10 :fill-pointer 0)))
+		       (let ((first-word (next-data)))
+			 (cl:etypecase first-word
+			   (cl:integer (setq variable (if (ldb-test (byte 1 30) first-word)
+							  (expand-reintern-symbol
+							    (aref *common-name-table*
+								  (%logldb (byte 8 16)
+									   first-word))
+							    local-package)
+							  (aref *common-symbol-table*
+								(%logldb (byte 8 16)
+									 first-word))))
+				       (when (ldb-test (byte 1 31) first-word)
+					 (setq at-end-p t))
+				       (cl:vector-push-extend (%logldb (byte 16 0) first-word)
+							      positions))
+			   (cl:float (setq variable (expand-reintern-symbol
+						      (expand-compressed-pname-string
+							(%fixnum first-word))
+						      local-package)))
+			   (symbol (setq variable first-word))
+			   (string (setq variable (expand-reintern-symbol first-word
+									  local-package)))))
+		       (unless (plusp (fill-pointer positions))
+			 (if singleton-p
+			     (let ((position (next-data)))
+			       (when (ldb-test (byte 1 31) position)
+				 (setf (%logldb (byte 1 31) position) 0)
+				 (setq at-end-p t))
+			       (cl:vector-push-extend position positions))
+			     (let ((byte-pos 32)
+				   (word 0))
+			       (flet ((next-byte ()
+					(when ( byte-pos 32)
+					  (setq word (next-data))
+					  (decf byte-pos 32))
+					(prog1 (%logldb (byte 8 byte-pos) word)
+					       (incf byte-pos 8))))
+				 (loop as byte = (next-byte)
+				       with pos = 0
+				       do (selector byte =
+					    (#o377 (setq at-end-p t)
+						   (return))
+					    (#o376 (return))
+					    (#o375 (incf pos byte))
+					    (otherwise
+					      (incf pos byte)
+					      (cl:vector-push-extend pos positions)
+					      (setq pos 0))))))))
+		       (cl:vector-push-extend (cons variable (cl:coerce positions 'list))
+					      sequence))
+		     (when at-end-p
+		       (return)))
+		   (add-type `(,type . ,(cl:coerce sequence 'list))))))
+	     )
+
+      (let ((common-local-map (get-byte %%debug-info-common-local-map)))
+	#+3600
+	(unless (zerop common-local-map)
+	  (setq local-map nil)
+	  (loop for variable in (aref *function-common-local-map-initial-subsequences*
+				      (1- common-local-map))
+		for i from 0
+		do (push (cons i variable) local-map)))
+	(when (test-bit %%debug-info-local-name-package)
+	  (setq local-package (cl:find-package (next-data))))
+	(unless local-package
+	  (setq local-package (function-spec-likely-package name)))
+	(when (test-bit %%debug-info-more-local-map)
+	  (when (eq local-map 'unknown)
+	    (setq local-map nil))
+	  #+3600
+	  (let ((slot-no 0))
+	    (cl:loop
+	      (let* ((first-word (next-data))
+		     (pcs (ldb (byte 20 0) first-word))
+		     (index (ldb (byte 8 20) first-word))
+		     (slot-class (ldb (byte 2 28) first-word))
+		     (string-p (ldb-test (byte 1 30) first-word))
+		     (at-end-p (ldb-test (byte 1 31) first-word))
+		     (variable nil)
+		     (lexical-function-name))
+		(if (< slot-class 2)
+		    (setq variable (aref (if string-p *common-name-table* *common-symbol-table*)
+					 index))
+		  (setq variable (next-data))
+		  (when (= slot-class 3)
+		    (setq lexical-function-name (expand-typed-symbol (next-data) local-package)))
+		  (setq slot-class index))
+		(incf slot-no slot-class)
+		(let ((lo (ldb (byte 10 0) pcs))
+		      (hi (ldb (byte 10 10) pcs)))
+		  (setq pcs (dpb hi (byte 16 16) lo)))
+		(when string-p
+		  (when (floatp variable)
+		    (setq variable (expand-compressed-pname-string (%fixnum variable))))
+		  (setq variable (expand-reintern-symbol variable local-package)))
+		(let ((slot-entry (assq slot-no local-map)))
+		  (when (null slot-entry)
+		    (setq slot-entry (ncons slot-no))
+		    (push slot-entry local-map))
+		  (if (zerop pcs)
+		      (setf (cdr slot-entry) variable)
+		      (push (if lexical-function-name
+				(list variable pcs lexical-function-name)
+				(list variable pcs))
+			    (cdr slot-entry))))
+		(when at-end-p
+		  (return)))))
+	  #+IMach
+	  (let ((last-pc 0) (vars nil))
+	    (labels ((emit ()
+		       (when vars
+			 (push `(,last-pc . ,(nreverse vars)) local-map)
+			 (setq vars nil)))
+		     (process-entry (entry)
+		       (unless (zerop entry)
+			 (if (ldb-test (byte 1 17) entry)
+			     (let ((dpc (ldb (byte 7 10) entry)))
+			       (when (plusp dpc) (emit))
+			       (incf last-pc dpc)
+			       (let ((variable (if (ldb-test (byte 1 9) entry)
+						   (expand-typed-symbol
+						     (aref *common-name-table*
+							   (ldb (byte 8 0) entry))
+						     local-package)
+						   (aref *common-symbol-table*
+							 (ldb (byte 8 0) entry)))))
+				 (if (ldb-test (byte 1 8) entry)
+				     (setq variable (list variable)))
+				 (push variable vars)))
+			     (let ((dpc (ldb (byte 13 4) entry)))
+			       (when (plusp dpc) (emit))
+			       (incf last-pc dpc)
+			       (selector (ldb (byte 4 0) entry) =
+				 (13)
+				 (14 (push (expand-typed-symbol (next-data) local-package) vars))
+				 (15 (push (list (expand-typed-symbol (next-data) local-package)) vars))
+				 (otherwise (push (ldb (byte 4 0) entry) vars))))))))
+	      (stack-let ((temp (make-array 100 :fill-pointer 0)))
+		(loop while list-remaining
+		      while ( (%tag (car list-remaining)) dtp-packed-instruction-60)
+		      do (cl:vector-push-extend (pop list-remaining) temp))
+		(loop for elem being the array-elements of temp do
+		  (process-entry (ldb (byte 18 0) (%fixnum elem)))
+		  (process-entry (dpb (%tag elem)
+				      (byte 4 14)
+				      (ldb (byte 14 18) (%fixnum elem)))))
+		(emit)
+		(setq local-map (nreverse local-map))))))
+	#+IMach
+	(unless (zerop common-local-map)
+	  (when (eq local-map 'unknown)
+	    (setq local-map nil))
+	  (setq local-map (merge-variable-creation-alist-common-entries
+			    local-map (%args-info function) (1- common-local-map)))))
+      (cond ((test-bit %%debug-info-complicated-local-map)
+	     (setq local-map (copytree (next-data)))
+	     #+3600
+	     (dolist (elem local-map)
+	       (if (atom (cdr elem))
+		   (setf (cdr elem) (expand-typed-symbol (cdr elem) local-package))
+		   (dolist (elem (cdr elem))
+		     (expand-symbol-sublist elem local-package)
+		     ;; Careful about old style pc encoding, which uses integers in the 3rd.
+		     (when (and (cddr elem)
+				(cl:typep (third elem) '(or string cl:float)))
+		       (expand-symbol-sublist (cddr elem) local-package)))))
+	     #+3600
+	     (add-type `(:local-map . ,local-map))
+	     #+IMach
+	     (dolist (elem local-map)
+	       (loop for sublist on (cdr elem) as entry = (car sublist) do
+		 (cl:typecase entry
+		   (cl:cons
+		     (setf (car entry) (expand-typed-symbol (car entry) local-package)))
+		   (small-ratio
+		     (setf (car sublist) (%fixnum entry)))
+		   (otherwise
+		     (setf (car sublist) (expand-typed-symbol entry local-package))))))
+	     #+IMach
+	     (add-type `(:variable-creation-alist . ,local-map)))
+	    ((eq local-map 'unknown)
+	     (setq local-map nil))
+	    (t
+	     #+3600 (dolist (entry local-map)
+		      (unless (atom (cdr entry))
+			(setf (cdr entry) (nreverse (cdr entry)))))
+	     #+3600  (setq local-map (nreverse local-map))
+	     #+3600  (add-type `(:local-map . ,local-map))
+	     #+IMach (add-type `(:variable-creation-alist . ,local-map))))
+
+      (when (test-bit %%debug-info-declared-arglist)
+	(setq arglist (expand-arglist (next-data) local-package))
+	(setq arglist `(arglist . ,arglist))
+	(add-type arglist))
+      (when (test-bit %%debug-info-simple-arglist)
+	(setq arglist `(,(if arglist 'real-arglist 'arglist)
+			. ,(function-simple-arglist function local-map)))
+	(add-type arglist))
+      (setq arglist (cdr arglist))
+
+      (when (test-bit %%debug-info-values)
+	(add-type `(values . ,(expand-symbol-list (next-data) local-package))))
+
+      (let ((macros nil))
+	(when (test-bit %%debug-info-common-macros-expanded)
+	  (let ((first-macro-word (next-data))
+		(second-macro-word 0))
+	    (when (minusp first-macro-word)
+	      (setq second-macro-word (next-data)
+		    first-macro-word (ldb (byte 31 0) first-macro-word)))
+	    (stack-let ((common-macros (make-array (+ (cl:logcount first-macro-word)
+						      (cl:logcount second-macro-word))
+						   :fill-pointer 0)))
+	      (dotimes (i 31)
+		(when (ldb-test (byte 1 i) first-macro-word)
+		  (cl:vector-push-extend (aref *common-macro-table* i) common-macros)))
+	      (dotimes (i 32)
+		(when (ldb-test (byte 1 i) second-macro-word)
+		  (cl:vector-push-extend (aref *common-macro-table* (+ i 31)) common-macros)))
+	      (setq macros (cl:coerce common-macros 'list)))))
+	(when (test-bit %%debug-info-more-macros-expanded)
+	  (setq macros (nconc macros (next-data))))
+	(when macros
+	  (add-type `(:macros-expanded ,macros))))
+
+      (expand-symbol-number-sequence %%debug-info-instance-variable-instructions
+				     :instance-variable-instructions
+				     nil)
+  
+      (let ((simple-function-parent (get-byte %%debug-info-simple-function-parent)))
+	(unless (zerop simple-function-parent)
+	  (let* ((parent-type (aref *simple-function-parent-types*
+				    (1- simple-function-parent)))
+		 (parent-fspec (function-simple-function-parent-fspec name parent-type
+								      arglist)))
+	    (add-type `(function-parent ,parent-fspec ,parent-type)))))
+
+      (let ((constants nil))
+	(when (test-bit %%debug-info-common-constants)
+	  (let ((first-constant-word (next-data))
+		(second-constant-word 0))
+	    (when (minusp first-constant-word)
+	      (setq second-constant-word (next-data)
+		    first-constant-word (ldb (byte 31 0) first-constant-word)))
+	    (stack-let ((common-constants (make-array (+ (cl:logcount first-constant-word)
+							 (cl:logcount second-constant-word))
+						   :fill-pointer 0)))
+	      (dotimes (i 31)
+		(when (ldb-test (byte 1 i) first-constant-word)
+		  (cl:vector-push-extend (aref *common-constant-table* i) common-constants)))
+	      (dotimes (i 32)
+		(when (ldb-test (byte 1 i) second-constant-word)
+		  (cl:vector-push-extend (aref *common-constant-table* (+ i 31))
+				      common-constants)))
+	      (setq constants (cl:coerce common-constants 'list)))))
+	(when (test-bit %%debug-info-more-constants)
+	  (setq constants (nconc constants (next-data))))
+	(when constants
+	  (add-type `(:constants-open-coded ,constants))))
+
+      (expand-symbol-number-sequence %%debug-info-lexical-variable-instructions
+				     :lexical-variable-instructions
+				     nil)
+  
+      (when (test-bit %%debug-info-simple-internal-function-offsets)
+	(let ((offsets (function-simple-internal-function-offsets function)))
+	  (add-type `(#+3600  :internal-function-offsets
+		      #+IMach :internal-functions
+		        . ,offsets))))
+      
+      (expand-symbol-number-sequence %%debug-info-lexical-map :lexical-map t)
+      (expand-symbol-number-sequence %%debug-info-captive-map :captive-map t)
+	
+      (when (and (cl:consp name) (eq (first name) ':internal)
+		 (cdddr name) (not (symbolp (fourth name))) (atom (fourth name)))
+	(setq name (copylist name))
+	(expand-symbol-sublist (cdddr name) local-package))
+
+      (setq result (cons name (cl:coerce result 'list)))
+      (when (test-bit %%debug-info-more-debug-info)
+	(cl:assert (cl:consp (first list-remaining)))
+	(setq result (nconc result list-remaining)
+	      list-remaining nil))
+      (cl:assert (and (zerop info-word) (null list-remaining)))
+      result)))
+
+(defun expand-arglist (arglist local-package)
+  ;; Must copy against the (rather unlikely) event that this arglist is shared
+  ;; with one having all the same names in another package.
+  (let ((compressed-arglist (copytree arglist)))
+    (loop for sublist = compressed-arglist then (cdr sublist)
+	  until (atom sublist) do
+      (let ((entry (car sublist)))
+	(if (atom entry)
+	    (expand-symbol-sublist sublist local-package)
+	  (expand-symbol-sublist entry local-package)
+	  (when (and (cl:consp (cdr entry))
+		     (cl:consp (cddr entry)))
+	    (expand-symbol-sublist (cddr entry) local-package)))))
+    compressed-arglist))
+
+(defun expand-symbol-list (list local-package)
+  (let ((compressed-list (copylist list)))
+    (loop for sublist = compressed-list then (cdr sublist)
+	  until (atom sublist) do
+      (expand-symbol-sublist sublist local-package))
+    compressed-list))
+
+(defun expand-symbol-sublist (sublist local-package)
+  (when (atom (car sublist))
+    (setf (car sublist) (expand-typed-symbol (car sublist) local-package))))
+
+(defun expand-typed-symbol (thing local-package)
+  (cl:etypecase thing
+    (cl:integer
+      (if (ldb-test (byte 1 31) thing)
+	  (expand-reintern-symbol (aref *common-name-table* (%logldb (byte 8 0) thing))
+				  local-package)
+	  (aref *common-symbol-table* (%logldb (byte 8 0) thing))))
+    (cl:float
+      (expand-reintern-symbol (expand-compressed-pname-string (%fixnum thing))
+			      local-package))
+    (string (expand-reintern-symbol thing local-package))
+    (symbol thing)))
+
+(defun expand-reintern-symbol (string local-package)
+  (condition-case ()
+       (intern string local-package)
+     (error (make-symbol string))))
+
+;;;; Special versions of above that might save the whole deal
+
+;;; Called when a :internal function spec has had the name encoded.  Decode it now is possible.
+(defun expand-extra-info-name (extra-info)
+  (let ((name (car extra-info)))
+    (block skip-it
+      (let ((local-package (function-spec-likely-package name)))
+	(when (null local-package)
+	  (let* ((debug-info (cdr extra-info))
+		 (flags (pop debug-info)))
+	    (unless (fixnump flags)
+	      (return-from skip-it))
+	    (when (ldb-test %%debug-info-local-name-package flags)
+	      (setq local-package (cl:find-package (pop debug-info)))))
+	  (when (null local-package)
+	    (return-from skip-it)))
+	(setq name (copylist name))
+	(expand-symbol-sublist (cdddr name) local-package)
+	(when *store-back-expanded-extra-info*
+	  (setf (car extra-info) name))))
+    name))
+
+;;; Called by the :internal function spec handler to get the offset.
+(defun compiled-function-internal-function-offsets (compiled-function)
+  (let ((debug-info (cdr (cca-extra-info (compiled-function-cca compiled-function)))))
+    (when (let ((flags (car debug-info)))
+	    (and (fixnump flags)
+		 (ldb-test %%debug-info-simple-internal-function-offsets flags)))
+      (return-from compiled-function-internal-function-offsets
+	(function-simple-internal-function-offsets compiled-function)))
+    (dolist (elem debug-info)
+      (when (and (cl:consp elem)
+		 (eq (car elem) #+3600  :internal-function-offsets
+				#+IMach :internal-functions))
+	(return (cdr elem))))))
+
+(defun expand-generic-function-debugging-info (generic-function)
+  (if (flavor::generic-function-compressed-debugging-info generic-function)
+      (let ((debug-info (generic-function-debugging-info generic-function))
+	    (local-package (generic-function-likely-package generic-function)))
+	(setf (generic-function-arglist generic-function) 
+	      (expand-arglist (generic-function-arglist generic-function)
+			      local-package))
+	(let ((values (assq 'values debug-info)))
+	  (when values
+	    (setq debug-info (cl:substitute (expand-symbol-list values local-package)
+					    values debug-info))))
+	(dolist (type '(arglist :method-arglist))
+	  (let ((elem (assq type debug-info)))
+	    (when elem
+	      (setq debug-info (cl:substitute (expand-arglist elem local-package)
+					      elem debug-info)))))
+	(when (eq *store-back-expanded-extra-info* t)
+	  (setf (generic-function-debugging-info generic-function)
+		(copy-into-area-if-not-there debug-info debug-info-area))
+	  (setf (flavor::generic-function-compressed-debugging-info generic-function) nil))
+	debug-info)
+      (generic-function-debugging-info generic-function)))
+
+;;; Make more localized.  Do not alter data representation.
+
+(defun compact-all-debug-info ()
+  (with-progress-report ("compacting compressed debugging info")
+    (using-system-temporary-area
+      (let ((debug-info-hash-table (cl:make-hash-table
+				     :test #'cl:equal :number-of-values 0
+				     :area system-temporary-area :size 500000	;??
+				     :mutating nil :ignore-gc t :locking nil)))
+	(map-compiled-functions t nil "Scanning compiled functions compacting debugging info"
+	  #'(lambda (function cca)
+	      (ignore function)
+	      (let ((extra-info (cca-extra-info cca)))
+		(loop for sublis on (cdr extra-info)
+		      for entry = (car sublis) do
+		  (when (cl:consp entry)
+		    (setq entry
+			  (selectq (car entry)
+			    (lt:inline-form
+			     (let* ((old (second entry))
+				    (new (make-array (array-length old)
+						     :area debug-info-area
+						     :named-structure-symbol 'lt:inline-form)))
+			       (dotimes (i (array-length old))
+				 (setf (aref new i) (copytree-share (aref old i)
+								    debug-info-area
+								    debug-info-hash-table)))
+			       (list-in-area debug-info-area 'lt:inline-form new)))
+			    (otherwise
+			     (if (memq (car entry) *debug-info-types-not-to-copy*)
+				 (copylist entry debug-info-area)
+				 (copytree-share entry debug-info-area
+						 debug-info-hash-table)))))
+		    (setf (car sublis) entry)))
+		(let ((name (car extra-info)) mh)
+		  (cond ((atom name))
+			((and (memq (car name) flavor::*fdefinable-method-types*)
+			      (setq mh (flavor::find-method-holder name)))
+			 (setf (car extra-info) (flavor::method-holder-function-spec mh)))
+			(t
+			 (setf (car extra-info) (copytree-share name debug-info-area
+								debug-info-hash-table)))))
+		(setf (cca-extra-info cca) (copylist extra-info debug-info-area)))))
+	(dolist (generic *all-generic-function-names*)
+	  (when (setq generic (flavor:find-generic-function generic nil))
+	    (setf (generic-function-arglist generic)
+		  (copytree-share (generic-function-arglist generic)
+				  debug-info-area debug-info-hash-table))
+	    (when (generic-function-debugging-info generic)
+	      (setf (generic-function-debugging-info generic)
+		    (copytree-share (generic-function-debugging-info generic)
+				    debug-info-area debug-info-hash-table)))))))))
+
+;;; Anything not needed for the correct runtime functioning of the compiler or application. 
+;;; Correct compilation is limited to correct code compiled to core for compile-flavor-methods
+;;; and the like.  File compilations should not be done without these.  In particular, no
+;;; guarantee about the debugging info of the resultant compiled code can be made.
+;;; There is no great gain from compressing the result, since it is exactly the preserved
+;;; information that always goes in the more-debug-info part of the compressed format, but it
+;;; saves a little when there're internal functions and so on.
+(defconst *non-essential-debug-info-types*
+  '(#+3600 :local-map #+IMach :variable-creation-alist
+    :macros-expanded :instance-variable-instructions
+    :constants-open-coded :lexical-variable-instructions 
+    :lexical-map :fdefinition-location-hints :mapping-table-instructions :captive-map
+    si:shared-structure-accessor compiler:do-not-record-macroexpansions
+    sys:function-parent values))
+
+(defconst *for-compiler-debug-info-types*
+  '(lt:inline-form lt:side-effects compiler:do-not-record-macroexpansions
+    si:storage-category sys:downward-funarg dbg:invisible-frame
+    compiler:return-type compiler:dont-allow-calls lt:replicability
+    compiler:evacuable-downward-closures sys:downward-function))
+
+(defun function-spec-documentation-essential-p (name)
+  (when (cl:consp name)
+    (selectq (first name)
+      (flavor:method
+       ;; Debugger prompts are automatically generated this way.
+       (memq (flavor::standardize-generic-function-name (second name)) '(proceed)))
+      )))
+
+(defun remove-all-debug-info (keep-compiler)
+  (let ((*store-back-expanded-extra-info* nil)
+	(text (if keep-compiler
+		  "removing non-essential debugging info"
+		  "removing almost all debugging info")))
+   (with-progress-report (text)
+    (let ((n-funs 0)
+	  (n-no-info 0)
+	  (n-inlines 0)
+	  (inline-hash-table (and keep-compiler
+				  (cl:make-hash-table :test #'cl:equal
+						      :size 3400 :mutating nil :locking nil))))
+      (map-compiled-functions t nil text
+	#'(lambda (function cca)
+	    (multiple-value-bind (new-extra-info inline-p)
+		(remove-debug-info-from-extra-info function (cca-extra-info cca)
+						   keep-compiler inline-hash-table)
+	      (incf n-funs)
+	      (when ( (length new-extra-info) 2)
+		(incf n-no-info))
+	      (when inline-p
+		 (incf n-inlines))
+	      (setf (cca-extra-info cca) new-extra-info))))
+      (gc-optimization-report "info removed from ~d functions.  ~d have nothing left.~%"
+			      n-funs n-no-info)
+      (when keep-compiler
+	(gc-optimization-report "~d inline forms found, of which ~d were unique.~%"
+				n-inlines (send inline-hash-table :filled-elements))))
+    (dolist (generic *all-generic-function-names*)
+      (when (setq generic (flavor:find-generic-function generic nil))
+	(setf (generic-function-arglist generic)
+	      (args-info-simple-arglist (args-info-from-lambda-list
+					  (generic-function-arglist generic))
+					nil))
+	(let ((debug-info (generic-function-debugging-info generic)))
+	  (stack-let ((new-debug-info (make-array (length debug-info) :fill-pointer 0)))
+	    (dolist (elem debug-info)
+	      (let ((type (first elem)))
+		(if keep-compiler
+		    (selectq type
+		      ((:method-arglist)
+		       (array-push-extend new-debug-info
+					  (cons type
+						(args-info-simple-arglist
+						  (args-info-from-lambda-list (cdr elem))
+						  nil))))
+		      (otherwise
+		       (unless (memq type *non-essential-debug-info-types*)
+			 (array-push-extend new-debug-info elem))))
+		    (selectq type
+		      (otherwise
+		       (unless (or (memq type *non-essential-debug-info-types*)
+				   (memq type *for-compiler-debug-info-types*))
+			 (array-push-extend new-debug-info elem)))))))
+	    (setf (generic-function-debugging-info generic)
+		  (let ((default-cons-area debug-info-area))
+		    (cl:coerce new-debug-info 'list)))))))
+    (let ((remove-properties
+	    (if keep-compiler
+		;; any of these used for non-debugging applications?
+		'(:documentation)
+		'(cl:inline defconstant cl:documentation
+			    :documentation sys:defsysbyte cli::type-lambda-list
+			    compiler:optimizers compiler:style-checker
+			    compiler:optimized-into compiler:obsolete-defun
+			    ;; Cannot remove defstruct info because needed by runtime
+			    ;;typep checking.
+			    si:defstruct-slot si:defstruct-name ;si:defstruct-description
+			    ))))
+      (do-all-symbols (symbol)
+	(dolist (property remove-properties)
+	  (remprop symbol property))
+	(let ((struct (get symbol 'si:defstruct-description)))
+	  (when struct
+	    ;; Kill the larger slots probably only needed at compile time.
+	    (setf (si:defstruct-description-slot-alist struct) symbol)
+	    (setf (si:defstruct-description-property-alist struct) symbol))))))))
+
+(defun remove-debug-info-from-extra-info (function extra-info keep-compiler
+					  &optional inline-hash-table)
+  (let ((name (car extra-info))
+	(debug-info (cdr extra-info))
+	(arglist-p nil)
+	(inline-p nil))
+    (stack-let ((new-extra-info (make-array (1+ (length debug-info))
+					    :type 'art-q-list
+					    :fill-pointer 0)))
+      (when (and (cl:consp name) (eq (first name) ':internal) (cdddr name))
+	(setq name (butlast name)))
+      (array-push-extend new-extra-info name)
+      (dolist (elem debug-info)
+	(let ((type (first elem)))
+	  (if keep-compiler
+	      (selectq type
+		((arglist real-arglist)
+		 (setq arglist-p t))
+		(:documentation
+		 (when (function-spec-documentation-essential-p name)
+		   (array-push-extend new-extra-info elem)))
+		(lt:inline-form
+		 (setq inline-p t)
+		 (array-push-extend new-extra-info
+				    (list type
+					  (simplify-inline-form (second elem)
+								inline-hash-table))))
+		((downward-function downward-funarg)
+		 ;;+++ DLA says he's going to fix this one also.
+		 ;;remove here when/if duplication.
+		 (unless (and (cl:consp name) (eq (first name) ':internal))
+		   (array-push-extend new-extra-info elem)))
+		(otherwise
+		 (unless (memq type *non-essential-debug-info-types*)
+		   (array-push-extend new-extra-info elem))))
+	      (selectq type
+		((arglist real-arglist)
+		 (setq arglist-p t))
+		(:documentation
+		 (when (function-spec-documentation-essential-p name)
+		   (array-push-extend new-extra-info elem)))
+		(otherwise
+		 (unless (or (memq type *non-essential-debug-info-types*)
+			     (memq type *for-compiler-debug-info-types*))
+		   (array-push-extend new-extra-info elem)))))))
+      (setq new-extra-info (compress-extra-info function (g-l-p new-extra-info)))
+      (when arglist-p
+	;; arrange for the stupid arglist to be generated if anyone asks.
+	(setf (ldb %%debug-info-simple-arglist (second new-extra-info)) 1))
+      (values new-extra-info inline-p))))
+
+(defun remove-debugging-related-junk ()
+  (when (cl:listp zwei:*lisp-indentation-offset-hash-table*)
+    ;; The editor has not been loaded; forget indentation info built for it by defmacro.
+    ;; Also forget gprint version of same info.  Since we are removing local names, there's
+    ;; little point in being able to correctly grind code.
+    (loop for (name . indentation) in zwei:*lisp-indentation-offset-hash-table* do
+      (ignore indentation)
+      (when (memq (get name 'gprint::formatter) gprint:: *body-special-formatters*)
+	(remprop name 'gprint::formatter)))
+    (setq zwei:*lisp-indentation-offset-hash-table* nil)))
+
+#||
+
+;;;; Analysis tools
+
+(defun analyze-debug-info-types ()
+  (let ((count-table (cl:make-hash-table))
+	(size-table (cl:make-hash-table)))
+    (labels ((estimate-size (thing)
+	       (if (not (eql (%area-number thing) debug-info-area))
+		   0
+		   (cl:typecase thing
+		     (list (+ (%structure-total-size thing)
+			      (loop for l = thing then (cdr l) until (atom l)
+				    sum (estimate-size (car l)))))
+		     (string (%structure-total-size thing))
+		     (otherwise 0)))))
+      (map-compiled-functions t nil "scanning compiled functions"
+	#'(lambda (function cca)
+	    (ignore cca)
+	    (let ((debug-info (debugging-info function)))
+	      (loop for (type . stuff) in debug-info do
+		(incf (cl:gethash type count-table 0))
+		(incf (cl:gethash type size-table 0) (estimate-size stuff)))))))
+    (cl:fresh-line)
+    (let ((untable (make-array (* 3 (send count-table :filled-elements)) :fill-pointer 0)))
+      (maphash #'(lambda (type count)
+		   (cl:vector-push-extend count untable)
+		   (cl:vector-push-extend (gethash type size-table) untable)
+		   (cl:vector-push-extend type untable))
+	       count-table)
+      (sort-grouped-array untable 3 #'>)
+      (formatting-table ()
+	(formatting-column-headings (t :underline-p t) "Type" "Count" "Size")
+	(loop for index below (fill-pointer untable) by 3 do
+	  (formatting-row ()
+	    (format-cell (aref untable (+ index 2)) #'prin1)
+	    (format-cell (aref untable index) #'prin1 :align :right)
+	    (format-cell (aref untable (1+ index)) #'prin1 :align :right)))))))
+
+(defun check-simple-debug-info ()
+  (let ((total-functions 0)
+	(simple-arglist 0)
+	(non-simple-arglist 0)
+	(simple-function-parent 0)
+	(non-simple-function-parent 0)
+	(simple-internal-functions 0)
+	(non-simple-internal-functions 0))
+    (map-compiled-functions t nil "scanning compiled functions"
+      #'(lambda (function cca)
+	  (ignore cca)
+	  (incf total-functions)
+	  (let ((debug-info (debugging-info function))
+		(arglist ()))
+	    (let ((local-map (cdr (assq #+3600 :local-map #+IMach :variable-creation-alist
+					debug-info)))
+		  (arglist-elem (or (assq 'real-arglist debug-info)
+				    (assq 'arglist debug-info))))
+	      (when arglist-elem
+		(setq arglist (cdr arglist-elem))
+		(if (function-has-simple-arglist-p function local-map arglist-elem)
+		    (incf simple-arglist)
+		    (incf non-simple-arglist))))
+	    (let ((function-parent-elem (assq 'function-parent debug-info)))
+	      (when function-parent-elem
+		(if (function-simple-function-parent-type (function-name function)
+							  arglist function-parent-elem)
+		    (incf simple-function-parent)
+		    (incf non-simple-function-parent))))
+	    (let ((internal-function-offsets
+		    (assq #+3600  :internal-function-offsets
+			  #+IMach :internal-functions
+			  debug-info)))
+	      (when internal-function-offsets
+		(if (function-has-simple-internal-function-offsets-p
+		      function (cdr internal-function-offsets))
+		    (incf simple-internal-functions)
+		    (incf non-simple-internal-functions)))))))
+    (format t "~&~D total functions.
+~D (~D%) functions with simple arglist, ~D with complex.
+~D (~D%) functions with simple function parent, ~D with complex.
+~D (~D%) functions with simple internal function offsets, ~D with complex.~%"
+	    total-functions
+	    simple-arglist (round (* 100 simple-arglist)
+				  (+ simple-arglist
+				     non-simple-arglist))
+	    non-simple-arglist
+	    simple-function-parent (round (* 100 simple-function-parent)
+					  (+ simple-function-parent
+					     non-simple-function-parent))
+	    non-simple-function-parent
+	    simple-internal-functions (round (* 100 simple-internal-functions)
+					     (+ simple-internal-functions
+						non-simple-internal-functions))
+	    non-simple-internal-functions)
+    (values total-functions
+	    simple-arglist non-simple-arglist
+	    simple-function-parent non-simple-function-parent
+	    simple-internal-functions non-simple-internal-functions)))
+
+#+3600
+(defun check-local-map-initial-subsequences ()
+  (let ((total-functions 0)
+	(initial-sequences (make-array (length
+					 *function-common-local-map-initial-subsequences*)
+				       :initial-element 0)))
+    (map-compiled-functions t nil "scanning compiled functions"
+      #'(lambda (function cca)
+	  (ignore cca)
+	  (incf total-functions)
+	  (let* ((debug-info (debugging-info function))
+		 (local-map (cdr (assq :local-map debug-info))))
+	    (multiple-value-bind (n rest)
+		(local-map-initial-subsequence local-map)
+	      (ignore rest)
+	      (when n
+		(incf (aref initial-sequences n)))))))
+    (format t "~&~D total functions.~%" total-functions)
+    (formatting-table ()
+      (formatting-column-headings (t :underline-p t)
+	"Count" "Subseq")
+      (dotimes (j (cl:length initial-sequences))
+	(formatting-row ()
+	  (format-cell (aref initial-sequences j) #'prin1 :align :right)
+	  (format-cell (aref *function-common-local-map-initial-subsequences* j)
+		       #'prin1))))
+    (terpri))
+  (values))
+
+(defun check-common-name-tables ()
+  (multiple-value-bind (macro-table constant-table name-table symbol-table)
+      (build-common-name-tables)
+    (flet ((do-table (table common-table common-hash-table desc
+			    &optional (printer #'prin1)
+				      (key #'cl:identity))
+	     (format t "~&Most common ~A are: " desc)
+	     (format-textual-list common-table printer :filled t :after-line-break "    ")
+	     (let ((total 0)
+		   (total-handled 0))
+	       (maphash #'(lambda (common count)
+			    (incf total count)
+			    (when (if common-hash-table
+				      (gethash common common-hash-table)
+				      (cl:find common common-table :key key))
+			      (incf total-handled count)))
+			table)
+	       (format t "~%  accounting for ~D out of ~D (~D%)~2%" total-handled total
+		       (round (* 100 total-handled) total)))))
+      (do-table macro-table *common-macro-table* nil "macros")
+      (do-table constant-table *common-constant-table* nil "constants"
+		#'(lambda (x s) (prin1 (car x) s)) #'car)
+      (do-table name-table *common-name-table* *common-name-hash-table* "names"
+		#'cl:write-string)
+      (do-table symbol-table *common-symbol-table* *common-symbol-hash-table* "symbols"))
+    (values macro-table constant-table name-table symbol-table)))
+
+(defun equal-except-for-uninterned (x y)
+  (declare lt:(side-effects reader reducible))
+  (declare (compiler:return-type boolean))
+  (cl:loop
+    (cond ((eql x y) (return t))
+	  ((not (= (sys:%data-type x) (sys:%data-type y))) (return nil))
+	  ((cl:consp x)
+	   (cl:loop
+	     (unless (or (eql (car x) (car y))
+			 (equal-except-for-uninterned (car x) (car y)))
+	       (return-from equal-except-for-uninterned nil))
+	     (setq x (cdr x) y (cdr y))
+	     (unless (and (cl:consp x) (cl:consp y))
+	       (return))))
+	  ((arrayp x)
+	   (cond ((stringp x) (return (and (stringp y) (sys:%string= x 0 y 0 nil))))
+		 ((cl:bit-vector-p x)
+		  (return (and (cl:bit-vector-p y) (cli::bit-vector-equal x y))))
+		 (t (return nil))))
+	  ((symbolp x)
+	   (return (and (null (symbol-package x)) (null (symbol-package y))
+			(string= (cl:symbol-name x) (cl:symbol-name y)))))
+	  (t (return nil)))))
+
+(defun compare-debugging-info (debug-1 debug-2)
+  (dolist (elem-1 debug-1)
+    (let ((elem-2 (assq (car elem-1) debug-2)))
+      (unless (or (equal-except-for-uninterned elem-1 elem-2)
+		  (neq elem-1 (assq (car elem-1) debug-1))	;Duplicate shit.
+		  (cl:case (car elem-1)
+		    ((:macros-expanded :constants-open-coded)
+		     (loop for thing-1 in (cadr elem-1)
+			   always (cl:member thing-1 (cadr elem-2)
+					     :test #'equal-except-for-uninterned))
+		     (loop for thing-2 in (cadr elem-2)
+			   always (cl:member thing-2 (cadr elem-1)
+					     :test #'equal-except-for-uninterned)))
+		    #+3600
+		    ((:local-map)
+		     ;; May have changed from old format to new.
+		     (and (= (length elem-1) (length elem-2))
+			  (loop for (slot-1 . var-1) in (cdr elem-1)
+				for (slot-2 . var-2) in (cdr elem-2)
+				always (if (atom var-1)
+					   (eq var-1 var-2)
+					   (and (cl:consp var-2)
+						(= (length var-1) (length var-2))
+						(loop for sub-1 in var-1
+						      for sub-2 in var-2
+						      always (multiple-value-bind (n1 l1 h1 f1)
+								 (l-lisp-compiler:decode-one-local-description
+								   sub-1)
+							       (multiple-value-bind (n2 l2
+										     h2 f2)
+								   (l-lisp-compiler:decode-one-local-description
+								     sub-2)
+								 (and (eq n1 n2)
+								      (eql l1 l2)
+								      (eql h1 h2)
+								      (eq f1 f2))))))))))
+		    ((lt:inline-form)
+		     (and (null (cddr elem-1)) (null (cddr elem-2))
+			  (let ((form-1 (cadr elem-1))
+				(form-2 (cadr elem-2)))
+			    (and (= (array-length form-1) (array-length form-2))
+				 (loop for index below (array-length form-1)
+				       always (equal-except-for-uninterned
+						(aref form-1 index)
+						(aref form-2 index)))))))))
+	(cl:break "Differs in ~S vs ~S" elem-1 elem-2))))
+  (dolist (elem-2 debug-2)
+    (unless (assq (car elem-2) debug-1)
+      (cl:break "Extra ~S" elem-2))))
+
+(defvar *verbose-check-function-compression* nil)
+
+(defun check-function-compression (function &optional (extra-info
+							(cca-extra-info
+							  (compiled-function-cca function)))
+						      (retain-macros t)
+						      macro-table
+						      constants-table
+						      package-table)
+  (let* ((compressed (compress-extra-info function extra-info retain-macros
+					  macro-table constants-table package-table))
+	 (expanded (expand-extra-info function compressed)))
+    (when *verbose-check-function-compression*
+      (format t "~%~S~%  ~S~%  ~S" function compressed expanded))
+    (cl:assert (cl:equal (function-name function) (car expanded)))
+    (compare-debugging-info (debugging-info function) (cdr expanded))
+    (values compressed expanded)))
+
+;;; This version does it on the fly, and therefore doesn't check the pname to byte string
+;;; part of the compression.
+(defun check-all-function-compression ()
+  (multiple-value-bind (macro-table constants-table package-table)
+      (build-common-name-tables-if-necessary)
+    (map-compiled-functions t nil "scanning compiled functions"
+      #'(lambda (function cca)
+	  #+imach (canonicalize-variable-creation-alist function)
+	  (check-function-compression function (cca-extra-info cca)
+				      t macro-table constants-table package-table)))))
+
+;;; This version is comprehensive, but obviously not as fast.
+(defun recheck-extra-info (old-extra-info)
+  (let ((definition (fdefinition (first old-extra-info))))
+    (when (cl:consp definition)
+      (setq definition (or (special-form-p definition)
+			   (macro-function definition))))
+    (let ((new-debugging-info (let ((*store-back-expanded-extra-info* nil))
+				(compiled-function-debugging-info definition))))
+      (compare-debugging-info (cdr old-extra-info) new-debugging-info))))
+
+(defun recheck-generic-function (generic-function-name arglist debugging-info)
+  (let ((generic-function (flavor:find-generic-function generic-function-name)))
+    (expand-generic-function-debugging-info generic-function)
+    (cl:assert (and (cl:equal arglist (generic-function-arglist generic-function))
+		    (cl:equal debugging-info
+			      (generic-function-debugging-info generic-function))))))
+
+(defun slow-check-all-function-compression (&optional (file "sys:sys;debug-info-temp.bin"))
+  (let ((file-attribute-list '(:package :zetalisp-user)))
+    (writing-bin-file (stream file t)	;Use equal hash.
+      (dump-attribute-list file-attribute-list stream)
+      (map-compiled-functions t nil "scanning compiled functions"
+        #'(lambda (function cca)
+	    (when (function-same-as-function-from-name function)
+	      (dump-form-to-eval `(recheck-extra-info ',(cca-extra-info cca)) stream))))
+      (dolist (generic *all-generic-function-names*)
+	(when (setq generic (flavor:find-generic-function generic nil))
+	  (dump-form-to-eval `(recheck-generic-function ',(generic-function-name generic)
+							',(generic-function-arglist generic)
+							',(generic-function-debugging-info
+							    generic))
+			     stream)))))
+  (multiple-value-bind (macro-table constants-table package-table)
+      (build-common-name-tables-if-necessary)
+    (compress-all-debug-info t macro-table constants-table package-table)
+    (compact-all-debug-info)
+    (compress-debug-info-strings-if-possible))
+  (load file))
+
+(defun analyze-debug-info-strings ()
+  (let ((duplicate-table (cl:make-hash-table :number-of-values 0))
+	(nstrings 0)
+	(total-length 0)
+	(total-size 0)
+	(char-use-table (cl:make-array 256 :initial-element 0)))
+    (do-debug-info-strings (string :progress-note "Scanning ~A debug-info strings")
+      (unless (gethash string duplicate-table)
+	(setf (gethash string duplicate-table) t)
+	(unless (loop for pkg in *all-packages*
+		      thereis (intern-local-soft string pkg))
+	  (incf nstrings)
+	  (incf total-length (string-length string))
+	  (incf total-size (%structure-total-size string))
+	  (loop for char being the array-elements of string do
+	    (incf (aref char-use-table (char-subindex char)))))))
+    (format t "~&~D total strings; ~D characters in ~D words.~%"
+	    nstrings total-length total-size)
+    (formatting-table (t :multiple-columns 4)
+      (dotimes (code 256)
+	(when (plusp (aref char-use-table code))
+	  (formatting-row ()
+	    (format-cell (code-char code) #'cl:write-char)
+	    (format-cell (aref char-use-table code) #'prin1 :align :right)))))
+    (values char-use-table nstrings total-length total-size)))
+
+(defun analyze-extra-info-compression ()
+  (let ((total 0)
+	(compressed 0)
+	(internal 0)
+	(internal-compressed 0))
+    (map-compiled-functions t nil "scanning compiled functions"
+      #'(lambda (function cca)
+	  (ignore function)
+	  (incf total)
+	  (destructuring-bind (name . debug-info) (cca-extra-info cca)
+	    (when (fixnump (first debug-info))
+	      (incf compressed))
+	    (when (and (cl:consp name) (eq (first name) ':internal) (cdddr name))
+	      (incf internal)
+	      (when (not (symbolp (fourth name)))
+		(incf internal-compressed))))))
+    (format t "~&~D total functions.  ~D are compressed.
+~D internal functions.  ~D have compressed names."
+	    total compressed internal internal-compressed))
+  (values))
+
+(defun meter-simple-arglists (&aux (yes 0) (no 0))
+  (map-compiled-functions t nil "Scanning all compiled functions"
+    (lambda (function ignore)
+      (if (function-has-simple-arglist-p function)
+	  (incf yes)
+	  (incf no))))
+  (values yes no))
+
+(defun verify-simple-arglist-algorithm ()
+  (si:map-compiled-functions t nil "Pinhead test"
+    (lambda (function ignore)
+      (when (function-has-simple-arglist-p function)
+	(unless (equal (arglist function t)
+		       (function-simple-arglist function))
+	  (format t "~%Failure for ~S" function))))))
+
+
+#+imach
+(defun check-vca-sequences (&aux (table (cl:make-hash-table :test #'cl:equal))
+			    (table1 (cl:make-hash-table :test #'cl:equal))
+			    (table2 (cl:make-hash-table :test #'cl:equal))
+			    (table3 (cl:make-hash-table :test #'cl:equal))
+			    (table4 (cl:make-hash-table :test #'cl:equal)))
+  (si:map-compiled-functions t nil "scanning"
+    (lambda (function ignore)
+      (let ((vca (cdr (assq 0 (cdr (assq :variable-creation-alist
+					 (debugging-info function)))))))
+	(incf (cl:gethash vca table 0))
+	(let ((length (length vca)))
+	  (when (> length 1) (incf (cl:gethash (firstn 1 vca) table1 0)))
+	  (when (> length 2) (incf (cl:gethash (firstn 2 vca) table2 0)))
+	  (when (> length 3) (incf (cl:gethash (firstn 3 vca) table3 0)))
+	  (when (> length 4) (incf (cl:gethash (firstn 4 vca) table4 0)))))))
+  (flet ((print-table (table order)
+	   (format t "~%~A" order)
+	   (let ((alist (cl:sort (convert-table-to-alist table) #'> :key #'cadr)))
+	     (loop repeat 5
+		   for (sequence count) in alist
+		   do (format t "~%  ~5D ~S" count sequence)))))
+    (print-table table  "All Entry")
+    (print-table table1 "First 1")
+    (print-table table2 "First 2")
+    (print-table table3 "First 3")
+    (print-table table4 "First 4")))
+
+#+imach
+(defun check-rest-names (&aux (table (cl:make-hash-table :test #'cl:equal)))
+  (si:map-compiled-functions t nil "scanning"
+    (lambda (function ignore)
+      (let ((info (%args-info function)))
+	(when (ldb-test %%arg-desc-rest-arg info)
+	  (let* ((index (+ (* (- (ldb %%arg-desc-max-args info)
+				 (ldb %%arg-desc-min-args info))
+			      2)
+			   2))
+		 (var (cadr (assq index (cdr (assq :variable-creation-alist
+						   (debugging-info function)))))))
+	    (incf (cl:gethash var table 0)))))))
+  (flet ((print-table (table order)
+	   (format t "~%~A" order)
+	   (let ((alist (cl:sort (convert-table-to-alist table) #'> :key #'cadr)))
+	     (loop repeat 5
+		   for (sequence count) in alist
+		   do (format t "~%  ~5D ~S" count sequence)))))
+    (print-table table  "Rest Arg Name")))
+
+(defun meter-simple-offsets (&aux (yes 0) (no 0))
+  (si:map-compiled-functions t nil "scanning"
+    (lambda (fun ignore)
+      (let ((internals (cl:assoc #+IMach :internal-functions #+3600 :internal-function-offsets
+				 (debugging-info fun))))
+	(when internals
+	  (if (function-has-simple-internal-function-offsets-p fun (cdr internals))
+	      (incf yes)
+	      (incf no))))))
+  (values yes no))
+
+(defun verify-simple-offsets ()
+  (si:map-compiled-functions t nil "scanning"
+    (lambda (fun ignore)
+      (let ((internals (cl:assoc #+IMach :internal-functions #+3600 :internal-function-offsets
+				 (debugging-info fun))))
+	(when (and internals
+		   (function-has-simple-internal-function-offsets-p fun (cdr internals))
+		   (not (equal (function-simple-internal-function-offsets fun)
+			       (cdr internals))))
+	  (print fun))))))
+
+#+obsolete
+(defun gather-vca-statistics (&optional (n-dpc 1024.) (n-int 10.) (n-len 50.))
+  (let ((dpc-array (cl:make-array n-dpc :initial-element 0))
+	(int-array (cl:make-array n-int :initial-element 0))
+	(len-array (cl:make-array n-len :initial-element 0))
+	(big-dpcs 0)
+	(big-ints 0)
+	(big-lens 0)
+	(max-dpc 0)
+	(max-int 0)
+	(max-len 0))
+    (si:map-compiled-functions t nil "Gathering :VARIABLE-CREATION-ALIST statistics"
+      (lambda (function ignore)
+	(multiple-value-bind (nil vca)
+	    (variable-creation-alist-common-entries
+	      (cdr (cl:assoc :variable-creation-alist (debugging-info function)))
+	      (%args-info function))
+	  (let ((dpc-array dpc-array))
+	    (declare (sys:array-register dpc-array))
+	    (loop with last-pc = 0
+		  for (pc . entries) in (sortcar (copylist vca) #'<)
+		  as dpc = (prog1 (- pc last-pc) (setq last-pc pc))
+		  do (if (< dpc n-dpc)
+			 (incf (aref dpc-array dpc))
+		       (incf big-dpcs)
+		       (setq max-dpc (max max-dpc dpc)))
+		     (loop for entry in entries for i from 0 do
+		       (cond ((fixnump entry)
+			      (when (plusp i)
+				(format t "~%~S has a nonleading integer." function))
+			      (if (< entry n-int)
+				  (incf (aref int-array entry))
+				(incf big-ints)
+				(setq max-int (max max-int entry))))
+			     ((symbolp entry)
+			      (when (plusp i)
+				(let* ((pname (zl:get-pname entry))
+				       (length (cl:length pname)))
+				  (and (> length 16.)
+				       (char= (aref pname 0) #/.)
+				       (%string= pname (- length 15) "-FUNCTION-CELL." 0 15)
+				       (format t "~%~S has a nonleading function cell."
+					       function)))))
+			     (t (format t "~%~S has an unknown format." function))))
+		     (let ((length (length entries)))
+		       (if (< length n-len)
+			   (incf (aref len-array length))
+			 (incf big-lens)
+			 (setq max-len (max max-len length)))))))))
+    (flet ((summarize (string array big max)
+	     (format t "~2%Statistics for ~A:" string)
+	     (when (zerop max)
+	       (setq max (loop for i downfrom (1- (cl:length array)) to 0
+			       when (plusp (aref array i))
+				 return i)))
+	     (format t "~%  Maximum ~D" max)
+	     (loop for i below (cl:length array)
+		   as elem = (aref array i)
+		   when (plusp elem)
+		     do (format t "~%  ~4D:  ~6D" i elem))
+	     (when (plusp big)
+	       (format t "~%  ....:  ~6D" big))))
+      (summarize "Delta PC" dpc-array big-dpcs max-dpc)
+      (summarize "Integers" int-array big-ints max-int)
+      (summarize "Lengths"  len-array big-lens max-len)
+      (values dpc-array int-array len-array))))
+
+||#

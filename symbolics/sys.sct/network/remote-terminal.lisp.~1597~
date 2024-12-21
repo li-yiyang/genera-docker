@@ -1,0 +1,1615 @@
+;; -*- Mode: Lisp; Package: Network-Internals; Base: 8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;; Support for remote terminals connected via the serial ports or the network
+;; Written by Carl Hoffman for Release 6
+
+;; A REMOTE-TERMINAL encapsulates a lower-level stream and provides the basic stream
+;; operations in terms of simpler ones.  It uses its own protocol to talk with flavors built
+;; on top of this one, using messages with names ending with "-RAW".  A flavor built on top of
+;; this one can implement this simpler protocol, or the full interactive stream protocol for
+;; greater efficiency.  Terminal capabilities are asked about using message names ending with
+;; "?".  Those capabilities which are input related are computed whenever the message is sent.
+;; Those which are output related are cached in instance variables for speed.  The default
+;; value for WIDTH is 79, since many terminals will echo a newline if you try to print in
+;; column 80.
+
+(DEFVAR *REMOTE-TERMINAL-FOR-THIS-PROCESS* NIL
+  "Bound to the REMOTE-TERMINAL object which is responsible for this process.")
+
+(DEFMACRO WITH-REMOTE-TERMINAL-LOCKED (&BODY BODY)
+  `(SI:WITH-LOCK-HELD (LOCK :MYLOCK-OK .LOCKED-P.)
+     (CONDITION-CASE-IF (AND .LOCKED-P. (EQ SELF *REMOTE-TERMINAL-FOR-THIS-PROCESS*)) (ERROR)
+	 (PROGN ,@BODY)
+       (ERROR
+	 (UNLESS (CL:TYPEP ERROR '(OR SYS:NETWORK-ERROR SYS:END-OF-FILE))
+	   (TV:NOTIFY NIL "~A got an error:~%~A" SELF ERROR))
+	 (THROW 'REMOTE-TERMINAL-EXIT T)))))
+
+(DEFMACRO WITH-REMOTE-TERMINAL-LOCKED-SOFT (&BODY BODY)
+  `(SI:WITH-LOCK-HELD (LOCK :SOFT T)
+     ,@BODY))
+
+(DEFFLAVOR REMOTE-TERMINAL
+	   ((LOCK NIL)
+	    (PENDING-OUTPUT-TIMER NIL)		;timer for forcing pending-output
+	    (PENDING-OUTPUT NIL)		;T if there is pending output
+	    (RAW-STREAM NIL)
+	    (UNTYI-CHAR NIL)
+	    (SAIL-DISPLAY? NIL)
+	    (CAN-OVERSTRIKE? NIL)
+	    (INPUT-SPEED NIL)
+	    (OUTPUT-SPEED NIL)
+	    (CURSOR-X 0)			;Where Lisp thinks the cursor is.
+	    (CURSOR-Y 0)
+	    (CURSOR-X-RAW 0)			;Where the cursor really is.
+	    (CURSOR-Y-RAW 0)
+	    (RAW-LINE-CLEAR? T)			;If T, then the CURSOR-Y-RAW line
+						;is clear after the cursor.
+	    (KILL-HISTORY NIL)
+	    (TERMINAL-KILL-HISTORY NIL)
+	    (PROCESS NIL)
+	    (INPUT-PROCESS T)
+	    (INPUT-BUFFER NIL)
+	    (WIDTH 79.)
+	    (HEIGHT CL:MOST-POSITIVE-FIXNUM)
+	    (AVAILABLE-HEIGHT NIL)
+	    (MORE-P T)
+	    (WHO-LINE-P NIL)
+	    (WHO-LINE-DISPLAYED-Y NIL)
+	    (WHO-LINE-DISPLAYED-STRING NIL)
+	    (WHO-LINE-TEMPLATE NIL)
+	    (WHO-LINE-UPDATE-NEEDED NIL)
+	    (WHO-LINE-LAST-UPDATE-TIME 0)
+	    (WHO-LINE-UPDATE-FREQUENCY (* 5 60.))
+	    )
+	   ()
+  ;; Build on the generic interactive stream.  The individual terminal flavors must
+  ;; mix in the appropriate input editor flavor, usually SI:DISPLAY-INPUT-EDITOR or
+  ;; SI:PRINTING-INPUT-EDITOR.
+  (:REQUIRED-FLAVORS SI:INTERACTIVE-STREAM)
+  :ABSTRACT-FLAVOR
+  (:SETTABLE-INSTANCE-VARIABLES KILL-HISTORY WHO-LINE-UPDATE-FREQUENCY)
+  (:GETTABLE-INSTANCE-VARIABLES KILL-HISTORY RAW-STREAM HEIGHT WIDTH CURSOR-X CURSOR-Y
+				TERMINAL-KILL-HISTORY PROCESS
+				MORE-P WHO-LINE-P)
+  (:INITABLE-INSTANCE-VARIABLES KILL-HISTORY RAW-STREAM HEIGHT WIDTH INPUT-SPEED OUTPUT-SPEED
+				INPUT-PROCESS
+				MORE-P WHO-LINE-P))
+
+(DEFMETHOD (SYS:REMOTE-TERMINAL-P REMOTE-TERMINAL) () T)
+
+(DEFUN-IN-FLAVOR (DISPLAY-WHO-LINE REMOTE-TERMINAL) (STRING)
+  (LET* ((NEW-STRING STRING)
+	 (OLD-STRING WHO-LINE-DISPLAYED-STRING)
+	 (NEW-LENGTH (FILL-POINTER NEW-STRING))
+	 (OLD-LENGTH (FILL-POINTER OLD-STRING))
+	 (OUTPUTTING-P NIL)
+	 (HIGHLIGHT-STATE NIL))
+    (DECLARE (SYS:ARRAY-REGISTER NEW-STRING OLD-STRING))
+
+    ;; trim whitespace
+    (LOOP WHILE (PLUSP OLD-LENGTH)
+	  WHILE (CHAR= (AREF OLD-STRING (1- OLD-LENGTH)) #\SPACE)
+	  DO (DECF OLD-LENGTH))
+    (LOOP WHILE (PLUSP NEW-LENGTH)
+	  WHILE (CHAR= (AREF NEW-STRING (1- NEW-LENGTH)) #\SPACE)
+	  DO (DECF NEW-LENGTH))
+
+    (WITH-REMOTE-TERMINAL-LOCKED 
+      (UNWIND-PROTECT
+	  ;; bind cursor-x and cursor-y, so that we can mung them and
+	  ;; cause the underlying cursor-addressing stuff to do the
+	  ;; right things.
+	  (LETF ((CURSOR-Y (OR WHO-LINE-DISPLAYED-Y 0))
+		 (CURSOR-X 0)
+		 (WHO-LINE-DISPLAYED-Y WHO-LINE-DISPLAYED-Y))
+	    (LET ((INDEX 0))
+
+	      ;; local fun to capture hiliting-ness and char-width
+	      ;; computation. only actually does output if outputting-p is
+	      ;; on, else just simulates it by bumping cursor-x
+	      (FLET ((OUTPUT-CHAR (NEW-CHAR &OPTIONAL OLD-CHAR)
+		       (LET ((NEW-HIGHLIGHT (EQ (SI:CS-FACE (SI:CHAR-STYLE NEW-CHAR))
+						:ITALIC)))
+			 (UNLESS (EQ HIGHLIGHT-STATE NEW-HIGHLIGHT)
+			   (SETQ HIGHLIGHT-STATE NEW-HIGHLIGHT)
+			   (IF HIGHLIGHT-STATE
+			       (BEGIN-CHARACTER-HIGHLIGHTING SELF)
+			       (END-CHARACTER-HIGHLIGHTING SELF))))
+		       (LET* ((PLAIN-CHAR (SI:MAKE-CHAR NEW-CHAR))
+			      (CWIDTH (SEND SELF :CHARACTER-WIDTH PLAIN-CHAR))
+			      (NEW-X (+ CURSOR-X CWIDTH)))
+			 (COND (( NEW-X (1- WIDTH))
+				NIL)
+			       (T
+				(IF (AND OUTPUTTING-P (NEQ NEW-CHAR OLD-CHAR))
+				    (SEND SELF :TYO PLAIN-CHAR)
+				    (SETQ CURSOR-X NEW-X))
+				T)))))
+
+		;; the main loop.  start walking down the two strings,
+		;; comparing characters.  when find a mismatch, output
+		;; whatever chars are necessary to fix it.
+		(LOOP WHILE (< INDEX (MIN NEW-LENGTH OLD-LENGTH))
+		      ;; while (< CURSOR-X WIDTH)
+		      FOR NEW-CHAR = (AREF NEW-STRING INDEX)
+		      FOR OLD-CHAR = (AREF OLD-STRING INDEX)
+		      DO
+		  (UNLESS (CHAR= NEW-CHAR OLD-CHAR)
+		    ;; mismatch.  output it.
+		    (WHEN (AND CAN-OVERSTRIKE? (NOT OUTPUTTING-P))
+		      ;; we're an overstriking terminal, and this is the
+		      ;; first difference.  zap the rest of the line.
+		      (SEND SELF :CLEAR-REST-OF-LINE)
+		      (SETQ OLD-LENGTH INDEX)	; pretend old string is only this long.
+		      )
+		    (SETQ OUTPUTTING-P T))	; we're now sending stuff
+		      WHILE (OUTPUT-CHAR NEW-CHAR OLD-CHAR)	; output it, real or fake...
+		      DO (INCF INDEX))
+
+		;; if new string is shorter than old, clear to eol.  if
+		;; longer, output the rest of the string.
+		(COND ((>= CURSOR-X (-  WIDTH 2))	; stopped at right margin?
+		       NIL)			; do nothing
+		      ((< INDEX OLD-LENGTH)
+		       (SEND SELF :CLEAR-REST-OF-LINE))
+		      ((> NEW-LENGTH OLD-LENGTH)
+		       (SETQ OUTPUTTING-P T)
+		       (LOOP WHILE (< INDEX NEW-LENGTH)
+			     WHILE (OUTPUT-CHAR (AREF NEW-STRING INDEX))
+			     DO (INCF INDEX)))))))
+	(WHEN HIGHLIGHT-STATE
+	  (END-CHARACTER-HIGHLIGHTING SELF))))))
+
+(DEFUN-IN-FLAVOR (SET-SIZE-VARIABLES REMOTE-TERMINAL) ()
+  (SETQ AVAILABLE-HEIGHT HEIGHT)
+  (SETQ WHO-LINE-DISPLAYED-Y (AND WHO-LINE-P (DECF AVAILABLE-HEIGHT)))
+  (IF WHO-LINE-DISPLAYED-STRING
+      (SYS:ADJUST-ARRAY-SIZE WHO-LINE-DISPLAYED-STRING WIDTH)
+      (SETQ WHO-LINE-DISPLAYED-STRING (CL:MAKE-ARRAY WIDTH
+						     :ELEMENT-TYPE 'CL:CHARACTER
+						     :FILL-POINTER 0)))
+  (SETQ WHO-LINE-TEMPLATE (COMPUTE-REMOTE-TERMINAL-WHO-LINE-TEMPLATE WIDTH))
+  (WHEN MORE-P
+    (DECF AVAILABLE-HEIGHT))
+  (WHEN WHO-LINE-P
+    (WITH-STACK-ARRAY (FOO 0 :FILL-POINTER 0)
+      (DISPLAY-WHO-LINE FOO))			; zap old one
+    (WHO-LINE-CLOBBERED SELF)))
+
+(DEFMETHOD (MAKE-INSTANCE REMOTE-TERMINAL) (&REST IGNORE)
+  (SETQ TERMINAL-KILL-HISTORY (MAKE-INSTANCE 'ZWEI:INTERVAL-HISTORY ':NAME "Kill"))
+  (UNLESS KILL-HISTORY
+    (SETQ KILL-HISTORY TERMINAL-KILL-HISTORY))
+  (SET-SIZE-VARIABLES))
+
+;;;
+;;; These mixins are used for separating display (cursor-addressable)
+;;; terminals from printing ones.
+;;;
+(DEFFLAVOR DISPLAY-TERMINAL-MIXIN 
+	()
+	()
+  :ABSTRACT-FLAVOR
+  (:REQUIRED-FLAVORS REMOTE-TERMINAL))
+
+(DEFFLAVOR PRINTING-TERMINAL-MIXIN
+	()
+	()
+  :ABSTRACT-FLAVOR
+  (:REQUIRED-FLAVORS REMOTE-TERMINAL))
+
+;; Used by the input editor in constructing the name of the input history.
+
+(DEFMETHOD (:NAME REMOTE-TERMINAL) () "Remote Terminal")
+
+(DEFMETHOD (:FOREIGN-HOST REMOTE-TERMINAL) () NIL)
+
+;; Used by the input editor in printing Help key information.
+
+(DEFMETHOD (:PRINT-SELF REMOTE-TERMINAL) (STREAM IGNORE SLASHIFY-P)
+  (IF SLASHIFY-P
+      (PRINTING-RANDOM-OBJECT (SELF STREAM :TYPEP))
+      (FORMAT STREAM "a remote terminal connected to ~A" (SEND *LOCAL-HOST* :PRETTY-NAME))))
+
+(DEFMETHOD (:CLEAR-INPUT REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED-SOFT	;Can be called from abort
+    (TV:IO-BUFFER-CLEAR INPUT-BUFFER)
+    (SEND RAW-STREAM :CLEAR-INPUT)))
+
+(DEFMETHOD (:CLEAR-OUTPUT REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SEND RAW-STREAM :CLEAR-OUTPUT)))
+
+(DEFMETHOD (SYSTEM-APPLICATIONS:CALL-WITH-RAW-STREAM REMOTE-TERMINAL) (CONTINUATION)
+  (DECLARE (SYS:DOWNWARD-FUNARG CONTINUATION))
+  (LET ((CANCEL (CATCH 'SYSTEM-APPLICATIONS:SERIAL-FILE-CANCEL
+		  (LET (done-flag seen-flag
+			(SYSTEM-APPLICATIONS:*SERIAL-FILE-CANCEL-MODE* 'THROW))
+		    (WITH-REMOTE-TERMINAL-LOCKED
+		      (UNWIND-PROTECT
+			  (PROGN
+			    (UNLESS (SYMBOLP INPUT-PROCESS)
+			      (send input-process :interrupt 
+				    (lambda (cell reply)
+				      (process-wait "File Transfer"
+					'location-contents cell)
+				      (setf (location-contents reply) t)
+				      )
+				    (locf done-flag)
+				    (locf seen-flag)
+				    )
+			      ;; This is an error-prone way to interrupt it
+			      #+ignore ;;tell me about it
+			      (SEND INPUT-PROCESS :ARREST-REASON SELF))
+			    (when (symbolp input-process) (error "Why?"))
+			    (FUNCALL CONTINUATION RAW-STREAM))
+			(UNLESS (SYMBOLP INPUT-PROCESS)
+			  (setq done-flag t)
+			  (process-wait "File transfer done" 'location-contents (locf seen-flag))
+			  (cl::sleep 1 :sleep-reason "Avoid bug")
+			  (process::process-wakeup input-process)
+			  #+ignore
+			  (SEND INPUT-PROCESS :REVOKE-ARREST-REASON SELF)))
+		      NIL)))))
+    (WHEN CANCEL
+      (ERROR "~A" CANCEL))))
+
+;; Cursor motion optimization
+
+;; The instance variables CURSOR-X-RAW, CURSOR-Y-RAW, and RAW-LINE-CLEAR? maintain a model of
+;; what the state of the remote terminal really is.  To remove this feature, define
+;; UPDATE-RAW-CURSOR to be a no-op, and define the rest of the DEFUN-METHODs to simply send
+;; the corresponding -RAW message.
+
+(DEFUN-IN-FLAVOR (TYO-RAW REMOTE-TERMINAL) (CHAR)
+  (SEND RAW-STREAM :TYO CHAR)
+  (INCF CURSOR-X-RAW))
+
+(DEFUN-IN-FLAVOR (STRING-OUT-RAW REMOTE-TERMINAL) (STRING)
+  (SEND RAW-STREAM :STRING-OUT STRING)
+  (INCF CURSOR-X-RAW (STRING-LENGTH STRING)))
+
+(DEFUN-IN-FLAVOR (NEW-LINE-RAW REMOTE-TERMINAL) ()
+  (SEND SELF :NEW-LINE-RAW)
+  (SETQ CURSOR-X-RAW 0 CURSOR-Y-RAW (1+ CURSOR-Y-RAW))
+  (SETQ RAW-LINE-CLEAR? T))
+
+(DEFUN-IN-FLAVOR (SET-CURSORPOS-RAW REMOTE-TERMINAL) (X Y)
+  (UNLESS (AND (= CURSOR-X-RAW X) (= CURSOR-Y-RAW Y))
+    (SEND SELF :SET-CURSORPOS-RAW X Y)
+    (IF (OR ( Y CURSOR-Y-RAW) (< X CURSOR-X-RAW)) (SETQ RAW-LINE-CLEAR? NIL))
+    (SETQ CURSOR-X-RAW X CURSOR-Y-RAW Y)))
+
+(DEFUN-IN-FLAVOR (CLEAR-WINDOW-RAW REMOTE-TERMINAL) ()
+  (SEND SELF :CLEAR-WINDOW-RAW)
+  (WHO-LINE-CLOBBERED SELF)
+  (SETQ CURSOR-X-RAW 0 CURSOR-Y-RAW 0)
+  (SETQ RAW-LINE-CLEAR? T))
+
+(DEFUN-IN-FLAVOR (CLEAR-REST-OF-WINDOW-RAW REMOTE-TERMINAL) ()
+  (SEND SELF :CLEAR-REST-OF-WINDOW-RAW)
+  (WHO-LINE-CLOBBERED SELF)
+  (SETQ RAW-LINE-CLEAR? T))
+
+(DEFUN-IN-FLAVOR (CLEAR-REST-OF-LINE-RAW REMOTE-TERMINAL) ()
+  (UNLESS RAW-LINE-CLEAR?
+    (SEND SELF :CLEAR-REST-OF-LINE-RAW)
+    (SETQ RAW-LINE-CLEAR? T)))
+
+(DEFUN-IN-FLAVOR (UPDATE-RAW-CURSOR REMOTE-TERMINAL) ()
+  (UNLESS (AND (= CURSOR-X CURSOR-X-RAW) (= CURSOR-Y CURSOR-Y-RAW))
+    (SET-CURSORPOS-RAW CURSOR-X CURSOR-Y)))
+
+;; Management of pending output
+
+(DEFMETHOD (:NOTE-PENDING-OUTPUT REMOTE-TERMINAL) ()
+  (UNLESS PENDING-OUTPUT
+    (SETF PENDING-OUTPUT T)
+    (UNLESS PENDING-OUTPUT-TIMER
+      (SETF PENDING-OUTPUT-TIMER (PROCESS:CREATE-TIMER-CALL
+				   SELF '(:PENDING-OUTPUT-TIMER-EXPIRED)	;SEND
+				   :NAME "Remote Server pending output")))
+    (UNLESS (PROCESS:TIMER-PENDING-P PENDING-OUTPUT-TIMER)
+      (PROCESS:RESET-TIMER-RELATIVE-TIMER-UNITS PENDING-OUTPUT-TIMER
+						(// PROCESS:*TIMER-UNITS*)))))	;1 second
+
+(DEFMETHOD (:PENDING-OUTPUT-TIMER-EXPIRED REMOTE-TERMINAL) ()
+  ;; Loop until we can get the lock, or until someone else forces the output
+  (LOOP WHILE PENDING-OUTPUT
+	DO (WITH-REMOTE-TERMINAL-LOCKED-SOFT
+	     (IGNORE-ERRORS
+	       (SEND SELF :FORCE-OUTPUT))
+	     (LOOP-FINISH))
+	   ;; Wait for the lock
+	   (PROCESS-SLEEP 60)))
+
+(DEFMETHOD (:FORCE-OUTPUT-IF-NECESSARY REMOTE-TERMINAL) ()
+  (WHEN (AND PENDING-OUTPUT
+	     (NOT (SEND SELF :LISTEN)))
+    (SEND SELF :FORCE-OUTPUT)))
+
+;; The user can explicitly force output to move the cursor to a given position on the screen.
+
+(DEFMETHOD (:FORCE-OUTPUT REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UPDATE-RAW-CURSOR)
+    (SEND RAW-STREAM :FORCE-OUTPUT)
+    (SETF PENDING-OUTPUT NIL)))
+
+;; Input operations.
+
+(DEFMETHOD (:LISTEN REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (OR (NOT (NULL UNTYI-CHAR))
+	(IF (SYMBOLP INPUT-PROCESS)
+	    (SEND RAW-STREAM :LISTEN)
+	    (TV:IO-BUFFER-NOT-EMPTY-P INPUT-BUFFER)))))
+
+(DEFMETHOD (:INPUT-WAIT REMOTE-TERMINAL) (&OPTIONAL WHOSTATE FUNCTION &REST ARGUMENTS)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UNLESS UNTYI-CHAR
+      (SEND SELF :FORCE-OUTPUT-IF-NECESSARY)
+      (IF (SYMBOLP INPUT-PROCESS)
+	  (LEXPR-SEND RAW-STREAM :INPUT-WAIT
+		      WHOSTATE FUNCTION ARGUMENTS)
+	  (LEXPR-FUNCALL #'TV:IO-BUFFER-INPUT-WAIT INPUT-BUFFER
+			 WHOSTATE FUNCTION ARGUMENTS)))))
+
+(DEFMETHOD (REMOTE-TERMINAL-INPUT-TOP-LEVEL REMOTE-TERMINAL) ()
+  (CONDITION-CASE ()
+       ;; Do not lock stream while doing this, since user process will
+       ;; have it locked while in input-wait.  Rely on user process not
+       ;; touching input side of stream, and on atomic behavior of
+       ;; io-buffer functions.
+       (LOOP NAMED TOP DOING
+	 (FLET ((WHO-LINE-READY ()
+		  (DECLARE (SYS:DOWNWARD-FUNCTION))
+		  ;; Must use instance variables in case predicate changes while inside wait.
+		  (AND WHO-LINE-P WHO-LINE-UPDATE-FREQUENCY
+		       (TIME-ELAPSED-P WHO-LINE-UPDATE-FREQUENCY WHO-LINE-LAST-UPDATE-TIME))))
+	   (SEND RAW-STREAM :INPUT-WAIT "Remote terminal input" #'WHO-LINE-READY)
+	   (IF (WHO-LINE-READY)
+	       (SETQ WHO-LINE-UPDATE-NEEDED T)
+	       (LOOP FOR FIRST-P = T THEN NIL
+		     AS CHAR = (SEND SELF :LISPM-CHAR (IF FIRST-P :TYI :TYI-NO-HANG))
+		     WHILE (OR CHAR FIRST-P)	;Do insert EOF
+		     DO (COND ((EQ CHAR :STATUS)
+			       (SETQ WHO-LINE-UPDATE-NEEDED T))
+			      ((SEND SELF :ASYNCHRONOUS-CHARACTER-P CHAR)
+			       (SEND SELF :HANDLE-ASYNCHRONOUS-CHARACTER CHAR))
+			      (T
+			       (UNLESS (TV:IO-BUFFER-FULL-P INPUT-BUFFER)
+				 (TV:IO-BUFFER-PUT INPUT-BUFFER CHAR))))
+			(WHEN (NULL CHAR)
+			  (RETURN-FROM TOP)))))
+	 (WHEN WHO-LINE-UPDATE-NEEDED
+	   (WITH-REMOTE-TERMINAL-LOCKED-SOFT
+	     (SEND SELF :MAYBE-UPDATE-WHO-LINE))
+	   (WHEN WHO-LINE-UPDATE-NEEDED
+	     ;; Meaning that the lock failed; let user process do it.
+	     (UNLESS (TV:IO-BUFFER-FULL-P INPUT-BUFFER)
+	       (TV:IO-BUFFER-PUT INPUT-BUFFER :WAKEUP))
+	     ;; The :INPUT-WAIT will return right away.  Wait a little
+	     ;; bit for the other process to take over.
+	     (SI:PROCESS-WAIT-WITH-TIMEOUT "User updates who line" 60
+	       #'(LAMBDA (CELL) (NULL (LOCATION-CONTENTS CELL)))
+	       (LOCF WHO-LINE-UPDATE-NEEDED)))))
+     ((SYS:NETWORK-ERROR SYS:END-OF-FILE)
+       (TV:IO-BUFFER-PUT INPUT-BUFFER :ERROR)))
+  (SETQ INPUT-PROCESS T))			;Don't try to kill twice
+
+(DEFMETHOD (START-REMOTE-TERMINAL-PROCESSES REMOTE-TERMINAL) ()
+  (SETQ PROCESS CURRENT-PROCESS)
+  (WHEN INPUT-PROCESS
+    (UNLESS INPUT-BUFFER
+      (SETQ INPUT-BUFFER (TV:MAKE-IO-BUFFER 100)))
+    (WHEN (EQ INPUT-PROCESS 'T)
+      (SETQ INPUT-PROCESS (PROCESS-RUN-FUNCTION "Remote terminal input"
+			    #'REMOTE-TERMINAL-INPUT-TOP-LEVEL SELF)))))
+
+(DEFMETHOD (STOP-REMOTE-TERMINAL-PROCESSES REMOTE-TERMINAL) ()
+  (UNLESS (SYMBOLP INPUT-PROCESS)
+    (SEND INPUT-PROCESS :KILL)
+    (SETQ INPUT-PROCESS T)))
+
+(DEFMETHOD (:LISPM-CHAR REMOTE-TERMINAL :DEFAULT) (OPERATION)
+  (SEND RAW-STREAM OPERATION))
+
+;;; Get the next character object from the input process or directly if disabled.
+(DEFUN-IN-FLAVOR (LISPM-CHAR-INTERNAL REMOTE-TERMINAL) (OPERATION)
+  ;; Begin counting lines until --More--, for scrolling terminals
+  (UNLESS (SEND SELF :CURSOR-MOTION?) (SETQ CURSOR-Y 0 CURSOR-Y-RAW 0))
+  (LOOP DOING
+    (SEND SELF :MAYBE-UPDATE-WHO-LINE T)
+    ;; Make sure user sees any pending output.  Force output inside the filter loop
+    ;; rather than outside since an intercepted character may generate output.  Don't force
+    ;; output if there is typeahead so as to minimize the number of packets sent.
+    (SEND SELF :FORCE-OUTPUT-IF-NECESSARY)
+    (LET ((CHAR
+	    ;; Get one character in the Lispm character set, or NIL if
+	    ;; OPERATION is :TYI-NO-HANG and nothing available.
+	    (IF (SYMBOLP INPUT-PROCESS)
+		(SEND SELF :LISPM-CHAR OPERATION)
+		(TV:IO-BUFFER-GET INPUT-BUFFER
+				  (MEMQ OPERATION '(:ANY-TYI-NO-HANG :TYI-NO-HANG))
+				  "Remote input"))))
+      (WHEN (EQ CHAR :ERROR)
+	;; Network error caught by input process.
+	(THROW 'REMOTE-TERMINAL-EXIT T))
+      (WHEN (EQ CHAR :STATUS)
+	(SETQ WHO-LINE-UPDATE-NEEDED T)
+	(SETQ CHAR :WAKEUP))
+      (UNLESS (EQ CHAR :WAKEUP)
+	;; Update the idle time.
+	(SETQ TV:KBD-LAST-ACTIVITY-TIME (TIME))
+	(SETQ SI:WHO-LINE-JUST-COLD-BOOTED-P NIL)
+	(RETURN CHAR)))))
+
+
+(DEFUN-IN-FLAVOR (ANY-TYI-INTERNAL REMOTE-TERMINAL) (OPERATION)
+  (IF UNTYI-CHAR
+      (PROG1 UNTYI-CHAR (SETQ UNTYI-CHAR NIL))
+      (WITH-REMOTE-TERMINAL-LOCKED
+	(LOOP FOR CHAR = (LISPM-CHAR-INTERNAL OPERATION) DO
+	      ;; If a character is to be intercepted, do so and retry.
+	      ;; Otherwise, return the character.
+	      (IF (MEMQ CHAR KBD-INTERCEPTED-CHARACTERS)
+		  (KBD-INTERCEPT-CHARACTER CHAR)
+		  (RETURN CHAR))))))
+
+;; The INTERACTIVE-STREAM :ANY-TYI and :ANY-TYI-NO-HANG whoppers filter out the EOF argument.
+
+(DEFMETHOD (:ANY-TYI REMOTE-TERMINAL) ()
+  (ANY-TYI-INTERNAL :TYI))
+
+(DEFMETHOD (:ANY-TYI-NO-HANG REMOTE-TERMINAL) ()
+  (ANY-TYI-INTERNAL :TYI-NO-HANG))
+
+(DEFMETHOD (:UNTYI REMOTE-TERMINAL) (CHAR)
+  (SETQ UNTYI-CHAR CHAR))
+
+;; Output operations.
+
+;; Printing characters which aren't in the ASCII character set.  Needed only for terminals
+;; which don't have the full Sail character set.
+
+(DEFCONST PSEUDO-PRINTING-CHARACTERS
+	  '((#/ . #.(SI:STRING-TO-ASCII "<>"))
+	    (#/ . #.(SI:STRING-TO-ASCII "<-"))
+	    (#/ . #.(SI:STRING-TO-ASCII "->"))
+	    (#/ . #.(SI:STRING-TO-ASCII "<="))
+	    (#/ . #.(SI:STRING-TO-ASCII ">="))))
+
+;; Returns the width of a character, in character units.
+;; For backspace, it can return a negative number.
+;; For tab, the number returned depends on second arg or the current cursor position.
+;; For return, the result is zero.
+
+(DEFMETHOD (:CHARACTER-WIDTH REMOTE-TERMINAL) (CHAR &OPTIONAL FONT (X CURSOR-X))
+  FONT						;Ignored
+  (LET (STRING)
+    (COND
+      ;; Printing characters
+      ((OR ( #O040 (CHAR-CODE CHAR) #O176)
+	   (AND (< (CHAR-CODE CHAR) #O200) SAIL-DISPLAY?))
+       1)
+      ;; Phony printing characters
+      ((SETQ STRING (CDR (ASSQ CHAR PSEUDO-PRINTING-CHARACTERS)))
+       (ARRAY-ACTIVE-LENGTH STRING))
+      ;; Format effectors
+      ((AND (CHAR-EQUAL CHAR #\BACKSPACE) CAN-OVERSTRIKE?) -1)
+      ((CHAR-EQUAL CHAR #\TAB) (- (* (// (+ X 8) 8) 8) X))
+      ((CHAR-EQUAL CHAR #\NEWLINE) 0)
+      ;; Lozenged characters
+      (T (+ 2 (STRING-LENGTH (OR (CL:CHAR-NAME CHAR)
+				 (FORMAT NIL "~O" (CHAR-INT CHAR)))))))))
+(DEFMETHOD (:CHAR-WIDTH REMOTE-TERMINAL) () 1)
+(DEFMETHOD (:LINE-HEIGHT REMOTE-TERMINAL) () 1)
+
+(DEFMETHOD (:STRING-LENGTH REMOTE-TERMINAL) (STRING &OPTIONAL (BEGIN 0) (END NIL))
+  (OR END (SETQ END (STRING-LENGTH STRING)))
+  (LOOP FOR I FROM BEGIN BELOW END
+	SUM (SEND SELF :CHARACTER-WIDTH (AREF STRING I))))
+
+(DEFMETHOD (:COMPUTE-MOTION REMOTE-TERMINAL) (STRING &OPTIONAL (BEGIN 0) END X Y)
+  (OR END (SETQ END (STRING-LENGTH STRING)))
+  (OR X (SETQ X CURSOR-X))
+  (OR Y (SETQ Y CURSOR-Y))
+  (LOOP FOR I FROM BEGIN BELOW END
+	FOR CHAR = (AREF STRING I)
+	DO (COND ((CHAR-EQUAL CHAR #\RETURN)
+		  (SETQ X 0)
+		  (SETQ Y (MOD (1+ Y) AVAILABLE-HEIGHT)))
+		 (T (LET ((SIZE (SEND SELF :CHARACTER-WIDTH CHAR NIL X)))
+		      (INCF X SIZE)
+		      (COND ((= X (1- WIDTH))
+			     (SETQ X 0)
+			     (SETQ Y (MOD (1+ Y) AVAILABLE-HEIGHT)))
+			    (( X WIDTH)
+			     (SETQ X SIZE)
+			     (SETQ Y (MOD (1+ Y) AVAILABLE-HEIGHT))))))))
+  (VALUES X Y))
+
+;; For now, assume all remote terminals only have cursors which can be moved by character
+;; units.  Add graphics later.
+
+(DEFMETHOD (:SIZE REMOTE-TERMINAL) ()
+  (VALUES WIDTH HEIGHT))
+
+(DEFMETHOD (:SIZE-IN-CHARACTERS REMOTE-TERMINAL) ()
+  (VALUES (1- WIDTH) AVAILABLE-HEIGHT))
+
+(DEFMETHOD (:VISIBLE-CURSORPOS-LIMITS REMOTE-TERMINAL) (&OPTIONAL IGNORE)
+  (VALUES 0 0 (1- WIDTH) AVAILABLE-HEIGHT))
+
+(DEFMETHOD (:INSIDE-WIDTH REMOTE-TERMINAL) () (1- WIDTH))
+(DEFMETHOD (:INSIDE-HEIGHT REMOTE-TERMINAL) () AVAILABLE-HEIGHT)
+(DEFMETHOD (:INSIDE-SIZE REMOTE-TERMINAL) () (VALUES (1- WIDTH) AVAILABLE-HEIGHT))
+
+(DEFMETHOD (:SET-SIZE REMOTE-TERMINAL) (NEW-WIDTH NEW-HEIGHT)
+  (IF (FIXP NEW-WIDTH) (SETQ WIDTH NEW-WIDTH))
+  (IF (FIXP NEW-HEIGHT) (SETQ HEIGHT NEW-HEIGHT))
+  (SET-SIZE-VARIABLES))
+
+(DEFMETHOD (:SET-SIZE-IN-CHARACTERS REMOTE-TERMINAL) (NEW-WIDTH NEW-HEIGHT)
+  (IF (FIXP NEW-WIDTH) (SETQ WIDTH (1+ NEW-WIDTH)))
+  (IF (FIXP NEW-HEIGHT) (SETQ HEIGHT (+ NEW-HEIGHT (- HEIGHT AVAILABLE-HEIGHT))))
+  (SET-SIZE-VARIABLES))
+
+(DEFMETHOD (SI:CURSORPOS-UNIT-SUPPORTED-P REMOTE-TERMINAL) (UNIT)
+  (EQ UNIT ':CHARACTER))			
+
+(DEFMETHOD (:READ-CURSORPOS REMOTE-TERMINAL) (&OPTIONAL (UNITS :CHARACTER))
+  (SELECTQ UNITS
+    (:CHARACTER (VALUES CURSOR-X CURSOR-Y))
+    (T (FERROR "~S is not a known unit" UNITS))))
+
+(DEFMETHOD (:SET-CURSORPOS REMOTE-TERMINAL) (X Y &OPTIONAL (UNITS :CHARACTER))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SELECTQ UNITS
+      (:CHARACTER
+       (IF X (SETQ CURSOR-X (MIN (MAX X 0) (- WIDTH 2))))
+       (IF Y (SETQ CURSOR-Y (MIN (MAX Y 0) (1- AVAILABLE-HEIGHT)))))
+      (T (FERROR "~S is not a known unit" UNITS)))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:INCREMENT-CURSORPOS REMOTE-TERMINAL) (X Y &OPTIONAL (UNITS :CHARACTER))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SELECTQ UNITS
+      (:CHARACTER
+       (IF X (SETQ CURSOR-X (MIN (MAX (+ CURSOR-X X) 0) (- WIDTH 2))))
+       (IF Y (SETQ CURSOR-Y (MIN (MAX (+ CURSOR-Y Y) 0) (1- AVAILABLE-HEIGHT)))))
+      (T (FERROR "~S is not a known unit" UNITS)))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:HOME-CURSOR REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SETQ CURSOR-X 0 CURSOR-Y 0)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:FRESH-LINE REMOTE-TERMINAL) ()
+  (IF (ZEROP CURSOR-X)
+      (PROGN (SEND SELF :CLEAR-REST-OF-LINE) NIL)
+      (PROGN (SEND SELF :TYO #\RETURN) T)))
+
+;; TV:MORE-PROCESSING-GLOBAL-ENABLE here is being used as a flag which means we are inside
+;; the input editor redisplay.
+
+(DEFUN-IN-FLAVOR (CHECK-END-OF-LINE REMOTE-TERMINAL) (SIZE UPDATE-RAW?)
+  (WHEN (OR (> (+ CURSOR-X SIZE) (1- WIDTH))
+	    (AND (= (+ CURSOR-X SIZE) (1- WIDTH))
+		 TV:MORE-PROCESSING-TRULY-GLOBAL-ENABLE
+		 TV:MORE-PROCESSING-GLOBAL-ENABLE))
+    (SETQ CURSOR-X (- WIDTH 2))
+    (UPDATE-RAW-CURSOR)
+    (TYO-RAW (ASCII-CODE #/!))
+    (SEND SELF :TYO #\NEWLINE))
+  (IF UPDATE-RAW? (UPDATE-RAW-CURSOR)))
+
+(DEFMETHOD (:TYO REMOTE-TERMINAL) (CHAR)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (LET (STRING LENGTH)
+      (COND
+	;; Check for garbage data
+	((LISTP CHAR)
+	 (FERROR "~S is not a character" CHAR))
+	;; Optimize printing of spaces
+; this optimization appears not to work at all; it doesn't go off (at least not 
+; all the time) on the regular part of the screen, but does go off when outputting
+; the wholine, thus really screwing up the display...    9/4/90 -- jrd
+;	((CHAR-EQUAL CHAR #\SPACE)
+;	 (CHECK-END-OF-LINE 1 NIL)
+;	 (INCF CURSOR-X))
+	;; Printing characters
+	((OR ( #O040 (CHAR-CODE CHAR) #O176)
+	     (AND (< (CHAR-CODE CHAR) #O200) SAIL-DISPLAY?))
+	 (CHECK-END-OF-LINE 1 T)
+	 (TYO-RAW (ASCII-CODE CHAR))
+	 (INCF CURSOR-X))
+	;; Phony printing characters
+	((SETQ STRING (CDR (ASSQ CHAR PSEUDO-PRINTING-CHARACTERS)))
+	 (SETQ LENGTH (STRING-LENGTH STRING))
+	 (CHECK-END-OF-LINE LENGTH T)
+	 (STRING-OUT-RAW STRING)
+	 (INCF CURSOR-X LENGTH))
+	;; Format effectors
+	((AND (CHAR-EQUAL CHAR #\BACKSPACE) CAN-OVERSTRIKE?)
+	 (SETQ CURSOR-X (MAX (1- CURSOR-X) 0)))
+	((CHAR-EQUAL CHAR #\TAB)
+	 (SETQ CURSOR-X (MIN (* (// (+ CURSOR-X 8) 8) 8) (- WIDTH 2))))
+	((CHAR-EQUAL CHAR #\NEWLINE)
+	 (COND ((AND (= CURSOR-Y (1- AVAILABLE-HEIGHT))
+		     MORE-P
+		     TV:MORE-PROCESSING-TRULY-GLOBAL-ENABLE
+		     TV:MORE-PROCESSING-GLOBAL-ENABLE)
+		(NEW-LINE-RAW)
+		(STRING-OUT-RAW (SI:STRING-TO-ASCII "--More--"))
+		(SETQ CURSOR-X CURSOR-X-RAW CURSOR-Y CURSOR-Y-RAW)
+		
+		;; if the newline we're doing is echoing while inside an
+		;; input-editor, LISPM-CHAR-INTERNAL would ordinarily
+		;; lead to an explosion.  Rebind sys:rubout-handler, so
+		;; as to treat this tyi specially, ie not part of the
+		;; editted input going on.
+		(LET ((SYS:RUBOUT-HANDLER ':TYI))
+		  (SETQ CHAR (LISPM-CHAR-INTERNAL :TYI)))
+
+		(SETQ CHAR (OR (NULL CHAR)
+			       (MEMQ CHAR '(#\RUBOUT #\CONTROL-Z))
+			       (CHAR-EQUAL CHAR #\ABORT)))
+		(SET-CURSORPOS-RAW 0 CURSOR-Y-RAW)
+		(CLEAR-REST-OF-LINE-RAW)
+		(WHEN (SEND SELF :CURSOR-MOTION?)
+		  (IF CHAR (STRING-OUT-RAW (SI:STRING-TO-ASCII "--Flushed--")))
+		  (SET-CURSORPOS-RAW 0 0)
+		  (CLEAR-REST-OF-LINE-RAW))
+		(SEND RAW-STREAM :FORCE-OUTPUT)
+		(SETQ CURSOR-X 0 CURSOR-Y 0)
+		(WHEN CHAR
+		  (SI:PROCESS-ABORT CURRENT-PROCESS)))
+	       (( CURSOR-Y (1- AVAILABLE-HEIGHT))
+		(SET-CURSORPOS-RAW 0 0)
+		(CLEAR-REST-OF-LINE-RAW)
+		(SETQ CURSOR-X 0 CURSOR-Y 0))
+	       (T (UPDATE-RAW-CURSOR)
+		  (NEW-LINE-RAW)
+		  (SETQ CURSOR-X 0 CURSOR-Y (1+ CURSOR-Y)))))
+	;; Lozenged characters
+	(T
+	 (SETQ STRING
+	       (OR (CL:CHAR-NAME CHAR)
+		   (FORMAT NIL "~O" CHAR)))
+	 (SETQ LENGTH (+ 2 (STRING-LENGTH STRING)))
+	 (CHECK-END-OF-LINE LENGTH T)
+	 (TYO-RAW (ASCII-CODE #/<))
+	 (STRING-OUT-RAW (SI:STRING-TO-ASCII STRING))
+	 (TYO-RAW (ASCII-CODE #/>))
+	 (INCF CURSOR-X LENGTH))))
+    ;; If we printed a character in the rightmost column, because we were inside the input
+    ;; editor, then move the cursor to the next line.
+    (IF (= CURSOR-X (1- WIDTH)) (SEND SELF :TYO #\NEWLINE))
+    (WHO-LINE-CLOBBERED SELF NIL)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:BEEP REMOTE-TERMINAL) (&OPTIONAL IGNORE)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SEND SELF :BEEP-RAW)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:CLEAR-WINDOW REMOTE-TERMINAL) (&OPTIONAL IGNORE)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (CLEAR-WINDOW-RAW)
+    (SETQ CURSOR-X 0 CURSOR-Y 0)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:CLEAR-REST-OF-WINDOW REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UPDATE-RAW-CURSOR)
+    (CLEAR-REST-OF-WINDOW-RAW)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:CLEAR-REST-OF-LINE REMOTE-TERMINAL) ()
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UPDATE-RAW-CURSOR)
+    (CLEAR-REST-OF-LINE-RAW)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFUN-IN-FLAVOR (CLEAR-BETWEEN-CURSORPOSES-INTERNAL DISPLAY-TERMINAL-MIXIN) (X1 Y1 Y2)
+  (IF (OR (= CURSOR-Y-RAW Y1) ( CURSOR-Y-RAW Y2))
+      (LOOP FOR X = X1 THEN 0
+	    FOR Y FROM Y1 TO Y2 DO
+	    (SET-CURSORPOS-RAW X Y)
+	    (CLEAR-REST-OF-LINE-RAW))
+      (PROGN
+	(SET-CURSORPOS-RAW 0 Y2)
+	(CLEAR-REST-OF-LINE-RAW)
+	(LOOP FOR Y FROM (1- Y2) ABOVE Y1 DO
+	      (SET-CURSORPOS-RAW 0 Y)
+	      (CLEAR-REST-OF-LINE-RAW))
+	(SET-CURSORPOS-RAW X1 Y1)
+	(CLEAR-REST-OF-LINE-RAW))))
+
+;; This isn't quite the right definition, but nobody who uses this message really seems to
+;; care about X2.
+
+(DEFMETHOD (:CLEAR-BETWEEN-CURSORPOSES DISPLAY-TERMINAL-MIXIN) (X1 Y1 IGNORE Y2)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SETQ X1 (MIN (MAX X1 0) (1- WIDTH)))
+    (SETQ Y1 (MIN (MAX Y1 0) (1- AVAILABLE-HEIGHT)))
+    (SETQ Y2 (MIN (MAX Y2 0) (1- AVAILABLE-HEIGHT)))
+    (COND (( Y1 Y2)
+	   (CLEAR-BETWEEN-CURSORPOSES-INTERNAL X1 Y1 Y2))
+	  ((OR (= CURSOR-Y-RAW 0) (= CURSOR-Y-RAW Y2))
+	   (CLEAR-BETWEEN-CURSORPOSES-INTERNAL 0 0 Y2)
+	   (CLEAR-BETWEEN-CURSORPOSES-INTERNAL X1 Y1 (1- AVAILABLE-HEIGHT)))
+	  (T (CLEAR-BETWEEN-CURSORPOSES-INTERNAL X1 Y1 (1- AVAILABLE-HEIGHT))
+	     (CLEAR-BETWEEN-CURSORPOSES-INTERNAL 0 0 Y2)))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:CLEAR-BETWEEN-CURSORPOSES PRINTING-TERMINAL-MIXIN) (&REST IGNORE)
+  ;; should this try to do anything clever?
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SEND SELF ':FRESH-LINE)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+;; :INSERT-STRING and :DELETE-STRING assume that the string contains no newlines, and that the
+;; line will not wrap around the edge of the screen.  Bind RAW-LINE-CLEAR? since we know that
+;; the line is effectively clear from the point of view of the :STRING-OUT.
+
+(DEFMETHOD (:INSERT-STRING REMOTE-TERMINAL)
+	   (STRING &OPTIONAL (BEGIN 0) (END NIL) (TYPE-ALSO? T))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (OR END (SETQ END (STRING-LENGTH STRING)))
+    (LET ((LENGTH (SEND SELF :STRING-LENGTH STRING BEGIN END)))
+      (UNLESS (ZEROP LENGTH)
+	(UPDATE-RAW-CURSOR)
+	(SEND SELF :INSERT-CHAR-RAW LENGTH)
+	(WHEN TYPE-ALSO?
+	  (LETF ((RAW-LINE-CLEAR? T))
+	    (SEND SELF :STRING-OUT STRING BEGIN END)))))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:DELETE-STRING REMOTE-TERMINAL) (STRING &OPTIONAL (BEGIN 0) (END NIL))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (OR END (SETQ END (STRING-LENGTH STRING)))
+    (LET ((LENGTH (SEND SELF :STRING-LENGTH STRING BEGIN END)))
+      (UNLESS (ZEROP LENGTH)
+	(UPDATE-RAW-CURSOR)
+	(SEND SELF :DELETE-CHAR-RAW LENGTH)))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+;; The next five operations aren't used by the input editor, but include them here for
+;; completeness.
+
+(DEFMETHOD (:CLEAR-CHAR REMOTE-TERMINAL) (&OPTIONAL CHAR)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UPDATE-RAW-CURSOR)
+    (SEND SELF :CLEAR-CHAR-RAW CHAR)
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:INSERT-CHAR REMOTE-TERMINAL) (&OPTIONAL (COUNT 1))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UNLESS (ZEROP COUNT)
+      (UPDATE-RAW-CURSOR)
+      (SEND SELF :INSERT-CHAR-RAW COUNT))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:DELETE-CHAR REMOTE-TERMINAL) (&OPTIONAL (COUNT 1))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UNLESS (ZEROP COUNT)
+      (UPDATE-RAW-CURSOR)
+      (SEND SELF :DELETE-CHAR-RAW COUNT))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:INSERT-LINE REMOTE-TERMINAL) (&OPTIONAL (COUNT 1))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UNLESS (ZEROP COUNT)
+      (UPDATE-RAW-CURSOR)
+      (SEND SELF :INSERT-LINE-RAW COUNT))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:DELETE-LINE REMOTE-TERMINAL) (&OPTIONAL (COUNT 1))
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UNLESS (ZEROP COUNT)
+      (UPDATE-RAW-CURSOR)
+      (SEND SELF :DELETE-LINE-RAW COUNT))
+    (SEND SELF :NOTE-PENDING-OUTPUT)))
+
+(DEFMETHOD (:SET-MORE-P REMOTE-TERMINAL) (NEW-VALUE)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (SETQ MORE-P NEW-VALUE)
+    (SET-SIZE-VARIABLES)))
+
+(DEFMETHOD (:SET-WHO-LINE-P REMOTE-TERMINAL) (NEW-VALUE)
+  (WITH-REMOTE-TERMINAL-LOCKED
+    (UNLESS (EQ WHO-LINE-P NEW-VALUE)
+      (SETQ WHO-LINE-P NEW-VALUE)
+      (SET-SIZE-VARIABLES)
+      (SEND SELF :CLEAR-WINDOW)
+      (WHEN NEW-VALUE
+	(SETQ WHO-LINE-UPDATE-NEEDED T)
+	(SEND SELF :MAYBE-UPDATE-WHO-LINE)))))
+
+(DEFMETHOD (WHO-LINE-CLOBBERED REMOTE-TERMINAL) (&OPTIONAL (CLEARED? T))
+  (IF WHO-LINE-P
+      (WHEN CLEARED?
+	(SETF (FILL-POINTER WHO-LINE-DISPLAYED-STRING) 0))
+      (SETQ WHO-LINE-DISPLAYED-Y NIL)))
+
+(DEFMETHOD (:MAYBE-UPDATE-WHO-LINE REMOTE-TERMINAL) (&OPTIONAL FROM-INPUT)
+  (WHEN WHO-LINE-UPDATE-NEEDED
+    (LET ((NEWLINE NIL))
+      (WHEN (NULL WHO-LINE-DISPLAYED-Y)
+	(SETF (FILL-POINTER WHO-LINE-DISPLAYED-STRING) 0)
+	(SEND SELF :FRESH-LINE)
+	(SETQ NEWLINE T)
+	(WHEN (SEND SELF :CURSOR-MOTION?)
+	  (SETQ WHO-LINE-DISPLAYED-Y CURSOR-Y)))
+      (STACK-LET ((WHO-LINE-STRING (CL:MAKE-ARRAY WIDTH :ELEMENT-TYPE 'CHARACTER
+						  :FILL-POINTER 0)))
+	(COMPUTE-REMOTE-TERMINAL-WHO-LINE WHO-LINE-TEMPLATE WHO-LINE-STRING PROCESS
+					  FROM-INPUT)
+	(DISPLAY-WHO-LINE WHO-LINE-STRING)
+	(LET ((LENGTH (FILL-POINTER WHO-LINE-STRING)))
+	  (SETF (FILL-POINTER WHO-LINE-DISPLAYED-STRING) LENGTH)
+	  (COPY-ARRAY-PORTION WHO-LINE-STRING 0 LENGTH
+			      WHO-LINE-DISPLAYED-STRING 0 LENGTH)))
+      (WHEN NEWLINE
+	(LETF ((WHO-LINE-DISPLAYED-Y WHO-LINE-DISPLAYED-Y))
+	  (SEND SELF :TYO #\RETURN)))
+      (SEND SELF :FORCE-OUTPUT))
+    (SETQ WHO-LINE-UPDATE-NEEDED NIL
+	  WHO-LINE-LAST-UPDATE-TIME (TIME))))
+
+;;; Not very flexible for now.
+(DEFUN COMPUTE-REMOTE-TERMINAL-WHO-LINE-TEMPLATE (WIDTH)
+  (LET ((PWIDTH (ROUND WIDTH 8))
+	(RWIDTH (ROUND (* WIDTH 3) 20))
+	(TWIDTH (CL:ECASE TV:*WHOLINE-CLOCK-FORMAT*
+		  (:MONTH-DAY-YEAR 17.)
+		  (:DOW-HH-MM-SS 19.)
+		  (:DOW-HH-MM-AM 18.))))
+    (WHEN (EQ TV:*WHOLINE-CLOCK-DELIMITERS* 'T)
+      (INCF TWIDTH 2))
+    (LIST (LIST :TIME TWIDTH TV:*WHOLINE-CLOCK-FORMAT*)
+	  (LIST :PACKAGE PWIDTH)
+	  (LIST :RUNSTATE RWIDTH)
+	  (LIST :PROGRESS (- WIDTH (+ PWIDTH RWIDTH TWIDTH 4))))))
+
+;;; Not very extensible.
+(DEFUN COMPUTE-REMOTE-TERMINAL-WHO-LINE (TEMPLATE STRING PROCESS &OPTIONAL FROM-INPUT)
+  (SETF (FILL-POINTER STRING) 0)
+  (LOOP FOR (TYPE WIDTH . OPTIONS) IN TEMPLATE
+	AS START = (FILL-POINTER STRING)
+	AS END = (+ START WIDTH)
+	DO
+    (CL:ECASE TYPE
+      (:TIME
+	(LET ((FORMAT (FIRST OPTIONS)))
+	  (CL:ASSERT (ZEROP START))
+	  (COND ((EQ FORMAT :MONTH-DAY-YEAR)
+		 (ARRAY-PUSH-PORTION-EXTEND STRING "MM//DD//YY HH:MM:SS")
+		 (MULTIPLE-VALUE-BIND (SECONDS MINUTES HOURS DAY MONTH YEAR)
+		     (TIME:GET-TIME)
+		   (TV:NWATCH-N MONTH STRING 0)
+		   (TV:NWATCH-N DAY STRING 3)
+		   (TV:NWATCH-N YEAR STRING 6)
+		   (TV:NWATCH-N HOURS STRING 9)
+		   (TV:NWATCH-N MINUTES STRING 12.)
+		   (TV:NWATCH-N SECONDS STRING 15.)))
+		(T
+		 (TV:FILL-STRING-FROM-DECODED-TIME STRING NIL NIL)))))
+      (:PACKAGE
+	(MULTIPLE-VALUE-BIND (PKG RDTBL)
+	    (TV:WHO-LINE-PACKAGE-FOR-PROCESS PROCESS)
+	  (WHEN (AND (ARRAYP PKG) (SI:PKG-PACKAGE-P PKG)
+		     (ARRAYP RDTBL) (CL:READTABLEP RDTBL))
+	    (MULTIPLE-VALUE-BIND (SYNTAX-STRING PKG-STRING)
+		(TV:WHO-LINE-PACKAGE-STRINGS PKG RDTBL)
+	      (ARRAY-PUSH-PORTION-EXTEND STRING SYNTAX-STRING)
+	      (ARRAY-PUSH STRING #\SPACE)
+	      (ARRAY-PUSH-PORTION-EXTEND STRING PKG-STRING)
+	      (SCL:MINF (FILL-POINTER STRING) (1- END))
+	      (ARRAY-PUSH STRING #\:)))))
+      (:RUNSTATE
+	(ARRAY-PUSH-PORTION-EXTEND STRING (IF FROM-INPUT
+					      SI:*WHOSTATE-AWAITING-USER-INPUT*
+					      (TV:PEEK-PROCESS-WHOSTATE PROCESS))))
+      (:PROGRESS
+	(LET (NUM DEN)
+	  (MULTIPLE-VALUE-BIND (STREAM TYPE)
+	      (TV:WHO-LINE-PICK-PROGRESS-NOTE-OR-STREAM-FOR-PROCESS PROCESS)
+	    (SELECTQ TYPE
+	      (TV:PROGRESS-NOTE
+	       (SETQ NUM (TV:PROGRESS-NOTE-FRACTION-DONE-NUMERATOR STREAM)
+		     DEN (TV:PROGRESS-NOTE-FRACTION-DONE-DENOMINATOR STREAM))
+	       (ARRAY-PUSH-PORTION-EXTEND STRING (TV:PROGRESS-NOTE-NAME STREAM)))
+	      (TV:STREAM
+	       (MULTIPLE-VALUE-BIND (IGNORE DIRECTION COUNT PERCENT)
+		   (SEND STREAM :WHO-LINE-INFORMATION)
+		 (MULTIPLE-VALUE (NUM DEN)
+		   (LET ((LENGTH (SEND STREAM :LENGTH)))
+		     (IF (OR (NULL LENGTH) (ZEROP LENGTH))
+			 (VALUES 0 1)
+			 (VALUES COUNT LENGTH))))
+		 (TV:DISPLAY-FILE-TRANSFER-INTERNAL STRING STREAM
+						    DIRECTION COUNT PERCENT WIDTH)))))
+	  (WHEN (AND NUM DEN)
+	    (SCL:MINF (FILL-POINTER STRING) END)
+	    (DOTIMES (IGNORE (- END (FILL-POINTER STRING)))
+	      (ARRAY-PUSH STRING #\SPACE))
+	    (LOOP FOR INDEX FROM START
+		  REPEAT (ROUND (* NUM WIDTH) DEN)
+		  DO
+	      ;; Obvious (SETF (SI:CHAR-STYLE (AREF STRING INDEX)) '(NIL :ITALIC NIL)) fails.
+	      (LET ((CHAR (AREF STRING INDEX)))
+		(SETF (SI:CHAR-STYLE-INDEX CHAR)
+		      (SI:STYLE-INDEX (SI:PARSE-CHARACTER-STYLE '(NIL :ITALIC NIL))))
+		(SETF (AREF STRING INDEX) CHAR)))))))
+    (SCL:MINF (FILL-POINTER STRING) END)
+    (DOTIMES (IGNORE (- (1+ END) (FILL-POINTER STRING)))
+      (ARRAY-PUSH STRING #\SPACE)))
+  (DECF (FILL-POINTER STRING))
+  STRING)
+
+(COMPILE-FLAVOR-METHODS REMOTE-TERMINAL)
+
+;; Convert a single character in the Ascii character set into one in the Lisp Machine character set.
+;; Convert ^I to TAB and ^M to RETURN as special cases since the latter is most likely what appeared
+;; on the top of the key that was pressed.  Don't convert ^L to PAGE since the user probably held
+;; down the control key and pressed L.
+
+(DEFUN-IN-FLAVOR (CONVERT-ASCII-TO-LISPM REMOTE-TERMINAL) (CHAR)
+  (LET ((LISPM (LET ((ASCII (LDB (BYTE 7 0) CHAR)))
+		 (COND ((< ASCII #O040)
+			(SELECTOR ASCII =
+			  (#O010 #\BACKSPACE)
+			  (#O011 #\TAB)
+			  (#O012 #\LINE)
+			  (#O014 #\C-L)
+			  (#O015 #\RETURN)
+			  (#O033 #/)
+			  ;; Translate c-@, c-A through c-Z, c-\, c-], c-^, c-_.
+			  ;; Turn  into B, then turn on control bit.
+			  ;; Don't translate  into c-[.
+			  (OTHERWISE (SET-CHAR-BIT (CODE-CHAR (+ ASCII #O100)) :CONTROL T))))
+		       ((= ASCII #O177) #\RUBOUT)
+		       (T (CODE-CHAR ASCII))))))
+    ;; Some Ascii terminals have meta keys.  Otherwise, assume it is a parity bit to be stripped off.
+    (IF (AND (BIT-TEST #O200 CHAR) (SEND SELF :META-KEY?))
+	(SET-CHAR-BIT (CHAR-FLIPCASE LISPM) :META T)
+	LISPM)))
+
+;; Convert a sequence of characters in the Ascii character set into one in the Lispm character set.
+;; This still needs a way to address those codes below 40 and above 176.
+;; The escape characters are specified in the Ascii character set, rather than in the Lispm character set,
+;; so that it is not ambiguous what character is meant.
+
+(DEFVAR CONTROL-ESCAPE     #\CONTROL-^)		;Must be typed twice from many SUPDUP programs.
+(DEFVAR META-ESCAPE	   #\)			;ESC
+(DEFVAR SUPER-ESCAPE	   #\CONTROL-])
+(DEFVAR HYPER-ESCAPE	   #\CONTROL-\)		;Must be typed twice from MINITS terminals.
+(DEFVAR SHIFT-ESCAPE       #\CONTROL-@)		;Or BREAK from MINITS terminals.
+(DEFVAR SPECIAL-KEY-ESCAPE #\CONTROL-_)
+
+(DEFVAR SPECIAL-KEYS
+	'((#\H . #\HELP)
+	  (#\E . #\END)
+	  (#\A . #\ABORT)
+	  (#\S . #\SUSPEND)
+	  (#\R . #\RESUME)
+	  (#\C . #\COMPLETE)
+	  (#\I . #\CLEAR-INPUT)
+	  (#\X . #\ESCAPE)
+	  (#\L . #\LINE)
+	  (#\P . #\PAGE)
+	  (#\F . #\REFRESH)
+	  (#\B . #\BACKSPACE)
+	  (#\N . #\NETWORK)
+	  (#\1 . #\SQUARE)
+	  (#\2 . #\CIRCLE)
+	  (#\3 . #\TRIANGLE)
+	  ))
+
+(DEFUN ASCII-TERMINAL-HELP (TERMINAL)
+  (LET ((FOREIGN-HOST (SEND TERMINAL :FOREIGN-HOST))
+	(WARNING-MESSAGE) (WARNING-CHARACTER))
+    (WHEN FOREIGN-HOST
+      (COND ((EQ (SEND FOREIGN-HOST :SYSTEM-TYPE) :MINITS)
+	     (SETQ WARNING-MESSAGE "MINITS terminals")
+	     (SETQ WARNING-CHARACTER #\CONTROL-\))
+	    ((EQ (SEND FOREIGN-HOST :SYSTEM-TYPE) :NETBOX)
+	     (SETQ WARNING-MESSAGE "NETBOX terminals")
+	     (SETQ WARNING-CHARACTER #\CONTROL-\))
+	    ((TYPEP TERMINAL 'SUPDUP-TERMINAL)
+	     (SETQ WARNING-MESSAGE "some SUPDUP programs")
+	     (SETQ WARNING-CHARACTER #\CONTROL-^))))
+    (FORMAT TERMINAL
+	    "The following characters may be used to access the Symbolics character set.~@
+	     ~4X~C = Toggle the Control bit~35T~C = Toggle the Super bit~@
+	     ~4X~:[~C~;~*ESC~] = Toggle the Meta bit~35T~C = Toggle the Hyper bit~@
+	     ~4X~C = Toggle the Shift bit~:[~*~;~@
+	   The character ~:*~C must be typed twice from ~A.~]~@
+           The character ~C dispatches off one of the following.~%"
+	    CONTROL-ESCAPE SUPER-ESCAPE (CHAR-EQUAL META-ESCAPE #\) META-ESCAPE HYPER-ESCAPE
+	    SHIFT-ESCAPE WARNING-CHARACTER WARNING-MESSAGE SPECIAL-KEY-ESCAPE)
+    (LET* ((LENGTH (LENGTH SPECIAL-KEYS))
+	   (HALF-LENGTH (// (1+ LENGTH) 2)))
+      (LOOP FOR (CHAR-1 . LISPM-CHAR-1) IN SPECIAL-KEYS
+	    FOR (CHAR-2 . LISPM-CHAR-2) IN (NTHCDR HALF-LENGTH SPECIAL-KEYS)
+	    DO (FORMAT TERMINAL "~4X~C = ~C~35T~C = ~C~%"
+		       CHAR-1 LISPM-CHAR-1 CHAR-2 LISPM-CHAR-2))
+      (IF (ODDP LENGTH)
+	  (LET ((ENTRY (NTH (// LENGTH 2) SPECIAL-KEYS)))
+	    (FORMAT TERMINAL "~4X~C = ~C~%" (CAR ENTRY) (CDR ENTRY)))))
+    (FORMAT TERMINAL "c-_W displays status information.
+c-__ is a prefix for symbol characters.
+The Backspace key, if the console has one, is used as an End key.")))
+
+;;(CL:DEFINE-MODIFY-MACRO NOTF (X) NOT)
+
+(DEFMACRO NOTF (FIELD) `(SETF ,FIELD (NOT ,FIELD)))
+
+(DEFUN ASCII-TERMINAL-FILTER (FUNCTION OPERATION)
+  (LOOP WITH CONTROL-FLAG
+	WITH META-FLAG
+	WITH SUPER-FLAG
+	WITH HYPER-FLAG
+	WITH SHIFT-FLAG
+	WITH SPECIAL-KEY-FLAG
+	WITH SYMBOL-FLAG
+	FOR CHAR = (FUNCALL FUNCTION OPERATION) DO
+    (WHEN (NULL CHAR) (RETURN NIL))
+    (SELECTOR CHAR CHAR-EQUAL
+      (CONTROL-ESCAPE (NOTF CONTROL-FLAG))
+      (META-ESCAPE    (NOTF META-FLAG))
+      (SUPER-ESCAPE   (NOTF SUPER-FLAG))
+      (HYPER-ESCAPE   (NOTF HYPER-FLAG))
+      (SHIFT-ESCAPE   (NOTF SHIFT-FLAG))
+      (SPECIAL-KEY-ESCAPE (NOTF SPECIAL-KEY-FLAG))
+      (OTHERWISE 
+	;; Kludge.  This is just a more useful way of using the keyboard.
+	(WHEN (CHAR-EQUAL CHAR #\BACKSPACE)
+	  (SETQ CHAR #\END))
+	(WHEN SPECIAL-KEY-FLAG
+	  (COND ((CHAR-EQUAL CHAR #/_)
+		 (SETQ CHAR NIL)
+		 (NOTF SYMBOL-FLAG))
+		((CHAR-EQUAL CHAR #/W)
+		 (RETURN :STATUS))
+		(T
+		 (WHEN (CHAR-BIT CHAR :CONTROL)	;I.e. ASCII control
+		   (SETQ CONTROL-FLAG T)	;E.g. c-_ c-A becomes c-Abort.
+		   (SETQ CHAR (MAKE-CHAR CHAR)))
+		 (LET ((ENTRY (ASS #'CHAR-EQUAL (CHAR-UPCASE CHAR) SPECIAL-KEYS)))
+		   (SETQ CHAR (AND ENTRY (CDR ENTRY))))))
+	  (SETQ SPECIAL-KEY-FLAG NIL))
+	(WHEN CHAR
+	  (WHEN SYMBOL-FLAG
+	    (BLOCK FOUND
+	      ;; If shift, just search second row.  Otherwise, look shifted and unshifted.
+	      ;; The shift sequence on the remote keyboard may not be same as on the 3600.
+	      (LOOP FOR ROW FROM (IF SHIFT-FLAG 1 0) BELOW 2 DO
+		(LOOP FOR INDEX BELOW 200 DO
+		      (WHEN (= (AREF SI:KBD-NEW-TABLE ROW INDEX) (CHAR-CODE CHAR))
+			(LET ((SHIFTED (AREF SI:KBD-NEW-TABLE (LOGIOR ROW #B10) INDEX)))
+			  (WHEN (< SHIFTED 200)
+			    (SETQ CHAR (CODE-CHAR SHIFTED))
+			    (RETURN-FROM FOUND))))))))
+	  ;; These two can be set via ASCII control or Meta key.
+	  (WHEN (CHAR-BIT CHAR :CONTROL)
+	    (SETQ CONTROL-FLAG T))
+	  (WHEN (CHAR-BIT CHAR :META)
+	    (SETQ META-FLAG T))
+	  ;; Make sure the up/down case works.
+	  (SETQ CHAR (MAKE-CHAR CHAR))
+	  (COND ((OR CONTROL-FLAG META-FLAG SUPER-FLAG HYPER-FLAG)
+		 (SETQ CHAR (IF SHIFT-FLAG
+				(CHAR-DOWNCASE CHAR)
+				(CHAR-UPCASE CHAR)))
+		 (WHEN CONTROL-FLAG
+		   (SETF (CHAR-BIT CHAR :CONTROL) T))
+		 (WHEN META-FLAG
+		   (SETF (CHAR-BIT CHAR :META) T))
+		 (WHEN SUPER-FLAG
+		   (SETF (CHAR-BIT CHAR :SUPER) T))
+		 (WHEN HYPER-FLAG
+		   (SETF (CHAR-BIT CHAR :HYPER) T)))
+		(SHIFT-FLAG
+		 (SETQ CHAR (CHAR-UPCASE CHAR))))
+	  (RETURN CHAR))))
+    ;; If a prefix character was typed to :TYI-NO-HANG, wait for the rest
+    ;; of the character to be typed.  This will be much cleaner when there is
+    ;; a keyboard process.
+    (SETQ OPERATION :TYI)))
+
+(DEFFLAVOR ASCII-TERMINAL ((X3.64 NIL) (META-KEY? NIL)) (REMOTE-TERMINAL)
+  (:GETTABLE-INSTANCE-VARIABLES X3.64)		;SET method is just below
+  (:SETTABLE-INSTANCE-VARIABLES META-KEY?)
+  (:REQUIRED-METHODS REMOTE-TERMINAL-FLAVOR)
+  :ABSTRACT-FLAVOR
+  (:DOCUMENTATION :BASIC "Shared among all flavors of ascii terminal"))
+
+(DEFMETHOD (:SET-X3.64 ASCII-TERMINAL) (NEW-VALUE)
+  (SETQ X3.64 NEW-VALUE)
+  (CHANGE-INSTANCE-FLAVOR SELF (REMOTE-TERMINAL-FLAVOR SELF))
+  (IF X3.64 (SEND SELF :CLEAR-WINDOW)))
+
+(DEFFLAVOR PRINTING-ASCII-TERMINAL () 
+	   (SI:PRINTING-INPUT-EDITOR PRINTING-TERMINAL-MIXIN ASCII-TERMINAL))
+
+(DEFFLAVOR DISPLAY-ASCII-TERMINAL () 
+	   (SI:DISPLAY-INPUT-EDITOR DISPLAY-TERMINAL-MIXIN ASCII-TERMINAL))
+
+;This method is replicated to avoid defeating the :REQUIRED-METHODS above
+(DEFMETHOD (REMOTE-TERMINAL-FLAVOR PRINTING-ASCII-TERMINAL) ()
+  (IF (SEND SELF :CURSOR-MOTION?) 'DISPLAY-ASCII-TERMINAL 'PRINTING-ASCII-TERMINAL))
+(DEFMETHOD (REMOTE-TERMINAL-FLAVOR DISPLAY-ASCII-TERMINAL) ()
+  (IF (SEND SELF :CURSOR-MOTION?) 'DISPLAY-ASCII-TERMINAL 'PRINTING-ASCII-TERMINAL))
+
+(DEFMETHOD (:CURSOR-MOTION? ASCII-TERMINAL) () X3.64)
+(DEFMETHOD (:ASCII-KEYBOARD? ASCII-TERMINAL) () T)
+
+(DEFMETHOD (:INPUT-EDITOR-HELP ASCII-TERMINAL) ()
+  (ASCII-TERMINAL-HELP SELF))
+
+(DEFMETHOD (:LISPM-CHAR ASCII-TERMINAL) (OPERATION)
+  (FLET ((READ-ASCII-CHAR (OPERATION)
+	   (DECLARE (SYS:DOWNWARD-FUNCTION))
+	   (LET ((CHAR (SEND RAW-STREAM OPERATION T)))
+	     (IF CHAR (CONVERT-ASCII-TO-LISPM CHAR)))))
+    (ASCII-TERMINAL-FILTER #'READ-ASCII-CHAR OPERATION)))
+
+(DEFMETHOD (:BEEP-RAW ASCII-TERMINAL) ()
+  (SEND RAW-STREAM :TYO (ASCII-CODE "BEL")))
+
+;; This definition isn't really correct, since some :CLEAR-REST-OF-LINE-RAW method might
+;; want to look at the values of CURSOR-X-RAW and CURSOR-Y-RAW, and they will be incorrect.
+
+(DEFMETHOD (:NEW-LINE-RAW ASCII-TERMINAL) ()
+  (SEND RAW-STREAM :TYO (ASCII-CODE "CR"))
+  (SEND RAW-STREAM :TYO (ASCII-CODE "LF"))
+  (SEND SELF :CLEAR-REST-OF-LINE-RAW))
+
+;; Do (SETQ X CURSOR-X-RAW) instead of (SETQ CURSOR-X-RAW X) since all assignment of
+;; CURSOR-X-RAW and CURSOR-Y-RAW must be done by the REMOTE-TERMINAL DEFUN-METHODs.
+
+(DEFWHOPPER (:SET-CURSORPOS-RAW ASCII-TERMINAL) (X Y)
+  (LET (COUNT)
+    (IF (COND ((= X 0)
+	       (SEND RAW-STREAM :TYO (ASCII-CODE "CR"))
+	       T)
+	      (( 1 (SETQ COUNT (- CURSOR-X-RAW X)) 3)
+	       (LOOP REPEAT COUNT DO (SEND RAW-STREAM :TYO (ASCII-CODE "BS")))
+	       T)
+	      ((AND ( 1 (SETQ COUNT (- X CURSOR-X-RAW)) 3) RAW-LINE-CLEAR?)
+	       (LOOP REPEAT COUNT DO (SEND RAW-STREAM :TYO (ASCII-CODE "SP")))
+	       T))
+	(SETQ X CURSOR-X-RAW))
+    (COND (( 1 (SETQ COUNT (- Y CURSOR-Y-RAW)) 3)
+	   (LOOP REPEAT COUNT DO (SEND RAW-STREAM :TYO (ASCII-CODE "LF")))
+	   (SETQ Y CURSOR-Y-RAW)))
+    (UNLESS (AND (= X CURSOR-X-RAW) (= Y CURSOR-Y-RAW))
+      ;; Dispatch among terminal types here
+      (CONTINUE-WHOPPER X Y))))
+
+(DEFMETHOD (:SET-CURSORPOS-RAW ASCII-TERMINAL) (X Y)
+  (LET (COUNT)
+    (IF (NOT X3.64)
+	(WHEN ( Y CURSOR-Y-RAW)
+	  (LOOP REPEAT (- Y CURSOR-Y-RAW) DO (SEND RAW-STREAM :TYO (ASCII-CODE "LF")))
+	  (COND ((< X CURSOR-X-RAW)
+		 (LOOP REPEAT (- CURSOR-X-RAW X) DO (SEND RAW-STREAM :TYO (ASCII-CODE "BS"))))
+		((> X CURSOR-X-RAW)
+		 #m(LOOP FOR TAB = (* (// (+ CURSOR-X-RAW 8) 8) 8) THEN (+ TAB 8) 
+			 UNTIL (> TAB X) DO
+			 (SEND RAW-STREAM :TYO (ASCII-CODE "TAB"))
+			 (INCF CURSOR-X-RAW 8))
+		 (LOOP REPEAT (- X CURSOR-X-RAW)
+		       DO (SEND RAW-STREAM :TYO (ASCII-CODE "SP"))))))
+	(COND ((= Y CURSOR-Y-RAW)
+	       (COND ((= (- X CURSOR-X-RAW) 1)
+		      (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[C")))
+		     (T (SEND RAW-STREAM :STRING-OUT
+			      (SI:STRING-TO-ASCII
+				(FORMAT NIL "[~:[~D~;~]`" (ZEROP X) (1+ X)))))))
+	      ((= X CURSOR-X-RAW)
+	       (COND (( 1 (SETQ COUNT (- CURSOR-Y-RAW Y)) 2)
+		      (LOOP REPEAT COUNT
+			    DO (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "M"))))
+		     (T (SEND RAW-STREAM :STRING-OUT
+			      (SI:STRING-TO-ASCII
+				(FORMAT NIL "[~:[~D~;~]d" (ZEROP Y) (1+ Y)))))))
+	      (T (SEND RAW-STREAM :STRING-OUT
+		       (SI:STRING-TO-ASCII
+			 (FORMAT NIL "[~:[~D~;~*~]~:[;~D~;~*~]H"
+				 (ZEROP Y) (1+ Y) (ZEROP X) (1+ X)))))))))
+
+(DEFMETHOD (:CLEAR-WINDOW-RAW ASCII-TERMINAL) ()
+  (IF X3.64
+      (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[H[J"))
+      (SEND SELF :NEW-LINE-RAW)))
+
+(DEFMETHOD (:CLEAR-REST-OF-WINDOW-RAW ASCII-TERMINAL) ()
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[J"))))
+
+(DEFMETHOD (:CLEAR-REST-OF-LINE-RAW ASCII-TERMINAL) ()
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[K"))))
+
+(DEFMETHOD (:CLEAR-CHAR-RAW ASCII-TERMINAL) (CHAR)
+  CHAR  ;Ignored.  All characters have the same width.
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[X"))))
+
+(DEFMETHOD (:INSERT-CHAR-RAW ASCII-TERMINAL) (COUNT)
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT
+		  (SI:STRING-TO-ASCII (FORMAT NIL "[~:[~D~;~]@" (= COUNT 1) COUNT)))))
+
+(DEFMETHOD (:DELETE-CHAR-RAW ASCII-TERMINAL) (COUNT)
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT
+		  (SI:STRING-TO-ASCII (FORMAT NIL "[~:[~D~;~]P" (= COUNT 1) COUNT)))))
+
+(DEFMETHOD (:INSERT-LINE-RAW ASCII-TERMINAL) (COUNT)
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT
+		  (SI:STRING-TO-ASCII (FORMAT NIL "[~:[~D~;~]L" (= COUNT 1) COUNT)))))
+
+(DEFMETHOD (:DELETE-LINE-RAW ASCII-TERMINAL) (COUNT)
+  (IF X3.64 (SEND RAW-STREAM :STRING-OUT
+		  (SI:STRING-TO-ASCII (FORMAT NIL "[~:[~D~;~]M" (= COUNT 1) COUNT)))))
+;;; Set this to '((:bold 7) (:italic 4)) for something that looks okay on an Ambassador
+(DEFVAR *CHARACTER-FACE-X3.64-CHARACTER-ATTRIBUTES* NIL)
+
+(DEFMETHOD (:WITH-CHARACTER-STYLE ASCII-TERMINAL) (STYLE CONTINUATION XSTREAM &OPTIONAL IGNORE)
+  (IF (NOT X3.64)
+      (FUNCALL CONTINUATION XSTREAM)
+      (FLET ((SET-ATTRIBUTE (PARAM)
+	       (WITH-REMOTE-TERMINAL-LOCKED
+		 (SEND RAW-STREAM :STRING-OUT
+		       (SI:STRING-TO-ASCII (FORMAT NIL "[~Dm" PARAM))))))
+	(LET ((PARAM (CADR (ASSQ (SI:CS-FACE (SI:PARSE-CHARACTER-STYLE STYLE))
+				 *CHARACTER-FACE-X3.64-CHARACTER-ATTRIBUTES*))))
+	  (IF (NULL PARAM)
+	      (FUNCALL CONTINUATION XSTREAM)
+	      (UNWIND-PROTECT
+		  (PROGN
+		    (SET-ATTRIBUTE PARAM)
+		    (FUNCALL CONTINUATION XSTREAM))
+		(SET-ATTRIBUTE 0)))))))
+
+(DEFMETHOD (BEGIN-CHARACTER-HIGHLIGHTING REMOTE-TERMINAL) () )
+(DEFMETHOD (END-CHARACTER-HIGHLIGHTING REMOTE-TERMINAL) () )
+
+(DEFMETHOD (BEGIN-CHARACTER-HIGHLIGHTING ASCII-TERMINAL) ()
+  (WHEN X3.64
+    (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[4m"))))
+
+(DEFMETHOD (END-CHARACTER-HIGHLIGHTING ASCII-TERMINAL) ()
+  (WHEN X3.64
+    (SEND RAW-STREAM :STRING-OUT (SI:STRING-TO-ASCII "[0m"))))
+
+(COMPILE-FLAVOR-METHODS ASCII-TERMINAL DISPLAY-ASCII-TERMINAL PRINTING-ASCII-TERMINAL)
+
+;;;; Commands
+
+(DEFVAR *REMOTE-TERMINAL-USER-COMMAND-TABLE* (CP:MAKE-COMMAND-TABLE "Remote terminal user"))
+
+(DEFUN PRINT-TERMINAL-HERALD (TERMINAL)
+  (SEND TERMINAL :CLEAR-WINDOW)
+  (SCT:PRINT-HERALD :BRIEF T :STREAM TERMINAL)
+  (SEND TERMINAL :TYO #\NEWLINE)
+  (LET (MORE-TYPEOUT)
+    (WHEN (SEND TERMINAL :ASCII-KEYBOARD?)
+      (FORMAT TERMINAL "Type ~C H for Help.~%" SPECIAL-KEY-ESCAPE)
+      (SETQ MORE-TYPEOUT T))
+    (LET ((USER CP:*USER-COMMAND-TABLE*)
+	  (REMOTE *REMOTE-TERMINAL-USER-COMMAND-TABLE*))
+      ;; Make commands accessible.  They are relatively harmless in
+      ;; normal command windows, where they will be left as a side
+      ;; effect.
+      (UNLESS (MEMQ REMOTE (CP::COMMAND-TABLE-INHERIT-FROM USER))
+	(SETF (SCL:SYMBOL-VALUE-IN-INSTANCE USER 'CP::INHERIT-FROM)
+	      (APPEND (CP::COMMAND-TABLE-INHERIT-FROM USER) (NCONS REMOTE)))))
+    (UNLESS (SEND TERMINAL :CURSOR-MOTION?)
+      (FORMAT TERMINAL "Type ~\CP:COMMAND\ to set the terminal type.~%"
+	      '(COM-SET-REMOTE-TERMINAL-OPTIONS))
+      (SETQ MORE-TYPEOUT T))
+    (WHEN (EQUAL (SEND *LOCAL-HOST* :SERVER-MACHINE) "YES")
+      (FORMAT TERMINAL "Warning:  ~A is a server machine.  Please exercise caution.~%"
+	      (SEND *LOCAL-HOST* :PRETTY-NAME))
+      (SETQ MORE-TYPEOUT T))
+    (IF MORE-TYPEOUT (SEND TERMINAL :TYO #\NEWLINE)))
+  (SEND TERMINAL :FORCE-OUTPUT))
+
+(CP:DEFINE-COMMAND (COM-SHOW-REMOTE-TERMINAL-OPTIONS
+		     :COMMAND-TABLE "Remote terminal user")
+    ()
+   (SHOW-TERMINAL-PARAMETERS))
+
+(CP:DEFINE-COMMAND (COM-SET-REMOTE-TERMINAL-OPTIONS
+		     :COMMAND-TABLE "Remote terminal user"
+		     :PROVIDE-OUTPUT-DESTINATION-KEYWORD NIL)
+    ()
+   (ASK-TERMINAL-PARAMETERS))
+
+(CP:DEFINE-COMMAND (COM-HALT-REMOTE-TERMINAL
+		     :COMMAND-TABLE "Remote terminal user"
+		     :PROVIDE-OUTPUT-DESTINATION-KEYWORD NIL)
+    ()
+   (IF (NOT (TYPEP TERMINAL-IO 'REMOTE-TERMINAL))
+       (FORMAT T "~&You are not in a remote terminal command loop.~%")
+       (WHEN (YES-OR-NO-P "Do you really want to close this terminal connection? ")
+	 (UNLESS NET:REMOTE-LOGIN-ON
+	   (WHEN (YES-OR-NO-P "Remote login is not enabled. Enable it before closing? ")
+	     (NET:REMOTE-LOGIN-ON)))
+	 (THROW 'REMOTE-TERMINAL-EXIT T))))
+
+;; NIL for WIDTH or HEIGHT means to leave that parameter unchanged.
+
+;; NIL for WIDTH or HEIGHT means to leave that parameter unchanged.
+
+(DEFUN SET-TERMINAL-PARAMETERS (&REST OPTIONS)
+  (DECLARE (ARGLIST &KEY X3.64 META-KEY? WIDTH HEIGHT MORE-P
+		    WHO-LINE-P WHO-LINE-UPDATE-FREQUENCY))
+  (WHEN (NOT (KEYWORDP (FIRST OPTIONS)))	;Compatibility
+    (SETQ OPTIONS (LOOP FOR OPTION IN OPTIONS FOR KEY IN '(:X3.64 :META-KEY? :WIDTH :HEIGHT)
+		    APPEND `(,KEY ,OPTION))))
+  (LET ((STREAM TERMINAL-IO))
+    (IF (NOT (REMOTE-TERMINAL-P STREAM))
+	(FORMAT T "~&This is not a remote terminal.~%")
+	(LET (WIDTH HEIGHT WHO-LINE-P WHO-LINE-P-P)
+	  (LOOP FOR (INDICATOR VALUE) ON OPTIONS BY 'CDDR
+		DO (CL:ECASE INDICATOR
+		     (:X3.64 (SEND STREAM :SET-X3.64 VALUE))
+		     (:META-KEY? (SEND STREAM :SET-META-KEY? VALUE))
+		     (:WIDTH (SETQ WIDTH VALUE))
+		     (:HEIGHT (SETQ HEIGHT VALUE))
+		     (:MORE-P (SEND STREAM :SET-MORE-P VALUE))
+		     (:WHO-LINE-P (SETQ WHO-LINE-P VALUE
+					WHO-LINE-P-P T))
+		     (:WHO-LINE-UPDATE-FREQUENCY
+		       (SEND STREAM :SET-WHO-LINE-UPDATE-FREQUENCY VALUE))))
+	  (WHEN (OR WIDTH HEIGHT)
+	    (SEND STREAM :SET-SIZE WIDTH HEIGHT))
+	  (WHEN WHO-LINE-P-P
+	    (SEND STREAM :SET-WHO-LINE-P WHO-LINE-P))))))
+
+(DEFUN ASK-TERMINAL-PARAMETERS ()
+  (LET ((STREAM TERMINAL-IO))
+    (IF (NOT (REMOTE-TERMINAL-P STREAM))
+	(FORMAT T "~&This is not a remote terminal.~%")
+	(LET ((OPTIONS NIL))
+	  (DW:ACCEPTING-VALUES ()
+	    (LABELS ((GET-DEFAULT (INDICATOR)
+		       (CL:GETF OPTIONS INDICATOR (SEND STREAM INDICATOR)))
+		     (ASK-QUESTION (INDICATOR TYPE PROMPT)
+		       (LET* ((DEFAULT (GET-DEFAULT INDICATOR))
+			      (VALUE (ACCEPT TYPE :PROMPT PROMPT :QUERY-IDENTIFIER INDICATOR
+					     :DEFAULT DEFAULT)))
+			 (UNLESS (EQL DEFAULT VALUE)
+			   (IF (MEMBER INDICATOR OPTIONS)
+			       (SETF (CL:GETF OPTIONS INDICATOR) VALUE)
+			       (SETQ OPTIONS (NCONC OPTIONS (LIST* INDICATOR VALUE NIL))))))))
+	      (WHEN (TYPEP STREAM 'ASCII-TERMINAL)
+		(ASK-QUESTION :X3.64 'BOOLEAN "Console supports X3.64 display codes")
+		(ASK-QUESTION :META-KEY? 'BOOLEAN "Console has a meta key")
+		(ASK-QUESTION :WIDTH '(CL:INTEGER 0) "Width in characters")
+		(ASK-QUESTION :HEIGHT '((SCL:TOKEN-OR-TYPE
+					  (("Infinity" . #.CL:MOST-POSITIVE-FIXNUM))
+					  (CL:INTEGER 0)))
+				      "Height in characters"))
+	      (WHEN (< (GET-DEFAULT :HEIGHT) CL:MOST-POSITIVE-FIXNUM)
+		(ASK-QUESTION :MORE-P 'BOOLEAN "More processing"))
+	      (WHEN (IF (TYPEP STREAM 'ASCII-TERMINAL)
+			(GET-DEFAULT :X3.64)
+			(SEND STREAM :CURSOR-MOTION?))
+		(ASK-QUESTION :WHO-LINE-P 'BOOLEAN "Display a status line")
+		(WHEN (GET-DEFAULT :WHO-LINE-P)
+		  (ASK-QUESTION :WHO-LINE-UPDATE-FREQUENCY
+				'((SCL:TOKEN-OR-TYPE
+				    ("Never" . NIL)
+				    TIME:TIME-INTERVAL-60THS))
+				"  Frequency of status line updates")))))
+	  (APPLY #'SET-TERMINAL-PARAMETERS OPTIONS)))))
+
+(DEFUN SHOW-TERMINAL-PARAMETERS ()
+  (LET ((STREAM TERMINAL-IO))
+    (IF (NOT (REMOTE-TERMINAL-P STREAM))
+	(FORMAT T "~&This is not a remote terminal.~%")
+      (WHEN (TYPEP STREAM 'ASCII-TERMINAL)
+	(FORMAT T "~&X3.64 is ~:[not ~]enabled.  Meta key is ~:[not ~]enabled.~%"
+		(SEND STREAM :X3.64) (SEND STREAM :META-KEY?)))
+      (FORMAT T "~&Width is ~D characters.  Height is ~D characters.
+More processing is ~:[not ~]enabled.~%"
+	      (SEND STREAM :WIDTH) (SEND STREAM :HEIGHT) (SEND STREAM :MORE-P))
+      (FORMAT T "~&Status line is ~:[not enabled~;updated every ~\TIME-INTERVAL\~].~%"
+	      (SEND STREAM :WHO-LINE-P)
+	      (LET ((INTERVAL (SEND STREAM :WHO-LINE-UPDATE-FREQUENCY)))
+		(AND INTERVAL (ROUND INTERVAL 60)))))))
+
+;; Eventually, all of ZWEI:*GLOBAL-INITIALIZATION-LIST* should be bound, instead of just
+;; ZWEI:*KILL-HISTORY*.  TRACE-OUTPUT used to be bound by WITH-COMMAND-LOOP-STREAM-BINDINGS.
+;; Since it isn't any more, bind it here.
+
+(DEFUN REMOTE-TERMINAL-TOP-LEVEL (TOP-LEVEL REMOTE-TERMINAL)
+  (LET ((ORIGINAL-REMOTE-LOGIN-STATE REMOTE-LOGIN-ON))
+    (UNWIND-PROTECT
+	(PROGN (START-REMOTE-TERMINAL-PROCESSES REMOTE-TERMINAL)
+	       (CATCH 'REMOTE-TERMINAL-EXIT
+		 (LET ((*REMOTE-TERMINAL-FOR-THIS-PROCESS* REMOTE-TERMINAL)
+		       (ZWEI:*KILL-HISTORY* (SEND REMOTE-TERMINAL :KILL-HISTORY))
+		      ;(TV:MORE-PROCESSING-GLOBAL-ENABLE T)	;Obey global value
+		       (TRACE-OUTPUT SYN-TERMINAL-IO))
+		   (FUNCALL TOP-LEVEL REMOTE-TERMINAL))))
+      ;; Do these cleanups D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")only0 if we were the last terminal to have logged in.
+      ;; If someone has since logged in from another terminal, then our disconnection
+      ;; should not reset anything they've set up.
+      (WHEN (EQ SI:*MOST-RECENT-LOGIN-TERMINAL* REMOTE-TERMINAL)
+	;; Since the login is being done for sake of someone who has disconnected,
+	;; no point in going into the debugger if an error occurs.
+	(UNWIND-PROTECT (IGNORE-ERRORS (LOGOUT))
+	  ;; Regardless of whether the logout completes successfully, restore the original
+	  ;; state of connectability.
+	  (REMOTE-LOGIN-ON ORIGINAL-REMOTE-LOGIN-STATE)))))
+  (STOP-REMOTE-TERMINAL-PROCESSES REMOTE-TERMINAL))
+
+;; Eventually, this should be SHARE-EDITOR or something.
+
+(DEFUN SHARE-KILL-HISTORY (&OPTIONAL (SHARE-P T))
+  (WHEN (TYPEP TERMINAL-IO 'REMOTE-TERMINAL)
+    (LET ((NEW-KILL-HISTORY
+	    (IF SHARE-P
+		(SYMEVAL-GLOBALLY 'ZWEI:*KILL-HISTORY*)
+		(SEND TERMINAL-IO :TERMINAL-KILL-HISTORY))))
+      (SEND TERMINAL-IO :SET-KILL-HISTORY NEW-KILL-HISTORY)
+      (SETQ ZWEI:*KILL-HISTORY* NEW-KILL-HISTORY))))
+
+;; A list of all remote terminals currently connected to this machine, both hardwired and via
+;; the network.
+
+;(DEFVAR *REMOTE-TERMINALS* NIL) moved to servers, in the base system
+
+;; Ascii terminals connected to serial lines.  Eventually, this database should be flushed
+;; in favor of host :PERIPHERAL properties.
+
+;(DEFVAR *SERIAL-TERMINALS* (MAKE-ARRAY `(2 4) :INITIAL-VALUE NIL))
+;
+;(DEFSUBST SERIAL-TERMINAL (UNIT) (AREF *SERIAL-TERMINALS* 0 UNIT))
+;(DEFSUBST SERIAL-PROCESS (UNIT) (AREF *SERIAL-TERMINALS* 1 UNIT))
+
+(defvar *SERIAL-TERMINALS* (cl:make-hash-table :test #'equal))
+
+(defstruct (serial-terminal-elt :conc-name :named)
+  terminal
+  process)
+
+(defsubst serial-terminal (unit) 
+  (let ((elt (gethash unit *serial-terminals*)))
+    (and elt (serial-terminal-elt-terminal elt))))
+(defun set-serial-terminal (unit term)
+  (let ((elt (gethash unit *serial-terminals*)))
+    (unless elt
+      (setq elt (make-serial-terminal-elt))
+      (setf (gethash unit *serial-terminals*) elt))
+    (setf (serial-terminal-elt-terminal elt) term)))
+(scl:defsetf serial-terminal set-serial-terminal)
+
+(defsubst serial-process (unit) 
+  (let ((elt (gethash unit *serial-terminals*)))
+    (and elt (serial-terminal-elt-process elt))))
+(defun set-serial-process (unit term)
+  (let ((elt (gethash unit *serial-terminals*)))
+    (unless elt
+      (setq elt (make-serial-terminal-elt))
+      (setf (gethash unit *serial-terminals*) elt))
+    (setf (serial-terminal-elt-process elt) term)))
+(scl:defsetf serial-process set-serial-process)
+
+(DEFUN ENABLE-SERIAL-TERMINAL (&REST OPTIONS
+			       &KEY (TOP-LEVEL 'SI:LISP-TOP-LEVEL1) (HERALD T)
+			       (X3.64 NIL) (WIDTH 79.) (HEIGHT 1_30.)
+			       (UNIT 1) (SHARE-KILL-HISTORY NIL)
+			       (STATUS-LINE-P NIL) (STATUS-LINE-UPDATE-FREQUENCY 300.)
+			       &ALLOW-OTHER-KEYS)
+;  (CHECK-ARG UNIT
+;	     (AND (FIXP UNIT) ( 0 UNIT
+;				 (ARRAY-DIMENSION-N 2 *SERIAL-TERMINALS*)))
+;	     "a valid serial port number")
+  (LET ((TERMINAL (SERIAL-TERMINAL UNIT))
+	(PROCESS (SERIAL-PROCESS UNIT)))
+    (COND (TERMINAL
+	   (FERROR "Serial unit ~:[~A~;#~D~] is currently in use by terminal ~S and process ~S"
+		   (NUMBERP UNIT) UNIT TERMINAL PROCESS))
+	  (T (SETQ TERMINAL
+		   (MAKE-INSTANCE (IF X3.64 'DISPLAY-ASCII-TERMINAL 'PRINTING-ASCII-TERMINAL)
+				  ;; :X3.64 X3.64
+				  :WIDTH WIDTH :HEIGHT HEIGHT
+				  :KILL-HISTORY (IF SHARE-KILL-HISTORY ZWEI:*KILL-HISTORY*)
+				  :WHO-LINE-P STATUS-LINE-P
+				  :WHO-LINE-UPDATE-FREQUENCY STATUS-LINE-UPDATE-FREQUENCY
+				  :RAW-STREAM (LEXPR-FUNCALL
+						#'SI:MAKE-SERIAL-STREAM
+						:UNIT UNIT :PARITY NIL :NUMBER-OF-DATA-BITS 8
+						(SI:REM-KEYWORDS
+						  OPTIONS
+						  '(:TOP-LEVEL :HERALD :X3.64
+						    :WIDTH :HEIGHT :KILL-HISTORY :STATUS-LINE-P
+						    :STATUS-LINE-UPDATE-FREQUENCY)))))
+	     (send TERMINAL :set-x3.64 x3.64)
+	     (SETF (SERIAL-TERMINAL UNIT) TERMINAL)
+	     (IF HERALD (PRINT-TERMINAL-HERALD TERMINAL))
+	     (PUSH TERMINAL *REMOTE-TERMINALS*)
+	     (SETF (SERIAL-PROCESS UNIT)
+		   (PROCESS-RUN-RESTARTABLE-FUNCTION
+		     (FORMAT NIL "Remote Terminal ~D" UNIT)
+		     'REMOTE-TERMINAL-TOP-LEVEL TOP-LEVEL TERMINAL)))))
+  T)
+
+(DEFUN DISABLE-SERIAL-TERMINAL (UNIT)
+;  (CHECK-ARG UNIT
+;	     (AND (FIXP UNIT) ( #+CADR 1 #+3600 0 UNIT
+;				 (ARRAY-DIMENSION-N 2 *SERIAL-TERMINALS*)))
+;	     "a valid serial port number")
+  (LET ((TERMINAL (SERIAL-TERMINAL UNIT))
+	(PROCESS (SERIAL-PROCESS UNIT)))
+    (COND ((NOT TERMINAL)
+	   (FERROR "Serial unit ~:[~A~;#~D~] is not currently in use" (NUMBERP UNIT) UNIT))
+	  (T (SETQ *REMOTE-TERMINALS* (DELQ TERMINAL *REMOTE-TERMINALS*))
+	     (PROCESS-KILL PROCESS)
+	     (SEND TERMINAL :CLEAR-OUTPUT)
+	     (SEND TERMINAL :CLEAR-WINDOW)
+	     (SEND (SEND TERMINAL :RAW-STREAM) :CLOSE)
+	     (SETF (SERIAL-TERMINAL UNIT) NIL)
+	     (SETF (SERIAL-PROCESS UNIT) NIL))))
+  T)

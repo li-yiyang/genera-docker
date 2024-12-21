@@ -1,0 +1,474 @@
+;;; -*- Mode: Lisp; Syntax: Common-Lisp; Package: TCP; Base: 10; Lowercase: Yes -*-
+;;; Useful definitions for file transfer protocols.
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;(export '*tcp-ftp-debug-p*)
+(defvar *tcp-ftp-debug-p* nil
+  "T to trace all FTP commands and responses.")
+
+;;; STREAM mode input
+
+(defflavor ftp-stream-mode-input-mixin () (si:input-pointer-remembering-mixin)
+  :abstract-flavor
+  (:required-flavors si:basic-buffered-input-stream)
+  (:required-instance-variables stream))
+
+(defmethod (:next-input-buffer ftp-stream-mode-input-mixin) (&optional ignore)
+  (send stream :read-input-buffer))
+
+(defmethod (:discard-input-buffer ftp-stream-mode-input-mixin) (ignore)
+  (send stream :advance-input-buffer))
+
+(defmethod (:close ftp-stream-mode-input-mixin :before) (&optional abortp)
+  (unless abortp (send stream :close)))
+
+;;; BLOCK mode input
+
+(defresource ftp-block-mode-buffer (&optional (length 400))
+  :constructor (make-array length :element-type '(unsigned-byte 8))
+  :matcher ( (string-length object) length))
+
+(defconstant ftp-block-eor 128)
+(defconstant ftp-block-eof 64)
+(defconstant ftp-block-error 32)
+(defconstant ftp-block-restart 16)
+
+(defflavor ftp-block-mode-input-mixin
+	((header (make-array 3 :element-type '(unsigned-byte 8))))
+	()
+  :abstract-flavor
+  (:required-flavors si:basic-buffered-input-stream)
+  (:required-instance-variables stream))
+
+(defmethod (:next-input-buffer ftp-block-mode-input-mixin) (&optional ignore)
+  (loop until (logtest ftp-block-eof (aref header 0))
+	do (multiple-value-bind (header-length eof)
+	       (send stream :string-in nil header)
+	     (when (or eof (not (= header-length 3)))
+	       (error "Block mode stream closed unexpectedly.")))
+	for len = (dpb (aref header 1) (byte 8 8) (aref header 2))
+	unless (zerop len)
+	do (let ((buffer (allocate-resource 'ftp-block-mode-buffer len)))
+	     (multiple-value-bind (length eof)
+		 (send stream :string-in nil buffer 0 len)
+	       (when (or eof (not (= length len)))
+		 (error "Block mode stream closed unexpectedly.")))
+	     (unless (logtest ftp-block-restart (aref header 0))
+	       (return (values buffer 0 len))))))
+
+(defmethod (:discard-input-buffer ftp-block-mode-input-mixin) (buffer)
+  (deallocate-resource 'ftp-block-mode-buffer buffer))
+
+;;; BINARY input
+
+(defflavor ftp-binary-input-mixin
+	((bits 0)
+	 (number-of-bits 0)
+	 byte-size
+	 (fs:plist nil))
+	(si:binary-stream)
+  :abstract-flavor
+  (:gettable-instance-variables byte-size)
+  (:initable-instance-variables byte-size))
+
+(defmethod (make-instance ftp-binary-input-mixin :after) (&rest ignore)
+  (setf (getf fs:plist :byte-size) byte-size))
+
+(defwhopper (:tyi ftp-binary-input-mixin) (&optional eof)
+  (loop until ( number-of-bits byte-size)
+	as ch = (continue-whopper eof)
+	when (null ch)
+	  return nil
+		 ;; Note: first bits to come in are the MOST significant in this
+		 ;; protocol, unlike the fast lisp machine convention.
+	do (setq bits (dpb bits (byte number-of-bits 8) ch))
+	   (incf number-of-bits 8)
+	finally
+	  (decf number-of-bits byte-size)
+	  (return (prog1 (ldb (byte byte-size number-of-bits) bits)
+			 (setq bits (ldb (byte number-of-bits 0) bits))))))
+
+(defmethod (:untyi ftp-binary-input-mixin) (char)
+  (setf bits (dpb char (byte byte-size number-of-bits) bits))
+  (incf number-of-bits byte-size))
+
+(defmethod (:set-pointer ftp-binary-input-mixin :after) (position)
+  (if (zerop position)
+      (progn (setf bits 0)
+	     (setf number-of-bits 0))
+      (error "You can't reposition binary FTP streams.")))
+
+;;; Little-ender binary for Unix.
+
+(defflavor ftp-little-end-binary-input-mixin
+	((bits 0)
+	 (number-of-bits 0)
+	 byte-size
+	 (fs:plist nil))
+	(si:binary-stream)
+  :abstract-flavor
+  (:gettable-instance-variables byte-size)
+  (:initable-instance-variables byte-size))
+
+(defmethod (make-instance ftp-little-end-binary-input-mixin :after) (&rest ignore)
+  (setf (getf fs:plist :byte-size) byte-size))
+
+(defwhopper (:operation-handled-p ftp-little-end-binary-input-mixin) (op)
+  (and (neq op ':line-in)
+       (neq op :string-line-in)
+       (continue-whopper op)))
+
+(defwhopper (:tyi ftp-little-end-binary-input-mixin) (&optional eof)
+  (loop until ( number-of-bits byte-size)
+	as ch = (continue-whopper eof)
+	when (null ch)
+	  return nil
+		 ;; Note: first bits to come in are the MOST significant in this
+		 ;; protocol, unlike the fast lisp machine convention.
+	do (setq bits (dpb ch (byte 8 number-of-bits) bits))
+	   (incf number-of-bits 8)
+	finally
+	  (decf number-of-bits byte-size)
+	  (return (prog1 (ldb (byte byte-size 0) bits)
+			 (setq bits (ash bits (- byte-size)))))))
+
+(defmethod (:untyi ftp-little-end-binary-input-mixin) (char)
+  (setf bits (+ char (ash bits byte-size)))
+  (incf number-of-bits byte-size))
+
+(defmethod (:set-pointer ftp-little-end-binary-input-mixin :after) (position)
+  (if (zerop position)
+      (progn (setf bits 0)
+	     (setf number-of-bits 0))
+      (error "You can't reposition binary FTP streams.")))
+
+;;; CHARACTER input
+
+(defflavor ftp-character-input-mixin ()
+	   (si:buffered-line-input-stream
+	    si:fast-ascii-translating-input-mixin)
+  :abstract-flavor
+  (:init-keywords :byte-size))
+
+(defmethod (:characters ftp-character-input-mixin) () t)
+
+(defmethod (:element-type ftp-character-input-mixin) () 'cl:string-char)
+
+;;; IMAGE input
+
+(defflavor ftp-image-input-mixin
+	(byte-size
+	 (fs:plist nil))
+	(si:binary-stream)
+  :abstract-flavor
+  (:gettable-instance-variables byte-size)
+  (:initable-instance-variables byte-size))
+
+(defmethod (make-instance ftp-image-input-mixin :after) (&rest ignore)
+  (setf (getf fs:plist :byte-size) byte-size))
+
+;;; STREAM mode output
+
+(defflavor ftp-stream-mode-output-mixin () ()
+  :abstract-flavor
+  (:required-flavors si:basic-buffered-output-stream)
+  (:required-instance-variables stream))
+
+(defmethod (:new-output-buffer ftp-stream-mode-output-mixin) ()
+  (send stream :get-output-buffer))
+
+(defmethod (:send-output-buffer ftp-stream-mode-output-mixin) (ignore end &optional ignore)
+  (send stream :advance-output-buffer end))
+
+(defmethod (:discard-output-buffer ftp-stream-mode-output-mixin) (ignore))
+
+(defmethod (:close ftp-stream-mode-output-mixin :after) (&optional abortp)
+  (unless abortp (send stream :close)))
+
+;;; BLOCK mode output
+
+(defflavor ftp-block-mode-output-mixin () ()
+  :abstract-flavor
+  (:required-flavors si:basic-buffered-output-stream)
+  (:required-instance-variables stream))
+
+(defmethod (:new-output-buffer ftp-block-mode-output-mixin) ()
+  (let ((buffer (allocate-resource 'ftp-block-mode-buffer)))
+    (values buffer 3 (string-length buffer))))
+
+(defmethod (:send-output-buffer ftp-block-mode-output-mixin) (buffer end &optional ignore)
+  (setf (aref buffer 0) 0)
+  (setf (aref buffer 1) (lsh end -8))
+  (setf (aref buffer 2) (logand (- end 3) #x+FF))
+  (send stream :string-out buffer 0 end)
+  (deallocate-resource 'ftp-block-mode-buffer buffer))
+
+(defmethod (:discard-output-buffer ftp-block-mode-output-mixin) (buffer)
+  (deallocate-resource 'ftp-block-mode-buffer buffer))
+
+(defmethod (:close ftp-block-mode-output-mixin :before) (&optional abortp)
+  (unless abortp
+    (send self :force-output)
+    (send stream :tyo ftp-block-eof)
+    (send stream :tyo 0)
+    (send stream :tyo 0)
+    (send stream :finish)))
+
+;;; CHARACTER output
+
+;;; CHARACTER output
+
+(defflavor ftp-character-output-mixin ()
+	   (si:line-output-stream-mixin
+	    si:fast-ascii-translating-output-mixin
+	    si:character-stream)
+  :abstract-flavor
+  (:init-keywords :byte-size))
+
+(defmethod (:characters ftp-character-output-mixin) () t)
+
+(defmethod (:element-type ftp-character-output-mixin) () 'cl:string-char)
+
+;;; BINARY output
+
+(defflavor ftp-binary-output-mixin
+	((bits 0)
+	 (number-of-bits 0)
+	 byte-size
+	 (fs:plist nil))
+	(si:binary-stream)
+  :abstract-flavor
+  (:gettable-instance-variables byte-size)
+  (:initable-instance-variables byte-size))
+
+;;; The :byte-size gettable instance variable above is shadowed by 
+;;; si:file-data-stream, which gets mixed in more specifically.
+;;; That mixin wants the byte size to be on the property list.
+;;; It is simpler to do that than to fix the flavor ordering.
+
+(defmethod (make-instance ftp-binary-output-mixin :after) (&rest ignore)
+  (setf (getf fs:plist :byte-size) byte-size))
+
+(defwhopper (:tyo ftp-binary-output-mixin) (ch &optional ignore)
+  ;; Above big-ender note applies here too.
+  (setq bits (dpb bits (byte number-of-bits byte-size) ch))
+  (incf number-of-bits byte-size)
+  (loop while ( number-of-bits 8)
+	doing (decf number-of-bits 8)
+	(continue-whopper (ldb (byte 8 number-of-bits) bits))
+	(setq bits (ldb (byte number-of-bits 0) bits))))
+
+;;; Little-end binary output for Unix
+
+(defflavor ftp-little-end-binary-output-mixin
+	((bits 0)
+	 (number-of-bits 0)
+	 byte-size
+	 (fs:plist nil))
+	(si:binary-stream)
+  :abstract-flavor
+  (:gettable-instance-variables byte-size)
+  (:initable-instance-variables byte-size))
+
+(defmethod (make-instance ftp-little-end-binary-output-mixin :after) (&rest ignore)
+  (setf (getf fs:plist :byte-size) byte-size))
+
+(defwhopper (:operation-handled-p ftp-little-end-binary-output-mixin) (op)
+  (and (neq op ':line-out)
+       (continue-whopper op)))
+
+(defwhopper (:tyo ftp-little-end-binary-output-mixin) (ch &optional ignore)
+  (setq bits (dpb ch (byte byte-size number-of-bits) bits))
+  (incf number-of-bits byte-size)
+  (loop while ( number-of-bits 8)
+	doing (decf number-of-bits 8)
+	      (continue-whopper (ldb (byte 8 0) bits))
+	      (setq bits (ash bits -8))))
+
+;;; CHARACTER output
+
+(defflavor ftp-image-output-mixin
+	(byte-size
+	 (fs:plist nil))
+	(si:binary-stream)
+  :abstract-flavor
+  (:gettable-instance-variables byte-size)
+  (:initable-instance-variables byte-size))
+
+(defmethod (make-instance ftp-image-output-mixin :after) (&rest ignore)
+  (setf (getf fs:plist :byte-size) byte-size))
+
+
+;; The real mixins
+
+(defflavor ftp-stream-mode-character-input-mixin ()
+	   (ftp-character-input-mixin
+	    ftp-stream-mode-input-mixin
+	    si:areg-caching-buffered-input-stream-mixin
+	    si:buffered-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-stream-mode-binary-input-mixin ()
+	   (ftp-binary-input-mixin
+	    ftp-stream-mode-input-mixin
+	    si:areg-caching-buffered-input-stream-mixin
+	    si:buffered-tyi-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-stream-mode-little-end-binary-input-mixin ()
+	   (ftp-little-end-binary-input-mixin
+	    ftp-stream-mode-input-mixin
+	    si:areg-caching-buffered-input-stream-mixin
+	    si:buffered-tyi-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-stream-mode-image-input-mixin ()
+	   (ftp-image-input-mixin
+	    ftp-stream-mode-input-mixin
+	    si:areg-caching-buffered-input-stream-mixin
+	    si:buffered-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-stream-mode-character-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-character-output-mixin
+	    ftp-stream-mode-output-mixin
+	    si:areg-caching-buffered-output-stream-mixin
+	    si:buffered-output-stream
+	    ))
+
+(defflavor ftp-stream-mode-binary-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-binary-output-mixin
+	    ftp-stream-mode-output-mixin
+	    si:areg-caching-buffered-output-stream-mixin
+	    si:buffered-tyo-output-stream
+	    ))
+
+(defflavor ftp-stream-mode-little-end-binary-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-little-end-binary-output-mixin
+	    ftp-stream-mode-output-mixin
+	    si:areg-caching-buffered-output-stream-mixin
+	    si:buffered-tyo-output-stream
+	    ))
+
+(defflavor ftp-stream-mode-image-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-image-output-mixin
+	    ftp-stream-mode-output-mixin
+	    si:areg-caching-buffered-output-stream-mixin
+	    si:buffered-output-stream
+	    ))
+
+(defflavor ftp-block-mode-character-input-mixin ()
+	   (ftp-character-input-mixin
+	    ftp-block-mode-input-mixin
+	    si:buffered-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-block-mode-binary-input-mixin ()
+	   (ftp-binary-input-mixin
+	    ftp-block-mode-input-mixin
+	    si:buffered-tyi-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-block-mode-little-end-binary-input-mixin ()
+	   (ftp-little-end-binary-input-mixin
+	    ftp-block-mode-input-mixin
+	    si:buffered-tyi-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-block-mode-image-input-mixin ()
+	   (ftp-image-input-mixin
+	    ftp-block-mode-input-mixin
+	    si:buffered-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor ftp-block-mode-character-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-character-output-mixin
+	    ftp-block-mode-output-mixin
+	    si:buffered-output-stream
+	    si:character-stream
+	    ))
+
+(defflavor ftp-block-mode-binary-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-binary-output-mixin
+	    ftp-block-mode-output-mixin
+	    si:buffered-tyo-output-stream
+	    ))
+
+(defflavor ftp-block-mode-little-end-binary-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-little-end-binary-output-mixin
+	    ftp-block-mode-output-mixin
+	    si:buffered-tyo-output-stream
+	    ))
+
+(defflavor ftp-block-mode-image-output-mixin ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-image-output-mixin
+	    ftp-block-mode-output-mixin
+	    si:buffered-output-stream
+	    ))

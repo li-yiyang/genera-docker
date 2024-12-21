@@ -1,0 +1,823 @@
+;;; -*- Mode:LISP; Package:Language-Tools; Syntax:Common-Lisp -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Written April 1983 by David A. Moon for use by the Common Lisp community
+;;; based on a design by Alan Bawden
+
+;;; Lambda-binding optimizer
+
+;--- Common Lisp version conversion issues:
+;--- Depends on CONDITION-CASE which Common Lisp doesn't have yet (for exceptions)
+;--- Is someone really going to force me to use <= rather than  ?  Ugh, bletch.
+
+;;; The entry functions to this module are 
+;;; LET-SUBST, LET*-SUBST, CONSTRUCT-SUBST-DEFINITION
+;;; ONCE-ONLY, EXPAND-SUBST-DEFINITION-INTERNAL
+;;;
+;;; EXPAND-SUBST-DEFINITION-INTERNAL is not exported, it's only called
+;;; from SI:EXPAND-SUBST-DEFINITION.
+
+;;; The idea of LET-SUBST is that
+;;;	(LET-SUBST vars vals form)
+;;; could return
+;;;	`((LAMBDA (,@vars) ,form) ,@vals)
+;;; but normally it will analyze the body and the vals and substitute a val
+;;; for occurrences of the corresponding var inside the body if at all possible.
+;;; The vars had better not have been declared special or the analysis won't work.
+;;; The expansion will not always be a LET.  If the body form needs to scope
+;;; declarations or BINDs, it should contain an explicit LET or LOCALLY.
+(DEFUN LET-SUBST (VARS VALS FORM &OPTIONAL ENV)
+  (WHEN (OR (NULL VARS) (CONSTANTP FORM ENV)) (RETURN-FROM LET-SUBST FORM))
+  ;; Do something reasonable if the form cannot be understood
+  (CONDITION-CASE (FAILURE)
+       ;; First see how the form uses the vars
+       (LET ((VARNOTES (LOOP FOR VAR IN VARS COLLECTING (MAKE-VARNOTE :NAME VAR))))
+	 (ANNOTATE-FORM FORM VARNOTES ENV)
+	 ;; Then decide which variables are to be substituted	
+	 (LET-SUBST-INTERNAL VARS VALS VARNOTES FORM T ENV))
+     (FORM-NOT-UNDERSTOOD
+       (WARN "LET-SUBST is punting because ~A" FAILURE)
+       `(LET ,(MAPCAR #'LIST VARS VALS) ,FORM))))
+
+;;; LET*-SUBST is similar, but uses serial binding
+(DEFUN LET*-SUBST (VARS VALS FORM &OPTIONAL ENV)
+  (WHEN (OR (NULL VARS) (CONSTANTP FORM ENV)) (RETURN-FROM LET*-SUBST FORM))
+  ;; Do something reasonable if the form cannot be understood
+  (CONDITION-CASE (FAILURE)
+       ;; First see how the form uses the vars
+       (LET ((VARNOTES (LOOP FOR VAR IN VARS COLLECTING (MAKE-VARNOTE :NAME VAR))))
+	 (ANNOTATE-FORM FORM VARNOTES ENV)
+	 ;; Then decide which variables are to be substituted	
+	 (LET-SUBST-INTERNAL VARS VALS VARNOTES FORM NIL ENV))
+     (FORM-NOT-UNDERSTOOD
+       (WARN "LET*-SUBST is punting because ~A" FAILURE)
+       `(LET* ,(MAPCAR #'LIST VARS VALS) ,FORM))))
+
+#||
+(DEFUN LET-SUBST-INTERNAL (VARS VALS VARNOTES FORM PARALLEL ENV &KEY BIND-GENSYMS)
+  `(,(IF PARALLEL `LET `LET*) ,(MAPCAR #'LIST VARS VALS)
+    ,FORM))
+||#
+
+(DEFUN LET-SUBST-INTERNAL (VARS VALS VARNOTES FORM PARALLEL ENV &KEY BIND-GENSYMS)
+  (LET* (;; Decide which variables are to be substituted
+	 ;; DECISIONS is a list parallel to VARS and VALS
+	 ;; Each element of this list is a list (substp notepad freevars)
+	 ;;  substp is T if the value is to be substituted, NIL if not
+	 ;;  notepad is the annotation of the value
+	 ;;  freevars is the list of variables used freely by the value
+	 (DECISIONS (LET-SUBST-DECIDE VARS VALS VARNOTES VARNOTES PARALLEL ENV))
+	 ;; Collect the variables that are used free by the forms that
+	 ;; are getting substituted into the FORM
+	 (FREE-VARS (LOOP FOR (SUBSTP NIL FREE) IN DECISIONS
+			  WHEN SUBSTP
+			    APPEND FREE))
+	 ;; This special variable accumulates the substitutions to be done
+	 (SUBSTITUTIONS NIL)
+	 (DECLARATIONS NIL)
+	 (PROGNS NIL)
+	 (MUST-LET NIL)
+	 ;; Collect the bindings for the unsubstituted variables.
+	 ;; This may involve renaming non-substituted variables that conflict with
+	 ;; substituted forms that are now being moved inside their scope.
+	 (LETS (LOOP FOR (SUBSTP) IN DECISIONS
+		     FOR VAR IN VARS
+		     FOR VAL IN VALS
+		     FOR VARNOTE IN VARNOTES
+		     DO (WHEN (AND (NOT PARALLEL)
+				   SUBSTITUTIONS)
+			  (SETQ VAL (LET-SUBST-COPYFORMS SUBSTITUTIONS VAL ENV)))
+		     WHEN (NOT SUBSTP)		;This variable isn't going away
+		       ;;Does it need to be renamed?
+		       DO (WHEN (AND (OR BIND-GENSYMS
+					 (MEMBER VAR FREE-VARS))
+				     (NOT (VARNOTE-SPECIAL-P)))
+			    (PUSH (CONS VAR (SETQ VAR (GENSYM))) SUBSTITUTIONS))
+			  (WHEN (VARNOTE-SPECIAL-P)
+			    (PUSH `(SPECIAL ,VAR) DECLARATIONS))
+			  (UNLESS (OR (NULL VARNOTE) (EQ (VARNOTE-VALUE-TYPE) T))
+			    (PUSH `(TYPE ,(VARNOTE-VALUE-TYPE) ,VAR) DECLARATIONS))
+			  (COND ((AND VARNOTE
+				      (ZEROP (VARNOTE-N-USAGES))
+				      (VARNOTE-NOTEPAD))
+				 (PUSHNEW VAR PROGNS)
+				 (SETF MUST-LET T))
+				(T
+				 (SETF MUST-LET T)))
+		       AND COLLECT (LIST VAR VAL)
+		     ELSE DO (LET ((TYPE (VARNOTE-VALUE-TYPE)))
+			       (UNLESS (OR (NULL TYPE) (EQ TYPE T))
+				 (SETF VAL `(THE ,TYPE ,VAL))))
+			     (UNLESS (OR (AND (CONSP VAL)
+					      (EQ (CAR VAL) 'VALUES)
+					      (CONSP (CDR VAL))
+					      (NULL (CDDR VAL)))
+					 (CONSTANTP VAL ENV)
+					 (VARIABLEP VAL ENV))
+			       ;; already (values x) or a constant or a variable
+			       (SETF VAL `(VALUES ,VAL)))
+			     (WHEN (AND VARNOTE
+					(ZEROP (VARNOTE-N-USAGES))
+					(SYMBOLP VAL)
+					(NOT (COMPILER:SELF-EVALUATING-SYMBOL-P VAL)))
+			       (PUSHNEW VAL PROGNS))
+			     (PUSH (CONS VAR VAL) SUBSTITUTIONS))))
+    ;; Generate the substituted FORM
+    (WHEN SUBSTITUTIONS
+      (SETQ FORM (LET-SUBST-COPYFORMS SUBSTITUTIONS FORM ENV)))
+    ;; This is only so the compiler can tell that they were "used".
+    (WHEN PROGNS
+      (SETF FORM `(PROGN ,@PROGNS ,FORM)))
+    ;; Three cases: no LET required, no LET variables used in FORM, or a LET is required
+    (WHEN LETS
+      (IF MUST-LET
+	  (SETF FORM `(,(IF PARALLEL `LET `LET*) ,LETS
+		       ,@(WHEN DECLARATIONS `((DECLARE ,@DECLARATIONS)))
+		       (DECLARE (COMPILER:VARIABLE-INLINABLE ,@(MAPCAR #'FIRST LETS)))
+		       ,FORM))
+	  (SETF FORM `(PROGN ,@(MAPCAR #'SECOND LETS) ,FORM))))
+    FORM))
+
+(DEFUN LET-SUBST-COPYFORMS (SUBSTITUTIONS BODY ENV)
+  ;; Bind the variables being substituted for, to hide any symbol-macros with the same names
+  (SI:WITH-INTERPRETER-ENVIRONMENT
+    (NEW-ENV ENV
+	     (APPEND (MAPCAR #'(LAMBDA (X) (LIST (CAR X) NIL)) SUBSTITUTIONS)
+		     (POP ENV))
+	     (POP ENV) (POP ENV) (POP ENV) (POP ENV))
+    (COPYFORMS #'(LAMBDA (FORM KIND IGNORE)
+		   (BLOCK LET-SUBST-COPY
+		     (CASE KIND
+		       ((SYMEVAL SET)
+			(UNLESS (MEMBER FORM *MAPFORMS-BOUND-VARIABLES*)
+			  (LET ((TEM (ASSOC FORM SUBSTITUTIONS)))
+			    (WHEN TEM
+			      ;;Make substitution and don't subst inside it
+			      (RETURN-FROM LET-SUBST-COPY (VALUES (CDR TEM) T)))))))
+		     FORM))
+	       BODY
+;	       :BACK-TRANSLATE-MACROS T
+	       :BOUND-VARIABLES NIL :ENVIRONMENT NEW-ENV)))
+
+;For EXPAND-SUBST-DEFINITION
+(DEFVAR *INNOCUOUS-VARNOTE* (MAKE-VARNOTE :NAME '*INNOCUOUS-VARNOTE*
+					  :N-USAGES 1))
+
+;A debugging feature
+(DEFVAR *LET-SUBST-DECIDE-TRACE* NIL)
+
+;Replace this (in LET-SUBST-DECIDE) with AND to dike out the tracing code
+(DEFMACRO LET-SUBST-DECIDE-TRACE-HACK (&REST FORMS)
+  (COND ((NULL FORMS) T)
+	(T (LET ((FORM (CAR FORMS)))
+	     `(COND (,FORM (LET-SUBST-DECIDE-TRACE-HACK . ,(CDR FORMS)))
+		    (*LET-SUBST-DECIDE-TRACE*
+		     (LET-SUBST-DECIDE-TRACE ',FORM VAL VAR
+		       ;; If FORM is a function call, report its arguments
+		       ,@(AND (FUNCTIONP (CAR FORM) NIL)
+			      (LOOP FOR ARG IN (CDR FORM)
+				    COLLECT `',ARG
+				    COLLECT `,ARG)))
+		     NIL))))))
+
+(DEFUN LET-SUBST-DECIDE-TRACE (FORM VAL VAR &REST ARGS)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (CASE *LET-SUBST-DECIDE-TRACE*
+    (BREAK
+      (BREAK "~S returned NIL, hence ~S will not be substituted for ~S.~@[~%~{~S=~S~^, ~}~]"
+	     FORM VAL VAR ARGS))
+    (OTHERWISE
+      (FORMAT *TRACE-OUTPUT* "~2&~S returned NIL, hence ~S will not be substituted for ~S.~
+				~@[~%~{~S=~S~^, ~}~]"
+	      FORM VAL VAR ARGS)))
+  NIL)
+
+;; Decide which values may be substituted in.
+;; This has to be done right to left (by recursion) so that we know
+;; whether we will be moving a value past any value to its right, and
+;; so that with serial binding the forms to the right of a variable
+;; act like part of the body as far as that variable is concerned.
+(DEFUN LET-SUBST-DECIDE (VARS VALS VARNOTES RIGHT-VARNOTES PARALLEL ENV &AUX VNP)
+  (WHEN RIGHT-VARNOTES
+    (LET ((VAR (POP VARS))
+	  (VAL (POP VALS))
+	  (VARNOTE (OR (CAR RIGHT-VARNOTES) *INNOCUOUS-VARNOTE*))
+	  (DECISIONS (LET-SUBST-DECIDE
+		       VARS VALS VARNOTES (CDR RIGHT-VARNOTES) PARALLEL ENV)))
+      VAR					;not actually used
+      ;; Now we have the value form to be substituted, the information
+      ;; about where it will go, and the decisions for the values
+      ;; to its right.  Analyze the value form.
+      (LET ((SERIAL-VARNOTES
+	      (AND (NOT PARALLEL)
+		   (LOOP FOR VNS ON VARNOTES
+			 UNTIL (EQ VNS RIGHT-VARNOTES)
+			 FOR VN = (CAR VNS)
+			 COLLECT (AND VN
+				      (MAKE-VARNOTE :NAME (VARNOTE-NAME VN)
+						    :NOTEPAD (FORK-NOTEPAD (VARNOTE-NOTEPAD))
+						    :VARIABLE-ENV (VARNOTE-VARIABLE-ENV)
+						    :BLOCK-ENV (VARNOTE-BLOCK-ENV)
+						    :TAG-ENV (VARNOTE-TAG-ENV)
+						    :FUNCTION-ENV (VARNOTE-FUNCTION-ENV)))))))
+	;; SERIAL-VARNOTES has an entry for each variable to the left that will already
+	;; be bound at the time VAL is evaluated.  Each entry assumes that VAL contains
+	;; one or more references to its variable; if VAL does not reference the variable,
+	;; the entry will be ignored by JOIN-VARNOTES since VARNOTE-N-USAGES will be zero.
+	;; ANNOTATE-FORM updates the SERIAL-VARNOTES to reflect what would happen to those
+	;; variables if VAL was in fact substituted for VAR, thus moving references to
+	;; those variables to a different environment.
+	;; At the same time, it collects information about VAL so we know
+	;; whether it can safely be substituted.
+	(MULTIPLE-VALUE-BIND (NOTEPAD FREE-VARIABLES FREE-BLOCKS FREE-TAGS REPLICABILITY
+			      FREE-FUNCTIONS)
+	    (ANNOTATE-FORM VAL SERIAL-VARNOTES ENV (VARNOTE-NOTEPAD))
+	  ;; Note that substituting a lambda expression for a variable cannot change
+	  ;; where side-effects in the body of the lambda expression happen, since it
+	  ;; will still be called at the same places.  The only issue with a lambda
+	  ;; expression is what free references it makes.
+	  ;;--- It would be better if this knew about forms that return lambda-expressions
+	  ;;--- without calling them, rather than knowing only about bare lambda-expressions
+	  ;;--- but that's too hard.
+	  (WHEN (AND (LISTP VAL)
+		     (CASE (CAR VAL)
+		       (LAMBDA T)
+		       (FUNCTION (SI:INTERPRETED-LAMBDA-P (SECOND VAL))))
+		     (NOT (SI:LOCAL-FUNCTION-DEFINITION (CAR VAL) ENV)))
+	    (SETF (NOTEPAD-READ) NIL
+		  (NOTEPAD-WRITTEN) NIL))
+	  (LET ((DECISION
+		  (LET-SUBST-DECIDE-TRACE-HACK
+		    (NOT (VARNOTE-SPECIAL-P))
+		    ;; Variable has not been used in an unsubstitutable way
+		    (SETQ VNP (VARNOTE-NOTEPAD))
+		    ;; Value does not have a free variable reference captured by body form
+		    ;;(DISJOINT-SETS FREE-VARIABLES (VARNOTE-VARIABLE-ENV))
+		    ;; The above test is made stronger to allow for the fact that
+		    ;; an arbitrary side-effect might be influenced by the binding
+		    ;; of a special variable.  Here we assume that all variables
+		    ;; in varnote-variable-env might have been declared special,
+		    ;; had their LOCF taken, or otherwise be "global" in scope.
+		    (DISJOINT-SETS (NOTEPAD-READ) (VARNOTE-VARIABLE-ENV))
+		    (DISJOINT-SETS (NOTEPAD-WRITTEN) (VARNOTE-VARIABLE-ENV))
+		    ;; No captured free block references
+		    (DISJOINT-SETS FREE-BLOCKS (VARNOTE-BLOCK-ENV))
+		    ;; No captured free go tag references
+		    (DISJOINT-SETS FREE-TAGS (VARNOTE-TAG-ENV))
+		    ;; No captured function references
+		    (DISJOINT-SETS FREE-FUNCTIONS (VARNOTE-FUNCTION-ENV))
+		    ;; Either no side-effects or has side-effects but is evaluated exactly once.
+		    (CASE (NOTEPAD-CONTROL VNP)
+		      ((NIL)
+		       (OR (NOT (NOTEPAD-WRITTEN))
+			   (= (VARNOTE-N-USAGES) 1)))
+		      ((LAMBDA)
+		       NIL)
+		      (OTHERWISE		      
+			(NOT (NOTEPAD-WRITTEN))))
+		    ;; Not evaluated too many times.
+		    ( (VARNOTE-N-USAGES) REPLICABILITY)
+		    ;; No side effects on previous variables
+		    (EVERY #'(LAMBDA (VN) (OR (NULL VN) (NOT (NULL (VARNOTE-NOTEPAD VN)))))
+			   SERIAL-VARNOTES)
+		    ;; May pass over everything that happens from the beginning of
+		    ;; the body up to the last place the variable appears.
+		    (DISJOINT-NOTES VNP NOTEPAD)
+		    ;; May pass over values to its right
+		    (LOOP WITH PASSED = (NOTEPAD-SUBSTS VNP)
+			  ;; LAST marks the last reference to this variable, when it is
+			  ;; not referenced from the body, only from sequential bindings.
+			  WITH LAST = (AND (ZEROP (VARNOTE-N-USAGES))
+					   (LOOP FOR (NIL PAD) IN DECISIONS WITH LAST = NIL
+						 DO (WHEN (MEMBER VAR (NOTEPAD-SUBSTS PAD))
+						      (SETQ LAST PAD))
+						 FINALLY (RETURN LAST)))
+			  FOR (SUBSTP PAD) IN DECISIONS
+			  FOR VAR IN VARS
+			  FOR VARNOTE IN (CDR RIGHT-VARNOTES)
+			  UNTIL (EQ PAD LAST)
+			  WHEN (OR (NOT SUBSTP)	;Would pass over form in LET
+				   (MEMBER VAR PASSED))	;Would pass over substituted form
+			    ALWAYS (DISJOINT-NOTES PAD NOTEPAD)
+			    ;; Would pass over a special variable binding, so must not
+			    ;; reference the variable either directly or via influence
+			    ;; of a special variable on a side-effect.
+			  WHEN (VARNOTE-SPECIAL-P)
+			    ALWAYS (STACK-LET ((SPECIAL (LIST VAR)))
+				     (AND (DISJOINT-SETS (NOTEPAD-READ) SPECIAL)
+					  (DISJOINT-SETS (NOTEPAD-WRITTEN) SPECIAL)))))))
+	    ;; If moving VAL inside bindings of variables to the left,
+	    ;; update the real varnotes from the serial-varnotes
+	    ;; Also update variables might pass over this one if we decided to substitute.
+	    (WHEN SERIAL-VARNOTES
+	      (LOOP WITH N-USAGES = (IF DECISION (VARNOTE-N-USAGES) 1)
+		    FOR SERIAL-VARNOTE IN SERIAL-VARNOTES
+		    FOR OLD-VARNOTE IN VARNOTES
+		    WHEN OLD-VARNOTE
+		      DO (WHEN DECISION
+			   (LET ((PAD (VARNOTE-NOTEPAD OLD-VARNOTE)))
+			     (WHEN (AND PAD (MEMBER VAR (NOTEPAD-SUBSTS PAD)))
+			       (JOIN-NOTEPADS PAD NOTEPAD))))
+			 (JOIN-VARNOTES OLD-VARNOTE SERIAL-VARNOTE N-USAGES)
+			 ))
+	    ;;
+	    (LIST* (LIST DECISION NOTEPAD FREE-VARIABLES) DECISIONS))))))) 
+
+(DEFUN JOIN-VARNOTES (OLD-VARNOTE SERIAL-VARNOTE N-USAGES)
+  (WHEN (PLUSP (VARNOTE-N-USAGES SERIAL-VARNOTE))
+    (INCF (VARNOTE-N-USAGES OLD-VARNOTE)
+	  (* N-USAGES (VARNOTE-N-USAGES SERIAL-VARNOTE)))
+    (SETF (VARNOTE-VARIABLE-ENV OLD-VARNOTE)
+	  (UNION (VARNOTE-VARIABLE-ENV OLD-VARNOTE)
+		 (VARNOTE-VARIABLE-ENV SERIAL-VARNOTE)))
+    (SETF (VARNOTE-BLOCK-ENV OLD-VARNOTE)
+	  (UNION (VARNOTE-BLOCK-ENV OLD-VARNOTE)
+		 (VARNOTE-BLOCK-ENV SERIAL-VARNOTE)))
+    (SETF (VARNOTE-TAG-ENV OLD-VARNOTE)
+	  (UNION (VARNOTE-TAG-ENV OLD-VARNOTE)
+		 (VARNOTE-TAG-ENV SERIAL-VARNOTE)))
+    (SETF (VARNOTE-FUNCTION-ENV OLD-VARNOTE)
+	  (UNION (VARNOTE-FUNCTION-ENV OLD-VARNOTE)
+		 (VARNOTE-FUNCTION-ENV SERIAL-VARNOTE)))
+    (LET ((OLD-NOTEPAD (VARNOTE-NOTEPAD OLD-VARNOTE))
+	  (SERIAL-NOTEPAD (VARNOTE-NOTEPAD SERIAL-VARNOTE)))
+      (WHEN OLD-NOTEPAD
+	(IF SERIAL-NOTEPAD
+	    (JOIN-NOTEPADS OLD-NOTEPAD SERIAL-NOTEPAD)
+	    (SETF (VARNOTE-NOTEPAD OLD-VARNOTE) NIL)))))
+  NIL)
+
+;;;; DEFSUBST
+
+#+LISPM (PROGN	;Only the Lisp Machine compiler understands substs
+
+;Report errors in the DEFSUBST macro in a nice way, hooked up with the compiler
+(DEFUN DEFSUBST-ERROR (FUNCTION FATAL FORMAT-STRING &REST FORMAT-ARGS)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (LET ((COMPILER:DEFAULT-WARNING-FUNCTION FUNCTION)
+	(COMPILER:DEFAULT-WARNING-DEFINITION-TYPE 'DEFUN))
+    (APPLY #'COMPILER:WARN (AND FATAL '(:ERROR T)) FORMAT-STRING FORMAT-ARGS)))
+
+(DEFUN FUNCTION-INLINE-FORM-METHOD (FUNCTION)
+  (LET ((ENTRY (SI:DEBUGGING-INFO-USER-ENTRY FUNCTION 'INLINE-FORM)))
+    (AND ENTRY
+	 (SECOND ENTRY))))
+
+(DEFUN FIND-INLINE-FORM-METHOD (NAME &OPTIONAL ENV)
+  (LET ((LOCAL (SI:LOCAL-FUNCTION-DEFINITION NAME ENV)))
+    (WHEN LOCAL
+      (WHEN (AND (CONSP LOCAL)
+		 (EQ (FIRST LOCAL) 'DEFUN-IN-FLAVOR)
+		 (LOCATION-BOUNDP (THIRD LOCAL)))
+	(LET ((INFO (SI:DEBUGGING-INFO-USER-ENTRY (LOCATION-CONTENTS (THIRD LOCAL))
+						  'INLINE-FORM)))
+	  (WHEN INFO
+	    (RETURN-FROM FIND-INLINE-FORM-METHOD (SECOND INFO)))))
+      (WHEN (TYPEP LOCAL 'COMPILER:INTERNAL-FUNCTION)
+	(SETF (COMPILER:FUNCTION-USED LOCAL) T)
+	(RETURN-FROM FIND-INLINE-FORM-METHOD
+	  (COMPILER:FUNCTION-INLINE-FORM-METHOD LOCAL)))
+      ;; Locally defined but not inlinable, so shadow any global definition
+      (RETURN-FROM FIND-INLINE-FORM-METHOD NIL)))
+  (MULTIPLE-VALUE-BIND (COMPILER FOUND)
+      (COMPILER:FILE-DECLARATION NAME 'DEF)
+    (WHEN FOUND
+      (RETURN-FROM FIND-INLINE-FORM-METHOD
+	(AND (TYPEP COMPILER 'INLINE-FORM)
+	     COMPILER))))
+  (WHEN (FDEFINEDP NAME)
+    (LET ((DEF (FDEFINITION (SI:UNENCAPSULATE-FUNCTION-SPEC NAME))))
+      (LET ((INFO (SI:DEBUGGING-INFO-USER-ENTRY DEF 'INLINE-FORM)))
+	(WHEN INFO
+	  (RETURN-FROM FIND-INLINE-FORM-METHOD (SECOND INFO))))))
+  NIL)
+
+(DEFUN MAYBE-EXPAND-INLINE-FORM (FORM ENV &REST ARGS)
+  (LET ((METHOD (AND (SI:ENV-DECLARATIONS-INLINE-P (FIRST FORM) ENV)
+		     (FIND-INLINE-FORM-METHOD (FIRST FORM) ENV))))
+    (IF METHOD
+	(APPLY #'EXPAND-INLINE-FORM METHOD FORM ENV ARGS)
+	FORM)))
+
+
+
+(DEFPROP INLINE-FORM T SI:DEBUG-INFO)
+
+(DEFSTRUCT INLINE-FORM
+  NAME
+  LAMBDA-LIST
+  BODY
+  (ENV NIL)
+  FORM
+  VARIABLES
+  VARNOTES
+  FREE-VARIABLES
+  FREE-BLOCKS
+  FREE-TAGS
+  FREE-FUNCTIONS)
+
+(DEFPARAMETER *DECLARATIONS-TO-ELIDE-FROM-INLINE-FORMS*
+	      ;; no need to mention those which don't get passed on
+	      ;; by SI:PARSE-BODY-DECLARATIONS
+	      ;; in particular: IGNORE, type declarations,
+	      ;; DOWNWARD-FUNARG, DOWNWARD-FUNCTION, and stuff
+	      ;; with an SI:DEBUG-INFO property
+	      '(INSTANCE-VARIABLES FLAVOR:LOCAL-FUNCTIONS))
+
+(DEFUN CONSTRUCT-INLINE-FORM (NAME LAMBDA-LIST BODY &OPTIONAL ENV
+			      &KEY (BLOCK-NAME NIL BLOCK-NAME-P))
+  (DECLARE (VALUES METHOD SIDE-EFFECTS))
+  (LET ((NOTEPAD (MAKE-NOTEPAD))
+	(VARIABLES NIL)
+	(BLOCK-NAMES (AND BLOCK-NAME-P (LIST BLOCK-NAME))))
+    ;; Analyze the lambda-list and collect the variables
+    (CONDITION-CASE (ERROR)
+	 (ANNOTATE-CONDITIONAL
+	   (MAP-OVER-LAMBDA-LIST
+	     LAMBDA-LIST
+	     #'(LAMBDA (LIST TYPE)
+		 (LET ((ITEM (FIRST LIST)))
+		   (ECASE TYPE
+		     ((:REQUIRED :REST)
+		      (PUSH ITEM VARIABLES))
+		     ((:OPTIONAL :KEY :AUX)
+		      (IF (ATOM ITEM)
+			  (PUSH ITEM VARIABLES)
+			  (LET ((VARIABLE (FIRST ITEM)))
+			    (WHEN (CONSP VARIABLE)
+			      ;; &key ((keyword variable) ..)
+			      (SETQ VARIABLE (SECOND VARIABLE)))
+			    (PUSH VARIABLE VARIABLES)
+			    (UNLESS (NULL (REST ITEM))
+			      (JOIN-NOTEPADS NOTEPAD
+					     (ANNOTATE-FORM (SECOND ITEM) NIL ENV NOTEPAD))
+			      (UNLESS (NULL (REST (REST ITEM)))
+				(PUSH (THIRD ITEM) VARIABLES))))))
+		     ((:ALLOW-OTHER-KEYS)))))))
+       (ERROR
+	 (DEFSUBST-ERROR NAME T "~A" ERROR)))
+    (SETF VARIABLES (NREVERSE VARIABLES))
+    (WHEN (EQUAL VARIABLES LAMBDA-LIST)		;Save storage later
+      (SETF VARIABLES LAMBDA-LIST))
+    ;; Parse off the declarations
+    (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS REAL-BODY DOC DEBUGGING-INFO VAR-DCLS
+			  UNSPECIALS FUN-DCLS)
+	(SI:PARSE-BODY-DECLARATIONS BODY ENV LAMBDA-LIST)
+      (DECLARE (IGNORE DOC DEBUGGING-INFO))
+      ;; Remove from the body initial IGNOREs which mention only variables,
+      ;; since the inliner doesn't care
+      (LOOP WITH STUFF-TO-NOT-IGNORE = NIL
+	    WHILE (CONSP REAL-BODY)
+	    AS FORM = (FIRST REAL-BODY)
+	    WHILE (AND (CONSP FORM) (EQL (FIRST FORM) 'IGNORE))
+	    DO (LOOP FOR IGNORE-SUBFORM IN (REST FORM)
+		     DO (UNLESS (OR (MEMBER IGNORE-SUBFORM VARIABLES)
+				    (CONSTANTP IGNORE-SUBFORM ENV))
+			  (PUSH IGNORE-SUBFORM STUFF-TO-NOT-IGNORE)))
+	       (POP REAL-BODY)
+	    FINALLY (WHEN STUFF-TO-NOT-IGNORE
+		      (PUSH `(IGNORE ,@(NREVERSE STUFF-TO-NOT-IGNORE))
+			    REAL-BODY)))
+      (LOOP WHILE (AND (CONSP REAL-BODY)
+		       (NULL (CDR REAL-BODY))
+		       (CONSP (FIRST REAL-BODY))
+		       (EQL (FIRST (FIRST REAL-BODY)) 'BLOCK))
+	    DOING
+	;; Remove any outer blocks
+	(PUSH (SECOND (FIRST REAL-BODY)) BLOCK-NAMES)
+	(SETQ REAL-BODY (CDDR (FIRST REAL-BODY))))
+      ;; Forcibly prevent recursive expansion.
+      ;; This is disabled because it messes up SETF.
+      #||
+      (WHEN NAME
+	(LET ((ENTRY (ASSOC NAME FUN-DCLS :TEST #'EQUAL)))
+	  (IF (NULL ENTRY)
+	      (PUSH `(,NAME (INLINE . NOTINLINE)) FUN-DCLS)
+	      (LET ((INLINE (ASSOC 'INLINE (CDR ENTRY))))
+		(IF (NULL INLINE)
+		    (PUSH '(INLINE . NOTINLINE) (CDR ENTRY))
+		    (SETF (CDR INLINE) 'NOTINLINE))))))
+      ||#
+      ;; Put back var-dcls and fun-dcls.
+      (SETF DECLARATIONS
+	    (APPEND (SI:RECONSTITUTE-BODY-DECLARATIONS VAR-DCLS FUN-DCLS VARIABLES ())
+		    DECLARATIONS))
+      (LET ((VARNOTES (MAPCAR #'(LAMBDA (VAR)
+				  (MAKE-VARNOTE :NAME VAR
+						:VALUE-TYPE (LET ((TEM (ASSOC VAR VAR-DCLS)))
+							      (IF TEM
+								  (IF (SETQ TEM
+									    (ASSOC 'TYPE
+										   (CDR TEM)))
+								      (CDR TEM)
+								      T)
+								  T))
+						:SPECIAL-P (SI:SPECIAL-VARIABLE-P VAR ENV SPECIALS UNSPECIALS)))
+			      VARIABLES)))
+	(MULTIPLE-VALUE-BIND (THIS-NOTEPAD FREE-VARIABLES FREE-BLOCKS FREE-TAGS REPLICABILITY
+			      FREE-FUNCTIONS)
+	    (ANNOTATE-FORM `(LOCALLY (DECLARE ,@DECLARATIONS)
+				     ,@REAL-BODY)
+			   VARNOTES ENV NOTEPAD)
+	  (IGNORE REPLICABILITY)
+	  ;; Note any side effects
+	  (JOIN-NOTEPADS NOTEPAD THIS-NOTEPAD)
+	  ;; If any of the blocks we stripped off were used, put them back.
+	  ;; BLOCK-NAMES is in inner->outer order, so the relative order of the
+	  ;; blocks will be the same as in the original form.
+	  (LOOP FOR BLOCK IN BLOCK-NAMES DOING
+	    (WHEN (MEMBER BLOCK FREE-BLOCKS)
+	      (SETQ REAL-BODY `((BLOCK ,BLOCK ,@REAL-BODY)))
+	      (SETQ FREE-BLOCKS (DELETE BLOCK FREE-BLOCKS))))
+	  ;; Smash the varnote for any variable that has no constraints on substitution
+	  ;; since this is actually the usual case, e.g. for most defstruct accessors
+	  (LOOP FOR L ON VARNOTES AS VARNOTE = (CAR L) WITH VNP DO
+	    (AND (SETQ VNP (VARNOTE-NOTEPAD))	;Variable isn't used in some horrible way
+		 (NULL (VARNOTE-VARIABLE-ENV))	; and isn't used inside a lexical contour
+		 (NULL (VARNOTE-BLOCK-ENV))	; of any of the three kinds
+		 (NULL (VARNOTE-TAG-ENV))
+		 (NULL (VARNOTE-FUNCTION-ENV))
+		 (= (VARNOTE-N-USAGES) 1)	; and is only used once
+		 (NOT (VARNOTE-SPECIAL-P))	; and isn't special
+		 (EQ T (VARNOTE-VALUE-TYPE))	; and isn't typed
+		 (NOT (NOTEPAD-CONTROL VNP))	; and isn't inside control structure
+		 (NULL (NOTEPAD-READ VNP))	; and isn't affected by side-effects
+		 (NULL (NOTEPAD-WRITTEN VNP))	; and isn't used after side-effects
+		 (NULL (NOTEPAD-SUBSTS VNP))	; and doesn't interact with other variables
+		 (SETF (CAR L) NIL)))
+	  ;; Remove declarations the inliner doesn't care about
+	  ;; Mostly so they don't get in the way of optimizers
+	  ;; Don't remove them until after all the ANNOTATE-FORMs are done, though 
+	  (SETQ DECLARATIONS
+		(DELETE-IF #'(LAMBDA (DECL)
+			       (AND (CONSP DECL)
+				    (MEMBER (FIRST DECL)
+					    *DECLARATIONS-TO-ELIDE-FROM-INLINE-FORMS*)))
+			   DECLARATIONS))
+	  ;; Make the structure
+	  (VALUES (MAKE-INLINE-FORM :NAME NAME :LAMBDA-LIST LAMBDA-LIST :BODY BODY :ENV ENV
+				    :FORM (COND (DECLARATIONS
+						 `(LOCALLY (DECLARE ,@DECLARATIONS)
+							   ,@REAL-BODY))
+						((= (LENGTH REAL-BODY) 1)
+						 (FIRST REAL-BODY))
+						(T `(PROGN ,@REAL-BODY)))
+				    :VARIABLES VARIABLES :VARNOTES VARNOTES
+				    :FREE-VARIABLES FREE-VARIABLES :FREE-BLOCKS FREE-BLOCKS
+				    :FREE-TAGS FREE-TAGS :FREE-FUNCTIONS FREE-FUNCTIONS)
+		  (COND ((NOTEPAD-WRITTEN NOTEPAD) 'WRITER)
+			((NOTEPAD-READ NOTEPAD) 'READER)
+			(T 'SIMPLE))))))))
+
+(DEFUN CONSTRUCT-INLINE-FORM-DECLARATION (NAME LAMBDA-LIST BODY &OPTIONAL ENV)
+  (MULTIPLE-VALUE-BIND (METHOD SIDE-EFFECTS)
+      (MULTIPLE-VALUE-BIND (BLOCK-NAME FOUNDP)
+	  (SI:DIVINE-SUITABLE-BLOCK-NAME NAME)
+	(IF FOUNDP
+	    (CONSTRUCT-INLINE-FORM NAME LAMBDA-LIST BODY ENV :BLOCK-NAME BLOCK-NAME)
+	    (CONSTRUCT-INLINE-FORM NAME LAMBDA-LIST BODY ENV)))
+    (LET ((DECLARATIONS `((INLINE-FORM ,METHOD))))
+      (UNLESS (EQ SIDE-EFFECTS 'WRITER)
+	(PUSH `(SIDE-EFFECTS ,SIDE-EFFECTS) DECLARATIONS))
+      (VALUES `(DECLARE ,@DECLARATIONS)
+	      METHOD))))
+
+(DEFUN EXPAND-INLINE-FORM (METHOD FORM-TO-EXPAND NEW-ENV
+			   &KEY APPLY NEVER-BIND-LOCALS SUPPRESS-WARNINGS-FOR-LEGAL-LISP)
+  (CHECK-TYPE METHOD INLINE-FORM)
+  (LET ((OLD-ENV (INLINE-FORM-ENV METHOD)))
+    ;; See if we can expand at all
+    (DOLIST (FREE-FCN (INLINE-FORM-FREE-FUNCTIONS METHOD))
+      (WHEN (LOOP WITH OLD-FCN-ENV = (SI:ENV-FUNCTIONS OLD-ENV)
+		  FOR FCN-ENV ON (SI:ENV-FUNCTIONS NEW-ENV)
+		  UNTIL (EQ FCN-ENV OLD-FCN-ENV)
+		  THEREIS (EQ FREE-FCN (FIRST (FIRST FCN-ENV))))
+	(RETURN-FROM EXPAND-INLINE-FORM FORM-TO-EXPAND)))
+    (DOLIST (FREE-VAR (INLINE-FORM-FREE-VARIABLES METHOD))
+      (WHEN (LOOP WITH OLD-VAR-ENV = (SI:ENV-VARIABLES OLD-ENV)
+		  FOR VAR-ENV ON (SI:ENV-VARIABLES NEW-ENV)
+		  UNTIL (EQ VAR-ENV OLD-VAR-ENV)
+		  THEREIS (AND (EQ FREE-VAR (FIRST (FIRST VAR-ENV)))
+			       ;; it's okay if they're both specials
+			       (NOT (AND (EQ (FCLI::VARIABLE-INFORMATION FREE-VAR NEW-ENV)
+					     :SPECIAL)
+					 (EQ (FCLI::VARIABLE-INFORMATION FREE-VAR OLD-ENV)
+					     :SPECIAL)))))
+	(RETURN-FROM EXPAND-INLINE-FORM FORM-TO-EXPAND)))
+    (DOLIST (FREE-BLOCK (INLINE-FORM-FREE-BLOCKS METHOD))
+      (WHEN (LOOP WITH OLD-BLOCK-ENV = (SI:ENV-BLOCKS OLD-ENV)
+		  FOR BLOCK-ENV ON (SI:ENV-BLOCKS NEW-ENV)
+		  UNTIL (EQ BLOCK-ENV OLD-BLOCK-ENV)
+		  THEREIS (EQ FREE-BLOCK (FIRST (FIRST BLOCK-ENV))))
+	(RETURN-FROM EXPAND-INLINE-FORM FORM-TO-EXPAND)))
+    (DOLIST (FREE-TAG (INLINE-FORM-FREE-TAGS METHOD))
+      (WHEN (LOOP WITH OLD-TAG-ENV = (SI:ENV-TAGBODIES OLD-ENV)
+		  FOR TAG-ENV ON (SI:ENV-TAGBODIES NEW-ENV)
+		  UNTIL (EQ TAG-ENV OLD-TAG-ENV)
+		  THEREIS (MEMBER FREE-TAG (FIRST (FIRST TAG-ENV))))
+	(RETURN-FROM EXPAND-INLINE-FORM FORM-TO-EXPAND)))
+    ;; Collect the arguments
+    (CONDITION-CASE (ERROR)
+	 (MULTIPLE-VALUE-BIND (TEMP-VARS TEMP-VALS ARG-VARS ARG-VALS)
+	     (MATCH-SOURCE-ARGS-TO-LAMBDA-LIST (INLINE-FORM-LAMBDA-LIST METHOD)
+					       (REST FORM-TO-EXPAND)
+					       :APPLY APPLY)
+	   (LET ((EXPANSION
+		   (IF NEVER-BIND-LOCALS
+		       ;; Plug them all in.
+		       (LOOP WITH TEMP-SUBSTITUTIONS = (MAPCAR #'CONS TEMP-VARS TEMP-VALS)
+			     FOR ARG-VAR IN ARG-VARS
+			     FOR ARG-VAL IN ARG-VALS
+			     COLLECT (CONS ARG-VAR
+					   (LET-SUBST-COPYFORMS (APPEND TEMP-SUBSTITUTIONS
+									SUBSTITUTIONS)
+								ARG-VAL NEW-ENV))
+			       INTO SUBSTITUTIONS
+			     FINALLY (RETURN (LET-SUBST-COPYFORMS SUBSTITUTIONS
+								  (INLINE-FORM-FORM METHOD)
+								  NEW-ENV)))
+		       ;; Plug in only those appropriate
+		       (LET-SUBST-INTERNAL (APPEND TEMP-VARS ARG-VARS)
+					   (APPEND TEMP-VALS ARG-VALS)
+					   (APPEND (MAPCAR #'(LAMBDA (TEMP-VAR)
+							       (MAKE-VARNOTE :NAME TEMP-VAR))
+							   TEMP-VARS)
+						   (LET ((VARNOTES (INLINE-FORM-VARNOTES METHOD)))
+						     (MAPCAR #'(LAMBDA (ARG-VAR)
+								 (COPY-TREE (ASSOC ARG-VAR VARNOTES)))
+							     ARG-VARS)))
+					   (INLINE-FORM-FORM METHOD)
+					   NIL NEW-ENV
+					   :BIND-GENSYMS T))))
+	     (COMPILER:NOTE-MACROEXPANSION FORM-TO-EXPAND EXPANSION)
+	     EXPANSION))
+       (ERROR
+	 (UNLESS (AND SUPPRESS-WARNINGS-FOR-LEGAL-LISP
+		      (TYPEP ERROR 'LAMBDA-LIST-ERROR))
+	   (WARN NIL "~S will not be expanded inline because of an error:~%~A"
+		 FORM-TO-EXPAND ERROR))
+	 FORM-TO-EXPAND))))
+
+
+
+;;; This section is for compatibility with people who used these undocumented features in rel-6.
+
+;; The predigested form of the subst is stored in the debug-info of the function.
+;; During compilation it is also stored in the file-local declarations.
+;; In either case this is a list, called a subst-definition, that looks like
+;;	(SUBST-DEFINITION lambda-list vars varnotes body)
+;;  lambda-list is the original lambda-list
+;;  vars is a list of the variables by themselves (cons it once since it's needed later)
+;;  varnotes is a list of varnotes for each variable, or of NIL if the variable may always
+;;   be substituted, or NIL as the whole list if all the elements are NIL
+;;  body is a single form
+
+(COMPILER:MAKE-OBSOLETE EXPAND-SUBST-DEFINITION
+			"use LT:CONSTRUCT-INLINE-FORM and LT:EXPAND-INLINE-FORM instead")
+(DEFUN EXPAND-SUBST-DEFINITION (SUBST FORM)
+  (CHECK-TYPE SUBST LIST)
+  ;; Decode the old-style subst definition.
+  (MULTIPLE-VALUE-BIND (LAMBDA-LIST BODY)
+      (ECASE (FIRST SUBST)
+	(SYS:SUBST-DEFINITION
+	  ;; We deliberately don't trust the varnotes here because of old bugs.
+	  (DESTRUCTURING-BIND (NIL LAMBDA-LIST NIL NIL BODY) SUBST
+	    (VALUES LAMBDA-LIST BODY)))
+	(ZL:SUBST
+	  (DESTRUCTURING-BIND (NIL LAMBDA-LIST &REST BODY) SUBST
+	    (VALUES LAMBDA-LIST BODY)))
+	(ZL:NAMED-SUBST
+	  (DESTRUCTURING-BIND (NIL NIL LAMBDA-LIST &REST BODY) SUBST
+	    (VALUES LAMBDA-LIST BODY))))
+    ;; Use the modern code to expand it.
+    (EXPAND-INLINE-FORM (CONSTRUCT-INLINE-FORM NIL LAMBDA-LIST BODY NIL)
+			FORM NIL)))
+
+);#+LISPM
+
+;;;; ONCE-ONLY
+
+;See page 222 of the Chine Nual.  Admittedly the documentation there is incomprehensible.
+
+(DEFUN CHECK-ONCE-ONLY-ARGUMENTS (ENVIRONMENT-VAR VARIABLE-LIST BODY)
+  (SETF VARIABLE-LIST
+	(LOOP WITH VL = VARIABLE-LIST
+	      WHILE VL
+	      FOR VAR = (POP VL)
+	       IF (VARIABLEP VAR)
+		 COLLECT VAR
+	      ELSE
+		IF (MEMBER VAR LAMBDA-LIST-KEYWORDS)
+		  DO (CASE VAR
+		       (&ENVIRONMENT
+			 (SETF ENVIRONMENT-VAR (POP VL)))
+		       (OTHERWISE
+			 (WARN "~S is not a valid keyword for ONCE-ONLY." VAR)))
+	      ELSE DO (WARN "~S is not a valid variable name." VAR)))
+  (VALUES ENVIRONMENT-VAR VARIABLE-LIST BODY)) 
+
+;;; Create code that is body, possibly with a lambda wrapped around it to make
+;;; sure that the forms assigned to the listed variables only get evaluated once.
+(DEFMACRO ONCE-ONLY (VARIABLE-LIST &BODY BODY &AUX ENVIRONMENT-VAR)
+  (DECLARE (COMPILER:DO-NOT-RECORD-MACROEXPANSIONS)
+	   (ARGLIST (VARIABLE-NAME |...| &ENVIRONMENT ENVIRONMENT) &BODY BODY))
+  (MULTIPLE-VALUE-SETQ (ENVIRONMENT-VAR VARIABLE-LIST BODY)
+    (CHECK-ONCE-ONLY-ARGUMENTS ENVIRONMENT-VAR VARIABLE-LIST BODY))
+  ;; Generate code that evaluates the body with each variable bound to a gensym
+  ;; then uses LET-SUBST to remove the gensyms where possible.  When a gensym cannot
+  ;; be removed, the form returned by the body is wrapped in a binding of the gensym.
+  ;; The gensyms need to be distinct from any expression that might get incorporated
+  ;; into the result of the body, so we have to make new gensyms on every invocation.
+  ;; If we were willing to make two copies of the body, we could have a special case
+  ;; for when the values of all the variables are atoms (variables or constants)
+  ;; in which case no let-subst and no gensyms are required.  But this doesn't
+  ;; seem worthwhile.
+  `(LET ((ONCE-ONLY-TEMPS
+	   (LIST ,@(LOOP FOR L IN VARIABLE-LIST
+			 COLLECT `(GENSYMBOL ,(STRING-APPEND "ONCE-ONLY-" L "-"))))))
+     (LET-SUBST ONCE-ONLY-TEMPS
+		(LIST ,@VARIABLE-LIST)
+		(LET ,(LOOP FOR VAR IN VARIABLE-LIST
+			    COLLECT `(,VAR (POP ONCE-ONLY-TEMPS)))
+		  ,@BODY)
+		,ENVIRONMENT-VAR)))
+
+(DEFUN (:PROPERTY ONCE-ONLY COMPILER:STYLE-CHECKER) (FORM)
+  (UNLESS (ATOM FORM)
+    (DESTRUCTURING-BIND (IGNORE &OPTIONAL VARIABLE-LIST-AND-&ENVIRONMENT &BODY BODY) FORM
+      (IGNORE BODY)
+      (LET ((ENVIRONMENT-VAR-P (MEMBER '&ENVIRONMENT VARIABLE-LIST-AND-&ENVIRONMENT)))
+	(UNLESS ENVIRONMENT-VAR-P
+	  (WARN "A call to ~S was found with no ~S keyword.~@
+		 ~@
+		 Local macros will not expand properly inside the body.~@
+		 Supply the lexical environment, derived from the ~S~@
+		 parameter in a ~S, ~S, or ~S."
+		'ONCE-ONLY '&ENVIRONMENT
+		'&ENVIRONMENT
+		'DEFMACRO 'MACROLET 'DEFMACRO-IN-FLAVOR))))))
+
+;;; If the values of the variables are themselves variables, then they are simple
+;;; variables, i.e. no one will modify them, they aren't SPECIAL, etc.
+(DEFMACRO ONCE-ONLY-SIMPLE-VARIABLES (VARIABLE-LIST &BODY BODY &AUX ENVIRONMENT-VAR)
+  (MULTIPLE-VALUE-SETQ (ENVIRONMENT-VAR VARIABLE-LIST BODY)
+    (CHECK-ONCE-ONLY-ARGUMENTS ENVIRONMENT-VAR VARIABLE-LIST BODY))
+  `(LET ((*SIMPLE-VARIABLES* (LIST* ,@VARIABLE-LIST *SIMPLE-VARIABLES*)))
+     (ONCE-ONLY (,@VARIABLE-LIST ,@(when environment-var `(&environment ,environment-var)))
+       ,@BODY)))
+
+;;; Utility for macroexpanding a whole form...
+
+(DEFUN MACROEXPAND-ALL (FORM &REST COPYFORMS-KEYWORDS-AND-ARGS)
+  (APPLY #'COPYFORMS #'(LAMBDA (X &REST IGNORE) X) FORM :EXPAND-ALL-MACROS T
+	 COPYFORMS-KEYWORDS-AND-ARGS))

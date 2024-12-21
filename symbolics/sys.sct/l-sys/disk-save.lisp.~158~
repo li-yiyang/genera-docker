@@ -1,0 +1,1365 @@
+;;; -*- Mode: LISP; Base: 8;  Package: SYSTEM-INTERNALS; Lowercase: T -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;; Disk-save
+
+(defvar *disk-saved* nil
+  "Set to T once world has been disk-saved (no longer insta-booted)")
+
+(defvar *disk-saving* nil
+  "Bound to T when reinitializing after a disk-save.")
+
+(defvar who-line-just-cold-booted-p nil
+  "Set to T upon cold boot for who-line's benefit")
+
+(defvar disk-save-area (if (variable-boundp disk-save-area)
+			   disk-save-area
+			   (make-area :name 'disk-save-area
+				      :representation :structure
+				      :gc :temporary
+				      '%%region-scavenge-enable 0))
+  "Stores structures used during disk save")
+
+(add-initialization "Reset DISK-SAVE-AREA" '(reset-temporary-area disk-save-area t) '(:warm))
+
+(defconst *disk-save-extra-pages* 10.
+	  "Number of extra file pages to allocate for unexpected consing")
+
+(defconst *incremental-disk-save-extra-pages* 200.
+  "Number of extra file pages to allocated for unexpected consing when doing an
+   Incremental Disk Save")
+
+;; For BEFORE-COLD initializations, this is true if this is an IDS save.
+(defvar *incremental-disk-save*)
+
+;; DEFVARed in SYSDF1, so don't DEFVAR again, just initialize
+(when (not (variable-boundp *sysout-generation-number*))
+  (setq *sysout-generation-number* 0
+	*sysout-timestamp-1* -1
+	*sysout-timestamp-2* -1
+	*sysout-parent-timestamp-1* -1
+	*sysout-parent-timestamp-2* -1))
+
+;;;
+
+(cl:defparameter si:*world-load-file-type* #+3600 :cold-load
+					   #+(and IMach (not VLM)) :i-cold-load
+					   #+(and IMach VLM) :v-cold-load)
+
+(defun world-load-default-pathname ()
+  (send (fs:parse-pathname "FEP:>") :new-pathname
+	:type si:*world-load-file-type* :version :newest))
+
+(defun sys:loaded-band-name ()
+  (if (boundp 'sys:loaded-band-name)
+      (condition-case ()
+	   (fs:parse-pathname sys:loaded-band-name)
+	 (error sys:loaded-band-name))
+      (cl:merge-pathnames "unknown" (world-load-default-pathname))))
+
+(defun (cl:setf sys:loaded-band-name) (new-value)
+  (let* ((string (string new-value))
+	 (string-length (si:array-active-length string)))
+    #+IMach (unless (and (array-has-leader-p sys:loaded-band-name)
+			 (>= (si:array-length sys:loaded-band-name) 
+			     string-length))
+	      ;; IFEP versions before Utilities 324.8 constructed
+	      ;; sys:loaded-band-name incorrectly.  Compensate.
+	      (setf sys:loaded-band-name (scl:make-array (max 64. string-length)
+							 :element-type 'cl:string-char
+							  :fill-pointer t)))
+    (setf (fill-pointer sys:loaded-band-name) 0)
+    (array-push-portion-extend sys:loaded-band-name string)
+    new-value))
+
+;;;
+
+(cp:define-command (com-save-world :command-table "World Building"
+				   :provide-output-destination-keyword nil)
+    ((how '((scl:member :complete :incremental))
+	  :default :complete
+	  :documentation "Complete means save the entire world, Incremental means only save the changed pages"
+	  :when *sysout-enabled-p*)
+     (file-spec #-VLM 'fs:fep-pathname
+		#+VLM 'fs:pathname
+		:confirm t
+		:default (default-pathname-for-disk-save (eq how :incremental))
+		:prompt #-VLM "on FEP file" #+VLM "on file"
+		:documentation #-VLM "FEP file on which to store this world"
+			       #+VLM "File on which to store this world"))
+   (if (eq how :incremental)
+       (if *sysout-enabled-p*
+	   (disk-save file-spec t)
+	   (format error-output "~&You do not have the Incremental Disk Save facility enabled in your environment."))
+       (disk-save file-spec nil)))
+
+;;;
+
+(defun disk-save (&optional destination-file (incremental :ask)
+		  &key (boot-file nil) (query t))
+  (setq tv:*forcibly-show-progress-notes* t)	;Let user see what's happening
+  ;; Setup FEP communication area.
+  (reset-temporary-area disk-save-area)		;Just in case, should be empty already
+  ;; This array must be aligned on a page boundary.
+  (let ((fep-communication-area
+	  #+VLM nil
+	  #-VLM (%pointer (make-array (1- page-size) :area disk-save-area))))
+    #-VLM
+    ;; Actually, probably not needed in IMach even.  The IFEP
+    ;; initializes the whole page.
+    (initialize-fep-communication-area fep-communication-area)
+    ;; Do the user interface part.
+    (loop doing
+      (catch 'new-pathname
+	(multiple-value-bind (truename copy-load-file-p file-array estimated-n-disk-pages
+			      eventual-author eventual-time eventual-comment incremental)
+	    (disk-save-prepare destination-file incremental :query query
+			       :throw-for-new-pathname t)
+	  ;; Now the hard stuff.
+	  ;; It's now too late to return.
+	  (format t "~&System Shutdown ...")
+	  (process-preset si:initial-process #'disk-save-real-thing
+			  truename copy-load-file-p file-array estimated-n-disk-pages
+			  eventual-author eventual-time eventual-comment incremental
+			  fep-communication-area
+			  (or boot-file (and (not query) :none)))
+	  (process-reset-and-enable si:initial-process)
+	  (process-wait-forever "Save World")))
+      (setq destination-file nil)		; makes disk-save-prepare prompt for pathname
+      )))
+
+(defun default-pathname-for-disk-save (incremental-p)
+  (let* ((name (sct:system-version-for-disk-save incremental-p))
+	 (loaded-pathname #+VLM (ignore-errors
+				  (fs:parse-pathname sys:loaded-band-name))
+			  #-VLM nil)
+	 (host (cond (loaded-pathname
+		       (send loaded-pathname :host))
+		     #+VLM
+		     ((fboundp 'mac-fs::make-host-file-host)
+		      (fs:get-pathname-host "HOST"))
+		     (t
+		       (fs:get-pathname-host "FEP"))))
+	 (directory (if loaded-pathname
+			(send loaded-pathname :directory)
+			:root)))
+    (fs:make-pathname :host host
+		      :directory directory
+		      :name name
+		      :type *world-load-file-type*)))
+
+#+VLM
+;; --- For now, we just assume that life-support will succeed in creating the file
+(defun disk-save-prepare (destination-file incremental &key (query t) throw-for-new-pathname)
+  (declare (values truename copy-load-file-p file-array estimated-n-disk-pages
+		   eventual-author eventual-time eventual-comment incremental))
+  (declare (ignore throw-for-new-pathname))
+  (when *disk-saved*
+    (error "This world has already been disk saved. It dosen't work to disk save it again."))
+  (login-to-sys-host)
+  (let* ((incremental
+	   (and *sysout-enabled-p*
+		(selectq incremental
+		  ((nil) nil)
+		  ((:ask) (y-or-n-p "Incremental Disk Save is enabled.  Save an incremental image instead of full image? "))
+		  (otherwise t))))
+	 (default-destination-file (default-pathname-for-disk-save incremental))
+	 (truename)
+	 (copy-load-file-p)
+	 (file-array)
+	 (estimated-n-disk-pages)
+	 (eventual-author user-id)
+	 (eventual-time (time:get-universal-time))
+	 (eventual-comment)
+	 (*incremental-disk-save* incremental))
+    (unless destination-file
+      (setq destination-file
+	    (prompt-and-read `(:pathname :default ,default-destination-file)
+			     "Save into what file (default is ~A): "
+			     default-destination-file)))
+    (loop
+      with succeeded = nil
+;      with if-exists = :error
+;      with if-locked = :error
+      for dest-path = (fs:merge-pathnames destination-file default-destination-file)
+      doing
+      (condition-case ()
+	  (unwind-protect
+	      (progn
+		(progn
+;		  with-open-file (dest-block-file dest-path :direction :block
+;						 :if-exists if-exists
+;						 :if-does-not-exist :create
+;						 :if-locked if-locked)
+;		  (setq dest-path (send dest-block-file :pathname))
+;		  (setf truename (send dest-block-file :truename))
+;		  (when (send dest-block-file :get :dont-delete)
+;		    (error 'fs:fep-dont-delete-flag-set :pathname dest-path))
+		  (setf truename dest-path)
+		  ;; Do an allocate here with the current estimated disk
+		  ;; save size mainly to get any fep-no-more-room errors,
+		  ;; but also to do the majority of the required consing.
+		  (setq estimated-n-disk-pages
+			(+ (estimate-disk-save-size :incremental incremental)
+			   (if incremental
+			       *incremental-disk-save-extra-pages*
+			       *disk-save-extra-pages*)))
+		  (format t "~&Estimated size is ~D blocks." estimated-n-disk-pages)
+;		  (setq file-array (send dest-block-file :allocate estimated-n-disk-pages
+;					 :map-area disk-save-area))
+		  ;; Remember this
+		  (setf eventual-comment 
+			(if query
+			    (sct:get-new-system-version
+			      (send truename :string-for-host))
+			    (let ((comment (sct:system-version-info :disk-label)))
+			      (when (> (string-length comment) sct:system-version-max-length)
+				(setq comment
+				      (substring comment 0 sct:system-version-max-length)))
+			      comment)))
+		  ;; Mark the file
+;		  (send dest-block-file :change-properties t
+;			:length-in-bytes (* estimated-n-disk-pages 4 disk-sector-data-size32)
+;			:deleted nil :author eventual-author :creation-date eventual-time
+;			:comment "Incomplete save")
+		  ;; This may cons a lot, so do it now.
+		  (format t "~&Running BEFORE-COLD initializations ...")
+		  (initializations 'before-cold-initialization-list t)
+		  ;; Log out the user
+		  (format t "~&Logging out ...")
+		  (logout)
+		  ;; Allocate the disk space.  Must do this before we turn
+		  ;; off consing, because it conses disk arrays.  Do this
+		  ;; before turning off the window system, because it might
+		  ;; need to interact with the user in the future.  Allocate
+		  ;; a little more space than we think we need, because we
+		  ;; may cons a little bit more, and to allow space for the
+		  ;; header.
+		  (gc-all-ephemeral-objects-to-dynamic-space-immediately)
+		  (setq estimated-n-disk-pages
+			(max estimated-n-disk-pages
+			     (+ (estimate-disk-save-size :slow-p t :incremental incremental)
+				(if incremental
+				    *incremental-disk-save-extra-pages*
+				    *disk-save-extra-pages*))))
+		  (format t "~&New estimated size is ~D blocks." estimated-n-disk-pages)
+;		  (setq file-array
+;			(send dest-block-file :allocate estimated-n-disk-pages
+;			      :map-area disk-save-area))
+		  )
+		;; We've done it.
+		(setf succeeded t))
+	    (unless succeeded
+	      (login-to-sys-host)))		;In case we logged out
+;	(fs:file-already-exists
+;	  (selectq (fquery '(:choices (((:overwrite "Overwrite") #/O)
+;				       ((:reprompt "New pathname") #/N #\sp)))
+;			   "File ~A already exists.~@
+;			    Overwrite, or New pathname? "
+;			   (send dest-path :string-for-printing))
+;	    (:overwrite
+;	     (setq if-exists :overwrite))
+;	    (:reprompt
+;	     (setq destination-file
+;		   (prompt-and-read `(:pathname :default ,dest-path)
+;				    "Enter new pathname (default is ~A): "
+;				    dest-path))))
+;	  nil)
+;	(fs:fep-file-load-locked
+;	  (if (fquery format:yes-or-no-p-options
+;		      "Trying to disk save to the same file this world was instabooted from.~@
+;		       Do you want to continue? ")
+;	      (progn
+;		(setf copy-load-file-p t)
+;		(setf if-locked :share))
+;	    (signal 'sys:abort)))
+;	(fs:fep-file-swap-locked
+;	  (setf destination-file
+;		(prompt-and-read `(:pathname :default ,dest-path)
+;				 "Trying to copy into a swap file which is currently in use.~@
+;				  Enter new pathname (default is ~A): "
+;				 dest-path)))
+;	(fs:dont-delete-flag-set
+;	  (selectq (fquery '(:choices (((:clear "Clear flag and proceed") #/C)
+;				       ((:reprompt "New pathname") #/N #\sp)))
+;			   "File ~A's don't delete flag is set.~@
+;			    Clear flag and proceed, or New pathname? "
+;			   (send dest-path :string-for-printing))
+;	    (:clear
+;	     (with-open-file (s dest-path :direction :probe)
+;	       (send s :change-properties t :dont-delete nil)))
+;	    (:reprompt
+;	     (setq destination-file
+;		   (prompt-and-read `(:pathname :default ,dest-path)
+;				    "Enter new pathname (default is ~A): "
+;				    dest-path))))
+;	  nil)
+;	(fs:no-more-room
+;	  (disk-save-make-room dest-path estimated-n-disk-pages t throw-for-new-pathname)
+;	  nil)
+	)
+      until succeeded)
+    (values truename copy-load-file-p file-array estimated-n-disk-pages
+	    eventual-author eventual-time eventual-comment incremental)))
+
+#-VLM
+(defun disk-save-prepare (destination-file incremental &key (query t) throw-for-new-pathname)
+  (declare (values truename copy-load-file-p file-array estimated-n-disk-pages
+		   eventual-author eventual-time eventual-comment incremental))
+  (when *disk-saved*
+    (error "This world has already been disk saved. It dosen't work to disk save it again."))
+  (login-to-sys-host)
+  (let* ((incremental
+	   (and *sysout-enabled-p*
+		(selectq incremental
+		  ((nil) nil)
+		  ((:ask) (y-or-n-p "Incremental Disk Save is enabled.  Save an incremental image instead of full image? "))
+		  (otherwise t))))
+	 (default-destination-file (default-pathname-for-disk-save incremental))
+	 (truename)
+	 (copy-load-file-p)
+	 (file-array)
+	 (estimated-n-disk-pages)
+	 (eventual-author user-id)
+	 (eventual-time (time:get-universal-time))
+	 (eventual-comment)
+	 (*incremental-disk-save* incremental))
+    (unless destination-file
+      (setq destination-file
+	    (prompt-and-read `(:pathname :default ,default-destination-file)
+			     "Save into what file (default is ~A): "
+			     default-destination-file)))
+    (loop
+      with succeeded = nil
+      with if-exists = :error
+      with if-locked = :error
+      for dest-path = (fs:merge-pathnames destination-file default-destination-file)
+      doing
+      (condition-case ()
+	  (unwind-protect
+	      (progn
+		(with-open-file (dest-block-file dest-path :direction :block
+						 :if-exists if-exists :if-does-not-exist :create
+						 :if-locked if-locked)
+		  (setq dest-path (send dest-block-file :pathname))
+		  (setf truename (send dest-block-file :truename))
+		  (when (send dest-block-file :get :dont-delete)
+		    (error 'fs:fep-dont-delete-flag-set :pathname dest-path))
+		  ;; Do an allocate here with the current estimated disk
+		  ;; save size mainly to get any fep-no-more-room errors,
+		  ;; but also to do the majority of the required consing.
+		  (setq estimated-n-disk-pages
+			(+ (estimate-disk-save-size :incremental incremental)
+			   (if incremental
+			       *incremental-disk-save-extra-pages*
+			       *disk-save-extra-pages*)))
+		  (format t "~&Estimated size is ~D blocks." estimated-n-disk-pages)
+		  (setq file-array (send dest-block-file :allocate estimated-n-disk-pages
+					 :map-area disk-save-area))
+		  ;; Remember this
+		  (setf eventual-comment 
+			(if query
+			    (sct:get-new-system-version
+			      (send truename :string-for-host))
+			    (let ((comment (sct:system-version-info :disk-label)))
+			      (when (> (string-length comment) sct:system-version-max-length)
+				(setq comment
+				      (substring comment 0 sct:system-version-max-length)))
+			      comment)))
+		  ;; Mark the file
+		  (send dest-block-file :change-properties t
+			:length-in-bytes (* estimated-n-disk-pages 4 disk-sector-data-size32)
+			:deleted nil :author eventual-author :creation-date eventual-time
+			:comment "Incomplete save")
+		  ;; This may cons a lot, so do it now.
+		  (format t "~&Running BEFORE-COLD initializations ...")
+		  (initializations 'before-cold-initialization-list t)
+		  ;; Log out the user
+		  (format t "~&Logging out ...")
+		  (logout)
+		  ;; Allocate the disk space.  Must do this before we turn
+		  ;; off consing, because it conses disk arrays.  Do this
+		  ;; before turning off the window system, because it might
+		  ;; need to interact with the user in the future.  Allocate
+		  ;; a little more space than we think we need, because we
+		  ;; may cons a little bit more, and to allow space for the
+		  ;; header.
+		  (gc-all-ephemeral-objects-to-dynamic-space-immediately)
+		  (setq estimated-n-disk-pages
+			(max estimated-n-disk-pages
+			     (+ (estimate-disk-save-size :slow-p t :incremental incremental)
+				(if incremental
+				    *incremental-disk-save-extra-pages*
+				    *disk-save-extra-pages*))))
+		  (format t "~&New estimated size is ~D blocks." estimated-n-disk-pages)
+		  (setq file-array
+			(send dest-block-file :allocate estimated-n-disk-pages
+			      :map-area disk-save-area)))
+		;; We've done it.
+		(setf succeeded t))
+	    (unless succeeded
+	      (login-to-sys-host)))		;In case we logged out
+	(fs:file-already-exists
+	  (selectq (fquery '(:choices (((:overwrite "Overwrite") #/O)
+				       ((:reprompt "New pathname") #/N #\sp)))
+			   "File ~A already exists.~@
+			    Overwrite, or New pathname? "
+			   (send dest-path :string-for-printing))
+	    (:overwrite
+	     (setq if-exists :overwrite))
+	    (:reprompt
+	     (setq destination-file
+		   (prompt-and-read `(:pathname :default ,dest-path)
+				    "Enter new pathname (default is ~A): "
+				    dest-path))))
+	  nil)
+	(fs:fep-file-load-locked
+	  (if (fquery format:yes-or-no-p-options
+		      "Trying to disk save to the same file this world was instabooted from.~@
+		       Do you want to continue? ")
+	      (progn
+		(setf copy-load-file-p t)
+		(setf if-locked :share))
+	    (signal 'sys:abort)))
+	(fs:fep-file-swap-locked
+	  (setf destination-file
+		(prompt-and-read `(:pathname :default ,dest-path)
+				 "Trying to copy into a swap file which is currently in use.~@
+				  Enter new pathname (default is ~A): "
+				 dest-path)))
+	(fs:dont-delete-flag-set
+	  (selectq (fquery '(:choices (((:clear "Clear flag and proceed") #/C)
+				       ((:reprompt "New pathname") #/N #\sp)))
+			   "File ~A's don't delete flag is set.~@
+			    Clear flag and proceed, or New pathname? "
+			   (send dest-path :string-for-printing))
+	    (:clear
+	     (with-open-file (s dest-path :direction :probe)
+	       (send s :change-properties t :dont-delete nil)))
+	    (:reprompt
+	     (setq destination-file
+		   (prompt-and-read `(:pathname :default ,dest-path)
+				    "Enter new pathname (default is ~A): "
+				    dest-path))))
+	  nil)
+	(fs:no-more-room
+	  (disk-save-make-room dest-path estimated-n-disk-pages t throw-for-new-pathname)
+	  nil)
+	)
+      until succeeded)
+    (values truename copy-load-file-p file-array estimated-n-disk-pages
+	    eventual-author eventual-time eventual-comment incremental)))
+
+(defun disk-save-make-room (dest-path estimated-n-disk-pages
+			    &optional (warn-for-dired t) throw-for-new-pathname)
+  (let ((access-path (send (send dest-path :host) :file-access-path))
+	(path (send dest-path :new-pathname :name :wild :type :wild :version :wild))
+	(choices (if throw-for-new-pathname
+		     '(:choices (((:dired "Dired") #/D)
+				 ((:expunge "Expunge directory") #/E)
+				 ((:listf "List directory") #/L)
+				 ((:new-pathname
+				    "New pathname (presumably on a different FEPn:)") #/N)
+				 ((:selective "Selectively delete load files") #/S)))
+		   '(:choices (((:dired "Dired") #/D)
+			       ((:expunge "Expunge directory") #/E)
+			       ((:listf "List directory") #/L)
+			       ((:selective "Selectively delete load files") #/S))))))
+    (loop do
+      (selectq (fquery choices
+		       "Not enough room in FEP filesystem, need at least ~D. more block~:P.~@
+			Run DIRED, Expunge directory, List directory,~
+                            ~:[~;~% New pathname,~] or Selectively delete load files? "
+		       (- estimated-n-disk-pages (send access-path :disk-space))
+		       throw-for-new-pathname)
+	(:new-pathname (throw 'new-pathname nil))
+	(:listf (disk-label-to-stream path standard-output))
+	(:selective
+	 (when (disk-save-selective-load-delete path access-path
+						estimated-n-disk-pages)
+	   (return nil)))
+	(:dired
+	 (when (or (not warn-for-dired)
+		   (fquery nil
+			   "Running DIRED will substantially increase the size ~
+			    of the saved world.~@
+			    You should, therefore, boot again before saving if you ~
+			    run it.~@
+			    Run DIRED anyway? "))
+	   (dired path)				;+++
+	   (return nil)))
+	(:expunge
+	 (format t "~&~D. block~:P expunged." (fs:expunge-directory path))
+	 (return nil))))))
+
+(defun disk-save-real-thing
+       (truename copy-load-file-p file-array estimated-n-disk-pages
+	eventual-author eventual-time eventual-comment incremental
+	fep-communication-area
+	&optional (boot-file nil))
+  #+VLM (declare (ignore file-array))
+  (let ((n-disk-pages nil))
+    (unwind-protect
+	(setf n-disk-pages
+	      (disk-save-internal #-VLM file-array #+VLM truename fep-communication-area
+				  copy-load-file-p estimated-n-disk-pages
+				  incremental))
+      (disk-save-finish-up truename n-disk-pages (not (null n-disk-pages))
+			   eventual-author eventual-time eventual-comment
+			   boot-file)))
+  (process-disable current-process)
+  (process-wait-forever))
+
+(defun disk-save-internal (file-array fep-communication-area
+			   copy-load-file-p estimated-n-disk-pages
+			   incremental)
+  (let ((mytime1 (integer-low-bits-as-fixnum (time:get-universal-time)))
+	(mytime2 (%microsecond-clock))
+	n-disk-pages)
+    ;; Shutdown the system
+    ;; Get rid of the disk arrays one way or another.
+    #-VLM
+    (reset-disk-array-area)
+    ;; Shut down the window system
+    ;; This can't be a before-cold initialization, because
+    ;; some other initializations sometimes type out
+    (tv:shutdown-window-system)
+    ;; Run the system shutdown initializations
+    (initializations 'system-shutdown-initialization-list t)
+    ;; Do this as late as possible so we can still play with the keyboard.
+    (cli::disable-consoles)
+    ;; No more scheduling.
+    (process::shutdown-new-scheduler)
+    ;; Save this out properly.
+    (let-globally ((who-line-just-cold-booted-p t)
+		   (*virgin-world-p* t)
+		   #+3600 ((fill-pointer sys:primary-network-address) 0))
+      ;; No more consing allowed past this point, because we
+      ;; commit to which pages are going to be saved.
+      (setf n-disk-pages
+	    (disk-save-really-save file-array fep-communication-area
+				   copy-load-file-p estimated-n-disk-pages
+				   incremental
+				   mytime1
+				   mytime2)))
+    (setf *disk-saved* t)
+    n-disk-pages))
+
+(defun disk-save-finish-up (truename n-disk-pages save-completed
+			    eventual-author eventual-time eventual-comment
+			    &optional (boot-file nil))
+  #+VLM (declare (ignore eventual-author eventual-time eventual-comment))
+  #+VLM (declare (ignore boot-file))		;--- Fix later
+  (let-globally ((*disk-saving* t))
+    ;; Update the FEP's idea of the loaded world.
+    (when save-completed
+      (setf (sys:loaded-band-name) (send truename :string-for-printing)))
+    (lisp-reinitialize-part-1)
+    (run-genera-initializations)
+    (initialize-application)
+    (fs:with-automatic-login-to-sys-host
+      (when save-completed
+	;; lisp-reinitialize may have changed the local host.
+	;; Adjust the FEP pathname accordingly.
+	(setf truename
+	      (send truename :new-pathname
+		    :host
+		    #+VLM (send truename :host)
+		    #-VLM (fs:add-fep-file-host (send (send truename :host) :unit))
+		    ))
+	#-VLM
+	(with-open-file (dest-block-file truename :direction :block
+					 :if-exists :overwrite :if-does-not-exist :error)
+	  (send dest-block-file :truncate n-disk-pages))
+	#-VLM
+	(fs:change-file-properties truename t
+				   :author eventual-author
+				   :length-in-bytes (* n-disk-pages disk-sector-data-size32 4)
+				   :creation-date eventual-time
+				   :comment eventual-comment))
+      #+IMach (system-case
+		(Embedded
+		  ;; Restart the applications on the host as that's where the initial
+		  ;; Lisp Listener is implemented.
+		  (setf (sys:emb-restart-applications) 1)
+		  (setq *system-initialization-in-progress* nil))
+		(Domino
+		  (setq *system-initialization-in-progress* nil))
+		(otherwise nil))
+      (process-wait "Finish disk save"
+	#'(lambda () (or (not (null tv:initial-lisp-listener))
+			 (not (null *simple-listener-process*)))))
+      (when save-completed
+	(let ((terminal-io (or tv:initial-lisp-listener terminal-io)))
+	  (format t "~&Saved to ~A, size is ~D. blocks.~%" truename n-disk-pages)
+	  #+VLM					;--- Fix later
+	  (format t "~&You must update your ivory config file to use this world~%")
+	  #-VLM
+	  (unless (eq boot-file :none)
+	    (multiple-value-bind (boot-file-updated world-file #+3600 microcode-file)
+		(let ((user-id eventual-author))
+		  (query-set-current-world-load truename boot-file))
+	      (report-update-boot-file-outcome (or boot-file "Boot file") boot-file-updated
+					       world-file #+3600 microcode-file))))))
+    (lisp-reinitialize-part-2)))
+
+;;; Return the approximate number of disk pages required to save the virtual image.
+(defun estimate-disk-save-size (&key slow-p incremental)
+  #+VLM (declare (ignore slow-p))
+  ;; Write out all frames to ensure that the ESRT is up to its full size
+  ;; by calling GC-PAGE-OUT for every frame in main memory.
+  #-VLM
+  (when slow-p
+    (%funcall-in-aux-stack #'write-all-modified-pages))
+  (let (;; Scan the a-mem blocks to save, counting number of entries required
+	#+3600 (n-sparse-entries (loop for name in *a-mem-blocks-to-save*
+				       as (nil start end) = (assq name *magic-locations*)
+				       summing (%pointer-difference end start)))
+	(n-disk-pages 0)
+	(n-load-entries 0)
+	(start-vpn nil)
+	(next-vpn nil))
+    (flet ((count-pages (vpn pages)
+	     (declare (sys:downward-function))
+	     (if (and vpn next-vpn 
+		      (or (= vpn next-vpn)
+			  #+VLM
+			  (eq (1+ (ldb %%vpn-chunk-num next-vpn))
+			      (ldb %%vpn-chunk-num vpn))))
+		 (setq next-vpn (+ vpn pages))
+		 (when start-vpn
+		   (incf n-load-entries)
+		   #+VLM
+		   ;; round end-vpn to chunk
+		   (setq next-vpn (dpb 0 %%page-within-chunk
+				       (+ next-vpn (dpb -1 %%page-within-chunk 0))))
+		   (incf n-disk-pages (- next-vpn start-vpn)))
+		 (when vpn
+		   (setq start-vpn vpn
+			 next-vpn (+ vpn pages))))))
+      ;; Scan through the region table counting used pages
+      (map-over-regions
+	#'(lambda (area)
+	    (and ( area page-table-area)	; Don't dump the page table
+		 ( area disk-save-area)	; Don't dump disk-save temporary storage
+		 #+imach ( area wired-dynamic-area)
+		 #+imach ( area fep-area)
+		 ( area disk-array-area)))	; Only 1 page will be saved, eventually
+	nil					; all regions
+	#'(lambda (area region)
+	    (flet ((consider-pages (base-vma n-words)
+		     (declare (sys:downward-function))
+		     ;; -- This WHEN shouldn't be needed.  Some regions happen
+		     ;; to have 0 size because SHORTEN-REGION will shorten a
+		     ;; region to 0 size.  Don't fix SHORTEN-REGION to call
+		     ;; %FREE-REGION without fixing all the callers.  Instead,
+		     ;; maybe fix the cause of a region being created and then
+		     ;; having a 0 free pointer.
+		     (when (plusp n-words)
+		       (let ((n-pages (ceiling-page-size n-words)))
+			 (if (and incremental
+				  *sysout-enabled-p*
+				  (not (= area gc-table-area))
+				  (not (= sys:%wired-level
+					  (ldb sys:%%region-level (si:region-bits region)))))
+			     (loop repeat n-pages
+				   for vpn upfrom (vma-page-num base-vma)
+				   when (sysout-bitmap vpn)
+				     do (count-pages vpn 1))
+			     (count-pages (vma-page-num base-vma) n-pages))))))
+	      (if (ldb-test %%region-stack (region-bits region))
+		  ;; Count only those stack pages that are actively in use
+		  (loop for p = (region-origin region) then (+ p size)
+			with b = (+ (region-origin region) (region-free-pointer region))
+			while (< p b)
+			as size = (multiple-value-bind (origin active-size size)
+				      (decode-stack-address p)
+				    (if (null size)
+					;; Skip over a hole where a purged stack used to be
+					sys:page-size
+					;; consider the active pages
+					(consider-pages origin active-size)
+					size)))
+		  (consider-pages (region-origin region) (region-free-pointer region))))))
+      ;; Accumulate last entry
+      (count-pages nil nil))
+    (+ n-disk-pages (ceiling-page-size (+ #+3600 5 #+imach 8
+					  #+3600 (* n-sparse-entries 2)
+					  (* n-load-entries 3))))))
+
+(defun disk-save-selective-load-delete (path access-path estimated-n-disk-pages)
+  (let ((dirlist (cdr (fs:directory-list (send path :new-type *world-load-file-type*)))))
+    (cond ((null dirlist)
+	   (format error-output "~&No world load files.")
+	   nil)
+	  (t (format t "~&World load files on unit ~D:"
+		     (send (send path :host) :unit))
+	     (loop for plist in dirlist
+		   as (path) = plist
+		   do (format t "~&  ~A (~D block~:P)"
+			      path (get plist :length-in-blocks))
+		      (when (fep-file-in-use-p (fep-read-lock
+						 (fep-file-lookup access-path path)))
+			(format t " (current world)")))
+	     (loop for plist in dirlist
+		   as (path) = plist
+		   when (fquery '(:type :readline
+				  :choices ((t "Yes")
+					    (nil "No")))
+				"Delete ~A (~D block~:P) and expunge? "
+				path (get plist :length-in-blocks))
+		     do (when (fep-file-in-use-p (fep-read-lock
+						   (fep-file-lookup access-path path)))
+			  (copy-world-file-to-swap-area path))
+			(deletef path)
+			(fs:expunge-directory path)
+			(let ((needed (- estimated-n-disk-pages
+					 (send access-path :disk-space))))
+			  (cond ((plusp needed)
+				 (format t "~&Still need ~D block~:P." needed))
+				(t (format t "~&There should be enough space now.")
+				   (return t))))
+		   finally (return nil))))))
+
+;Initialize a dummy copy of the fep communication area, to be saved into the world load
+;file in place of the one we are actually running with.
+#-VLM
+;; Actually, probably not needed in IMach even.  The IFEP initializes
+;; the whole page.
+(defun initialize-fep-communication-area (fep-communication-area)
+  (destructuring-bind (name start end &rest variables)
+      (assq 'fep-communication-area *magic-locations*)
+    name end
+    ;; Unused locations are all unbound
+    (%block-store-tag-and-pointer fep-communication-area page-size dtp-null start 1)
+    ;; Locations that have corresponding variables are unbound except for special cases
+    ;; that need to be initialized and are not initialized by the FEP (v.13).
+    (loop for (nil variable) in variables
+	  for i from 0
+	  as loc = (%make-pointer-offset dtp-locative fep-communication-area i)
+	  do (cl:case variable
+	       ((%unwired-virtual-address-low
+		  %unwired-virtual-address-high
+		  %unwired-physical-address-low
+		  ;;kludge-mini-buffer-number
+		  ;;kludge-mini-buffer-full
+		  )
+		(setf (location-contents loc) (symeval variable)))
+	       ((fep-preloaded-address
+		  fep-preloaded-size
+		  console-command)
+		(setf (location-contents loc) nil))
+	       ((task-3-requests
+		  task-3-enables
+		  requesting-lisp-to-stop
+		  console-brightness
+		  console-volume)
+		(setf (location-contents loc) 0))
+	       ((%software-configuration)
+		(setf (location-contents loc) -1))
+	       (otherwise
+		 (location-makunbound loc variable))))))
+
+#-VLM
+(defun reset-disk-array-area ()
+  ;; Have to clear out all the caches which may have stuff
+  ;; in disk-save-area now.
+  (initialize-fep-filesystem)
+  ;; Now throw away all disk arrays, because LMFS allocates a large
+  ;; number of them.  For now, can't check whether the resource thinks
+  ;; some disk-arrays are in use, because LMFS forgets to free them
+  ;; (fixed in the source, not patched into Release 5.0).
+  ;; The only things that can be in the disk-array-area are disk-arrays
+  ;; and disk-events.
+  (clear-resource 'disk-array)
+  (clear-resource 'disk-event)
+  ;; *DCW-ARRAY* is used by SI:DISK-READ-HEADER (called by
+  ;; SI:MOUNT-DISK-UNIT) and is consed in disk-array-area.
+  #+3600 (setq *dcw-array* nil)
+  (do-area-regions (region disk-array-area)
+    (setf (region-free-pointer region) 0)))
+
+#+VLM
+(defun map-save-blocks (continuation)
+  "Maps over regions in vma order calling continuation with (origin-pg pages stack-p)"
+  (declare (sys:downward-funarg continuation))
+  ;; Scan through regions in vma order
+  (loop named save
+	with vma = 0 and region = nil and area = nil 
+	while 
+	  (loop named search
+		with row
+		with last = (%pointer-plus
+			      *address-space-map-address*
+			      (lsh 1 (byte-size %%vma-address-space-map-high)))
+		as high = (%pointer-plus *address-space-map-address*
+					 (ldb %%vma-address-space-map-high vma))
+			then (%pointer-plus high 1)
+		as row-offset = (ldb %%vma-address-space-map-low vma) then 0
+		with word-offset = (ldb-test %%vma-address-space-map-offset vma)
+		while (%pointer-lessp high last)
+		when (setq row (%memory-read high :cycle-type %memory-raw))
+		  do (loop with word
+			   with end = (%pointer-plus
+					row
+					(lsh 1 (byte-size %%vma-address-space-map-low)))
+			   as low = (%pointer-plus row row-offset)
+				  then (%pointer-plus low 1)
+			   while (%pointer-lessp low end)
+			   do
+		       (when ( -1 (setq word (%memory-read low :cycle-type %memory-raw
+							    :fixnum-only t)))
+			 (when (or
+				 (unless (cl:shiftf word-offset nil)
+				   (region-valid-p
+				     (setq region (ldb (byte #o20 #o0) word))))
+				 (region-valid-p
+				   (setq region (ldb (byte #o20 #o20) word))))
+			   (setq area (region-area region))
+			   (return-from search t)))))
+	do
+    (unless (or (= area page-table-area)	; Don't dump page tbl
+		(= area disk-save-area)		; Don't dump temp stg
+		#+imach (= area wired-dynamic-area)
+		#+imach (= area si:fep-area)
+		)
+      (if (ldb-test %%region-stack (region-bits region))
+	  ;; Count only those stack pages
+	  ;; that are actively in use
+	  (loop for p = (region-origin region) then (+ p size)
+		with b = (%pointer-plus (region-origin region)
+					(region-free-pointer region))
+		while (%pointer-< p b) with (size active-size) do
+	    (multiple-value (nil active-size size)
+	      (decode-stack-address p))
+	    (if (null size)
+		;; Skip over a hole where a purged stack used to be
+		(setq size sys:page-size)
+		(let* ((origin-pg (vma-page-num p))
+		       (end-pg (+ origin-pg (ceiling-page-size active-size)))
+		       (pages (- end-pg origin-pg)))
+		  (funcall continuation origin-pg pages area region t))))
+	  ;; Ordinary region
+	  (let* ((origin-pg (vma-page-num (region-origin region)))
+		 (end-pg (+ origin-pg
+			    (ceiling-page-size (region-free-pointer region))))
+		 (pages (- end-pg origin-pg)))
+	    (funcall continuation origin-pg pages area region nil))))
+    (setq vma (%pointer-plus (region-origin region) (region-length region)))))
+
+#+VLM
+(defun disk-save-save-ephemeral-bits ()
+  (let ((page-bit-tables
+	  (create-dynamic-array art-q %number-of-bitmaps 
+				nil #'storage::create-dynamic-space-for-esrt)))
+    (flet ((set-page-bits (vpn vpn-limit)
+	     (loop with bitmap-size = (ash 1 (byte-size %%vpn-bitmap-index))
+		   while (< vpn vpn-limit)
+		   do
+	       (let* ((bitmap-num (ldb %%vpn-bitmap-num vpn))
+		      (bitmap-array (aref page-bit-tables bitmap-num)))
+		 (when (null bitmap-array)
+		   (setf (aref page-bit-tables bitmap-num)
+			 (setf bitmap-array
+			       (create-dynamic-array 
+				 art-boolean bitmap-size
+				 nil #'storage::create-dynamic-space-for-esrt))))
+		 (let ((bitmap-array bitmap-array))
+		   (declare (sys:array-register bitmap-array))
+		   (loop with index-limit = (if (= bitmap-num (ldb %%vpn-bitmap-num vpn-limit))
+						(ldb %%vpn-bitmap-index vpn-limit)
+						bitmap-size)
+			 for index from (ldb %%vpn-bitmap-index vpn) below index-limit
+			 do (setf (aref bitmap-array index) t)
+			 finally (setq vpn (dpb 0 %%vpn-bitmap-index (+ vpn bitmap-size)))))))))
+      (map-save-blocks
+	#'(lambda (origin-pg pages &rest ignore)
+	    (declare (ignore ignore))
+	    (loop with end-address
+		  with limit = (deposit-vpn (+ origin-pg pages) 0)
+		  for address = (deposit-vpn origin-pg 0) then end-address
+		  while (si:%pointer-< address limit)
+		  do
+	      (when (setq address
+			  (storage::vm-pht-scan
+			    address
+			    (%pointer-difference limit address)
+			    ;; search for any pages with ephemeral references
+			    storage::(%logdpbs 1 vm-attribute-exists
+					       1 vm-attribute-ephemeral-reference
+					       0)
+			    t)) 
+		;; Now search for next page that does not match
+		(setq end-address
+		      (or (storage::vm-pht-scan
+			    address
+			    (%pointer-difference limit address)
+			    storage::(%logdpbs 1 vm-attribute-exists
+					       1 vm-attribute-ephemeral-reference
+					       0)
+			    nil)
+			  limit))
+		(set-page-bits (extract-vpn (%pointer address))
+			       (extract-vpn (%pointer end-address))))
+		  while address
+		    ))))
+    (setq storage::*saved-esrt* page-bit-tables)))
+
+#+VLM
+(defun disk-save-really-save (file-name fep-communication-area copy-load-file-p
+			      estimated-n-disk-pages incremental mytime1 mytime2)
+  (declare (ignore fep-communication-area copy-load-file-p estimated-n-disk-pages))
+  (storage::unwire-all-stack-pages)
+  (disk-save-save-ephemeral-bits)
+  (let ((gc-table-size (region-free-pointer %gc-table-area-region))
+	(n-disk-pages 0))
+    (let* ((header-slots (1- (defstorage-size coprocessor-save-world)))
+	   ;; Conservative guess of # of entries
+	   (entries (* (+ (n-regions) *number-of-active-stacks*)
+		       (defstorage-size coprocessor-save-world-map-entry)))
+	   (load-map (make-array (+ header-slots entries)
+				 :fill-pointer header-slots
+				 :area disk-save-area))
+	   (save-world (locf (aref load-map 0)))
+	   (start-vpn nil)
+	   (next-vpn nil)
+	   )
+      (flet ((note-pages-to-save (vpn pages)
+	       (if (and vpn next-vpn 
+			(or (= vpn next-vpn)
+			    (eq (1+ (ldb %%vpn-chunk-num next-vpn))
+				(ldb %%vpn-chunk-num vpn))))
+		   (setq next-vpn (+ vpn pages))
+		   (when start-vpn
+		     (scl:vector-push-extend (storage::deposit-vpn start-vpn 0) load-map)
+		     ;; round end-vpn to chunk
+		     (setq next-vpn (dpb 0 %%page-within-chunk
+					 (+ next-vpn (dpb -1 %%page-within-chunk 0))))
+		     (scl:vector-push-extend (storage::deposit-vpn (- next-vpn start-vpn) 0)
+					     load-map)
+		     (incf n-disk-pages (- next-vpn start-vpn)))
+		   (when vpn
+		     (setq start-vpn vpn
+			   next-vpn (+ vpn pages))))))
+	(map-save-blocks
+	  #'(lambda (origin-pg pages area region stack-p )
+	      (if stack-p
+		  (if (not (and incremental *sysout-enabled-p*))
+		      (when (plusp pages)
+			(note-pages-to-save origin-pg pages))
+		      (loop for pn from origin-pg below (+ origin-pg pages) do
+			(unless (not (sysout-bitmap pn))
+			  (note-pages-to-save pn 1))))
+		  (progn
+		    (setf (region-created-pages region)	;Only the pages that get saved
+			  (dpb pages %%vma-page-num 0))
+		    (if (or (not (and incremental *sysout-enabled-p*))
+			    (= (ldb %%vpn-equals-ppn origin-pg) %vma-equals-pma)
+			    (= area gc-table-area))
+			(when (plusp pages)
+			  (note-pages-to-save origin-pg pages))
+			(loop for pn from origin-pg below (+ origin-pg pages) do
+			  (when (sysout-bitmap pn)
+			    (note-pages-to-save pn 1))))))))
+	;; Accumulate last entry
+	(note-pages-to-save nil nil)
+	)
+      (setf (coprocessor-save-world-filename save-world) (send file-name :string-for-host))
+      (setf (coprocessor-save-world-map-size save-world) (// (- (cl:length load-map)
+								header-slots)
+							     2))
+      ;; Clear cons caches since region-created-pages was changed
+      (clear-cons-caches)
+      ;; Make sure we allocated enough disk space
+      #+ignore-for-now
+      (if (> n-disk-pages estimated-n-disk-pages)
+	  (ferror "~D too few pages allocated; increase ~A"
+		  (- n-disk-pages estimated-n-disk-pages)
+		  (if incremental
+		      '*incremental-disk-save-extra-pages*
+		      '*disk-save-extra-pages*)))
+      ;; Right before we go over, update region
+      ;; tables to not show temp arrays
+      ;; Don't call reset-temporary-area, we don't want to
+      ;; actually return the main-memory pages!
+      ;; Resetting the free-pointer is safe because no page
+      ;; faults on these locations will occur; they're wired.
+      (do-area-regions (region disk-save-area)
+	(setf (region-free-pointer region) 0))
+      (let ((*sysout-generation-number* (if incremental
+					    (1+ *sysout-generation-number*)
+					    0))
+	    (*sysout-timestamp-1* mytime1)
+	    (*sysout-timestamp-2* mytime2)
+	    (*sysout-parent-timestamp-1* *sysout-timestamp-1*)
+	    (*sysout-parent-timestamp-2* *sysout-timestamp-2*))
+	;; Make the save happen
+	(let (stack-wired-low current-stack-group)
+	  ;; Things to make world "Cold"
+	  (setq *storage-cold-boot* t)
+	  (cl:shiftf stack-wired-low (sg-wired-control-stack-low %current-stack-group) nil)
+	  (cl:shiftf current-stack-group %current-stack-group nil)
+	  (%coprocessor-write save-world %coprocessor-register-save-world)
+	  (cl:setf (sg-wired-control-stack-low current-stack-group) stack-wired-low
+		   %current-stack-group current-stack-group)
+	  (setq *storage-cold-boot* nil)
+	  )))
+
+    ;; --- shouldn't be an issue on VLM until we save the ephemeral bits
+    ;; in the PHT out at disk save
+    ;; Make sure the GC tables didn't grow after we decided which
+    ;; pages of GC-TABLE-AREA would be saved.
+    ;; Hopefully this error check is redundant.
+    (when (> (region-free-pointer %gc-table-area-region)
+	     gc-table-size)
+      (ferror "GC-TABLE-AREA expanded from ~O to ~O while saving. ~%Consequently the world load file that was just written is trash."
+	      gc-table-size
+	      (region-free-pointer %gc-table-area-region)))
+    n-disk-pages))
+
+#-VLM
+(PROGN
+(defmacro write-header-map (vpn n-pages)
+  `(progn 'compile
+	  (%p-store-contents-offset (%logdpb ,vpn %%vma-page-num 0) header (incf offset))
+	  (%p-store-contents-offset (* ,n-pages page-size) header (incf offset))
+	  (%p-store-contents-offset fpn header (incf offset))
+	  (incf fpn ,n-pages)))
+
+(defmacro with-wired-structure-for-disk-save (object &body body)
+  ;; like with-wired-structure but does the structure bounds once since
+  ;; disk-save plays around with some region free pointers.
+  `(multiple-value-bind (nil .leader. .size.)
+       (sys:%find-structure-extent ,object)
+     (let ((.structure-wired-p. nil))
+       (unwind-protect
+	   (progn (without-interrupts
+		    (si:wire-words .leader. .size.)
+		    (setq .structure-wired-p. t))
+		  ,@body)
+	 (when .structure-wired-p.
+	   (si:unwire-words .leader. .size.))))))
+
+(defun disk-save-really-save (file-array fep-communication-area copy-load-file-p
+			      estimated-n-disk-pages incremental mytime1 mytime2)
+  #+imach (storage::unwire-all-stack-pages)
+  ;; Write out all frames to ensure that the ESRT is up to its full size
+  ;; by calling GC-PAGE-OUT for every frame in main memory.
+  (%funcall-in-aux-stack #'write-all-modified-pages)
+  (let ((page-bit-tables (make-array %number-of-bitmaps :area disk-save-area))
+	;; Scan the a-mem blocks to save,
+	;; counting number of entries required
+	#+3600
+	(n-sparse-entries
+	  (loop for name in *a-mem-blocks-to-save*
+		       as (nil start end) = (assq name *magic-locations*)
+		       summing (%pointer-difference end start)))
+	(gc-table-size (region-free-pointer %gc-table-area-region))
+	(n-disk-pages 0))
+    ;; Scan through the region table making a bit
+    ;; map indexed by page number to show if the
+    ;; virtual page is used.
+    (flet ((set-page-bit (vpn)
+	     (let* ((num (ldb %%vpn-bitmap-num vpn))
+		    (array (aref page-bit-tables num)))
+	       (when (null array)
+		 (setf (aref page-bit-tables num)
+		       (setf array
+			     (make-array (ash 1 (byte-size %%vpn-bitmap-index))
+					 :type 'art-boolean :area disk-save-area))))
+	       (setf (aref array (ldb %%vpn-bitmap-index vpn)) t)
+	       (incf n-disk-pages))))
+      (loop for area from 0 below (n-areas)
+	    unless (or (= area page-table-area)	; Don't dump page tbl
+		       (= area disk-save-area)	; Don't dump temp stg
+		       #+imach (= area wired-dynamic-area)
+		       #+imach (= area si:fep-area)
+		       )
+	      do (do-area-regions (region area)
+		   (if (ldb-test %%region-stack (region-bits region))
+		       ;; Count only those stack pages
+		       ;; that are actively in use
+		       (loop for p = (region-origin region) then (+ p size)
+			     with b = (+ (region-origin region)
+					 (region-free-pointer region))
+			     while (< p b) with (size active-size) do
+			 (multiple-value (nil active-size size)
+			   (decode-stack-address p))
+			 (if (null size)
+			     ;; Skip over a hole where a purged stack used to be
+			     (setq size sys:page-size)
+			     (let* ((origin-pg (vma-page-num p))
+				    (end-pg (+ origin-pg (ceiling-page-size active-size))))
+			       (loop for pn from origin-pg below end-pg do
+				 (unless (and incremental *sysout-enabled-p*
+					      (not (sysout-bitmap pn)))
+				   (set-page-bit pn))))))
+		       ;; Ordinary region
+		       (let* ((origin-pg (vma-page-num (region-origin region)))
+			      (end-pg (+ origin-pg
+					 (ceiling-page-size (region-free-pointer region)))))
+			 (setf (region-created-pages region)	;Only the pages that get saved
+			       (dpb (- end-pg origin-pg) %%vma-page-num 0))
+			 (loop for pn from origin-pg below end-pg do
+			   (when (or #+3600 (= region 0)
+				     #+imach
+				     (= (ldb %%vpn-equals-ppn origin-pg) %vma-equals-pma)
+				     (= area gc-table-area)
+				     (not (and incremental *sysout-enabled-p*
+					       (not (sysout-bitmap pn)))))
+			     (set-page-bit pn))))))))
+    ;; Clear cons caches since region-created-pages was changed
+    (clear-cons-caches)
+    ;; Now build the header
+    (flet ((map-save-blocks (continuation)
+	     (declare (sys:downward-funarg continuation))
+	     (let ((wired-boundary #+3600 (ldb %%vma-page-num (region-length 0))
+				   #+imach (ldb %%vma-page-num (%logdpb %vma-equals-pma %%vma-equals-pma 0))))
+	       (dotimes (num %number-of-bitmaps)
+		 (let ((page-bit-table (aref page-bit-tables num)))
+		   (when page-bit-table
+		     (macrolet ((do-block ()
+				  `(funcall continuation
+					    vpn-start
+					    (- vpn vpn-start)
+					    #+3600 (< vpn-start wired-boundary)
+					    #+imach (not (< vpn-start wired-boundary))
+					    )))
+		       (loop with vpn-start = nil
+			     for vpn upfrom (dpb num %%vpn-bitmap-num 0)
+			     for prev-b = nil then b
+			     for i from 0 below (array-length page-bit-table)
+			     for b = (aref page-bit-table i)
+			     do (cond ((and (not prev-b) b)	; Start of a block
+				       (setq vpn-start vpn))
+				      ((and (not b) prev-b)	; End of a block
+				       (do-block))
+				      #+3600
+				      ((and b (= vpn wired-boundary))
+				       (do-block)
+				       (setf vpn-start vpn)))
+			     finally 
+			       (when prev-b	; In a block
+				 (do-block))))))))))
+    (let ((mm-frames)
+	  (n-initial-entries 0)
+	  (n-load-entries 0)
+	  (offset 4))
+      (map-save-blocks #'(lambda (ignore ignore wired)
+			   (if wired
+			       (incf n-initial-entries)
+			       (incf n-load-entries))))
+      (let* ((n-header-pages
+	       (ceiling-page-size
+		 #+3600 (+ 5			; Fixed header
+			   (* 2 n-sparse-entries)	; Sparse load
+			   (* 3 (+ n-initial-entries n-load-entries)))
+		 #+imach (+ 8			; Fixed header
+			    (* 3 (+ n-initial-entries n-load-entries)))))
+	     (header
+	       (make-array (* (1+ n-header-pages) page-size)
+			   :area disk-save-area))
+	     (fpn n-header-pages))
+	(incf n-disk-pages n-header-pages)
+	;; Make sure we allocated enough disk space
+	(if (> n-disk-pages estimated-n-disk-pages)
+	    (ferror "~D too few pages allocated; increase ~A"
+		    (- n-disk-pages estimated-n-disk-pages)
+		    (if incremental
+			'*incremental-disk-save-extra-pages*
+			'*disk-save-extra-pages*)))
+	;; Unless you have to copy the instaboot image, don't allocate
+	;; any more frames than you have to (even this is a little high,
+	;; since the wired pages already have frames).
+	(setq mm-frames (make-array
+			  (let ((possible (- *count-usable-pages* *count-wired-pages*)))
+			    (if copy-load-file-p
+				possible
+				(min n-disk-pages possible)))
+			  :type 'art-16b
+			  :fill-pointer 0
+			  :area disk-save-area))
+	(setq header (%make-pointer
+		       dtp-locative
+		       (dpb 0 %%vma-word-offset
+			    (%pointer (aloc header page-size)))))
+	;; Allocate wired pages for the header
+	(loop with start-vpn = (ldb %%vma-page-num (%pointer header))
+	      for vpn from start-vpn below (+ start-vpn n-header-pages)
+	      for vma = (%logdpb vpn %%vma-page-num 0)
+	      do
+	  (%funcall-in-aux-stack #'storage::create-page-range vpn 1)
+	  (wire-words vma page-size)
+	  (array-push mm-frames
+		      (mmpt-lookup (storage::pht-ppn (pht-lookup vpn)))))
+	;; Build the fixed header
+	#+3600
+	(progn
+	  (%p-store-contents header (array-leader %microcode-version 1))
+	  (%p-store-contents-offset 0 header 1)
+	  (%p-store-contents-offset n-sparse-entries header 2)
+	  (%p-store-contents-offset n-initial-entries header 3)
+	  (%p-store-contents-offset n-load-entries header 4)
+	  (setq offset 4)
+	  ;; Build the sparse load
+	  (loop for name in *a-mem-blocks-to-save*
+		as (nil start end) = (assq name *magic-locations*)
+		do (loop for ptr first start
+				 then (%make-pointer-offset dtp-locative ptr 1)
+			 while (%pointer-lessp ptr end)
+			 do
+		     ;; Store the address
+		     (incf offset)
+		     (%p-store-contents-offset ptr header offset)
+		     ;; Store the data -- all 36 bits
+		     (incf offset)
+		     (%p-store-tag-and-pointer
+		       (%make-pointer-offset dtp-locative header offset)
+		       (%p-ldb %%q-all-but-pointer ptr)
+		       (%p-ldb %%q-pointer ptr)))))
+	#+imach
+	(macrolet ((set-header-word (offset type value)
+		     `(%p-store-cdr-and-contents (%pointer-plus header ,offset)
+						 (%set-tag ,value ,type)
+						 1)))
+	  (set-header-word 0 sys:dtp-fixnum (dpb sys:%world-target-architecture-Ivory-1
+						 sys:%%world-header-target-architecture
+						 sys:%current-world-format-version))
+	  (set-header-word 1 sys:dtp-small-ratio n-initial-entries)
+	  (set-header-word 2 sys:dtp-single-float n-load-entries)
+	  (set-header-word 3 sys:dtp-character 0)
+	  ;; Don't bother with the checksums
+	  (sys:%p-store-contents-offset nil header 4)
+	  (sys:%p-store-contents-offset nil header 5)
+	  (sys:%p-store-contents-offset nil header 6)
+	  (sys:%p-store-contents-offset nil header 7)
+	  (setq offset 7))
+	;; Build both maps
+	(map-save-blocks #'(lambda (vpn n-pages wired)
+			     (when wired
+			       (write-header-map vpn n-pages))))
+	(map-save-blocks #'(lambda (vpn n-pages wired)
+			     (when (not wired)
+			       (write-header-map vpn n-pages))))
+	;; Now switch to the auxiliary stack and copy the pages
+	(with-wired-structure-for-disk-save file-array
+	  (with-wired-structure-for-disk-save mm-frames
+	    (wire-words fep-communication-area page-size)
+	    ;; Right before we go over, update region
+	    ;; tables to not show temp arrays
+	    ;; Don't call reset-temporary-area, we don't want to
+	    ;; actually return the main-memory pages!
+	    ;; Resetting the free-pointer is safe because no page
+	    ;; faults on these locations will occur; they're wired.
+	    (do-area-regions (region disk-save-area)
+	      (setf (region-free-pointer region) 0))
+	    (let ((*sysout-generation-number* (if incremental
+						  (1+ *sysout-generation-number*)
+						  0))
+		  (*sysout-timestamp-1* mytime1)
+		  (*sysout-timestamp-2* mytime2)
+		  (*sysout-parent-timestamp-1* *sysout-timestamp-1*)
+		  (*sysout-parent-timestamp-2* *sysout-timestamp-2*))
+	      (%funcall-in-aux-stack
+		#'aux-disk-save
+		mm-frames
+		(array-length mm-frames)
+		header
+		(locf (aref file-array 0))
+		(locf (aref file-array (- (array-active-length file-array) 2)))
+		copy-load-file-p
+		(ldb %%vma-page-num fep-communication-area)))
+	    ;; Make sure the GC tables didn't grow after we decided which
+	    ;; pages of GC-TABLE-AREA would be saved.
+	    ;; Hopefully this error check is redundant.
+	    (when (> (region-free-pointer %gc-table-area-region)
+		     gc-table-size)
+	      (ferror "GC-TABLE-AREA expanded from ~O to ~O while saving.
+Consequently the world load file that was just written is trash."
+		      gc-table-size
+		      (region-free-pointer %gc-table-area-region)))))
+	(unwire-words fep-communication-area page-size))))
+    n-disk-pages))
+) ;#-VLM
+
+;;;
+
+(defconst *compiled-initializations*
+	  '(system-initialization-list
+	    cold-initialization-list
+	    warm-initialization-list
+	    neti:after-network-initialization-list
+	    neti:local-name-initialization-list
+	    neti:add-interfaces-initialization-list
+	    neti:commonly-used-property-lists
+	    si:enable-services-initialization-list
+	    si:disable-services-initialization-list
+	    si:login-initialization-list
+	    si:logout-initialization-list
+	    si:window-initialization-list
+	    ))
+
+(defun compile-boot-initializations ()
+  (when (variable-boundp #'compile)
+    (mapc #'compile-initializations *compiled-initializations*))
+  nil)
+
+(add-initialization "Compile Boot Initializations" '(compile-boot-initializations)
+		    '(:before-cold))
+
+(define-gc-optimization compile-boot-initializations :layered-ids-release
+  (:documentation "Ensures that system initialization lists are compiled.")
+  (:order :first (:before si:cache-function-currency))
+  (:before-flip (ignore)
+    (compile-boot-initializations)))

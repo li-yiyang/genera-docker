@@ -1,0 +1,755 @@
+;;; -*- Mode: lisp; Syntax: common-lisp; Package: (UID SCL); Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Unique ID generator.
+
+;;; This is a general-purpose utility module to generate unique
+;;; numerical identifiers known as UIDs.  A UID is a ninety-six bit
+;;; value, expressed as an ordered triple of fixnums.  The entrypoint
+;;; (uid:unique-id) returns a new, unique value.  The intention of this
+;;; module is that these numbers are unique over all time and space.
+;;;
+;;; See q:>dlw>statice>unique-id for an explanation of the design.  For
+;;; the VLM, we simply use the universal time as the middle word which
+;;; creates a counter block (a space of 2^32 UID's for each serial
+;;; number).  The low word is set to a random value, and a new block
+;;; allocated every *blocking-factor* UID's.  If the universal time
+;;; should go backwards, resulting in the same counter block being
+;;; allocated more than once, the odds are *blocking-factor*/1_32.
+;;; (about 1 in 16 million) that there will be a collision.  That's on
+;;; top of the odds of the machine being booted at exactly the same
+;;; second twice.
+
+(defvar *debug* nil)
+
+
+;;; Stream to the UNIQUE-ID file.
+(defvar *unique-id-file-stream* nil)
+
+
+;;; The last unique ID value that we returned.
+(defvar *unique-id-word-1* nil)
+
+(defvar *unique-id-word-2* nil)
+
+(defvar *unique-id-word-3* nil)
+
+
+;;; The sequence number word currently in the UNIQUE-ID file (or counter
+;;; block, for the VLM case).
+(defvar *sequence-number-in-file* nil)
+
+
+;;; Lock protecting update of the file and counter block
+(defvar *unique-id-lock* (process:make-lock "Unique ID Lock"))
+
+
+(defun initialize-unique-id ()
+  (setq *unique-id-file-stream* nil)
+  (setq *unique-id-word-1* nil)
+  (setq *unique-id-word-2* nil)
+  (setq *unique-id-word-3* nil)
+  (setq *sequence-number-in-file* nil)
+  (process:reset-lock *unique-id-lock*))
+
+;;; This is on :before-cold instead of :cold in order to help minimize
+;;; the amount of paging during booting, per Moon's request.
+(add-initialization "Unique-ID" '(initialize-unique-id) '(:before-cold))
+
+;;; Preallocate this many unique ID numbers at a time.
+(defparameter *blocking-factor* #-VLM 700 #+VLM 1_8.)
+
+;;; Make a new counter and initialize the disk array.
+(defun make-new-counter #-VLM (block stream) #+VLM ()
+  #-VLM
+  (progn
+    (setf (aref block *file-checkword-a-1*) *file-checkword-a*)
+    (setf (aref block *file-checkword-b-1*) *file-checkword-b*)
+    (setf (aref block *file-counter-word-1*) 0)	; Sequence number
+    (setf (aref block *file-counter-word-2*) (ldb (byte 24 0) (sys:%microsecond-clock)))
+    (setf (aref block *file-counter-word-3*) (get-machine-serial-number))
+    (put-string-into-array (get-pack-name (send (send stream :file-access-path) :unit))
+			   block *file-pack-name* 8)
+    (setf (aref block *file-fep-sequence-number*) (send stream :file-sequence-number))
+    (setf (aref block *file-dbg-universal-time*)
+	  (si:integer-low-bits-as-fixnum (get-universal-time)))
+    (put-string-into-array sys:user-id block *file-dbg-user-id* 2)
+    (setf (aref block *file-checkword-a-2*) *file-checkword-a*)
+    (setf (aref block *file-checkword-b-2*) *file-checkword-b*))
+  ;;Changed to ensure that UID's aren't negative for statice dumper -- Kalman 7/24/96
+  #+VLM
+  (setf *unique-id-word-1* (sys:%logdpb (sys:%microsecond-clock) (byte 23 8) 0)
+	*unique-id-word-2* (ldb (byte 31 0)
+				(si:integer-low-bits-as-fixnum (get-universal-time)))
+	*unique-id-word-3* (get-machine-serial-number)
+	*sequence-number-in-file* (+ *unique-id-word-1* *blocking-factor*)))
+
+;;; Our own little table of board types.  For each one, we store the
+;;; part number, the overall type of board, and our code number for our
+;;; tag field.  See si:*id-part-number-board-info* for the official
+;;; info.
+#+3600
+(defparameter *board-info*
+	      '((170018 :chassis 1 "3600")
+		(170027 :chassis 2 "3670")
+		(170219 :chassis 3 "3640")
+		(364202 :chassis 4 "3650")
+		(365450 :chassis 5 "3620")
+		(170082 :io 6 "IO REV 2A")
+		(170157 :io 7 "IO REV 6")
+		(170495 :io 8 "NBS FEP I/O")
+		(170423 :io 9 "NBS FEP I/O (NEC)")))
+
+
+;;; Return the serial number of this machine.  Use the NanoFEP and/or
+;;; Chassis ID, unless it's zero, in which case use the IO board ID.
+;;; The result is a 24-bit number, whose high 4 bits are a tag encoding
+;;; the board part number, and whose low 20 bits are the lowest 20 bits
+;;; (i.e. all) of the serial number.
+(defun get-machine-serial-number ()
+  #+3600
+  (let ((chassis-serial-number nil)
+	(io-serial-number nil))
+    (dolist (board (si:get-machine-configuration))
+      ;; Each element is a list of alternating keywords and values.
+      (let ((info (assoc (getf board :part-number) *board-info*)))
+	(when info
+	  (case (second info)
+	    (:chassis
+	      (when chassis-serial-number
+		(error "unique-id bug: Error examining machine configuration information.@~
+                        apparently there are two chassis boards!"))
+	      (let ((num (getf board :serial-number)))
+		(unless (zerop num)
+		  (setq chassis-serial-number (dpb (third info) (byte 4 20) num)))))
+	    (:io
+	      (when io-serial-number
+		(error "unique-id bug: Error examining machine configuration information.@~
+                        apparently there are two IO boards!"))
+	      (let ((num (getf board :serial-number)))
+		(unless (zerop num)
+		  (setq io-serial-number (dpb (third info) (byte 4 20) num)))))))))
+    (or chassis-serial-number
+	io-serial-number
+	(error "unique-id bug: Error examining machine configuration information.@~
+                apparently there is neither a valid chassis nor a valid IO!~@
+                Valid means it exists and has a non-zero serial number.")))
+  #+IMACH
+  (multiple-value-bind (nil serial-number)
+      (si:machine-model)
+    (or serial-number
+	(random most-positive-fixnum))))	;+++ kludge until si:machine-model works right
+
+;;; Generating unique IDs, and shutdown processing.
+
+(defun unique-id ()
+  (declare (values uid-word-1 uid-word-2 uid-word-3))
+  #-VLM
+  (unless (and *unique-id-file-stream* *unique-id-word-1*)
+    (process:with-lock (*unique-id-lock*)
+      (unless (and *unique-id-file-stream* *unique-id-word-1*)
+	(setq *unique-id-file-stream* (get-file-stream))
+	(recover-file *unique-id-file-stream*))))
+  #+VLM
+  ;; If you just booted, or incrementing the counter would wrap, make a
+  ;; new counter
+  (unless (and *unique-id-word-1* ( *unique-id-word-1* -1))
+    (process:with-lock (*unique-id-lock*)
+      (unless (and *unique-id-word-1* ( *unique-id-word-1* -1))
+	(make-new-counter))))
+  (loop do
+    (let* ((old-seq *unique-id-word-1*)
+	   (new-seq #-VLM (1+ old-seq)
+		    #+VLM (let ((candidate (sys:%32-bit-plus old-seq 1)))
+			    ;;need to ensure uid's aren't negative for dumper -- Kalman
+			    (if (minusp candidate)
+				(ldb (byte 31 0) candidate)
+				candidate))))
+      (cond #-VLM
+	    ((> new-seq *sequence-number-in-file*)
+	     ;; We're trying to give out a number higher than the one in
+	     ;; the file.  So we must advance the file.
+	     (process:with-lock (*unique-id-lock*)
+	       (when (> new-seq *sequence-number-in-file*)
+		 ;; Nobody beat us to it; it's still our job.
+		 (advance-sequence-number *unique-id-file-stream*))))
+	    #+VLM
+	    ((sys:%unsigned-lessp *sequence-number-in-file* new-seq)
+	     ;; After emitting a block of numbers we advance into a new
+	     ;; region, reducing the possibility of collisions
+	     (process:with-lock (*unique-id-lock*)
+	       (when (sys:%unsigned-lessp *sequence-number-in-file* new-seq)
+		 ;; Nobody beat us to it; it's still our job.
+		 (advance-sequence-number))))
+	    ((store-conditional (locf *unique-id-word-1*) old-seq new-seq)
+	     (return (values new-seq *unique-id-word-2* *unique-id-word-3*)))))))
+
+(defflavor unique-id (w0 w1 w2) ()
+  :initable-instance-variables)
+
+(defmethod (unique-id-words unique-id) ()
+  (declare (values word0 word1 word2))
+  (values w0 w1 w2))
+
+(defun unique-id-instance ()
+  (multiple-value-bind (w0 w1 w2) (unique-id)
+    (make-instance 'unique-id :w0 w0 :w1 w1 :w2 w2)))
+
+(defmethod (sys:print-self unique-id) (stream ignore slashify-p)
+  (flet ((bod () (format stream "Unique-ID [~S ~S ~S]" w0 w1 w2)))
+    (if slashify-p
+	(sys:printing-random-object (self stream)
+	  (bod))
+	(bod))))
+
+;;; Advanced the sequence number in the file by *blocking-factor*, and
+;;; update the value of *sequence-number-in-file*.
+(defun advance-sequence-number #-VLM (stream) #+VLM ()
+  #-VLM
+  (using-resource (block-0 si:disk-array)
+    (using-resource (block-1 si:disk-array)
+      (unless (and (read-block stream 0 block-0)
+		   (read-block stream 1 block-1))
+	;; The file is damaged.  Attempt to recover, and try again.
+	(recover-file stream)
+	(unless (and (read-block stream 0 block-0)
+		     (read-block stream 1 block-1))
+	  ;; Still getting errors!?
+	  (error "unique-id bug: Irrecoverable errors reading unique-id file")))
+      (let ((new-seq (+ *blocking-factor* (aref block-0 *file-counter-word-1*))))
+	(setf (aref block-0 *file-counter-word-1*) new-seq)
+	(setf (aref block-1 *file-counter-word-1*) new-seq)
+	(send stream :block-out 0 1 block-0)
+	(send stream :block-out 1 1 block-1)
+	(setq *sequence-number-in-file* new-seq))))
+  #+VLM
+  (make-new-counter))
+
+
+;;; Shut down the unique ID generator.  Write the latest number back to
+;;; the disk (so that we don't lose up to *blocking-factor*
+;;; numbers, although I admit this may not be terribly important) and
+;;; call our cold initialization function to erase all volatile state.
+(defun shutdown ()
+  #-VLM
+  (let ((stream *unique-id-file-stream*))
+    (when (and stream *sequence-number-in-file* *unique-id-word-1*)
+      (using-resource (block-0 si:disk-array)
+	(using-resource (block-1 si:disk-array)
+	  ;; If there are any problems reading the file, forget about
+	  ;; trying to conserve sequence number values, and let the next
+	  ;; user worry about recovery.
+	  (when (and (read-block stream 0 block-0)
+		     (read-block stream 1 block-1))
+	    (setf (aref block-0 *file-counter-word-1*) *unique-id-word-1*)
+	    (setf (aref block-1 *file-counter-word-1*) *unique-id-word-1*)
+	    (send stream :block-out 0 1 block-0)
+	    (send stream :block-out 1 1 block-1)
+	    ;; It's too dangerous to close the stream, because of FEPFS
+	    ;; problems.  The lock might have been gone, and FEPFS would
+	    ;; signal an error.  It's particularly bad for this to happen
+	    ;; during world-load creation!  Fix this when we're sure FEPFS
+	    ;; is suitably robust.  Until then, it doesn't hurt.
+	    ;; (close *unique-id-file-stream*)
+	    (initialize-unique-id))))))
+  #+VLM
+  (initialize-unique-id))
+
+(add-initialization "Unique-ID Shutdown" '(shutdown) '(:logout))
+
+#-VLM (progn
+;;; Contents of the UNIQUE-ID file.
+
+;;; Layout of each block of the UNIQUE-ID file:
+;;;    Checkwords.
+;;;    Counter.
+;;;    Disk pack name and file sequence number.
+;;;    Debugging info.
+;;;    Checkwords.
+
+(defconstant *file-checkword-a* #o2527007525)
+
+(defconstant *file-checkword-b* #o5250770252)
+
+(defconstant *file-checkword-a-1* 2)		; Checkword A
+
+(defconstant *file-checkword-b-1* 3)		; Checkword B
+
+(defconstant *file-counter-word-1* 4)		; Sequence number
+
+(defconstant *file-counter-word-2* 5)		; 8 bits mbz, 24 bits microsecond clock
+
+(defconstant *file-counter-word-3* 6)		; 8 bits mbz, 24 bits serial number
+
+(defconstant *file-pack-name* 7)		; labl-pack-name, 8 words long
+
+(defconstant *file-fep-sequence-number* 15)	; sequence number from FEP FS
+
+(defconstant *file-dbg-universal-time* 16)	; Time of writing to disk
+
+(defconstant *file-dbg-user-id* 17)		; user-id at time of writing, first 8 chars
+
+(defconstant *file-checkword-a-2* 19)		; Checkword A
+
+(defconstant *file-checkword-b-2* 20)		; Checkword B
+
+(defconstant *file-n-words* 21)
+
+;;; Finding the UNIQUE-ID file.
+
+;;; Get a stream to the UNIQUE-ID file.  Possibly this function should
+;;; have a whole lot more error-system hacking, but I'm not sure what
+;;; cases are likely enough to justify the work.  If anything goes
+;;; wrong, the user can always just delete the file.
+(defun get-file-stream ()
+  (fs:with-automatic-login-to-sys-host
+    (let* ((pathname (format nil "FEP~D:>UNIQUE-ID.FEP.1" (find-disk-unit)))
+	   (stream (open pathname
+			 :direction :block
+			 :if-exists :overwrite
+			 :if-does-not-exist :create
+			 :if-locked :share)))
+      ;; Make sure there are at least two blocks.  This has no effect if
+      ;; the file already exists and has two blocks.
+      (send stream :allocate 2)
+      stream)))
+
+;;; If there are any fixed-media disks, use the one with the lowest unit
+;;; number; otherwise, use whatever disk has the lowest unit number.
+;;; Return a disk unit number.
+(defun find-disk-unit ()
+  (let ((first-unit nil)
+	(first-fixed-unit nil))
+    ;; Iterate over all the disk units.
+    (dotimes (unit #+3600 (fill-pointer sys:*disk-unit-table*)
+		   #+IMACH (si:n-disk-units))
+      (when (si:disk-unit-mounted-p unit)
+	;; This unit is mounted.
+	(unless first-unit
+	  (setq first-unit unit))
+	(unless first-fixed-unit
+	  (when (fixed-unit-p unit)
+	    (setq first-fixed-unit unit)))))
+    (or first-fixed-unit
+	first-unit
+	(error "Unique-id generator bug: No disk units are mounted??"))))
+
+
+;;; Is this unit a fixed-medium disk drive?
+(defun fixed-unit-p (unit)
+  #+3600
+  ;; Unfortunately, there's no way to tell from the information
+  ;; available.  Hence this kludge, which looks for disks that appear to
+  ;; be T306s, that being our only removable disk right now.
+  (not (and (= (si:disk-n-pages-per-track unit) 16)
+	    (= (/ (si:disk-n-pages-per-cylinder unit) (si:disk-n-pages-per-track unit)) 19)))
+  #+IMACH
+  (declare (ignore unit))
+  #+IMACH
+  t)
+
+;;; Recovery.
+
+;;; Read the block into the array, carefully.  Return T if it looks valid.
+(defun read-block (stream block-number array)
+  (condition-case ()
+       (progn
+	 (send stream :block-in block-number 1 array)
+	 (and (= (aref array *file-checkword-a-1*) *file-checkword-a*)
+	      (= (aref array *file-checkword-b-1*) *file-checkword-b*)
+	      (= (aref array *file-checkword-a-2*) *file-checkword-a*)
+	      (= (aref array *file-checkword-b-2*) *file-checkword-b*)))
+     (si:disk-error nil)))
+
+
+;;; Given a stream to the file, make the file valid.  Assumes that the
+;;; file exists and has (at least) two blocks in it.  Also, set the 
+;;; relevant global variables.
+(defun recover-file (stream)
+  (using-resource (block-0 si:disk-array)
+    (using-resource (block-1 si:disk-array)
+      (let ((block-0-is-ok (read-block stream 0 block-0))
+	    (block-1-is-ok (read-block stream 1 block-1))
+	    (good-block nil))
+       (cond (block-0-is-ok
+	       (cond (block-1-is-ok
+		      ;; Both blocks look good.  But are they in sync?
+		      (setq good-block block-0)
+		      (let ((seq-0 (aref block-0 *file-counter-word-1*))
+			    (seq-1 (aref block-1 *file-counter-word-1*)))
+			(when ( seq-0 seq-1)
+			  (when *debug*
+			    (format *error-output* "~&Sequence numbers differ: ~D ~D"
+				    seq-0 seq-1))
+			  (cond ((< seq-0 seq-1)
+				 (send stream :block-out 0 1 block-1)
+				 (setq good-block block-1))
+				(t
+				 (send stream :block-out 1 1 block-0)
+				 (setq good-block block-0))))))
+		     (t
+		      ;; Block 0 is OK, block 1 is not.
+		      (when *debug* (format *error-output* "~&Block 0 OK, block 1 not OK"))
+		      (send stream :block-out 1 1 block-0)
+		      (setq good-block block-0))))
+	      (t
+	       (cond (block-1-is-ok
+		      ;; Block 1 is OK, block 0 is not.
+		      (when *debug* (format *error-output* "~&Block 1 OK, block 0 not OK"))
+		      (send stream :block-out 0 1 block-1)
+		      (setq good-block block-1))
+		     (t
+		      ;; Neither block is OK.  Make a new counter.
+		      (when *debug*
+			(format *error-output* "~&Both blocks not OK, new counter"))
+		      (make-new-counter block-0 stream)
+		      (send stream :block-out 0 1 block-0)
+		      (send stream :block-out 1 1 block-0)
+		      (setq good-block block-0)))))
+	(when (file-was-copied-p stream good-block)
+	  ;; This file was copied here from another disk pack!  Naughty, naughty.
+	  (when *debug* (format *error-output* "~&File was apparently copied; new counter"))
+	  (make-new-counter block-0 stream)
+	  (send stream :block-out 0 1 block-0)
+	  (send stream :block-out 1 1 block-0)
+	  (setq good-block block-0))	  
+	(setq *unique-id-word-1* (aref good-block *file-counter-word-1*))
+	(setq *unique-id-word-2* (aref good-block *file-counter-word-2*))
+	(setq *unique-id-word-3* (aref good-block *file-counter-word-3*))
+	(setq *sequence-number-in-file* *unique-id-word-1*)))))
+
+
+;;; Look at the file and see if it looks like a copy, rather than a file
+;;; that we created ourselves.
+(defun file-was-copied-p (stream block)
+  (not (and (compare-string-to-array
+	      (get-pack-name (send (send stream :file-access-path) :unit))
+	      block *file-pack-name* 8)
+	    (= (send stream :file-sequence-number)
+	       (aref block *file-fep-sequence-number*)))))
+
+;;; Read the disk label of the given unit, and return the pack-name
+;;; field as a Lisp string.
+(defun get-pack-name (unit)
+  (using-resource (label-array si:disk-array 288.)
+    (using-resource (disk-event si:disk-event)
+      (si:read-fep-label unit label-array disk-event)
+      (si:labl-pack-name label-array))))
+
+
+;;; I have to add this extra method here.  This really belongs with its
+;;; brethren in sys: l-sys; fep-stream.
+(defmethod (:file-sequence-number si:base-disk-stream) ()
+  (using-resource (file-header si:disk-array)
+    (using-resource (disk-event si:disk-event)
+      (si:disk-read file-header disk-event si:file-header-dpn))
+    (si:feph-sequence-number file-header)))
+
+;;; Upon every warm-boot, the FEP file system is reinitialized. 
+;;; Unfortunately, this doesn't work very well.  Any FEP FS streams that
+;;; existed before the warm-boot will continue to exist, and can be
+;;; used, but they have lost their locks!  So it's dangerous to use
+;;; them, and attempts to close such streams signal an error trying to
+;;; unlock a lock that they don't have.  To circumvent this bug until
+;;; it's fixed, the following initliazation discards this dangerous
+;;; broken stream, upon warm-boot.  The unique-id function will note
+;;; that the variable is nil, and re-open a good stream.
+(add-initialization "Unique-ID Discard Stream"
+		    '(setq *unique-id-file-stream* nil)
+		    nil
+		    'si:warm-initialization-list)
+
+;;; Utility functions to manipulate strings in arrays.
+
+(defun put-string-into-array (string block first-word n-words)
+  (loop for word-n from first-word
+	repeat n-words do
+    (setf (aref block word-n) 0))
+  (loop for word-n from first-word
+	repeat n-words
+	with string-length = (string-length string)
+	with char-n = 0
+	until ( char-n string-length) do
+    (setf (aref block word-n)
+	  (loop with word = 0
+		repeat 4
+		for pos from 24 by -8
+		until ( char-n string-length) do
+	    (setq word (dpb (char-code (aref string char-n)) (byte 8 pos) word))
+	    (incf char-n)
+	    finally (return word)))))
+
+
+;;; Return t if the string is the same as what's in the array.
+(defun compare-string-to-array (string block first-word n-words)
+  (loop for word-n from first-word
+	repeat n-words
+	with string-length = (string-length string)
+	with char-n = 0
+	until ( char-n string-length) do
+    (loop with word = (aref block word-n)
+	  repeat 4
+	  for pos from 24 by -8
+	  until ( char-n string-length) do
+      (unless (= (char-code (aref string char-n)) (ldb (byte 8 pos) word))
+	(return-from compare-string-to-array nil))
+      (incf char-n)))
+  t)
+
+
+(defun get-string-from-array (block first-word n-words)
+  (let ((string (make-array (* n-words 5) :element-type 'string-char :fill-pointer 0)))
+    (loop for word-n from first-word
+	  repeat n-words do
+      (loop with word = (aref block word-n)
+	    repeat 4
+	    for pos from 24 by -8 do
+	(let ((code (ldb (byte 8 pos) word)))
+	  (when (zerop code)
+	    (return-from get-string-from-array string))
+	  (vector-push (code-char code) string))))))
+
+
+) ;; #-VLM
+
+;;; Debugging functions.
+
+#||
+
+;;; Show the contents of the unique-id.fep file.
+(defun show-the-file ()
+  (let* ((pathname (format nil "FEP~D:>UNIQUE-ID.FEP.1" (find-disk-unit)))
+	 (stream (open pathname
+		       :direction :block
+		       :if-exists :overwrite
+		       :if-does-not-exist :error
+		       :if-locked :share)))
+    (format t "~&Contents of file ~A:~2&" pathname)
+    (using-resource (block-0 si:disk-array)
+      (using-resource (block-1 si:disk-array)
+	(flet ((read-array (block-number array)
+		 (let ((lose nil))
+		   (flet ((lossage (format-string &rest format-args)
+			    (setq lose t)
+			    (format t "~&Error: ")
+			    (apply #'format format-string format-args)))
+		     (format t "~&Reading block ~S." block-number)
+		     (condition-case (err)
+			  (send stream :block-in block-number 1 array)
+			(si:disk-error
+			  (lossage "Disk error: ~S" err))
+			(:no-error 
+			  (unless (= (aref array *file-checkword-a-1*) *file-checkword-a*)
+			    (lossage "Checkword A-1 does not match: ~S ~S"
+				     (aref array *file-checkword-a-1*) *file-checkword-a*))
+			  (unless (= (aref array *file-checkword-b-1*) *file-checkword-b*)
+			    (lossage "Checkword B-1 does not match: ~S ~S"
+				     (aref array *file-checkword-b-1*) *file-checkword-b*))
+			  (unless (= (aref array *file-checkword-a-2*) *file-checkword-a*)
+			    (lossage "Checkword A-2 does not match: ~S ~S"
+				     (aref array *file-checkword-a-2*) *file-checkword-a*))
+			  (unless (= (aref array *file-checkword-b-2*) *file-checkword-b*)
+			    (lossage "Checkword B-2 does not match: ~S ~S"
+				     (aref array *file-checkword-b-2*) *file-checkword-b*)))))
+		   (not lose))))
+	  (let ((block-0-is-ok (read-array 0 block-0))
+		(block-1-is-ok (read-array 1 block-1)))
+	    (flet ((show-block (block-number array)
+		     (format t "~2&Contents of block ~S:" block-number)
+		     (format t "~&Counter: ~D ~D ~D"
+			     (aref array *file-counter-word-1*)
+			     (aref array *file-counter-word-2*)
+			     (aref array *file-counter-word-3*))
+		     (format t "~&Pack name ~S, FEP FS sequence number ~S"
+			     (get-string-from-array array *file-pack-name* 8)
+			     (aref array *file-fep-sequence-number*))
+		     (format t "~&Date/time ~\\time\\, user ~S"
+			     (si:unsigned-aref array *file-dbg-universal-time*)
+			     (get-string-from-array array *file-dbg-user-id* 2))))
+	      (when block-0-is-ok (show-block 0 block-0))
+	      (when block-1-is-ok (show-block 1 block-1)))
+	    (when (and block-0-is-ok block-1-is-ok)
+	      (terpri)
+	      (unless (and (= (aref block-0 *file-counter-word-2*)
+			      (aref block-1 *file-counter-word-2*))
+			   (= (aref block-0 *file-counter-word-3*)
+			      (aref block-1 *file-counter-word-3*)))
+		(format t "~2&Error: The counter IDs do not match!"))
+	      (unless (= (aref block-0 *file-counter-word-1*)
+			 (aref block-1 *file-counter-word-1*))
+		(format t "~2&Note: The two sequence numbers are not equal."))
+	      (print-machine-serial-number (ldb (byte 24 0)
+						(aref block-0 *file-counter-word-3*))))))))))
+
+
+;;; For debugging only.
+(defun print-machine-serial-number (num)
+  (let ((tag (ldb (byte 4 20) num)))
+    (loop for info in *board-info* do
+      (when (eql (third info) tag)
+	(format t "~%Serial number from ~A board of ~A is ~A"
+		(second info) (fourth info) (ldb (byte 20 0) num))
+	(return nil))
+      finally (format t "~&??? Unknown tag value ~A" tag))))
+
+
+;;; Before running tests, set *debug* to t and *blocking-factor* to
+;;; something much smaller, like 3 or 5.
+
+;;; Test of string manipulation.
+(defun testa ()
+  (let ((block (make-array 10)))
+    (put-string-into-array "Hello" block 3 4)
+    (print (get-string-from-array block 3 4))
+    (print (compare-string-to-array "Hello" block 3 4))
+    (print (compare-string-to-array "Hollo" block 3 4))))
+
+
+;;; Do file recovery, and then show the file.
+(defun testb ()
+  (let ((stream (get-file-stream)))
+    (recover-file stream))
+  (show-the-file))
+
+
+;;; Bash checkword of block N.  Try calling this in the middle of
+;;; generating some unique IDs and see what happens.
+(defun bashcw (block-number)
+  (let ((stream *unique-id-file-stream*))
+    (using-resource (array si:disk-array)
+      (send stream :block-in block-number 1 array)
+      (setf (aref array  *file-checkword-b-1*) 69)
+      (send stream :block-out block-number 1 array))))
+
+
+;;; Another test is to call (si:resequence-fep-filesystem) and make sure
+;;; that it causes a new counter to be generated.
+
+;;; Simulate a typical user, with blood in his eye.
+;;; You might have to warm-boot before running this in order to get
+;;; the FEP FS to unlock everything.
+(defun murder ()
+  (flet ((say (string) (format t "~&~A" string)))
+    (let* ((pathname (fs:parse-pathname (format nil "FEP~D:>UNIQUE-ID.FEP.1"
+						(find-disk-unit))))
+	   (bad-pathname (send pathname :new-name "BAD-UNIQUE-ID")))
+      (say "Run unique-id.")
+      (print (multiple-value-list (unique-id)))
+      (say "Shutdown.")
+      (shutdown)
+      (say "Copy file.")
+      (copy-file pathname bad-pathname)
+      (say "Run unique-id 20 times, show final value.")
+      (loop repeat 19 do (unique-id))
+      (print (multiple-value-list (unique-id)))
+      (say "Shutdown again.")
+      (shutdown)
+      (say "Delete file.")
+      (delete-file pathname)
+      (say "Expunge directory.")
+      (send pathname :expunge)
+      (say "Show directory")
+      (zl:listf (send pathname :new-name :wild))
+      (say "Copy file back.")
+      (copy-file bad-pathname pathname)
+      (say "Run unique-id 3 times, showing all values.")
+      (loop repeat 3 do (print (multiple-value-list (unique-id)))))))
+
+
+;;; Test what happens in the face of a hard ECC error.
+
+;;; From NDIAG
+(defun ecc-make-disk-array (size)
+  "Make a disk-array with an extra word for the ECC code."
+  (let ((si:disk-sector-data-size32 (1+ size)))
+    (si:make-disk-array (1+ size))))
+
+
+;;; From NDIAG
+(defmacro with-ecc-word (&body body)
+  `(let ((si:disk-sector-data-size32 (1+ si:disk-sector-data-size32))
+	 (si:*disk-enq-disable-checks* t))
+     ,@body))
+
+
+(defun trash-block (stream block-number)
+  (let ((e-array (ecc-make-disk-array 288)))
+    (with-ecc-word
+      (send stream :block-out block-number 1 e-array))))
+
+
+(defun trash ()
+  (flet ((say (string) (format t "~&~A" string)))
+    (say "Run unique-id.")
+    (print (multiple-value-list (unique-id)))
+    (say "Shutdown")
+    (shutdown)
+    (say "Trash block 0 of the file.")
+    (with-open-stream (s (get-file-stream))
+      (trash-block s 0))
+    (say "Run unique-id.")
+    (print (multiple-value-list (unique-id)))
+    (say "Trash block 1 of the file.")
+    (with-open-stream (s (get-file-stream))
+      (trash-block s 1))
+    (say "Run unique-id 6 times.")
+    (loop repeat 6 do (print (multiple-value-list (unique-id))))
+    (say "Trash blocks 0 and 1of the file.")
+    (with-open-stream (s (get-file-stream))
+      (trash-block s 0)
+      (trash-block s 1))
+    (say "Run unique-id 6 times.")
+    (loop repeat 6 do (print (multiple-value-list (unique-id))))
+    t))
+||#

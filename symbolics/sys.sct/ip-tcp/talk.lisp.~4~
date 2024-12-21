@@ -1,0 +1,1174 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Package: COMMON-LISP-NETWORK-INTERNALS -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; This file implements the Berkeley UNIX talk family of protocols as a
+;;; protocol implementing the SEND service, for use by Converse and friends.
+;;;
+;;; Talk-control (known as "talk" on UNIX) and new-talk-control ("ntalk"
+;;; on UNIX) are UDP protocols used for rendezvousing to open a TCP talk
+;;; connection.  New-talk-control replaced talk-control in/around
+;;; 4.3BSD, to fix the byte-ordering problems associated with
+;;; talk-control.  Unfortunately, most commercial Berkeley UNIX systems
+;;; are 4.2BSD-derived, so talk-control is still widespread.  Even more
+;;; unfortunately, the revised (new-talk-control) protocol still commits
+;;; various heresies, such as passing UNIX internal data structures
+;;; around (what do I care what a sockaddr looks like?).
+;;;
+;;; The basic point of the UNIX talk program is to provide real-time
+;;; display of a bidirectional character stream, so that both users can
+;;; type simultaneously.  My experience is that most people actually
+;;; alternate typing paragraphs, which makes real conversation possible.
+;;; This alternation provides a convenient way to break an incoming talk
+;;; stream into converse messages.
+
+;; Client  server request codes.  Happily, these didn't change from
+;; 4.2 to 4.3 BSD.
+(defenumerated *talk-request-codes*
+	       (%talk-request-leave-invitation	;Leave invitation for callee
+		 %talk-request-look-up		;Look for invitation from callee
+		 %talk-request-delete-invitation	;Delete previously-left invitation
+		 %talk-request-announce-invitation))	;Write invitation to callee's logins
+
+;; Server  client reply codes
+;; These apply to both 4.2 and 4.3
+(defenumerated *talk-reply-answer-codes*
+	       (%talk-answer-success		;Request succeeded
+		 %talk-answer-not-here		;Callee not logged in
+		 %talk-answer-failed		;Operation failed for unknown reason
+		 %talk-answer-machine-unknown	;Caller's machine unknown
+		 %talk-answer-permission-denied	;Permission to announce denied.
+						; On UNIX, this means the callee's tty
+						; permissions won't let the server
+						; write the announcement.  On Genera, this
+						; means that Converse is gagged.
+		 %talk-answer-unknown-request	;Request has unknown type value
+		 ;; These only apply to 4.3 talk
+		 %talk-answer-bad-version	;Request has unknown version value
+		 %talk-answer-bad-address	;Request has bad address field
+		 %talk-answer-bad-control-address))	;Request has bad control-address field
+
+;;; Port numbers
+
+(tcp:add-udp-port-for-protocol :unix42-talk-control 517.)
+(tcp:add-udp-port-for-protocol :unix43-talk-control 518.) 
+
+;; This is never used, but is necessary for GNS to believe that TCP/TALK
+;; is a viable protocol
+(tcp:add-tcp-port-for-protocol :talk 517.)
+
+
+;;; Parameters
+
+(defvar *talk-ring-interval* 30
+  "Seconds to wait between invitation retransmissions")
+(defvar *talk-partial-message-timeout* 5
+  "Number of seconds after which a paragraph is considered ended")
+(defvar *talk-control-transaction-timeout* 2
+  "Number of seconds to wait before assuming a control request was lost")
+(defvar *talk-delivery-timeout* 300.
+  "Number of seconds to wait for remote user to respond to an invitation")
+
+(defvar *unix43-talk-version* 1
+  "Version number of the 4.3 BSD talk-control protocol")
+
+;; Packet size constants
+;; This applies to both 4.2 and 4.3 BSD
+(defconstant *talk-tty-size* 16
+  "Number of characters in a tty name")
+
+;; This only applies to 4.2
+(defconstant *unix42-talk-name-size* 9
+  "Number of characters in a name")
+
+;; This only applies to 4.3
+(defconstant *unix43-talk-name-size* 12
+  "Number of characters in a name")
+
+;; UNIX way to say "Internet"; this is Lisp for AF_INET
+(defconstant *unix-internet-address-family* 2)
+
+(eval-when (compile load eval)
+
+;; Unsigned fixnum of N 8-bit bytes in Internet network order
+(defun (network-bytes lmfs:defstorage-processor) (accessor ignore spec)
+  (let ((length (car spec)))
+    (lmfs:defstorage-align 'lmfs:byte)
+    (lmfs:defstorage-encode-runtime-info accessor 'byte length)
+    (lmfs:generate-defstorage-accessor
+      accessor '8array
+      ``(defstorage-rt-swap-bytes ,8array ,,lmfs:*defstorage-index-offset* ,,length))
+    (lmfs:generate-defstorage-storer
+      accessor '8array 'v
+      ``(defmacro%store-swapped-bytes ,v ,8array ,,lmfs:*defstorage-index-offset* ,',length))
+    (lmfs:defstorage-increment length 'lmfs:byte)))
+
+;; Build fixnum by extracting bytes and swapping them around
+(defun defstorage-rt-swap-bytes (8array start len)
+  (let ((8array 8array))
+    (declare (sys:array-register 8array))
+    (loop for i from 0 below len
+	  for 8ix upfrom start
+	  for shift = (lsh 1 (* 8 (- len i 1)))
+	  summing (* (aref 8array 8ix) shift))))
+
+;; Store fixnum into array, swapping bytes around
+(defun defmacro%store-swapped-bytes (val 8array 8start len)
+  (let ((8array 8array))
+    (declare (sys:array-register 8array))
+    (loop for i from (1- len) downto 0
+	  for 8x upfrom 8start
+	  do (setf (aref 8array 8x) (ldb (byte 8 (* i 8)) val)))))
+
+)						; eval-when
+
+;; This is the structure UNIX uses for passing around machine addresses.
+;; Each field is in network byte order
+(lmfs:defstorage unix-sockaddr
+  (family network-bytes 2)			; For us, always *unix-internet-address-family*
+  (port network-bytes 2)
+  (address network-bytes 4)
+  (ignore char 8))
+
+
+;;; TALK protocol errors
+
+(defflavor talk-error
+	((user) (host))
+	(sys:network-error)
+  :initable-instance-variables)
+
+
+(defflavor talk-connection-refused
+	()
+	(talk-error))
+
+(defmethod (dbg:report talk-connection-refused) (stream)
+  (format stream "~A@~A is refusing TALK messages" user host))
+
+
+(defflavor talk-recipient-not-logged-in
+	()
+	(talk-error))
+
+(defmethod (dbg:report talk-recipient-not-logged-in) (stream)
+  (format stream "~A@~A not logged in" user host))
+
+
+(defflavor talk-delivery-timeout
+	()
+	(talk-error))
+
+(defmethod (dbg:report talk-delivery-timeout) (stream)
+  (format stream "No response from ~A@~A" user host))
+
+
+(defflavor talk-miscellaneous-error
+	((text))
+	(talk-error)
+  :initable-instance-variables)
+
+(defmethod (dbg:report talk-miscellaneous-error) (stream)
+  (write-string text stream))
+
+
+(defun signal-talk-error (packet-hacker callee-name host pkt pkt-type)
+  (selector (packet-field packet-hacker pkt pkt-type :answer) =
+    (%talk-answer-not-here
+      (signal 'talk-recipient-not-logged-in
+	      :user callee-name
+	      :host host))
+    (%talk-answer-permission-denied
+      (signal 'talk-connection-refused
+	      :user callee-name
+	      :host host))
+    (otherwise
+      (signal 'talk-miscellaneous-error
+	      :user callee-name
+	      :host host
+	      :text (selector (packet-field packet-hacker pkt pkt-type :answer) =
+		      (%talk-answer-failed "Operation failed")
+		      (%talk-answer-machine-unknown "Calling machine unknown by callee")
+		      (%talk-answer-unknown-request "Protocol confusion")
+		      (%talk-answer-bad-version "Protocol version mismatch")
+		      (%talk-answer-bad-address "Protocol botch in address field")
+		      (%talk-answer-bad-control-address
+			"Protocol botch in control address field")
+		      (Otherwise (format nil "Unknown TALK answer code ~D"
+					 (packet-field packet-hacker pkt pkt-type
+						       :answer))))))))
+
+;; Talk packet-hacking mixins
+
+;; This is the talk request packet layout
+;; The 9s should be *unix42-talk-name-size*, the 16 *talk-tty-size*
+(lmfs:defstorage unix42-talk-req-pkt
+  (type byte)
+  (caller-name ascii-char 9)
+  (callee-name ascii-char 9)
+  (pad byte)
+  (message-id network-bytes 4)
+  (process-id network-bytes 4)
+  (callee-tty ascii-char 16)
+  (addr unix-sockaddr)				; address for establishing conversation
+  (control-address unix-sockaddr))		; control address
+
+;; This is the talk response packet layout
+(lmfs:defstorage unix42-talk-rep-pkt
+  (type byte)
+  (answer byte)
+  (message-id network-bytes 4)
+  (addr unix-sockaddr))
+
+;; This is the new-talk packet layout, for both request and response
+(lmfs:defstorage unix43-talk-pkt
+  (version byte)				; *talk-version*
+  (type byte)					; *talk-req-D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")foo0* request
+  (answer byte)					; *talk-rep-1foo0* response
+  (pad byte)					; word-alignment padding
+  (message-id fixnum)				; message id
+  (addr unix-sockaddr)				; address for establishing conversation
+  (control-address unix-sockaddr)		; control address
+  (process-id fixnum)				; UNIX pid of caller
+  ;; The 12s should be *unix43-talk-name-size*, the 16 *talk-tty-size*
+  (caller-name ascii-char 12)			; Name of caller
+  (callee-name ascii-char 12)			; Name of callee
+  (callee-tty ascii-char 16))
+
+
+(defflavor basic-talk-packet-hacker
+	()
+	()
+  :abstract-flavor
+  (:init-keywords :talk-control-protocol)
+  (:mixture (:talk-control-protocol
+	      (:unix42-big-endian unix42-big-endian-talk-packet-hacker)
+	      (:unix42-little-endian unix42-little-endian-talk-packet-hacker)
+	      (:unix43 unix43-talk-packet-hacker))))
+
+(defun-in-flavor (extract-string basic-talk-packet-hacker) (string)
+  (let ((null-pos (position #.(ascii-to-char 0) string :test 'char=)))
+    (if null-pos
+	(subseq string 0 null-pos)
+	string)))
+
+(defmacro-in-flavor (setf-null-padded basic-talk-packet-hacker) (location value max-length)
+  `(progn
+     (setf ,location ,value)
+     (when (< (length ,value) ,max-length)
+       (fill ,location (code-char 0) :start (length ,value)))))
+
+
+;; Big-endian 4.2 BSD Talk
+
+(defflavor unix42-big-endian-talk-packet-hacker
+	()
+	(basic-talk-packet-hacker))
+
+(defmethod (packet-hacker-packet-size unix42-big-endian-talk-packet-hacker) (pkt-type)
+  (assert (member pkt-type '(:response :request)))
+  (if (eq pkt-type :response)
+      (unix42-talk-rep-pkt-size-in-bytes)
+      (unix42-talk-req-pkt-size-in-bytes)))
+
+(defmethod (packet-field unix42-big-endian-talk-packet-hacker) (pkt pkt-type field)
+  (assert (member pkt-type '(:response :request)))
+  (if (eq pkt-type :response)
+      ;; Response packet
+      ;; CASE not ECASE because the UNIX43 talk response packet has more fields
+      (case field
+	(:version)
+	(:type (unix42-talk-rep-pkt-type pkt))
+	(:answer (unix42-talk-rep-pkt-answer pkt))
+	(:message-id (unix42-talk-rep-pkt-message-id pkt))
+	(:addr-family (unix42-talk-rep-pkt-addr-family pkt))
+	(:addr-address (unix42-talk-rep-pkt-addr-address pkt))
+	(:addr-port (unix42-talk-rep-pkt-addr-port pkt)))
+      ;; Request packet 
+      ;; CASE not ECASE because the UNIX43 talk request packet has more fields
+      (case field
+	(:version)
+	(:type (unix42-talk-req-pkt-type pkt))
+	(:caller-name (extract-string (unix42-talk-req-pkt-caller-name pkt)))
+	(:callee-name (extract-string (unix42-talk-req-pkt-callee-name pkt)))
+	(:message-id (unix42-talk-req-pkt-message-id pkt))
+	(:process-id (unix42-talk-req-pkt-process-id pkt))
+	(:callee-tty (extract-string (unix42-talk-req-pkt-callee-tty pkt)))
+	(:addr-family (unix42-talk-req-pkt-addr-family pkt))
+	(:addr-address (unix42-talk-req-pkt-addr-address pkt))
+	(:addr-port (unix42-talk-req-pkt-addr-port pkt))
+	(:control-address-family (unix42-talk-req-pkt-control-address-family pkt))
+	(:control-address-address (unix42-talk-req-pkt-control-address-address pkt))
+	(:control-address-port (unix42-talk-req-pkt-control-address-port pkt)))))
+
+(defmethod (modify-packet unix42-big-endian-talk-packet-hacker)
+	   (pkt pkt-type &key (type nil tp) (answer nil ap) (message-id nil mip)
+		(addr-family nil afp) (addr-address nil aap) (addr-port nil app)
+		(caller-name nil crnp) (callee-name nil cenp) (process-id nil pip)
+		(callee-tty nil ctp) (control-address-family nil cafp)
+		(control-address-address nil caap) (control-address-port nil capp)
+		version)
+  (ignore version)
+  (assert (member pkt-type '(:response :request)))
+  (if (eq pkt-type :response)
+      ;; Response packet
+      (block nil
+	(when tp
+	  (setf (unix42-talk-rep-pkt-type pkt) type))
+	(when ap
+	  (setf (unix42-talk-rep-pkt-answer pkt) answer))
+	(when mip
+	  (setf (unix42-talk-rep-pkt-message-id pkt) message-id))
+	(when afp
+	  (setf (unix42-talk-rep-pkt-addr-family pkt) addr-family))
+	(when aap
+	  (setf (unix42-talk-rep-pkt-addr-address pkt) addr-address))
+	(when app
+	  (setf (unix42-talk-rep-pkt-addr-port pkt) addr-port)))
+      ;; Request packet
+      (when tp
+	(setf (unix42-talk-req-pkt-type pkt) type))
+      (when crnp
+	(setf-null-padded (unix42-talk-req-pkt-caller-name pkt)
+			  caller-name *unix42-talk-name-size*))
+      (when cenp
+	(setf-null-padded (unix42-talk-req-pkt-callee-name pkt)
+			  callee-name *unix42-talk-name-size*))
+      (when mip
+	(setf (unix42-talk-req-pkt-message-id pkt) message-id))
+      (when pip
+	(setf (unix42-talk-req-pkt-process-id pkt) process-id))
+      (when ctp
+	(setf-null-padded (unix42-talk-req-pkt-callee-tty pkt) callee-tty *talk-tty-size*))
+      (when afp
+	(setf (unix42-talk-req-pkt-addr-family pkt) addr-family))
+      (when aap
+	(setf (unix42-talk-req-pkt-addr-address pkt) addr-address))
+      (when app
+	(setf (unix42-talk-req-pkt-addr-port pkt) addr-port))
+      (when cafp
+	(setf (unix42-talk-req-pkt-control-address-family pkt) control-address-family))
+      (when caap
+	(setf (unix42-talk-req-pkt-control-address-address pkt) control-address-address))
+      (when capp
+	(setf (unix42-talk-req-pkt-control-address-port pkt) control-address-port))))
+
+
+;;; Little-endian 4.2 BSD Talk
+
+(defflavor unix42-little-endian-talk-packet-hacker
+	()
+	(basic-talk-packet-hacker))
+
+(defmacro-in-flavor (byte-swap-16 unix42-little-endian-talk-packet-hacker)
+		    (num &environment env)
+  (once-only (num &environment env)
+    `(dpb (ldb (byte 8 0) ,num) (byte 8 8) (ldb (byte 8 8) ,num))))
+
+(defmethod (packet-hacker-packet-size unix42-little-endian-talk-packet-hacker) (pkt-type)
+  (assert (member pkt-type '(:response :request)))
+  (if (eq pkt-type :response)
+      (unix42-talk-rep-pkt-size-in-bytes)
+      (unix42-talk-req-pkt-size-in-bytes)))
+
+(defmethod (packet-field unix42-little-endian-talk-packet-hacker) (pkt pkt-type field)
+  (assert (member pkt-type '(:response :request)))
+  (if (eq pkt-type :response)
+      ;; Response packet
+      ;; CASE not ECASE because the UNIX43 talk response packet has more fields
+      (case field
+	(:version)
+	(:type (unix42-talk-rep-pkt-type pkt))
+	(:answer (unix42-talk-rep-pkt-answer pkt))
+	(:message-id (rpc::byte-swap (unix42-talk-rep-pkt-message-id pkt)))
+	(:addr-family (byte-swap-16 (unix42-talk-rep-pkt-addr-family pkt)))
+	(:addr-address (unix42-talk-rep-pkt-addr-address pkt))
+	(:addr-port (unix42-talk-rep-pkt-addr-port pkt)))
+      ;; Request packet 
+      ;; CASE not ECASE because the UNIX43 talk request packet has more fields
+      (case field
+	(:version)
+	(:type (unix42-talk-req-pkt-type pkt))
+	(:caller-name (extract-string (unix42-talk-req-pkt-caller-name pkt)))
+	(:callee-name (extract-string (unix42-talk-req-pkt-callee-name pkt)))
+	(:message-id (rpc::byte-swap (unix42-talk-req-pkt-message-id pkt)))
+	(:process-id (unix42-talk-req-pkt-process-id pkt))
+	(:callee-tty (extract-string (unix42-talk-req-pkt-callee-tty pkt)))
+	(:addr-family (byte-swap-16 (unix42-talk-req-pkt-addr-family pkt)))
+	(:addr-address (unix42-talk-req-pkt-addr-address pkt))
+	(:addr-port (unix42-talk-req-pkt-addr-port pkt))
+	(:control-address-family
+	  (byte-swap-16 (unix42-talk-req-pkt-control-address-family pkt)))
+	(:control-address-address (unix42-talk-req-pkt-control-address-address pkt))
+	(:control-address-port (unix42-talk-req-pkt-control-address-port pkt)))))
+
+(defmethod (modify-packet unix42-little-endian-talk-packet-hacker)
+	   (pkt pkt-type &key (type nil tp) (answer nil ap) (message-id nil mip)
+		(addr-family nil afp) (addr-address nil aap) (addr-port nil app)
+		(caller-name nil crnp) (callee-name nil cenp) (process-id nil pip)
+		(callee-tty nil ctp) (control-address-family nil cafp)
+		(control-address-address nil caap) (control-address-port nil capp)
+		version)
+  (ignore version)
+  (assert (member pkt-type '(:response :request)))
+  (if (eq pkt-type :response)
+      ;; Response packet
+      (block nil
+	(when tp
+	  (setf (unix42-talk-rep-pkt-type pkt) type))
+	(when ap
+	  (setf (unix42-talk-rep-pkt-answer pkt) answer))
+	(when mip
+	  (setf (unix42-talk-rep-pkt-message-id pkt) (rpc::byte-swap message-id)))
+	(when afp
+	  (setf (unix42-talk-rep-pkt-addr-family pkt) (byte-swap-16 addr-family)))
+	(when aap
+	  (setf (unix42-talk-rep-pkt-addr-address pkt) addr-address))
+	(when app
+	  (setf (unix42-talk-rep-pkt-addr-port pkt) addr-port)))
+      ;; Request packet
+      (when tp
+	(setf (unix42-talk-req-pkt-type pkt) type))
+      (when crnp
+	(setf-null-padded (unix42-talk-req-pkt-caller-name pkt)
+			  caller-name *unix42-talk-name-size*))
+      (when cenp
+	(setf-null-padded (unix42-talk-req-pkt-callee-name pkt)
+			  callee-name *unix42-talk-name-size*))
+      (when mip
+	(setf (unix42-talk-req-pkt-message-id pkt) (rpc::byte-swap message-id)))
+      (when pip
+	(setf (unix42-talk-req-pkt-process-id pkt) process-id))
+      (when ctp
+	(setf-null-padded (unix42-talk-req-pkt-callee-tty pkt) callee-tty *talk-tty-size*))
+      (when afp
+	(setf (unix42-talk-req-pkt-addr-family pkt) (byte-swap-16 addr-family)))
+      (when aap
+	(setf (unix42-talk-req-pkt-addr-address pkt) addr-address))
+      (when app
+	(setf (unix42-talk-req-pkt-addr-port pkt) addr-port))
+      (when cafp
+	(setf (unix42-talk-req-pkt-control-address-family pkt)
+	      (byte-swap-16 control-address-family)))
+      (when caap
+	(setf (unix42-talk-req-pkt-control-address-address pkt) control-address-address))
+      (when capp
+	(setf (unix42-talk-req-pkt-control-address-port pkt) control-address-port))))
+
+;;; 4.3 BSD Talk
+
+(defflavor unix43-talk-packet-hacker
+	()
+	(basic-talk-packet-hacker))
+
+(defmethod (packet-hacker-packet-size unix43-talk-packet-hacker) (pkt-type)
+  (assert (member pkt-type '(:response :request)))
+  (unix43-talk-pkt-size-in-bytes))
+
+(defmethod (packet-field unix43-talk-packet-hacker) (pkt pkt-type field)
+  (assert (member pkt-type '(:response :request)))
+  (ecase field
+    (:version (unix43-talk-pkt-version pkt))
+    (:type (unix43-talk-pkt-type pkt))
+    (:answer (unix43-talk-pkt-answer pkt))
+    (:message-id (unix43-talk-pkt-message-id pkt))
+    (:addr-family (unix43-talk-pkt-addr-family pkt))
+    (:addr-address (unix43-talk-pkt-addr-address pkt))
+    (:addr-port (unix43-talk-pkt-addr-port pkt))
+    (:control-address-family (unix43-talk-pkt-control-address-family pkt))
+    (:control-address-address (unix43-talk-pkt-control-address-address pkt))
+    (:control-address-port (unix43-talk-pkt-control-address-port pkt))
+    (:process-id (unix43-talk-pkt-process-id pkt))
+    (:caller-name (extract-string (unix43-talk-pkt-caller-name pkt)))
+    (:callee-name (extract-string (unix43-talk-pkt-callee-name pkt)))
+    (:callee-tty (extract-string (unix43-talk-pkt-callee-tty pkt)))))
+
+(defmethod (modify-packet unix43-talk-packet-hacker)
+	   (pkt pkt-type &key (type nil tp) (answer nil ap) (message-id nil mip)
+		(addr-family nil afp) (addr-address nil aap) (addr-port nil app)
+		(caller-name nil crnp) (callee-name nil cenp) (process-id nil pip)
+		(callee-tty nil ctp) (control-address-family nil cafp)
+		(control-address-address nil caap) (control-address-port nil capp)
+		(version nil vp))
+  (assert (member pkt-type '(:response :request)))
+  ;; New-talk only has one packet format
+  (when vp
+    (setf (unix43-talk-pkt-version pkt) version))
+  (when tp
+    (setf (unix43-talk-pkt-type pkt) type))
+  (when ap
+    (setf (unix43-talk-pkt-answer pkt) answer))
+  (when mip
+    (setf (unix43-talk-pkt-message-id pkt) message-id))
+  (when afp
+    (setf (unix43-talk-pkt-addr-family pkt) addr-family))
+  (when aap
+    (setf (unix43-talk-pkt-addr-address pkt) addr-address))
+  (when app
+    (setf (unix43-talk-pkt-addr-port pkt) addr-port))
+  (when cafp
+    (setf (unix43-talk-pkt-control-address-family pkt) control-address-family))
+  (when caap
+    (setf (unix43-talk-pkt-control-address-address pkt) control-address-address))
+  (when capp
+    (setf (unix43-talk-pkt-control-address-port pkt) control-address-port))
+  (when pip
+    (setf (unix43-talk-pkt-process-id pkt) process-id))
+  (when crnp
+    (setf-null-padded (unix43-talk-pkt-caller-name pkt) caller-name *unix43-talk-name-size*))
+  (when cenp
+    (setf-null-padded (unix43-talk-pkt-callee-name pkt) callee-name *unix43-talk-name-size*))
+  (when ctp
+    (setf-null-padded (unix43-talk-pkt-callee-tty pkt) callee-tty *talk-tty-size*)))
+
+
+;; Resource for use by TALK-CONTROL protocol
+(defresource talk-packet-hacker (&key talk-control-protocol)
+  :constructor (make-instance 'basic-talk-packet-hacker
+			      :talk-control-protocol talk-control-protocol))
+
+
+;;; TALK-CONTROL servers
+
+;; Base flavor with basic server algorithms.  Descendants are defined to
+;; cope with the 4.2 to 4.3 protocol changes.
+(defflavor basic-talk-control-server
+	(request-array
+	 request-array-start
+	 request-array-end
+	 response-array
+	 response-array-start
+	 response-array-end)
+	(neti:udp-server)
+  :initable-instance-variables)
+
+(defmethod (server-top-level-internal basic-talk-control-server) (packet-hacker)
+  (sys:with-data-stack
+    (let* ((req-pkt (sys:make-stack-array (- request-array-end request-array-start)
+					  :type 'sys:art-8b
+					  :displaced-to request-array
+					  :displaced-index-offset request-array-start))
+	   (rep-pkt (sys:make-stack-array (- response-array-end response-array-start)
+					  :type 'sys:art-8b
+					  :displaced-to response-array
+					  :displaced-index-offset response-array-start)))
+      ;; These are always set in the response packet
+      (modify-packet packet-hacker rep-pkt :response
+		     :version (packet-field packet-hacker req-pkt :request :version)
+		     :type (packet-field packet-hacker req-pkt :request :type)
+		     :message-id (packet-field packet-hacker req-pkt :request :message-id)
+		     :process-id (packet-field packet-hacker req-pkt :request :process-id))
+      ;; Figure out the answer code
+      (if (and (packet-field packet-hacker req-pkt :request :version)
+	       ( (packet-field packet-hacker req-pkt :request :version)
+		  *unix43-talk-version*))
+	  ;; This talk protocol supports versions, and we're running the wrong one
+	  (modify-packet packet-hacker rep-pkt :response
+			 :answer %talk-answer-bad-version)
+	  ;; Act on specific talk request
+	  (selector (packet-field packet-hacker req-pkt :request :type) =
+	    ((%talk-request-look-up %talk-request-announce-invitation)
+	     ;; Foreign talk program is looking for an invitation.
+	     ;; We always return success, assuming that Converse isn't
+	     ;; gagged and they're looking for the right user.
+	     ;; Note that we have to trim trailing null characters from the user name.
+	     (cond ((not (string-equal
+			   (packet-field packet-hacker req-pkt :request :callee-name)
+			   (send si:*user* :lispm-name)))
+		    (modify-packet packet-hacker rep-pkt :response
+				   :answer %talk-answer-not-here))
+		   (zwei:*converse-gagged*
+		    (if (= (packet-field packet-hacker req-pkt :request :type)
+			   %talk-request-look-up)
+			;; This should provoke %talk-request-announce-invitation
+			(modify-packet packet-hacker rep-pkt :response
+				       :answer %talk-answer-failed)
+			;; Refuse to ask the user for an invitation
+			(modify-packet packet-hacker rep-pkt :response
+				       :answer %talk-answer-permission-denied)))
+		   (t
+		    (modify-packet packet-hacker rep-pkt :response
+				   :answer %talk-answer-success)
+		    (when (= (packet-field packet-hacker req-pkt :request :type)
+			     %talk-request-look-up)
+		      (let* ((foreign-host (neti:get-host-from-address neti:address
+								       neti:network))
+			     (addresses (send net:*local-host* :network-addresses))
+			     (address (cadr (assoc neti:network addresses)))
+			     ;; Here we need to gensym a TCP port number & open it
+			     (stream (open-stream-for-talk foreign-host neti:network))
+			     (port (send stream :local-port)))
+			;; If it's a lookup that just succeeded, spawn a server
+			;; and send back its TCP port
+			(modify-packet packet-hacker rep-pkt :response
+				       :addr-family *unix-internet-address-family*
+				       :addr-port port
+				       :addr-address address)
+			(start-talk-to-converse-translator
+			  stream
+			  :network neti:network
+			  :remote-user (packet-field packet-hacker req-pkt
+						     :request :caller-name)
+			  :host foreign-host))))))
+	    ((%talk-request-leave-invitation %talk-request-delete-invitation)
+	     ;; We do nothing with these, so they always succeed
+	     (modify-packet packet-hacker rep-pkt :response
+			    :answer %talk-answer-success))
+	    (otherwise
+	      (modify-packet packet-hacker rep-pkt :response
+			     :answer %talk-answer-unknown-request))))
+      (values t
+	      (+ response-array-start (packet-hacker-packet-size packet-hacker :response))))))
+
+
+;;; UNIX42 TALK-CONTROL server
+(defflavor unix42-talk-control-server
+	()
+	(basic-talk-control-server))
+
+(defmethod (:server-top-level unix42-talk-control-server) ()
+  (flet ((unix42-talk-control-protocol ()
+	   (with-stack-array (pkt (- request-array-end request-array-start)
+				  :type 'sys:art-8b
+				  :displaced-to request-array
+				  :displaced-index-offset request-array-start)
+	     (if (= *unix-internet-address-family*
+		    (unix42-talk-req-pkt-control-address-family pkt))
+		 :unix42-big-endian
+		 ;; Need to do byte-swapping
+		 :unix42-little-endian))))
+    (using-resource (packet-hacker talk-packet-hacker
+				   :talk-control-protocol (unix42-talk-control-protocol))
+      (server-top-level-internal self packet-hacker))))
+
+(net:define-server :unix42-talk-control
+    (:medium :datagram
+     :error-disposition :notify
+     :reject-unless-trusted nil
+     :flavor unix42-talk-control-server))
+
+
+;;; UNIX43 TALK-CONTROL server
+(defflavor unix43-talk-control-server
+	()
+	(basic-talk-control-server unix43-talk-packet-hacker))
+
+(defmethod (:server-top-level unix43-talk-control-server) ()
+  (using-resource (packet-hacker talk-packet-hacker
+				 :talk-control-protocol :unix43)
+    (server-top-level-internal self packet-hacker)))
+
+(net:define-server :unix43-talk-control
+    (:medium :datagram
+     :reject-unless-trusted nil
+     :error-disposition :notify
+     :flavor unix43-talk-control-server))
+
+
+;;; TALK-CONTROL
+
+;; Sends a talk-control request, waits for a reply.  Retransmits every 2
+;; seconds until it gets a reply.
+(defun talk-control-request (stream talk-control-protocol request-code callee-name message-id
+			     &key maximum-retransmissions)
+  (declare (values reply-type reply-answer))
+  (let (request-end)
+    (unwind-protect
+	(multiple-value-bind (buffer start end)
+	    (send stream :new-output-buffer)
+	  ;; Fill in talk request packet
+	  (using-resource (packet-hacker talk-packet-hacker
+					 :talk-control-protocol talk-control-protocol)
+	    (with-stack-array (pkt (- end start)
+				   :element-type '(unsigned-byte 8)
+				   :displaced-to buffer
+				   :displaced-index-offset start)
+	      (with-stack-array (empty-string *talk-tty-size* :element-type 'character
+					      :initial-element (code-char 0))
+		(modify-packet packet-hacker pkt :request
+			       :version *unix43-talk-version*
+			       :type request-code
+			       :answer -1
+			       :message-id message-id
+			       ;; Make 4.3 NTALKD happy
+			       :addr-family *unix-internet-address-family*
+			       :addr-port (send stream :local-port)
+			       :addr-address (send stream :local-address)
+			       :control-address-family *unix-internet-address-family*
+			       :control-address-port (send stream :local-port)
+			       :control-address-address (send stream :local-address)
+			       ;; Nonsense value
+			       :process-id (%pointer current-process)
+			       :caller-name (send si:*user* :lispm-name)
+			       :callee-name callee-name
+			       :callee-tty empty-string)))
+	    ;; Transmit packet and wait for reply
+	    (multiple-value-bind (buffer start end)
+		(loop named retransmit
+		      initially (setf request-end (+ start (packet-hacker-packet-size
+							     packet-hacker :request)))
+		      doing
+		  (send stream :send-output-buffer-without-freeing buffer request-end)
+		  (process:with-timeout (*talk-control-transaction-timeout*)
+		    (multiple-value-bind (bfr bfr-start bfr-end)
+			(send stream :read-input-buffer)
+		      (return-from retransmit (values bfr bfr-start bfr-end))))
+		  ;; Check retransmission limit
+		  (when maximum-retransmissions
+		    (when (zerop maximum-retransmissions)
+		      (return-from talk-control-request nil))
+		    (decf maximum-retransmissions)))
+	      (with-stack-array (pkt (- end start)
+				     :element-type '(unsigned-byte 8)
+				     :displaced-to buffer
+				     :displaced-index-offset start)
+		(if (= (packet-field packet-hacker pkt :response :answer) %talk-answer-success)
+		    t
+		    (signal-talk-error packet-hacker callee-name (send stream :foreign-host)
+				       pkt :response))))))
+      (when request-end
+	(send stream :advance-output-buffer request-end)))))
+
+;; This is invoked when we want to send a message to someone without a
+;; current TALK server.  Keep broadcasting invitations until the callee
+;; responds, then send the message.
+(defun talk-control-internal (stream callee talk-control-protocol)
+  (loop with last-announcement = 0 and message-id = 1
+	until (loop for server in net:*active-servers*
+		    thereis (and (typep server 'talk-server)
+				 (message-deliverable-p
+				   server callee (send stream :foreign-host))))
+	do (let ((now (time:get-universal-time)))
+	     ;; Re-announce invitation every 30 seconds
+	     (when ( (- now last-announcement) *talk-ring-interval*)
+	       (talk-control-request stream talk-control-protocol
+				     %talk-request-announce-invitation
+				     callee (incf message-id))
+	       (setf last-announcement now))
+	     ;; Wait for *active-servers* to change, or until next
+	     ;; announcement should be sent.
+	     (process-wait-with-timeout
+		 "Await RSVP"
+		 (* (- (+ last-announcement *talk-ring-interval*) now) 60)
+	       (lambda (old-*active-servers*)
+		 (neq old-*active-servers* net:*active-servers*))
+	       net:*active-servers*))))
+
+;; This bit of fun gets to guess whether the machine in question is
+;; big-endian or little-endian
+(net:define-protocol :unix42-talk-control (:talk-control :datagram)
+  (:invoke (sap)
+    (let* ((args (neti:service-access-path-args sap))
+	   (callee-name (getf args :callee-name))
+	   (talk-control-protocol (getf args :talk-control-protocol)))
+      (flet ((do-it (talk-control-protocol)
+	       (with-open-stream (stream (net:get-connection-for-service sap :no-rfc t))
+		 (talk-control-internal stream callee-name talk-control-protocol)))
+	     (check-it (talk-control-protocol)
+	       (with-open-stream (stream (net:get-connection-for-service sap :no-rfc t))
+		 (condition-case ()
+		      (talk-control-request stream talk-control-protocol %talk-request-look-up
+					    callee-name 0 :maximum-retransmissions 3)
+		    (talk-recipient-not-logged-in t)))))
+	(if talk-control-protocol
+	    (do-it talk-control-protocol)
+	    ;; Guess which endian to use
+	    (unless (condition-case ()
+			 (when (check-it :unix42-big-endian)
+			   (do-it :unix42-big-endian)
+			   t)
+		       (tcp::udp-destination-unreachable nil))
+	      (do-it :unix42-little-endian)))))))
+
+(net:define-protocol :unix43-talk-control (:talk-control :datagram)
+  (:invoke (sap)
+    (let* ((args (neti:service-access-path-args sap))
+	   (callee (getf args :callee-name)))
+      (with-open-stream (stream (net:get-connection-for-service sap :no-rfc t))
+	(talk-control-internal stream callee :unix43)))))
+
+
+;;; Talk  Converse translator process
+;;;
+;;; This is the clever bit.  This process translates between the "talk"
+;;; and Converse protocols.  Incoming talk streams are broken into
+;;; Converse messages at paragraph boundaries (modulo some fiddling
+;;; around with timeouts); outgoing Converse messages are shoved down
+;;; the byte stream with a terminating blank line, thereby turning them
+;;; into paragraphs.
+
+(defflavor talk-server
+	(remote-user
+	 sender
+	 ;; Input-editing commands are embedded in the incoming character stream...
+	 char-erase
+	 line-kill
+	 word-erase
+	 ;; UNIX line delimiters
+	 (delimiters '(#\Return #\Line))
+	 ;; Output lock
+	 (lock nil))
+	(neti:byte-stream-server)
+  (:initable-instance-variables remote-user)
+  (:readable-instance-variables remote-user))
+
+(defmethod (make-instance talk-server) (&rest ignore)
+  (setf sender `(:name ,remote-user :host (:object ,(send self :foreign-host)))))
+
+(defmethod (talk-disabled-p talk-server) ()
+  (or zwei:*converse-gagged* (null (neti:service-enabled-p :send))))
+
+(defmethod (:server-top-level talk-server) ()
+   ;; First, exchange three "editing characters" with client
+   (write-string "   " neti:stream)
+   (force-output neti:stream)
+   (setf char-erase (read-char neti:stream))
+   (setf line-kill (read-char neti:stream))
+   (setf word-erase (read-char neti:stream))
+   ;; Loop endlessly, handling messages
+   (do () (())
+     (multiple-value-bind (msg done)
+	 (receive-talk-message self)
+       (when msg
+	 (let ((now (time:get-universal-time)))
+	 (zwei:converse-process-incoming-message
+	   :date now
+	   :from sender
+	   :text (string-append
+		   ;; Prepend header, ala converse
+		   (format nil "~A ~\\TIME\\~%" (zwei:converse-address-string sender) now)
+		   msg))))
+       (when (or done
+		 ;; If incoming messages get turned off, we go away
+		 (talk-disabled-p self))
+	 (return nil)))))
+
+;; This is like PROCESS:WITH-TIMEOUT wrapped around
+;; SI:READ-DELIMITED-STRING-INTERNAL, except that the timeout gets reset
+;; each time you read a character.  Some of the flexibility of the
+;; constituent functions has been removed to simplify the code (ha).
+(defun-in-flavor (read-delimited-string-with-character-interval-timeout talk-server)
+		 (stream delimiters timeout buffer begin input-pending-p)
+  ;; Body of PROCESS::WITH-TIMEOUT-INTERNAL
+  (block with-timeout
+    (let ((tag (process::with-timeout-tag)))
+      (condition-bind ((process::form-timeout
+			 #'(lambda (condition)
+			     (let* ((current-timer (process::form-timeout-timer condition))
+				    (args (process::timer-args current-timer)))
+			       (when (eql (process::form-timeout-tag args) tag)
+				 (return-from with-timeout nil))
+			       nil))))
+	(catch tag
+	  (using-resource (timer process::form-timeout-timers)
+	    (let ((args (process::timer-args timer)))
+	      (setf (process::form-timeout-process args) *current-process*)
+	      (setf (process::form-timeout-continuation args)
+		    #'(lambda ()
+			(declare (sys:downward-function))
+			(signal 'process::form-timeout :timer timer)
+			(return-from with-timeout nil)))
+	      ;; deal with recursive calls to a WITH-TIMEOUT function
+	      (setf (process::form-timeout-tag args) tag)
+	      (setf (process::form-timeout-uid args)
+		    (process::form-timeout-state-uid (process::form-timeout-state args))))
+	    (when (or input-pending-p (plusp (fill-pointer buffer)))
+	      (process:reset-timer-relative timer timeout))
+	    ;; Slightly simplified variant of SI:READ-DELIMITED-STRING-INTERNAL,
+	    ;; includes delimiter in returned string.
+	    (loop with length = (length buffer)
+		  for index from begin
+		  do (when (array-has-leader-p buffer)
+		       (setf (fill-pointer buffer) index))
+		  as char = (send stream :any-tyi)
+		  do (process:reset-timer-relative timer timeout)
+		     (cond
+		       ((or (null char)
+			    (listp char))
+			(let (return-char return-arg)
+			  (cond ((null char))
+				((listp char)
+				 (when (neq (first char) :activation)
+				   (error "Unexpected blip returned by the input editor - ~S"
+					  char))
+				 (setq return-char (second char) return-arg (third char)))
+				((characterp char)
+				 (setq return-char char)))
+			  (return (values buffer (null char) return-char return-arg))))
+		       (t (when (= index length)
+			    (setq buffer
+				  (zl:adjust-array-size
+				    buffer 
+				    (incf length
+					  (if (< (%structure-total-size buffer) page-size)
+					      (max (length buffer) 100.)
+					      (/ (length buffer) 4))))))))
+		     (setf (aref buffer index) char)
+		     (when (member char delimiters :test #'char-equal)
+		       (incf (fill-pointer buffer))
+		       (return (values buffer nil))))))))))
+
+;; Read a line of a talk message.  Return when a line has been read, or
+;; talk-disabled-p goes true, or *talk-partial-message-timeout* has
+;; elapsed and input-pending-p is true, or
+;; *talk-partial-message-timeout* has elapsed and some data was read on
+;; a previous go-round.
+(defmethod (receive-talk-message-internal talk-server) (buffer input-pending-p)
+  (declare (values line eofp))
+  (loop for previous-buffer-fill-pointer = (fill-pointer buffer)
+	doing
+    (multiple-value-bind (string eofp)
+	(read-delimited-string-with-character-interval-timeout
+	  neti:stream delimiters *talk-partial-message-timeout*
+	  buffer (fill-pointer buffer) input-pending-p)
+      (if string
+	  (return (values string eofp))
+	  ;; We timed out.
+	  (when (or input-pending-p
+		    (not (zerop previous-buffer-fill-pointer))
+		    (talk-disabled-p self))
+	    ;; Return any characters that have accumulated.
+	    (return (values (unless (zerop (fill-pointer buffer)) buffer) nil)))))))
+
+(defmethod (receive-talk-message talk-server) ()
+  (sys:with-data-stack
+    (loop with done = nil
+	  with buffer = nil
+	  unless buffer
+	    do (setf buffer (make-stack-array 256. :type 'art-string :fill-pointer 0))
+	  for line = (multiple-value-bind (line eofp)
+			 (receive-talk-message-internal self buffer lines)
+		       (when eofp
+			 (setf done :eof))
+		       (when line
+			 (setf buffer nil))
+		       line)
+	  for end-of-paragraph = (or (null line)
+				     (zerop (length line))
+				     (member (aref line 0) delimiters :test #'char-equal))
+	  unless end-of-paragraph
+	    collect line into lines
+	  until (or done end-of-paragraph)
+	  finally (return (values (when lines (postprocess-talk-lines self lines delimiters))
+				  done)))))
+
+;; Copy from buffer to line, emulating the UNIX input editing commands as we go
+(defmethod (postprocess-talk-lines talk-server) (buffers delimiters)
+  (loop with line = (make-stack-array (1+ (loop for buffer in buffers
+						summing (length buffer)))
+				      :type 'art-string :fill-pointer 0)
+	and j = 0 and line-start = 0
+	for buffer in buffers
+	do
+    (loop for i from 0 below (length buffer)
+	  for char = (aref buffer i)
+	  do (cond ((char= char char-erase)
+		    (unless (or (zerop j) (= j line-start))
+		      (decf j)))
+		   ((char= char line-kill)
+		    (setf j line-start))
+		   ((char= char word-erase)
+		    ;; Need to set fill-pointer because position uses it
+		    (setf (fill-pointer line) j)
+		    (let* ((non-space-index (position #\space line
+						      :test-not #'char=
+						      :start line-start
+						      :end j
+						      :from-end t))
+			   (space-index (position #\space line
+						  :test #'char=
+						  :start line-start
+						  :end non-space-index
+						  :from-end t)))
+		      (if space-index
+			  (setf j (1+ space-index))
+			  (setf j line-start))))
+		   (t
+		      (if (member char delimiters :test #'char-equal)
+			  (progn
+			    (setf (aref line j) #\Return)
+			    (setf line-start (incf j)))
+			  (setf (aref line j) char)
+			  (incf j)))))
+	  finally (setf (fill-pointer line) j)
+		  (return line)))
+
+;; Replace #\Return with #\Line, and make sure the message as delivered ends with two of them.
+(defmethod (preprocess-and-send-talk-message talk-server) (message)
+  (loop with bol = 0
+	with message-length = (length message)
+	for eol = (position #\return message :test 'char= :start bol)
+	while eol
+	do (write-string message neti:stream :start bol :end eol)
+	   (write-char #\Line neti:stream)
+	   (setf bol (min (1+ eol) message-length))
+	finally (unless (= bol message-length)
+		  ;; Send last line
+		  (write-string message neti:stream :start bol)
+		  (write-char #\Line neti:stream))
+		(write-char #\Line neti:stream)
+		(send neti:stream :force-output))
+  t)
+
+;; Return T if this server can handle a message to user and host
+(defmethod (message-deliverable-p talk-server) (user host)
+  (let ((foreign-host (send self :foreign-host)))
+    (and (or (eq host foreign-host)
+	     ;; Uninterned hosts may be non-EQ, but still represent the
+	     ;; same host.  Compare their addresses...
+	     (and (send host :uninterned-p)
+		  (send foreign-host :uninterned-p)
+		  (equal (send host :address) (send foreign-host :address))))
+	 (string= user remote-user))))
+
+;; Return T if it got delivered, otherwise NIL.  A per-server lock is
+;; held during output, so that multiple sends to the same TALK
+;; connection don't get mingled.
+(defmethod (deliver-message talk-server) (user host message)
+  (when (message-deliverable-p self user host)
+    ;; Make sure there's an output lock
+    (unless lock
+      (setf lock (process:make-lock (string-append (process-name neti:process)
+						   " output lock"))))
+    ;; Hold the lock during output
+    (process:with-lock (lock)
+      (condition-case ()
+	   (preprocess-and-send-talk-message self message)
+	 (sys:network-error nil)))))
+
+
+;;; Server definition and other hackery
+
+(net:define-server :talk (:medium :byte-stream
+			  :stream stream
+			  :error-disposition :notify
+			  :who-line t
+			  :reject-unless-trusted nil
+ 			  :flavor talk-server))
+
+(neti:define-protocol :talk (:send :byte-stream)
+  (:desirability 0.5)
+  (:invoke (sap)
+    (let* ((args (neti:service-access-path-args sap))
+	   (to (getf args :to))
+	   (callee-name (getf to :name))
+	   (host (second (getf to :host)))
+	   (text (string-thin (zwei:text-as-string (getf args :text))
+			      :remove-bits t)))
+      (block deliver-message
+	(process:with-timeout (*talk-delivery-timeout*)
+	  (loop doing
+	    ;; Try to deliver message to an active TALK server
+	    (loop for server in net:*active-servers*
+		  when (and (typep server 'talk-server)
+			    (deliver-message server callee-name host text))
+		    do (return-from deliver-message t))
+	    ;; No active talk server, so let callee know we've got a message pending
+	    (find-and-invoke-talk-control host callee-name)))
+	(signal 'talk-delivery-timeout
+		:host (neti:service-access-path-host sap)
+		:user callee-name)))))
+
+(defun find-and-invoke-talk-control (host callee-name)
+  (let ((service-args (list :callee-name callee-name))
+	(paths (neti:find-paths-to-service-on-host :talk-control host t nil)))
+    (if paths
+	;; Namespace tells us what to do
+	(neti:invoke-service-access-path (neti:most-desirable-service-access-path paths)
+					 service-args)
+	;; Try each TALK-CONTROL protocol, and to hell with the Namespace
+	(loop for protocol in '(:unix43-talk-control :unix42-talk-control)
+	      until (condition-case ()
+			 (let ((path (condition-bind
+				       ((neti:host-does-not-support-service
+					  'neti:host-does-not-support-protocol-use-first-path))
+				       (neti:find-path-to-protocol-on-host protocol host))))
+			   (neti:invoke-service-access-path path service-args))
+		       (tcp::udp-destination-unreachable
+			 nil)
+		       (:no-error (return-from find-and-invoke-talk-control)))
+	      finally
+		;; Maybe this should allow proceed options?
+		(error "Unable to guess TALK-CONTROL protocol for ~A" host)))))
+
+(defun start-talk-to-converse-translator (proto-stream &key host network remote-user)
+  (flet ((start-translator-internal ()
+	   (with-open-stream (stream (finish-opening-stream-for-talk proto-stream network))
+	     (with-stack-list (arguments :stream stream
+					 :remote-user remote-user)
+	       (neti:funcall-server-function (neti:find-server-named :talk) arguments)))))
+    (let* ((process-name (format nil "TALK server (~A)" host)))
+      (process-run-function process-name #'start-translator-internal))))
+
+
+;;; These guys are unpleasant but (as far as I can see) necessary.
+;;; A nicer interface would be a gensym-port entry point.
+
+(defun open-stream-for-talk (host network)
+  (ecase (send network :type)
+    (:internet
+      (tcp:tcp-listen host nil nil
+		      :wait-for-syn nil
+		      :characters t
+		      :ascii-translation t))))
+
+(defun finish-opening-stream-for-talk (stream network)
+  (ecase (send network :type)
+    (:internet
+      (let* ((tcb (send stream :tcb)))
+	;; Borrowed from TCP:TCP-LISTEN
+	(when (and (eq (tcp::tcb-state tcb) :listen)
+		   (tcp::tcb-initial-receive-seq tcb))	;syn has arrived
+	  (tcp::accept-tcb tcb))
+	(tcp::tcb-travel-through-states tcb "Accept" nil :listen :syn-received)
+	stream))))

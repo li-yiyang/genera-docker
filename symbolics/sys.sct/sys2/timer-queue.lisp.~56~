@@ -1,0 +1,389 @@
+;;; -*- Mode: LISP; Package: SI; Base: 10; Lowercase: T -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;--- SYS:DEMO;ALARM should use this
+;;--- File scavenger should use this?
+;;--- Perhaps the timer-queue process should not use process-run-function,
+;;---  but rather just do the funcall itself, and errors be damned.  If
+;;---  this is the case, maybe repeater functions should be put back in.
+;;--- Should warm booting flush all timer queue entries?
+
+;; Timer queues:
+;;
+;; (ADD-TIMER-QUEUE-ENTRY TIME REPEAT NAME FUNCTION &REST ARGS)
+;;    - adds an entry to the timer queue.  FUNCTION is called with ARGS
+;;      when the timer fires.  TIME can be a (:ABSOLUTE universal-time)
+;;      (or just universal-time) or (:RELATIVE n-secs).  REPEAT is of the
+;;      form :ONCE, (:FOREVER n-secs), or (n-times n-secs).  NAME is a
+;;      string which names the timer queue entry.  The id of the entry
+;;      is returned.  To effect a "repeat function", the called function
+;;      can (conditionally) add another timer queue entry!
+;; (REMOVE-TIMER-QUEUE-ENTRY TIMER-ID)
+;;    - removes the entry which has TIMER-ID as its id.
+;; (PRINT-TIMER-QUEUE STREAM)
+;;    - prints the contents of the timer queue
+
+(cl:defstruct (timer-queue-entry
+		(:conc-name timer-queue-))
+  name			;a pretty name for this entry
+  function		;function called via process-run-function
+  arguments		;  with this as its argument list
+  expiration		;timer expires when the current time is this
+  repeat		;entry is requeued based on this
+  id)			;an id usable by remove-timer-queue-entry
+
+(defresource timer-queue-entry ()
+  :constructor (make-timer-queue-entry))
+
+(defvar *timer-queue*)
+(defvar *timer-queue-entry-id* 0)
+(defvar *timer-queue-process-wakeup* nil)
+(defvar *timer-queue-process*)
+(defvar *timer-queue-process-started* nil)
+
+(defun timer-queue-< (x y) (and x (if y (< x y) t)))
+(defun timer-queue- (x y) (and x (if y ( x y) t)))
+
+(defun add-timer-queue-entry (time repeat name function &rest args)
+  ;; Parse the repeat spec
+  (cond ((eq repeat :once))
+	((null repeat) (setq repeat :once))
+	((and (or (eq (first repeat) :forever)
+		  (numberp (first repeat)))
+	      (numberp (second repeat))))
+	(t (ferror "Bad repeat specification: ~S" repeat)))
+  ;; Parse the initial expiration time 
+  (let* ((expiration
+	   (cond ((null time) nil)
+		 ((numberp time) time)
+		 ((and (eq (car time) :absolute)
+		       (numberp (cadr time)))
+		  (cadr time))
+		 ((and (memq (car time) '(:delta :relative))
+		       (numberp (cadr time)))
+		  (unless time:*timebase-initialized*
+		    (error "Attempt to add a ~S timer queue entry before time is initialized."
+			   (car time)))
+		  (+ (cadr time) (time:get-universal-time)))
+		 (t (ferror "Bad time specification: ~S" time))))
+	 (timer-id))
+    (without-interrupts				;no competetion, please
+      (setq timer-id *timer-queue-entry-id*)
+      (setq *timer-queue-entry-id* (%32-bit-plus *timer-queue-entry-id* 1)))
+    ;; Make sure the queue and process exist
+    (start-timer-queue-process)
+    ;; Now that the expiration time is parsed, build the entry
+    (let ((entry (allocate-resource 'timer-queue-entry))
+	  (empty-p (send *timer-queue* :empty-p)))
+      (cl:setf (timer-queue-name entry) name
+	       (timer-queue-expiration entry) expiration
+	       (timer-queue-function entry) function
+	       (timer-queue-arguments entry) (copylist args)
+	       (timer-queue-repeat entry) repeat
+	       (timer-queue-id entry) timer-id)
+      (send *timer-queue* :insert entry expiration)
+      ;; Alert the timer queue process if the new entry is either the first
+      ;; entry or the only entry.  You might think that there is a race condition
+      ;; here if we don't set the wakeup, but that can't ever happen, since if
+      ;; you lose the race with someone else, he is guaranteed to set it for you!
+      (when (or empty-p (eq entry (send *timer-queue* :top)))
+	(setq *timer-queue-process-wakeup* t)
+	(process:process-wakeup *timer-queue-process*)))
+    timer-id))
+
+(defun remove-timer-queue-entry (timer-id &optional no-error-p)
+  (let ((entry (send *timer-queue*
+		     :delete-by-item timer-id #'(lambda (id item)
+						  (= id (timer-queue-id item)))
+				     no-error-p)))
+    (when entry
+      (setf (timer-queue-id entry) nil)
+      (deallocate-resource 'timer-queue-entry entry))))
+
+;; If there are more than one entry that share the same name, only one is removed,
+;; chosen arbitrarily.
+(defun remove-timer-queue-entry-named (name &optional no-error-p)
+  (let ((entry (send *timer-queue*
+		     :delete-by-item name #'(lambda (name item)
+					      (equal name (timer-queue-name item)))
+				     no-error-p)))
+    (when entry
+      (setf (timer-queue-id entry) nil)
+      (deallocate-resource 'timer-queue-entry entry))))
+
+(defun get-timer-queue-data (entry)
+  (let* ((name (timer-queue-name entry))
+	 (id (timer-queue-id entry))
+	 (expires (timer-queue-expiration entry))
+	 (repeat (timer-queue-repeat entry))
+	 (func (timer-queue-function entry))
+	 (prf nil)
+	 (args (timer-queue-arguments entry)))
+    (when (or (eq func #'process-run-function)
+	      (eq func #'process-run-restartable-function))
+      (setq prf func
+	    func (second args)
+	    args (cddr args)))
+    (values name id expires repeat func prf args)))
+
+(defun add-timer-entry-internal (name interval offset continuation)
+  (multiple-value-bind (next-time interval)
+      (time:next-time interval offset)
+    (labels ((invoke-next ()
+	       (add-timer-queue-entry next-time :once name #'iterate))
+	     (iterate ()
+	       (flet ((return-without-requeueing ()
+			(return-from iterate nil)))
+		 (catch-error-restart ((error sys:abort)
+				       (format nil "Abort all executions of ~S" name))
+		   (catch-error-restart ((error sys:abort)
+					 (format nil "Abort this execution of ~S" name))
+		     (error-restart ((error sys:abort)
+				     (format nil "Retry this execution of ~S" name))
+		       (funcall continuation #'return-without-requeueing)))
+		   (incf next-time interval)
+		   (invoke-next)))))
+      (invoke-next))))
+
+(defmacro add-timer-entry ((name interval &optional offset) &body body)
+  `(add-timer-entry-internal
+     ,name ,interval ,offset
+     (named-lambda add-timer-entry (.abort-function.)
+       (flet ((abort-timer () (funcall .abort-function.)))
+	 ,@body))))
+
+;; These are here for compatability
+(compiler:make-obsolete add-timer "Use ADD-TIMER-QUEUE-ENTRY instead.")
+(defun add-timer (timeout function &rest args)
+    (lexpr-funcall #'add-timer-queue-entry
+		   (if timeout `(:delta ,(round timeout 60.)) nil) :once
+		   (format nil "~A" (function-name function))
+		   function args))
+
+(compiler:make-obsolete delete-timer "Use REMOVE-TIMER-QUEUE-ENTRY instead.")
+(defun delete-timer (entry)
+  (remove-timer-queue-entry entry t))
+
+;; The timer queue process itself...
+(defun timer-queue-process ()
+  (loop with sleep-time
+	doing
+    ;; Always wait until the timebase is initialized; we may have been warm-booted.
+    (timer-queue-wait-for-timebase)
+    ;; Loop over all likely entries in the heap
+    (setq sleep-time (timer-queue-process-internal sleep-time))
+    ;; Wait for the next timer to go off
+    (process:process-block-with-timeout sleep-time
+			       "Timer Wait" #'(lambda () *timer-queue-process-wakeup*))
+    (setq *timer-queue-process-wakeup* nil)))
+
+(defun timer-queue-wait-for-timebase ()
+  (unless (process-wait-with-timeout "Time Initialized" (* 60. 60.)
+	    #'car (locf time:*timebase-initialized*))
+    (tv:notify nil
+      "The Timer Queue has been waiting for the time to be initialized for 1 minute.~@
+       It will not be run until time is initialized.")
+    (process-wait "Time Initialized" #'car (locf time:*timebase-initialized*))
+    (tv:notify nil "Timer Queue finished waiting for the time to be initialized")))
+
+(defun timer-queue-process-internal (sleep-time)
+  (loop named firing-loop
+	with entry and got-one and expiration-time
+	as expired = nil
+	doing
+    ;; Cache the current time; the small sacrifice in accuracy is worth
+    ;; the savings in consing
+    (let ((current-time (time:get-universal-time)))
+      ;; Check the first entry, and remove it iff it has expired
+      (without-interrupts
+	(multiple-value (entry nil got-one)
+	  (send *timer-queue* :top))
+	(when got-one
+	  (setq expiration-time (timer-queue-expiration entry))
+	  (setq expired (timer-queue- expiration-time current-time))
+	  ;; Only now do we actually remove the entry
+	  (when expired (send *timer-queue* :remove))))
+      ;; We have a live entry, so process it
+      (cond ((not got-one)
+	     ;; The heap is empty, so stop running altogether
+	     (setq sleep-time nil)
+	     (return-from firing-loop))
+	    ((not expired)
+	     ;; The top entry hasn't fired, so wait for it
+	     (setq sleep-time
+		   (if (null expiration-time) nil
+		       ;; Don't wake up before the next second has turned
+		       (max (// (1+ (- 60. (mod (time) 60.))) 60s0)
+			    (- expiration-time current-time))))
+	     (return-from firing-loop))
+	    (t
+	     ;; The top entry has expired, so process it and then go through
+	     ;; the loop again in case something else has expired
+	     (lexpr-funcall #'process-run-function
+			    (timer-queue-name entry)
+			    (timer-queue-function entry) (timer-queue-arguments entry))
+	     
+	     #| (format t "~&Running: ~D" (timer-queue-id entry)) |#
+	     
+	     ;; Handle the repeat specification
+	     (let ((repeat (timer-queue-repeat entry)))
+	       (cond ((eq repeat :once)
+		      (setf (timer-queue-id entry) nil)
+		      (deallocate-resource 'timer-queue-entry entry))
+		     ((eq (car repeat) :forever)
+		      (setf (timer-queue-expiration entry)
+			    (+ current-time (cadr repeat)))
+		      (send *timer-queue*
+			    :insert entry (timer-queue-expiration entry)))
+		     ((prog2 (decf (car (timer-queue-repeat entry)))
+			     (not (plusp (car (timer-queue-repeat entry)))))
+		      (setf (timer-queue-id entry) nil)
+		      (deallocate-resource 'timer-queue-entry entry))
+		     (t
+		      ;; This depends on the side effects from above
+		      (setf (timer-queue-expiration entry)
+			    (+ current-time (cadr (timer-queue-repeat entry))))
+		      (send *timer-queue*
+			    :insert entry (timer-queue-expiration entry)))))))))
+  sleep-time)
+
+;; Initialize the timer queue and start the timer process
+(defun start-timer-queue-process ()
+  (unless (variable-boundp *timer-queue*)
+    (setq *timer-queue*
+	  (make-heap :interlocking :without-interrupts
+		     :size 20. :predicate #'timer-queue-<)))
+  (unless (variable-boundp *timer-queue-process*)
+    (setq *timer-queue-process*
+	  (make-process "Timer queue"
+			:warm-boot-action #'(lambda (process)
+					      (if *timer-queue-process-started*
+						  (process-warm-boot-delayed-restart process)
+						  (process-warm-boot-reset process)))
+			:system-process t
+			:whostate "Timer Wait" :priority 2 :quantum 6)))
+  (unless *timer-queue-process-started*
+    (setq *timer-queue-process-started* t)
+    (process-preset *timer-queue-process* #'timer-queue-process)
+    (process-enable *timer-queue-process*)))
+
+(add-initialization "Clear out the timer queue"
+		    '(progn (when (variable-boundp *timer-queue*)
+			      (send *timer-queue* :clear))
+			    (setq *timer-queue-process-started* nil))
+		    '(:system-shutdown))
+
+#|
+(defun hh ()
+  (D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")add-timer-queue-entry
+0    1`(:relative 05)
+      1`(:forever0 51)
+0      "GC Thermometer"
+      1#'0ignore1)
+0    1(add-timer-queue-entry '(:relative 1) '(:forever 1)
+0			   "Network Traffic Light"
+			   1#'0ignore)))
+
+|#
+
+(defun peek-at-timers ()
+  (tv:peek-hidden-data
+    "Insert or remove information about old timers."
+    (list ()
+	  (tv:scroll-parse-item "Timer queue entries")
+	  (tv:scroll-parse-item (format nil "~6A~25A~20A~10A"
+					"ID" "Timer Name" "Expires at" "Function"))
+	  (tv:scroll-parse-item "")
+	  ;; The lexical variable last-elements-list is so we can keep old items
+	  ;; as they were and notice when old items have changed their expiration.
+	  (let ((last-elements-list nil))
+	    (tv:scroll-maintain-list
+	      #'(lambda ()
+		  (and *timer-queue-process-started*
+		       (sort
+			 (setq last-elements-list
+			       (loop for tqe being the heap-elements of si:*timer-queue*
+				     collect
+				       (let ((old (assq tqe last-elements-list)))
+					 (cond ((and old (eq (cdr old)
+							     (si:timer-queue-expiration tqe)))
+						old)
+					       (t (cons tqe (si:timer-queue-expiration tqe)))))))
+			 #'(lambda (x1 x2) (< (cdr x1) (cdr x2))))))
+	      #'(lambda (xtqe)
+		  (let ((tqe (car xtqe)))
+		    (multiple-value-bind (name id expires nil func prf nil)
+			(si:get-timer-queue-data tqe)
+		      (tv:scroll-parse-item
+			;; Don't look...
+			`(:function ,#'(lambda (id) id) (,id) 6. ("~D"))
+			`(:mouse-item
+			   (nil :kbd (send :timer-queue-menu ,tqe)
+				:documentation
+				"Menu of useful things to do to this queue entry.")
+			   :function ,#'(lambda (name) name) (,name) 25. ("~A"))
+			`(:function ,#'(lambda (expires)
+					 (if (null expires)
+					     "Never"
+					     (time:print-universal-time
+					       expires nil)))
+			  (,expires) 20. ("~A"))
+			`(:function ,#'(lambda (func prf)
+					 (let ((package pkg-global-package))
+					   (format
+					     nil "~S~@[ via ~S~]"
+					     (function-name func)
+					     (if prf (function-name prf)))))
+			  (,func ,prf) 60. ))))))))
+    "Old Timers"))

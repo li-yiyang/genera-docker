@@ -1,0 +1,742 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: (SPELL SCL); Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Spelling corrector: core routines.
+
+(defconstant *max-spell-word-length* 48.)		;inclusive
+
+(defresource utility-strings ()
+  :constructor (make-array *max-spell-word-length* :element-type 'character :fill-pointer 0)
+  :initial-copies 10)
+
+(defresource utility-arrays ()
+  :constructor (make-array 100 :element-type 'fixnum :fill-pointer 0)
+  :initial-copies 1)
+
+;; No fill pointer.
+(defresource long-strings ()
+  :constructor (make-array 150 :element-type 'character)
+  :initial-copies 2)
+
+;;; Utility functions for encoding eight-bit ASCII values into five-bit
+;;; values, and decoding the 5-bit values back into eight-bit ASCII.
+;;; Only alphabetic characters and single-quotes (for some reason) are
+;;; encoded.  Case information is discarded by the encoding; the
+;;; decoding always returns upper-case.
+
+(defvar *encode-array*)
+
+(defvar *decode-array*)
+
+(defmacro with-encoding (&body body)
+  `(let ((encode-array *encode-array*))
+     (declare (compiler:array-register encode-array))
+     . ,body))
+
+(defmacro with-decoding (&body body)
+  `(let ((decode-array *decode-array*))
+     (declare (compiler:array-register decode-array))
+     . ,body))
+
+(defun initialize-code-arrays ()
+  (setq *encode-array* (make-array 256 :element-type '(integer 0 (256))))
+  (setq *decode-array* (make-array  32 :element-type '(integer 0 (256))))
+  (with-encoding
+    (with-decoding
+      (let ((code 1))
+	(loop for upper-case from (char-code #\A) to (char-code #\Z)
+	      for lower-case from (char-code #\a) do
+	  (setf (aref encode-array upper-case) code)
+	  (setf (aref encode-array lower-case) code)
+	  (setf (aref decode-array code) upper-case)
+	  (incf code))
+	;; Apostrophes are considered alphabetic, so that "it's" and
+	;; other contractions and possessives are considered words.
+	(setf (aref encode-array (char-code #\')) code)
+	(setf (aref decode-array code) (char-code #\'))))))
+
+(initialize-code-arrays)
+
+(defflavor cannot-encode () (error))
+
+(defmethod (dbg:report cannot-encode) (stream)
+  (format stream "The string contains characters that cannot be encoded"))
+
+(compile-flavor-methods cannot-encode)
+
+;;; Take the first n-bytes bytes of string, and encode the successive
+;;; bytes of the string into a sequence of fixnums, each of which holds
+;;; six encoded characters.  Call the function on arg, a stack-consed list of
+;;; the sequence, n-bytes, and a hash code formed by XORing the fixnums.
+;;; It is assumed that eight fixnums will suffice.
+(defun encode-string (string n-bytes function arg)
+  (with-stack-list (list nil nil nil nil nil nil nil nil)
+    (with-encoding
+      (let ((string string)
+	    (idx 0))
+	(declare (compiler:array-register string))
+	(loop for sublist on list
+	      for hash = 0 then (logxor hash fixnum)
+	      for fixnum = 0 do
+	  (let ((code (char-code (aref string idx))))
+	    (if ( code 256) (error 'cannot-encode))
+	    (setq fixnum (aref encode-array code)))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (let ((code (char-code (aref string idx))))
+	    (if ( code 256) (error 'cannot-encode))
+	    (setq fixnum (dpb (aref encode-array code) (byte 5  5) fixnum)))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (let ((code (char-code (aref string idx))))
+	    (if ( code 256) (error 'cannot-encode))
+	    (setq fixnum (dpb (aref encode-array code) (byte 5 10) fixnum)))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (let ((code (char-code (aref string idx))))
+	    (if ( code 256) (error 'cannot-encode))
+	    (setq fixnum (dpb (aref encode-array code) (byte 5 15) fixnum)))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (let ((code (char-code (aref string idx))))
+	    (if ( code 256) (error 'cannot-encode))
+	    (setq fixnum (dpb (aref encode-array code) (byte 5 20) fixnum)))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (let ((code (char-code (aref string idx))))
+	    (if ( code 256) (error 'cannot-encode))
+	    (setq fixnum (dpb (aref encode-array code) (byte 5 25) fixnum)))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (setf (car sublist) fixnum)
+	  finally
+	    (setf (car sublist) fixnum)
+	    (setq hash (logxor hash fixnum))
+	    (return (funcall function arg list n-bytes hash)))))))
+
+;;; Read fixnums from array, which is an array of fixnums containing encoded
+;;; strings, starting at start-offset, and decode a string out of the fixnums.
+;;; Stop when the string is n-bytes long.  Then call function on the string.
+;;; The string is from a resource, so the function should not store it away.
+(defun decode-string (array start-offset n-bytes function)
+  (using-resource (string utility-strings)
+    (setf (fill-pointer string) n-bytes)
+    (with-decoding
+      (loop with idx = 0
+	    for offset from start-offset do
+	(let ((fixnum (aref array offset)))
+	  (setf (aref string idx) (code-char (aref decode-array (ldb (byte 5 00) fixnum))))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (setf (aref string idx) (code-char (aref decode-array (ldb (byte 5 05) fixnum))))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (setf (aref string idx) (code-char (aref decode-array (ldb (byte 5 10) fixnum))))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (setf (aref string idx) (code-char (aref decode-array (ldb (byte 5 15) fixnum))))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (setf (aref string idx) (code-char (aref decode-array (ldb (byte 5 20) fixnum))))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop))
+	  (setf (aref string idx) (code-char (aref decode-array (ldb (byte 5 25) fixnum))))
+	  (incf idx) (if ( idx n-bytes) (go si:end-loop)))))
+    (funcall function string)))
+
+;;; The dictionary data structure.
+
+;;; encoded-strings is a big fixnum array, containing fixnums representing
+;;; the encoding of every word in the dictionary.  max-offset is the current
+;;; length of encoded-strings; no elements beyond it are valid.
+
+;;; spell-tables is an array, indexed by word length.  For each possible
+;;; length of word, there is one spell-table, or else the contents of
+;;; the array is nil, meaning there are no words of that length.
+
+;;; pathname is a pathname if this dictionary has any associated
+;;; pathname, or nil if it does not.  modified-p is true if any words
+;;; have been added to the dictionary since the last time it was read
+;;; from a file or written to a file.  It starts out true.  characters-p
+;;; is true if the file is in character format, and false if it's in binary
+;;; format.
+
+(defflavor dictionary
+	(encoded-strings
+	 max-offset
+	 spell-tables
+	 (pathname nil)
+	 modified-p
+	 characters-p)
+	()
+  (:readable-instance-variables pathname encoded-strings spell-tables)
+  (:writable-instance-variables pathname modified-p)
+  :initable-instance-variables)
+
+(defmethod (sys:print-self dictionary) (stream ignore ignore)
+  (format stream "#<Dictionary ~:[(no pathname)~*~;~A~] ~\\SI:ADDRESS\\>"
+	  pathname (when pathname (send pathname :string-for-editor)) (zl:%pointer self)))
+
+(defun make-empty-dictionary (&optional pathname characters-p)
+  (make-instance 'dictionary
+		 :encoded-strings (make-array 10000 :element-type 'fixnum :initial-element 0)
+		 :max-offset 0
+		 :spell-tables (make-array *max-spell-word-length* :initial-element nil)
+		 :pathname pathname
+		 :modified-p t
+		 :characters-p characters-p))
+
+(defmethod (make-instance dictionary) (&rest ignore)
+  (when pathname
+    (check-type pathname pathname)))
+
+;;; A spell table is a hash table associating strings to offsets in
+;;; the encoded-strings array of the dictionary.
+;;; Linear rehashing is used; if there are more than *max-rehash*
+;;; probes, the string is not found.  The hash code is the one produced
+;;; by encode-string, rem'ed with modulus.  The value of modulus is kept
+;;; less than the length of the array by *max-rehash* so as to avoid the
+;;; cost of extra end-checks in loops.  size is the size of the array.
+;;; n-bytes is the length of the words that this spell-table keeps track
+;;; of; there's a separate spell-table for each value of n-bytes (see
+;;; above).  n-fixnums is the number of elements of encoded-strings
+;;; that one of our words will occupy; it's a function of n-bytes.
+;;; A -1 in the offset-array indicates an empty element.  real-elements
+;;; is the number of elements of offset-array that aren't -1.
+
+(defflavor spell-table
+	(offset-array
+	 real-elements
+	 modulus
+	 size
+	 n-bytes
+	 n-fixnums)
+	()
+  :initable-instance-variables
+  (:readable-instance-variables real-elements offset-array))
+
+(defconstant *max-rehash* 20)
+
+(defun make-spell-table (n-bytes)
+  (let* ((modulus (get-good-modulus 300))
+	 (size (+ modulus *max-rehash*)))
+    (make-instance 'spell-table
+		   :offset-array (make-array size :initial-element -1)
+		   :real-elements 0
+		   :modulus modulus
+		   :size size
+		   :n-bytes n-bytes
+		   :n-fixnums (ceiling n-bytes 6))))
+
+;;; Looking up words, adding new words, and deleting words.
+
+;;; Look up a word in the dictionary.  list is a list of fixnums
+;;; representing the encoded word.  n-bytes is the length of the word.
+;;; hash is the hash code of the word.  Returns nil if not found, t if
+;;; the word is "implicitly" in the dictionary, or a fixnum offset into
+;;; the encoded-strings array if the word is found.  In the last case
+;;; it returns two extra values: the spell table and the offset within
+;;; the spell table's offset-array.
+(defmethod (lookup-word dictionary) (list n-bytes hash)
+  (cond ((< n-bytes 2) t)			; One-letter words are inherently correct.
+	(( n-bytes *max-spell-word-length*) nil)
+	(t (let ((spell-table (aref spell-tables n-bytes)))
+	     (and spell-table
+		  (get-pointer spell-table list hash encoded-strings))))))
+
+(defmethod (get-pointer spell-table) (list hash encoded)
+  (let ((offset-array-x offset-array)
+	(encoded encoded)
+	(car-list (car list)))
+    (declare (sys:array-register offset-array-x encoded))
+    (loop named top
+	  repeat *max-rehash*
+	  for idx upfrom (mod hash modulus) do
+      (let ((offset (aref offset-array-x idx)))
+	(when (= offset -1)
+	  (return nil))
+	(when (and ( offset -2) (= car-list (aref encoded offset)))
+	  ;; The first word matches!  Check the rest.
+	  (loop for elt in (cdr list)
+		for count from (1- n-fixnums) by -1
+		for off from (1+ offset) do
+	    (when (zerop count) (return-from top (values offset self idx)))
+	    (when ( elt (aref encoded off)) (return nil))))))))
+
+;;; Add a word to the dictionary.  list is a list of fixnums
+;;; representing the encoded word.  n-bytes is the length of the word.
+;;; hash is the hash code of the word.  Returns nil.
+(defmethod (add-word dictionary) (list n-bytes hash)
+  (cond ((< n-bytes 2) nil)			; One-letter words are inherently correct.
+	(( n-bytes *max-spell-word-length*)
+	 (error "Sorry, can't add a ~D character word." n-bytes))
+	((lookup-word self list n-bytes hash))
+	(t
+	 ;; Insert the word.
+	 (let ((n-words (ceiling n-bytes 6))
+	       (offset max-offset))
+	   (when ( (+ offset n-words) (length encoded-strings))
+	     ;; Grow the encoded-strings array.  Note that it has to be at least
+	     ;; a few words long for the algorithms to work.  Might as well pre-allocate
+	     ;; at least 20, or leave 1.5 room to grow.  These are just guesses.
+	     (let ((new-array (make-array (max 20 (floor (* (length encoded-strings) 1.5))))))
+	       (copy-array-portion encoded-strings 0 offset new-array 0 offset)
+	       (setq encoded-strings new-array)))
+	   (loop repeat n-words
+		 for fixnum in list
+		 for off from offset do
+	     (setf (aref encoded-strings off) fixnum))
+	   (incf max-offset n-words)
+	   (let ((spell-table (aref spell-tables n-bytes)))
+	     (when (null spell-table)
+	       (setq spell-table (make-spell-table n-bytes))
+	       (setf (aref spell-tables n-bytes) spell-table))
+	     (put-pointer spell-table hash offset encoded-strings)))
+	 (setq modified-p t)))
+  nil)
+
+(defmethod (put-pointer spell-table) (hash offset encoded-strings)
+  (loop named top doing
+	(loop repeat *max-rehash*
+	      for idx upfrom (mod hash modulus) do
+	  (when (member (aref offset-array idx) '(-1 -2))
+	    (setf (aref offset-array idx) offset)
+	    (incf real-elements)
+	    (return-from top offset)))
+	;; It's locally full.  Time to grow the spell-table.
+	(let ((old-size size)
+	      (old-offset-array offset-array))
+	  (setq modulus (get-good-modulus (floor (* size 1.5))))
+	  (setq size (+ modulus *max-rehash*))
+	  (setq offset-array (make-array size :initial-element -1))
+	  (setq real-elements 0)
+	  (loop for idx below old-size do
+	    (let ((offset (aref old-offset-array idx)))
+	      (unless (or (= offset -1) (= offset -2))
+		(put-pointer self
+			     (loop with hash = 0
+				   repeat n-fixnums
+				   for off upfrom offset
+				   do (setq hash (logxor hash (aref encoded-strings off)))
+				   finally (return hash))
+			     offset
+			     encoded-strings)))))))
+
+;;; Hair this up later?
+(defun get-good-modulus (modulus)
+  (if (evenp modulus) (1+ modulus) modulus))
+
+(defmethod (make-empty dictionary) ()
+  (setq max-offset 0)
+  (setq modified-p t)
+  (loop for spt being the array-elements of spell-tables do
+    (when spt
+      (clear-table spt)))
+  t)
+
+(defmethod (clear-table spell-table) ()
+  (setq real-elements 0)
+  (dotimes (i size)
+    (setf (aref offset-array i) -1)))
+
+;;; Delete a word from the dictionary.  list is a list of fixnums
+;;; representing the encoded word.  n-bytes is the length of the word.
+;;; hash is the hash code of the word.  Returns T if it deletes the
+;;; word, NIL if the word wasn't in the dictionary.
+(defmethod (delete-word dictionary) (list n-bytes hash)
+  (cond ((< n-bytes 2) nil)			; One-letter words are inherently correct.
+	(( n-bytes *max-spell-word-length*) nil)
+	(t
+	 (multiple-value-bind (offset spell-table idx)
+	     (lookup-word self list n-bytes hash)
+	   (when offset
+	     (zap-index spell-table idx)
+	     t)))))
+
+(defmethod (zap-index spell-table) (idx)
+  (setf (aref offset-array idx) -2)
+  (decf real-elements))
+
+;;; The spelling-correction algorithm itself.
+
+;;; Given a misspelled word, expressed as an ordinary Lisp string, find
+;;; all the corrected versions of the word.  You should provide an array
+;;; from the correction-array resource of arrays.  The corrections are
+;;; put into the array.  Other functions take these arrays and do good
+;;; things with them. Note: this function does NOT look up word itself.
+(defmethod (get-corrections dictionary) (word correction-array)
+  (using-resource (string utility-strings)
+    (let* ((n-bytes (length word))
+	   (n-bytes-minus-1 (1- n-bytes))
+	   (n-bytes-plus-1 (1+ n-bytes))
+	   (ca-fill 0))
+      ;; string is a temporary buffer in which we will buid all of the possible
+      ;; ways to re-spell word.  Between the various tests, string is always set
+      ;; to be a copy of word.
+      (copy-array-portion word 0 n-bytes string 0 n-bytes)
+      (setf (fill-pointer string) n-bytes-plus-1)
+      (macrolet ((try (n-bytes-form)
+		   `(let ((answer
+			    (encode-string string ,n-bytes-form #'lookup-word self)))
+		      (when (and answer (loop for i below ca-fill by 2
+					      never (eql (aref correction-array i) answer)))
+			(setf (aref correction-array ca-fill) answer)
+			(setf (aref correction-array (1+ ca-fill)) ,n-bytes-form)
+			(incf ca-fill 2)))))
+	(with-decoding
+	  (when (> n-bytes 2)
+	    ;; DELETE test: try deleting one letter of the word.
+	    (copy-array-portion word 1 n-bytes string 0 n-bytes-minus-1)
+	    (dotimes (idx n-bytes)
+	      (try n-bytes-minus-1)
+	      (setf (aref string idx) (aref word idx)))
+	    ;; CHANGE test: try changing each letter.
+	    (loop with idx = 0
+		  for val from 1 do
+	      (when ( val 1_5)
+		(setf (aref string idx) (aref word idx))
+		(setq val 1)
+		(incf idx))
+	      until ( idx n-bytes) do
+	      (setf (aref string idx) (code-char (aref decode-array val)))
+	      (try n-bytes)))
+	  ;; SWAP test: try swapping adjacent pairs of characters.
+	  (zl:swapf (aref string 0) (aref string 1))
+	  (loop for idx below n-bytes-minus-1 do
+	    (try n-bytes)
+	    (setf (aref string (+ idx 2))
+		  (prog1 (aref string idx)
+			 (setf (aref string (+ idx 1))
+			       (prog1 (aref string (+ idx 2))
+				      (setf (aref string idx)
+					    (aref string (+ idx 1))))))))
+	  (setf (aref string n-bytes-minus-1) (aref word n-bytes-minus-1))
+	  ;; ADD test: try adding a new letter.
+	  (loop with idx = n-bytes
+		for val from 1 do
+	    (when ( val 1_5)
+	      (setq val 1)
+	      (decf idx)
+	      (when ( idx 0)
+		(setf (aref string (1+ idx)) (aref string idx))))
+	    until (minusp idx) do
+	    (setf (aref string idx) (code-char (aref decode-array val)))
+	    (try n-bytes-plus-1))))
+      (setf (fill-pointer correction-array) ca-fill)
+      correction-array)))
+
+;;; Given a misspelled word, expressed as an ordinary Lisp string, find
+;;; all the corrected versions of the word, and return then as a list of
+;;; strings.  Note: this function does NOT look up word itself.
+(defmethod (get-list-of-corrections dictionary) (word)
+  (using-resource (correction-array utility-arrays)
+    (get-corrections self word correction-array)
+    (loop for i below (length correction-array) by 2 collect
+      (decode-string encoded-strings (aref correction-array i) (aref correction-array (1+ i))
+		     #'(lambda (string) (copy-seq string))))))
+
+;;; Reading and writing directories, using the binary format.
+
+(fs:define-canonical-type :dict "DICT"
+  (:unix "DC" "DICT")
+  (:unix42 "DICT" "DC")
+  (:vms4 "DCT" "DICT")
+  ((:vms :fep :msdos) "DCT"))
+
+(defprop :dict 16 :binary-file-byte-size)
+
+;;; Make a dictionary, and read the file into it.  The file is in a
+;;; special binary format known about only by this program.
+(defun read-binary-dictionary (stream pathname)
+  (macrolet ((fixnum-in ()
+	       '(let* ((low (send stream :tyi))
+		       (high (send stream :tyi)))
+		  (dpb high (byte 16. 16.) low))))
+    (let* ((max-offset (fixnum-in))
+	   (encoded-strings (make-array (floor (* max-offset 1.02))
+					:element-type 'fixnum
+					:initial-element 0))
+	   (spell-tables (make-array *max-spell-word-length* :initial-element nil)))
+      (send stream :string-in nil
+	    (make-array (* max-offset 2)
+			:element-type '(integer 0 (65536))
+			:displaced-to encoded-strings))
+      (loop as n-bytes = (send stream :tyi)
+	    until (zerop n-bytes) do
+	(setf (aref spell-tables n-bytes)
+	      (let* ((modulus (fixnum-in))
+		     (size (fixnum-in))
+		     (real-elements (fixnum-in))
+		     (offset-array (make-array size :initial-element -1)))
+		(send stream :string-in nil
+		      (make-array (* size 2)
+				  :element-type '(integer 0 (65536))
+				  :displaced-to offset-array))
+		(make-instance 'spell-table
+			       :offset-array offset-array
+			       :real-elements real-elements
+			       :modulus modulus
+			       :size size
+			       :n-bytes n-bytes
+			       :n-fixnums (ceiling n-bytes 6)))))
+      (make-instance 'dictionary
+		     :encoded-strings encoded-strings
+		     :max-offset max-offset
+		     :spell-tables spell-tables
+		     :pathname pathname
+		     :modified-p nil
+		     :characters-p nil))))
+
+;;; Write the dictionary to its associated pathname.  If to-pathname is
+;;; provided, then make to-pathname be the associated pathname and write
+;;; it there.  Always use binary format.
+(defmethod (write-binary-dictionary dictionary) (&optional to-pathname)
+  (when to-pathname (setq pathname to-pathname))
+  (with-open-file (stream pathname :direction :output :characters nil)
+    (send stream :tyo (ldb (byte 16 00) max-offset))
+    (send stream :tyo (ldb (byte 16 16) max-offset))
+    (send stream :string-out
+	  (make-array (* max-offset 2)
+		      :element-type '(integer 0 (65536))
+		      :displaced-to encoded-strings))
+    (loop for n-bytes from 2 below *max-spell-word-length* do
+      (let ((spell-table (aref spell-tables n-bytes)))
+	(when spell-table
+	  (send stream :tyo n-bytes)
+	  (write-spell-table spell-table stream))))
+    (send stream :tyo 0)
+    (send stream :truename))
+  (setq modified-p nil)
+  (setq characters-p nil))
+
+(defmethod (write-spell-table spell-table) (stream)
+    (send stream :tyo (ldb (byte 16 00) modulus))
+    (send stream :tyo (ldb (byte 16 16) modulus))
+    (send stream :tyo (ldb (byte 16 00) size))
+    (send stream :tyo (ldb (byte 16 16) size))
+    (send stream :tyo (ldb (byte 16 00) real-elements))
+    (send stream :tyo (ldb (byte 16 16) real-elements))
+    (send stream :string-out
+	  (make-array (* size 2)
+		      :element-type '(integer 0 (65536))
+		      :displaced-to offset-array)))
+
+;;; Reading a character dictionary.
+
+(defun read-character-dictionary (stream pathname)
+  (let ((dictionary (make-empty-dictionary pathname t)))
+    (map-over-words-from-stream
+      stream
+      #'(lambda (word n-chars)
+	  (encode-string word n-chars #'add-word dictionary)))
+    (setf (dictionary-modified-p dictionary) nil)
+    dictionary))
+
+(defun map-over-words-from-stream (stream function)
+  (using-resource (buffer long-strings)
+    (let ((buffer-length (length buffer))
+	  (n-leftover 0)
+	  start-word)
+      (loop do
+	(multiple-value-bind (n-chars-in-buffer eof-p overflow-p)
+	    (send stream :string-line-in nil buffer n-leftover buffer-length)
+	  (setq n-leftover 0)
+	  (loop with index = 0 do
+	    ;; Skip forward over non-word-components like delimiters and blanks.
+	    (loop while (< index n-chars-in-buffer) do
+	      (let ((char (aref buffer index)))
+		(when (or (alpha-char-p char) (char-equal char #\'))
+		  (return nil)))
+	      (incf index))
+	    ;; Now we're at the beginning of a word (or end of buffer).
+	    (setq start-word index)
+	    ;; Move forward over word components.
+	    (loop while (< index n-chars-in-buffer) do
+	      (let ((char (aref buffer index)))
+		(when (not (or (alpha-char-p char) (char-equal char #\')))
+		  (return nil)))
+	      (incf index))
+	    ;; Check for buffer overflow.
+	    (let ((n-chars (- buffer-length start-word)))
+	      (when (and (= index buffer-length) overflow-p)
+		(copy-array-portion buffer start-word buffer-length buffer 0 n-chars)
+		(setq n-leftover n-chars)
+		(return nil)))
+	    (let ((word-length (- index start-word)))
+	      (when (> word-length 1)
+		;; We've found an actual word.
+		(funcall function
+			 (substring buffer start-word index)
+			 word-length)))
+	    (when ( index n-chars-in-buffer) (return nil)))
+	  (when eof-p (return nil)))))))
+
+;;; Printing out words from a dictionary.
+
+(defmethod (print-words dictionary) (&optional (stream *standard-output*))
+  (loop for spell-table being the array-elements of spell-tables do
+    (when spell-table
+      (print-words-in-table spell-table stream encoded-strings))))
+
+(defmethod (print-words-in-table spell-table) (stream encoded-strings)
+  (loop for offset being the array-elements of offset-array do
+    (when (and ( offset -1) ( offset -2))
+      (print-word-in-table self stream offset encoded-strings)
+      (terpri stream))))
+
+(defmethod (print-word-in-table spell-table) (stream offset encoded-strings)
+  (decode-string encoded-strings offset n-bytes #'(lambda (string) (princ string stream))))
+
+;;; Write the dictionary to its associated pathname.  If to-pathname is
+;;; provided, then make to-pathname be the associated pathname and write
+;;; it there.  Always use characters format.
+(defmethod (write-character-dictionary dictionary) (&optional to-pathname)
+  (when to-pathname (setq pathname to-pathname))
+  (with-open-file (stream pathname :direction :output :characters t)
+    (print-words self stream))
+  (setq modified-p nil)
+  (setq characters-p t))
+
+;;; Write the dictionary to its associated pathname, even if it isn't modified.
+(defmethod (save-dictionary dictionary) ()
+  (if characters-p
+      (write-character-dictionary self)
+      (write-binary-dictionary self)))
+
+(defmethod (count-words dictionary) ()
+  (loop for spell-table being the array-elements of spell-tables
+	when spell-table 
+	summing (spell-table-real-elements spell-table)))
+
+(defmethod (print-words-sorted dictionary) (&optional (stream *standard-output*))
+  (let* ((n-words (count-words self))
+	 (ga (make-array (* 2 n-words))))
+    (loop with fill = 0
+	  for n-bytes below *max-spell-word-length* do
+      (let ((spell-table (aref spell-tables n-bytes)))
+	(when spell-table
+	  (let ((oa (spell-table-offset-array spell-table)))
+	    (loop for offset being the array-elements of oa do
+	      (when (and ( offset -1) ( offset -2))
+		(setf (aref ga fill) offset)
+		(setf (aref ga (1+ fill)) n-bytes)
+		(incf fill 2)))))))
+    (sort-grouped-array-group-key
+      ga 2
+      #'(lambda (a1 i1 a2 i2)
+	  (block top
+	    (let ((n-bytes-1 (aref a1 (1+ i1)))
+		  (n-bytes-2 (aref a2 (1+ i2))))
+	      (loop with n-bytes = 0
+		    for offset-1 from (aref a1 i1)
+		    for offset-2 from (aref a2 i2) do
+		(cond (( n-bytes n-bytes-1) (return t))
+		      (( n-bytes n-bytes-2) (return nil)))
+		(incf n-bytes 6)
+		(let ((fixnum-1 (aref encoded-strings offset-1))
+		      (fixnum-2 (aref encoded-strings offset-2)))
+		  (loop for pos below 30 by 5 do
+		    (let ((char-1 (ldb (byte 5 pos) fixnum-1))
+			  (char-2 (ldb (byte 5 pos) fixnum-2)))
+		      (cond ((< char-1 char-2) (return-from top t))
+			    ((> char-1 char-2) (return-from top nil)))))))))))
+    (loop for i below (* 2 n-words) by 2 do
+      (decode-string
+	encoded-strings
+	(aref ga i)
+	(aref ga (1+ i))
+	#'(lambda (string) (format stream "  ~A~%" string))))))
+
+;;; Make a dictionary by looking through a namespace database for all
+;;; names of users.
+
+(cp:define-command (com-create-spell-dictionary-from-namespace
+		     :command-table "Spelling"
+		     :provide-output-destination-keyword nil)
+    ((namespace 'neti:namespace
+		:prompt "namespace"
+		:default net:*namespace*
+		:documentation
+		"The namespace whose names should be scanned")
+     (pathname 'pathname
+	       :prompt "dictionary pathname"
+	       :default (send (fs:default-pathname)
+			      :new-canonical-type :dict)
+	       :documentation
+	       "Where to write out the new dictionary file"))
+   (let ((dict (make-empty-dictionary pathname)))
+     (using-resource (word-buffer utility-strings)
+       (labels ((insert-name (name)
+		  ;; Name is an arbitrary string.  Find the words
+		  ;; within name, and insert each into the dictionary.
+		  ;; A word is made of contiguous alphabetic
+		  ;; characters.  (Words of length one are ignored, as
+		  ;; usual.)  Also put in posessive forms for each word.
+		  (loop with start = 0
+			with end = (string-length name) do
+		    ;; Skip over non-alphabetics.
+		    (loop do (when ( start end)
+			       (return-from insert-name nil))
+			  until (alpha-char-p (aref name start))
+			  do (incf start))
+		    ;; Pass over alphabetics.
+		    (let ((start-of-word start))
+		      (loop until (or ( start end)
+				      (not (alpha-char-p (aref name start))))
+			    do (incf start))
+		      ;; start-of-word and start now delimit a word.
+		      (let ((len (- start start-of-word)))
+			(when (> len 1)
+			  (copy-array-portion name start-of-word start
+					      word-buffer 0 len)
+			  (encode-string word-buffer len #'add-word dict)
+			  (setf (aref word-buffer len) #\')
+			  (setf (aref word-buffer (1+ len)) #\s)
+			  (encode-string word-buffer (+ len 2) #'add-word dict)))))))
+	 ;; Find every user in the namespace, and call add-string on the
+	 ;; user's login name and personal name.
+	 (loop for user in (neti:searching-one-namespace (namespace)
+			     (net:find-objects-from-property-list :user))
+	       do (insert-name (send (send user :name) :string))
+		  (insert-name (send user :personal-name-first-name-first)))))
+     (write-binary-dictionary dict)))
+(compile-flavor-methods dictionary spell-table)

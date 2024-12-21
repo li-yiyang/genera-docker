@@ -1,0 +1,822 @@
+;;; -*- Mode:Lisp; Syntax:Common-Lisp; Package:STORAGE; Base:10; Lowercase:T; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;; Disk events
+
+;;; These disk events are specially allocated in safeguarded objects area so they
+;;; survive cold boots (and, in particular, disk saves).
+
+;;; The root of the disk events used by user-disk, a child of *root-disk-event*.
+(defvar *user-root-disk-event*)
+
+;;; Disk event used for :hang-p t disk transfers with no specified disk event.
+(defvar *user-anonymous-disk-event*)
+
+;; Disk event used for, e.g., Create Netboot Core
+(defvar *user-serial-disk-event*)
+
+(defresource disk-event (&key (parent *user-root-disk-event*)
+			      (ordered t)
+			      (data-check nil)
+			      (error-dequeue-action %disk-event-error-dequeue-signal)
+			      (error-enqueue-action %disk-event-error-enqueue-flush)
+			 &allow-other-keys)
+  :constructor construct-disk-event
+  :initializer initialize-disk-event
+  :deinitializer deinitialize-disk-event)
+
+;;; All normal disk events are allocated in disk-array-area, and go away in cold boots.
+(defun construct-disk-event (resource
+			     &key (parent *user-root-disk-event*)
+				  (ordered t)
+				  (data-check nil)
+				  (error-dequeue-action %disk-event-error-dequeue-signal)
+				  (error-enqueue-action %disk-event-error-enqueue-flush)
+			     &allow-other-keys)
+  (declare (ignore resource parent ordered
+		   data-check error-enqueue-action error-dequeue-action))
+  (make-array (1+ %disk-event-object-size)
+	      :named-structure-symbol 'disk-event
+	      :area si:disk-array-area))
+
+(defun initialize-disk-event (resource event
+			      &key (parent *user-root-disk-event*)
+				   (ordered t)
+				   (data-check nil)
+				   (error-dequeue-action %disk-event-error-dequeue-signal)
+				   (error-enqueue-action %disk-event-error-enqueue-flush)
+			      &allow-other-keys)
+  (declare (ignore resource))
+  (without-interrupts
+    (setf (disk-event-flags event)
+	  (dpbs (if data-check 1 0) %%disk-event-data-check
+		error-enqueue-action %%disk-event-error-enqueue-action
+		error-dequeue-action %%disk-event-error-dequeue-action
+		(let ((depth (1+ (if (null (disk-event-flags parent))
+				     0
+				 (disk-event-depth parent)))))
+		  (if ( depth (rot 1 (byte-size %%disk-event-depth)))
+		      (error "Exceeded maximum disk-event depth")
+		    depth))
+		%%disk-event-depth
+		(if ordered %disk-event-serial %disk-event-parallel)))
+    (setf (disk-event-parent event) parent)
+    (setf (disk-event-children event) nil)
+    (let ((siblings (disk-event-children parent)))
+      (setf (disk-event-previous-event event) siblings)
+      (setf (disk-event-next-event event) nil)
+      (when (not (null siblings))
+	(setf (disk-event-next-event siblings) event))
+      (setf (disk-event-children parent) event))
+    (setf (disk-event-request-head event) nil)
+    (setf (disk-event-request-tail event) nil)
+    (setf (disk-event-blocked-process event) nil)
+    (if (disk-event-lock event)
+	(process:reset-lock (disk-event-lock event))
+      (setf (disk-event-lock event) (process:make-lock "Disk Event")))
+    (setf (disk-event-error-thread event) nil)
+    (setf (disk-event-error-index event) 0)
+    (setf (disk-event-error-table event)
+	  (or (disk-event-error-table event)
+	      (make-array %disk-event-error-table-size :area si:disk-array-area)))
+    (setf (disk-event-flushed-transfers event) 0)
+    (setf (disk-event-active-tasks event) 0)
+    (setf (disk-event-completed-tasks event) 0)
+    nil))
+
+(defun deinitialize-disk-event (resource event)
+  (declare (ignore resource))
+  (without-interrupts
+    ;; Splice it out of its parent's list of children.
+    (multiple-value-bind (parent next previous)
+	(values
+	  (disk-event-parent event)
+	  (disk-event-next-event event)
+	  (disk-event-previous-event event))
+      (when (eq (disk-event-children parent) event)
+	(setf (disk-event-children parent) previous))
+      (when (not (null next))
+	(setf (disk-event-previous-event next) previous))
+      (when (not (null previous))
+	(setf (disk-event-next-event previous) next))))
+  nil)
+
+(defun initialize-user-disk-once ()
+  (setf *user-root-disk-event*
+	(make-array (1+ %disk-event-object-size)
+		    :named-structure-symbol 'disk-event :area sys:wired-control-tables))
+  (setf (disk-event-error-table *user-root-disk-event*)
+	(make-array %disk-event-error-table-size :area sys:wired-control-tables))
+  (setf *user-anonymous-disk-event*
+	(make-array (1+ %disk-event-object-size)
+		    :named-structure-symbol 'disk-event :area sys:wired-control-tables))
+  (setf (disk-event-error-table *user-anonymous-disk-event*)
+	(make-array %disk-event-error-table-size :area sys:wired-control-tables))
+  (setf *user-serial-disk-event*
+	(make-array (1+ %disk-event-object-size)
+		    :named-structure-symbol 'disk-event :area sys:wired-control-tables))
+  (setf (disk-event-error-table *user-serial-disk-event*)
+	(make-array %disk-event-error-table-size :area sys:wired-control-tables)))
+
+(add-initialization "Create user disk events" '(initialize-user-disk-once) '(:once))
+
+(defun initialize-user-disk ()
+  ;; If the user root disk event is a child of the root disk event, remove it.
+  (when (loop for child first (disk-event-children *root-disk-event*)
+			then (disk-event-previous-event child)
+	      until (null child)
+	      thereis (eq child *user-root-disk-event*))
+    (deinitialize-disk-event nil *user-root-disk-event*))
+  ;; Now reconnect the user disk events.
+  (initialize-disk-event nil *user-root-disk-event*
+			 :parent *root-disk-event* :ordered nil)
+  (initialize-disk-event nil *user-anonymous-disk-event*
+			 :parent *user-root-disk-event* :ordered t)
+  (initialize-disk-event nil *user-serial-disk-event*
+			 :parent *user-root-disk-event* :ordered t)
+  ;; Create and/or reset the locks for the system disk events, so we can wait for them.
+  (stack-let ((events (list *root-disk-event*
+			    #-VLM *storage-root-disk-event*
+			    #-VLM *storage-serial-disk-event*
+			    #-VLM *storage-parallel-disk-event*
+			    #-VLM *storage-background-disk-event*)))
+    (loop for event in events do
+      (process:reset-lock
+	(or (disk-event-lock event)
+	    (setf (disk-event-lock event) (process:make-lock "Disk Event"))))))
+  nil)
+
+(add-initialization "Initialize user disk" '(initialize-user-disk) '(:system))
+
+;;; +++ These should be changed to do something faster (particularly the wired-p)
+(defun wire-disk-event (event)
+  (let ((error-table (disk-event-error-table event)))
+    (%funcall-in-aux-stack #'wire-words event (+ %disk-event-object-size 2))
+    (when (not (null error-table))
+      (%funcall-in-aux-stack #'wire-words error-table (1+ %disk-event-error-table-size)))))
+
+(defun unwire-disk-event (event)
+  (when (not (disk-event-idle-p event))
+    (process-wait "Disk event idle" #'disk-event-idle-p event))
+  (let ((error-table (disk-event-error-table event)))
+    (%funcall-in-aux-stack #'unwire-words event (+ %disk-event-object-size 2))
+    (when (not (null error-table))
+      (%funcall-in-aux-stack #'unwire-words error-table (1+ %disk-event-error-table-size)))))
+
+(defun disk-event-wired-p (event)
+  (let ((error-table (disk-event-error-table event)))
+    (and (%funcall-in-aux-stack #'words-wired-p event (+ %disk-event-object-size 2))
+	 (or (null error-table)
+	     (%funcall-in-aux-stack #'words-wired-p error-table
+				    (1+ %disk-event-error-table-size))))))
+
+;;; User interface to keep a disk event wired.
+(defmacro with-wired-disk-event ((disk-event) &body body &environment environment)
+  (once-only (disk-event &environment environment)
+    `(let ((.disk-event-wired. nil))
+       (unwind-protect
+	   (progn
+	     (without-aborts ("Wiring a disk event must be done atomically")
+	       (wire-disk-event ,disk-event)
+	       (setq .disk-event-wired. ,disk-event))
+	     ,@body)
+	 (when .disk-event-wired. (unwire-disk-event .disk-event-wired.))))))
+
+
+;;;; Error handling support
+
+(defflavor disk-error-event
+  (event
+   error-event
+   error-type
+   error-address
+   flushed-transfer-count)
+  (disk-error)
+  (:conc-name disk-error-)
+  :readable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (dbg:report disk-error-event) (stream)
+  (format stream "~A during a ~A operation on unit ~D., ~A"
+	  (nth (ldb %%disk-error-type-class error-type) *disk-error-codes*)
+	  dbg:command-name
+	  dbg:unit
+	  (decode-disk-address (unit-queue dbg:unit) error-address))
+  (let ((error-description (decode-disk-error (unit-queue dbg:unit) error-type)))
+    (when (not (null error-description))
+      (format stream "~%  ~A" error-description)))
+  (when (and flushed-transfer-count (plusp flushed-transfer-count))
+    (format stream "~%  ~D. pending transfer~:P associated with this disk event aborted"
+	    flushed-transfer-count))
+  (when (not (eq event error-event))
+    (format stream "~%  The failed request was for ~S, but was detected by ~S"
+	    error-event event)))
+
+(defmethod (dbg:proceed disk-error-event :ignore) ()
+  "Continue, ignoring the error"
+  t)
+
+;;; See also PROCESS-FAILED-REQUEST in the master queue processing code.
+(defun signal-disk-error (event error-event error-flags error-address)
+  (signal
+    (make-condition
+      'disk-error-event
+      :event event
+      :error-event error-event
+      :unit (ldb %%disk-request-unit error-flags)
+      :command-name (disk-command-name (ldb %%disk-request-command error-flags))
+      :error-type (ldb %%disk-request-error-type error-flags)
+      :error-address error-address
+      :flushed-transfer-count (shiftf (disk-event-flushed-transfers event) 0))))
+
+(defun signal-disk-errors (event)
+  (when (not (null *disk-error-events*))
+    (loop do
+      (multiple-value-bind (error-event error-flags error-address)
+	  (block search
+	    (without-interrupts
+	      (map-over-disk-error-events
+		(lambda (error-event)
+		  (when (and (or (eq error-event event)
+				 (disk-event-descendent-p error-event event))
+			     (> (disk-event-error-index error-event) 0))
+		    (return-from search (lookup-disk-error error-event))))))
+	    (return-from signal-disk-errors nil))
+	(when (not (null error-event))
+	  (signal-disk-error event error-event error-flags error-address))))))
+
+
+;;;; User disk interface
+
+(defun wait-for-disk-event (disk-event)
+  (process:with-lock ((disk-event-lock disk-event))
+    (when (not (disk-event-idle-p disk-event))
+      (unwind-protect-case ()
+	  (progn
+	    (register-disk-event-blocked-process disk-event *current-process*)
+	    (process:process-block "Disk wait" #'disk-event-idle-p disk-event))
+	(:abort (wait-for-disk-done))
+	(:always (unregister-disk-event-blocked-process disk-event))))
+    (when (not (null *disk-error-events*))
+      (signal-disk-errors disk-event))))
+
+;;; See DISK-IO comment
+(defun disk-read (disk-arrays disk-event dpn &optional n-blocks (hang-p t) (block-offset 0))
+  (disk-io %disk-command-read32 disk-arrays disk-event dpn n-blocks hang-p block-offset))
+
+;;; See DISK-IO comment
+(defun disk-write (disk-arrays disk-event dpn &optional n-blocks (hang-p t) (block-offset 0))
+  (disk-io %disk-command-write32 disk-arrays disk-event dpn n-blocks hang-p block-offset))
+
+;;; Perform user disk IO.  DISK-ARRAYS can be a disk-array, or a list of disk-arrays to
+;;; read contiguously.  If HANG-P is true then the disk-array will be wired, the transfer
+;;; enqueued, and the routine will hang for the transfer to complete, and finally the
+;;; disk-array will be unwired.  If HANG-P is false the array is assumed wired, and the
+;;; transfer will simply be enqueued.
+(defun disk-io (command disk-arrays disk-event dpn n-blocks hang-p block-offset)
+  (labels ((enqueue-request (command disk-array disk-event dpn n-blocks block-offset)
+	     (loop with unit = (ldb %%dpn-unit dpn)
+		   until (disk-unit-mounted-p unit)
+		   do (signal-proceed-case (() 'disk-not-mounted-error :unit unit)
+			#|(:mount-disk-unit (mount-disk-unit unit))|#))
+	     (when ( (%disk-array-block-size disk-array) %page-size32)
+	       (error "Disk arrays with arbitrary block sizes aren't supported yet"))
+	     (%funcall-in-aux-stack #'enqueue-disk-request
+	       (dpbs (ldb %%dpn-unit dpn) %%disk-request-unit
+		     command %%disk-request-command
+		     %class-user %%disk-request-class
+		     0)
+	       disk-event
+	       (pageskilobits (ldb %%dpn-page-num dpn))
+	       (pageskilobits n-blocks)
+	       (if (= block-offset 0)
+		   (%disk-array-dap-list disk-array)
+		 (split-daps (%disk-array-dap-list disk-array)
+			     (* block-offset %page-size32))))))
+    (when (null disk-event)
+      (setq disk-event *user-anonymous-disk-event*))
+    (if (listp disk-arrays)
+	;; Map through the disk arrays enqueueing the appropriate transfers.  However, if
+	;; hang-p is true we don't hang in between the operations, we wire everything at the
+	;; beginning, wait at the end, then unwire.
+	(let ((array-wired nil)
+	      (event-wired nil))
+	  (unwind-protect
+	      (progn
+		(when hang-p
+		  ;; Synchronous I/O, wire things if necessary, queue request and wait for it
+		  ;; to complete, then unwire things as appropriate.
+		  (without-aborts ("Wiring structures before a synchronous disk transfer")
+		    (loop for disk-array in disk-arrays do (wire-disk-array disk-array))
+		    (setq array-wired t)
+		    (when (not (disk-event-wired-p disk-event))
+		      (wire-disk-event disk-event)
+		      (setq event-wired t))))
+		;; Unwrap lists of disk arrays here.
+		(loop for disk-array in disk-arrays
+		      do (setq disk-array (real-disk-array disk-array))
+		      for block-count = (disk-array-block-count disk-array)
+		      for this-size = (if n-blocks (min block-count n-blocks) block-count)
+		      for this-size-left = (- this-size block-offset)
+		      do
+		  (cond ((plusp this-size-left)
+			 (enqueue-request command disk-array disk-event dpn this-size-left block-offset)
+			 (when n-blocks
+			   (decf n-blocks this-size-left))
+			 (incf dpn this-size-left)
+			 (setf block-offset 0))
+			(t
+			 (decf block-offset this-size))))
+		(when hang-p
+		  (wait-for-disk-event disk-event)))
+	    (without-aborts ("Unwiring structures after a synchronous disk transfer")
+	      (when event-wired
+		(unwire-disk-event disk-event))
+	      (when array-wired
+		(loop for disk-array in disk-arrays do (unwire-disk-array disk-array))))))
+      (let ((disk-array (real-disk-array disk-arrays)))
+	;; Verify the capacity of the disk array against the requested transfer length.
+	(let ((nblks (- (%disk-array-block-count disk-array) block-offset)))
+	  (cond ((null n-blocks)
+		 (setq n-blocks nblks))
+		((> n-blocks nblks)
+		 (error "Can't ~:[read~;write~] ~D. blocks using arrays with ~
+		      space for only ~D. blocks"
+			(disk-transfer-write-p command) n-blocks nblks))))
+	(if (not hang-p)
+	    ;; Asynchronous I/O, just queue it up and return.
+	    (enqueue-request command disk-array disk-event dpn n-blocks block-offset)
+	  ;; Synchronous I/O, wire things if necessary, queue request and wait for it
+	  ;; to complete, then unwire things as appropriate.
+	  (let ((array-wired nil)
+		(event-wired nil))
+	    (unwind-protect
+		(progn
+		  (without-aborts ("Wiring structures before a synchronous disk transfer")
+		    (when (not (disk-array-wired-p disk-array))
+		      (wire-disk-array disk-array)
+		      (setq array-wired t))
+		    (when (not (disk-event-wired-p disk-event))
+		      (wire-disk-event disk-event)
+		      (setq event-wired t)))
+		  (enqueue-request command disk-array disk-event dpn n-blocks block-offset)
+		  (wait-for-disk-event disk-event))
+	      (without-aborts ("Unwiring structures after a synchronous disk transfer")
+		(when event-wired
+		  (unwire-disk-event disk-event))
+		(when array-wired
+		  (unwire-disk-array disk-array))))))))))
+
+;;; On the VLM, disk I/O is done using virtual rather than physical addresses.
+;;; Consequently, the storage system will have already taken care of marking the
+;;; pages as modified so we need do nothing here ...
+(defwiredfun user-disk-complete (ppn)
+  #+VLM (declare (ignore ppn))
+  #+3600 (setf (mmpt-modified (mmpt-lookup ppn)) 1)
+  #+(and IMach (not VLM)) (setf (pht-modified (pht-lookup (mmpt-vpn (mmpt-lookup ppn)))) 1))
+
+
+;;;; Scheduler interface
+
+(defun register-disk-event-blocked-process (disk-event process)
+  (without-aborts ("Disk event ~S is updating its blocked process." disk-event)
+    (incf* *disk-event-blocked-processes*)
+    (setf (disk-event-blocked-process disk-event)
+	  (process::register-process-for-sequence-break process))))
+
+(defun unregister-disk-event-blocked-process (disk-event)
+  (without-aborts ("Disk event ~S is updating its blocked process." disk-event)
+    (let ((handle (shiftf (disk-event-blocked-process disk-event) nil)))
+      (when (not (null handle))
+	(decf* *disk-event-blocked-processes*)
+	(process::unregister-process-for-sequence-break handle)))))
+
+
+;;;; Disk event task support, for 3600 compatibility only
+
+;;; Called by process-completed-request at request dequeueing time.
+;;; Atomic operations are used throughout this code because this routine runs asynchronously.
+(defwiredfun disk-event-task-complete (disk-event task-id)
+  (atomic-logior (disk-event-completed-tasks disk-event) (rot 1 task-id)))
+
+(defun si:disk-event-enq-task (disk-event)
+  (when (not (disk-event-serial-p disk-event))
+    (error "Disk event tasks aren't meaningful for parallel disk events"))
+  ;; Serialize all disk event task allocation/deallocation.
+  (without-interrupts
+    (let ((active-tasks (disk-event-active-tasks disk-event))
+	  (unit
+	    ;; We can enqueue an event task to any unit we please, and it will work.
+	    ;; However, if the requests that the task depends on are for a different unit,
+	    ;; we'll cause an interunit dependency, which will block at enqueue time.  So
+	    ;; try to enqueue the task to the same unit as the last request in the disk
+	    ;; event is for.  This has to be done carefully, since the disk event request
+	    ;; structures can be updated asynchronously.
+	    (loop do
+	      (let ((request (disk-event-request-head disk-event)))
+		(when (null request)
+		  (return (unit-unit-number (car *unit-list*))))
+		(let ((info (disk-request-flags request)))
+		  ;; If we got a consistent snapshot, return the unit number, else try again.
+		  (when (eq (disk-event-request-head disk-event) request)
+		    (return (ldb %%disk-request-unit info))))))))
+      (when ( active-tasks -1)
+	(loop for mask first 1 then (rot mask 1) and task-id from 0 do
+	  (when (not (logtest mask active-tasks))
+	    (atomic-logior (disk-event-active-tasks disk-event) mask)
+	    (atomic-logand (disk-event-completed-tasks disk-event) (lognot mask))
+	    (%funcall-in-aux-stack #'enqueue-disk-request
+				   (dpbs unit %%disk-request-unit
+					 %disk-command-event %%disk-request-command
+					 %class-nop %%disk-request-class
+					 0)
+				   disk-event task-id 0 nil)
+	    (return task-id)))))))
+
+(defun si:return-disk-event-task (disk-event task-id)
+  ;; Serialize all disk event task allocation/deallocation.
+  (without-interrupts
+    (let ((mask (rot 1 task-id)))
+      (atomic-logand (disk-event-active-tasks disk-event) (lognot mask))
+      (atomic-logand (disk-event-completed-tasks disk-event) (lognot mask)))))
+
+(defun si:disk-event-task-done-p (disk-event task-id)
+  (let ((mask (rot 1 task-id)))
+    (or (not (logtest (disk-event-active-tasks disk-event) mask))	;not active
+	(logtest (disk-event-completed-tasks disk-event) mask))))	;completed
+
+(defmacro si:with-disk-event-task ((task-var disk-event) &body body)
+  `(let ((,task-var nil))
+     (unwind-protect
+       (progn
+	 (without-interrupts (setq ,task-var (si:disk-event-enq-task ,disk-event)))
+	 (unless ,task-var
+	   (error "No available tasks in disk-event ~S." ,disk-event))
+	 ,@body)
+       (when ,task-var
+	 (si:return-disk-event-task ,disk-event ,task-var)))))
+
+(defun si:wait-for-disk-event-task (disk-event task-id)
+  (process:with-lock ((disk-event-lock disk-event))
+    (when (not (si:disk-event-task-done-p disk-event task-id))
+      (unwind-protect-case ()
+	  (progn
+	    (register-disk-event-blocked-process disk-event *current-process*)
+	    (process:process-block "Disk wait" #'si:disk-event-task-done-p disk-event task-id))
+	(:abort (wait-for-disk-done))
+	(:always (unregister-disk-event-blocked-process disk-event))))
+    (when (not (null *disk-error-events*))
+      (signal-disk-errors disk-event))))
+
+
+;;;; Miscellany
+
+(defun n-disk-units ()
+  (1+ (loop for unit in *unit-list* maximize (unit-unit-number unit))))
+
+;;; --- don't know what this means yet
+(defun disk-unit-mounted-p (unit)
+  (not (null (aref *unit-table* unit))))
+
+;;; --- don't know what this means yet
+(defun mount-disk-unit (unit-number) unit-number)
+
+;;; --- don't know what this means yet
+(defun dismount-disk-unit (unit-number) unit-number)
+
+
+;;;; Disk arrays
+
+;;; Disk arrays are fixnum arrays some multiple of some block size long.  There is
+;;; no space allocated for checkwords anymore.
+;;;
+;;; Disk array leader layout:
+;;;     0: unused (fill pointer)
+;;;     1: flags
+;;;     2: block count
+;;;     3: block size (in 32-bit words)
+;;;     4: DAP count
+;;;     5: DAP list
+;;;
+;;; The flags word contains a count of the number of times the array has been
+;;; wired by a client (wired-count), and a count of the number of active requests
+;;; involving part of this disk-array (active-count).  The array can be unwired
+;;; whenn (sic) both counts drop to zero.  If either count is non-zero, the array
+;;; is wired and the DAP list is valid.
+;;;
+;;; +++ The active-count is as yet unimplemented
+
+(defsubst %disk-array-wired-count (disk-array) (array-leader disk-array 1))
+(defsubst %disk-array-block-count (disk-array) (array-leader disk-array 2))
+(defsubst %disk-array-block-size (disk-array) (array-leader disk-array 3))
+(defsubst %disk-array-dap-count (disk-array) (array-leader disk-array 4))
+(defsubst %disk-array-dap-list (disk-array) (array-leader disk-array 5))
+
+(defsubst %disk-array-base (disk-array)
+  (multiple-value-bind (array control base bound)
+      (sys:setup-1d-array disk-array)
+    (declare (ignore array control bound))
+    base))
+
+(defsubst %disk-array-size (disk-array)
+  (* (%disk-array-block-count disk-array) (%disk-array-block-size disk-array)))
+
+;;; Follow any indirect or displaced arrays down to the actual disk array.
+(defun real-disk-array (array)
+  (loop while (array-indirect-p array)
+	do (setq array (array-indirect-pointer array))
+	finally (return (follow-structure-forwarding array))))
+
+;;; User accessors
+(defun disk-array-block-count (array) (%disk-array-block-count (real-disk-array array)))
+(defun disk-array-block-size (array) (%disk-array-block-size (real-disk-array array)))
+(defun disk-array-wired-p (array) ( (%disk-array-wired-count (real-disk-array array)) 0))
+
+;;; This needs to be defined early so the downard-funarg declaration takes hold.
+(defun map-disk-array-page-splits (disk-array block function)
+  (declare (sys:downward-funarg function))
+  (let ((base (%pointer (%disk-array-base disk-array)))
+	(block-size (%disk-array-block-size disk-array)))
+    #-VLM (loop for size first block-size then (- size nwords)
+		for vma first (+ base (* block block-size)) then (+ vma nwords)
+		for nwords = (min size (- page-size (ldb %%vma-word-offset vma)))
+		while (plusp nwords)
+		do (funcall function vma nwords))
+    #+VLM (funcall function (+ base (* block block-size)) block-size))
+  nil)
+
+;;; Make an array to be used for user disk I/O.  This now looks more like CL:MAKE-ARRAY,
+;;; with compatibility support for ZL:MAKE-ARRAY.
+(defun construct-disk-array (resource
+			     &optional (length %page-size32)
+			     &key (element-type 'fixnum)
+			     initial-element
+			     (area si:disk-array-area)
+			     (block-size %page-size32)
+			     ;; For compatibility with 7.2 and L-machines
+			     (initial-value initial-element)
+			     (type (type-array-element-type element-type))
+			     &allow-other-keys)
+  (declare (ignore resource))
+  (check-type length integer)
+  (when (symbolp type) (setq type (symbol-value type)))
+  (let* ((e-p-q (array-elements-per-q type))
+	 (blocks (ceiling (ceiling length e-p-q) block-size)))
+    (setq length (* blocks block-size e-p-q))
+    (unless (array-bits-per-element type)
+      (error "May not use disk arrays that are not implemented with fixnums"))
+    (let ((disk-array (zl:make-array length
+				     :type type
+				     :initial-value initial-value
+				     :area area
+				     :leader-list '(nil 0 0 0 0 0))))
+      (setf (%disk-array-wired-count disk-array) 0)
+      (setf (%disk-array-block-count disk-array) blocks)
+      (setf (%disk-array-block-size disk-array) block-size)
+      ;; Allocate enough storage for the DAP list and initialize all the DAP word counts.
+      ;; First allocate temporary storage assuming that each block of the disk-array will
+      ;; span the maximum number of VM pages.  Then map over each VM page in each block
+      ;; noting the extent in this temporary array.  Finally, make a new array the right
+      ;; size, copy the word counts to it, and store the dap list in the disk-array.
+      (stack-let ((extents (make-array (* (1+ (ceiling block-size
+						       #-VLM page-size #+VLM %page-size32))
+					  blocks 2))))
+	(let ((index 0))
+	  (loop for block below blocks do
+	    (map-disk-array-page-splits disk-array block
+	      (lambda (vma words)
+		(declare (ignore vma))
+		(setf (aref extents (shiftf index (+ index 2))) words))))
+	  ;; Index is now 2X the number of DAPs we need.
+	  (let ((dap-array (make-array index :area area)))
+	    (copy-array-portion extents 0 index dap-array 0 index)
+	    (setf (%p-cdr-code (locf (aref dap-array (1- index)))) sys:cdr-nil)
+	    (setf (%disk-array-dap-list disk-array)
+		  (%make-pointer dtp-list (locf (aref dap-array 0))))
+	    (setf (%disk-array-dap-count disk-array) (/ index 2)))))
+      disk-array)))
+
+(defun match-disk-array (resource disk-array
+			 &optional (length %page-size32)
+			 &key (element-type 'fixnum)
+			 initial-element
+			 (area si:disk-array-area)
+			 (block-size %page-size32)
+			 ;; For compatibility with 7.2 and L-machines
+			 (initial-value initial-element)
+			 (type (type-array-element-type element-type))
+			 &allow-other-keys)
+  (declare (ignore resource))
+  (when (symbolp type) (setq type (symbol-value type)))
+  (when (= (disk-array-block-size disk-array) block-size)
+    (let ((blocks (ceiling (ceiling length (array-elements-per-q type)) block-size)))
+      (when (and (= (%disk-array-block-count disk-array) blocks)
+		 (= (%area-number disk-array) area))
+	(if (= (array-type-field disk-array) type)
+	    (si:fill-array disk-array length (or initial-value (array-null-element type)))
+	  ;; +++ Here the array has the right number of blocks, and we could convert the
+	  ;; element type to the one we want.
+	  (return-from match-disk-array nil))
+	t))))
+
+(defun deinitialize-disk-array (resource disk-array)
+  (declare (ignore resource))
+  (when ( (%disk-array-wired-count disk-array) 0)
+    (cerror "Unwire it, then proceed"
+	    "Attempt to deallocate a disk-array while it's still wired")
+    (loop do (unwire-disk-array disk-array)
+	  until (= (%disk-array-wired-count disk-array) 0))))
+
+(defresource disk-array (&optional (length %page-size32)
+			 &key (element-type 'fixnum)
+			 initial-element
+			 (area si:disk-array-area)
+			 (block-size %page-size32)
+			 ;; For compatibility with 7.2 and L-machines
+			 (initial-value initial-element)
+			 (type (type-array-element-type element-type))
+			 &allow-other-keys)
+  :constructor construct-disk-array
+  :matcher match-disk-array
+  :deinitializer deinitialize-disk-array
+  ;; +++ Kludge to ensure that SI:DISK-ARRAY-AREA has at least one region
+;  #+VLM :initial-copies #+VLM 2
+			       )
+
+;;; Actually wire or unwire the leader, header, data, and daps of a disk array.
+(defun wire/unwire-disk-array-internal (disk-array wire-p)
+  (let ((function (if wire-p #'wire-words #'unwire-words)))
+    (multiple-value-bind (header-base header-size)
+	(progn
+	  #+IMach
+	  (let ((leader-length (array-leader-length-field disk-array)))
+	    (values (%pointer-plus disk-array (- leader-length))
+		    (+ leader-length 1 (if (= (array-long-prefix-bit disk-array) 0) 1 6))))
+	  #+3600
+	  (values disk-array (array-prefix-length disk-array)))
+      (let ((base (%disk-array-base disk-array))
+	    (size (%disk-array-size disk-array))
+	    (dap-base (%disk-array-dap-list disk-array))
+	    (dap-size (*2 (%disk-array-dap-count disk-array))))
+	;; Merge the un/wiring of the header and daps together with the data wiring, if
+	;; they're for consecutive addresses (which should be the common case).  Eliminates
+	;; a few PHT lookups and other miscellaneous overhead.
+	(if (= (%pointer (%pointer-plus header-base header-size)) (%pointer base))
+	    (setq base (%pointer-plus base (- header-size)) size (+ size header-size))
+	  (%funcall-in-aux-stack function header-base header-size))
+	(if (= (%pointer (%pointer-plus base size)) (%pointer (%pointer-plus dap-base -1)))
+	    (setq size (+ size dap-size 1))
+	  (%funcall-in-aux-stack function dap-base dap-size))
+	(%funcall-in-aux-stack function base size)))))
+
+;;; Wire a disk array.  Must use this instead of wire-structure.
+(defun wire-disk-array (disk-array)
+  (without-aborts ("Wiring a disk array must be done atomically")
+    (let ((disk-array (real-disk-array disk-array)))
+      (when (= (process:atomic-incf (%disk-array-wired-count disk-array)) 1)
+	(wire/unwire-disk-array-internal disk-array t)
+	;; Set up the DAP addresses.
+	(let ((address (%pointer (%disk-array-base disk-array)))
+	      (dap (%disk-array-dap-list disk-array)))
+	  (loop repeat (%disk-array-dap-count disk-array) do
+	    (let ((words (pop dap)))
+	      (setf (car dap)
+		    (let ((pma (%vma-to-wired-pma address)))
+		      (typecase pma
+			(null
+			  (error "Address ~O in disk array ~S isn't wired" address disk-array))
+			(fixnum pma)
+			((data-type dtp-physical-address)
+			 (if (ldb-test %%vma-equals-pma (%pointer pma))
+			     pma
+			     (%make-unmapped-address (%pointer pma)))))))
+	      (pop dap)
+	      (setq address (#+3600 + #+IMach %pointer-plus address words))))))))
+  nil)
+
+;;; Unwire a disk array.  Must use this instead of unwire-structure.
+(defun unwire-disk-array (disk-array)
+  (without-aborts ("Unwiring a disk array must be done atomically")
+    (let ((disk-array (real-disk-array disk-array)))
+      (when (= (process:atomic-decf (%disk-array-wired-count disk-array)) 0)
+	(wire/unwire-disk-array-internal disk-array nil))))
+  nil)
+
+;;; User interface to keep a disk array wired.
+(defmacro with-wired-disk-array ((disk-array) &body body &environment environment)
+  (once-only (disk-array &environment environment)
+    `(let ((.disk-array-wired. nil))
+       (unwind-protect
+	   (progn
+	     (without-aborts ("Wiring a disk array must be done atomically")
+	       (wire-disk-array ,disk-array)
+	       (setq .disk-array-wired. ,disk-array))
+	     ,@body)
+	 (when .disk-array-wired. (unwire-disk-array .disk-array-wired.))))))
+
+
+;;;; Stubs and declarations for obsolete 3600 disk-array functions
+
+(compiler:make-obsolete si:disk-array-checkword
+			"Disk sector checkwords are no longer supported")
+(defun si:disk-array-checkword (&rest ignore)
+  (error "Disk sector checkwords are no longer supported"))
+(defun si:set-disk-array-checkword (&rest ignore)
+  (error "Disk sector checkwords are no longer supported"))
+(defsetf si:disk-array-checkword si:set-disk-array-checkword)
+
+;;; Noone should be using this, but just in case.
+(compiler:make-obsolete si:disk-array-setup-flag* "Use STORAGE:DISK-ARRAY-WIRED-P instead")
+(defun si:disk-array-setup-flag* (disk-array) (disk-array-wired-p disk-array))
+
+(compiler:make-obsolete si:disk-array-checkwords
+			"Disk sector checkwords are no longer supported")
+(defun si:disk-array-checkwords (&rest ignore)
+  (error "Disk sector checkwords are no longer supported"))
+
+;;;+++ for compatibility until everything fixed to use resources
+(compiler:make-obsolete si:make-disk-array "use ALLOCATE-RESOURCE 'SI:DISK-ARRAY instead.")
+(defun si:make-disk-array (&rest args)
+  (apply #'allocate-resource 'disk-array args))
+
+;;;+++ for compatibility until everything fixed to use resources
+(compiler:make-obsolete si:return-disk-array "use DEALLOCATE-RESOURCE 'SI:DISK-ARRAY instead.")
+(defun si:return-disk-array (disk-array)
+  (deallocate-resource 'disk-array disk-array))
+
+;;; For compatibility, this means `remove all traces of any recent disk error from this event'.
+;;; Not sure what this means in the presence of inherited disk events, but for compatibility
+;;; applications that probably doesn't matter.  Maybe the right way do to this is to
+;;; condition-bind 'disk-error and call signal-disk-errors?
+(defun si:initialize-disk-event (ignore disk-event)
+  (without-interrupts
+    (setf (disk-event-blocked-process disk-event) nil)
+    ;; Search the list of pending errors for this event, and snap it out.  Asynchronous
+    ;; execution of record-disk-error can atomically push new events on the head of the list
+    ;; while we're doing this, but otherwise we don't have to worry about locking.  The only
+    ;; screw case is if the event is we're searching for is at the head of the list; we use a
+    ;; store-conditional to deal with that.
+    (loop for location first (locf *disk-error-events*)
+		       then (locf (disk-event-error-thread event))
+	  as event = (location-contents location)
+	  until (null event)
+	  do
+      (when (and (eq event disk-event)
+		 (store-conditional location event (disk-event-error-thread event)))
+	(return nil)))
+    (setf (disk-event-error-thread disk-event) nil)
+    (setf (disk-event-error-index disk-event) 0)
+    (setf (disk-event-flushed-transfers disk-event) 0)
+    (setf (disk-event-active-tasks disk-event) 0)
+    (setf (disk-event-completed-tasks disk-event) 0)))

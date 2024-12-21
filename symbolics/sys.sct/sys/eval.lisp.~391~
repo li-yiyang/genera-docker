@@ -1,0 +1,4123 @@
+;;; -*- Mode: LISP; Package: SYSTEM-INTERNALS; Base: 8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; The lexically-scoped Lisp interpreter
+
+
+;;; Having global variables that change the language like this is a really bad idea.
+;;; However, it can't be helped.  Hopefully any code other than user code that depends
+;;; on this runs compiled.  This variable only affects DECLARE; LOCAL-DECLARE always
+;;; makes pervasive special declarations.  If this variable is T, new bindings inside
+;;; the scope of a special declaration are special; otherwise they are lexical.
+(DEFVAR *SPECIAL-DECLARATIONS-ARE-PERVASIVE* NIL
+	"T for Zetalisp, NIL for Common Lisp")
+
+;;; Avoid blowing the stack frame when evaluating very long forms
+;;; The 40. is an estimate of the maximum size of the frame aside from %PUSHes
+;;; The #+3600 32. is because the value of CONTROL-STACK-MAX-FRAME-SIZE includes overhead,
+;;; so subtracting 32 gives the amount you can actually use.  No symbol for this?
+;;; If this constant is too large, an %ASSURE-PDL-ROOM error will go off at run time
+(DEFCONSTANT MAXIMUM-ARGUMENT-PUSHES (- CONTROL-STACK-MAX-FRAME-SIZE 40. 32.))
+
+(DEFMACRO STACK-SPACE-LEFT ()
+  `(- (- CONTROL-STACK-MAX-FRAME-SIZE
+	 #+3600 (+ 1. #o40)			; (See ASSURE-PDL-ROOM)
+	 #+imach (+ 1. 1. #o10)			; (Slush)
+	 )
+      (%POINTER-DIFFERENCE
+	(COMPILER:%STACK-LOCATION-INTERNAL 0)
+	(%STACK-FRAME-POINTER))))
+
+(COMPILER-LET ((COMPILER:*ENABLE-FRAME-SPLITTING* NIL))
+
+
+;;; Representation of Environments
+
+;The null lexical environment is represented by NIL.
+;
+;A lexical environment is a list of up to seven elements.  Missing elements
+;at the end are assumed to be NIL.
+;
+;Terminology:  An environment consists of several sections.  Each section is a
+;list.  Each element of those lists is an entry.
+;
+;Environments and their component parts are always created on the stack
+;initially, but can be evacuated to the heap if they need to be incorporated into
+;an "upward funarg" (also known as a "general lexical closure" as opposed to a
+;"stack lexical closure").  When an environment is evacuated, it is shortened;
+;unnecessary NIL elements at the end are not stored.
+;
+;An environment looks like
+;
+;	(variables functions blocks tagbodies declarations evacuation parent)
+;
+;The sections of an environment are
+;
+;    variables
+;	A list of variable bindings.  Each entry in the list looks like
+;
+;		(symbol value)
+;               (symbol macro t)
+;	        (symbol . locative)
+;
+;	The first form is for lexical variables, the second for local
+;	symbol macros, and the third for special and instance variables.
+;	For the variable cases, the CADR of the entry is the value and
+;	SETF of CADR is used to change the value.  Variables are looked
+;	up with ASSQ.
+;	Elements of the third kind are created if a variable is locally
+;	declared special, even if it is not bound at that point, which
+;	makes all the Common Lisp scoping rules work correctly.
+;
+;    functions
+;	A list of local function definitions.  Each entry in the list
+;	looks like
+;
+;		(symbol definition)
+;
+;	where definition is anything that could go in a function cell.
+;	This is used for both local functions and local macros.
+;
+;    blocks
+;	A list of blocks that can be returned from.  Each entry in the
+;	list looks like
+;
+;		(blockname catch-tag)
+;
+;	To return from the block, THROW the values to be returned to the
+;	catch-tag.
+;	The catch-tag is smashed to NIL when the dynamic extent of the block terminates.
+;
+;    tagbodies
+;	A list of tagbodies that GO can jump into.  Each entry in the
+;	list looks like
+;
+;		(body catch-tag)
+;
+;	GO finds the correct level of tagbody by doing a MEMQ of the
+;	tag in the body.  It then THROWs the place in the body to jump
+;	to to the catch-tag.
+;	The catch-tag is smashed to NIL when the dynamic extent of the tagbody terminates.
+;	Note the compromise that GO, unlike RETURN, has to do two
+;	levels of list searching.  This slows GO down a little but
+;	makes the amount of environment structure to be built on the
+;	stack smaller.
+;
+;    declarations
+;	A list of lists of declarations.  Each entry in the list is a list
+;	of elements that are identical to what you can put after DECLARE.
+;	The declaration section of the environment is only for the
+;	benefit of macros.  SPECIAL declarations are not stored here
+;	when running in the Common-Lisp-compatible non-pervasive mode.
+;
+;    evacuation 
+;	Initially NIL.  If the environment is evacuated
+;	from the stack to the heap, the evacuation field of the stack copy
+;	of the environment points to the heap copy.  This avoids creating
+;	multiple heap copies, which improves efficiency but does not affect
+;	correctness.  The evacuation field of the heap copy is not used.
+;
+;    parent
+;	The parent environment.  This is used during evacuation.  The parent
+;	field of an environment on the heap is not used.
+;
+;---I'm unsure that parent and evacuation are both used at the same time.
+;---Maybe with some mildly clever hacking we can condense these into one slot.
+;
+;
+;When an environment is to be enclosed in a lexical closure, if the closure is
+;"downward" and consed on the stack no special provision needs to be made.  For
+;the general case, where the closure is to be consed in the heap, the
+;environment and everything in it must be evacuated to the heap.  The process
+;of evacuation preserves the identity of entries in the sections of the
+;environment; all references to an entry in the stack are updated to point to
+;the new copy of the entry in the heap.  This is necessary to preserve the
+;identity of variable value cells.  The identity of environments and section
+;lists is not always preserved, but there is an attempt to preserve it to
+;cut down on consing.
+
+;;; If ENV wanted to be special, it would be called *ENV*.
+
+(EVAL-WHEN (COMPILE)				;Check for possible disaster
+  (DOLIST (VAR '(ENV NEW-ENV))			;There may be more, these are the worst
+    (WHEN (SPECIAL-VARIABLE-P VAR)
+      (FERROR "Compiling the interpreter with ~S declared special will produce
+a broken interpreter.  Many of the kludgey macros will get confused and generate
+wrong code." VAR))))
+
+(DEFSTRUCT (ENVIRONMENT :LIST (:CONC-NAME ENV-)
+			(:CONSTRUCTOR NIL)	;Constructed with WITH-STACK-LIST
+			(:ALTERANT NIL)
+			(:DEFAULT-POINTER ENV))
+  VARIABLES
+  FUNCTIONS
+  BLOCKS
+  TAGBODIES
+  DECLARATIONS
+  EVACUATION
+  PARENT)
+
+;--- This will have to be changed if we use the data-stack
+(DEFSUBST STACK-LIST-P (X)
+  (AND (%POINTER-LESSP %CONTROL-STACK-LOW X)
+       (%POINTER-LESSP X (COMPILER:%STACK-LOCATION-INTERNAL 0))))
+
+
+;Evacuation makes no attempt to interlock against the scheduler or other
+;processes.  Functions passed to other processes, or to process-wait,
+;need to be general closures if they contain any SETQs of free lexical
+;variables.  Only the stack that created an environment will ever evacuate it.
+(DEFUN EVACUATE-ENVIRONMENT (ENV)
+  (COND ((NULL ENV) NIL)			;Empty environment
+	((ENV-EVACUATION ENV))			;Already evacuated
+	((NOT (STACK-LIST-P ENV)) ENV)		;Already evacuated
+	(T
+	 (LET ((CIRCULAR NIL))			;T if circular environment structure seen
+	   ;; Iterate over the component sections of the environment: variables,
+	   ;; functions, blocks, tagbodies, and declarations.  For each section,
+	   ;; evacuate the entries and evacuate the lists, down to any tails that
+	   ;; are already evacuated.
+	   (DOTIMES (I 5)
+	     (LET ((L (NTH I ENV)))
+	       (UNLESS (NULL L)			;Speed bum
+		 ;; Get the non-stack-resident part of the list; there may also be
+		 ;; a stack-resident version of this in the stack-resident environments.
+		 (LET* ((TAIL (LOOP FOR E = ENV THEN (ENV-PARENT E)
+				    AS L = (NTH I E)
+				    WHILE (STACK-LIST-P L)
+				    FINALLY (RETURN L)))
+			(STACK-TAIL (AND TAIL	;speed bum
+					 (NTHCDR (- (LENGTH L) (LENGTH TAIL)) L)))
+			(RECURSIVE NIL))	;T if recursively evacuated something
+		   ;; Evacuate each entry down to entries guaranteed evacuated already
+		   (LOOP FOR L = L THEN (CDR L) UNTIL (EQ L STACK-TAIL)
+			 AS X = (CAR L)
+			 DO (WHEN (STACK-LIST-P X)
+			      ;; Evacuate function closure and its contained environment, too
+			      (WHEN (AND (= I 1)
+					 (TYPEP (SECOND X) :LEXICAL-CLOSURE)
+					 (STACK-LIST-P (SECOND X)))
+				(LET ((SUBENV (LEXICAL-CLOSURE-ENVIRONMENT (SECOND X)))
+				      (FUNCTION (LEXICAL-CLOSURE-FUNCTION (SECOND X))))
+				  (IF (EQ (CAR SUBENV) ENV)
+				      (SETQ CIRCULAR T
+					    SUBENV (CONS (CAR SUBENV) (CDR SUBENV)))
+				      (SETQ RECURSIVE T
+					    SUBENV (CONS (EVACUATE-ENVIRONMENT (CAR SUBENV))
+							 (CDR SUBENV))))
+				  (SETF (SECOND X)
+					(MAKE-LEXICAL-CLOSURE SUBENV FUNCTION))))
+			      ;; Now evacuate the entry
+			      (SETF (CAR L) (COPYLIST X))))
+		   ;; If a parent environment might have been evacuated, recompute
+		   ;; the non-stack-resident part of the list
+		   (WHEN RECURSIVE
+		     (SETQ TAIL (LOOP FOR E = ENV THEN (ENV-PARENT E)
+				      AS L = (NTH I E)
+				      WHILE (STACK-LIST-P L)
+				      FINALLY (RETURN L))
+			   STACK-TAIL (AND TAIL	;speed bum
+					   (NTHCDR (- (LENGTH L) (LENGTH TAIL)) L))))
+		   ;; Evacuate the list
+		   (LET ((NL (COPYLIST-DIFFERENCE L STACK-TAIL TAIL)))
+		     ;; Update this environment and its parents to point to the new list
+		     (LOOP FOR E = ENV THEN (ENV-PARENT E)
+			   AS OL = (NTH I E)
+			   UNTIL (EQ OL TAIL)
+			   DO (LOOP UNTIL (EQ L OL)
+				    DO (POP NL) (POP L))
+			      (SETF (NTH I E) NL)))))))
+	   ;; Now evacuate the environment itself, and its parents
+	   (LOOP FOR CHILD = NIL THEN PARENT
+		 AS PARENT = ENV THEN (ENV-PARENT CHILD)
+		 WHILE (STACK-LIST-P PARENT) WITH NEW-ENV = ENV
+		 DO (LET ((NEW-PARENT (MAKE-LIST ;; Only as long as actually needed
+						 (LOOP FOR I DOWNFROM 4 TO 0
+						       UNTIL (NTH I PARENT)
+						       FINALLY (RETURN (1+ I))))))
+		      (DO ((L1 PARENT (CDR L1))
+			   (L2 NEW-PARENT (CDR L2)))
+			  ((NULL L2))
+			(SETF (CAR L2) (CAR L1)))		    
+		      (SETF (ENV-EVACUATION PARENT) NEW-PARENT)
+		      (SETQ PARENT NEW-PARENT)
+		      (IF CHILD
+			  (SETF (ENV-PARENT CHILD) NEW-PARENT)
+			  (SETQ NEW-ENV NEW-PARENT)))
+		 FINALLY
+		   ;; Plug the new environment into any lexical closures that need it
+		   (WHEN CIRCULAR
+		     (DOLIST (X (ENV-FUNCTIONS))
+		       (WHEN (TYPEP (SECOND X) :LEXICAL-CLOSURE)
+			 (WHEN (EQ (CAR (LEXICAL-CLOSURE-ENVIRONMENT (SECOND X))) ENV)
+			   (SETF (CAR (LEXICAL-CLOSURE-ENVIRONMENT (SECOND X))) NEW-ENV)))))
+		   ;; Return the new environment as result of EVACUATE-ENVIRONMENT
+		   (RETURN NEW-ENV))))))
+
+(DEFUN NULL-ENVIRONMENT-P (ENVIRONMENT)
+  (OR (NULL ENVIRONMENT)
+      (AND (NULL (ENV-VARIABLES ENVIRONMENT))
+	   (NULL (ENV-FUNCTIONS ENVIRONMENT))
+	   (NULL (ENV-BLOCKS ENVIRONMENT))
+	   (NULL (ENV-TAGBODIES ENVIRONMENT)))))
+
+;;; Return a list that is EQUAL to HEAD, but the part between HEAD and TAIL is a copy
+;;; Also substitute NEW-TAIL for TAIL (but if one is NIL so is the other)
+(DEFUN COPYLIST-DIFFERENCE (HEAD TAIL NEW-TAIL)
+  (IF (EQ HEAD TAIL) NEW-TAIL
+      (DO ((L HEAD (CDR L))
+	   (N 0 (1+ N)))
+	  ((EQ L TAIL)
+	   (SETQ L (MAKE-LIST (IF TAIL (1+ N) N)))
+	   (DO ((LL L (CDR LL)))
+	       (NIL)
+	     (SETF (CAR LL) (POP HEAD))
+	     (WHEN (EQ HEAD TAIL)
+	       (WHEN TAIL
+		 (%CHANGE-LIST-TO-CONS LL)
+		 (RPLACD LL NEW-TAIL))
+	       (RETURN L)))))))
+
+;;; Given a function name, return an appropriate block name. 
+(DEFUN DIVINE-SUITABLE-BLOCK-NAME (NAME)
+  (DECLARE (VALUES BLOCK-NAME-OR-NIL))
+  (LOOP FOR BLOCK = NAME THEN (SECOND BLOCK) DO
+    (COND ((SYMBOLP BLOCK) (RETURN (VALUES BLOCK T)))
+	  ((OR (NOT (LISTP BLOCK))
+	       (NOT (LISTP (CDR BLOCK))))
+	   (RETURN (VALUES NIL NIL))))))
+
+;;; If there is an appropriate block name for the function name, wrap the body in a
+;;; block with that name.
+(DEFUN WRAP-BODY-WITH-BLOCK (FUNCTION-NAME BODY)
+  (MULTIPLE-VALUE-BIND (NAME FOUNDP)
+      (DIVINE-SUITABLE-BLOCK-NAME FUNCTION-NAME)
+    (IF FOUNDP
+	`((BLOCK ,NAME ,@BODY))
+	BODY)))
+
+(DEFVAR *FUNCTION-LET-VALID-SPEC-TYPES* '(CL:SETF FUTURE-COMMON-LISP:SETF LOCF))
+
+(DEFUN FUNCTION-LET-VALID-NAME-P (FUNCTION-NAME)
+  (OR (SYMBOLP FUNCTION-NAME)
+      (AND (CL:CONSP FUNCTION-NAME)
+	   (CL:MEMBER (FIRST FUNCTION-NAME) *FUNCTION-LET-VALID-SPEC-TYPES*)
+	   (VALIDATE-FUNCTION-SPEC FUNCTION-NAME NIL))))
+
+(DEFUN CHECK-FUNCTION-LET-SYNTAX (FORM)
+  (LET ((TYPE (FIRST FORM)))
+    (FLET ((ISSUE-WARNING (&REST ARGUMENTS)
+	     (APPLY #'WARN ARGUMENTS)
+	     (RETURN-FROM CHECK-FUNCTION-LET-SYNTAX NIL)))
+      (UNLESS (CL:CONSP (CDR FORM))
+	(ISSUE-WARNING "The ~s form ~s is not a long enough list" TYPE FORM))
+      (LET ((BINDINGS (SECOND FORM))
+	    (BOUND-THINGS))
+	(UNLESS (CL:LISTP BINDINGS)
+	  (ISSUE-WARNING "The bindings in the form ~s are not a list" FORM))
+	(DOLIST (BINDING BINDINGS)
+	  (UNLESS (AND (CL:LISTP BINDING)
+		       (IF (OR (EQ TYPE 'MACROLET)
+			       (EQ TYPE 'FUTURE-COMMON-LISP:MACROLET))
+			   (SYMBOLP (FIRST BINDING))
+			   (FUNCTION-LET-VALID-NAME-P (FIRST BINDING)))
+		       (CL:CONSP (CDR BINDING))
+		       (CL:LISTP (SECOND BINDING)))
+	    (ISSUE-WARNING "The binding ~s in ~s is invalid" BINDING FORM))
+	  (LET ((NAME (FIRST BINDING)))
+	    (WHEN (CL:MEMBER NAME BOUND-THINGS :TEST #'EQUAL)
+	      (ISSUE-WARNING "~s is bound multiple times in ~s" NAME FORM))
+	    (PUSH NAME BOUND-THINGS)))
+	  T))))
+
+(DEFUN CHECK-VALUE-LET-SYNTAX (FORM)
+  (LET ((TYPE (FIRST FORM)))
+    (FLET ((ISSUE-WARNING (&REST ARGUMENTS)
+	     (APPLY #'WARN ARGUMENTS)
+	     (RETURN-FROM CHECK-VALUE-LET-SYNTAX NIL)))
+      (UNLESS (CL:CONSP (CDR FORM))
+	(ISSUE-WARNING "The ~s form ~s is not a long enough list" TYPE FORM))
+      (LET ((BINDINGS (SECOND FORM))
+	    (BOUND-THINGS))
+	(UNLESS (CL:LISTP BINDINGS)
+	  (ISSUE-WARNING "The bindings in the form ~s are not a list" FORM))
+	(DOLIST (BINDING BINDINGS)
+	  (LET ((SYMBOL
+		  (COND ((SYMBOLP BINDING) BINDING)
+			((CL:CONSP BINDING)
+			 (UNLESS (SYMBOLP (FIRST BINDING))
+			   (ISSUE-WARNING "Attempt to bind a non-symbol in ~s" BINDING))
+			 (UNLESS (AND (CL:CONSP (CDR BINDING))
+				      (NULL (CDDR BINDING)))
+			   (ISSUE-WARNING "Invalid format for the binding ~s" BINDING))
+			 (FIRST BINDING))
+			(T (ISSUE-WARNING "Invalid format for the binding ~s" BINDING)))))
+	    (COND ((COMPILER:SELF-EVALUATING-SYMBOL-P SYMBOL)
+		   (ISSUE-WARNING "Attempt to ~s ~s in ~s" TYPE SYMBOL FORM))
+		  ((LT:NAMED-CONSTANT-P SYMBOL)
+		   (FERROR "Attempt to ~s ~s, which is a constant declared with DEFCONSTANT, ~
+                            in the form ~s"
+			   TYPE SYMBOL FORM)))
+	    (UNLESS (EQ TYPE 'LET*)
+	      (WHEN (CL:MEMBER SYMBOL BOUND-THINGS)
+		(ISSUE-WARNING "~s is bound multiple times in ~s" SYMBOL FORM))
+	      (PUSH SYMBOL BOUND-THINGS))))
+	T))))
+
+;;; Evalhook
+
+(DEFVAR-RESETTABLE CL:*EVALHOOK* NIL)
+(DEFVAR-RESETTABLE CL:*APPLYHOOK* NIL)
+
+;Standin for EVAL.  If there is a hook, bind it off and call it.
+(DEFUN EVAL (FORM &OPTIONAL ENV)
+  (IF (NULL CL:*EVALHOOK*)
+      (*EVAL FORM ENV)
+      (LET ((TEM CL:*EVALHOOK*)
+	    (CL:*EVALHOOK* NIL)
+	    (CL:*APPLYHOOK* NIL))
+	(FUNCALL TEM FORM ENV))))
+
+;Evaluate this form, but call the hook instead of EVAL for any nested evaluations
+;If a third argument is supplied, it is a hook called by EVAL after evaluating all
+;the arguments, instead of applying the function to them.  Note well: this catches
+;applies by EVAL; it does not catch any other use of APPLY.
+(DEFUN EVALHOOK (FORM CL:*EVALHOOK* &OPTIONAL CL:*APPLYHOOK* ENV)
+  (*EVAL FORM ENV CL:*EVALHOOK*))
+
+;After discussion on the Common Lisp mailing list, the ENV for the apply hook
+;is the environment in which the arguments have already been evaluated, not
+;the environment of the function to be called, which is of course still inside
+;its closure.  Its completely inutile to have the environment as an argument here,
+;but it's in the book so I'll accept it and ignore it.
+(DEFUN APPLYHOOK (FUNCTION ARGS CL:*EVALHOOK* CL:*APPLYHOOK* &OPTIONAL ENV)
+  (IGNORE ENV)
+  (APPLY FUNCTION ARGS))
+
+;; Obsolete, but here for compatibility.
+(DEFUN EVALHOOK1 (FORM &OPTIONAL ENV)
+  (EVAL FORM ENV))
+
+;Called instead of %FINISH-FUNCTION-CALL if there is an APPLYHOOK
+;This only works if the call was to D-RETURN, and that cannot be fixed on the A machine
+;After discussion on the Common Lisp mailing list, the ENV for the apply hook
+;is the environment in which the arguments have already been evaluated, not
+;the environment of the function to be called, which is of course still inside
+;its closure.
+(DEFUN APPLYHOOK1 (FUNCTION N-ARGUMENTS LEXPR ENV)
+  ;; Collect arguments, which are at the top of the caller's stack frame
+  (LET ((ARGUMENTS
+	 (AND (PLUSP N-ARGUMENTS) 
+	      (%MAKE-POINTER-OFFSET DTP-LIST
+				    (FRAME-PREVIOUS-TOP (%STACK-FRAME-POINTER))
+				    (- 1 N-ARGUMENTS)))))
+    (AND ARGUMENTS
+	 (%P-STORE-CDR-CODE (%MAKE-POINTER-OFFSET DTP-LOCATIVE ARGUMENTS (1- N-ARGUMENTS))
+			    CDR-NIL))
+    (AND LEXPR ARGUMENTS
+	 (IF (= N-ARGUMENTS 1)
+	     (SETQ ARGUMENTS (CAR ARGUMENTS))
+	     (%CHANGE-LIST-TO-CONS (NTHCDR (- (LENGTH ARGUMENTS) 2) ARGUMENTS))))
+    ;; Call the hook with hooks turned off, return its result in place of original call
+    (LET ((TEM CL:*APPLYHOOK*)
+	  (CL:*EVALHOOK* NIL)
+	  (CL:*APPLYHOOK* NIL))
+      (FUNCALL TEM FUNCTION ARGUMENTS ENV))))
+
+;;; Eval
+
+;;; Usually the function definition of EVAL is this function, but EVALHOOK changes it.
+;;; HOOK is supplied by the EVALHOOK mechanism; it's needed because of open-coded recursion.
+(DEFUN *EVAL (FORM &OPTIONAL ENV HOOK)
+  (PROG EVAL ()
+   RETRY					;Loop back to here after macro expansion
+    (WHEN (ATOM FORM)
+      (UNLESS (SYMBOLP FORM)
+	;; All nonsymbolic atoms evaluate to themselves
+	(RETURN-FROM EVAL FORM))
+      ;; Some kind of variable.  This convoluted code is bummed for speed.
+      ;; The first thing to try for is a variable mentioned in the environment,
+      ;; which is lexical, instance, or declared special.
+      (LET ((TEMP (CDR (ASSQ FORM (ENV-VARIABLES)))))
+	(WHEN TEMP				;Has a local binding?
+	  (RETURN-FROM EVAL
+	    (IF (CL:CONSP TEMP)			;Lexical variable or symbol macro?
+		(LET ((EXP (POP TEMP)))
+		  (COND (TEMP			;Symbol macro
+			 (SETQ FORM EXP)
+			 (GO RETRY))
+			(T EXP)))		;Lexical variable
+		(CAR TEMP)))))			;Special
+      ;; Not listed in the environment, it's some other kind of symbol.
+      ;; It's either a SPECIAL variable not locally declared, a constant,
+      ;; a symbol macro, or an error.		      
+      ;; Have to check for symbol macro first because there are plenty
+      ;; of symbol macros lying around that are BOUNDP.  Should we make
+      ;; an explicit test for NIL, T, or keyword before symbol-macro?
+      (MULTIPLE-VALUE-BIND (MACRO-P EXPANSION)
+	  (LT:SYMBOL-MACRO-P FORM ENV)
+	(WHEN MACRO-P
+	  (SETF FORM EXPANSION)
+	  (GO RETRY)))
+      (MULTIPLE-VALUE-BIND (CONSTANTP VALUE)
+	  (LT:NAMED-CONSTANT-P FORM ENV)
+	(WHEN CONSTANTP
+	  (RETURN-FROM EVAL VALUE)))
+      (RETURN-FROM EVAL 
+	(SYMEVAL FORM)))
+
+    ;; It's a function combination
+    (LET ((FUNCTION (FIRST FORM)))
+
+      ;; This special case is probably still worth it
+      (WHEN (EQ FUNCTION 'QUOTE)
+	(RETURN-FROM EVAL (SECOND FORM)))
+
+      ;; Handle open LAMBDA (have to pass the environment through)
+      (WHEN (LISTP FUNCTION)
+	(UNLESS (EQ (CAR FUNCTION) 'DIGESTED-LAMBDA)
+	  (SETF FUNCTION (DIGEST-LAMBDA FUNCTION ENV NIL T)))
+	(COND (CL:*APPLYHOOK*
+	       ;; If applyhook is going to see it, make a closure
+	       (SETQ FUNCTION (ENCLOSE FUNCTION ENV)))
+	      ((< (LENGTH FORM) MAXIMUM-ARGUMENT-PUSHES)
+	       ;; No hook, pass the environment the fast way
+	       (WITH-STACK-LIST* (EXTRA-INFO ENV FUNCTION)
+		 (LET ((N-ARGS (LENGTH FORM)))	;Includes the environment
+		   (%START-FUNCTION-CALL #'INTERPRETER-TRAMPOLINE RETURN N-ARGS NIL)
+		   (%PUSH EXTRA-INFO)
+		   (SETQ FORM (CDR FORM))
+		   (LOOP UNTIL (NULL FORM)
+			 DO (%PUSH (EVAL (POP FORM) ENV)))
+		   (RETURN-FROM EVAL (%FINISH-FUNCTION-CALL #'INTERPRETER-TRAMPOLINE RETURN N-ARGS NIL)))))))
+
+      ;; Look up the function's definition
+      (WHEN (SYMBOLP FUNCTION)
+	;; Local function lookup will return a lexical closure with an environment in it
+	;; Global function lookup, if local fails, takes care of the undefined-function error
+	(SETQ FUNCTION (OR (CADR (ASSQ FUNCTION (ENV-FUNCTIONS)))
+			   (AND COMPILER:FILE-LOCAL-DECLARATIONS
+				(CLOS-INTERNALS:COMPILE-FILE-ENVIRONMENT-P ENV)
+				(LET ((DEF (COMPILER:FILE-DECLARATION FUNCTION 'COMPILER:DEF)))
+				  (AND (CL:CONSP DEF)
+				       (EQ (FIRST DEF) 'SPECIAL)
+				       DEF)))
+			   (FSYMEVAL FUNCTION)))
+	;; This lets you do (DEFF FOO 'BAR), where BAR is defined as a macro.  This doesn't
+	;; seem like such a good idea, but since the compiler and MACROEXPAND support it
+	;; (via DECLARED-DEFINITION) I guess the interpreter has to.  In the interpreter
+	;; this accidentally works when BAR is a special form, too, but the compiler
+	;; doesn't support that and it should not be regarded as a feature.
+	(LOOP WHILE (SYMBOLP FUNCTION) DO
+	  (SETQ FUNCTION (FSYMEVAL FUNCTION))))
+
+      ;; Bind variables needed to apply a function to arguments
+      (PROG ((N-ARGS (LENGTH (CDR FORM)))
+	     (ARGNO 0)
+	     (KLUDGE1 ENV) (KLUDGE2 NIL)	;Space in which to make a lexical closure
+	     (KLUDGE3 NIL) (KLUDGE4 #'INTERPRETER-TRAMPOLINE)
+	     (ARGUMENTS NIL) (APPLY NIL)
+	     ARG TEM)
+	    (%P-STORE-CDR-CODE (LOCF KLUDGE1) CDR-NORMAL)
+	    (%P-STORE-CDR-CODE (LOCF KLUDGE2) CDR-NIL)
+	    (SETF KLUDGE3 (%MAKE-POINTER DTP-LIST (LOCF KLUDGE1)))
+	    (%P-STORE-CDR-CODE (LOCF KLUDGE3) LEXICAL-CLOSURE-SUBTYPE-LEXICAL-CLOSURE)
+	    (%P-STORE-CDR-CODE (LOCF KLUDGE4) CDR-NIL)
+	    ;Temporaries
+	;; Check for special forms and macros
+	(COND ((ATOM FUNCTION))
+	      ((EQ (FIRST FUNCTION) 'SPECIAL)
+	       (BLOCK TRICK			;Call interpreter function if present
+		 (RETURN-FROM EVAL (FUNCALL (OR (THIRD FUNCTION) (RETURN-FROM TRICK))
+					    FORM ENV)))
+						;Otherwise expand macro
+	       (SETQ FORM (EVAL-MACRO (SECOND FUNCTION) FORM ENV))
+	       (GO RETRY))
+	      ((EQ (CAR FUNCTION) 'MACRO)	;Old-type macro, temporary compatibility
+	       (SETQ FORM (EVAL-MACRO2 (CDR FUNCTION) FORM))
+	       (GO RETRY))
+	      ((EQ (FIRST FUNCTION) 'FLAVOR:DEFUN-IN-FLAVOR)
+	       (SETQ TEM (SECOND FUNCTION))	;Flavor name
+	       (SETQ FUNCTION (LOCATION-CONTENTS (THIRD FUNCTION)))	;Fdefinition
+	       (SETQ FORM (CDR FORM))
+	       (INCF N-ARGS 2)
+	       (COND ((< N-ARGS MAXIMUM-ARGUMENT-PUSHES)
+		      (%START-FUNCTION-CALL FUNCTION RETURN N-ARGS NIL)
+		      #+3600(PROGN
+			      (%PUSH (SETQ ARG (CADR (ASSQ 'SELF (ENV-VARIABLES)))))
+			      (%PUSH (FLAVOR:GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE ARG TEM)))
+		      #+IMACH(PROGN
+			       (%PUSH (FLAVOR:GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE
+					(SETQ ARG (CADR (ASSQ 'SELF (ENV-VARIABLES))))
+					TEM))
+			       (%PUSH ARG)))
+		     (T
+		      (SETQ APPLY T)
+		      (%START-FUNCTION-CALL FUNCTION RETURN 1 T)
+		      #+3600(PROGN
+			      (PUSH (SETQ ARG (CADR (ASSQ 'SELF (ENV-VARIABLES)))) ARGUMENTS)
+			      (PUSH (FLAVOR:GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE ARG TEM)
+				    ARGUMENTS))
+		      #+IMACH(PROGN
+			       (PUSH (FLAVOR:GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE
+				       (SETQ ARG (CADR (ASSQ 'SELF (ENV-VARIABLES)))) TEM)
+				    ARGUMENTS)
+			       (PUSH ARG ARGUMENTS))))
+	       (SETQ ARGNO 2)
+	       (GO EVARGS)))
+
+	;; It's a regular function
+	;; We really don't care what type it is, nor how many arguments it wants.
+	;; Let the normal function-calling microcode take care of all that stuff.
+	(SETQ FORM (CDR FORM))
+	(COND ((< N-ARGS MAXIMUM-ARGUMENT-PUSHES)
+	       (%START-FUNCTION-CALL FUNCTION RETURN N-ARGS NIL))
+	      (T
+	       (SETQ APPLY T)
+	       (%START-FUNCTION-CALL FUNCTION RETURN 1 T)))
+      EVARGS
+	(LOOP UNTIL (NULL FORM) DO
+	  (SETQ ARG (POP FORM))
+	  #+IMACH
+	  (WHEN APPLY
+	    (%START-FUNCTION-CALL #'CONS T 2 NIL))
+	  ;; Open-code the recursive evaluation for speed and to support downward funargs
+	  (%PUSH (BLOCK EVAL-OPEN
+		   (COND (HOOK			;EVALHOOK takes control
+			  (RETURN-FROM EVAL-OPEN
+			    (LET ((CL:*EVALHOOK* NIL)
+				  (CL:*APPLYHOOK* NIL))
+			      (FUNCALL HOOK ARG ENV))))
+			 ((SYMBOLP ARG)		;Handle lexicals and locally declared special
+						; or instance variables quickly
+			  (LET ((TEMP (CDR (ASSQ ARG (ENV-VARIABLES)))))
+			    (WHEN TEMP
+			      (RETURN-FROM EVAL-OPEN
+				(IF (CL:CONSP TEMP)
+				    (LET ((EXP (POP TEMP)))
+				      (IF TEMP
+					  (EVAL EXP ENV)
+					  EXP))
+				    (CAR TEMP))))))
+			 ((ATOM ARG)		;Self-evaluating constant
+			  (RETURN-FROM EVAL-OPEN ARG))
+			 ((EQ (SETQ TEM (FIRST ARG)) 'QUOTE)
+			  (RETURN-FROM EVAL-OPEN (SECOND ARG)))
+			 ((EQ TEM 'FUNCTION)
+			  ;; Do the downward-funarg cases of the FUNCTION special form
+			  (SETQ TEM (SECOND ARG))
+			  (TYPECASE TEM
+			    (:SYMBOL
+			      (SETQ TEM (OR (CADR (ASSQ TEM (ENV-FUNCTIONS)))
+					    (RETURN-FROM EVAL-OPEN (FSYMEVAL TEM))))
+			      ;; Local function, may be able to avoid evacuation
+			      (WHEN (ARGUMENT-IS-DOWNWARD-FUNARG FUNCTION ARGNO TEM)
+				(RETURN-FROM EVAL-OPEN TEM)))
+			    (:LIST
+			      (WHEN (EQ (CAR TEM) 'DIGESTED-LAMBDA)
+				(WHEN (AND (NULL KLUDGE2)
+					   (ARGUMENT-IS-DOWNWARD-FUNARG FUNCTION ARGNO TEM))
+				  ;; LAMBDA-expression that has been digested already, and
+				  ;; space still available on the stack to build lexical closure
+				  (SETQ KLUDGE2 TEM)
+				  (RETURN-FROM EVAL-OPEN
+				    ;; This works now
+				    (%MAKE-POINTER DTP-LEXICAL-CLOSURE (LOCF KLUDGE3))
+				    ))))))
+			 ((EQ TEM 'DIGESTED-LAMBDA)
+			  ;; LAMBDA as a special form, do the downward-funarg case
+			  ;; Don't bother if it hasn't been digested yet, that conses anyway
+			  (WHEN (AND (NULL KLUDGE2)
+				     (ARGUMENT-IS-DOWNWARD-FUNARG FUNCTION ARGNO ARG))
+			    ;; Build a lexical closure on the stack
+			    (SETQ KLUDGE2 ARG)
+			    (RETURN-FROM EVAL-OPEN
+			      ;; This works now
+			      (%MAKE-POINTER DTP-LEXICAL-CLOSURE (LOCF KLUDGE3))))))
+		   ;; Dropped through to the general case
+		   (EVAL ARG ENV)))
+	  #+3600
+	  (WHEN APPLY
+	    (PUSH (%POP) ARGUMENTS))
+	  #+IMACH
+	  (WHEN APPLY
+	    (%PUSH ARGUMENTS)
+	    (SETQ ARGUMENTS (%FINISH-FUNCTION-CALL #'CONS T 2 NIL)))
+	  (INCF ARGNO))
+	(RETURN-FROM EVAL
+	  (COND ((NOT APPLY)
+		 (IF CL:*APPLYHOOK*
+		     (APPLYHOOK1 FUNCTION N-ARGS NIL ENV)
+		     (%FINISH-FUNCTION-CALL FUNCTION RETURN N-ARGS NIL)))
+		(T
+		 (%PUSH (NREVERSE ARGUMENTS))
+		 (IF CL:*APPLYHOOK*
+		     (APPLYHOOK1 FUNCTION 1 T ENV)
+		     (%FINISH-FUNCTION-CALL FUNCTION RETURN 1 T)))))))))
+
+;;; Broken off into a separate function because CATCH-ERROR-RESTART forces extra
+;;; stack slots to be created at the front of any function that uses it
+(DEFUN EVAL-MACRO (EXPANDER FORM ENV)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (CATCH-ERROR-RESTART (ERROR "Retry macroexpansion of ~S" (CAR FORM))
+    (SETQ FORM (MACROEXPAND-HOOK EXPANDER FORM ENV)))
+  FORM)
+
+(DEFUN EVAL-MACRO2 (EXPANDER FORM)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (CATCH-ERROR-RESTART (ERROR "Retry macroexpansion of ~S" (CAR FORM))
+    (SETQ FORM (MACROEXPAND-HOOK EXPANDER FORM)))
+  FORM)
+
+;; EVAL is defined below in the EVALHOOK stuff.
+;;(DEFF EVAL #'*EVAL)
+
+;;; Defining Special Forms
+
+;;; The guts of DEFINE-SPECIAL-FORM (also called by the compiler)
+(EVAL-WHEN (COMPILE LOAD EVAL)
+(DEFUN PARSE-SPECIAL-FORM-BODY (BODY ARGLIST)
+  (MULTIPLE-VALUE-BIND (DECLARATIONS REAL-BODY)
+      (FIND-BODY-DECLARATIONS BODY NIL ARGLIST)
+    (IF (NOT (KEYWORDP (FIRST REAL-BODY)))
+	(VALUES DECLARATIONS REAL-BODY NIL)
+	(LOOP WITH STATE = NIL
+	      FOR FORM IN REAL-BODY
+	      IF (KEYWORDP FORM)
+		DO (SETF STATE FORM)
+	      ELSE IF (EQ STATE :MACRO-EXPANDER)
+		     COLLECT FORM INTO MACRO-BODY
+	      ELSE IF (EQ STATE :INTERPRETER)
+		     COLLECT FORM INTO INTERPRETER-BODY
+	      ELSE DO (CL:WARN '(:FATAL T) "Invalid syntax in body of DEFINE-SPECIAL-FORM.")
+	      FINALLY
+		(UNLESS INTERPRETER-BODY
+		  (WARN "No :INTERPRETER specified in DEFINE-SPECIAL-FORM."))
+		(RETURN (VALUES DECLARATIONS INTERPRETER-BODY MACRO-BODY))))))
+)
+    
+(DEFMACRO DEFINE-SPECIAL-FORM (NAME ARGLIST &REST BODY &ENVIRONMENT ENVIRONMENT)
+  (DECLARE (ARGLIST NAME [MACRO-EXPANDER] DEFMACRO-LIKE-DESTRUCTURING-PATTERN &BODY BODY))
+  (CHECK-ARG NAME SYMBOLP "a symbol")
+  (UNLESS (NULL-ENVIRONMENT-P ENVIRONMENT)
+    (ERROR "Environments aren't allowed for special forms"))
+  (LET ((MACRO-EXPANDER NIL))
+    (WHEN (NOT (CL:LISTP ARGLIST))
+      (CL:SHIFTF MACRO-EXPANDER ARGLIST (POP BODY)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS INTERPRETER-BODY MACRO-BODY)
+	(PARSE-SPECIAL-FORM-BODY BODY ARGLIST)
+      (WHEN (AND MACRO-EXPANDER MACRO-BODY)
+	(WARN "Both MACRO-EXPANDER and :MACRO specified in DEFINE-SPECIAL-FORM."))
+      (MULTIPLE-VALUE-BIND (INTERPRETER-FUNCTION INDENTATION)
+	  (DEFMACRO-1 'LAMBDA 'SPECIAL NAME ARGLIST
+		      (APPEND DECLARATIONS INTERPRETER-BODY))
+	(LET ((MACRO (OR MACRO-EXPANDER
+			 (AND MACRO-BODY
+			      (DEFMACRO-1 'LAMBDA 'MACRO NAME ARGLIST
+					  (APPEND DECLARATIONS MACRO-BODY))))))
+	  `(PROGN
+	     ,(IF INDENTATION
+		  `(DEFMACRO-SET-INDENTATION-FOR-ZWEI ',NAME ',INDENTATION)
+		  `(DEFMACRO-CLEAR-INDENTATION-FOR-ZWEI ',NAME))
+	     (FDEFINE ',NAME
+		      (LIST
+			'SPECIAL
+			,(IF (SYMBOLP MACRO)
+			     `',MACRO
+			     `#',MACRO)
+			#',INTERPRETER-FUNCTION)
+		      T)
+	     ',NAME))))))
+
+(DEFPROP DEFINE-SPECIAL-FORM DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+
+
+;;; Digestive Tract
+
+;;; Several control-structure special forms are "digestable".  What this means is that they
+;;; have an alternate "digested" form in which some difficult-to-compute information has
+;;; been cached in a readily-usable form.
+
+;;; Evaluating one of these forms causes the digested form to be computed and then itself
+;;; evaluated.  The reason this is not a loss is that whenever a lambda-expression is
+;;; digested, its body is walked and all interior special forms are also digested.
+
+;;; List of all special forms resulting from digestion
+(DEFVAR *DIGESTED-SPECIAL-FORMS* NIL)
+
+(DEFMACRO DEFINE-DIGESTABLE-SPECIAL-FORM (NAME ARGLIST &BODY BODY)
+  (MULTIPLE-VALUE-BIND (DECLARATIONS INTERPRETER-BODY MACRO-BODY)
+      (PARSE-SPECIAL-FORM-BODY BODY ARGLIST)
+    (LET ((SYMBOL
+	    (COND ((SYMBOLP NAME)
+		   (INTERN (STRING-APPEND "DIGEST-" NAME "-1") PACKAGE))
+		  ((LISTP NAME)
+		   (PROG1 (SECOND NAME)
+			  (SETQ NAME (FIRST NAME))))
+		  (T (ERROR "~s is an invalid name for a special form"))))
+	  (SF-DECLARATIONS NIL)
+	  (OUTER-ARGLIST ARGLIST))
+      (UNLESS (EQ (SECOND (MEMBER '&WHOLE OUTER-ARGLIST)) 'FORM)
+	(SETF OUTER-ARGLIST `(&WHOLE FORM ,@OUTER-ARGLIST)))
+      (UNLESS (EQ (SECOND (MEMBER '&ENVIRONMENT OUTER-ARGLIST)) 'ENV)
+	(SETF OUTER-ARGLIST `(,@OUTER-ARGLIST &ENVIRONMENT ENV)))
+      (MULTIPLE-VALUE (DECLARATIONS SF-DECLARATIONS)
+	(LOOP FOR DCL IN DECLARATIONS
+	      IF (AND (LISTP DCL)
+		      (LISTP (SECOND DCL))
+		      (MEMQ (FIRST (SECOND DCL)) '(LT:ARG-TEMPLATE ARGLIST)))
+		COLLECT DCL INTO SF-DECLARATIONS
+	      ELSE COLLECT DCL INTO DIGESTER-DECLARATIONS
+	      FINALLY (RETURN (VALUES DIGESTER-DECLARATIONS SF-DECLARATIONS))))
+      `(PROGN
+	 ,(DEFMACRO-1 'DEFUN 'MACRO SYMBOL ARGLIST
+		      `((DECLARE (SYS:FUNCTION-PARENT ,NAME DEFINE-DIGESTABLE-SPECIAL-FORM))
+			,@DECLARATIONS
+			,@INTERPRETER-BODY))
+	 (DEFPROP ,NAME ,SYMBOL SPECIAL-FORM-DIGESTER)
+	 (DEFINE-SPECIAL-FORM ,NAME ,OUTER-ARGLIST
+	   ,@SF-DECLARATIONS
+	   ,@(WHEN MACRO-BODY
+	       `(:MACRO-EXPANDER
+		  FORM ENV
+		  ,@MACRO-BODY))
+	   :INTERPRETER
+	   ,@(LOOP FOR ARG IN ARGLIST
+		   WHEN (LT:VARIABLEP ARG)
+		     COLLECT ARG)
+	   (LET ((EXPANSION (,SYMBOL FORM ENV)))
+	     (FUNCALL (THIRD (FSYMEVAL (FIRST EXPANSION))) EXPANSION ENV)))))))
+
+;Same as DEFINE-SPECIAL-FORM but also creates an undigesting macro
+;so the compiler and code-walkers will see the undigested special form
+(DEFMACRO DEFINE-DIGESTED-SPECIAL-FORM (NAME (FORM +ENV+) &BODY BODY)
+  `(PROGN (PUSH* ',NAME *DIGESTED-SPECIAL-FORMS*)
+	  (DEFINE-SPECIAL-FORM ,NAME UNDIGEST (&WHOLE ,FORM &ENVIRONMENT ,+ENV+ &REST IGNORE)
+			       ,@BODY)))
+
+(DEFPROP DEFINE-DIGESTABLE-SPECIAL-FORM DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+(DEFPROP DEFINE-DIGESTED-SPECIAL-FORM DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+;;; Macro-expander function for digested special forms
+;;; also usable by anyone who wants to not see this stuff (pretty print for example)
+(DEFUN UNDIGEST (FORM &OPTIONAL ENV)
+  (IGNORE ENV)
+  (IF (AND (LISTP FORM) (MEMQ (CAR FORM) *DIGESTED-SPECIAL-FORMS*))
+      (SECOND FORM)				;Original form
+      FORM))					;No macro expansion here
+
+(DEFVAR *DIGEST-SPECIAL-FORM-BODIES* NIL)
+
+(DEFUN DIGEST-FORM (FORM ENV)
+  (IF (VARIABLE-BOUNDP #'LT:COPYFORMS)
+      (LT:COPYFORMS
+	#'(LAMBDA (FORM KIND USAGE)
+	    (BLOCK DIGESTABLE
+	      (COND ((CL:LISTP KIND)
+		     (WHEN (AND (LISTP FORM)
+				(NOT (EQ USAGE 'MACROEXPAND)))
+		       (LET ((FCN (FIRST FORM)))
+			 (WHEN (SYMBOLP FCN)
+			   (LET ((DIGESTER (GET FCN 'SPECIAL-FORM-DIGESTER)))
+			     (WHEN DIGESTER
+			       (LET ((*DIGEST-SPECIAL-FORM-BODIES* T))
+				 (RETURN-FROM DIGESTABLE
+				   (VALUES (FUNCALL DIGESTER FORM LT::*MAPFORMS-LEXICAL-FUNCTION-ENVIRONMENT*)
+					   T)))))))))
+		    ((EQ KIND 'LT:QUOTE)
+		     (WHEN (AND (EQ USAGE 'LT:CALL)
+				(INTERPRETED-LAMBDA-P FORM))
+		       (RETURN-FROM DIGESTABLE
+			 (VALUES (DIGEST-LAMBDA FORM ENV NIL T)
+				 T)))))
+	      FORM))
+	FORM
+	:EXPAND-ALL-MACROS T :ENVIRONMENT ENV)
+      FORM))
+
+(DEFUN DIGEST-BODY (BODY ENV)
+  (IF *DIGEST-SPECIAL-FORM-BODIES*
+      (MAPCAR #'(LAMBDA (FORM) (DIGEST-FORM FORM ENV)) BODY)
+      BODY))
+
+
+
+;;; Gross internals
+;;; Do not look at the code on this page if you value your sanity
+
+;;; Generate kludgey stack-hacking code to add a set of bindings to the
+;;; lexical environment, evaluating initial-value forms.
+;;; Requires that the caller have declared three temporary variables in
+;;; some surrounding environment (because of the use of %PUSH).
+;;; "Arguments" are a variable with the list of binding descriptors in
+;;; it, parallel vs. sequential binding flag, the number of stack slots
+;;; that will be used in the body, information for
+;;; constructing the new environment, and three temporary variables.
+;;; No order-of-evaluation guarantees.
+;;; If there are too many bindings to fit in a stack frame, we just error out.
+;;; Later this could be made to go off and use the data-stack instead.
+;;; NEW-DCLS can be evaluated twice if INSERT-DCLS is specified.
+;--- Fix by making compiler understand CAR and RPLACA of COMPILER:%STACK-LOCATION-INTERNAL
+;--- which means have to fix the offsets below
+(DEFMACRO INTERPRET-BINDINGS
+	  ((BINDINGS PARALLEL EXTRA-STACK
+		     (NEW-ENV OLD-ENV NEW-VARS NEW-FNS NEW-BLKS NEW-TAGS NEW-DCLS
+			      &OPTIONAL INSERT-DCLS)
+		     (HEAD-TEM TAIL-TEM BIND-TEM))
+	   &BODY BODY)
+  ;; Build the new environment on the stack
+  `(WITH-INTERPRETER-ENVIRONMENT (,NEW-ENV ,OLD-ENV
+				  ,NEW-VARS ,NEW-FNS ,NEW-BLKS ,NEW-TAGS ,NEW-DCLS
+				  ,INSERT-DCLS)
+     ;; Optimize the case where there are no bindings; allows using Fortran DO-loops
+     (WHEN ,BINDINGS
+       (COND (( (STACK-SPACE-LEFT)
+		 (+ (* (SETQ ,TAIL-TEM (LENGTH ,BINDINGS)) 3) (+ 2 ,EXTRA-STACK)))
+	      ;; Start the bindings list and save a pointer to its beginning
+	      (%PUSH (POP ,BINDINGS))
+	      (SETQ ,HEAD-TEM (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 0)))
+	      ;; Copy the binding descriptions onto the stack, creating the
+	      ;; stack slots that will become the variable bindings list
+	      (LOOP WHILE ,BINDINGS
+		    DO (%PUSH (POP ,BINDINGS)))
+	      ;; Hook onto the previous variable bindings list
+	      (%PUSH (ENV-VARIABLES ,NEW-ENV))
+	      (SETQ ,TAIL-TEM (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 1)))
+	      (%P-STORE-CDR-CODE ,TAIL-TEM CDR-NORMAL)
+	      ;; Go back and evaluate the bindings, which are
+	      ;; reversed, moving TAIL-TEM down through them and
+	      ;; pushing value cells for lexicals.  Moving down
+	      ;; through the special declarations at the end is slower
+	      ;; than it could be, but in almost all cases there are
+	      ;; no special declarations so don't worry about it.
+	      (LOOP DO
+		(SETQ ,BIND-TEM (CAR ,TAIL-TEM))	;Get a binding description
+		(COND ((ATOM (CDR ,BIND-TEM)))	;Skip over SPECIAL declarations
+		      ((NULL (CDDR ,BIND-TEM))	;A lexical binding
+		       (%PUSH (CADR ,BIND-TEM))	;Symbol
+		       (%PUSH (EVAL (CAR ,BIND-TEM) ,(IF PARALLEL OLD-ENV NEW-ENV)))
+		       (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL)
+		       (SETF (CAR ,TAIL-TEM)	;(symbol value)
+			     (%MAKE-POINTER DTP-LIST
+					    (COMPILER:%STACK-LOCATION-INTERNAL 2))))
+		      ((ATOM (CDDR ,BIND-TEM))	;A special binding
+		       ,@(IF PARALLEL
+			     ;; Parallel binding of a special variable.  Save the value
+			     ;; and bind it later.  Push (symbol . locative) as a flag.
+			     `((%PUSH (CDR ,BIND-TEM))
+			       (%PUSH (EVAL (CAR ,BIND-TEM) ,OLD-ENV))
+			       (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1)
+						  CDR-NIL)
+			       (SETF (CAR ,TAIL-TEM)
+				     (%MAKE-POINTER
+				       DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 2))))
+			     ;; Serial binding of a special variable, bind it right now
+			     ;; and put (symbol . locative) on the environment alist.
+			     `((%BIND-LOCATION (CDDR ,BIND-TEM)
+					       (EVAL (CAR ,BIND-TEM) ,NEW-ENV))
+			       (SETF (CAR ,TAIL-TEM) (CDR ,BIND-TEM)))))
+		      (T NIL))			;symbol macro
+		,@(UNLESS PARALLEL
+		    ;; Install this binding or SPECIAL declaration into the environment
+		    `((SETF (ENV-VARIABLES ,NEW-ENV) ,TAIL-TEM)
+		      ;; If the earlier partial environment got evacuated because a
+		      ;; lexical closure captured it, we don't want the full
+		      ;; environment to turn back into the partial one if evacuated.
+		      (SETF (ENV-EVACUATION ,NEW-ENV) NIL)))
+		    UNTIL (EQ ,TAIL-TEM ,HEAD-TEM)	;Until all bindings processed
+		    DO ;; Advance to next binding
+		(SETQ ,TAIL-TEM (%MAKE-POINTER-OFFSET DTP-LIST ,TAIL-TEM -1))))
+	     (T
+	      ;; Start the bindings list and save a pointer to its beginning
+	      (SETQ ,HEAD-TEM (APPEND ,BINDINGS (ENV-VARIABLES ,NEW-ENV)))
+	      (SETQ ,TAIL-TEM (%MAKE-POINTER-OFFSET DTP-LIST ,HEAD-TEM (1- ,TAIL-TEM)))
+	      ;; Go back and evaluate the bindings, which are
+	      ;; reversed, moving TAIL-TEM down through them and
+	      ;; pushing value cells for lexicals.  Moving down
+	      ;; through the special declarations at the end is slower
+	      ;; than it could be, but in almost all cases there are
+	      ;; no special declarations so don't worry about it.
+	      (LOOP DO
+		(SETQ ,BIND-TEM (CAR ,TAIL-TEM))
+		(COND ((ATOM (CDR ,BIND-TEM)))	;Skip over SPECIAL declarations
+		      ((NULL (CDDR ,BIND-TEM))	;A lexical binding
+		       (SETF (CAR ,TAIL-TEM)	;(symbol value)
+			     (LIST (CADR ,BIND-TEM)
+				   (EVAL (CAR ,BIND-TEM)
+					 ,(IF PARALLEL OLD-ENV NEW-ENV)))))
+		      ((ATOM (CDDR ,BIND-TEM))	;A special binding
+		       ,@(IF PARALLEL
+			     ;; Parallel binding of a special variable.  Save the value
+			     ;; and bind it later.  Push (symbol . locative) as a flag.
+			     `((SETF (CAR ,TAIL-TEM)
+				     (LIST (CDR ,BIND-TEM)
+					   (EVAL (CAR ,BIND-TEM) ,OLD-ENV))))
+			     ;; Serial binding of a special variable, bind it right now
+			     ;; and put (symbol . locative) on the environment alist.
+			     `((%BIND-LOCATION (CDDR ,BIND-TEM)
+					       (EVAL (CAR ,BIND-TEM) ,NEW-ENV))
+			       (SETF (CAR ,TAIL-TEM) (CDR ,BIND-TEM)))))
+		      (T NIL))			;symbol macro
+		,@(UNLESS PARALLEL
+		    ;; Install this binding or SPECIAL declaration into the environment
+		    `((SETF (ENV-VARIABLES ,NEW-ENV) ,TAIL-TEM)
+		      ;; If the earlier partial environment got evacuated because a
+		      ;; lexical closure captured it, we don't want the full
+		      ;; environment to turn back into the partial one if evacuated.
+		      (SETF (ENV-EVACUATION ,NEW-ENV) NIL)))
+		    UNTIL (EQ ,TAIL-TEM ,HEAD-TEM)	;Until all bindings processed
+		    DO ;; Advance to next binding
+		(SETQ ,TAIL-TEM (%MAKE-POINTER-OFFSET DTP-LIST ,TAIL-TEM -1)))))
+       ,@(WHEN PARALLEL
+	   ;; Install all the bindings into the environment.  To do deferred
+	   ;; SPECIAL bindings, scan through the bindings list a second time.
+	   `((SETQ ,TAIL-TEM (ENV-VARIABLES ,NEW-ENV))
+	     (SETF (ENV-VARIABLES ,NEW-ENV) ,HEAD-TEM)
+	     (LOOP UNTIL (EQ ,HEAD-TEM ,TAIL-TEM) DO
+	       (SETQ ,BIND-TEM (CAR ,HEAD-TEM))
+	       (WHEN (LISTP (CAR ,BIND-TEM))
+		 ;; ,BIND-TEM is ((symbol . locative) value) instead of (symbol value).
+		 ;; Bind the special variable and substitute (symbol . locative).
+		 (%BIND-LOCATION (CDAR ,BIND-TEM) (CADR ,BIND-TEM))
+		 (SETF (CAR ,HEAD-TEM) (CAR ,BIND-TEM)))
+	       (SETQ ,HEAD-TEM (CDR ,HEAD-TEM))))))
+     ;; Evaluate the body, presumably it uses NEW-ENV
+     ,@BODY))
+
+;;; A similar crock for LABELS, FLET, and MACROLET
+;--- Macrolet could be optimized to use fewer temporary variables, who cares
+(DEFMACRO INTERPRET-FUNCTION-BINDINGS
+	  ((BINDINGS TYPE EXTRA-STACK
+	    (NEW-ENV OLD-ENV NEW-VARS NEW-FNS NEW-BLKS NEW-TAGS NEW-DCLS
+	     &OPTIONAL INSERT-DCLS)
+	    (HEAD-TEM TAIL-TEM BIND-TEM))
+	   &BODY BODY)
+  ;; Build the new environment on the stack
+  `(WITH-INTERPRETER-ENVIRONMENT (,NEW-ENV ,OLD-ENV
+				  ,NEW-VARS ,NEW-FNS ,NEW-BLKS ,NEW-TAGS ,NEW-DCLS
+				  ,INSERT-DCLS)
+     ;; Optimize the case where there are no bindings; allows using Fortran DO-loops
+     (WHEN ,BINDINGS
+       (COND (( (STACK-SPACE-LEFT)
+		 (+ ,(SELECTQ TYPE
+		       (MACROLET
+			`(LENGTH ,BINDINGS))
+		       ((CLOS:GENERIC-FLET CLOS:GENERIC-LABELS)
+			`(* (LENGTH ,BINDINGS) 3))
+		       (OTHERWISE
+			`(* (LENGTH ,BINDINGS) 7)))
+		    (+ 2 ,EXTRA-STACK)))
+	      ;; Process any SPECIAL bindings
+	      (WHEN (ATOM (CDR (FIRST ,BINDINGS)))
+		;; Save pointer to location before the bindings list
+		(SETQ ,HEAD-TEM (COMPILER:%STACK-LOCATION-INTERNAL 0))
+		;; Copy the binding descriptions onto the stack, creating the
+		;; stack slots that will become the variable bindings list
+		(LOOP DO (%PUSH (POP ,BINDINGS))
+		      WHILE (AND ,BINDINGS (ATOM (CDR (FIRST ,BINDINGS)))))
+		;; Hook onto the previous function bindings list
+		(%PUSH (ENV-VARIABLES ,NEW-ENV))
+		(SETQ ,TAIL-TEM (COMPILER:%STACK-LOCATION-INTERNAL 1))	;Location of last binding
+		(%P-STORE-CDR-CODE ,TAIL-TEM CDR-NORMAL)
+		;; Install the bindings into the environment
+		(SETF (ENV-VARIABLES ,NEW-ENV) (%MAKE-POINTER-OFFSET DTP-LIST ,HEAD-TEM 1)))
+	      (WHEN ,BINDINGS
+		;; Save pointer to location before the bindings list
+		(SETQ ,HEAD-TEM (COMPILER:%STACK-LOCATION-INTERNAL 0))
+		;; Copy the binding descriptions onto the stack, creating the
+		;; stack slots that will become the function bindings list
+		(LOOP WHILE ,BINDINGS
+		      DO (%PUSH (POP ,BINDINGS)))
+		;; Hook onto the previous function bindings list
+		(%PUSH (ENV-FUNCTIONS ,NEW-ENV))
+		(SETQ ,TAIL-TEM (COMPILER:%STACK-LOCATION-INTERNAL 1))	;Location of last binding
+		(%P-STORE-CDR-CODE ,TAIL-TEM CDR-NORMAL)
+		;; Install the bindings into the environment
+		(SETF (ENV-FUNCTIONS ,NEW-ENV) (%MAKE-POINTER-OFFSET DTP-LIST ,HEAD-TEM 1))
+		;; Go back and process the bindings, pushing an association pair from
+		;; name to definition for each, which is a lexical closure on the stack.
+		;; MACROLET doesn't need this because the definition is a constant.
+		,(UNLESS (EQ TYPE 'MACROLET)
+		   `(LOOP UNTIL (EQ ,HEAD-TEM ,TAIL-TEM) DO
+		      ;; Fetch the next function-binding descriptor
+		      (SETQ ,BIND-TEM (%P-CONTENTS-INCREMENT-POINTER ,HEAD-TEM))
+
+		      ,(SELECTQ TYPE
+			 ((CLOS:GENERIC-FLET)
+			  `(PROGN
+			     ;; Build the binding association pair
+			     (%PUSH (FIRST ,BIND-TEM))	;Symbol
+			     (%PUSH (EVAL (SECOND ,BIND-TEM) ,OLD-ENV))))
+			 ((CLOS:GENERIC-LABELS)
+			  `(PROGN
+			     ;; Build the binding association pair
+			     (%PUSH (FIRST ,BIND-TEM))	;Symbol
+			     (%PUSH (EVAL (SECOND ,BIND-TEM) ,NEW-ENV))))
+			 (OTHERWISE
+			  `(PROGN
+			     ;; Build the lexical-closure structure
+			     (%PUSH ,(IF (EQ TYPE 'LABELS) NEW-ENV OLD-ENV))
+			     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NORMAL)
+			     (%PUSH (SECOND ,BIND-TEM))
+			     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL)
+			     (%PUSH (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 1)))
+			     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1)
+						LEXICAL-CLOSURE-SUBTYPE-LEXICAL-CLOSURE)
+			     (%PUSH #'INTERPRETER-TRAMPOLINE)
+			     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL)
+			     ;; Build the binding association pair
+			     (%PUSH (FIRST ,BIND-TEM))	;Symbol
+			     (%PUSH (%MAKE-POINTER DTP-LEXICAL-CLOSURE
+						   (COMPILER:%STACK-LOCATION-INTERNAL 2))))))
+		      (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL)
+		      ;; Install the binding association pair in place of the descriptor
+		      (%P-STORE-CONTENTS ,HEAD-TEM
+					 (%MAKE-POINTER DTP-LIST
+							(COMPILER:%STACK-LOCATION-INTERNAL 2)))))))
+	     (T
+	      ;; Process any SPECIAL bindings
+	      (LOOP WHILE (AND ,BINDINGS (ATOM (CDR (FIRST ,BINDINGS))))
+		    DO (PUSH (POP ,BINDINGS) (ENV-VARIABLES ,NEW-ENV)))
+	      ;; Now do the functions
+	      (SETQ ,TAIL-TEM (ENV-FUNCTIONS ,NEW-ENV))
+	      (SETQ ,HEAD-TEM (APPEND ,BINDINGS ,TAIL-TEM))
+	      (SETF (ENV-FUNCTIONS ,NEW-ENV) ,HEAD-TEM)
+	      ,(UNLESS (EQ TYPE 'MACROLET)
+		 `(LOOP UNTIL (EQ ,HEAD-TEM ,TAIL-TEM) DO
+		    (SETQ ,BIND-TEM (CAR ,HEAD-TEM))
+		    (RPLACA ,HEAD-TEM
+			    (LIST (FIRST ,BIND-TEM)	;Symbol
+				  ,(SELECTQ TYPE
+				    ((CLOS:GENERIC-FLET)
+				     `(EVAL (SECOND ,BIND-TEM) ,OLD-ENV))
+				    ((CLOS:GENERIC-LABELS)
+				     `(EVAL (SECOND ,BIND-TEM) ,NEW-ENV))
+				    (OTHERWISE
+				     `(MAKE-LEXICAL-CLOSURE
+					(CONS ,(IF (EQ TYPE 'LABELS) NEW-ENV OLD-ENV)
+					      (SECOND ,BIND-TEM))
+					#'INTERPRETER-TRAMPOLINE)))))
+		    (SETQ ,HEAD-TEM (CDR ,HEAD-TEM)))))))
+	      
+     ;; Evaluate the body, presumably it uses NEW-ENV
+     ,@BODY))
+
+;;; Basic macro to build an environment on the stack
+;;; NEW-DCLS can be evaluated twice if INSERT-DCLS is specified.
+;--- Fix by making compiler understand CAR and RPLACA of COMPILER:%STACK-LOCATION-INTERNAL
+;--- which means have to fix the offsets here and there in the code
+(DEFMACRO WITH-INTERPRETER-ENVIRONMENT
+	  ((NEW-ENV OLD-ENV NEW-VARS NEW-FNS NEW-BLKS NEW-TAGS NEW-DCLS &OPTIONAL INSERT-DCLS)
+	   &BODY BODY)
+  `(WITH-STACK-LIST (,NEW-ENV ,NEW-VARS ,NEW-FNS ,NEW-BLKS ,NEW-TAGS ,NEW-DCLS NIL ,OLD-ENV)
+     ;; Insert additional declarations if any were specified
+     ,@(WHEN INSERT-DCLS
+	 `((WHEN ,INSERT-DCLS
+	     (%PUSH ,INSERT-DCLS)
+	     (%PUSH ,NEW-DCLS)
+	     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 2) CDR-NORMAL)
+	     (RPLACA (COMPILER:%STACK-LOCATION-INTERNAL 5)	;(ENV-DECLARATIONS ,NEW-ENV)
+		     (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 2))))))
+     ;; Evaluate the body, presumably it uses NEW-ENV
+     . ,BODY))
+
+;;; Add some SPECIAL declarations to the environment without doing normal bindings
+(DEFMACRO INTERPRET-SPECIAL-DECLARATIONS (+ENV+ OLD-ENV SPECIALS)
+  `(COND ((NULL ,SPECIALS))			;Usual case
+	 ((NULL (ENV-VARIABLES ,+ENV+))		;Optimized case
+	  (SETF (ENV-VARIABLES ,+ENV+) ,SPECIALS))
+	 (( (STACK-SPACE-LEFT) (+ (LENGTH ,SPECIALS) 10.))
+	  ;; Point to bindings list about to be pushed onto the stack
+	  (SETF (ENV-VARIABLES ,+ENV+)
+		(%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 0)))
+	  ;; Copy references to the binding descriptions onto the stack
+	  (LOOP DO (%PUSH (POP ,SPECIALS))
+		WHILE ,SPECIALS)
+	  ;; Hook onto the previous variables-list
+	  (%PUSH (ENV-VARIABLES ,OLD-ENV))
+	  (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 2) CDR-NORMAL))
+	 (T
+	  ;; Punt and cons the thing
+	  (SETF (ENV-VARIABLES ,+ENV+)
+		(NCONC (REVERSE ,SPECIALS) (ENV-VARIABLES ,OLD-ENV))))))
+
+;;; Evaluate the body of a special form, returning the value(s) of the last form
+;;; <body> must be a smashable variable
+(DEFMACRO EVAL-BODY (BODY ENV)
+  `(PROGN
+     (LOOP WHILE (CDR ,BODY)
+	   DO (EVAL (POP ,BODY) ,ENV))
+     (EVAL (CAR ,BODY) ,ENV)))
+
+;;; Variable-binding special forms
+
+(DEFMACRO CL:LOCALLY (&BODY BODY)
+  (DECLARE (COMPILER:DO-NOT-RECORD-MACROEXPANSIONS))
+  `(LET () ,@BODY))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-LET (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Create all the variables we will need before doing any %PUSHes
+  (LET ((BINDINGS (POP BODY))
+	(DECLARATIONS (POP BODY))
+	(E ENV))
+    ;; New environment starts out as a copy of the old one, then we add the declarations,
+    ;; and then we add the new variable bindings
+    (INTERPRET-BINDINGS (BINDINGS T 5
+			 (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E) DECLARATIONS)
+			 (DECLARATIONS E BINDINGS))
+      ;; Evaluate the body
+      (EVAL-BODY BODY NEW-ENV))))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM LET (&WHOLE FORM BINDINGS &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE PARALLEL-LET DECLARE . BODY))
+  (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY NIL NIL NIL UNSPECIALS)
+      (PARSE-BODY-DECLARATIONS BODY ENV)
+    `(DIGESTED-LET ,FORM ,(DIGEST-BINDINGS BINDINGS SPECIALS UNSPECIALS ENV) ,DECLARATIONS
+		   ,@(DIGEST-BODY BODY ENV))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-LET* (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Create all the variables we will need before doing any %PUSHes
+  (LET ((BINDINGS (POP BODY))
+	(DECLARATIONS (POP BODY))
+	(E ENV))
+    ;; New environment starts out as a copy of the old one, then we add the declarations,
+    ;; and then we add the new variable bindings
+    (INTERPRET-BINDINGS (BINDINGS NIL 5
+			 (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E) DECLARATIONS)
+			 (DECLARATIONS E BINDINGS))
+      ;; Evaluate the body
+      (EVAL-BODY BODY NEW-ENV))))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM LET* (&WHOLE FORM BINDINGS &BODY BODY
+			    &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE ((REPEAT LET)) DECLARE . BODY))
+  (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY NIL NIL NIL UNSPECIALS)
+      (PARSE-BODY-DECLARATIONS BODY ENV)
+    `(DIGESTED-LET* ,FORM ,(DIGEST-BINDINGS BINDINGS SPECIALS UNSPECIALS ENV) ,DECLARATIONS
+		    ,@(DIGEST-BODY BODY ENV))))
+
+;;; Support for variable-binding special forms
+
+;;; Sees ENV in case SPECIAL declarations are pervasive on bindings
+;;; The returned list of bindings is backwards; see INTERPRET-BINDINGS
+;;; The new pervasive SPECIAL declarations (for free variable lookup) go at the end
+(DEFUN DIGEST-BINDINGS (BINDINGS SPECIALS UNSPECIALS ENV &OPTIONAL DO)
+  (NRECONC (LOOP FOR BINDING IN BINDINGS
+		 COLLECT (LET ((VAR BINDING) (VAL NIL))
+			   (WHEN (LISTP BINDING)
+			     (WHEN (AND (NOT DO) (CDDR BINDING))
+			       (FERROR "~S is not a valid variable binding specification"
+				       BINDING))
+			     (SETQ VAR (FIRST BINDING)
+				   VAL (SECOND BINDING)))
+			   (CHECK-SYMBOL-SETABILITY VAR "bind")
+			   (COND ((SPECIAL-VARIABLE-P VAR ENV SPECIALS UNSPECIALS)
+				  (SETQ SPECIALS (DELQ VAR SPECIALS))
+				  `(,VAL ,VAR . ,(FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION  VAR) NIL)))
+				 (T
+				  (SETQ UNSPECIALS (DELQ VAR UNSPECIALS))
+				  `(,VAL ,VAR)))))
+	   (MAPCAR #'(LAMBDA (VAR) `(,VAR . ,(FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+		   SPECIALS)))
+
+(DEFVAR *DUPLICATE-DECLARATIONS-WARNINGS* T "T for the World, NIL for MACSYMA")
+;;; Extract declarations from front of body, separating the SPECIALs from the others.
+;;; The SPECIAL declarations have to be handled specially to make it possible to
+;;; shadow a lexical variable binding with a SPECIAL declaration that affects
+;;; references (rather than bindings).
+;;; The lists of declarations, specials, and debugging-info are guaranteed clobberable.
+;;; ENV argument is just used for looking up macro definitions.
+;;; LAMBDA-LIST argument supplied only if this is the top-level body of a function,
+;;; in that case the fourth and fifth values are the documentation string and
+;;; the debugging-info.
+(DEFUN PARSE-BODY-DECLARATIONS (BODY ENV &OPTIONAL (LAMBDA-LIST NIL LAMBDA-LIST-P)
+				&AUX (SPECIALS NIL) (UNSPECIALS NIL) (DECLARATIONS NIL)
+				(DOCUMENTATION NIL) (DEBUGGING-INFO NIL)
+				(DOWNWARD-FUNARGS NIL) (VAR-DCLS NIL) (FUN-DCLS NIL))
+  (DECLARE (VALUES DECLARATIONS SPECIALS BODY DOCUMENTATION DEBUGGING-INFO VAR-DCLS
+		   UNSPECIALS FUN-DCLS))
+  (LABELS ((ADD-VAR-DCL (KIND VALUE &REST VARS)
+	     (DOLIST (VAR VARS)
+	       (COND ((SYMBOLP VAR)
+		      (LET ((ENTRY (ASSQ VAR VAR-DCLS)))
+			(UNLESS ENTRY
+			  (PUSH (SETQ ENTRY (NCONS VAR)) VAR-DCLS))
+			(LET ((ALREADY (ASSQ KIND (CDR ENTRY))))
+			  (IF ALREADY (if *duplicate-declarations-warnings*
+					  (WARN NIL "Duplicate ~S declarations for variable ~S." KIND VAR))
+			      (PUSH (CONS KIND VALUE) (CDR ENTRY))))))
+		     (T
+		      (WARN "~S is not a valid variable name, a ~S declaration is being ignored."
+			    VAR KIND)))))
+	   (ADD-FUN-DCL (KIND VALUE &REST FUNS)
+	     (DOLIST (FUN FUNS)
+	       (COND ((VALIDATE-FUNCTION-SPEC FUN)
+		      (LET ((ENTRY (ASSOC FUN FUN-DCLS)))
+			(UNLESS ENTRY
+			  (PUSH (SETQ ENTRY (NCONS FUN)) FUN-DCLS))
+			(LET ((ALREADY (ASSQ KIND (CDR ENTRY))))
+			  (IF ALREADY
+			      (WARN NIL "Duplicate ~S declarations for function ~S." KIND FUN)
+			      (PUSH (CONS KIND VALUE) (CDR ENTRY))))))
+		     (T
+		      (WARN "~S is not a valid function name, a ~S declaration is being ignored."
+			    FUN KIND)))))
+	   (ADD-VAR-OR-FUN-DCL (KIND VALUE &REST NAMES)
+	     (DOLIST (NAME NAMES)
+	       (IF (AND (LISTP NAME)
+			(= (LENGTH NAME) 2)
+			(MEMQ (FIRST NAME) '(FUTURE-COMMON-LISP:FUNCTION FUNCTION)))
+		   (ADD-FUN-DCL KIND VALUE (SECOND NAME))
+		   (ADD-VAR-DCL KIND VALUE NAME)))))	     
+    (LOOP UNTIL (NULL BODY)
+	  AS FORM = (CAR BODY)
+	  DO (WHEN (AND (LISTP FORM)
+			(NOT (EQ (FIRST FORM) 'DECLARE)))
+	       (SETF FORM (MACROEXPAND FORM ENV T T)))
+	     (COND ((AND LAMBDA-LIST-P (SI:SOME-STRING FORM) (CDR BODY))
+		    (UNLESS DOCUMENTATION	;Only remember the first documentation string
+		      (SETQ DOCUMENTATION FORM)))
+		   ((AND (LISTP FORM)
+			 (EQ (CAR FORM) 'DECLARE))
+		    (DOLIST (DECLARATION (CDR FORM))
+		      (LISP:LOOP
+			   (COND ((EQ (CAR DECLARATION) 'SPECIAL)
+				  (SETQ SPECIALS (APPEND (CDR DECLARATION) SPECIALS))
+				  (WHEN *SPECIAL-DECLARATIONS-ARE-PERVASIVE*
+				    (PUSH DECLARATION DECLARATIONS))
+				  (LEXPR-FUNCALL #'ADD-VAR-DCL 'SPECIAL T (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'UNSPECIAL)
+				  (SETQ UNSPECIALS (APPEND (CDR DECLARATION) UNSPECIALS))
+				  (WHEN *SPECIAL-DECLARATIONS-ARE-PERVASIVE*
+				    (PUSH DECLARATION DECLARATIONS))
+				  (LEXPR-FUNCALL #'ADD-VAR-DCL 'SPECIAL NIL (REST1 DECLARATION))
+				  (RETURN))
+				 ((AND LAMBDA-LIST-P
+				       (EQ (CAR DECLARATION) 'DOWNWARD-FUNARG))
+				  (SETQ DOWNWARD-FUNARGS
+					(APPEND (DOWNWARD-FUNARG-DEBUGGING-INFO
+						  DECLARATION LAMBDA-LIST FORM)
+						DOWNWARD-FUNARGS))
+				  (RETURN))
+				 ((AND LAMBDA-LIST-P
+				       (EQ (CAR DECLARATION) 'DOWNWARD-FUNCTION))
+				  (PUSH `(DOWNWARD-FUNCTION) DEBUGGING-INFO)
+				  (RETURN))
+				 ((AND LAMBDA-LIST-P
+				       (EQ (CAR DECLARATION) 'COMPILER:EVACUABLE-DOWNWARD-CLOSURES))
+				  (PUSH `(COMPILER:EVACUABLE-DOWNWARD-CLOSURES) DEBUGGING-INFO)
+				  (RETURN))
+				 ((AND LAMBDA-LIST-P
+				       (GET (CAR DECLARATION) 'DEBUG-INFO))
+				  (PUSH DECLARATION DEBUGGING-INFO)
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'IGNORE)
+				  (LEXPR-FUNCALL #'ADD-VAR-OR-FUN-DCL 'IGNORE T (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'FUTURE-COMMON-LISP:IGNORABLE)
+				  (LEXPR-FUNCALL #'ADD-VAR-OR-FUN-DCL 'IGNORE 'FUTURE-COMMON-LISP:IGNORABLE (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'CL:TYPE)
+				  (LEXPR-FUNCALL #'ADD-VAR-DCL 'CL:TYPE (SECOND DECLARATION)
+						 (REST2 DECLARATION))
+				  (RETURN))
+				 ((CLI::TYPE-NAME-P (CAR DECLARATION))
+				  (LEXPR-FUNCALL #'ADD-VAR-DCL 'CL:TYPE (FIRST DECLARATION)
+						 (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'COMPILER:VARIABLE-INLINABLE)
+				  (LEXPR-FUNCALL #'ADD-VAR-DCL 'COMPILER:VARIABLE-INLINABLE T
+						 (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'FUTURE-COMMON-LISP:DYNAMIC-EXTENT)
+				  (LEXPR-FUNCALL #'ADD-VAR-OR-FUN-DCL
+						 'FUTURE-COMMON-LISP:DYNAMIC-EXTENT T
+						 (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'LISP:INLINE)
+				  (LEXPR-FUNCALL #'ADD-FUN-DCL 'LISP:INLINE 'LISP:INLINE
+						 (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'LISP:NOTINLINE)
+				  (LEXPR-FUNCALL #'ADD-FUN-DCL 'LISP:INLINE 'LISP:NOTINLINE
+						 (REST1 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'LISP:FTYPE)
+				  (LEXPR-FUNCALL #'ADD-FUN-DCL 'LISP:FTYPE (SECOND DECLARATION)
+						 (REST2 DECLARATION))
+				  (RETURN))
+				 ((EQ (CAR DECLARATION) 'LISP:FUNCTION)
+				  (ADD-FUN-DCL 'LISP:FTYPE `(FUNCTION ,@(REST2 DECLARATION))
+					       (SECOND DECLARATION))
+				  (RETURN))
+				 ((OR (EQ (CAR DECLARATION) 'SYS:ARRAY-REGISTER)
+				      (EQ (CAR DECLARATION) 'SYS:ARRAY-REGISTER-1D)
+				      (EQ (CAR DECLARATION) 'SYS:LOGIC-VARIABLE))
+				  (LEXPR-FUNCALL #'ADD-VAR-DCL
+						 'COMPILER:VARIABLE-CLASS (FIRST DECLARATION)
+						 (REST1 DECLARATION))
+				  (RETURN))
+				 ((GET (CAR DECLARATION) 'DECLARATION-ALIAS)
+				  (LET ((ALIAS (GET (CAR DECLARATION) 'DECLARATION-ALIAS)))
+				    (CL:ETYPECASE ALIAS
+				      (CL:SYMBOL
+					(SETQ DECLARATION (CONS ALIAS (CDR DECLARATION))))
+				      (CL:FUNCTION
+					(SETQ DECLARATION (FUNCALL ALIAS DECLARATION ENV))))))
+				 (T
+				  (PUSH DECLARATION DECLARATIONS)
+				  (RETURN))))))
+		   (T (RETURN)))
+	     (POP BODY)))
+  ;; Handle downward funarg hair.
+  (WHEN LAMBDA-LIST-P
+    ;; Map any DYNAMIC-EXTENT declarations into DOWNWARD-FUNARGs.
+    (DOLIST (ENTRY VAR-DCLS)
+      (WHEN (ASSQ 'FUTURE-COMMON-LISP:DYNAMIC-EXTENT (CDR ENTRY))
+	(SETF DOWNWARD-FUNARGS (APPEND (DOWNWARD-FUNARG-DEBUGGING-INFO
+					 `(FUTURE-COMMON-LISP:DYNAMIC-EXTENT ,(CAR ENTRY))
+					 LAMBDA-LIST (LIST* NIL DEBUGGING-INFO))
+				       DOWNWARD-FUNARGS))))
+    (WHEN DOWNWARD-FUNARGS
+      (PUSH `(DOWNWARD-FUNARG ,DOWNWARD-FUNARGS) DEBUGGING-INFO)))
+  (VALUES (NREVERSE DECLARATIONS) SPECIALS BODY DOCUMENTATION DEBUGGING-INFO VAR-DCLS
+	  UNSPECIALS FUN-DCLS))
+
+(DEFUN RECONSTITUTE-VAR-DCL (ENTRY)
+  (WHEN ENTRY
+    (LET ((DECLARATIONS NIL)
+	  (VAR (CAR ENTRY)))
+      (DOLIST (DCL (CDR ENTRY))
+	(CL:ECASE (CAR DCL)
+	  (SPECIAL
+	    (IF (CDR DCL)
+		(PUSH `(SPECIAL ,VAR) DECLARATIONS)
+		(PUSH `(UNSPECIAL ,VAR) DECLARATIONS)))
+	  (CL:IGNORE
+	    (CL:ECASE (CDR DCL)
+	      ((T)
+	       (PUSH `(IGNORE ,VAR) DECLARATIONS))
+	      ((FUTURE-COMMON-LISP:IGNORABLE)
+	       (PUSH `(FUTURE-COMMON-LISP:IGNORABLE ,VAR) DECLARATIONS))))
+	  (CL:TYPE
+	    (PUSH `(CL:TYPE ,(CDR DCL) ,VAR) DECLARATIONS))
+	  (FUTURE-COMMON-LISP:DYNAMIC-EXTENT
+	    (PUSH `(FUTURE-COMMON-LISP:DYNAMIC-EXTENT ,VAR) DECLARATIONS))
+	  (COMPILER:VARIABLE-INLINABLE
+	    (PUSH `(COMPILER:VARIABLE-INLINABLE ,VAR) DECLARATIONS))
+	  ))
+      DECLARATIONS)))
+
+(DEFUN RECONSTITUTE-FUN-DCL (ENTRY)
+  (WHEN ENTRY
+    (LET ((DECLARATIONS NIL)
+	  (FUN (CAR ENTRY)))
+      (DOLIST (DCL (CDR ENTRY))
+	(CL:ECASE (CAR DCL)
+	  (CL:INLINE
+	    (PUSH `(,(CDR DCL) ,FUN) DECLARATIONS))
+	  (CL:FTYPE
+	    (PUSH `(CL:FTYPE ,(CDR DCL) ,FUN) DECLARATIONS))
+	  (FUTURE-COMMON-LISP:DYNAMIC-EXTENT
+	    (PUSH `(FUTURE-COMMON-LISP:DYNAMIC-EXTENT #',FUN) DECLARATIONS))
+	  (CL:IGNORE
+	    (CL:ECASE (CDR DCL)
+	      ((T)
+	       (PUSH `(IGNORE #',FUN) DECLARATIONS))
+	      ((FUTURE-COMMON-LISP:IGNORABLE)
+	       (PUSH `(FUTURE-COMMON-LISP:IGNORABLE #',FUN) DECLARATIONS))))
+	  ))
+      DECLARATIONS)))
+
+(DEFUN RECONSTITUTE-BODY-DECLARATIONS (VAR-DCLS FUN-DCLS VARS FUNS)
+  (LET ((DECLARATIONS NIL))
+    (DOLIST (ENTRY VAR-DCLS)
+      (LET ((VAR (CAR ENTRY)))
+	(UNLESS (MEMQ VAR VARS)
+	  (SETF DECLARATIONS (NCONC (RECONSTITUTE-VAR-DCL ENTRY) DECLARATIONS)))))
+    (DOLIST (ENTRY FUN-DCLS)
+      (LET ((FUN (CAR ENTRY)))
+	(UNLESS (MEMBER FUN FUNS)
+	  (SETF DECLARATIONS (NCONC (RECONSTITUTE-FUN-DCL ENTRY) DECLARATIONS)))))
+    DECLARATIONS))
+
+(DEFUN FIND-BODY-DECLARATIONS (BODY ENV &OPTIONAL (LAMBDA-LIST NIL LAMBDA-LIST-P))
+  "Separate the declarations from the body."
+  (DECLARE (VALUES DECLARATIONS REAL-BODY FIRST-FORM-ALREADY-MACRO-EXPANDED))
+  (DECLARE (IGNORE LAMBDA-LIST))
+  (LOOP FOR REAL-BODY ON BODY
+	FOR FORM = (FIRST REAL-BODY)
+	DO (WHEN (AND (LISTP FORM)
+		      (NOT (EQ (FIRST FORM) 'DECLARE)))
+	     (SETF FORM (MACROEXPAND FORM ENV T)))
+	WHILE (COND ((SI:SOME-STRING FORM)
+		     (AND LAMBDA-LIST-P
+			  (NOT (NULL (REST1 REAL-BODY)))))
+		    ((LISTP FORM)
+		     (EQ (FIRST FORM) 'DECLARE)))
+	COLLECT FORM INTO DECLARATIONS
+	FINALLY (RETURN (VALUES DECLARATIONS REAL-BODY (AND REAL-BODY FORM)))))
+
+;Code borrowed from compiler:variable-declaration
+;--- Fix handling of file-local-declarations to be controlled by ENV
+;--- LOCAL-DECLARATIONS should be flushed, since it's nonlexical
+;--- For now we keep it, to avoid introducing massive incompatibility
+(DEFUN SPECIAL-VARIABLE-P (VAR &OPTIONAL ENV SPECIALS UNSPECIALS)
+  (WHEN (MEMQ VAR SPECIALS) (RETURN-FROM SPECIAL-VARIABLE-P T))
+  (WHEN (MEMQ VAR UNSPECIALS) (RETURN-FROM SPECIAL-VARIABLE-P NIL))
+  ;; Look for a declaration in the environment
+  (WHEN *SPECIAL-DECLARATIONS-ARE-PERVASIVE*
+    (DOLIST (DCLS (ENV-DECLARATIONS))
+      (DOLIST (DCL DCLS)
+	(SELECTQ (CAR DCL)
+	  (SPECIAL (WHEN (MEMQ VAR (CDR DCL)) (RETURN-FROM SPECIAL-VARIABLE-P T)))
+	  (ZL:UNSPECIAL (WHEN (MEMQ VAR (CDR DCL)) (RETURN-FROM SPECIAL-VARIABLE-P NIL))))))
+    ;; Look on LOCAL-DECLARATIONS --- should go away ---
+    (LOOP FOR (KWD . VAR-LIST) IN LOCAL-DECLARATIONS DO
+      (AND (MEMQ KWD '(SPECIAL COMPILER:LEXICAL ZL:UNSPECIAL))
+	   (MEMQ VAR VAR-LIST)
+	   (RETURN-FROM SPECIAL-VARIABLE-P (EQ KWD 'SPECIAL)))))
+  ;; Look for global declarations
+  (LT:GLOBAL-SPECIAL-VARIABLE-P VAR ENV))
+
+;;; Weirdo forms of variable binding
+
+;;; Used internally by Common Lisp SETF
+;;; If called for effect, the value may freely be substituted for the variable
+;;; in the effect form; the macro that generates this guarantees that that is
+;;; a safe transformation of the program.  (Variable only used once, and used
+;;; before any code that cannot pass the value due to side-effects).
+;;; Variable can never be SPECIAL.
+(DEFINE-SPECIAL-FORM LET-VALUE (VARIABLE VALUE EFFECT &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE (ORDER (2 LET) (1 RETURN) (3 EFFECT))))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  `(LET ((,VARIABLE ,VALUE))
+     ,EFFECT
+     ,VARIABLE)
+  :INTERPRETER
+  (LET ((E ENV))
+    (WITH-STACK-LIST (BD VARIABLE (EVAL VALUE ENV))
+      (WITH-STACK-LIST* (VARIABLES BD (POP E))
+	(WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ENV VARIABLES (POP E) (POP E) (POP E) (CAR E))
+	  (EVAL EFFECT NEW-ENV)
+	  (SECOND BD))))))
+
+;;; (LET-IF <COND> ((VAR-1 VAL-1) (VAR-2 VAL-2) ... (VAR-N VAL-N)) &BODY BODY)
+;;; If <COND> is not nil, binds VAR-I to VAL-I (evaluated) during execution of BODY,
+;;; otherwise just evaluates BODY.  The VAR's are always SPECIAL, but don't get autodeclared.
+;;; Binding is parallel.
+(DEFINE-SPECIAL-FORM LET-IF (&WHOLE FORM COND BINDINGS &BODY BODY
+				    &ENVIRONMENT ENV &AUX VAR VAL)
+  (DECLARE LT:(ARG-TEMPLATE TEST PARALLEL-LET . BODY))
+  :MACRO-EXPANDER
+  (IGNORE ENV FORM VAR VAL)
+  `(CL:LOCALLY
+     (DECLARE (SPECIAL ,@(MAPCAR #'FIRST BINDINGS)))
+     (FLET ((LET-IF-TEMP () ,@BODY))
+       (IF ,COND
+	   (LET ,BINDINGS
+	     (LET-IF-TEMP))
+	   (LET-IF-TEMP))))
+  :INTERPRETER
+  (%WITH-BINDING-STACK-LEVEL
+    (WHEN (EVAL COND ENV)			;Predicate for whether to bind
+      ;; Evaluate all the initial value forms first, saving them on the stack
+      (COND (( (STACK-SPACE-LEFT) (+ (* (LENGTH BINDINGS) 2) 5))
+	     (%PUSH NIL)
+	     (LOOP WHILE BINDINGS DO
+	       (IF (LISTP (CAR BINDINGS))
+		   (SETQ VAR (CAAR BINDINGS)
+			 VAL (EVAL (CADAR BINDINGS) ENV))
+		   (SETQ VAR (CAR BINDINGS)
+			 VAL NIL))
+	       (CHECK-SYMBOL-SETABILITY VAR "bind")
+	       (%PUSH VAL)
+	       (%PUSH (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL))
+	       (POP BINDINGS))
+	     ;; Now bind the special variables
+	     (LOOP DO (SETQ VAR (%POP)) WHILE VAR
+		   DO (SETQ VAL (%POP))
+		      (%BIND-LOCATION VAR VAL)))
+	    (T
+	     (LOOP WITH LIST = NIL
+		   FOR BINDING IN BINDINGS
+		   DOING
+	       (MULTIPLE-VALUE-BIND (VAR VAL)
+		   (IF (LISTP BINDING)
+		       (VALUES (CAR BINDING) (EVAL (CADR BINDING) ENV))
+		       (VALUES BINDING NIL))
+		 (PUSH VAL LIST)
+		 (PUSH (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL) LIST))
+		   FINALLY
+		     (LOOP WHILE LIST DOING
+		       (%BIND-LOCATION (POP LIST) (POP LIST)))))))
+    (EVAL-BODY BODY ENV)))
+
+;;; The VAR's are always SPECIAL, but don't get autodeclared. 
+;;; Excess values are ignored.  Excess variables are NIL (ZL), not unbound (CL)
+(DEFINE-SPECIAL-FORM PROGV (&WHOLE FORM VARS VALS &BODY BODY
+				 &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE EVAL EVAL ARBITRARY . BODY))
+  (SETQ VARS (EVAL VARS ENV)
+	VALS (EVAL VALS ENV))
+  (%WITH-BINDING-STACK-LEVEL
+    (LOOP WHILE VARS DO
+      (CHECK-SYMBOL-SETABILITY (CAR VARS) "bind")
+      (%BIND-LOCATION (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION (POP VARS)) NIL)
+		      (POP VALS)))
+    (EVAL-BODY BODY ENV)))
+
+;;; (PROGW '((VAR-1 VAL-1) (VAR-2 VAL-2) ... (VAR-N VAL-N)) &BODY BODY)
+;;; Binds VAR-I to VAL-I (evaluated) during execution of BODY
+;;; The VAR's are always SPECIAL, but don't get autodeclared. 
+;;; The VAL's are evaluated in the global environment.
+;;; Binding is sequential.
+(DEFINE-SPECIAL-FORM PROGW (VARS-AND-VALS &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE EVAL ARBITRARY . BODY))
+  :MACRO-EXPANDER
+  ENV
+  (LET ((TEMP (GENSYM)))
+    `(LET ((,TEMP ,VARS-AND-VALS))
+       (PROGV (MAPCAR #'FIRST ,TEMP) (MAPCAR #'(LAMBDA (ENTRY) (EVAL (SECOND ENTRY))) ,TEMP)
+	 ,@BODY)))
+  :INTERPRETER
+  (LET (VAR VAL)
+    (SETQ VARS-AND-VALS (EVAL VARS-AND-VALS ENV))
+    (%WITH-BINDING-STACK-LEVEL
+      (LOOP WHILE VARS-AND-VALS DO
+	(IF (LISTP (CAR VARS-AND-VALS))
+	    (SETQ VAR (CAAR VARS-AND-VALS)
+		  VAL (EVAL (CADAR VARS-AND-VALS)))
+	    (SETQ VAR (CAR VARS-AND-VALS)
+		  VAL NIL))
+	(CHECK-SYMBOL-SETABILITY VAR "bind")
+	(%BIND-LOCATION (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL) VAL)
+	(POP VARS-AND-VALS))
+      (EVAL-BODY BODY ENV))))
+
+;;; (WITH-STACK-LIST (var elem1 elem2...elemn) body...)
+;;; evaluates body with var bound to (LIST elem1 elem2...elemn) except
+;;; the list is in the stack.
+;;;--- Currently doesn't permit DECLARE to be used in the body, since the compiler doesn't
+(DEFINE-SPECIAL-FORM WITH-STACK-LIST ((VAR &REST ELEMENTS) &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE ((ORDER (2 LET) (1 (REPEAT EVAL)))) . BODY)) 
+  ;; Do LETs before %PUSHes
+  (%WITH-BINDING-STACK-LEVEL
+    (LET ((E ENV)
+	  (N (LENGTH ELEMENTS))
+	  LOC)
+      (CHECK-SYMBOL-SETABILITY VAR "bind")
+      ;; Build new environment structure
+      (WITH-STACK-LIST (BD VAR NIL)
+	(WITH-STACK-LIST* (VARIABLES BD (POP E))
+	  (WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ENV VARIABLES (POP E) (POP E) (POP E) (CAR E))
+	    ;; Build the list on the stack
+	    (%ASSURE-PDL-ROOM N)
+	    (DO () ((ENDP ELEMENTS))
+	      (%PUSH (EVAL (POP ELEMENTS) ENV)))
+	    (SETQ ELEMENTS (AND (> N 0) (%FINISH-STACK-LIST (1- N))))
+	    ;; Bind the variable (which may be SPECIAL)
+	    (COND ((SPECIAL-VARIABLE-P VAR NEW-ENV)
+		   (%CHANGE-LIST-TO-CONS BD)
+		   (SETQ LOC (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL))
+		   (SETF (CDR BD) LOC)
+		   (%BIND-LOCATION LOC ELEMENTS))
+		  (T (SETF (SECOND BD) ELEMENTS)))
+	    ;; Evaluate the body
+	    (EVAL-BODY BODY NEW-ENV)))))))
+
+;;; (WITH-STACK-LIST* (var elem1 elem2...elemn) body...)
+;;; evaluates body with var bound to (LIST* elem1 elem2...elemn) except
+;;; the list is in the stack.
+;;;--- Currently doesn't permit DECLARE to be used in the body, since the compiler doesn't
+(DEFINE-SPECIAL-FORM WITH-STACK-LIST* ((VAR &REST ELEMENTS) &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE ((ORDER (2 LET) (1 (REPEAT EVAL)))) . BODY))
+  ;; Do LETs before %PUSHes
+  (%WITH-BINDING-STACK-LEVEL
+    (LET ((E ENV)
+	  (N (LENGTH ELEMENTS))
+	  LOC)
+      (CHECK-SYMBOL-SETABILITY VAR "bind")
+      ;; Build new environment structure
+      (WITH-STACK-LIST (BD VAR NIL)
+	(WITH-STACK-LIST* (VARIABLES BD (POP E))
+	  (WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ENV VARIABLES (POP E) (POP E) (POP E) (CAR E))
+	    ;; Build the list on the stack
+	    (SETQ ELEMENTS
+		  (COND ((> N 1)
+			 (%ASSURE-PDL-ROOM N)
+			 (DO () ((ENDP ELEMENTS))
+			   (%PUSH (EVAL (POP ELEMENTS) ENV)))
+			 (%FINISH-STACK-LIST* (1- N)))
+			((NOT (ZEROP N))
+			 (EVAL (FIRST ELEMENTS) ENV))
+			(T
+			 (FERROR "Not enough elements for WITH-STACK-LIST*."))))
+	    ;; Bind the variable (which may be SPECIAL)
+	    (COND ((SPECIAL-VARIABLE-P VAR NEW-ENV)
+		   (%CHANGE-LIST-TO-CONS BD)
+		   (SETQ LOC (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL))
+		   (SETF (CDR BD) LOC)
+		   (%BIND-LOCATION LOC ELEMENTS))
+		  (T (SETF (SECOND BD) ELEMENTS)))
+	    ;; Evaluate the body
+	    (EVAL-BODY BODY NEW-ENV)))))))
+
+;;; Binding of arbitrary memory locations as if they were SPECIALs
+;;; This doesn't bother not consing
+(DEFINE-SPECIAL-FORM LETF (PLACES-AND-VALUES &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE PARALLEL-LETF . BODY))
+  (%WITH-BINDING-STACK-LEVEL
+    (LET* ((COUNT (LENGTH PLACES-AND-VALUES))
+	   THIS-VAR)
+      (COND (( (STACK-SPACE-LEFT) (* 2 COUNT))
+	     ;; Evaluate all the places and values
+	     (DO () ((ENDP PLACES-AND-VALUES))
+	       (SETF THIS-VAR (POP PLACES-AND-VALUES))
+	       ;; For each symbol, push 2 words on stack:
+	       ;; value cell location and new value.
+	       (%PUSH (EVAL `(LOCF ,(POP THIS-VAR)) ENV))
+	       (%PUSH (EVAL (CAR THIS-VAR) ENV)))
+	     ;; Now bind them.
+	     (DO () ((ZEROP COUNT))
+	       ;; Pop off next symbol and value, and bind them.
+	       (%BIND-LOCATION (%POP) (%POP))
+	       ;; Step down VARS-LEFT just so we pop as many pairs as we pushed.
+	       (DECF COUNT)))
+	    (T
+	     (LET ((LIST))
+	       (DO () ((ENDP PLACES-AND-VALUES))
+		 (SETF THIS-VAR (POP PLACES-AND-VALUES))
+		 ;; For each symbol, push 2 words on stack:
+		 ;; value cell location and new value.
+		 (PUSH (EVAL `(LOCF ,(POP THIS-VAR)) ENV) LIST)
+		 (PUSH (EVAL (CAR THIS-VAR) ENV) LIST))
+	       ;; Now bind them.
+	       (DO () ((NULL LIST))
+		 ;; Pop off next symbol and value, and bind them.
+		 (%BIND-LOCATION (POP LIST) (POP LIST))
+		 ;; Step down VARS-LEFT just so we pop as many pairs as we pushed.
+		 (DECF COUNT))))))
+    ;; Evaluate the body and return the values of the last form
+    (EVAL-BODY BODY ENV)))
+
+(DEFINE-SPECIAL-FORM LETF-IF (CONDITION PLACES-AND-VALUES &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE EVAL PARALLEL-LETF . BODY))
+  (%WITH-BINDING-STACK-LEVEL
+    (WHEN (EVAL CONDITION ENV)
+      (LET* ((COUNT (LENGTH PLACES-AND-VALUES))
+	     THIS-VAR)
+	(COND (( (STACK-SPACE-LEFT) (* 2 COUNT))
+	       ;; Evaluate all the places and values
+	       (DO () ((ENDP PLACES-AND-VALUES))
+		 (SETF THIS-VAR (POP PLACES-AND-VALUES))
+		 ;; For each symbol, push 2 words on stack:
+		 ;; value cell location and new value.
+		 (%PUSH (EVAL `(LOCF ,(POP THIS-VAR)) ENV))
+		 (%PUSH (EVAL (CAR THIS-VAR) ENV)))
+	       ;; Now bind them.
+	       (DO () ((ZEROP COUNT))
+		 ;; Pop off next symbol and value, and bind them.
+		 (%BIND-LOCATION (%POP) (%POP))
+		 ;; Step down VARS-LEFT just so we pop as many pairs as we pushed.
+		 (DECF COUNT)))
+	      (T
+	       (LET ((LIST))
+		 (DO () ((ENDP PLACES-AND-VALUES))
+		   (SETF THIS-VAR (POP PLACES-AND-VALUES))
+		   ;; For each symbol, push 2 words on stack:
+		   ;; value cell location and new value.
+		   (PUSH (EVAL `(LOCF ,(POP THIS-VAR)) ENV) LIST)
+		   (PUSH (EVAL (CAR THIS-VAR) ENV) LIST))
+		 ;; Now bind them.
+		 (DO () ((NULL LIST))
+		   ;; Pop off next symbol and value, and bind them.
+		   (%BIND-LOCATION (POP LIST) (POP LIST))
+		   ;; Step down VARS-LEFT just so we pop as many pairs as we pushed.
+		   (DECF COUNT)))))))
+    ;; Evaluate the body and return the values of the last form
+    (EVAL-BODY BODY ENV)))
+
+(DEFINE-SPECIAL-FORM LETF* (&WHOLE FORM PLACES-AND-VALUES &BODY BODY
+					      &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE ((REPEAT LETF)) . BODY))
+  (%WITH-BINDING-STACK-LEVEL
+    (PROG (VARS-LEFT)
+	  ;; Evaluate all the places and values
+	  ;; DO cannot be used, since the scope of the BINDs would be wrong.
+	  (SETQ VARS-LEFT PLACES-AND-VALUES)
+       BINDLOOP
+	  (COND (VARS-LEFT
+		 (%BIND-LOCATION (EVAL `(LOCF ,(CAAR VARS-LEFT)) ENV)
+				 (EVAL (CADAR VARS-LEFT) ENV))
+		 (POP VARS-LEFT)
+		 (GO BINDLOOP)))
+	  
+	  ;; Evaluate the body and return the values of the last form
+	  (RETURN (EVAL-BODY BODY ENV)))))
+
+(DEFINE-SPECIAL-FORM LETF*-IF (&WHOLE FORM CONDITION PLACES-AND-VALUES &BODY BODY
+					  &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE (EVAL (REPEAT LETF)) . BODY))
+  (%WITH-BINDING-STACK-LEVEL
+    (WHEN (EVAL CONDITION ENV)
+      (PROG (VARS-LEFT)
+	    ;; Evaluate all the places and values
+	    ;; DO cannot be used, since the scope of the BINDs would be wrong.
+	    (SETQ VARS-LEFT PLACES-AND-VALUES)
+	 BINDLOOP
+	    (COND (VARS-LEFT
+		   (%BIND-LOCATION (EVAL `(LOCF ,(CAAR VARS-LEFT)) ENV)
+				   (EVAL (CADAR VARS-LEFT) ENV))
+		   (POP VARS-LEFT)
+		   (GO BINDLOOP)))))
+    
+    ;; Evaluate the body and return the values of the last form
+    (EVAL-BODY BODY ENV)))
+
+
+;;; A zillion flavors of assignment statement
+
+;;; Ordinary assignment
+
+(DEFINE-SPECIAL-FORM SETQ (&WHOLE FORM &REST VARS-AND-VALS &ENVIRONMENT ENV)
+  ;;This isn't actually used, because it was too hard to make ORDER inside REPEAT work!
+  ;;---last is returned.  But also eval....
+  (DECLARE LT:(ARG-TEMPLATE (REPEAT (ORDER (2 SET) (1 EVAL)))))
+  (WHEN VARS-AND-VALS
+    (DO ()
+	(())
+      (LET ((VAR (POP VARS-AND-VALS)))
+	(UNLESS VARS-AND-VALS
+	  (FERROR "Odd number of arguments to SETQ: ~S" FORM))
+	(LET* ((VAL (POP VARS-AND-VALS))
+	       (TEMP (CDR (ASSQ VAR (ENV-VARIABLES))))
+	       (RESULT
+		 (IF TEMP
+		     (IF (AND (CL:CONSP TEMP)
+			      (CDR TEMP))
+			 (WITH-STACK-LIST (PAIRS (CAR TEMP) VAL)
+			    (EVAL (LT::EXPAND-SETF PAIRS ENV) ENV))
+			 (LET ((VAL (EVAL VAL ENV)))
+			   ;; The environment can change during the call to EVAL, so
+			   ;; we have to lookup the variable again.
+			   (CL:SETF (SECOND (ASSQ VAR (ENV-VARIABLES))) VAL)))
+		     (MULTIPLE-VALUE-BIND (MACRO-P EXPANSION)
+			 (LT:SYMBOL-MACRO-P VAR ENV)
+		       (COND (MACRO-P
+			      (WITH-STACK-LIST (PAIRS EXPANSION VAL)
+				(EVAL (LT::EXPAND-SETF PAIRS ENV) ENV)))
+			     (T
+			      (CHECK-SYMBOL-SETABILITY VAR "set")
+			      (SET VAR (EVAL VAL ENV))))))))
+	  (UNLESS VARS-AND-VALS
+	    (RETURN-FROM SETQ RESULT)))))))
+
+;;; Undo SETQ's
+(DEFUN (:PROPERTY SETQ :UNDO-FUNCTION) (FORM)
+  (LOOP FOR (VAR VALUE) ON (CDR FORM) BY 'CDDR
+	DO (IGNORE VALUE)
+	IF (BOUNDP VAR)
+	  COLLECT `(SETQ ,VAR ',(SYMEVAL VAR)) INTO UNSETQ-FORMS
+	ELSE
+	  COLLECT `(MAKUNBOUND ',VAR) INTO UNBIND-FORMS
+	FINALLY (RETURN `(PROGN ,@ UNBIND-FORMS ,@ UNSETQ-FORMS))))
+
+(DEFUN COMPILER:SELF-EVALUATING-SYMBOL-P (SYMBOL)
+  (OR (EQ SYMBOL NIL) (EQ SYMBOL T) (KEYWORDP SYMBOL)))
+
+(DEFUN CHECK-SYMBOL-SETABILITY (SYMBOL VERB)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (COND ((NOT (SYMBOLP SYMBOL))
+	 (FERROR "Attempt to ~A ~S which is not a symbol" VERB SYMBOL))
+	((COMPILER:SELF-EVALUATING-SYMBOL-P SYMBOL)
+	 (FERROR "Attempt to ~A ~S" VERB SYMBOL))
+	((LT:NAMED-CONSTANT-P SYMBOL)
+	 (FERROR "Attempt to ~A ~S, which is a constant declared with DEFCONSTANT."
+		 VERB SYMBOL))
+	))
+
+;;; Special forms for access to variables' value cells
+
+;This has to evacuate local variables because if the environment gets evacuated
+;later, the value cell of the local variable would suddenly move.  This would
+;break LOOP's COLLECT, for example, by changing the place where the collected list goes.
+(DEFINE-SPECIAL-FORM VARIABLE-LOCATION (VAR &ENVIRONMENT ENV)
+  ;; The comment below is inoperative.  We have to use SET because otherwise
+  ;; the substituter will think that it is all right to substitute.
+  ;;
+  (CHECK-SYMBOL-SETABILITY VAR "take VARIABLE-LOCATION of")
+  (LET ((TEM (CDR (ASSQ VAR (ENV-VARIABLES)))))
+    (FOLLOW-CELL-FORWARDING
+      (COND ((NULL TEM)
+	     ;; No Lexical definition, look for a global symbol macro or variable
+	     (MULTIPLE-VALUE-BIND (MACROP EXPANSION) (LT:SYMBOL-MACRO-P VAR)
+	       (IF MACROP
+		   (EVAL (LT::EXPAND-LOCF EXPANSION ENV) ENV)
+		   (VALUE-CELL-LOCATION VAR))))
+	    ((LOCATIVEP TEM)
+	     ;; A locative in this position in the environment is a pointer to the
+	     ;; variable.  Special and instance variables are done this way.
+	     TEM)
+	    ((CL:CONSP TEM)
+	     (IF (CDR TEM)
+		 (EVAL (LT::EXPAND-LOCF (CAR TEM) ENV) ENV)	;Lexical Symbol macro
+		 (%MAKE-POINTER DTP-LOCATIVE	;Lexical variable
+				;; Must do the ASSQ over again after evacuating the environment
+				(CDR (ASSQ VAR (ENV-VARIABLES (EVACUATE-ENVIRONMENT ENV)))))))
+	    (T (ERROR "Invalid variable environment")))
+      NIL)))
+
+;;; Easy special forms that don't involve variable binding
+
+(DEFINE-SPECIAL-FORM QUOTE (DATA)
+  (DECLARE LT:(ARG-TEMPLATE QUOTE))
+  DATA)
+
+(DEFINE-SPECIAL-FORM PROGN (&BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE . BODY))
+  (EVAL-BODY BODY ENV))
+
+(DEFINE-SPECIAL-FORM COMPILER:INVISIBLE-REFERENCES (VARIABLES &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE QUOTE . BODY))
+  (DECLARE (IGNORE VARIABLES))
+  (EVAL-BODY BODY ENV))
+
+(DEFINE-SPECIAL-FORM COMPILER:FOR-EFFECT (&BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE . BODY))
+  (EVAL-BODY BODY ENV))
+
+(DEFINE-SPECIAL-FORM BLOCK (NAME &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE BLOCK . BODY))
+  (CATCH (%STACK-FRAME-POINTER)
+    (WITH-STACK-LIST (ENTRY NAME (%STACK-FRAME-POINTER))
+      (WITH-STACK-LIST* (BLOCKS ENTRY (ENV-BLOCKS))
+	(LET ((E ENV))
+	  (WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ENV (POP E) (POP E) (PROGN (POP E) BLOCKS)
+						     (POP E) (CAR E))
+	    (UNWIND-PROTECT
+	      ;; Evaluate the body
+	      (EVAL-BODY BODY NEW-ENV)
+	      ;; Dynamic extent of block ends, flush the catch tag
+	      (SETF (SECOND (FIRST BLOCKS)) NIL))))))))
+
+(DEFINE-SPECIAL-FORM RETURN-FROM (BLOCK-NAME &REST VALUES &ENVIRONMENT ENV)
+  ;;These aren't actually used, it's really done procedurally, but they need
+  ;;to be here so we know these are special forms, not functions.
+  (DECLARE LT:(ARG-TEMPLATE RETURN-FROM . BODY))
+  (DECLARE (ARGLIST BLOCK-NAME &OPTIONAL RESULT)
+	   (ZWEI:INDENTATION . 1))
+  (LET ((DEST (ASSQ BLOCK-NAME (ENV-BLOCKS))))
+    (COND ((NULL DEST)
+	   (FERROR "~S is not the name of a lexically accessible block" BLOCK-NAME))
+	  ((NULL (SECOND DEST))
+	   (FERROR "The block ~S is no longer dynamically active" BLOCK-NAME))
+	  (T (THROW (FOLLOW-CELL-FORWARDING (SECOND DEST) NIL)
+	       (COND ((NULL VALUES)
+		      NIL)
+		     ((NULL (REST1 VALUES))
+		      (EVAL (FIRST VALUES) ENV))
+		     ;; Support the obsolete way of returning multiple values
+		     (T
+		      (APPLY #'VALUES (MAPCAR #'(LAMBDA (FORM) (EVAL FORM ENV))
+					      VALUES)))))))))
+
+(DEFINE-SPECIAL-FORM TAGBODY (&BODY FORMS &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE LOOP . PROG)
+	   (ZWEI:INDENTATION . ZWEI:INDENT-TAGBODY))
+  (DO-TAGBODY FORMS ENV))
+
+;;; Broken off into a separate function to make life easier for DO (%PUSH is a pain)
+;;; Shared between DO and TAGBODY
+(DEFUN DO-TAGBODY (BODY ENV)
+  (DECLARE LT:(ARG-TEMPLATE LOOP . PROG))
+  (WITH-STACK-LIST (ENTRY BODY (%STACK-FRAME-POINTER))
+    (WITH-STACK-LIST* (TAGBODIES ENTRY (ENV-TAGBODIES))
+      (LET ((E ENV))
+	(WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ENV (POP E) (POP E) (POP E)
+						   (PROGN (POP E) TAGBODIES) (CAR E))
+	  (UNWIND-PROTECT
+	    ;; Evaluate the body
+	    (LOOP DOING				;Loop repeats if a GO happens
+	      (SETQ BODY (CATCH (%STACK-FRAME-POINTER)
+			   (LOOP FOR STATEMENT IN BODY DO
+				 (UNLESS (ATOM STATEMENT)
+				   (EVAL STATEMENT NEW-ENV)))
+			   (RETURN NIL))))
+	    ;; Dynamic extent of tagbody ends, flush the catch tag
+	    (SETF (SECOND (FIRST TAGBODIES)) NIL)))))))
+
+(DEFINE-SPECIAL-FORM GO (TAG &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE GO))
+  (LOOP FOR ENTRY IN (ENV-TAGBODIES)
+	AS DEST = (CL:MEMBER TAG (FIRST ENTRY))
+	DO (WHEN DEST
+	     (UNLESS (SECOND ENTRY)
+	       (FERROR "The GO tag ~S is no longer dynamically active" TAG))	     
+	     (THROW (FOLLOW-CELL-FORWARDING (SECOND ENTRY) NIL) (CDR DEST)))
+	FINALLY (FERROR "~S is not the name of a lexically accessible GO tag" TAG)))
+
+(DEFINE-SPECIAL-FORM THROW (TAG RESULT &ENVIRONMENT ENV)
+  ;; This used to be (EVAL (REPEAT EFFECT) EVAL ARBITRARY)) -- why?
+  ;; ARBITRARY so it is understood to have side-effects
+  (DECLARE LT:(ARG-TEMPLATE EVAL EVAL ARBITRARY))
+  (THROW (EVAL TAG ENV) (EVAL RESULT ENV)))
+
+(DEFINE-SPECIAL-FORM CATCH (TAG &BODY BODY &ENVIRONMENT ENV)
+  ;;ARBITRARY here is to prevent moving complex code in or out of the scope of the catch
+  (DECLARE LT:(ARG-TEMPLATE EVAL ARBITRARY . BODY))
+  (CATCH (EVAL TAG ENV)
+    (EVAL-BODY BODY ENV)))
+
+(DEFINE-SPECIAL-FORM UNWIND-PROTECT (PROTECTED-FORM &REST CLEANUP-FORMS &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE RETURN (REPEAT EFFECT)))
+  (UNWIND-PROTECT (EVAL PROTECTED-FORM ENV)
+    (DOLIST (FORM CLEANUP-FORMS)
+      (EVAL FORM ENV))))
+
+;COMPILER-LET must record the bindings it makes, in these special variables,
+;so that it will work for internal lambdas that get broken off
+;(in the A-machine compiler)
+(DEFVAR COMPILER-LET-VARIABLES NIL)
+(DEFVAR COMPILER-LET-VALUES NIL)
+
+;COMPILER-LET is just like LET when interpreted.
+;But when compiled, it binds at compile time.
+;It is not a macro, for the sake of the compiler's definition of it,
+;and for the sake of COMPILE-DRIVER.
+(DEFINE-SPECIAL-FORM COMPILER-LET (BINDLIST &BODY BODY &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (COMPILER-LET-INTERNAL BINDLIST BODY #'EVAL ENV))
+
+;This subroutine is called by the compiler, too.
+(DEFUN COMPILER-LET-INTERNAL (BINDLIST BODY PROCESSING-FUNCTION &REST ADDITIONAL-ARGS)
+  (LET ((VARS (MAPCAR #'(LAMBDA (X) (IF (ATOM X) X (CAR X))) BINDLIST))
+	(VALS (MAPCAR #'(LAMBDA (X) (IF (ATOM X) NIL (EVAL (CADR X)))) BINDLIST)))
+    (PROGV VARS VALS
+      (LET ((COMPILER-LET-VALUES
+	      (NCONC VALS (LOOP FOR OLD-VAR IN COMPILER-LET-VARIABLES
+				AND OLD-VAL IN COMPILER-LET-VALUES
+				UNLESS (MEMQ OLD-VAR VARS) COLLECT OLD-VAL)))
+	    (COMPILER-LET-VARIABLES
+	      (NCONC VARS (LOOP FOR OLD-VAR IN COMPILER-LET-VARIABLES
+				UNLESS (MEMQ OLD-VAR VARS) COLLECT OLD-VAR))))
+	(LEXPR-FUNCALL PROCESSING-FUNCTION
+		       (IF (CDR BODY)
+			   `(PROGN 'COMPILE . ,BODY)
+			   (CAR BODY))
+		       ADDITIONAL-ARGS)))))
+
+;;; INHIBIT-STYLE-WARNINGS inhibits compiler style checking of what is inside it.
+;;; In the interpreter, it is a no-op.
+(DEFMACRO INHIBIT-STYLE-WARNINGS (FORM)
+  FORM)
+
+;Good old Maclisp/Zetalisp DECLARE.
+;In Common Lisp it should signal an error if it is ever called.
+(DEFINE-SPECIAL-FORM DECLARE (&REST IGNORE)
+  (DECLARE LT:(ARG-TEMPLATE . QUOTE))
+  'DECLARE)
+
+(DEFMACRO COMMENT (&BODY IGNORE)
+  ''COMMENT)
+
+;This definition assumes we are evalling.
+;COMPILE-DRIVER takes care of compiling and loading.
+(DEFINE-SPECIAL-FORM EVAL-WHEN (TIMES-LIST &BODY FORMS &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE QUOTE (REPEAT RETURN)))
+  (MULTIPLE-VALUE-BIND (IGNORE IGNORE EVAL-P)
+      (CHECK-EVAL-WHEN-TIMES TIMES-LIST)
+    (WHEN EVAL-P
+      (EVAL-BODY FORMS ENV))))
+
+(DEFUN CHECK-EVAL-WHEN-TIMES (TIMES &KEY (ERROR-FUNCTION #'ERROR))
+  (LET ((ERROR NIL)
+	(COMPILE-P NIL) (LOAD-P NIL) (EVAL-P NIL))
+    (IF (NOT (CL:LISTP TIMES))
+	(SETF ERROR T)
+	(DOLIST (TIME TIMES)
+	  (SELECTQ TIME
+	    ((COMPILE :COMPILE-TOPLEVEL)
+	     (SETF COMPILE-P T))
+	    ((LOAD CL:LOAD FUTURE-COMMON-LISP:LOAD :LOAD-TOPLEVEL)
+	     (SETF LOAD-P T))
+	    ((EVAL :EXECUTE)
+	     (SETF EVAL-P T))
+	    (OTHERWISE
+	     (SETF ERROR T)))))
+    (WHEN ERROR
+      (FUNCALL ERROR-FUNCTION "~S invalid EVAL-WHEN times; must be a subset of ~S."
+	       TIMES '(:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)))
+    (VALUES COMPILE-P LOAD-P EVAL-P)))
+
+;;;; SYS:MULTIPLE-DEFINITION feature
+
+;;; The compiler compiles this specially when seen at top level, doing all the compilations
+;;; of DEFUNs in the body before installing and definitions and evaluating any forms
+(DEFINE-SPECIAL-FORM MULTIPLE-DEFINITION (NAME TYPE &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE QUOTE QUOTE . BODY))
+  :MACRO-EXPANDER
+  `(ZL:LOCAL-DECLARE ((FUNCTION-PARENT ,NAME ,TYPE))
+     (LOAD-MULTIPLE-DEFINITION ',NAME ',TYPE
+			       (LIST ,@(MAPCAR #'(LAMBDA (FORM)
+						   (STYLE-CHECK-DEFINITION-FORM FORM ENV)
+						   ``(FUNCALL ,#'(LAMBDA () ,FORM)))
+					       BODY))
+			       NIL))
+  :INTERPRETER
+  (DOLIST (FORM BODY)
+    (STYLE-CHECK-DEFINITION-FORM FORM ENV))
+  (LET ((LOCAL-DECLARATIONS `((FUNCTION-PARENT ,NAME ,TYPE) ,@LOCAL-DECLARATIONS)))
+    (LOAD-MULTIPLE-DEFINITION NAME TYPE BODY ENV)))
+
+;;; When interpreting a SYS:MULTIPLE-DEFINITION, do some pre-checking, before entering
+;;; the without-aborts, as the compiler would.
+(DEFUN STYLE-CHECK-DEFINITION-FORM (FORM ENV)
+  (SETQ FORM (MACROEXPAND FORM ENV T))
+  (COND ((ATOM FORM))
+	((EQ (CAR FORM) 'DEFUN)
+	 ;; Turn old Maclisp DEFUNs into standard ones, provided function to do it is loaded.
+	 (WHEN (VARIABLE-BOUNDP #'DEFUN-COMPATIBILITY)
+	   (SETQ FORM (DEFUN-COMPATIBILITY (CDR FORM) :WARN-IF-OBSOLETE T))
+	   (UNLESS (EQ (FIRST FORM) 'DEFUN)
+	     (RETURN-FROM STYLE-CHECK-DEFINITION-FORM
+	       (STYLE-CHECK-DEFINITION-FORM FORM ENV))))
+	 (LET ((NAME (SECOND FORM))
+	       (LAMBDA-LIST (THIRD FORM))
+	       (BODY (CDDDR FORM)))
+	   ;; Create an inline declaration if needed.
+	   (WHEN (EQ (FUNCTION-SPEC-GET NAME 'CL:INLINE) 'CL:INLINE)
+	     (PUSH (LT::CONSTRUCT-INLINE-FORM-DECLARATION NAME LAMBDA-LIST BODY NIL)
+		   BODY))
+	   ;; Make sure body can be digested
+	   (DIGEST-LAMBDA `(LAMBDA ,LAMBDA-LIST ,@BODY) ENV NAME NIL)))
+	((EQ (CAR FORM) 'PROGN)
+	 (DOLIST (FORM (CDR FORM))
+	   (STYLE-CHECK-DEFINITION-FORM FORM ENV)))
+	((EQ (CAR FORM) 'EVAL-WHEN)
+	 (DOLIST (FORM (CDDR FORM))
+	   (STYLE-CHECK-DEFINITION-FORM FORM ENV))))
+  FORM)
+
+;;; This is called by the result of compiling a MULTIPLE-DEFINITION form
+(DEFUN LOAD-MULTIPLE-DEFINITION (NAME TYPE BODY ENV)
+  (WHEN (RECORD-DEFINITION-SOURCE-FILE NAME TYPE :START-TYPE-DEFINITION NIL)
+    (WITHOUT-ABORTS ("The ~@ ~S is being defined.~@
+		      Since this definition consists of several parts, aborting could ~
+		      leave it only half-defined."
+		     (OR (GET TYPE 'DEFINITION-TYPE-NAME) TYPE) NAME)
+      (EVAL-BODY BODY ENV))))
+
+;;; The Program Feature
+
+;;; Just a combination of BLOCK, LET, and TAGBODY
+;;; The Common Lisp manual (p.133) says the BLOCK goes on the outside.
+;;; We still support named-progs.
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM PROG (&WHOLE FORM VARS-AND-VALS &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE LOOP . (IF ZL:(OR (NULL (CAR LT:EXPR)) (LISTP (CAR LT:EXPR)))
+				       (ANONYMOUS-BLOCK PARALLEL-LET DECLARE . PROG)
+				       (BLOCK PARALLEL-LET DECLARE . PROG)))
+	   (ZWEI:INDENTATION . ZWEI:INDENT-PROG))
+  :MACRO-EXPANDER
+  (EXPAND-PROG VARS-AND-VALS BODY ENV 'LET)
+  :INTERPRETER
+  (DIGEST-PROG FORM VARS-AND-VALS BODY ENV 'DIGESTED-PROG))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM PROG* (&WHOLE FORM VARS-AND-VALS &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE LOOP . (IF ZL:(OR (NULL (CAR LT:EXPR)) (LISTP (CAR LT:EXPR)))
+				       (ANONYMOUS-BLOCK ((REPEAT LET)) DECLARE . PROG)
+				       (BLOCK ((REPEAT LET)) DECLARE . PROG)))
+	   (ZWEI:INDENTATION . ZWEI:INDENT-PROG))
+  :MACRO-EXPANDER
+  (EXPAND-PROG VARS-AND-VALS BODY ENV 'LET*)
+  :INTERPRETER
+  (DIGEST-PROG FORM VARS-AND-VALS BODY ENV 'DIGESTED-PROG*))
+
+(DEFUN EXPAND-PROG (VARS-AND-VALS BODY ENV BINDER)
+  (LET ((BLOCK-NAME NIL))
+    (WHEN (NOT (CL:LISTP VARS-AND-VALS))
+      (CL:SHIFTF BLOCK-NAME VARS-AND-VALS (POP BODY)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS REAL-BODY)
+	(FIND-BODY-DECLARATIONS BODY ENV)
+      (LET ((EXPANSION `(BLOCK ,BLOCK-NAME
+			  (,BINDER ,VARS-AND-VALS
+			   ,@DECLARATIONS
+			   (TAGBODY
+			     ,@REAL-BODY)))))
+	;; This craziness implements "invisible" (actually visible) blocks.
+	(UNLESS (OR (NULL BLOCK-NAME)
+		    (BLOCK INVISIBLE
+		      (DOLIST (DCLS DECLARATIONS)
+			(WHEN (AND (LISTP DCLS)
+				   (EQ (FIRST DCLS) 'DECLARE))
+			  (DOLIST (DCL (REST1 DCLS))
+			    (WHEN (AND (LISTP DCL)
+				       (SYMBOLP (FIRST DCL))
+				       (STRING-EQUAL (GET-PNAME (FIRST DCL))
+						     "INVISIBLE-BLOCK"))
+			      (RETURN-FROM INVISIBLE (SECOND DCL))))))
+		      (EQ BLOCK-NAME T)))
+	  (SETF EXPANSION `(BLOCK NIL ,EXPANSION)))
+	EXPANSION))))
+
+(DEFUN DIGEST-PROG (FORM VARS-AND-VALS BODY ENV DIGESTER)
+  (LET ((BLOCK-NAME-1 NIL)
+	(BLOCK-NAME-2 NIL))
+    ;; Check for named PROG
+    (WHEN (NOT (CL:LISTP VARS-AND-VALS))
+      (CL:SHIFTF BLOCK-NAME-1 VARS-AND-VALS (POP BODY)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY NIL NIL NIL UNSPECIALS)
+	(PARSE-BODY-DECLARATIONS BODY ENV)
+      ;; Check for invisible PROG (disable the NIL block-name)
+      ;; This is really old Zetalisp kludgery but let's stay compatible
+      (LET ((TEM (ASS #'STRING-EQUAL 'INVISIBLE-BLOCK DECLARATIONS)))
+	(WHEN (IF TEM (CADR TEM) (EQ BLOCK-NAME-1 T))
+	  (SETQ BLOCK-NAME-2 BLOCK-NAME-1)))
+      `(,DIGESTER ,FORM ,BLOCK-NAME-1 ,BLOCK-NAME-2
+	,(DIGEST-BINDINGS VARS-AND-VALS SPECIALS UNSPECIALS ENV) ,DECLARATIONS
+	,@(DIGEST-BODY BODY ENV)))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-PROG (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Build the environment structure for the two block names (which may be the same)
+  (WITH-STACK-LIST (ENTRY1 (POP BODY) (LOCF BODY))
+    (WITH-STACK-LIST (ENTRY2 (POP BODY) (LOCF BODY))
+      (WITH-STACK-LIST* (BLOCKS ENTRY1 ENTRY2 (ENV-BLOCKS))
+	;; Make environment smaller if we have only one block name
+	(WHEN (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+	  (POP BLOCKS))
+	;; Create all the variables we will need before doing any %PUSHes
+	(LET ((BINDINGS (POP BODY))
+	      (DECLARATIONS (POP BODY))
+	      (E ENV))
+	  ;; Build the environment structure for the tagbody, but don't install it yet
+	  (WITH-STACK-LIST (ENTRY BODY (LOCF ENV))
+	    (WITH-STACK-LIST* (TAGBODIES ENTRY (ENV-TAGBODIES))
+	      ;; Return from this CATCH to exit the block
+	      (CATCH (LOCF BODY)
+		;; New environment starts out as a copy of the old one, except
+		;; with the new blocks in place, then we add the declarations,
+		;; and then we add the new variable bindings, then we add the tagbody.
+		(INTERPRET-BINDINGS (BINDINGS T 15.
+				     (NEW-ENV ENV (POP E) (POP E) (PROGN (POP E) BLOCKS)
+						  (POP E) (CAR E) DECLARATIONS)
+				     (DECLARATIONS E BINDINGS))
+		  ;; Make the TAGBODY accessible
+		  (SETF (ENV-TAGBODIES NEW-ENV) TAGBODIES)
+		  (UNWIND-PROTECT
+		    ;; Evaluate the body
+		    (LOOP DOING			;Loop repeats if a GO happens
+		      (SETQ BODY (CATCH (LOCF ENV)
+				   (LOOP WHILE BODY DO
+				     (SETQ E (POP BODY))
+				     (UNLESS (ATOM E)
+				       (EVAL E NEW-ENV)))
+				   (RETURN NIL))))
+		    ;; Dynamic extent of PROG ends, flush the catch tags
+		    (SETF (SECOND (FIRST BLOCKS)) NIL)
+		    (UNLESS (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+		      (SETF (SECOND (SECOND BLOCKS)) NIL))
+		    (SETF (SECOND (FIRST TAGBODIES)) NIL)))))))))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-PROG* (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Build the environment structure for the two block names (which may be the same)
+  (WITH-STACK-LIST (ENTRY1 (POP BODY) (LOCF BODY))
+    (WITH-STACK-LIST (ENTRY2 (POP BODY) (LOCF BODY))
+      (WITH-STACK-LIST* (BLOCKS ENTRY1 ENTRY2 (ENV-BLOCKS))
+	;; Make environment smaller if we have only one block name
+	(WHEN (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+	  (POP BLOCKS))
+	;; Create all the variables we will need before doing any %PUSHes
+	(LET ((BINDINGS (POP BODY))
+	      (DECLARATIONS (POP BODY))
+	      (E ENV))
+	  ;; Build the environment structure for the tagbody, but don't install it yet
+	  (WITH-STACK-LIST (ENTRY BODY (LOCF ENV))
+	    (WITH-STACK-LIST* (TAGBODIES ENTRY (ENV-TAGBODIES))
+	      ;; Return from this CATCH to exit the block
+	      (CATCH (LOCF BODY)
+		;; New environment starts out as a copy of the old one, except
+		;; with the new blocks in place, then we add the declarations,
+		;; and then we add the new variable bindings, then we add the tagbody.
+		(INTERPRET-BINDINGS (BINDINGS NIL 15.
+				     (NEW-ENV ENV (POP E) (POP E) (PROGN (POP E) BLOCKS)
+						  (POP E) (CAR E) DECLARATIONS)
+				     (DECLARATIONS E BINDINGS))
+		  ;; Make the TAGBODY accessible
+		  (SETF (ENV-TAGBODIES NEW-ENV) TAGBODIES)
+		  (UNWIND-PROTECT
+		    ;; Evaluate the body
+		    (LOOP DOING			;Loop repeats if a GO happens
+		      (SETQ BODY (CATCH (LOCF ENV)
+				   (LOOP WHILE BODY DO
+				     (SETQ E (POP BODY))
+				     (UNLESS (ATOM E)
+				       (EVAL E NEW-ENV)))
+				   (RETURN NIL))))
+		    ;; Dynamic extent of PROG ends, flush the catch tags
+		    (SETF (SECOND (FIRST BLOCKS)) NIL)
+		    (UNLESS (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+		      (SETF (SECOND (SECOND BLOCKS)) NIL))
+		    (SETF (SECOND (FIRST TAGBODIES)) NIL)))))))))))
+
+;;; DO
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM DO (&WHOLE FORM VARS ENDTEST &BODY BODY &ENVIRONMENT ENV)
+  :MACRO-EXPANDER
+  (EXPAND-DO VARS ENDTEST BODY NIL NIL ENV)
+  :INTERPRETER
+  (DIGEST-DO FORM ENV NIL 'DIGESTED-DO VARS ENDTEST BODY))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM DO* (&WHOLE FORM VARS ENDTEST &BODY BODY &ENVIRONMENT ENV)
+  :MACRO-EXPANDER
+  (EXPAND-DO VARS ENDTEST BODY NIL T ENV)
+  :INTERPRETER
+  (DIGEST-DO FORM ENV NIL 'DIGESTED-DO* VARS ENDTEST BODY))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM DO-NAMED (&WHOLE FORM BLOCK-NAME VARS ENDTEST &BODY BODY &ENVIRONMENT ENV)
+  :MACRO-EXPANDER
+  (EXPAND-DO VARS ENDTEST BODY BLOCK-NAME NIL ENV)
+  :INTERPRETER
+  (DIGEST-DO FORM ENV BLOCK-NAME 'DIGESTED-DO VARS ENDTEST BODY))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM DO*-NAMED (&WHOLE FORM BLOCK-NAME VARS ENDTEST &BODY BODY &ENVIRONMENT ENV)
+  :MACRO-EXPANDER
+  (EXPAND-DO VARS ENDTEST BODY BLOCK-NAME T ENV)
+  :INTERPRETER
+  (DIGEST-DO FORM ENV BLOCK-NAME 'DIGESTED-DO* VARS ENDTEST BODY))
+
+;;; EXPAND-DO is in its own file.
+
+(DEFUN DIGEST-DO (FORM ENV BLOCK-NAME-1 DIGESTED-DO VARS ENDTEST BODY
+		  &AUX (BLOCK-NAME-2 NIL))
+  ;; If this is an old-style DO, convert it
+  (WHEN (NOT (CL:LISTP VARS))
+    (SETQ VARS `((,VARS ,ENDTEST ,(POP BODY))))
+    (SETQ ENDTEST `(,(POP BODY) NIL)))
+  (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY NIL NIL NIL UNSPECIALS)
+      (PARSE-BODY-DECLARATIONS BODY ENV)
+    ;; Check for invisible PROG (disable the NIL block-name)
+    ;; This is really old Zetalisp kludgery but let's stay compatible
+    (LET ((TEM (ASS #'STRING-EQUAL 'INVISIBLE-BLOCK DECLARATIONS)))
+      (WHEN (IF TEM (CADR TEM) (EQ BLOCK-NAME-1 T))
+	(SETQ BLOCK-NAME-2 BLOCK-NAME-1)))
+    `(,DIGESTED-DO ,FORM ,BLOCK-NAME-1 ,BLOCK-NAME-2
+      ,(DIGEST-BINDINGS VARS SPECIALS UNSPECIALS ENV T)
+      ,DECLARATIONS
+      ,(LOOP FOR ITEM IN VARS			;Variable steppings
+	     WHEN (AND (LISTP ITEM) (CDDR ITEM))
+	       COLLECT (LIST (FIRST ITEM) (THIRD ITEM))
+	       AND DO (WHEN (CDDDR ITEM)
+			(FERROR "~S is not a valid DO variable specification" ITEM)))
+      ,ENDTEST					;end condition
+      ,@(DIGEST-BODY BODY ENV))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-DO (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Build the environment structure for the two block names (which may be the same)
+  (WITH-STACK-LIST (ENTRY1 (POP BODY) (LOCF BODY))
+    (WITH-STACK-LIST (ENTRY2 (POP BODY) (LOCF BODY))
+      (WITH-STACK-LIST* (BLOCKS ENTRY1 ENTRY2 (ENV-BLOCKS))
+	;; Make environment smaller if we have only one block name
+	(WHEN (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+	  (POP BLOCKS))
+	;; Create all the variables we will need before doing any %PUSHes
+	(LET ((BINDINGS (POP BODY))
+	      (DECLARATIONS (POP BODY))
+	      (STEPS (POP BODY))
+	      (END (POP BODY))
+	      (E ENV))
+	    ;; Return from this CATCH to exit the block
+	    (CATCH (LOCF BODY)
+	      ;; New environment starts out as a copy of the old one, except
+	      ;; with the new blocks in place, then we add the declarations,
+	      ;; and then we add the new variable bindings.
+	      (INTERPRET-BINDINGS (BINDINGS T 15.
+				   (NEW-ENV ENV (POP E) (POP E) (PROGN (POP E) BLOCKS)
+						(POP E) (CAR E) DECLARATIONS)
+				   (DECLARATIONS E BINDINGS))
+		(UNWIND-PROTECT
+		  (LOOP DOING
+		    ;; Check the endtest
+		    (WHEN (EVAL (CAR END) NEW-ENV)
+		      ;; The DO ends, evaluate the result forms
+		      (SETQ END (CDR END))
+		      (LOOP WHILE (CDR END)
+			    DO (EVAL (POP END) NEW-ENV))
+		      (RETURN (EVAL (CAR END) NEW-ENV)))
+		    ;; Evaluate the body inside a TAGBODY
+		    (DO-TAGBODY BODY NEW-ENV)
+		    ;; Step the variables, in parallel
+		    (SETQ E STEPS)
+		    (COND (( (STACK-SPACE-LEFT) (LENGTH STEPS))
+			   (%ASSURE-PDL-ROOM (LENGTH STEPS))
+			   (SETQ BINDINGS (COMPILER:%STACK-LOCATION-INTERNAL 0))
+			   (LOOP WHILE E
+				 DO (%PUSH (EVAL (SECOND (POP E)) NEW-ENV)))
+			   (SETQ E STEPS)
+			   (LOOP WHILE E DO
+			     ;; Can't use SETF because it would introduce a temporary!
+			     (RPLACA (REST1 (ASSQ (FIRST (POP E)) (ENV-VARIABLES NEW-ENV)))
+				     (%P-CONTENTS-INCREMENT-POINTER BINDINGS)))
+			   (SETQ E STEPS)
+			   (LOOP WHILE E
+				 DO (%POP)
+				    (POP E)))
+			  (T
+			   (CL:LOCALLY
+			     (DECLARE (LT::NOTINLINE MAPC MAPCAR))
+			     (MAPC #'(LAMBDA (X B)
+				       (SETF (CADR (ASSQ (FIRST X) (ENV-VARIABLES NEW-ENV)))
+					     B))
+				   E
+				   (MAPCAR #'(LAMBDA (X) (EVAL (SECOND X) NEW-ENV)) E)))))
+		    ;; Check for obsolete Maclisp-compatible DO-once syntax
+		    (WHEN (NULL END)
+		      (RETURN NIL)))
+		  ;; Dynamic extent of PROG ends, flush the catch tags
+		  (SETF (SECOND (FIRST BLOCKS)) NIL)
+		  (UNLESS (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+		    (SETF (SECOND (SECOND BLOCKS)) NIL))))))))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-DO* (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Build the environment structure for the two block names (which may be the same)
+  (WITH-STACK-LIST (ENTRY1 (POP BODY) (LOCF BODY))
+    (WITH-STACK-LIST (ENTRY2 (POP BODY) (LOCF BODY))
+      (WITH-STACK-LIST* (BLOCKS ENTRY1 ENTRY2 (ENV-BLOCKS))
+	;; Make environment smaller if we have only one block name
+	(WHEN (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+	  (POP BLOCKS))
+	;; Create all the variables we will need before doing any %PUSHes
+	(LET ((BINDINGS (POP BODY))
+	      (DECLARATIONS (POP BODY))
+	      (STEPS (POP BODY))
+	      (END (POP BODY))
+	      (E ENV))
+	    ;; Return from this CATCH to exit the block
+	    (CATCH (LOCF BODY)
+	      ;; New environment starts out as a copy of the old one, except
+	      ;; with the new blocks in place, then we add the declarations,
+	      ;; and then we add the new variable bindings.
+	      (INTERPRET-BINDINGS (BINDINGS NIL 15.
+				   (NEW-ENV ENV (POP E) (POP E) (PROGN (POP E) BLOCKS)
+						(POP E) (CAR E) DECLARATIONS)
+				   (DECLARATIONS E BINDINGS))
+		(UNWIND-PROTECT
+		  (LOOP DOING
+		    ;; Check the endtest
+		    (WHEN (EVAL (CAR END) NEW-ENV)
+		      ;; The DO ends, evaluate the result forms
+		      (SETQ END (CDR END))
+		      (LOOP WHILE (CDR END)
+			    DO (EVAL (POP END) NEW-ENV))
+		      (RETURN (EVAL (CAR END) NEW-ENV)))
+		    ;; Evaluate the body inside a TAGBODY
+		    (DO-TAGBODY BODY NEW-ENV)
+		    ;; Step the variables, serially
+		    (SETQ E STEPS)
+		    (LOOP WHILE E
+			  DO (SETF (SECOND (ASSQ (FIRST (CAR E)) (ENV-VARIABLES NEW-ENV)))
+				   (EVAL (SECOND (POP E)) NEW-ENV))))
+		  ;; Dynamic extent of PROG ends, flush the catch tags
+		  (SETF (SECOND (FIRST BLOCKS)) NIL)
+		  (UNLESS (EQ (FIRST ENTRY1) (FIRST ENTRY2))
+		    (SETF (SECOND (SECOND BLOCKS)) NIL))))))))))
+
+;;; Conditionals
+
+(DEFINE-SPECIAL-FORM IF (CONDITION TRUE &REST FALSE &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE COND TEST RETURN . BODY))
+  (IF (EVAL CONDITION ENV)
+      (EVAL TRUE ENV)
+      (EVAL-BODY FALSE ENV)))
+
+(DEFINE-SPECIAL-FORM COND (&REST CLAUSES &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE COND (REPEAT (TEST . BODY))))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  (LABELS ((RECURSE (CLAUSES)
+	     (WHEN CLAUSES
+	       (LET ((CLAUSE (FIRST CLAUSES)))
+		 (IF (NULL (REST1 CLAUSE))
+		     (LET ((SYMBOL (GENSYM)))
+		       `(LET ((,SYMBOL ,(FIRST CLAUSE)))
+			  (IF ,SYMBOL ,SYMBOL
+			      ,(RECURSE (REST1 CLAUSES)))))
+		     `(IF ,(FIRST CLAUSE) (PROGN ,@(REST1 CLAUSE))
+			  ,(RECURSE (REST1 CLAUSES))))))))
+    (RECURSE CLAUSES))
+  :INTERPRETER
+  (LOOP WITH CLAUSE AND TEM
+	WHILE CLAUSES DO
+    (SETQ CLAUSE (CAR CLAUSES))
+    ;; This conditional is added to make it obey the Zetalisp rule for
+    ;; (COND ((VALUES 1 2))); if you remove it, the code will follow the Common Lisp rule
+    ;; which is to return only one value.
+    ;;(IF (OR (CDR CLAUSE) (CDR CLAUSES))
+    (WHEN (SETQ TEM (EVAL (CAR CLAUSE) ENV))
+      (SETQ TEM (OR (CDR CLAUSE) (RETURN TEM)))
+      (LOOP WHILE (CDR TEM)
+	    DO (EVAL (POP TEM) ENV))
+      (RETURN (EVAL (CAR TEM) ENV)))
+    ;; Singleton clause at end of COND
+    ;;(RETURN (EVAL (CAR CLAUSE) ENV)))
+    (POP CLAUSES)))
+
+(DEFINE-SPECIAL-FORM AND (&REST BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE COND (REPEAT TEST) RETURN))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  (IF BODY
+      `(COND ,@(LOOP FOR SUB ON BODY
+		     IF (NOT (CL:ENDP (CDR SUB)))
+		       COLLECT `((NOT ,(CAR SUB)) NIL)
+		     ELSE COLLECT `(T ,(CAR SUB))))
+      'T)
+  :INTERPRETER
+  (IF BODY
+      (LOOP WHILE (CDR BODY)
+	    UNLESS (EVAL (POP BODY) ENV) RETURN NIL
+	    FINALLY (RETURN (EVAL (CAR BODY) ENV)))
+      T))
+
+(DEFINE-SPECIAL-FORM OR (&REST BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE COND (REPEAT RETURN)))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  `(COND ,@(LOOP FOR SUB ON BODY
+		 IF (NOT (CL:ENDP (CDR SUB)))
+		   COLLECT `(,(CAR SUB))
+		 ELSE COLLECT `(T ,(CAR SUB))))
+  :INTERPRETER
+  (LOOP WHILE (CDR BODY)
+	AS VAL = (EVAL (POP BODY) ENV)
+	WHEN VAL RETURN VAL
+	FINALLY (RETURN (EVAL (CAR BODY) ENV))))
+
+(DEFINE-SPECIAL-FORM WHEN (CONDITION &REST BODY &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  `(IF ,CONDITION (PROGN ,@BODY))
+  :INTERPRETER
+  (WHEN (EVAL CONDITION ENV)
+    (EVAL-BODY BODY ENV)))
+
+(DEFINE-SPECIAL-FORM UNLESS (CONDITION &REST BODY &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  `(IF (NOT ,CONDITION) (PROGN ,@BODY))
+  :INTERPRETER
+  (UNLESS (EVAL CONDITION ENV)
+    (EVAL-BODY BODY ENV)))
+
+;;; LAMBDA
+
+(DEFMACRO-SET-INDENTATION-FOR-ZWEI 'FUTURE-COMMON-LISP:LAMBDA 1)
+
+(DEFINE-SPECIAL-FORM LAMBDA EXPAND-LAMBDA (&WHOLE FORM &REST IGNORE &ENVIRONMENT ENV)
+  (DECLARE (ARGLIST LAMBDA-LIST &REST BODY)
+	   (ZWEI:INDENTATION . 1))
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (ENCLOSE FORM ENV))
+
+(DEFINE-SPECIAL-FORM NAMED-LAMBDA EXPAND-LAMBDA (&WHOLE FORM &REST IGNORE &ENVIRONMENT ENV)
+  (DECLARE (ARGLIST NAME LAMBDA-LIST &REST BODY)
+	   (ZWEI:INDENTATION . 2))
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (ENCLOSE FORM ENV))
+
+(DEFINE-SPECIAL-FORM DIGESTED-LAMBDA EXPAND-LAMBDA (&WHOLE FORM &REST IGNORE &ENVIRONMENT ENV)
+  (ENCLOSE FORM ENV))
+
+;;; Don't even think about redefining this function!
+(DEFUN INTERPRETER-TRAMPOLINE (ENVIRONMENT-AND-FUNCTION &REST ARGS)
+  (DECLARE (FUTURE-COMMON-LISP:DYNAMIC-EXTENT ARGS))
+  (DECLARE (CLOS:PRINT-OBJECT INTERPRETED-FUNCTION-PRINTER))
+  (APPLY-LAMBDA (CAR ENVIRONMENT-AND-FUNCTION) (CDR ENVIRONMENT-AND-FUNCTION) ARGS))
+
+(DEFUN INTERPRETED-FUNCTION-PRINTER (OBJECT STREAM)
+  (MULTIPLE-VALUE-BIND (LAMBDA CLOSURE NAME)
+      (INTERPRETED-FUNCTION-LAMBDA-EXPRESSION OBJECT)
+    (DECLARE (IGNORE CLOSURE))
+    (IF NAME
+	(PRINT-FUNCTION NAME OBJECT STREAM
+			      :TYPE-NAME "Interpreted function")
+	(IF *PRINT-ESCAPE*
+	    (PRINTING-RANDOM-OBJECT (OBJECT STREAM)
+	      (SEND STREAM :STRING-OUT "Interpreted function")
+	      (SEND STREAM :TYO #\SPACE)
+	      (PRIN1 (SI:UNDIGEST LAMBDA) STREAM))
+	    (PRIN1 (SI:UNDIGEST LAMBDA) STREAM)))))
+
+(DEFUN ENCLOSE (LAMBDA ENVIRONMENT &OPTIONAL NAME)
+  (MAKE-LEXICAL-CLOSURE
+    (COND ((EQ (FIRST LAMBDA) 'DIGESTED-LAMBDA)
+	   ;; Already been done, so add an environment if it wants it.
+	   (CONS (IF (LDB-TEST %%LAMBDA-INTERNAL (FOURTH LAMBDA))
+		     (EVACUATE-ENVIRONMENT ENVIRONMENT)
+		     NIL)
+		 LAMBDA))
+	  ((NULL-ENVIRONMENT-P ENVIRONMENT)
+	   ;; No environment, so no need to see if it gets used
+	   (CONS NIL (DIGEST-LAMBDA LAMBDA ENVIRONMENT NAME NIL)))
+	  (T (CONS (EVACUATE-ENVIRONMENT ENVIRONMENT)
+		   (DIGEST-LAMBDA LAMBDA ENVIRONMENT NAME T))))
+    #'INTERPRETER-TRAMPOLINE))
+
+;;; This makes the compiler able to compile naked lambda
+(DEFUN EXPAND-LAMBDA (FORM IGNORE)
+  `(FUNCTION ,FORM))
+
+(DEFUN EVACUATE-LOCAL-FUNCTION-ENVIRONMENT-IF-NECESSARY (LOCAL-FUNCTION)
+  (DECLARE (VALUES LOCAL-FUNCTION))
+  (LET ((ENV (LEXICAL-CLOSURE-ENVIRONMENT LOCAL-FUNCTION)))
+    (IF (OR (STACK-LIST-P LOCAL-FUNCTION)
+	    (STACK-LIST-P (CAR ENV)))
+	(MAKE-LEXICAL-CLOSURE
+	  (CONS (EVACUATE-ENVIRONMENT (CAR ENV))
+		(CDR ENV))
+	  (LEXICAL-CLOSURE-FUNCTION LOCAL-FUNCTION))
+	LOCAL-FUNCTION)))
+
+(DEFCONST COMPILER:*&REST-ARGUMENTS-ALWAYS-DYNAMIC* T)
+
+(DEFUN INTERPRETED-LAMBDA-P (FORM)
+  (AND (LISTP FORM)
+       (CL:CASE (FIRST FORM)
+	 ((LAMBDA FUTURE-COMMON-LISP:LAMBDA) T))))
+
+(DEFUN INTERPRETED-LAMBDA-LAMBDA-LIST-AND-BODY (FORM)
+  (CL:ECASE (FIRST FORM)
+    ((FUTURE-COMMON-LISP:LAMBDA)
+     (REST1 FORM))
+    ((LAMBDA)
+     (WHEN COMPILER:*&REST-ARGUMENTS-ALWAYS-DYNAMIC*
+       (LET* ((LL (SECOND FORM))
+	      (REST (MEMQ '&REST LL)))
+	 (WHEN REST
+	   (RETURN-FROM INTERPRETED-LAMBDA-LAMBDA-LIST-AND-BODY
+	     `(,LL
+	       (DECLARE (FUTURE-COMMON-LISP:DYNAMIC-EXTENT ,(SECOND REST)))
+	       ,@(REST2 FORM))))))
+     (REST1 FORM))))
+
+(DEFUN INTERPRETED-FUNCTION-P (FCN)
+  (CL:TYPECASE FCN
+    (SYS:LEXICAL-CLOSURE
+      (EQ (SYS:LEXICAL-CLOSURE-FUNCTION FCN) #'INTERPRETER-TRAMPOLINE))
+    (CL:CONS
+      (SELECTQ (FIRST (LAMBDA-MACRO-EXPAND FCN NIL))
+	((LAMBDA) T)))))
+
+(DEFUN INTERPRETED-FUNCTION-LAMBDA-EXPRESSION (FCN)
+  (CL:TYPECASE FCN
+    (SYS:LEXICAL-CLOSURE
+      (LET ((TDATA (SYS:LEXICAL-CLOSURE-ENVIRONMENT FCN)))
+	(VALUES (CDR TDATA) (NOT (NULL-ENVIRONMENT-P (CAR TDATA))) (CAR (THIRD (CDR TDATA))))))
+    (CL:CONS
+      (VALUES FCN NIL (SECOND (ASSOC 'FUNCTION-NAME
+				     (INTERPRETED-FUNCTION-DEBUGGING-INFO FCN)))))))
+
+(DEFUN INTERPRETED-FUNCTION-DEBUGGING-INFO (FCN)
+  (CL:TYPECASE FCN
+    (SYS:LEXICAL-CLOSURE
+      (CDR (THIRD (CDR (SYS:LEXICAL-CLOSURE-ENVIRONMENT FCN)))))
+    (CL:CONS
+      (DESTRUCTURING-BIND (LAMBDA-LIST &REST BODY)
+	  (INTERPRETED-LAMBDA-LAMBDA-LIST-AND-BODY (LAMBDA-MACRO-EXPAND FCN NIL))
+	(MULTIPLE-VALUE-BIND (NIL NIL NIL DOCUMENTATION DEBUGGING-INFO)
+	    (PARSE-BODY-DECLARATIONS BODY NIL LAMBDA-LIST)
+	  (WHEN DOCUMENTATION
+	    (PUSH `(:DOCUMENTATION ,DOCUMENTATION) DEBUGGING-INFO))
+	  DEBUGGING-INFO)))))
+
+;;;
+
+;;; "Evaluate a form as in function position"
+;;; A symbol turns into its function definition, which may require evacuation.
+;;; A list is either a functional constant, which is enclosed,
+;;; a lambda macro, which is expanded,
+;;; or a function-spec, which turns into its function definition.
+;;; Note that (:property foo bar) is a function spec but (foo bar) is not a function spec!
+;;; Atomic functional constants (such as compiled functions) are also allowed,
+;;; although I don't really see how that feature would ever be used.
+(DEFINE-SPECIAL-FORM FUNCTION (FUNCTION &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE CALL))
+  (CL:LOOP					;iterate for lambda-macro expansion
+     (CL:TYPECASE FUNCTION
+       (CL:SYMBOL				;Function name, evaluate in local environment
+	 (SETQ FUNCTION (OR (CADR (ASSQ FUNCTION (ENV-FUNCTIONS)))
+			    (RETURN (FSYMEVAL FUNCTION))))
+	 (RETURN (COND ((TYPEP FUNCTION :LEXICAL-CLOSURE)
+			(EVACUATE-LOCAL-FUNCTION-ENVIRONMENT-IF-NECESSARY FUNCTION))
+		       ;; DEFUN-IN-FLAVOR
+		       ((AND (LISTP FUNCTION) (EQ (FIRST FUNCTION) 'FLAVOR:DEFUN-IN-FLAVOR))
+			(LET* ((SELF (CADR (ASSQ 'SELF (ENV-VARIABLES))))
+			       (SELF-MAPPING-TABLE
+				 (FLAVOR:GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE
+				   SELF (SECOND FUNCTION))))
+			  (MAKE-LEXICAL-CLOSURE 
+			    (LIST (LOCATION-CONTENTS (THIRD FUNCTION))
+				  SELF SELF-MAPPING-TABLE)
+			    #'DEFUN-IN-FLAVOR-TRAMPOLINE)))
+		       ;;--- Reject special forms and macros here?
+		       (T
+			FUNCTION))))
+       (CL:LIST					;Lambda-expression, -macro, or function-spec
+	 (LET (LOCAL-FUNCTION)
+	   (COND ((INTERPRETED-LAMBDA-P FUNCTION)
+		  (RETURN (ENCLOSE FUNCTION ENV)))
+		 ;;        Local ANSI CL (SETF reader) function
+		 ((AND (FUNCTION-LET-VALID-NAME-P FUNCTION)
+		       (SETQ LOCAL-FUNCTION (SECOND (CL:ASSOC FUNCTION (ENV-FUNCTIONS)
+							      :TEST #'CL:EQUAL))))
+		  (RETURN (EVACUATE-LOCAL-FUNCTION-ENVIRONMENT-IF-NECESSARY LOCAL-FUNCTION)))
+		 ((VALIDATE-FUNCTION-SPEC FUNCTION)
+		  (RETURN (FDEFINITION FUNCTION)))
+		 ((LAMBDA-MACRO-CALL-P FUNCTION)
+		  (SETQ FUNCTION (LAMBDA-MACRO-EXPAND FUNCTION ENV)))
+		 (T
+		  ;; Drops through if none of the above tests were satisfied
+		  (FERROR "~S is neither a function nor the name of a function" FUNCTION)))))
+       ;;Functional constants
+       ((OR CL:COMPILED-FUNCTION SYS:DYNAMIC-CLOSURE SYS:LEXICAL-CLOSURE)
+	(RETURN FUNCTION))
+       ((CL:SATISFIES VALIDATE-FUNCTION-SPEC)
+	(RETURN (FDEFINITION FUNCTION)))
+       (OTHERWISE
+	 (FERROR "~S is neither a function nor the name of a function" FUNCTION)))))
+
+;When a defun-in-flavor is used as a funarg in interpreted code, this helping function
+;gets it called with the proper environment.  Can't use normal lexical-closure
+;mechanism because there are two extra-arguments.
+(DEFUN DEFUN-IN-FLAVOR-TRAMPOLINE (ENV &REST ARGS)
+  (LEXPR-FUNCALL (POP ENV) (POP ENV) (CAR ENV) ARGS))
+
+(DEFINE-SPECIAL-FORM FUNCTION-LOCATION (FSPEC &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE CALL))
+  (FOLLOW-CELL-FORWARDING
+    (TYPECASE FSPEC
+      (:SYMBOL
+	(IF (SECOND (ASSQ FSPEC (ENV-FUNCTIONS)))
+	    (LOCF (SECOND (ASSQ FSPEC (ENV-FUNCTIONS (EVACUATE-ENVIRONMENT ENV)))))
+	    (FUNCTION-CELL-LOCATION FSPEC)))
+      (OTHERWISE
+	(FDEFINITION-LOCATION FSPEC)))
+    NIL))
+  
+;;; Internal form of LAMBDA expressions
+  
+;;; Fields in a lambda-info fixnum
+
+(DEFCONSTANT %%LAMBDA-N-BINDINGS (BYTE 8 0))	;Number of bindings (including aux vars)
+(DEFCONSTANT %%LAMBDA-INTERNAL (BYTE 1 8))	;First arg supplied will be an environment
+(DEFCONSTANT %%LAMBDA-METHOD (BYTE 1 9))	;Add instance variables to lexical env
+(DEFCONSTANT %%LAMBDA-ALLOW-OTHER-KEYS (BYTE 1 10.))	;&ALLOW-OTHER-KEYS specified
+(DEFCONSTANT %%LAMBDA-FAST (BYTE 1 11.))	;1 if fast case (no rest arg, no keyword
+						; args, no supplied-p, few bindings)
+(DEFCONSTANT %%LAMBDA-DOWNWARD (BYTE 1 12.))	;1 if okay to use as a downward funarg
+(DEFCONSTANT %%LAMBDA-DYNAMIC-EXTENT-REST (BYTE 1 13.))	;1 if &REST parameter has dynamic extent
+
+;;; Convert a LAMBDA expression to internal form
+;;; This is the first step of enclosing it, but a digested lambda is independent
+;;; of the environment and is shared by all closures of the function.
+;;; ENV is just used for looking up macro definitions
+;;; NAME can be NIL for anonymous LAMBDA expressions
+;;; INTERNAL means that the first argument supplied will be an environment
+;;; This has a lot of code duplication, but it seems to be the cleanest way to write it
+;;;
+;;; For compatibility, the value of LOCAL-DECLARATIONS is captured into the environment,
+;;; unless this is an internal lambda.  Eventually that variable will be phased out
+;;; since its scoping is wrong.
+
+;;; Since LOCAL-DECLARATIONS doesn't seem to be in any hurry to get phased out, we
+;;; have to phase these declarations out of the declarations which get inherited via
+;;; LOCAL-DECLARATIONS for non-internal lambdas.
+(DEFVAR *LOCAL-DECLARATIONS-FILTERED-FOR-DIGEST-LAMBDA*
+	'(SYS:FUNCTION-NAME SYS:INSTANCE-VARIABLES SYS:DOWNWARD-FUNCTION
+	  FLAVOR:LOCAL-FUNCTIONS))
+
+(DEFUN DIGEST-LAMBDA (FUNCTION ENV NAME INTERNAL)
+  (WHEN (EQ (FIRST FUNCTION) 'DIGESTED-LAMBDA)
+    ;; Already digested, just return it
+    (RETURN-FROM DIGEST-LAMBDA FUNCTION))
+  (LET ((THIS-FUNCTION (LAMBDA-MACRO-EXPAND FUNCTION ENV)))
+    (UNLESS (INTERPRETED-LAMBDA-P THIS-FUNCTION)
+      (ERROR 'INVALID-FUNCTION :FUNCTION FUNCTION))
+    (LET* ((BODY (INTERPRETED-LAMBDA-LAMBDA-LIST-AND-BODY THIS-FUNCTION))
+	   (DEBUG-INFO NIL)
+	   (LAMBDA-LIST (POP BODY))
+	   (ORIGINAL-LAMBDA-LIST LAMBDA-LIST)
+	   (LAMBDA-INFO (IF INTERNAL (DPB 1 %%LAMBDA-INTERNAL 0) 0))
+	   (ARGS-INFO %ARG-DESC-INTERPRETED)
+	   (N-REQUIRED 0)
+	   (N-OPTIONAL 0)
+	   (N-AUX 0)
+	   (BINDINGS NIL)
+	   (VARS NIL)
+	   (SPECIAL NIL)
+	   (ITEM NIL))				;Copy of (CAR LAMBDA-LIST)
+      ;; Do some checking for common mistakes
+      (CHECK-LAMBDA-LIST-SYNTAX LAMBDA-LIST)
+
+      ;; Merge declarations specified with LOCAL-DECLARE into declarations in the body
+      (WHEN (AND (NOT INTERNAL)
+		 LOCAL-DECLARATIONS)
+	(LET ((GOOD-DECL-SPECS
+		(LOOP FOR DECL-SPEC IN LOCAL-DECLARATIONS
+		      FOR TYPE = (FIRST DECL-SPEC)
+		      WHEN 
+			(NOT (CL:MEMBER TYPE
+					*LOCAL-DECLARATIONS-FILTERED-FOR-DIGEST-LAMBDA*))
+			COLLECT DECL-SPEC)))
+	  (WHEN GOOD-DECL-SPECS
+	    (PUSH `(DECLARE ,@GOOD-DECL-SPECS) BODY))))
+      ;; Parse out declarations first so we know what variables are SPECIAL
+      (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY DOCUMENTATION ADDITIONAL-INFO
+			    VAR-DCLS UNSPECIALS)
+	  (PARSE-BODY-DECLARATIONS BODY ENV LAMBDA-LIST)
+	(IGNORE VAR-DCLS)
+	(LET ((NAME-PAIR (CL:ASSOC 'SYS:FUNCTION-NAME ADDITIONAL-INFO)))
+	  (WHEN NAME-PAIR
+	    (SETQ ADDITIONAL-INFO (CL:DELETE NAME-PAIR ADDITIONAL-INFO))
+	    (SETQ NAME (SECOND NAME-PAIR))))
+	;; Save documentation, debugging-info, and downward-function declaration
+	(SETQ DEBUG-INFO (NCONC ADDITIONAL-INFO DEBUG-INFO))
+	(WHEN DOCUMENTATION
+	  (PUSH `(:DOCUMENTATION ,DOCUMENTATION) DEBUG-INFO))
+	(WHEN (SETQ ITEM (ASSQ 'DOWNWARD-FUNCTION DECLARATIONS))
+	  (SETQ DECLARATIONS (DELQ ITEM DECLARATIONS))
+	  (SETF (LDB %%LAMBDA-DOWNWARD LAMBDA-INFO) 1))
+
+	;; See if there are supposed to be instance variables in the environment
+	(WHEN (ASSQ 'INSTANCE-VARIABLES DECLARATIONS)
+	  (SETF (LDB %%LAMBDA-METHOD LAMBDA-INFO) 1)
+	  ;; Add local functions to lexical environment
+	  (WHEN (SETQ ITEM (ASSQ 'FLAVOR:LOCAL-FUNCTIONS DECLARATIONS))
+	    ;; Install local functions into the environment
+	    (SETQ ENV (LIST* (ENV-VARIABLES ENV)
+			     (IF (NULL (ENV-FUNCTIONS ENV))
+				 (CDR ITEM)
+				 (APPEND (CDR ITEM) (ENV-FUNCTIONS ENV)))
+			     (CDDR ENV)))))
+	    
+	;; Parse the required arguments
+	(LOOP WHILE LAMBDA-LIST DO
+	  (SETQ ITEM (CAR LAMBDA-LIST))
+	  (COND ((EQ ITEM '&SPECIAL) (SETQ SPECIAL T))	;Well the compiler supports it
+		((EQ ITEM '&LOCAL) (SETQ SPECIAL NIL))
+		((MEMQ ITEM LAMBDA-LIST-KEYWORDS) (RETURN))
+		((NOT (SYMBOLP ITEM)) (RETURN))
+		(T
+		 (CHECK-SYMBOL-SETABILITY ITEM "bind")
+		 (CHECK-FOR-DUPLICATE-SYMBOL ITEM VARS)
+		 (INCF N-REQUIRED)
+		 (PUSH (COND ((OR SPECIAL
+				  (SPECIAL-VARIABLE-P ITEM ENV SPECIALS UNSPECIALS))
+			      (SETQ SPECIALS (DELQ ITEM SPECIALS))
+			      (CONS ITEM (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION ITEM) NIL)))
+			     (T
+			      (SETQ UNSPECIALS (DELQ ITEM UNSPECIALS))
+			      ITEM))
+		       BINDINGS)
+		 (PUSH ITEM VARS)))
+	  (POP LAMBDA-LIST))
+
+	;; Parse the optional arguments
+	(WHEN (EQ ITEM '&OPTIONAL)
+	  (POP LAMBDA-LIST)
+	  (LOOP WHILE LAMBDA-LIST DO
+	    (SETQ ITEM (CAR LAMBDA-LIST))
+	    (COND ((EQ ITEM '&SPECIAL) (SETQ SPECIAL T))	;Well the compiler supports it
+		  ((EQ ITEM '&LOCAL) (SETQ SPECIAL NIL))
+		  ((MEMQ ITEM LAMBDA-LIST-KEYWORDS) (RETURN))
+		  ((SYMBOLP ITEM)
+		   (CHECK-SYMBOL-SETABILITY ITEM "bind")
+		   (CHECK-FOR-DUPLICATE-SYMBOL ITEM VARS)
+		   (INCF N-OPTIONAL)
+		   (PUSH (COND ((OR SPECIAL
+				    (SPECIAL-VARIABLE-P ITEM ENV SPECIALS))
+				(SETQ SPECIALS (DELQ ITEM SPECIALS))
+				(CONS ITEM (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION ITEM) NIL)))
+			       (T
+				(SETQ UNSPECIALS (DELQ ITEM UNSPECIALS))
+				ITEM))
+			 BINDINGS)
+		   (PUSH ITEM VARS))
+		  ((ATOM ITEM) (RETURN))
+		  ((NULL (CDDR ITEM))
+		   (LET ((VAR (FIRST ITEM)) (VAL (SECOND ITEM)))
+		     (CHECK-SYMBOL-SETABILITY VAR "bind")
+		     (CHECK-FOR-DUPLICATE-SYMBOL VAR VARS)
+		     (INCF N-OPTIONAL)
+		     (SETQ VAR (COND ((OR SPECIAL
+					  (SPECIAL-VARIABLE-P VAR ENV SPECIALS))
+				      (SETQ SPECIALS (DELQ VAR SPECIALS))
+				      (CONS VAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+				     (T 
+				      (SETQ UNSPECIALS (DELQ ITEM UNSPECIALS))
+				      VAR)))
+		     (PUSH (IF VAL (LIST VAR VAL) VAR)
+			   BINDINGS)
+		     (PUSH VAR VARS)))
+		  ((CDDDR ITEM) (RETURN))
+		  (T
+		   (LET ((VAR (FIRST ITEM)) (VAL (SECOND ITEM)) (SVAR (THIRD ITEM)))
+		     (CHECK-SYMBOL-SETABILITY VAR "bind")
+		     (CHECK-FOR-DUPLICATE-SYMBOL VAR VARS)
+		     (CHECK-SYMBOL-SETABILITY SVAR "bind (as a supplied-p variable)")
+		     (CHECK-FOR-DUPLICATE-SYMBOL SVAR VARS)
+		     (INCF N-OPTIONAL)
+		     (INCF N-AUX)
+		     (PUSH (LIST (COND ((OR SPECIAL
+					    (SPECIAL-VARIABLE-P VAR ENV SPECIALS))
+					(SETQ SPECIALS (DELQ VAR SPECIALS))
+					(CONS VAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+				       (T 
+					(SETQ UNSPECIALS (DELQ VAR UNSPECIALS))
+					VAR))
+				 VAL
+				 (COND ((OR SPECIAL
+					    (SPECIAL-VARIABLE-P SVAR ENV SPECIALS))
+					(SETQ SPECIALS (DELQ SVAR SPECIALS))
+					(CONS SVAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION SVAR) NIL)))
+				       (T
+					(SETQ UNSPECIALS (DELQ SVAR UNSPECIALS))
+					SVAR)))
+			   BINDINGS)
+		     (PUSH VAR VARS)
+		     (PUSH SVAR VARS))))
+	    (POP LAMBDA-LIST)))
+
+	;; Parse the rest argument
+	(WHEN (EQ ITEM '&REST)
+	  (PUSH ITEM BINDINGS)
+	  (POP LAMBDA-LIST)
+	  (SETQ ITEM (POP LAMBDA-LIST))
+	  (LOOP WHILE (MEMQ ITEM '(&SPECIAL &LOCAL))
+		DO (SETQ SPECIAL (EQ ITEM '&SPECIAL))
+		   (SETQ ITEM (POP LAMBDA-LIST)))
+	  (WHEN (MEMQ ITEM LAMBDA-LIST-KEYWORDS)
+	    (FERROR "Variable name missing between &REST and ~S" ITEM))
+	  (CHECK-SYMBOL-SETABILITY ITEM "bind (as a &rest argument)")
+	  (CHECK-FOR-DUPLICATE-SYMBOL ITEM VARS)
+	  (INCF N-AUX)
+	  (SETF (LDB %%ARG-DESC-REST-ARG ARGS-INFO) 1)
+	  (PUSH (COND ((OR SPECIAL (SPECIAL-VARIABLE-P ITEM ENV SPECIALS))
+		       (SETQ SPECIALS (DELQ ITEM SPECIALS))
+		       (CONS ITEM (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION ITEM) NIL)))
+		      (T
+		       (SETQ UNSPECIALS (DELQ ITEM UNSPECIALS))
+		       ITEM))
+		BINDINGS)
+	  (PUSH ITEM VARS)
+	  (WHEN (CDR (ASSQ 'FUTURE-COMMON-LISP:DYNAMIC-EXTENT (CDR (ASSQ ITEM VAR-DCLS))))
+	    (SETF (LDB %%LAMBDA-DYNAMIC-EXTENT-REST LAMBDA-INFO) 1))
+	  (SETQ ITEM (CAR LAMBDA-LIST)))
+
+	;; Parse the keyword arguments
+	(WHEN (EQ ITEM '&KEY)
+	  (PUSH ITEM BINDINGS)
+	  (POP LAMBDA-LIST)
+	  (SETF (LDB %%ARG-DESC-REST-ARG ARGS-INFO) 1)
+	  (LOOP WHILE LAMBDA-LIST DO
+	    (SETQ ITEM (CAR LAMBDA-LIST))
+	    (COND ((EQ ITEM '&SPECIAL) (SETQ SPECIAL T))	;Well the compiler supports it
+		  ((EQ ITEM '&LOCAL) (SETQ SPECIAL NIL))
+		  ((MEMQ ITEM LAMBDA-LIST-KEYWORDS) (RETURN))
+		  ((SYMBOLP ITEM)
+		   (CHECK-SYMBOL-SETABILITY ITEM "bind")
+		   (CHECK-FOR-DUPLICATE-SYMBOL ITEM VARS)
+		   (INCF N-AUX)
+		   (PUSH (LIST (INTERN (STRING ITEM) PKG-KEYWORD-PACKAGE)
+			       (COND ((OR SPECIAL
+					  (SPECIAL-VARIABLE-P ITEM ENV SPECIALS))
+				      (SETQ SPECIALS (DELQ ITEM SPECIALS))
+				      (CONS ITEM (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION ITEM) NIL)))
+				     (T
+				      (SETQ UNSPECIALS (DELQ ITEM UNSPECIALS))
+				      ITEM)))
+			 BINDINGS)
+		   (PUSH ITEM VARS))
+		  ((ATOM ITEM) (RETURN))
+		  ((NULL (CDDR ITEM))
+		   (LET* ((VAR (FIRST ITEM))
+			  (VAL (SECOND ITEM))
+			  (KEY (IF (LISTP VAR)
+				   (PROG1 (FIRST VAR) (SETQ VAR (SECOND VAR)))
+				   (INTERN (STRING VAR) PKG-KEYWORD-PACKAGE))))
+		     (CHECK-SYMBOL-SETABILITY VAR "bind")
+		     (CHECK-FOR-DUPLICATE-SYMBOL VAR VARS)
+		     (INCF N-AUX)
+		     (PUSH (LIST KEY
+				 (COND ((OR SPECIAL
+					    (SPECIAL-VARIABLE-P VAR ENV SPECIALS))
+					(SETQ SPECIALS (DELQ VAR SPECIALS))
+					(CONS VAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+				       (T
+					(SETQ UNSPECIALS (DELQ VAR UNSPECIALS))
+					VAR))
+				 VAL)
+			   BINDINGS)
+		     (PUSH VAR VARS)))
+		  ((CDDDR ITEM) (RETURN))
+		  (T
+		   (LET* ((VAR (FIRST ITEM))
+			  (VAL (SECOND ITEM))
+			  (SVAR (THIRD ITEM))
+			  (KEY (IF (LISTP VAR)
+				   (PROG1 (FIRST VAR) (SETQ VAR (SECOND VAR)))
+				   (INTERN (STRING VAR) PKG-KEYWORD-PACKAGE))))
+		     (CHECK-SYMBOL-SETABILITY VAR "bind")
+		     (CHECK-FOR-DUPLICATE-SYMBOL VAR VARS)
+		     (CHECK-SYMBOL-SETABILITY SVAR "bind (as a supplied-p variable)")
+		     (CHECK-FOR-DUPLICATE-SYMBOL SVAR VARS)
+		     (INCF N-AUX 2)
+		     (PUSH (LIST KEY
+				 (COND ((OR SPECIAL
+					    (SPECIAL-VARIABLE-P VAR ENV SPECIALS))
+					(SETQ SPECIALS (DELQ VAR SPECIALS))
+					(CONS VAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+				       (T
+					(SETQ UNSPECIALS (DELQ VAR UNSPECIALS))
+					VAR))
+				 VAL
+				 (COND ((OR SPECIAL
+					    (SPECIAL-VARIABLE-P SVAR ENV SPECIALS))
+					(SETQ SPECIALS (DELQ SVAR SPECIALS))
+					(CONS SVAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION SVAR) NIL)))
+				       (T
+					(SETQ UNSPECIALS (DELQ SVAR UNSPECIALS))
+					SVAR)))
+			   BINDINGS)
+		     (PUSH VAR VARS)
+		     (PUSH SVAR VARS))))
+	    (POP LAMBDA-LIST))
+	  (WHEN (EQ ITEM '&ALLOW-OTHER-KEYS)
+	    (SETF (LDB %%LAMBDA-ALLOW-OTHER-KEYS LAMBDA-INFO) 1)
+	    (POP LAMBDA-LIST)
+	    (SETQ ITEM (CAR LAMBDA-LIST))))
+
+	;; Parse the auxiliary variable bindings
+	(WHEN (EQ ITEM '&AUX)
+	  (PUSH ITEM BINDINGS)
+	  (POP LAMBDA-LIST)
+	  (LOOP WHILE LAMBDA-LIST DO
+	    (SETQ ITEM (CAR LAMBDA-LIST))
+	    (COND ((EQ ITEM '&SPECIAL) (SETQ SPECIAL T))	;Well the compiler supports it
+		  ((EQ ITEM '&LOCAL) (SETQ SPECIAL NIL))
+		  ((MEMQ ITEM LAMBDA-LIST-KEYWORDS) (RETURN))
+		  ((OR (ATOM ITEM) (NULL (CDDR ITEM)))
+		   (MULTIPLE-VALUE-BIND (VAR VAL)
+		       (IF (ATOM ITEM) (VALUES ITEM NIL)
+			   (VALUES (FIRST ITEM) (SECOND ITEM)))
+		     (CHECK-SYMBOL-SETABILITY VAR "bind")
+		     (CHECK-FOR-DUPLICATE-SYMBOL VAR VARS)
+		     (INCF N-AUX)
+		     (PUSH (COND ((OR SPECIAL
+				      (SPECIAL-VARIABLE-P VAR ENV SPECIALS))
+				  (SETQ SPECIALS (DELQ VAR SPECIALS))
+				  (LIST* VAL VAR (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+				 (T
+				  (SETQ UNSPECIALS (DELQ VAR UNSPECIALS))
+				  (CONS VAL VAR)))
+			   BINDINGS)
+		     (PUSH VAR VARS)))
+		  (T (RETURN)))
+	    (POP LAMBDA-LIST)))
+
+	;; Flush trailing &SPECIAL and &LOCAL (ILCP does this, and it's documented...)
+	(LOOP WHILE (MEMQ ITEM '(&SPECIAL &LOCAL))
+	      DO (POP LAMBDA-LIST)
+		 (SETQ ITEM (CAR LAMBDA-LIST)))
+
+	;; If anything is left, it was an error
+	(WHEN LAMBDA-LIST
+	  (FERROR "~S is illegal at this position in the lambda-list~%~S"
+		  ITEM ORIGINAL-LAMBDA-LIST))
+
+	;; Identify the fast case for APPLY-LAMBDA's benefit
+	(WHEN (AND (ZEROP N-AUX)
+		   (< (+ N-REQUIRED N-OPTIONAL) 40.)	;Based on max control-stack-frame size
+		   (NOT (LDB-TEST %%ARG-DESC-REST-ARG ARGS-INFO)))
+	  (SETF (LDB %%LAMBDA-FAST LAMBDA-INFO) 1))
+
+	(RETURN-FROM DIGEST-LAMBDA
+	  (LET ((N-BINDINGS (+ N-REQUIRED N-OPTIONAL N-AUX)))
+	    (WHEN ( N-BINDINGS (LSH 1 (BYTE-SIZE %%LAMBDA-N-BINDINGS)))
+	      (FERROR "The function ~s has ~s required, optional, and aux arguments, but the maximum allowed is ~s"
+		      FUNCTION
+		      N-BINDINGS
+		      (LSH 1 (BYTE-SIZE %%LAMBDA-N-BINDINGS))))
+	    `(DIGESTED-LAMBDA
+	       ,FUNCTION
+	       ,(AND (OR NAME DEBUG-INFO) (CONS NAME DEBUG-INFO))
+	       ,(DPB N-BINDINGS %%LAMBDA-N-BINDINGS LAMBDA-INFO)
+	       ,(DPB (+ N-REQUIRED N-OPTIONAL) %%ARG-DESC-MAX-ARGS
+		     (DPB N-REQUIRED %%ARG-DESC-MIN-ARGS ARGS-INFO))
+	       ,(MAPCAR #'(LAMBDA (VAR)
+			    `(,VAR . ,(FOLLOW-CELL-FORWARDING
+					(VALUE-CELL-LOCATION VAR) NIL)))
+			SPECIALS)
+	       ,(NREVERSE BINDINGS)
+	       ,DECLARATIONS
+	       ,@(LET ((*DIGEST-SPECIAL-FORM-BODIES* T))
+		   (DIGEST-BODY BODY ENV)))))))))
+
+(DEFUN CHECK-FOR-DUPLICATE-SYMBOL (VAR VARS)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (WHEN (AND (MEMQ VAR VARS)
+	     (NOT (EQ VAR 'IGNORE)))
+    (FERROR "The variable ~S appears more than once in the lambda list." VAR)))
+
+(PUSH* 'DIGESTED-LAMBDA *DIGESTED-SPECIAL-FORMS*)
+
+(DEFUN DIGESTED-LAMBDA-P (OBJECT)
+  (AND (LISTP OBJECT)
+       (EQ (CAR OBJECT) 'DIGESTED-LAMBDA)
+       ( (LENGTH OBJECT) 9)
+       (FUNCTIONP (SECOND OBJECT))
+       (OR (NULL (THIRD OBJECT)) (LISTP (THIRD OBJECT)))
+       (FIXNUMP (FOURTH OBJECT))
+       (FIXNUMP (FIFTH OBJECT))
+       ;; MORE THAN A COINCIDENCE?
+       ))
+       
+
+;;; SYS:DOWNWARD-FUNARG declaration
+
+;;; True if FUNCTION can be passed to CALLEE as its ARGNO'th argument in the form of
+;;; a stack closure, because it will not be retained past the call.
+;;; FUNCTION can be anything, but the only interesting cases are a DIGESTED-LAMBDA or
+;;; a closure of one.
+;;; It doesn't matter that this is a little bit slow, since it's still faster than consing.
+(DEFUN ARGUMENT-IS-DOWNWARD-FUNARG (CALLEE ARGNO FUNCTION)
+  (WHEN (INTERPRETED-FUNCTION-P FUNCTION)
+    (LET ((FUNCTION (INTERPRETED-FUNCTION-LAMBDA-EXPRESSION FUNCTION)))
+      (WHEN (EQ (CAR FUNCTION) 'DIGESTED-LAMBDA)
+	(OR (LDB-TEST %%LAMBDA-DOWNWARD (FOURTH FUNCTION))
+	    (LET ((FUNARG-INFO (CADR (ASSQ 'DOWNWARD-FUNARG (DEBUGGING-INFO CALLEE)))))
+	      (IF FUNARG-INFO
+		  (IF (MINUSP (CAR FUNARG-INFO))
+		      ( ARGNO (- 1 (CAR FUNARG-INFO)))
+		      (MEMQ ARGNO FUNARG-INFO)))))))))	;memq is faster than mem #'=
+
+(DEFUN FIND-ARG-INDEX (ARG ARGLIST)
+  (LET ((INDEX 0))
+    (LT:MAP-OVER-LAMBDA-LIST
+      ARGLIST
+      #'(LAMBDA (SUBLIST TYPE)
+	  (LET ((VAR (FIRST SUBLIST)))
+	    (WHEN (LISTP VAR) (SETF VAR (FIRST VAR)))
+	    (SELECTQ TYPE
+	      ((:REQUIRED :OPTIONAL)
+	       (WHEN (EQ VAR ARG)
+		 (RETURN-FROM FIND-ARG-INDEX INDEX))
+	       (INCF INDEX))
+	      ((:KEY)
+	       (WHEN (EQ ARG (IF (LISTP VAR) (SECOND VAR) VAR))
+		 (RETURN-FROM FIND-ARG-INDEX
+		   (IF (LISTP VAR)
+		       (FIRST VAR)
+		       (INTERN (GET-PNAME VAR) PKG-KEYWORD-PACKAGE)))))
+	      ((:REST)
+	       (WHEN (EQ ARG VAR)
+		 (RETURN-FROM FIND-ARG-INDEX '&REST))))))
+      :MACRO-&KEYWORDS T :MACRO-DESTRUCTURE-P T))
+  NIL)
+
+(DEFUN DOWNWARD-FUNARG-DEBUGGING-INFO (DECLARATION LAMBDA-LIST DECLARATIONS)
+  (SELECTQ (CAR DECLARATION)
+    ((DOWNWARD-FUNARG FUTURE-COMMON-LISP:DYNAMIC-EXTENT)
+     ;; Declaration lists arguments that can be downward funargs
+     (WHEN (FBOUNDP 'LT:MAP-OVER-LAMBDA-LIST)
+       (LET* ((ARG (CDR DECLARATION))
+	      (LENGTH (LENGTH ARG))
+	      (CAR-ARG (CAR ARG))
+	      (ARGLIST (CDR (ASSQ 'ARGLIST (CDR DECLARATIONS)))))
+	 (WHEN (EQ (CAR DECLARATION) 'DOWNWARD-FUNARG)
+	   (WHEN (AND (CL:CONSP CAR-ARG)
+		      (NULL (CDR ARG))
+		      (EVERY CAR-ARG #'FIXP))
+	     (RETURN-FROM DOWNWARD-FUNARG-DEBUGGING-INFO
+	       CAR-ARG))
+	   (WHEN (AND (EQ CAR-ARG '*) (= LENGTH 1))
+	     (RETURN-FROM DOWNWARD-FUNARG-DEBUGGING-INFO
+	       '(-1)))
+	   (WHEN (AND (= LENGTH 1) (LISTP CAR-ARG) (EQ (FIRST CAR-ARG) 'NOT))
+	     (COND ((OR (AND ARGLIST (EQ (SECOND CAR-ARG) (FIRST ARGLIST)))
+			(EQ (SECOND CAR-ARG) (FIRST LAMBDA-LIST)))
+		    (RETURN-FROM DOWNWARD-FUNARG-DEBUGGING-INFO
+		      '(-1)))
+		   (T
+		    (WARN "~S is not a supported declaration because ~S is not the first argument in ~S."
+			  DECLARATION (SECOND CAR-ARG) (OR ARGLIST LAMBDA-LIST))
+		    (RETURN-FROM DOWNWARD-FUNARG-DEBUGGING-INFO
+		      NIL)))))
+	 (LET ((DOWNWARD-FUNARGS NIL))
+	   (DOLIST (SYM ARG)
+	     (LET ((INDEX (OR (AND ARGLIST (FIND-ARG-INDEX SYM ARGLIST))
+			      (FIND-ARG-INDEX SYM LAMBDA-LIST))))
+	       (COND ((FIXP INDEX)
+		      (PUSH INDEX DOWNWARD-FUNARGS))
+		     ((NULL INDEX)
+		      (WARN "~S is not a valid declaration because ~S is not an argument in ~S."
+			    DECLARATION SYM (OR ARGLIST LAMBDA-LIST)))
+		     ((EQ INDEX '&REST))
+		     (T
+		      (WARN "The declaration ~S will be ignored because ~S is a keyword argument in ~S."
+			    DECLARATION SYM (OR ARGLIST LAMBDA-LIST))))))
+	   DOWNWARD-FUNARGS))))))
+
+
+;;; Interpretation of (digested) LAMBDA expressions
+;;; I'm sorry; the code on this page tends to be low-level and gross.  Too bad.
+
+;Internal macro of APPLY-LAMBDA
+(DEFMACRO ARGBIND (VAR VAL CONS-P)
+  `(PROGN (COND ((SYMBOLP ,VAR)			;Lexical
+		 ,(IF CONS-P
+		      `(RPLACA BP (LIST ,VAR ,VAL))
+		      `(PROGN
+			 (%PUSH ,VAR)
+			 (%PUSH ,VAL)
+			 (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL)
+			 (RPLACA BP (%MAKE-POINTER DTP-LIST
+						   (COMPILER:%STACK-LOCATION-INTERNAL 2))))))
+		(T				;Special
+		 (%BIND-LOCATION (CDR ,VAR) ,VAL)
+		 (RPLACA BP ,VAR)))
+	  (SETF (ENV-VARIABLES) BP)		;Sequential binding
+	  (SETQ BP (%MAKE-POINTER-OFFSET DTP-LIST BP -1))))
+
+;This function is called, with arguments like APPLY, by the microcode when
+;an attempt is made to call a function the microcode does not understand.
+;Currently it's really called by CALL-FUNNY-FUNCTION, not the actual microcode.
+;The first argument (the function) is guaranteed to be a list.
+;The second argument (the arg list) is generally in the stack, not a "real" list.
+;As with DIGEST-LAMBDA, there is a lot of duplicated code, but it seems simplest that way.
+(DEFUN APPLY-LAMBDA (OLD-ENV FUNCTION ARGUMENTS)
+  ;; Pull it apart, and bind all variables we will need before doing any %PUSHes
+  (PROG* ((BODY (CDDDR FUNCTION))
+	  (LAMBDA-INFO (POP BODY))
+	  (ARGS-INFO (POP BODY))
+	  (SPECIALS (POP BODY))
+	  (BINDINGS (POP BODY))
+	  (DECLARATIONS (POP BODY))
+	  (TEM OLD-ENV)
+	  (N (LDB %%ARG-DESC-MAX-ARGS ARGS-INFO))
+	  BP VAR VAL L)
+	 
+	 ;; Check for wrong number of arguments
+      RETRY
+	 (SETQ VAL (LENGTH ARGUMENTS))
+	 (WHEN (< VAL (LDB %%ARG-DESC-MIN-ARGS ARGS-INFO))
+	   (SIGNAL-PROCEED-CASE ((X) 'TOO-FEW-ARGUMENTS
+				 :FUNCTION FUNCTION
+				 :ARGUMENT-LIST (COPYLIST ARGUMENTS)
+				 :NARGS VAL)
+	     (:ADDITIONAL-ARGUMENTS
+	       (SETQ ARGUMENTS (APPEND ARGUMENTS X))
+	       (GO RETRY))
+	     (:VALUES (RETURN (VALUES-LIST X)))))
+	 (UNLESS (LDB-TEST %%ARG-DESC-REST-ARG ARGS-INFO)
+	   (WHEN (> VAL N)
+	     (SIGNAL-PROCEED-CASE ((X) 'TOO-MANY-ARGUMENTS
+				   :FUNCTION FUNCTION
+				   :ARGUMENT-LIST (COPYLIST ARGUMENTS)
+				   :NARGS VAL)
+	       (:FEWER-ARGUMENTS
+		 (SETQ ARGUMENTS (FIRSTN X ARGUMENTS))
+		 (GO RETRY))
+	       (:VALUES (RETURN (VALUES-LIST X))))))
+	 
+	 ;; Start building the new environment on the stack
+	 ;; Start with a copy of the old environment, with the new declarations added
+	 (WITH-INTERPRETER-ENVIRONMENT (ENV OLD-ENV
+					    (POP TEM) (POP TEM) (POP TEM) (POP TEM) (CAR TEM)
+					    DECLARATIONS)
+	   
+	   ;; Install the SPECIAL declaration pseudo-bindings, copying them
+	   ;; into the stack if necessary
+	   (INTERPRET-SPECIAL-DECLARATIONS ENV OLD-ENV SPECIALS)
+	   
+	   ;; If instance-variable pseudo-bindings are needed, go off and install them
+	   (WHEN (LDB-TEST %%LAMBDA-METHOD LAMBDA-INFO)
+	     (WHEN (SETQ TEM (ASSQ 'FLAVOR:LOCAL-FUNCTIONS DECLARATIONS))
+	       ;; Install local functions into the environment
+	       ;; The APPEND case should never happen, so don't bother with a stack-list.
+	       (SETF (ENV-FUNCTIONS ENV) (IF (NULL (ENV-FUNCTIONS ENV))
+					     (CDR TEM)
+					     (APPEND (CDR TEM) (ENV-FUNCTIONS ENV)))))
+	     (RETURN (APPLY-LAMBDA-METHOD BINDINGS ARGUMENTS ENV ARGS-INFO LAMBDA-INFO BODY
+					  (CDDR (ASSQ 'INSTANCE-VARIABLES DECLARATIONS)))))
+	   
+	   ;; If hair is required, go off and handle the hairy case
+	   (UNLESS (LDB-TEST %%LAMBDA-FAST LAMBDA-INFO)
+	     (RETURN (APPLY-LAMBDA-INTERNAL BINDINGS ARGUMENTS ENV ARGS-INFO LAMBDA-INFO BODY)))
+	   
+	   ;; Handle the simple case in-line.  This is just a bum to make the stack smaller.
+	   
+	   (%WITH-BINDING-STACK-LEVEL
+	     ;; Build a stack list to contain the argument bindings
+	     (SETQ TEM (LDB %%LAMBDA-N-BINDINGS LAMBDA-INFO))
+	     (UNLESS (ZEROP TEM)
+	       (COND (( (STACK-SPACE-LEFT) (+ (* TEM 3) 15.))
+		      (LOOP DO (%PUSH NIL)
+			       (DECF TEM)
+			    UNTIL (ZEROP TEM))
+		      ;; Save address of the highest argument binding slot
+		      (SETQ BP (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 0)))
+		      (COND ((NULL (ENV-VARIABLES))
+			     ;; Close off the bindings list
+			     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL))
+			    (T
+			     ;; Hook onto the other bindings already pushed
+			     (%PUSH (ENV-VARIABLES))
+			     (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 2)
+						CDR-NORMAL)))
+		      ;; ENV is now the right environment to begin taking arguments
+		      ;; As each argument is taken, move BP down and augment the environment
+		      ;; This is the simple case, so there are only required+optional arguments
+		      ;; and no supplied-p variables
+		      (LOOP UNTIL (ZEROP N) DO
+			(SETQ L (POP BINDINGS))
+			(COND ((OR (ATOM L) (ATOM (CDR L)))	;No defaulting hair
+			       (ARGBIND L (CAR ARGUMENTS) NIL))
+			      (T
+			       (SETQ VAR (POP L))	;Variable
+			       (SETQ VAL (POP L))	;Default
+			       (SETQ VAL (IF ARGUMENTS (CAR ARGUMENTS) (EVAL VAL ENV)))
+			       (ARGBIND VAR VAL NIL)))
+			(SETQ ARGUMENTS (CDR ARGUMENTS))
+			(DECF N)))
+		     (T
+		      (COND ((NULL (ENV-VARIABLES))
+			     (SETQ BP (%MAKE-POINTER-OFFSET
+					DTP-LIST
+					(MAKE-LIST TEM) (1- TEM))))
+			    (T
+			     (SETQ BP (%MAKE-POINTER-OFFSET
+					DTP-LOCATIVE
+					(MAKE-LIST (1+ TEM))
+					TEM))
+			     (SETF (LOCATION-CONTENTS BP) (ENV-VARIABLES))
+			     (SETQ BP (%MAKE-POINTER-OFFSET DTP-LIST BP -1))
+			     (%P-STORE-CDR-CODE BP CDR-NORMAL)))
+		      ;; ENV is now the right environment to begin taking arguments
+		      ;; As each argument is taken, move BP down and augment the environment
+		      ;; This is the simple case, so there are only required+optional arguments
+		      ;; and no supplied-p variables
+		      (LOOP UNTIL (ZEROP N) DO
+			(SETQ L (POP BINDINGS))
+			(COND ((OR (ATOM L) (ATOM (CDR L)))	;No defaulting hair
+			       (ARGBIND L (CAR ARGUMENTS) T))
+			      (T
+			       (SETQ VAR (POP L))	;Variable
+			       (SETQ VAL (POP L))	;Default
+			       (SETQ VAL (IF ARGUMENTS (CAR ARGUMENTS) (EVAL VAL ENV)))
+			       (ARGBIND VAR VAL T)))
+			(SETQ ARGUMENTS (CDR ARGUMENTS))
+			(DECF N)))))
+	     ;; Evaluate the body
+	     (RETURN (EVAL-BODY BODY ENV))))))
+
+;;; Hairy case of LAMBDA argument taking
+(DEFUN APPLY-LAMBDA-INTERNAL (BINDINGS ARGUMENTS ENV ARGS-INFO LAMBDA-INFO BODY)
+  ;; Bind all variables we will need before doing any %PUSHes
+  (%WITH-BINDING-STACK-LEVEL
+    (LET ((N (LDB %%ARG-DESC-MAX-ARGS ARGS-INFO))
+	  (TEM (LDB %%LAMBDA-N-BINDINGS LAMBDA-INFO))
+	  BP VAR VAL L)
+      
+      (COND ((ZEROP TEM)			;Allow Fortran DO-loops
+	     (WHEN (EQ (FIRST BINDINGS) '&KEY)
+	       (VALIDATE-KEYWORDS-LAMBDA NIL ARGUMENTS LAMBDA-INFO)))
+	    (( (STACK-SPACE-LEFT) (+ (* TEM 3) 15.))
+	     ;; Build a stack list to contain the argument bindings
+	     (LOOP UNTIL (ZEROP TEM)
+		   DO (%PUSH NIL)
+		      (DECF TEM))
+	     
+	     ;; Save address of the highest argument binding slot
+	     (SETQ BP (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 0)))
+	     (COND ((NULL (ENV-VARIABLES))
+		    ;; Close off the bindings list
+		    (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL))
+		   (T
+		    ;; Hook onto the other bindings already pushed
+		    (%PUSH (ENV-VARIABLES))
+		    (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 2) CDR-NORMAL)))
+	     
+	     ;; ENV is now the right environment to begin taking arguments
+	     ;; As each argument is taken, move BP down and augment the environment on the stack
+	     
+	     ;; Take required and optional arguments
+	     (LOOP UNTIL (ZEROP N) DO
+	       (SETQ L (POP BINDINGS))
+	       (COND ((OR (ATOM L) (ATOM (CDR L)))	;No defaulting hair
+		      (ARGBIND L (CAR ARGUMENTS) NIL))
+		     (T
+		      (SETQ VAR (POP L))	;Variable
+		      (SETQ VAL (POP L))	;Default
+		      (SETQ VAL (IF ARGUMENTS (CAR ARGUMENTS) (EVAL VAL ENV)))
+		      (ARGBIND VAR VAL NIL)
+		      (SETQ VAR (CAR L))	;Supplied-p variable
+		      (WHEN VAR (ARGBIND VAR (NOT (NULL ARGUMENTS)) NIL))))
+	       (SETQ ARGUMENTS (CDR ARGUMENTS))
+	       (DECF N))
+	     
+	     (WHEN BINDINGS			;Speed bum for common case
+	       (SETQ TEM (POP BINDINGS))
+	       
+	       ;; Take rest arg
+	       (WHEN (EQ TEM '&REST)
+		 (SETQ VAR (POP BINDINGS))
+		 (ARGBIND VAR (IF (LDB-TEST %%LAMBDA-DYNAMIC-EXTENT-REST LAMBDA-INFO)
+				  ARGUMENTS
+				  (APPLY #'LIST ARGUMENTS))
+			  NIL)
+		 (SETQ TEM (POP BINDINGS)))	;&KEY or &AUX
+	       
+	       ;; Take keyword arguments
+	       (WHEN (EQ TEM '&KEY)
+		 ;; Check number of arguments and validity of keywords
+		 (VALIDATE-KEYWORDS-LAMBDA BINDINGS ARGUMENTS LAMBDA-INFO)
+		 
+		 ;; Now do the bindings sequentially
+		 (LOOP WHILE BINDINGS DO
+		   (SETQ TEM (POP BINDINGS))
+		   (WHEN (EQ TEM '&AUX) (RETURN))
+		   (SETQ N (POP TEM))		;Keyword
+		   (SETQ VAR (POP TEM))		;Variable spec
+		   (COND ((NULL TEM)		;Speed bum, default is NIL and no supplied-p
+			  (ARGBIND VAR (GET (LOCF ARGUMENTS) N) NIL))
+			 (T			;Have to search
+			  (SETQ L ARGUMENTS)
+			  (LOOP WHILE L
+				DO (WHEN (EQ (CAR L) N)
+				     (SETQ VAL (CADR L))
+				     (RETURN))
+				   (SETQ L (CDDR L))
+				FINALLY
+				  (SETQ VAL (EVAL (CAR TEM) ENV)))
+			  (ARGBIND VAR VAL NIL)
+			  (WHEN (SETQ VAR (CADR TEM))	;Supplied-p
+			    (ARGBIND VAR (NOT (NULL L)) NIL))))))
+	       
+	       ;; Perform auxiliary bindings
+	       (LOOP WHILE BINDINGS DO
+		 (SETQ TEM (POP BINDINGS))
+		 (SETQ VAL (EVAL (CAR TEM) ENV))
+		 (SETQ TEM (CDR TEM))
+		 (ARGBIND TEM VAL NIL))))
+	    (T
+	     (COND ((NULL (ENV-VARIABLES))
+		    (SETQ BP (%MAKE-POINTER-OFFSET
+			       DTP-LIST
+			       (MAKE-LIST TEM) (1- TEM))))
+		   (T
+		    (SETQ BP (%MAKE-POINTER-OFFSET
+			       DTP-LOCATIVE
+			       (MAKE-LIST (1+ TEM))
+			       TEM))
+		    (SETF (LOCATION-CONTENTS BP) (ENV-VARIABLES))
+		    (SETQ BP (%MAKE-POINTER-OFFSET DTP-LIST BP -1))
+		    (%P-STORE-CDR-CODE BP CDR-NORMAL)))
+
+	     ;; ENV is now the right environment to begin taking
+	     ;; arguments As each argument is taken, move BP down and
+	     ;; augment the environment on the stack
+	     
+	     ;; Take required and optional arguments
+	     (LOOP UNTIL (ZEROP N) DO
+	       (SETQ L (POP BINDINGS))
+	       (COND ((OR (ATOM L) (ATOM (CDR L)))	;No defaulting hair
+		      (ARGBIND L (CAR ARGUMENTS) T))
+		     (T
+		      (SETQ VAR (POP L))	;Variable
+		      (SETQ VAL (POP L))	;Default
+		      (SETQ VAL (IF ARGUMENTS (CAR ARGUMENTS) (EVAL VAL ENV)))
+		      (ARGBIND VAR VAL T)
+		      (SETQ VAR (CAR L))	;Supplied-p variable
+		      (WHEN VAR (ARGBIND VAR (NOT (NULL ARGUMENTS)) T))))
+	       (SETQ ARGUMENTS (CDR ARGUMENTS))
+	       (DECF N))
+	     
+	     (WHEN BINDINGS			;Speed bum for common case
+	       (SETQ TEM (POP BINDINGS))
+	       
+	       ;; Take rest arg
+	       (WHEN (EQ TEM '&REST)
+		 (SETQ VAR (POP BINDINGS))
+		 (ARGBIND VAR ARGUMENTS T)
+		 (SETQ TEM (POP BINDINGS)))	;&KEY or &AUX
+	       
+	       ;; Take keyword arguments
+	       (WHEN (EQ TEM '&KEY)
+		 ;; Check number of arguments and validity of keywords
+		 (VALIDATE-KEYWORDS-LAMBDA BINDINGS ARGUMENTS LAMBDA-INFO)
+		 
+		 ;; Now do the bindings sequentially
+		 (LOOP WHILE BINDINGS DO
+		   (SETQ TEM (POP BINDINGS))
+		   (WHEN (EQ TEM '&AUX) (RETURN))
+		   (SETQ N (POP TEM))		;Keyword
+		   (SETQ VAR (POP TEM))		;Variable spec
+		   (COND ((NULL TEM)		;Speed bum, default is NIL and no supplied-p
+			  (ARGBIND VAR (GET (LOCF ARGUMENTS) N) T))
+			 (T			;Have to search
+			  (SETQ L ARGUMENTS)
+			  (LOOP WHILE L
+				DO (WHEN (EQ (CAR L) N)
+				     (SETQ VAL (CADR L))
+				     (RETURN))
+				   (SETQ L (CDDR L))
+				FINALLY
+				  (SETQ VAL (EVAL (CAR TEM) ENV)))
+			  (ARGBIND VAR VAL T)
+			  (WHEN (SETQ VAR (CADR TEM))	;Supplied-p
+			    (ARGBIND VAR (NOT (NULL L)) T))))))
+	       
+	       ;; Perform auxiliary bindings
+	       (LOOP WHILE BINDINGS DO
+		 (SETQ TEM (POP BINDINGS))
+		 (SETQ VAL (EVAL (CAR TEM) ENV))
+		 (SETQ TEM (CDR TEM))
+		 (ARGBIND TEM VAL T)))))
+      
+      ;; Evaluate the body
+      (EVAL-BODY BODY ENV))))  
+
+;;; Add bindings of instance variables to the lexical environment
+(DEFUN APPLY-LAMBDA-METHOD (BINDINGS ARGUMENTS ENV ARGS-INFO LAMBDA-INFO BODY VARS
+			    &AUX
+			    (SELF (PROGN #+3600 (FIRST ARGUMENTS)
+					 #+IMACH (SECOND ARGUMENTS))))
+  (CHECK-ARG-TYPE SELF :INSTANCE)
+  (SETQ SELF (FOLLOW-STRUCTURE-FORWARDING SELF))	;%MAKE-POINTER-OFFSET doesn't
+  (LET* ((N (MIN (LENGTH VARS)
+		 (PROGN #+3600 50.		;At most 50 bindings per stack frame
+			#+IMACH 12.)))		;Approximate to 25 for Ivory
+	 (TEM N)
+	 (ALL-VARS (FLAVOR:FLAVOR-ALL-INSTANCE-VARIABLES (%INSTANCE-FLAVOR SELF)))
+	 POS BP LP)
+
+    (WHEN (PLUSP N)				;Allow Fortran DO-loops
+  
+      ;; No %ASSURE-PDL-ROOM needed because of above MIN check
+      
+      ;; Allocate the stack slots for the list of binding descriptors
+      ;; LP points at the list, BP points just before it
+      (SETQ BP (COMPILER:%STACK-LOCATION-INTERNAL 0))
+      (%PUSH NIL)
+      (SETQ LP (%MAKE-POINTER DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 0)))
+      (LOOP DO (%PUSH NIL)
+	       (DECF TEM)
+	    UNTIL (ZEROP TEM))
+  
+      ;; Build the binding descriptors, pairs of (name . value-cell-location)
+      (LOOP DO (SETQ TEM (POP VARS))
+	       (SETQ POS (FIND-POSITION-IN-LIST TEM ALL-VARS))
+	       (WHEN POS
+		 ;; Bind this instance variable lexically to its instance slot, but
+		 ;; only if it has not been deleted.  If it has been deleted, which
+		 ;; can actually happen, omit it from the environment.
+		 (%PUSH TEM)
+		 (%PUSH (%MAKE-POINTER-OFFSET DTP-LOCATIVE SELF (1+ POS)))
+		 (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 2) CDR-NORMAL)
+		 (%P-STORE-CONTENTS-INCREMENT-POINTER
+		   (%MAKE-POINTER DTP-LIST
+				  (PROGN #+3600(COMPILER:%STACK-LOCATION-INTERNAL 1)
+					 ;; This is a RPLACD2 on the I machine, so
+					 ;; the pointer we will write to is also on
+					 ;; the stack.
+					 #+IMACH(COMPILER:%STACK-LOCATION-INTERNAL 2)))
+		   BP))
+	       (DECF N)
+	    UNTIL (ZEROP N))
+
+      ;; Hook onto the other bindings already pushed, if there were any
+      (UNLESS (EQ BP (%MAKE-POINTER-OFFSET DTP-LOCATIVE LP -1))
+	(%P-STORE-CDR-CODE BP CDR-NORMAL)
+	(%P-STORE-CONTENTS-INCREMENT-POINTER (ENV-VARIABLES) BP)
+	(SETF (ENV-VARIABLES) LP)))
+
+    ;; Recurse to do the rest of the job
+    (IF VARS
+	(APPLY-LAMBDA-METHOD BINDINGS ARGUMENTS ENV ARGS-INFO LAMBDA-INFO BODY VARS)
+	(APPLY-LAMBDA-INTERNAL BINDINGS ARGUMENTS ENV ARGS-INFO LAMBDA-INFO BODY))))
+
+;;; Broken off to make APPLY-LAMBDA smaller and so I can use normal looping constructs
+;;; without having to worry about %PUSH interfering
+(DEFUN VALIDATE-KEYWORDS-LAMBDA (BINDINGS ARGUMENTS LAMBDA-INFO)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (IF (OR (LDB-TEST %%LAMBDA-ALLOW-OTHER-KEYS LAMBDA-INFO)
+	  (CL:GETF ARGUMENTS :ALLOW-OTHER-KEYS))
+      ;; Only check the number of arguments
+      (VALIDATE-KEYWORDS-INTERNAL-ALLOW-OTHER-KEYS ARGUMENTS)
+      ;; Check both the keyword names and the number of arguments
+      (CL:LOOP
+	 (WHEN (ENDP ARGUMENTS) (RETURN))
+	 (LET ((KEY (POP ARGUMENTS)))
+	   (UNLESS (EQ KEY :ALLOW-OTHER-KEYS)
+	     (DO ((L BINDINGS (CDR L)))
+		 ((OR (NULL L) (ATOM (CAR L)))
+		  (CL:CERROR "Ignore the keyword argument ~S"
+			     "~S is not a valid keyword" KEY))
+	       (WHEN (EQ (CAAR L) KEY)
+		 (RETURN))))
+	   (COMPILER:%ERROR-WHEN (ENDP ARGUMENTS)
+	     (CL:CERROR "Assume NIL as the value of the ~S keyword argument"
+			"The value after the keyword ~S is missing." KEY)))
+	 (SETF ARGUMENTS (CDR ARGUMENTS))))
+  NIL)
+
+
+;Idea for representing closure taken from FUTURE-COMMON-LISP:CONSTANTLY.
+;Idea for this particular attack on the lexical binding taken from LT::MAPFORMS-FLET-LABELS.
+(DEFUN FAKE-FUNCTION-BINDING (NAME)
+  (LIST NAME 
+	(MAKE-LEXICAL-CLOSURE
+	  ;; Note that this is kind of a bizarre use of the environment, 
+	  ;; but I had a discussion about this with Cyphers before he left
+	  ;; and he seemed to think it was completely reasonable.
+	  NAME
+	  #'(LAMBDA (ENV-OBJ-IS-NAME &REST IGNORE)
+	      (DECLARE (CLOS:PRINT-OBJECT FAKE-FUNCTION-BINDING-PRINTER)
+		       (DBG:ERROR-REPORTER))
+	      (ERROR "Can't call lexical function ~S at syntax analysis time."
+		     ENV-OBJ-IS-NAME)))))
+
+;Modeled after CLI::CONSTANTLY-PRINTER.
+(DEFUN FAKE-FUNCTION-BINDING-PRINTER (OBJECT STREAM)
+  (WHEN (CL:TYPEP OBJECT 'SYS:LEXICAL-CLOSURE)
+    (SI:PRINTING-RANDOM-OBJECT (OBJECT STREAM)
+   ;(FUTURE-COMMON-LISP:PRINT-UNREADABLE-OBJECT (OBJECT STREAM :TYPE NIL :IDENTITY T)
+      (FORMAT STREAM "Placeholder for lexical function ~S"
+	      ;See comments on FAKE-FUNCTION-BINDING.
+	      (CLI::LEXICAL-CLOSURE-ENVIRONMENT OBJECT)))))
+
+(DEFMACRO WITH-FAKE-FUNCTION-BINDINGS ((FUNCTION-BINDINGS-VAR ENV-VAR) &BODY FORMS)
+  (CL:CHECK-TYPE FUNCTION-BINDINGS-VAR SYMBOL "a functions variable")
+  (CL:CHECK-TYPE ENV-VAR SYMBOL "an environment variable")
+  `(FLET ((DO-IT (,ENV-VAR) ,@FORMS))
+     (DESTRUCTURING-BIND (VARS FNS BLKS TAGS DCLS) ,ENV-VAR
+       (WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ,ENV-VAR VARS
+				      ;; This conses, but just at syntax-analysis time.
+				      ;; Maybe candidate for optimization, but probably
+				      ;; not very critical. -kmp 31-Jul-92
+				      (APPEND (MAPCAR #'FAKE-FUNCTION-BINDING
+						      (MAPCAR #'CAR ,FUNCTION-BINDINGS-VAR))
+					      FNS)
+				      BLKS TAGS DCLS)
+	 (DO-IT NEW-ENV)))))
+
+
+;;; Special forms for local functions
+
+;; This function exists because you can't do anything useful after using %PUSH.
+;; It digests the body, digests the internal functions (for LABELS), and returns
+;; the digested stuff.
+(DEFUN DIGEST-FUNCTION-THING
+       (FORM-NAME FORM REAL-FUNCTIONS REAL-DECLARATIONS BODY NEW-ENV &OPTIONAL SPECIALS)
+  (WHEN (EQ FORM-NAME 'DIGESTED-LABELS)
+    (DOLIST (FENTRY REAL-FUNCTIONS)
+      (SETF (SECOND FENTRY) (DIGEST-LAMBDA (SECOND FENTRY) NEW-ENV NIL T))))
+  (WHEN SPECIALS
+    (SETF REAL-FUNCTIONS
+	  (APPEND (MAPCAR #'(LAMBDA (VAR)
+			      (CONS VAR
+				    (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL)))
+			  SPECIALS)
+		  REAL-FUNCTIONS)))
+  `(,FORM-NAME ,FORM ,REAL-FUNCTIONS ,REAL-DECLARATIONS ,@(DIGEST-BODY BODY NEW-ENV)))
+
+;;;
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM FUTURE-COMMON-LISP:LABELS (&WHOLE FORM FUNCTIONS &BODY BODY &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (CHECK-FUNCTION-LET-SYNTAX FORM)
+  (MULTIPLE-VALUE-BIND (REAL-DECLARATIONS SPECIALS BODY NIL NIL NIL NIL FUN-DCLS)
+      (WITH-FAKE-FUNCTION-BINDINGS (FUNCTIONS ENV)
+        (PARSE-BODY-DECLARATIONS BODY ENV))
+    (LET ((REAL-FUNCTIONS (MAPCAR #'(LAMBDA (FUNCTION)
+				      (DESTRUCTURING-BIND (NAME LAMBDA-LIST &REST BODY) FUNCTION
+					(LET ((ENTRY (ASSQ NAME FUN-DCLS)))
+					  (WHEN (AND ENTRY
+						     (ASSQ 'FUTURE-COMMON-LISP:DYNAMIC-EXTENT
+							   (CDR ENTRY)))
+					    (PUSH '(DECLARE (DOWNWARD-FUNCTION)) BODY)))
+					`(,NAME
+					  (LAMBDA ,LAMBDA-LIST
+					    (DECLARE (FUNCTION-NAME ,NAME))
+					    ,@(WRAP-BODY-WITH-BLOCK NAME BODY)))))
+				  FUNCTIONS)))
+      (PUSH `(LISP:NOTINLINE ,@(MAPCAR #'FIRST FUNCTIONS)) REAL-DECLARATIONS)
+      ;; Build new environment for digestion only.
+      (LET ((FUNCTIONS REAL-FUNCTIONS)
+	    (DECLARATIONS REAL-DECLARATIONS)
+	    (E ENV))
+	(INTERPRET-FUNCTION-BINDINGS
+	  (FUNCTIONS LABELS 5
+		     (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+			      DECLARATIONS)
+		     (DECLARATIONS E FUNCTIONS))
+	  (DIGEST-FUNCTION-THING 'DIGESTED-LABELS FORM REAL-FUNCTIONS REAL-DECLARATIONS BODY
+				 NEW-ENV SPECIALS))))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-LABELS (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Create all the variables we will need before doing any %PUSHes
+  (LET ((FUNCTIONS (POP BODY))
+	(DECLARATIONS (POP BODY))
+	(E ENV))
+    ;; Build new environment
+    (INTERPRET-FUNCTION-BINDINGS (FUNCTIONS LABELS 5
+				  (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+					       DECLARATIONS)
+				  (DECLARATIONS E FUNCTIONS))
+      ;; Evaluate the body
+      (EVAL-BODY BODY NEW-ENV))))
+
+;;;
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM FUTURE-COMMON-LISP:FLET (&WHOLE FORM FUNCTIONS &BODY BODY &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (CHECK-FUNCTION-LET-SYNTAX FORM)
+  (MULTIPLE-VALUE-BIND (REAL-DECLARATIONS SPECIALS BODY NIL NIL NIL NIL FUN-DCLS)
+      (WITH-FAKE-FUNCTION-BINDINGS (FUNCTIONS ENV)
+        (PARSE-BODY-DECLARATIONS BODY ENV))
+    (LET ((REAL-FUNCTIONS (MAPCAR #'(LAMBDA (FUNCTION)
+				      (DESTRUCTURING-BIND (NAME LAMBDA-LIST &REST BODY) FUNCTION
+					(LET ((ENTRY (ASSQ NAME FUN-DCLS)))
+					  (WHEN (AND ENTRY
+						     (ASSQ 'FUTURE-COMMON-LISP:DYNAMIC-EXTENT
+							   (CDR ENTRY)))
+					    (PUSH '(DECLARE (DOWNWARD-FUNCTION)) BODY)))
+					`(,NAME ,(DIGEST-LAMBDA
+						   `(LAMBDA ,LAMBDA-LIST
+						      (DECLARE (FUNCTION-NAME ,NAME))
+						      ,@(WRAP-BODY-WITH-BLOCK NAME BODY))
+						   ENV NIL T))))
+				  FUNCTIONS)))
+      (PUSH `(LISP:NOTINLINE ,@(MAPCAR #'FIRST FUNCTIONS)) REAL-DECLARATIONS)
+      ;; Build new environment for digestion only.
+      (LET ((FUNCTIONS REAL-FUNCTIONS)
+	    (DECLARATIONS REAL-DECLARATIONS)
+	    (E ENV))
+	(INTERPRET-FUNCTION-BINDINGS
+	  (FUNCTIONS FLET 5
+		     (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+			      DECLARATIONS)
+		     (DECLARATIONS E FUNCTIONS))
+	  (DIGEST-FUNCTION-THING 'DIGESTED-FLET FORM REAL-FUNCTIONS REAL-DECLARATIONS BODY
+				 NEW-ENV SPECIALS))))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-FLET (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Create all the variables we will need before doing any %PUSHes
+  (LET ((FUNCTIONS (POP BODY))
+	(DECLARATIONS (POP BODY))
+	(E ENV))
+    ;; Build new environment
+    (INTERPRET-FUNCTION-BINDINGS (FUNCTIONS FLET 5
+				  (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+					       DECLARATIONS)
+				  (DECLARATIONS E FUNCTIONS))
+      ;; Evaluate the body
+      (EVAL-BODY BODY NEW-ENV))))
+
+;;;
+
+(EVAL-WHEN (COMPILE LOAD EVAL)
+(DEFUN DO-FLET-DYNAMIC-EXTENTS (BINDINGS)
+  (IF COMPILER:*&REST-ARGUMENTS-ALWAYS-DYNAMIC*
+      (MAPCAR #'(LAMBDA (BINDING)
+		  (DESTRUCTURING-BIND (NAME LAMBDA-LIST &BODY BODY) BINDING
+		    (LET ((REST (MEMQ '&REST LAMBDA-LIST)))
+		      (IF REST
+			  `(,NAME ,LAMBDA-LIST
+			    (DECLARE (FUTURE-COMMON-LISP:DYNAMIC-EXTENT ,(SECOND REST)))
+			    ,@BODY)
+			  BINDING))))
+	      BINDINGS)
+      BINDINGS))
+)
+
+(DEFMACRO FLET (BINDINGS &BODY BODY)
+  `(FUTURE-COMMON-LISP:FLET ,(DO-FLET-DYNAMIC-EXTENTS BINDINGS) ,@BODY))
+
+(DEFMACRO LABELS (BINDINGS &BODY BODY)
+  `(FUTURE-COMMON-LISP:LABELS ,(DO-FLET-DYNAMIC-EXTENTS BINDINGS) ,@BODY))
+
+;;;
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM MACROLET (&WHOLE FORM MACROS &BODY BODY
+						  &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (CHECK-FUNCTION-LET-SYNTAX FORM)
+  (LET ((REAL-FUNCTIONS (MAPCAR #'DIGEST-MACROLET-MACRO MACROS)))
+    ;; Build new environment for digestion only.
+    (LET ((FUNCTIONS REAL-FUNCTIONS)
+	  (DECLARATIONS NIL)
+	  (E ENV))
+      (INTERPRET-FUNCTION-BINDINGS
+	(FUNCTIONS MACROLET 5
+		   (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+			    DECLARATIONS)
+		   (DECLARATIONS E FUNCTIONS))
+	(DIGEST-FUNCTION-THING 'DIGESTED-MACROLET FORM REAL-FUNCTIONS NIL BODY NEW-ENV)))))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM (FUTURE-COMMON-LISP:MACROLET FCL-MACROLET-1)
+				(&WHOLE FORM MACROS &BODY BODY &ENVIRONMENT ENV)
+  ;;(DECLARE LT:(ARG-TEMPLATE))
+  (CHECK-FUNCTION-LET-SYNTAX FORM)
+  (LET ((REAL-FUNCTIONS (MAPCAR #'(LAMBDA (MACRO) (DIGEST-MACROLET-MACRO MACRO ENV)) MACROS)))
+    ;; Build new environment for digestion only.
+    (LET ((FUNCTIONS REAL-FUNCTIONS)
+	  (DECLARATIONS NIL)
+	  (E ENV))
+      (INTERPRET-FUNCTION-BINDINGS
+	(FUNCTIONS MACROLET 5
+		   (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+			    DECLARATIONS)
+		   (DECLARATIONS E FUNCTIONS))
+	(DIGEST-FUNCTION-THING 'DIGESTED-MACROLET FORM REAL-FUNCTIONS NIL BODY NEW-ENV)))))
+
+(DEFUN DIGEST-MACROLET-MACRO (MACRO &OPTIONAL ENVIRONMENT)
+  (LET ((LOCAL-DECLARATIONS NIL))
+    (DESTRUCTURING-BIND (NAME PATTERN . BODY) MACRO
+      `(,NAME (SPECIAL ,(ENCLOSE (DEFMACRO-1 'LAMBDA 'SPECIAL NAME PATTERN BODY)
+				 ENVIRONMENT NAME))))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-MACROLET (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Create all the variables we will need before doing any %PUSHes
+  (LET ((FUNCTIONS (POP BODY))
+	(DECLARATIONS (POP BODY))
+	(E ENV))
+    ;; Build new environment
+    (INTERPRET-FUNCTION-BINDINGS (FUNCTIONS MACROLET 5
+				  (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E)
+					       DECLARATIONS)
+				  (DECLARATIONS E FUNCTIONS))
+      ;; Evaluate the body
+      (EVAL-BODY BODY NEW-ENV))))
+
+(DEFINE-SPECIAL-FORM FUTURE-COMMON-LISP:SYMBOL-MACROLET
+		     (&WHOLE FORM BINDINGS &BODY BODY &ENVIRONMENT ENV)
+  (CHECK-VALUE-LET-SYNTAX FORM)
+  (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY NIL NIL VAR-DCLS UNSPECIALS)
+      (PARSE-BODY-DECLARATIONS BODY ENV)
+    (LET ((LET-BINDINGS (DIGEST-BINDINGS '() SPECIALS UNSPECIALS ENV))
+	  (E ENV))
+      (DOLIST (BINDING BINDINGS)
+	(WHEN (CDDR BINDING)
+	  (FERROR "~s is not a valid SYMBOL-MACROLET binding specification" BINDING))
+	(LET* ((VAR (POP BINDING))
+	       (EXPANSION (POP BINDING)))
+	  (CHECK-SYMBOL-SETABILITY VAR 'FUTURE-COMMON-LISP:SYMBOL-MACROLET)
+	  (WHEN (OR (MEMQ VAR SPECIALS) (MEMQ VAR UNSPECIALS))
+	    (ERROR "The ~S binding of ~S cannot be declared ~S or ~S."
+		   'FUTURE-COMMON-LISP:SYMBOL-MACROLET VAR 'SPECIAL 'UNSPECIAL))
+	  (LET ((TYPE (ASSQ 'CL:TYPE (CDR (ASSQ VAR VAR-DCLS)))))
+	    (WHEN TYPE
+	      (SETF EXPANSION `(CL:THE ,(CDR TYPE) ,EXPANSION))))
+	  (PUSH (LIST VAR EXPANSION T) LET-BINDINGS)))
+      ;; New environment starts out as a copy of the old one, then we add the declarations,
+      ;; and then we add the new variable bindings
+      (INTERPRET-BINDINGS (LET-BINDINGS T 5
+			    (NEW-ENV ENV (POP E) (POP E) (POP E) (POP E) (CAR E) DECLARATIONS)
+			    (DECLARATIONS E BINDINGS))
+	(EVAL-BODY BODY NEW-ENV)))))
+
+(DEFINE-SPECIAL-FORM FUTURE-COMMON-LISP:LOAD-TIME-VALUE (VALUE &OPTIONAL READ-ONLY-P)
+  ;; QUOTE is safe because the form is never evaluated in a context that MAPFORMS cares about.
+  (DECLARE LT:(ARG-TEMPLATE QUOTE QUOTE))
+  (DECLARE (IGNORE READ-ONLY-P))
+  (EVAL VALUE))
+
+;;; Multiple Value Special Forms
+
+(DEFINE-SPECIAL-FORM MULTIPLE-VALUE (&WHOLE FORM VARS VALUE &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE (ORDER (2 ((REPEAT (IF ZL:NULL QUOTE SET)))) (1 EVAL))))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  (LET ((TEMPS (MAPCAR #'(LAMBDA (IGNORE) (GENSYM)) VARS)))
+    `(MULTIPLE-VALUE-CALL #'(LAMBDA (&OPTIONAL ,@TEMPS &REST IGNORE)
+			      ,@(MAPCAR #'(LAMBDA (VAR TEMP)
+					    (IF VAR
+						`(SETQ ,VAR ,TEMP)
+						TEMP))
+					VARS TEMPS)
+			      ,(FIRST TEMPS))
+			  ,VALUE))
+  :INTERPRETER
+  (LET* ((N (%MULTIPLE-VALUE-PUSH (EVAL VALUE ENV)))
+	 (VP (%POINTER-PLUS (LOCF N) (- (1+ N)))))
+    (PROG1 (LOCATION-CONTENTS (%POINTER-PLUS VP 1))
+	   (DOLIST (VAR VARS)
+	     (LET ((VAL (AND (PLUSP N) (PROGN (DECF N) (%P-CONTENTS-INCREMENT-POINTER VP)))))
+	       (WHEN VAR
+		 (LET ((TEM (CDR (ASSQ VAR (ENV-VARIABLES)))))
+		   (IF TEM
+		       (IF (AND (CL:CONSP TEM) (CDR TEM))	;Symbol macro?
+			   (STACK-LET ((PAIRS `(,(CAR TEM) ',VAL)))
+			     (EVAL (LT::EXPAND-SETF PAIRS ENV) ENV))
+			   (SETF (CAR TEM) VAL))
+		       (MULTIPLE-VALUE-BIND (MACRO-P EXPANSION)
+			   (LT:SYMBOL-MACRO-P VAR ENV)
+			 (COND (MACRO-P
+				(STACK-LET ((PAIRS `(,EXPANSION ',VAL)))
+				  (EVAL (LT::EXPAND-SETF PAIRS ENV) ENV)))
+			       (T
+				(CHECK-SYMBOL-SETABILITY VAR "set")
+				(SET VAR VAL))))))))))))
+
+(DEFINE-DIGESTABLE-SPECIAL-FORM MULTIPLE-VALUE-BIND (&WHOLE FORM VARS VALUE &BODY BODY
+							    &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE (ORDER (2 ((REPEAT (IF ZL:NULL QUOTE LET)))) (1 EVAL))
+			    DECLARE . BODY)
+	   (ZWEI:INDENTATION 1 3 2 1))
+  :MACRO-EXPANDER
+  `(MULTIPLE-VALUE-CALL #'(LAMBDA (&OPTIONAL ,@VARS &REST IGNORE) ,@BODY) ,VALUE)
+  :INTERPRETER
+  (MULTIPLE-VALUE-BIND (DECLARATIONS SPECIALS BODY NIL NIL NIL UNSPECIALS)
+      (PARSE-BODY-DECLARATIONS BODY ENV)
+    `(DIGESTED-MULTIPLE-VALUE-BIND
+       ,FORM
+       ,(LOOP FOR VAR IN VARS
+	      COLLECT (WHEN VAR
+			(CHECK-SYMBOL-SETABILITY VAR "bind")
+			(COND ((SPECIAL-VARIABLE-P VAR ENV SPECIALS UNSPECIALS)
+			       (SETQ SPECIALS (DELQ VAR SPECIALS))
+			       `(,VAR . ,(FOLLOW-CELL-FORWARDING
+					   (VALUE-CELL-LOCATION VAR) NIL)))
+			      (T
+			       (SETQ UNSPECIALS (DELQ VAR UNSPECIALS))
+			       VAR))))
+       ,(MAPCAR #'(LAMBDA (VAR) `(,VAR . ,(FOLLOW-CELL-FORWARDING
+					    (VALUE-CELL-LOCATION VAR) NIL)))
+		SPECIALS)
+       ,DECLARATIONS ,VALUE ,@(DIGEST-BODY BODY ENV))))
+
+(DEFINE-DIGESTED-SPECIAL-FORM DIGESTED-MULTIPLE-VALUE-BIND (BODY ENV)
+  ;; Discard the special-form-name and the original-form
+  (SETQ BODY (CDDR BODY))  
+  ;; Create all the variables we will need before doing any %PUSHes
+  (%WITH-BINDING-STACK-LEVEL
+    (LET ((VARS (POP BODY))
+	  (SPECIALS (POP BODY))
+	  (DECLARATIONS (POP BODY))
+	  (N ENV)
+	  VP VAR)
+      ;; New environment starts out as a copy of the old one, but with the declarations
+      ;; and SPECIAL declarations added, then we add the new variable bindings
+      (WITH-INTERPRETER-ENVIRONMENT (NEW-ENV ENV
+					     (POP N) (POP N) (POP N) (POP N) (CAR N)
+					     DECLARATIONS)
+	
+	;; Install the SPECIAL declaration pseudo-bindings, copying them
+	;; into the stack if necessary
+	(INTERPRET-SPECIAL-DECLARATIONS NEW-ENV ENV SPECIALS)
+	
+	;; Evaluate the form and push the values on the stack
+	;; It is evaluated in NEW-ENV because it is in the scope of the new declarations
+	(SETQ N (%MULTIPLE-VALUE-PUSH (EVAL (POP BODY) NEW-ENV)))
+	
+	(WHEN VARS				;If there are any bindings to be done
+	  
+	  ;; Adjust the number of values on the stack to match the number of values wanted
+	  (SETQ VP (- (LENGTH VARS) N))
+	  (COND ((PLUSP VP)
+		 (%ASSURE-PDL-ROOM VP)
+		 (LOOP DO (%PUSH NIL)
+			  (INCF N)
+			  (DECF VP)
+		       UNTIL (ZEROP VP)))
+		((MINUSP VP)
+		 (LOOP DO (%POP)
+			  (DECF N)
+			  (INCF VP)
+		       UNTIL (ZEROP VP))))
+	  
+	  ;; Make this into a list that will be recycled as the variable bindings list
+	  ;; and hook onto the previous variable bindings list
+	  (%PUSH (ENV-VARIABLES NEW-ENV))
+	  (%P-STORE-CDR-CODE (COMPILER:%STACK-LOCATION-INTERNAL 2) CDR-NORMAL)
+	  (SETQ VP (%MAKE-POINTER-OFFSET DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 0) (- N)))
+	  (SETF (ENV-VARIABLES NEW-ENV) VP)
+
+	  (COND (( (STACK-SPACE-LEFT) (+ N N))
+		 ;; Bind the variables
+		 (LOOP DO (SETQ VAR (POP VARS))
+			  (COND ((NULL VAR)
+				 ;; Ignore value -> pseudobinding of NIL to NIL
+				 (SETF (CAR VP) NIL))
+				((ATOM VAR)
+				 ;; Lexical variable -> make binding pair
+				 (%PUSH VAR)
+				 (%PUSH (CAR VP))
+				 (%P-STORE-CDR-CODE
+				   (COMPILER:%STACK-LOCATION-INTERNAL 1) CDR-NIL)
+				 (SETF (CAR VP)
+				       (%MAKE-POINTER
+					 DTP-LIST (COMPILER:%STACK-LOCATION-INTERNAL 2))))
+				(T			;Special
+				 (%BIND-LOCATION (CDR VAR) (CAR VP))
+				 (SETF (CAR VP) VAR)))
+			  (POP VP)
+			  (DECF N)
+		       UNTIL (ZEROP N)))
+		(T
+		 (LOOP DO (SETQ VAR (POP VARS))
+			  (COND ((NULL VAR)
+				 ;; Ignore value -> pseudobinding of NIL to NIL
+				 (SETF (CAR VP) NIL))
+				((ATOM VAR)
+				 ;; Lexical variable -> make binding pair
+				 (SETF (CAR VP) (LIST VAR (CAR VP))))
+				(T			;Special
+				 (%BIND-LOCATION (CDR VAR) (CAR VP))
+				 (SETF (CAR VP) VAR)))
+			  (POP VP)
+			  (DECF N)
+		       UNTIL (ZEROP N)))))
+	
+	;; Evaluate the body
+	(EVAL-BODY BODY NEW-ENV)))))
+
+(DEFMACRO MULTIPLE-VALUE-LIST (FORM)
+  `(MULTIPLE-VALUE-CALL #'LIST ,FORM))
+
+;;; Common Lisp multiple-value-call.
+; This violates the rule that NARGS may not change between the %START-FUNCTION-CALL
+; and the %FINISH-FUNCTION-CALL.  On the 3600 this doesn't matter.  On the LM-2,
+; this turns out not to do much harm in this case, anyway we don't support LM-2's anymore.
+(DEFINE-SPECIAL-FORM MULTIPLE-VALUE-CALL (FUNCTION &REST ARGS &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE ARBITRARY (REPEAT EVAL)))
+  (SETQ FUNCTION (EVAL FUNCTION ENV))
+  (LET ((NARGS 0)
+	NARGS-ADDITIONAL)
+    (%START-FUNCTION-CALL FUNCTION RETURN NARGS NIL)
+    (LOOP UNTIL (NULL ARGS)
+	  DO (SETQ NARGS-ADDITIONAL (%MULTIPLE-VALUE-PUSH (EVAL (POP ARGS) ENV)))
+	     (INCF NARGS NARGS-ADDITIONAL))
+    (%FINISH-FUNCTION-CALL FUNCTION RETURN NARGS NIL)))
+
+;;; Another Common Lisp function; same caveats as MULTIPLE-VALUE-CALL
+(DEFINE-SPECIAL-FORM MULTIPLE-VALUE-PROG1 (VALUE &BODY BODY &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE RETURN (REPEAT EFFECT)))
+  (MULTIPLE-VALUE-PROG1
+    (EVAL VALUE ENV)
+    (LOOP UNTIL (NULL BODY)
+	DO (EVAL (POP BODY) ENV))))
+
+;;; Like MULTIPLE-VALUE-CALL, but the user tells how many values of each arg to take
+;;; Also the function isn't evaluated, just to be consistent!
+;;; This exists to support unconsed multi-word data, without the overhead of
+;;; multiple-value groups
+;;; I didn't bother making this not cons, ho hum.
+(DEFINE-SPECIAL-FORM %MULTIPLE-VALUE-CALL-N (FUNCTION &REST FORMS-AND-COUNTS &ENVIRONMENT ENV)
+  (DECLARE LT:(ARG-TEMPLATE CALL (REPEAT EVAL QUOTE)))
+  :MACRO-EXPANDER
+  (IGNORE ENV)
+  `(MULTIPLE-VALUE-CALL
+     #',FUNCTION
+     ,@(LOOP FOR (FORM COUNT) ON FORMS-AND-COUNTS BY #'CDDR
+	     DO (CL:CHECK-TYPE COUNT (CL:INTEGER 0 *))
+	     COLLECT (CL:CASE COUNT
+		       (0 `(PROGN ,FORM (VALUES)))
+		       (1 `(VALUES ,FORM))
+		       (OTHERWISE
+			 (LET ((TEMPS (LOOP REPEAT COUNT
+					    COLLECT (GENSYM))))
+			   `(MULTIPLE-VALUE-BIND ,TEMPS ,FORM
+			      (VALUES ,@TEMPS)))))))
+  :INTERPRETER
+  (LET* ((NARGS (LOOP FOR (NIL COUNT) ON FORMS-AND-COUNTS BY 'CDDR
+		      DO (CL:CHECK-TYPE COUNT (CL:INTEGER 0 *))
+		      SUM COUNT))
+	 (REAL-FUNCTION (EVAL `(FUNCTION ,FUNCTION) ENV))
+	 ARG-VALUE-LIST COUNT)
+    (%START-FUNCTION-CALL REAL-FUNCTION RETURN NARGS NIL)
+    (LOOP WHILE FORMS-AND-COUNTS
+	  DO (SETQ ARG-VALUE-LIST (MULTIPLE-VALUE-LIST (EVAL (POP FORMS-AND-COUNTS) ENV))
+		   COUNT (POP FORMS-AND-COUNTS))
+	     (LOOP WHILE (> COUNT 0)
+		   DO (%PUSH (POP  ARG-VALUE-LIST))
+		      (DECF COUNT)))
+    (%FINISH-FUNCTION-CALL REAL-FUNCTION RETURN NARGS NIL)))
+
+) ; *ENABLE-FRAME-SPLITTING*

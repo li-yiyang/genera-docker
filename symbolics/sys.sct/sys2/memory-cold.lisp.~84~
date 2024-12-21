@@ -1,0 +1,736 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SYSTEM-INTERNALS; Base: 8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Memory reorganization stuff which needs to be in the cold load.
+
+;;; Forwarding of Symbol Value & Function Cells
+
+;; Elements are (type symbol initial-size extension-size).
+(DEFVAR *SYMBOL-CELL-TABLE-DESCRIPTORS*
+	'((:UNSAFEGUARDED   *CURRENT-SYMBOL-CELL-TABLE* 	    15000. 1000.)
+	  (:SAFEGUARDED     *CURRENT-SAFEGUARDED-SYMBOL-CELL-TABLE*   200.  200.)
+	  (:WIRED	    *CURRENT-WIRED-SYMBOL-CELL-TABLE*	      200.  200.)
+	  (:SELF-EVALUATING *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*  11000. 1000.)))
+
+;; These are the current tables to add cells to.
+(DEFVAR *CURRENT-SYMBOL-CELL-TABLE*)
+(DEFVAR *CURRENT-SAFEGUARDED-SYMBOL-CELL-TABLE*)
+(DEFVAR *CURRENT-WIRED-SYMBOL-CELL-TABLE*)		;Set up by cold load
+(DEFVAR *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*)
+
+;; This is the initial system symbol cell table.  It exists to make
+;; COMPILER:DISASSEMBLE-DECODE-LOCATIVE faster.
+(DEFVAR *SYSTEM-SYMBOL-CELL-TABLE*)
+(DEFVAR *SYSTEM-SYMBOL-CELL-TABLE-TAIL*)
+
+;; Global list of symbol cell tables for debugging.
+;; Includes wired and self-evaluating tables as well as "normal" ones.
+;; Initialized to (LIST *CURRENT-WIRED-SYMBOL-CELL-TABLE*) by the cold loader.
+;; *CURRENT-SELF-EVALUATING-SYMBOL-TABLE* is pushed on by BUILD-INITIAL-PACKAGES.
+(DEFVAR *ALL-FORWARDED-SYMBOL-CELL-TABLES*)
+
+;; Global lock for all symbol cell table operations.
+(DEFVAR *FORWARDED-SYMBOL-CELL-TABLE-LOCK*)
+
+;; Bootstrapping lists sent over by the cold loader.
+(DEFVAR *VALUE-CELLS-TO-LOCALIZE-FIRST*)
+(DEFVAR *LINKED-SYMBOL-CELLS*)
+
+;; T means all references from compiled-functions are snapped.
+;; :MODIFIED-ONLY means all references from modified pages are snapped.
+;; :OPTIMIZING means that the optimizer is in the process of snapping all references.
+;; NIL means unsnapped references may exist.
+(DEFVAR *COMPILED-FUNCTION-OPTIMIZATION-STATE* NIL)
+
+(ADD-INITIALIZATION "Reset *COMPILED-FUNCTION-OPTIMIZATION-STATE*"
+		    '(WHEN (EQ *COMPILED-FUNCTION-OPTIMIZATION-STATE* :OPTIMIZING)
+		       (SETQ *COMPILED-FUNCTION-OPTIMIZATION-STATE* NIL))
+		    '(:WARM))
+
+(DEFMACRO FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS (TABLE) `(ARRAY-LEADER ,TABLE 2))
+
+(DEFUN MAKE-FORWARDED-SYMBOL-CELL-TABLE (SIZE &OPTIONAL (TYPE :UNSAFEGUARDED))
+  ;; Inhibit read-only in case we need to grow a symbol table which was allocated
+  ;; by the cold-loader in CONSTANTS-AREA (e.g., *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*)
+  (WITH-READ-ONLY-INHIBITED
+    (LET ((TABLE (MAKE-ARRAY SIZE
+			     :AREA (CL:ECASE TYPE
+				     (:UNSAFEGUARDED PERMANENT-STORAGE-AREA)
+				     (:SAFEGUARDED SAFEGUARDED-OBJECTS-AREA)
+				     (:WIRED WIRED-CONTROL-TABLES)
+				     (:SELF-EVALUATING CONSTANTS-AREA))
+			     :LEADER-LENGTH 3
+			     :NAMED-STRUCTURE-SYMBOL 'FORWARDED-SYMBOL-CELL-TABLE
+			     :FILL-POINTER 0)))
+      (WHEN (EQ TYPE :WIRED)
+	(WIRE-STRUCTURE TABLE))
+      ;; All debugging info is always consed in PERMANENT-STORAGE-AREA.
+      (SETF (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE)
+	    (IF (EQ TYPE :SELF-EVALUATING)
+		TABLE
+		(MAKE-ARRAY SIZE :AREA PERMANENT-STORAGE-AREA)))
+      (SETQ *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	    (CONS-IN-AREA TABLE *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+			  PERMANENT-STORAGE-AREA))
+      TABLE)))
+
+(DEFUN FORWARD-SYMBOL-CELL (SYMBOL-CELL &OPTIONAL (STORAGE-CATEGORY :UNSAFEGUARDED)
+			    &AUX TABLE INDEX TEMP)
+  (CL:CHECK-TYPE STORAGE-CATEGORY (CL:MEMBER :UNSAFEGUARDED :SAFEGUARDED :WIRED))
+  (LET ((SYMBOL (%FIND-STRUCTURE-HEADER SYMBOL-CELL)))
+    (CHECK-ARG SYMBOL-CELL
+	       (AND (LOCATIVEP SYMBOL-CELL)
+		    (SYMBOLP SYMBOL))
+	       "a symbol cell")
+    ;; Have to protect against multiple processes trying to do this at the same time...
+    (PROCESS:WITH-LOCK (*FORWARDED-SYMBOL-CELL-TABLE-LOCK*)
+      ;; Check for redefinition to a higher storage category.
+      (WHEN (AND (= (%P-DATA-TYPE SYMBOL-CELL) DTP-ONE-Q-FORWARD)
+		 (STORAGE-CATEGORY-LESSP
+		   (SETQ TEMP (ACTUAL-STORAGE-CATEGORY :CONSTANT
+				(FOLLOW-CELL-FORWARDING SYMBOL-CELL NIL)))
+		   STORAGE-CATEGORY))
+	;; Symbol was already forwarded to a storage category less than that being
+	;; requested.  In order for this to happen, the variable must have already
+	;; been referenced in the other state.
+	;; Issue a warning and attempt to clean things up.
+	(WARN "~S was referenced while ~A, but is now being ~A."
+	      SYMBOL (STRING-DOWNCASE TEMP) (STRING-DOWNCASE STORAGE-CATEGORY))
+	;; This causes the forwarded cell to be forwarded again.
+	(SETQ SYMBOL-CELL (FOLLOW-CELL-FORWARDING SYMBOL-CELL NIL)))
+      ;; Now that we have the lock, make sure somebody else didn't beat us to
+      ;; this symbol.
+      (UNLESS (= (%P-DATA-TYPE SYMBOL-CELL) DTP-ONE-Q-FORWARD)
+	(DESTRUCTURING-BIND (TABLE-SYMBOL NIL EXTENSION)
+			    (CDR (ASSQ STORAGE-CATEGORY *SYMBOL-CELL-TABLE-DESCRIPTORS*))
+	  (SETQ TABLE (SYMEVAL TABLE-SYMBOL)
+		INDEX (ARRAY-ACTIVE-LENGTH TABLE))
+	  (WHEN ( INDEX (ARRAY-LENGTH TABLE))
+	    (WHEN (NEQ STORAGE-CATEGORY :UNSAFEGUARDED)
+	      (FSIGNAL "~A symbol cell table is full!  Resume to make a new one."
+		       (STRING-CAPITALIZE-WORDS STORAGE-CATEGORY)))
+	    (SETQ TABLE (MAKE-FORWARDED-SYMBOL-CELL-TABLE EXTENSION STORAGE-CATEGORY))
+	    (SET TABLE-SYMBOL TABLE)
+	    (SETQ INDEX 0))
+	  (SETF (FILL-POINTER TABLE) (1+ INDEX))
+	  (LET ((NEW-CELL (ALOC TABLE INDEX)))
+	    (%P-COPY-Q SYMBOL-CELL NEW-CELL)
+	    (%P-STORE-TYPE-AND-POINTER SYMBOL-CELL DTP-ONE-Q-FORWARD NEW-CELL)
+	    (SETF (AREF (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE) INDEX)
+		  SYMBOL)
+	    (SETQ *COMPILED-FUNCTION-OPTIMIZATION-STATE* NIL)
+	    NIL))))))
+
+;; Database for snapping forward references to functions when loading.
+(DEFVAR *HOME-FOR-WAYWARD-FUNCTION-CELLS* NIL)
+(DEFVAR *HOME-FOR-WAYWARD-FUNCTION-CELLS-OPTIMIZED* NIL)
+
+(DEFUN REFERENCE-UNDEFINED-FUNCTION-CELL (REFERENCE-LOCATION FSPEC)
+  (SETQ *HOME-FOR-WAYWARD-FUNCTION-CELLS-OPTIMIZED* NIL)
+  (LET ((ENTRY (ASSOC FSPEC *HOME-FOR-WAYWARD-FUNCTION-CELLS*)))
+    (IF (NULL ENTRY)
+	(PUSH (LIST* FSPEC REFERENCE-LOCATION NIL) *HOME-FOR-WAYWARD-FUNCTION-CELLS*)
+	(RPLACD (LAST ENTRY) (NCONS REFERENCE-LOCATION)))))
+
+(DEFUN FIXUP-REFERENCES-TO-NEW-FUNCTION-CELL (FSPEC)
+  (SETQ *HOME-FOR-WAYWARD-FUNCTION-CELLS-OPTIMIZED* NIL)
+  (LET ((ENTRY (ASSOC FSPEC *HOME-FOR-WAYWARD-FUNCTION-CELLS*)))
+    (SETQ *HOME-FOR-WAYWARD-FUNCTION-CELLS* (DELQ ENTRY *HOME-FOR-WAYWARD-FUNCTION-CELLS*))
+    (LOOP FOR LOCATION IN (CDR ENTRY) DO
+      ;; This code (for both machines) is careful to allow the location
+      ;; to contain NIL, which could happen if the other function got an
+      ;; error while loading.
+      #+3600
+      (BLOCK KLUDGE
+	(%P-STORE-TYPE-AND-POINTER LOCATION DTP-LOCATIVE
+	  (FOLLOW-CELL-FORWARDING (OR (LOCATION-CONTENTS LOCATION)
+				      (RETURN-FROM KLUDGE NIL))
+				  NIL)))
+      #+IMach
+      ;; This turns out to be pretty hairy, since compiled functions can
+      ;; contain EVCP's.  We do want to follow the first EVCP, but we don't
+      ;; want to follow subsequent EVCP's.  We can't use %P-STORE-POINTER
+      ;; because that turns into %P-DPB which expects a number as its argument.
+      (LET ((WORD (%MEMORY-READ LOCATION :CYCLE-TYPE %MEMORY-SCAVENGE :SET-CDR-NEXT NIL)))
+	(WHEN WORD
+	  (%MEMORY-WRITE LOCATION
+	    (%SET-TAG (%MEMORY-READ-ADDRESS WORD :CYCLE-TYPE %MEMORY-BIND-READ :SET-CDR-NEXT T)
+		      (%TAG WORD))))))))
+
+(DEFUN FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION (FSPEC)
+  (WHEN (FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION-P FSPEC)
+    (LET* ((OLD-CELL (LOCF (FDEFINITION FSPEC)))
+	   (OLD-CELL-FORWARDED (FOLLOW-CELL-FORWARDING OLD-CELL NIL))
+	   (FUNCTION (LOCATION-CONTENTS OLD-CELL-FORWARDED)))
+      ;; Don't hack macros and other funnies.
+      (WHEN (AND (TYPEP FUNCTION :COMPILED-FUNCTION)
+		 (EQUAL FSPEC (COMPILED-FUNCTION-NAME FUNCTION)))
+	(LET ((NEW-CELL (LOCF (COMPILED-FUNCTION-FUNCTION-CELL
+				(COMPILED-FUNCTION-CCA FUNCTION)))))
+	  ;; Done already?
+	  (UNLESS (EQ OLD-CELL-FORWARDED NEW-CELL)
+	    ;; Check to see if it is forwarded somewhere else
+	    (UNLESS (EQ OLD-CELL-FORWARDED OLD-CELL)
+	      ;; Unless it is forwarded to an old compiled function, punt
+	      (UNLESS (LET ((TARGET (%FIND-STRUCTURE-HEADER OLD-CELL-FORWARDED)))
+			(OR (TYPEP TARGET :COMPILED-FUNCTION)
+			    (EQ (NAMED-STRUCTURE-P TARGET) 'FORWARDED-SYMBOL-CELL-TABLE)))
+		(RETURN-FROM FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION NIL))
+	      ;; We're reforwarding a pointer.  Set this so that OPTIMIZE-COMPILED-FUNCTIONS
+	      ;; can snap out references.
+	      (SETQ *COMPILED-FUNCTION-OPTIMIZATION-STATE* NIL)
+	      (IF (AND (WIRED-OR-SAFEGUARDED-P OLD-CELL-FORWARDED)
+		       (WIRED-OR-SAFEGUARDED-P NEW-CELL))
+		  ;; For wired and safeguarded functions, forward the old cell directly
+		  ;; to the new cell to avoid downward storage category references
+		  ;; through the (presumably) unsafeguarded cell.  The disadvantage
+		  ;; is that long chains of forwarding pointers can be created
+		  ;; for multiple redefinitions.
+		  (PROGN
+		    (%P-COPY-Q OLD-CELL-FORWARDED NEW-CELL)
+		    (RETURN-FROM FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION
+		     (%P-STORE-TYPE-AND-POINTER
+		       OLD-CELL-FORWARDED DTP-ONE-Q-FORWARD NEW-CELL)))
+		;; For unsafeguarded cells, forward it back through the home function
+		;; cell to avoid long chains of forwarding pointers.
+		(%P-COPY-Q OLD-CELL-FORWARDED OLD-CELL)
+		(%P-STORE-TYPE-AND-POINTER OLD-CELL-FORWARDED DTP-ONE-Q-FORWARD OLD-CELL)))
+	    ;; Now forward things the way we want them.
+	    (%P-COPY-Q OLD-CELL NEW-CELL)
+	    (%P-STORE-TYPE-AND-POINTER OLD-CELL DTP-ONE-Q-FORWARD NEW-CELL)))))))
+
+;; This sort of blows *COMPILED-FUNCTION-OPTIMIZATION-STATE*, since if you unforward
+;; a function, optimize, reforward, and optimize again it won't catch the reforwarding
+;; above.
+(DEFUN UNFORWARD-FUNCTION-CELL (FSPEC)
+  (WHEN (DEFINITION-HAS-LOCATION-P FSPEC)
+    (LET* ((UNFORWARDED-CELL (LOCF (FDEFINITION FSPEC)))
+	   (FORWARDED-CELL (FOLLOW-CELL-FORWARDING UNFORWARDED-CELL NIL)))
+      (WHEN (NEQ FORWARDED-CELL UNFORWARDED-CELL)
+	(SETQ *COMPILED-FUNCTION-OPTIMIZATION-STATE* NIL)
+	(%P-COPY-Q FORWARDED-CELL UNFORWARDED-CELL)
+	(%P-STORE-TYPE-AND-POINTER FORWARDED-CELL DTP-ONE-Q-FORWARD UNFORWARDED-CELL)))))
+
+;;; Bootstrapping
+
+;; Safeguarded variables are not forwarded by the cold load generator, but wired
+;; variables are.  So here we check for safeguarded variables and forward them
+;; appropriately.
+
+;; This pass creates the relocated symbol cells.
+;; It has to be done in a stack group with no bindings.
+;; It also has to be done without interrupts, but since processes aren't loaded yet,
+;; don't bother.
+
+(DEFUN BOOTSTRAP-FORWARD-SYMBOL-CELLS ()
+  ;; Setup unsafeguarded and safeguarded tables.
+  (CREATE-INITIAL-SYMBOL-CELL-TABLE :SAFEGUARDED)
+  (CREATE-INITIAL-SYMBOL-CELL-TABLE :UNSAFEGUARDED)
+  ;; Setup the system symbol cell pointers.
+  (SETQ *SYSTEM-SYMBOL-CELL-TABLE* *CURRENT-SYMBOL-CELL-TABLE*)
+  (SETQ *SYSTEM-SYMBOL-CELL-TABLE-TAIL*
+	(LOCF (AREF *SYSTEM-SYMBOL-CELL-TABLE*
+		    (1- (ARRAY-LENGTH *SYSTEM-SYMBOL-CELL-TABLE*)))))
+  (SETQ *HOME-FOR-WAYWARD-FUNCTION-CELLS* NIL)
+  (LOOP FOR (FROM-SYMBOL TO-SYMBOL TYPE) IN *LINKED-SYMBOL-CELLS*
+	DO (CL:CASE TYPE
+	     (:FUNCTION
+	       (LINK-SYMBOL-FUNCTION-CELLS FROM-SYMBOL TO-SYMBOL))
+	     (:VARIABLE
+	       (LINK-SYMBOL-VALUE-CELLS FROM-SYMBOL TO-SYMBOL))))
+  (SETQ *LINKED-SYMBOL-CELLS* NIL)
+  (LOOP FOR SYMBOL IN *VALUE-CELLS-TO-LOCALIZE-FIRST*
+	DO (FORWARD-SYMBOL-CELL (VALUE-CELL-LOCATION SYMBOL)
+				(OR (DECLARED-STORAGE-CATEGORY :VARIABLE SYMBOL)
+				    :UNSAFEGUARDED)))
+  (SETQ *VALUE-CELLS-TO-LOCALIZE-FIRST* NIL)
+  ;; Pass 0:  Forward all safeguarded value cells.  This has to be done separately
+  ;; so that safeguarded variables not referenced by any compiled function are properly
+  ;; forwarded.  (That is, pass 2 below could miss some symbols.)
+  (MAP-OVER-OBJECTS #'(LAMBDA (AREA)
+			(OR (= AREA SYMBOL-AREA)
+			    (= AREA SAFEGUARDED-OBJECTS-AREA)))
+		    #'REGION-PREDICATE-STRUCTURE
+    (LAMBDA (AREA REGION ADDRESS HEADER LEADER SIZE)
+      (DECLARE (IGNORE AREA REGION ADDRESS LEADER SIZE))
+      (WHEN (AND (SYMBOLP HEADER)
+		 (EQ (GET HEADER 'VARIABLE-STORAGE-CATEGORY) :SAFEGUARDED))
+	(FORWARD-SYMBOL-CELL (VALUE-CELL-LOCATION HEADER) :SAFEGUARDED))))
+  ;; Forward value and function cells, setup *HOME-FOR-WAYWARD-FUNCTION-CELLS*
+  ;; the way the cold loader would have if it knew how.
+  ;; Pass 1:  Forward all function cells into compiled functions.
+  (MAP-COMPILED-FUNCTIONS T  NIL NIL
+    #'(LAMBDA (FUNCTION IGNORE)
+	;; This function may not be defined yet because its definition form is on
+	;; *COLD-LOAD-DEFERRED-FORMS*.  Since that definition will do the forwarding
+	;; itself, just punt here.
+	;; But if the cold loader has already forwarded this function spec, assume
+	;; it has better judgement on where to put it.
+	(LET ((FSPEC (COMPILED-FUNCTION-NAME FUNCTION)))
+	  (WHEN (AND (FDEFINEDP FSPEC)
+		     (DEFINITION-HAS-LOCATION-P FSPEC)
+		     ( (%P-DATA-TYPE (FDEFINITION-LOCATION FSPEC)) DTP-ONE-Q-FORWARD))
+	    (FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION FSPEC)))))
+  ;; Pass 2:  Snap all references to cells.
+  (MAP-COMPILED-FUNCTIONS T NIL NIL
+    #'(LAMBDA (IGNORE P &AUX FUNCTION-CELL)
+	#+3600
+	(LOOP FOR J FROM (DEFSTORAGE-SIZE COMPILED-FUNCTION)
+	      REPEAT (COMPILED-FUNCTION-TABLE-SIZE P)
+	      AS LOC = (%P-STRUCTURE-OFFSET P J)
+	      WHEN (LOCATION-BOUNDP LOC)
+		DO (LET ((REF (LOCATION-CONTENTS LOC)))
+		     (IF (LOCATIVEP REF)
+			 (LET ((SYMBOL (%FIND-STRUCTURE-HEADER REF)))
+			   (WHEN (AND (SYMBOLP SYMBOL)
+				      (NOT (NULL SYMBOL)))
+			     ;; Only hack value and function cells.
+			     (WHEN (OR (SETQ FUNCTION-CELL
+					     (EQ REF (FUNCTION-CELL-LOCATION SYMBOL)))
+				       (EQ REF (VALUE-CELL-LOCATION SYMBOL)))
+			       ;; If it's a nonforwarded value cell or a function cell which
+			       ;; contains a non-compiled-function, put it in the table.
+			       (UNLESS (= (%P-DATA-TYPE REF) DTP-ONE-Q-FORWARD)	;optimization
+				 (COND (FUNCTION-CELL
+					(IF (LOCATION-BOUNDP REF)
+					    (LET ((CONTENTS (LOCATION-CONTENTS REF)))
+					      (UNLESS (TYPEP CONTENTS :COMPILED-FUNCTION)
+						(FORWARD-SYMBOL-CELL REF)))
+					    (REFERENCE-UNDEFINED-FUNCTION-CELL LOC SYMBOL)))
+				       (T (FORWARD-SYMBOL-CELL REF))))
+			       ;; Now if the cell has been forwarded, either by pass 1
+			       ;; or by the above code, snap it.
+			       (WHEN (= (%P-DATA-TYPE REF) DTP-ONE-Q-FORWARD)
+				 (SETF (%P-CONTENTS-OFFSET P J)
+				       (FOLLOW-CELL-FORWARDING REF NIL)))))))))
+	#+IMACH
+	(LOOP FOR L FIRST (%POINTER-PLUS P (DEFSTORAGE-SIZE COMPILED-FUNCTION))
+		    THEN (%POINTER-PLUS L 1)
+	      REPEAT (- (CCA-TOTAL-SIZE P) 
+			(CCA-SUFFIX-SIZE P)
+			(DEFSTORAGE-SIZE COMPILED-FUNCTION))
+	      ;; EVCPs are valid instructions (that we want to see), so use a scav cycle
+	      AS REF = (%MEMORY-READ L :CYCLE-TYPE %MEMORY-SCAVENGE :SET-CDR-NEXT T)
+	      ;; We're looking for full-word instructions that can point to function cells.
+	      WHEN (TYPE-MEMBER REF
+				DTP-EXTERNAL-VALUE-CELL-POINTER
+				DTP-LOCATIVE
+				DTP-CALL-INDIRECT
+				DTP-CALL-INDIRECT-PREFETCH)
+		DO (LET ((REF (%MAKE-POINTER DTP-LOCATIVE REF))
+			 (SYMBOL (%FIND-STRUCTURE-HEADER REF)))
+		     (WHEN (AND (SYMBOLP SYMBOL)
+				(NOT (NULL SYMBOL)))
+		       ;; Only hack value and function cells.
+		       (WHEN (OR (SETQ FUNCTION-CELL
+				       (EQ REF (FUNCTION-CELL-LOCATION SYMBOL)))
+				 (EQ REF (VALUE-CELL-LOCATION SYMBOL)))
+			 ;; If it's a nonforwarded value cell or a function cell which
+			 ;; contains a non-compiled-function, put it in the table.
+			 (UNLESS (= (%P-DATA-TYPE REF) DTP-ONE-Q-FORWARD)	;optimization
+			   (COND (FUNCTION-CELL
+				  (IF (LOCATION-BOUNDP REF)
+				      (LET ((CONTENTS (LOCATION-CONTENTS REF)))
+					(UNLESS (TYPEP CONTENTS :COMPILED-FUNCTION)
+					  (FORWARD-SYMBOL-CELL REF)))
+				      (REFERENCE-UNDEFINED-FUNCTION-CELL L SYMBOL)))
+				 (T (FORWARD-SYMBOL-CELL REF))))
+			 ;; Now if the cell has been forwarded, either by pass 1
+			 ;; or by the above code, snap it.
+			 (WHEN (= (%P-DATA-TYPE REF) DTP-ONE-Q-FORWARD)
+			   ;; Preserve the data type and cdr code of the instruction.
+			   (%P-STORE-POINTER L
+			     (%POINTER (FOLLOW-CELL-FORWARDING REF NIL))))))))))
+  #||
+  ;; No need to snap out references from flavors; none exist yet.
+  (LOOP FOR FLAVOR-NAME IN *ALL-FLAVOR-NAMES* DO
+    (LOOP FOR BINDING ON (FLAVOR-BINDINGS (GET FLAVOR-NAME 'FLAVOR))
+	  WHEN (LOCATIVEP (CAR BINDING))
+	    DO (SETF (CAR BINDING)
+		     (FOLLOW-CELL-FORWARDING (CAR BINDING) NIL))))
+  ;; No need to snap out references from stack groups; none exist yet.
+  (MAP-OVER-STACK-GROUP-SPECIAL-BINDINGS
+    #'(LAMBDA (SG SYMBOL PTR) SG SYMBOL
+	      (LET ((LOC (%MAKE-POINTER-OFFSET DTP-LOCATIVE PTR 1)))
+		(SETF (LOCATION-CONTENTS LOC)
+		      (FOLLOW-CELL-FORWARDING (LOCATION-CONTENTS LOC) NIL)))))
+  ||#
+  )
+
+(DEFUN CREATE-INITIAL-SYMBOL-CELL-TABLE (TYPE)
+  (DESTRUCTURING-BIND (TABLE-SYMBOL INITIAL-SIZE)
+		      (CDR (ASSQ TYPE *SYMBOL-CELL-TABLE-DESCRIPTORS*))
+    (SET TABLE-SYMBOL
+	 (MAKE-FORWARDED-SYMBOL-CELL-TABLE INITIAL-SIZE TYPE))))
+
+(DEFUN BOOTSTRAP-LINK-SYMBOL-CELLS (FROM-ADDR TO-ADDR STORAGE-CATEGORY)
+  (LET ((FROM-CHASE (FOLLOW-CELL-FORWARDING FROM-ADDR NIL))
+	(TO-CHASE (FOLLOW-CELL-FORWARDING TO-ADDR NIL)))
+    (UNLESS (EQ FROM-CHASE TO-CHASE)		;already linked?
+      ;; Duplicate value if necessary.
+      (IF (LOCATION-BOUNDP TO-CHASE)
+	  (IF (LOCATION-BOUNDP FROM-CHASE)
+	      (UNLESS (EQ (LOCATION-CONTENTS FROM-CHASE)
+			  (LOCATION-CONTENTS TO-CHASE))
+		(FERROR "Can't link two cells with different values."))
+	      (%P-COPY-Q TO-CHASE FROM-CHASE))
+	  (IF (LOCATION-BOUNDP FROM-CHASE)
+	      (%P-COPY-Q FROM-CHASE TO-CHASE)))
+      ;; Make them be forwarded to the same place.
+      (IF (EQ FROM-ADDR FROM-CHASE)
+	  (IF (EQ TO-ADDR TO-CHASE)
+	      (PROGN (FORWARD-SYMBOL-CELL TO-ADDR STORAGE-CATEGORY)
+		     (SETF TO-CHASE (FOLLOW-CELL-FORWARDING TO-ADDR NIL))
+		     (%P-STORE-TYPE-AND-POINTER FROM-CHASE SYS:DTP-ONE-Q-FORWARD TO-CHASE))
+	      (%P-STORE-TYPE-AND-POINTER FROM-CHASE SYS:DTP-ONE-Q-FORWARD TO-CHASE))
+	  (IF (EQ TO-ADDR TO-CHASE)
+	      (%P-STORE-TYPE-AND-POINTER TO-CHASE SYS:DTP-ONE-Q-FORWARD FROM-CHASE)
+	      (COND ((NOT (PREFERABLE-CELL-P FROM-CHASE))
+		     (%P-STORE-TYPE-AND-POINTER FROM-ADDR SYS:DTP-ONE-Q-FORWARD TO-CHASE)
+		     (%P-STORE-TYPE-AND-POINTER FROM-CHASE SYS:DTP-ONE-Q-FORWARD FROM-ADDR))
+		    ((NOT (PREFERABLE-CELL-P TO-CHASE))
+		     (%P-STORE-TYPE-AND-POINTER TO-ADDR SYS:DTP-ONE-Q-FORWARD FROM-CHASE)
+		     (%P-STORE-TYPE-AND-POINTER TO-CHASE SYS:DTP-ONE-Q-FORWARD TO-ADDR))
+		    (T
+		     (FERROR "Both cells are already linked to wired locations or communication regions.")))))
+      ;; Inform the optimizer.
+      (SETQ *COMPILED-FUNCTION-OPTIMIZATION-STATE* NIL))
+    NIL))
+
+;;; These functions aren't called during the cold-boot.  They are here for patching.
+
+(DEFUN LINK-SYMBOL-FUNCTION-CELLS (OTHER-SYMBOL REAL-SYMBOL)
+  (BOOTSTRAP-LINK-SYMBOL-CELLS (FUNCTION-CELL-LOCATION OTHER-SYMBOL)
+			       (FUNCTION-CELL-LOCATION REAL-SYMBOL)
+			       (OR (DECLARED-STORAGE-CATEGORY :FUNCTION-CELL REAL-SYMBOL NIL)
+				   :UNSAFEGUARDED)))
+
+(DEFUN LINK-SYMBOL-VALUE-CELLS (OTHER-SYMBOL REAL-SYMBOL)
+  (BOOTSTRAP-LINK-SYMBOL-CELLS (VALUE-CELL-LOCATION OTHER-SYMBOL)
+			       (VALUE-CELL-LOCATION REAL-SYMBOL)
+			       (OR (DECLARED-STORAGE-CATEGORY :VARIABLE REAL-SYMBOL NIL)
+				   :UNSAFEGUARDED)))
+
+;; True if cell is in A-memory, communication area, or wired area
+#+3600
+(DEFUN PREFERABLE-CELL-P (P)
+  (LET ((AREA (%AREA-NUMBER P)))
+    (OR (NULL AREA)
+	(EQL AREA WIRED-CONTROL-TABLES))))
+
+#+IMACH
+(DEFUN PREFERABLE-CELL-P (P)
+  (LET ((AREA (%AREA-NUMBER P)))
+    (OR (EQL AREA FEP-AREA)
+	(EQL AREA WIRED-CONTROL-TABLES))))
+
+;;Make two symbols share the same value, in spite of binding
+;;Don't do this while FROM-SYMBOL is bound, or it will get undone
+;;when it is unbound, since the microcode does not bother to take
+;;the overhead to check for that case.
+(COMPILER:MAKE-OBSOLETE FORWARD-VALUE-CELL "use SI:LINK-SYMBOL-VALUE-CELLS")
+(DEFUN FORWARD-VALUE-CELL (FROM-SYMBOL TO-SYMBOL)
+  (LINK-SYMBOL-VALUE-CELLS FROM-SYMBOL TO-SYMBOL))
+
+;Forward the value, function, and property cells from one symbol to another
+(DEFUN FORWARD-SYMBOL-CELLS (FROM TO)
+  (UNLESS (EQ (FOLLOW-CELL-FORWARDING (PROPERTY-CELL-LOCATION FROM) NIL)
+	      (FOLLOW-CELL-FORWARDING (PROPERTY-CELL-LOCATION TO) NIL))
+    (WHEN (AND (BOUNDP FROM)
+	       (BOUNDP TO)
+	       (NOT (EQL (SYMEVAL FROM) (SYMEVAL TO))))
+      (FERROR "~S and ~S both already have values" FROM TO))
+    (WHEN (AND (FBOUNDP FROM)
+	       (FBOUNDP TO)
+	       (NOT (EQL (FSYMEVAL FROM) (FSYMEVAL TO))))
+      (FERROR "~S and ~S both already have function definitions" FROM TO))
+    (LOOP FOR (PROP FROM-VAL) ON (PLIST FROM) BY 'CDDR
+	  FOR TO-VAL = (GET TO PROP)
+	  WHEN (AND TO-VAL
+		    (NOT (EQL TO-VAL FROM-VAL)))
+	    DO (IF (EQ PROP :SOURCE-FILE-NAME)
+		   (SETF (GET TO PROP)
+			 (MERGE-SOURCE-FILE-NAME-PROPERTIES FROM FROM-VAL
+							    TO TO-VAL))
+		   (FERROR "~S and ~S both already have ~S properties" FROM TO PROP))
+	  WHEN FROM-VAL
+	    UNLESS (EQ PROP :SOURCE-FILE-NAME)
+	      DO (SETF (GET TO PROP) FROM-VAL))
+    (SETF (PLIST FROM) (PLIST TO))
+    (BOOTSTRAP-LINK-SYMBOL-CELLS (VALUE-CELL-LOCATION FROM) (VALUE-CELL-LOCATION TO)
+				 (OR (DECLARED-STORAGE-CATEGORY :VARIABLE TO NIL)
+				     :UNSAFEGUARDED))
+    (BOOTSTRAP-LINK-SYMBOL-CELLS (FUNCTION-CELL-LOCATION FROM) (FUNCTION-CELL-LOCATION TO)
+				 (OR (DECLARED-STORAGE-CATEGORY :FUNCTION-CELL TO NIL)
+				     :UNSAFEGUARDED))
+    (BOOTSTRAP-LINK-SYMBOL-CELLS (PROPERTY-CELL-LOCATION FROM) (PROPERTY-CELL-LOCATION TO)
+				 :UNSAFEGUARDED)
+    T))
+
+(DEFUN INITIALIZE-SELF-EVALUATING-SYMBOL-TABLE ()
+  (SETF *FORWARDED-SYMBOL-CELL-TABLE-LOCK*
+	(PROCESS:MAKE-LOCK "Forwarded Symbol Cell Table Lock"))
+  (CREATE-INITIAL-SYMBOL-CELL-TABLE :SELF-EVALUATING)
+  (FORWARD-SELF-EVALUATING-SYMBOL 'NIL)
+  (FORWARD-SELF-EVALUATING-SYMBOL 'T)
+  NIL)
+
+(DEFUN FORWARD-SELF-EVALUATING-SYMBOL (SYMBOL)
+  ;; Can't use VALUE-CELL-LOCATION because that doesn't work on NIL.
+  (LET ((CELL (LOCF (SYMBOL-VALUE-CELL SYMBOL))))
+    (PROCESS:WITH-LOCK (*FORWARDED-SYMBOL-CELL-TABLE-LOCK*)
+      (WHEN (AND (EQ CELL (FOLLOW-CELL-FORWARDING CELL NIL))
+		 (EQ (LOCATION-CONTENTS CELL) SYMBOL))
+	(WHEN (>= (FILL-POINTER *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*)
+		  (ARRAY-LENGTH *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*))
+	  (SETQ *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*
+		(MAKE-FORWARDED-SYMBOL-CELL-TABLE
+		  (FOURTH (ASSQ :SELF-EVALUATING *SYMBOL-CELL-TABLE-DESCRIPTORS*))
+		  :SELF-EVALUATING)))
+	(LET* ((INDEX (FILL-POINTER *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*))
+	       (NEW-CELL (LOCF (AREF *CURRENT-SELF-EVALUATING-SYMBOL-TABLE* INDEX))))
+	  (WITH-READ-ONLY-INHIBITED
+	    (SETF (LOCATION-CONTENTS NEW-CELL) SYMBOL)
+	    (SETF (FILL-POINTER *CURRENT-SELF-EVALUATING-SYMBOL-TABLE*) (1+ INDEX)))
+	  (%P-STORE-TAG-AND-POINTER CELL DTP-ONE-Q-FORWARD NEW-CELL)))))
+  SYMBOL)
+
+;;; Things for symbol cell forwarding which don't need to be in the cold load.
+
+(DEFUN RATIONALIZE-WAYWARD-FUNCTION-CELLS (REMOVE-OBSOLETE-REFRENCES)
+  (WHEN (OR REMOVE-OBSOLETE-REFRENCES
+	    (NOT *HOME-FOR-WAYWARD-FUNCTION-CELLS-OPTIMIZED*))
+    (LET ((DEFAULT-CONS-AREA WORKING-STORAGE-AREA))
+      (WHEN REMOVE-OBSOLETE-REFRENCES
+	(LOOP FOR ELEMENT IN *HOME-FOR-WAYWARD-FUNCTION-CELLS*
+	      DO (SETF (CDR ELEMENT)
+		       (REM-IF-NOT #'(LAMBDA (X)
+				       (FUNCTION-SAME-AS-FUNCTION-FROM-NAME
+					 (%FIND-STRUCTURE-HEADER X)))
+				   (CDR ELEMENT)))))
+      (SETQ *HOME-FOR-WAYWARD-FUNCTION-CELLS*
+	    (COPYLIST (DEL-IF-NOT #'CDR *HOME-FOR-WAYWARD-FUNCTION-CELLS*)))
+      (LOOP FOR SUBLIST ON *HOME-FOR-WAYWARD-FUNCTION-CELLS*
+	    DO (SETF (CAR SUBLIST) (COPYLIST (CAR SUBLIST) NIL T)))
+      (SETQ *HOME-FOR-WAYWARD-FUNCTION-CELLS-OPTIMIZED* T))))
+
+(ADD-INITIALIZATION "Rationalize *HOME-FOR-WAYWARD-FUNCTION-CELLS*"
+		    '(RATIONALIZE-WAYWARD-FUNCTION-CELLS NIL)
+		    '(BEFORE-COLD))
+
+(DEFINE-GC-OPTIMIZATION COMPRESS-FORWARD-REFERENCE-DATABASE :LAYERED-SYSTEM-RELEASE
+  (:DOCUMENTATION
+    "Compress the database used to link forward references to undefined functions")
+  (:BEFORE-FLIP (IGNORE)
+    (RATIONALIZE-WAYWARD-FUNCTION-CELLS T)))
+
+#| Metering Functions |
+
+(DEFUN FIND-CELLS-WITH-DOWNWARD-REFERENCES ()
+  (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	AS TABLE-CATEGORY = (ACTUAL-STORAGE-CATEGORY :CONSTANT TABLE)
+	AS BACK = (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE) DO
+    (WHEN (STORAGE-CATEGORY-LESSP :UNSAFEGUARDED TABLE-CATEGORY)
+      (LOOP FOR I BELOW (FILL-POINTER TABLE)
+	    AS LOC = (ALOC TABLE I)
+	    AS VAR = (AREF BACK I)
+	    WHEN (LOCATION-BOUNDP LOC)
+	      DO (LET* ((CONTENTS (LOCATION-CONTENTS LOC)))
+		   (WHEN (AND (%POINTER-TYPE-P (%DATA-TYPE CONTENTS))
+			      (LET ((CATEGORY (ACTUAL-STORAGE-CATEGORY :CONSTANT CONTENTS)))
+				(IF (SYMBOLP CONTENTS)
+				    (EQ CATEGORY :UNSAFEGUARDED)
+				    (STORAGE-CATEGORY-LESSP CATEGORY TABLE-CATEGORY))))
+		     (FORMAT T "~%~48S ==> ~S" VAR CONTENTS)))))))
+
+(DEFUN FIND-MULTIPLY-FORWARDED-CELLS ()
+  (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	AS BACK = (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE) DO
+    (LOOP FOR I BELOW (FILL-POINTER TABLE)
+	  AS LOC = (ALOC TABLE I)
+	  AS VAR = (AREF BACK I)
+	  WHEN (= (%P-DATA-TYPE LOC) DTP-ONE-Q-FORWARD)
+	    DO (LET ((FLOC (FOLLOW-CELL-FORWARDING LOC NIL))
+		     (TYPE NIL))
+		 (COND ((AND (SYMBOLP VAR)
+			     (NOT (NULL VAR))
+			     (NOT (KEYWORDP VAR))
+			     (EQ (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL) FLOC))
+			(SETQ TYPE :VARIABLE))
+		       ((EQ (FOLLOW-CELL-FORWARDING (FDEFINITION-LOCATION VAR) NIL) FLOC)
+			(SETQ TYPE :FUNCTION)))
+		 (WHEN TYPE
+		   (LET ((CAT1 (ACTUAL-STORAGE-CATEGORY :CONSTANT LOC))
+			 (CAT2 (ACTUAL-STORAGE-CATEGORY :CONSTANT FLOC)))
+		     (IF (NEQ CAT1 CAT2)
+			 (FORMAT T "~%~A ~S was changed from ~A to ~A"
+				 (STRING-CAPITALIZE-WORDS TYPE) VAR
+				 (STRING-DOWNCASE CAT1) (STRING-DOWNCASE CAT2))
+			 (FORMAT T "~%~A ~A ~S is forwarded through ~S"
+				 (STRING-CAPITALIZE-WORDS CAT1) (STRING-DOWNCASE TYPE)
+				 VAR LOC))))))))
+
+(DEFUN FIND-FORWARDED-CELLS (SPEC)
+  (WHEN (SYMBOLP SPEC)
+    (FORMAT T "~&~S's value cell ~S is forwarded to ~S"
+	    SPEC (VALUE-CELL-LOCATION SPEC)
+	    (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION SPEC) NIL)))
+  (WHEN (AND (VALIDATE-FUNCTION-SPEC SPEC)
+	     (DEFINITION-HAS-LOCATION-P SPEC))
+    (FORMAT T "~&~S's definition cell ~S is forwarded to ~S"
+	    SPEC (FDEFINITION-LOCATION SPEC)
+	    (FOLLOW-CELL-FORWARDING (FDEFINITION-LOCATION SPEC) NIL)))
+  (TERPRI)
+  (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	AS BACK = (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE) DO
+    (LOOP FOR I BELOW (FILL-POINTER TABLE)
+	  WHEN (CL:EQUAL (AREF BACK I) SPEC)
+	    DO (FORMAT T "~%~S (~A) is forwarded to ~S"
+		       (ALOC TABLE I)
+		       (SELECT (%AREA-NUMBER TABLE)
+			 (CONSTANTS-AREA "self evaluating")
+			 (WIRED-CONTROL-TABLES "wired")
+			 (SAFEGUARDED-OBJECTS-AREA "safeguarded")
+			 (PERMANENT-STORAGE-AREA "unsafeguarded")
+			 (OTHERWISE "unknown"))
+		       (FOLLOW-CELL-FORWARDING (ALOC TABLE I) NIL)))))
+
+(DEFUN PRINT-FORWARDED-VARIABLES-NOT-DECLARED-SPECIAL ()
+  (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	AS BACK = (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE) DO
+    (LOOP FOR I BELOW (FILL-POINTER TABLE)
+	  AS LOC = (ALOC TABLE I)
+	  AS VAR = (AREF BACK I)
+	  WHEN (AND (SYMBOLP VAR)
+		    (NOT (NULL VAR))
+		    (EQ (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION VAR) NIL) LOC)
+		    (NOT (GET VAR 'SPECIAL))
+		    (NOT (KEYWORDP VAR)))
+	    DO (PRINT VAR))))
+
+(DEFUN SUMMARIZE-CONTENTS-OF-FORWARDED-SYMBOL-CELL-TABLES ()
+  (MACROLET ((VARIABLE () 0)
+	     (SYMBOL-FUNCTION-SPEC () 1)
+	     (LIST-FUNCTION-SPEC () 2)
+	     (WIRED () 0)
+	     (SAFEGUARDED () 1)
+	     (UNSAFEGUARDED () 2)
+	     (SELF-EVALUATING () 3))
+    (LOOP WITH ARRAY = (CL:MAKE-ARRAY '(3 4) :INITIAL-ELEMENT 0)
+	  WITH TABLE-COUNTS = (CL:MAKE-ARRAY 4 :INITIAL-ELEMENT 0)
+	  FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	  AS LENGTH = (ARRAY-ACTIVE-LENGTH TABLE)
+	  AS BACKBITER = (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS TABLE)
+	  AS TYPE = (SELECTOR (%AREA-NUMBER TABLE) =
+		      (PERMANENT-STORAGE-AREA (UNSAFEGUARDED))
+		      (SAFEGUARDED-OBJECTS-AREA (SAFEGUARDED))
+		      (WIRED-CONTROL-TABLES (WIRED))
+		      (CONSTANTS-AREA (SELF-EVALUATING)))
+	  DO (INCF (AREF TABLE-COUNTS TYPE))
+	     (LOOP FOR I BELOW LENGTH
+		   AS BACKBITE = (AREF BACKBITER I)
+		   AS SLOT = (ALOC TABLE I)
+		   AS CLASS = (IF (SYMBOLP BACKBITE)
+				  (IF (EQ (FOLLOW-CELL-FORWARDING
+					    (LOCF (SYMBOL-FUNCTION-CELL BACKBITE)) NIL)
+					  SLOT)
+				      (SYMBOL-FUNCTION-SPEC)
+				      (VARIABLE))
+				  (LIST-FUNCTION-SPEC))
+		   DO (INCF (AREF ARRAY CLASS TYPE)))
+	  FINALLY
+	    (SEND STANDARD-OUTPUT :FRESH-LINE)
+	    (FORMATTING-TABLE ()
+	      (FORMATTING-ROW ()
+		(FORMAT-CELL "" #'PRINC)
+		(FORMAT-CELL "variable" #'PRINC)
+		(FORMAT-CELL "symbol-function" #'PRINC)
+		(FORMAT-CELL "list-function" #'PRINC)
+		(FORMAT-CELL "total" #'PRINC))
+	      (LOOP FOR I BELOW 4
+		    FOR TYPE IN '("wired" "safeguarded" "unsafeguarded" "self evaluating") DO
+		(FORMATTING-ROW ()
+		  (FORMAT-CELL TYPE #'PRINC)
+		  (LOOP FOR J BELOW 3 DO
+		    (FORMATTING-CELL (STANDARD-OUTPUT :ALIGN :RIGHT)
+		      (PRINC (AREF ARRAY J I))))
+		  (FORMATTING-CELL (STANDARD-OUTPUT :ALIGN :RIGHT)
+		    (PRINC (LOOP FOR J BELOW 3 SUM (AREF ARRAY J I))))))
+	      (FORMATTING-ROW ()
+		(FORMAT-CELL "total" #'PRINC)
+		(LOOP FOR J BELOW 3 DO
+		  (FORMATTING-CELL (STANDARD-OUTPUT :ALIGN :RIGHT)
+		    (PRINC (LOOP FOR I BELOW 4 SUM (AREF ARRAY J I)))))
+		(FORMATTING-CELL (STANDARD-OUTPUT :ALIGN :RIGHT)
+		  (PRINC
+		    (LOOP FOR I BELOW 4 SUM
+		      (LOOP FOR J BELOW 3 SUM
+			(AREF ARRAY J I)))))))
+	    (WHEN (> (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (UNSAFEGUARDED)))
+		     (THIRD (ASSQ :UNSAFEGUARDED *SYMBOL-CELL-TABLE-DESCRIPTORS*)))
+	      (FORMAT T "~2%Warning:  Initial unsafeguarded table size should be increased to at least ~D."
+		      (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (UNSAFEGUARDED)))))
+	    (WHEN (> (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (SAFEGUARDED)))
+		     (THIRD (ASSQ :SAFEGUARDED *SYMBOL-CELL-TABLE-DESCRIPTORS*)))
+	      (FORMAT T "~2%Warning:  Initial safeguarded table size should be increased to at least ~D."
+		      (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (SAFEGUARDED)))))
+	    (WHEN (> (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (SELF-EVALUATING)))
+		     (THIRD (ASSQ :SELF-EVALUATING *SYMBOL-CELL-TABLE-DESCRIPTORS*)))
+	      (FORMAT T "~2%Warning:  Initial self-evaluating table size should be increased to at least ~D."
+		      (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (SELF-EVALUATING)))))
+	    (WHEN (> (AREF TABLE-COUNTS (WIRED)) 1)
+	      (FORMAT T "~2%Warning:  Initial wired table size should be increased to at least ~D."
+		      (LOOP FOR I BELOW 3 SUM (AREF ARRAY I (WIRED))))))))
+
+||#

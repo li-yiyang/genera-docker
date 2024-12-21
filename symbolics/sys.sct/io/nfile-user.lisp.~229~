@@ -1,0 +1,2588 @@
+;;; -*- Syntax: Zetalisp; Mode: LISP; Package: FILE-SYSTEM; Base: 8 -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; NEW FILE PROTOCOL
+
+(DEFCONST *NFILE-USER-VERSION* 2)
+;;; 6/18/85 10:00:02 BSG
+;;; Version 2 modifies the token list data stream protocol to use :EOF instead
+;;; of top level close-parens.  This is coincidental with the change from :NEW-FILE to :NFILE.
+
+;; The server, also on FS:, uses up the name data-channel.
+(DEFSTRUCT (NFILE-USER-DATA-CHANNEL :NAMED (:conc-name DATA-CHAN-)
+				    (:CONSTRUCTOR
+				     MAKE-USER-DATA-CHANNEL
+				     (DIRECTION HANDLE NET-STREAM))
+				    (:PRINT "#<NFILE-DATA-CHANNEL ~A ~\si:address\>"
+				     (DATA-CHAN-HANDLE NFILE-USER-DATA-CHANNEL)
+				     (%POINTER NFILE-USER-DATA-CHANNEL)))
+  DIRECTION					;:INPUT or :OUTPUT
+  (HANDLE NIL)					;string, the file handle
+  (UNSAFE NIL)					;Needs resynchronization.
+  NET-STREAM					;TOKEN-LIST stream to network
+  NET-DATA-STREAM				;TOKEN-DATA-FILE-STREAM wrapped about above
+  (FILE-STREAM NIL)				;file stream, when in use, mainly for peek
+						;and async output errors
+  (TIME (TIME))					;time touched
+  SIBLING					;brother or sister the other direction
+  (ASYNC-ERROR NIL)				;kludge to pass error var.
+  )
+
+(DEFFLAVOR NFILE-ACCESS-PATH
+	((SERVER-UNITS NIL))			;List of active SERVER-UNIT's
+	(font-encapsulating-access-path-mixin USER-FILE-ACCESS-PATH)
+  (:GETTABLE-INSTANCE-VARIABLES SERVER-UNITS)
+  (:METHOD-COMBINATION :LOGIN-COMMAND-PARAMETERS :APPEND))
+
+
+;;; Needs to be flavorized to know whether to prompt for capability password or not.
+;;; Maybe for :control-connection-lifetime, too.  Who knows how to pick those numbers?
+(DEFFLAVOR LMFS-NFILE-ACCESS-PATH ()
+	   (LMFS-ACCESS-PATH-MIXIN NFILE-ACCESS-PATH))
+
+(DEFINE-FILE-PROTOCOL :NFILE (:BYTE-STREAM-WITH-MARK)
+  (:DESIRABILITY .77)
+  (:ACCESS-PATH-FLAVOR (HOST)
+   (SELECTQ (SEND HOST ':SYSTEM-TYPE)
+     (:LISPM 'LMFS-NFILE-ACCESS-PATH)
+     (OTHERWISE 'NFILE-ACCESS-PATH))))
+
+(DEFVAR *NFILE-PROCESSES-READ-OWN-RESPONSES* NIL)
+(DEFVAR *NFILE-INTERRUPTS-AVAILABLE* T)
+
+(DEFVAR *NFILE-SERVER-UNITS-FOR-PERIODIC-POLLING* NIL)
+(DEFVAR *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING* NIL)
+
+(CHAOS:ADD-CONTACT-NAME-FOR-PROTOCOL :NFILE)
+
+
+;;;
+;;;Macrology for building and invoking server commands, and decoding the results.
+;;;
+
+(DEFUN ENCODE-OBJECT-TO-TOKEN-LIST (OBJECT NIL-IS-SYMBOL-P)
+  (IF (AND (NULL OBJECT) (NOT NIL-IS-SYMBOL-P))
+      NIL
+      (TYPECASE OBJECT
+	((:FIXNUM :BIGNUM :STRING :SYMBOL) OBJECT)
+	(:LIST (LOOP FOR ELEMENT IN OBJECT
+		     COLLECT (ENCODE-OBJECT-TO-TOKEN-LIST ELEMENT NIL)))
+	(FS:PATHNAME (SEND OBJECT ':STRING-FOR-HOST))
+	(OTHERWISE (FERROR "Don't know how to encode ~S to token list." OBJECT)))))
+
+
+(DEFUN NFILE-USER-DECODE-KEYWORD-VALUES (DATA-PAIRS DESCRIPTORS
+					 PATHNAME-FOR-TRUENAME-PARSING-AND-ERROR-HOST
+					 &OPTIONAL BARF-IF-NOT-KNOWN)
+  (WHEN (ODDP (LENGTH DATA-PAIRS))
+    (FERROR "Odd-length keyword//value pair list returned from file server? ~S" DATA-PAIRS))
+  
+  (LOOP WITH HOST = (SEND PATHNAME-FOR-TRUENAME-PARSING-AND-ERROR-HOST ':HOST)
+	FOR (INDICATOR VALUE) ON DATA-PAIRS BY 'CDDR
+	NCONC
+	(LOOP FOR (KEYWORD DATA-TYPE) IN DESCRIPTORS
+	      WHEN (STRING-EQUAL INDICATOR KEYWORD)
+	      RETURN
+	      (LIST KEYWORD
+		    (SELECTQ DATA-TYPE
+		      (:SEXP VALUE)
+		      (:STRING
+		       (OR (STRINGP VALUE)
+			   (FERROR "Bad ~A for parameter ~A returned by host ~A"
+				   (STRING-DOWNCASE DATA-TYPE) KEYWORD HOST))
+		       VALUE)
+		      (:PATHNAME (SEND PATHNAME-FOR-TRUENAME-PARSING-AND-ERROR-HOST
+				       ':PARSE-TRUENAME VALUE))
+		      ((:NUMBER :UNIVERSAL-TIME)
+		       (OR (NUMBERP VALUE)
+			   (FERROR "Bad ~A for parameter ~A returned by host ~A"
+				   (STRING-DOWNCASE DATA-TYPE) KEYWORD HOST))
+		       VALUE)
+		      (:KEYWORD (OR (KEYWORDP VALUE)
+				    (FERROR "Bad keyword for parameter ~A returned by host ~A"
+					    KEYWORD HOST))
+		       VALUE)
+		      (:KEYWORD-LIST
+		       (UNLESS (OR (NULL VALUE) (LISTP VALUE))
+			 (FERROR "Bad keyword list for parameter ~A returned ~
+					by host ~A" KEYWORD HOST))
+		       (LOOP FOR VAL IN VALUE
+			     UNLESS (KEYWORDP VAL)
+			     DO (FERROR "Bad keyword list for parameter ~A returned ~
+					by host ~A" KEYWORD HOST))
+		       VALUE)
+		      (:BOOLEAN (SELECTQ VALUE
+				  ((T NIL) VALUE)
+				  (T (FERROR "Illegal BOOLEAN value for parameter ~A ~
+					     from host ~A" KEYWORD HOST))))
+		      (T (FERROR "Unknown data type: ~S" DATA-TYPE))))
+	      FINALLY (IF BARF-IF-NOT-KNOWN
+			  (FERROR "Unknown indicator ~S returned from host ~A."
+				  INDICATOR HOST)))))
+
+;; KEYWORD-VALUE-PAIRS is guaranteed RPLACABLE!!!
+(DEFUN NFILE-KEYWORD-LIST-CALLER (INSTANCE CMDNAME WHOSTATE DATA-CHANNEL
+				  CONSTANT-ARGS KEYWORD-VALUE-PAIRS)
+  (LOOP FOR PTR ON CONSTANT-ARGS
+	AS (VALUE) = PTR
+	DO (UNLESS (OR (NUMBERP VALUE)
+		       (STRINGP VALUE)
+		       (LISTP VALUE)
+		       (MEMQ VALUE '(T NIL))
+		       (KEYWORDP VALUE))	;all trivial cases
+	     (SETF (CAR PTR)
+		   ;; NIL is a list here...
+		   (ENCODE-OBJECT-TO-TOKEN-LIST VALUE NIL))))
+  
+  (LET ((NARGS (+ 4
+		  ;;for the message name, cmd name, whostate, data chan
+		  (LENGTH CONSTANT-ARGS)
+		  (* 2
+		     (LOOP FOR PTR ON KEYWORD-VALUE-PAIRS BY'CDDR
+			   FOR (KWD VALUE) = PTR
+			   WHEN VALUE
+			   DO (UNLESS (OR (NUMBERP VALUE)
+					  (STRINGP VALUE)
+					  (LISTP VALUE)
+					  (MEMQ VALUE '(T NIL))
+					  (KEYWORDP VALUE))
+				(SETF (CADR PTR)
+				      ;; It doesn't matter how we interpret NIL, because
+				      ;; we never send it.
+				      (ENCODE-OBJECT-TO-TOKEN-LIST VALUE T)))
+			   (UNLESS (KEYWORDP KWD)
+			     (FERROR "Why isn't this keyword really a keyword? ~S" KWD))
+			   
+			   COUNT VALUE)))))
+    
+    (%START-FUNCTION-CALL INSTANCE RETURN NARGS NIL)
+    (%PUSH ':COMMAND)
+    (%PUSH CMDNAME)
+    (%PUSH WHOSTATE)
+    (%PUSH DATA-CHANNEL)
+    (LOOP WHILE CONSTANT-ARGS
+	  DO (%PUSH (POP CONSTANT-ARGS)))
+    (LOOP WHILE KEYWORD-VALUE-PAIRS
+	  WHEN (CADR KEYWORD-VALUE-PAIRS)
+	  DO
+	  (%PUSH (CAR KEYWORD-VALUE-PAIRS))
+	  (%PUSH (CADR KEYWORD-VALUE-PAIRS))
+	  DO
+	  (SETQ KEYWORD-VALUE-PAIRS (CDDR KEYWORD-VALUE-PAIRS)))
+    (%FINISH-FUNCTION-CALL INSTANCE RETURN NARGS NIL)))
+
+(DEFMACRO ISSUE-NFILE-COMMAND (SERVER-UNIT COMMAND-NAME &BODY ARGS
+			       &AUX WHOSTATE DATA-CHAN)
+  (SETQ WHOSTATE (COND ((AND (LISTP COMMAND-NAME)
+			     (EQ (CAR COMMAND-NAME) 'QUOTE)
+			     (STRING-CAPITALIZE-WORDS (CADR COMMAND-NAME))))
+		       ((SYMBOLP COMMAND-NAME) (STRING-CAPITALIZE-WORDS COMMAND-NAME))
+		       (T NIL)))
+  (LET ((STRAIGHT-ARGS-GENSYM NIL)
+	(KWD-ARGS-GENSYM NIL)
+        (STRAIGHT-ARGS (LOOP FOR X IN ARGS
+			     UNTIL (MEMQ X '(&KEY &WHOSTATE &DATA-CHANNEL))
+			     COLLECT X))
+	(KWD-ARGS
+	  (LOOP FOR X ON ARGS
+		WHEN (EQ (CAR X) '&WHOSTATE)
+		  DO (SETQ WHOSTATE (CADR X))
+		WHEN (EQ (CAR X) '&DATA-CHANNEL)
+		  DO (SETQ DATA-CHAN (CADR X))
+		WHEN (EQ (CAR X) '&KEY)
+		RETURN
+		(LOOP FOR ARGDESC IN (CDR X)
+		      NCONC
+		      (COND ((KEYWORDP ARGDESC)
+			     (FERROR "Lone keyword ~S in ISSUE-NFILE-COMMAND call?"
+				     ARGDESC))
+			    ((SYMBOLP ARGDESC)
+			     `(,(INTERN (GET-PNAME ARGDESC) PKG-KEYWORD-PACKAGE) ,ARGDESC))
+			    ((LISTP ARGDESC)
+			     (DESTRUCTURING-BIND (KEYWORD VALUE) ARGDESC
+			       (UNLESS (KEYWORDP KEYWORD)
+				 (FERROR
+				   "Keyword expected in ~S in ISSUE-NFILE-COMMAND"
+				   ARGDESC))
+			       `(,KEYWORD ,VALUE)))
+			    (T (FERROR
+				 "Don't understand ~S in ISSUE-NFILE-COMMAND")))))))
+    (IF STRAIGHT-ARGS (SETQ STRAIGHT-ARGS-GENSYM (GENSYM)))
+    (IF KWD-ARGS (SETQ KWD-ARGS-GENSYM (GENSYM)))
+    (LET ((RESULT
+	    `(NFILE-KEYWORD-LIST-CALLER
+	       ,SERVER-UNIT ,COMMAND-NAME ,(OR WHOSTATE
+					       (FERROR "Can't figure out whostate? ~S"
+						       COMMAND-NAME))
+	       ,DATA-CHAN
+	       ,STRAIGHT-ARGS-GENSYM ,KWD-ARGS-GENSYM)))
+      (IF KWD-ARGS
+	  (SETQ RESULT `(WITH-STACK-LIST (,KWD-ARGS-GENSYM . ,KWD-ARGS)
+			  ,RESULT)))
+      (IF STRAIGHT-ARGS
+	  (SETQ RESULT `(WITH-STACK-LIST (,STRAIGHT-ARGS-GENSYM . ,STRAIGHT-ARGS)
+			  ,RESULT)))
+      RESULT)))
+
+;; Only valid in access path or host unit methods!!!
+;; This used to be an AWFUL lot hairier when keywords, T, NIL, and numbers didn't come
+;; identified over the byte-stream protocol.
+(DEFMACRO NFILE-DESTRUCTURE-WITH-TYPES (DESCRIPTORS DATA &BODY BODY
+					&AUX RVAL-MAGIC REST-FLAG)
+  (IF (EQ (CAR DESCRIPTORS) '&REST)
+      (SETQ REST-FLAG T
+	    DESCRIPTORS (CDR DESCRIPTORS)))
+
+  (WHEN (ASSQ ':RETURN-VALUE DESCRIPTORS)    
+    (SETQ DESCRIPTORS (SUBST (SETQ RVAL-MAGIC (IF REST-FLAG DATA (GENSYM)))
+			     ':RETURN-VALUE DESCRIPTORS)))
+  
+  (LET ((CONVERSIONS
+	  (LOOP FOR ((NAME TYPE . THE-REST) . NOT-LAST) ON DESCRIPTORS
+		AS COMPLAIN-NAME = (IF (EQ NAME RVAL-MAGIC)
+				       "this command"
+				       NAME)
+		COLLECT `(UNLESS ,(IF REST-FLAG
+				      NAME
+				      '.SERVER-VALUE.)
+			   (FERROR ,(FORMAT NIL
+					    "File server ~~A did not return a value for ~A."
+					    COMPLAIN-NAME)
+				   HOST))
+		
+		
+		AS VALUE = (IF REST-FLAG NAME '(CAR .SERVER-VALUE.))
+		COLLECT
+		(LET ((TRANSLATION-FORM
+			(SELECTQ TYPE
+			  (:PATHNAME `(SEND SELF :PARSE-TRUENAME ,VALUE))
+			  ((:SEXP :NUMBER :KEYWORD :STRING :BOOLEAN :BOOLKEY :KEYWORD-LIST)
+			   VALUE)
+			  (:KEYWORD-PAIRS
+			   `(NFILE-USER-DECODE-KEYWORD-VALUES ,VALUE . ,THE-REST))
+			  (T (FERROR "Unknown data type: ~S" TYPE)))))
+		  ;; Avoid needless vars and setq if only one value.
+		  (IF (AND RVAL-MAGIC (EQ NAME RVAL-MAGIC))
+		      (SETQ DESCRIPTORS NIL))
+
+		  (IF (AND RVAL-MAGIC
+			   (OR REST-FLAG (NULL DESCRIPTORS)))
+		      TRANSLATION-FORM
+		      `(SETQ ,NAME ,TRANSLATION-FORM)))
+		WHEN NOT-LAST COLLECT '(POP .SERVER-VALUE.))))
+    
+    (IF REST-FLAG
+	(IF RVAL-MAGIC
+	    `(PROGN ,@CONVERSIONS)
+	    `(LET ((,(CAAR DESCRIPTORS) ,DATA))
+	       ,@CONVERSIONS
+	       . ,BODY))
+		  
+	`(LET ((.SERVER-VALUE. ,DATA)
+	       ,@ (MAPCAR #'CAR DESCRIPTORS))
+	   ,@ CONVERSIONS
+	   . ,(OR BODY (AND RVAL-MAGIC DESCRIPTORS (LIST RVAL-MAGIC)))))))
+
+(EVAL-WHEN (COMPILE LOAD EVAL)
+  (DEFUN NFILE-DESTRUCTURE-ONCE-ONLY (FORM ARG)
+    (IF (OR (ATOM ARG)
+	    (EQUAL ARG '(CAR .SERVER-VALUE.)))
+	(SUBST ARG '..VALUE.. FORM)
+	(LET ((GS (GENSYM)))
+	  `(LET ((,GS ,ARG))
+	     ,(SUBST GS '..VALUE.. FORM))))))
+
+;;Crockamarola to get HOST ...
+(DEFMACRO NFILE-STREAM-DESTRUCTURE-WITH-TYPES (DESCRIPTORS DATA &BODY BODY)
+  `(LET ((HOST (SEND SERVER-UNIT ':HOST)))
+     (NFILE-DESTRUCTURE-WITH-TYPES ,DESCRIPTORS ,DATA
+       . , BODY)))
+
+;;; Only good in access paths or streams.  Don't pass SERVER-UNIT-VAR if you are a
+;;; stream method, to cause it to use the SERVER-UNIT instance variable.
+;;; If SERVER-UNIT-VAR is :NEED-DATA-CHANNEL, you have SERVER-UNIT set up, but want
+;;; the macro to get the data channel set up for you.
+(DEFMACRO WITH-PROTECTED-ALLOCATION-OF-DATA-CHANNEL ((VARIABLE DIRECTION
+							       SERVER-UNIT-VAR)
+						     &BODY BODY &AUX SERVER-UNIT NEED-DC)
+  (IF (EQ SERVER-UNIT-VAR ':NEED-DATA-CHANNEL)
+      (SETQ SERVER-UNIT 'SERVER-UNIT SERVER-UNIT-VAR 'SERVER-UNIT NEED-DC T)
+      (SETQ SERVER-UNIT 'SELF))
+
+  (LET ((VAR (INTERN (STRING-APPEND VARIABLE "-.UNSAFE-FREE-FLAG")))
+	(MAKE-SERVER-UNIT-VAR SERVER-UNIT-VAR))
+    (IF (NULL SERVER-UNIT-VAR)
+	(SETQ SERVER-UNIT-VAR 'SERVER-UNIT))
+    `(LET ((,VAR T)
+	   (,VARIABLE NIL)
+	   ,@ (AND MAKE-SERVER-UNIT-VAR (NOT NEED-DC) `((,SERVER-UNIT-VAR NIL))))
+       (UNWIND-PROTECT
+	 (PROG2
+	   (PROGN ,@ (AND MAKE-SERVER-UNIT-VAR
+			  `(
+			    ,(IF NEED-DC
+				 `(SETQ ,VARIABLE
+					(SEND ,SERVER-UNIT ':GET-DATA-CHANNEL ,DIRECTION))
+				 `(MULTIPLE-VALUE (,VARIABLE ,SERVER-UNIT-VAR)
+				    (SEND ,SERVER-UNIT ':GET-DATA-CHANNEL ,DIRECTION))))
+			  )
+		  (SETF (DATA-CHAN-UNSAFE ,VARIABLE) T))
+	   (PROGN . ,BODY)
+	   (SETQ ,VAR NIL))
+	 (IF (AND ,VARIABLE ,SERVER-UNIT-VAR ,VAR)
+	     (SEND ,SERVER-UNIT-VAR ':FREE-DATA-CHANNEL ,VARIABLE T))))))
+
+;; For Stream methods, where SERVER-UNIT is expected to be already declared.
+(DEFMACRO PROTECT-DATA-CHANNEL-DEALLOCATION ((VARIABLE UNSAFE-FLAG) &BODY BODY)
+  (LET ((VAR (OR UNSAFE-FLAG
+		 (INTERN (STRING-APPEND VARIABLE "-.UNSAFE-FREE-FLAG")))))
+    `(LET ((,VAR ':MACRO-SET-IT-UNSAFE))
+       (UNWIND-PROTECT
+	 (PROG2 (SETF (DATA-CHAN-UNSAFE ,VARIABLE) T)	;probably be so anyway.
+		(PROGN . ,BODY)
+		(IF (EQ ,VAR ':MACRO-SET-IT-UNSAFE)
+		    (SETQ ,VAR NIL)))
+	 (SEND SERVER-UNIT ':FREE-DATA-CHANNEL
+	       (PROG1 ,VARIABLE
+		      (SETQ ,VARIABLE NIL))
+	       ,VAR)))))
+
+
+
+;;; One SERVER-UNIT is associated with each control connection
+(DEFFLAVOR NFILE-SERVER-UNIT
+	(HOST					;the most fundamental object of all
+	 ACCESS-PATH				;NFILE-ACCESS-PATH
+	 (CONTROL-STREAM NIL)			;Control token-list stream for this host
+	 (CONTROL-STREAM-TOUCHED (TIME))	;Last time the control connection was used.
+	 (DATA-CHANNELS NIL)			;List of DATA-CHAN's
+	 (MAX-DATA-CONNECTIONS-REACHED NIL)	;don't try for more.
+	 (PROPERTY-INDEX-TABLE NIL)		;values of property indices in lists.
+	 (LOCK (PROCESS:MAKE-LOCK "NFile Server Unit Lock" :RECURSIVE T))	;Lock to insure no timing screws
+	 (RESPONSE-LOCK (PROCESS:MAKE-LOCK "NFile Server Response Lock"))	;lock for picking up responses
+	 SERVICE-ACCESS-PATH			;How to make connection
+	 (RESPONSES NIL)			;list of (tid . response)'s
+	 
+	 (SERVER-INFO NIL)			;data returned at LOGIN time.
+
+	 ;; A quarter of this instance is devoted to being able to read without
+	 ;; clobbering somebody else's data.
+	 (RESPONSE-READING-CONTROL NIL)		;NIL = Read it ourself.
+						;':READER = use utility reader
+						;':INTERRUPT = stream has interrupt fcn.
+	 (CONTROL-STREAM-READ (TIME))
+	 (CONTROL-STREAM-READ-ERROR NIL)
+	 
+	 )
+	()
+  (:INITABLE-INSTANCE-VARIABLES ACCESS-PATH SERVICE-ACCESS-PATH)
+  (:GETTABLE-INSTANCE-VARIABLES SERVICE-ACCESS-PATH HOST ACCESS-PATH CONTROL-STREAM
+   PROPERTY-INDEX-TABLE CONTROL-STREAM-READ))
+
+(DEFMETHOD (MAKE-INSTANCE NFILE-SERVER-UNIT) (&REST IGNORE)
+  (SETQ HOST (SEND ACCESS-PATH ':HOST)))
+
+(DEFMETHOD (:SAMPLE-PATHNAME NFILE-ACCESS-PATH) ()
+  (SEND HOST :SAMPLE-PATHNAME))
+
+(DEFMETHOD (:PARSE-TRUENAME NFILE-ACCESS-PATH) (PATHNAME)
+  (PARSE-PATHNAME PATHNAME HOST))
+
+(DEFMETHOD (:PARSE-TRUENAME NFILE-SERVER-UNIT) (PATHNAME)
+  (SEND ACCESS-PATH :PARSE-TRUENAME PATHNAME))
+
+(DEFMETHOD (:GET-SERVER-UNIT NFILE-ACCESS-PATH) ()
+  (COND ((NULL SERVER-UNITS)
+	 (SEND SELF ':NEW-SERVER-UNIT))
+	((LOOP FOR UNIT IN SERVER-UNITS
+	       WHEN (SEND UNIT ':VALIDATE-CONTROL-STREAM T)
+	       RETURN UNIT))
+	(T
+	 (LET ((UNIT (CAR SERVER-UNITS)))
+	   (SEND UNIT ':VALIDATE-CONTROL-STREAM)
+	   UNIT))))
+
+(DEFMETHOD (:NEW-SERVER-UNIT NFILE-ACCESS-PATH) ()
+  (LET ((UNIT (MAKE-INSTANCE 'NFILE-SERVER-UNIT ':SERVICE-ACCESS-PATH SERVICE-ACCESS-PATH
+			     ':ACCESS-PATH SELF)))
+    (WITHOUT-INTERRUPTS
+      (SETQ SERVER-UNITS (NCONC SERVER-UNITS (NCONS UNIT))))
+    (SEND UNIT ':VALIDATE-CONTROL-STREAM)
+    UNIT))
+
+(DEFMETHOD (:RESET NFILE-ACCESS-PATH) ()
+  (DOLIST (UNIT SERVER-UNITS)
+    (SEND UNIT ':RESET))
+  (FS:UNREGISTER-FOR-FILE-CONNECTION-SCAVENGER SELF))
+
+(DEFMETHOD (:RESET NFILE-SERVER-UNIT)
+	   (&OPTIONAL DONT-UNLOCK-LOCK-P (REASON "Server unit reset"))
+  (WHEN CONTROL-STREAM
+    (SEND CONTROL-STREAM ':CLOSE-WITH-REASON REASON T)
+    (SETQ CONTROL-STREAM NIL))
+  ;;; RESPONSE-READING-CONTROL may have been changed by a CC reading error.
+  (WITHOUT-INTERRUPTS
+    (SETQ *NFILE-SERVER-UNITS-FOR-PERIODIC-POLLING*
+	  (DELQ SELF *NFILE-SERVER-UNITS-FOR-PERIODIC-POLLING*))
+    (SETQ *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*
+	  (DELQ SELF *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*))
+    (PROCESS:PROCESS-WAKEUP FS::*NFILE-RESPONSE-READER*))
+  (SETQ RESPONSES NIL)
+  (PROCESS:RESET-LOCK RESPONSE-LOCK)
+  
+  (LOOP FOR DATA-CHAN IN DATA-CHANNELS
+	AS STREAM = (DATA-CHAN-FILE-STREAM DATA-CHAN)
+	UNLESS (SYMBOLP STREAM)
+	DO (IGNORE-ERRORS
+	     (SEND STREAM ':CLOSE ':ABORT))
+	DO (SEND (DATA-CHAN-NET-STREAM DATA-CHAN) :CLOSE-WITH-REASON REASON T))
+  (SETQ DATA-CHANNELS NIL MAX-DATA-CONNECTIONS-REACHED NIL)
+  (UNLESS DONT-UNLOCK-LOCK-P
+    (PROCESS:RESET-LOCK LOCK)))
+
+;; Verify that connection is still open
+(DEFMETHOD (:TEST-CONNECTIONS NFILE-SERVER-UNIT) ()
+  (AND (SEND SELF ':TEST-CONTROL-STREAM)
+       (LOOP FOR DATA-CHAN IN DATA-CHANNELS
+	     ALWAYS (SEND (DATA-CHAN-NET-STREAM DATA-CHAN) :CONNECTED-P))))
+
+(DEFMETHOD (:TEST-CONTROL-STREAM NFILE-SERVER-UNIT) ()
+  (AND CONTROL-STREAM
+       (SEND CONTROL-STREAM ':CONNECTED-P)))
+
+;;; Lock a host unit around BODY
+(DEFMACRO LOCK-NSERVER-UNIT-SELF (&BODY BODY)
+  `(PROCESS:WITH-LOCK (LOCK)
+     ,@BODY))
+
+;;; Check that connection hasn't gone away, making a new one if necessary
+(DEFMETHOD (:VALIDATE-CONTROL-STREAM NFILE-SERVER-UNIT) (&OPTIONAL NO-ERROR-P)
+  (LOCK-NSERVER-UNIT-SELF
+    (SETQ CONTROL-STREAM-TOUCHED (TIME))
+    (COND ((SEND SELF ':TEST-CONNECTIONS)
+	   (WHEN *NFILE-RESPONSE-READER*
+	     (PROCESS:PROCESS-WAKEUP *NFILE-RESPONSE-READER*))
+	   T)
+	  (T
+	   (SEND SELF ':RESET T)	;Arg of T means don't unlock lock
+	   (DO (STREAM) (NIL)
+	     (CONDITION-CASE-IF NO-ERROR-P ()
+		 (SETQ STREAM
+		       (NET:GET-CONNECTION-FOR-SERVICE
+			 SERVICE-ACCESS-PATH ':TOKEN-LIST T))
+	       (CONNECTION-ERROR
+		(RETURN NIL))
+	       (:NO-ERROR
+		(SETQ CONTROL-STREAM STREAM CONTROL-STREAM-READ-ERROR NIL)
+		(SETQ RESPONSE-READING-CONTROL
+		      (COND (*NFILE-PROCESSES-READ-OWN-RESPONSES*
+			     NIL)
+			    ((AND *NFILE-INTERRUPTS-AVAILABLE* 
+				  (SEND CONTROL-STREAM ':OPERATION-HANDLED-P
+					':SET-INPUT-INTERRUPT-FUNCTION))
+			     (SEND CONTROL-STREAM ':SET-INPUT-INTERRUPT-FUNCTION
+				   'NFILE-INPUT-INTERRUPT-FUNCTION SELF)
+			     ':INTERRUPT)
+			    (T ':READER)))
+		(FS:REGISTER-FOR-FILE-CONNECTION-SCAVENGER
+		  ACCESS-PATH #'(LAMBDA () (SEND ACCESS-PATH :SCAVENGE)))
+		(WITHOUT-INTERRUPTS
+		  (SELECTQ RESPONSE-READING-CONTROL
+		    (:INTERRUPT)
+		    (:READER (PUSH SELF *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*))
+		    (NIL (PUSH SELF *NFILE-SERVER-UNITS-FOR-PERIODIC-POLLING*))))
+		(NFILE-SERVER-UNIT-LOGIN SELF T)
+		(WHEN *NFILE-RESPONSE-READER*
+		  (PROCESS:PROCESS-WAKEUP *NFILE-RESPONSE-READER*))
+		(RETURN T))))))))
+
+
+;;; Get a DATA-CHAN for use in DIRECTION.
+;;; Make two passes over existing units, first trying open ones.
+(DEFMETHOD (:GET-DATA-CHANNEL NFILE-ACCESS-PATH) (DIRECTION &AUX CHANNEL)
+  (BLOCK GET-DATA-CHANNEL
+    (LOOP FOR ERROR-P FIRST NIL THEN T
+	  DO
+	  (LOOP FOR UNIT IN SERVER-UNITS
+		DO (AND (SEND UNIT ':VALIDATE-CONTROL-STREAM (NOT ERROR-P))
+			(SETQ CHANNEL (SEND UNIT ':GET-DATA-CHANNEL DIRECTION))
+			(RETURN-FROM GET-DATA-CHANNEL (VALUES CHANNEL UNIT))))
+	  WHEN ERROR-P
+	  DO (LET ((UNIT (SEND SELF ':NEW-SERVER-UNIT)))
+	       (OR (SETQ CHANNEL (SEND UNIT ':GET-DATA-CHANNEL DIRECTION))
+		   (FERROR "New host unit ~S failed to allocate data channel" UNIT))
+	       (RETURN-FROM GET-DATA-CHANNEL (VALUES CHANNEL UNIT))))))
+
+;;; Get a data channel for this unit.  Makes a new pair if there are none free.
+;;; Prefer ones not needing resynchronization.
+(DEFMETHOD (:GET-DATA-CHANNEL NFILE-SERVER-UNIT) (DIRECTION)
+  (BLOCK GOT-DATA-CHANNEL
+    (LOCK-NSERVER-UNIT-SELF
+      (AND (NOT MAX-DATA-CONNECTIONS-REACHED)
+	   (LET ((CHANNEL
+		   (LOOP FOR I BELOW 3
+			 ;;0 for ones not needing resync
+			 ;;1 for ones even needing resync
+			 ;;2 for make new ones.
+			 THEREIS
+			 (LOOP FOR DATA-CHANNEL IN DATA-CHANNELS
+			       WHEN
+			       (AND (EQ (DATA-CHAN-DIRECTION DATA-CHANNEL) DIRECTION)
+				    (NULL (DATA-CHAN-FILE-STREAM DATA-CHANNEL))
+				    (IF (SEND (DATA-CHAN-NET-STREAM DATA-CHANNEL)
+					      ':CONNECTED-P)
+					T
+					(SETQ DATA-CHANNELS
+					      (DELQ DATA-CHANNEL DATA-CHANNELS))
+					NIL)
+				    (OR (> I 0) (NOT (DATA-CHAN-UNSAFE DATA-CHANNEL))))
+			       RETURN (PROGN
+					;;Mark as allocated
+					(SETF (DATA-CHAN-FILE-STREAM DATA-CHANNEL) T)
+					DATA-CHANNEL))
+			 DO (SELECTOR I =
+			      (0 )
+			      (1 (CONDITION-CASE ()
+				     (SEND SELF ':NEW-DATA-CONNECTION)
+				   (FS:FILE-ERROR	;really want something better here....
+				     (SETQ MAX-DATA-CONNECTIONS-REACHED T)
+				     (RETURN-FROM GOT-DATA-CHANNEL NIL))))
+			      (2 (FERROR "Failed to allocate data connection for ~A"
+					 SELF))))))
+	     ;; Do some initialization for fresh use.
+	     (SETF (DATA-CHAN-ASYNC-ERROR CHANNEL) NIL)
+	     ;; Unspring beartraps
+	     (SEND (DATA-CHAN-NET-STREAM CHANNEL)
+		   (SELECTQ DIRECTION
+		     (:INPUT :SET-INPUT-EXCEPTION)
+		     (:OUTPUT :SET-OUTPUT-EXCEPTION))
+		   NIL)
+	     ;;; The file-connection scavenger is supposed to resynchronize unsafe
+	     ;;; DC's if it can grab the lock when he gets ambitious.  If he hasn't
+	     ;;; we can do it, too.
+	     (IF (EQ DIRECTION ':OUTPUT)
+		 (SEND (DATA-CHAN-NET-DATA-STREAM CHANNEL) ':DISCARD-CURRENT-OUTPUT-BUFFER))
+	     (IF (DATA-CHAN-UNSAFE CHANNEL)
+		 (SEND SELF ':RESYNCHRONIZE-DATA-CHANNEL CHANNEL))
+	     (IF (EQ DIRECTION ':INPUT)
+		 (SEND (DATA-CHAN-NET-DATA-STREAM CHANNEL) ':CLEAR-EOF))
+	     (RETURN-FROM GOT-DATA-CHANNEL CHANNEL))))))
+
+(DEFMETHOD (:FREE-DATA-CHANNEL NFILE-SERVER-UNIT) (CHANNEL &OPTIONAL LEAVE-UNSAFE)
+  (LOCK-NSERVER-UNIT-SELF
+    (SETF (DATA-CHAN-TIME CHANNEL) (TIME))
+    (IF (OR (NOT LEAVE-UNSAFE)
+	    (EQ (DATA-CHAN-UNSAFE CHANNEL) ':CLEAN-ERROR))
+	(SETF (DATA-CHAN-UNSAFE CHANNEL) NIL))
+    (SETF (DATA-CHAN-FILE-STREAM CHANNEL) NIL)))
+
+;;; Allocate a new data connection
+(DEFMETHOD (:NEW-DATA-CONNECTION NFILE-SERVER-UNIT) ()
+  (LET* ((INPUT-HANDLE (FILE-GENSYM "I"))
+	 (OUTPUT-HANDLE (FILE-GENSYM "O"))
+	 
+	 (STREAM (SEND CONTROL-STREAM ':START-OPEN-AUXILIARY-STREAM
+			   T			;active-p
+			   ':FOREIGN-ID
+			   (NFILE-DESTRUCTURE-WITH-TYPES
+			     ((:RETURN-VALUE :STRING))
+			     (SEND SELF ':COMMAND
+				   ':DATA-CONNECTION
+				   "New Data Connection"
+				   NIL INPUT-HANDLE OUTPUT-HANDLE))
+			   ':STREAM-OPTIONS '(:TOKEN-LIST T)))
+	 (DATA-STREAM
+	   (MAKE-INSTANCE
+	     'NETI:TOKEN-LIST-BIDIRECTIONAL-DATA-STREAM
+	     :RAW-STREAM STREAM
+;;;+++Compatibility kludge with old data protocol
+	     :DATA-PROTOCOL-VERSION (OR (CADR (MEMQ ':SERVER-VERSION SERVER-INFO)) 2)))
+	 
+	 (INPUT-CHANNEL (MAKE-USER-DATA-CHANNEL ':INPUT INPUT-HANDLE STREAM))
+	 (OUTPUT-CHANNEL (MAKE-USER-DATA-CHANNEL ':OUTPUT OUTPUT-HANDLE STREAM)))
+    
+    D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; Wait up to one minute for a connection to the server.  The probability of a server
+0    1;; dying after we have just used a valid control connection is pretty slim but we should
+0    1;; have a timeout anyway.
+0    (SEND STREAM ':COMPLETE-CONNECTION :TIMEOUT (* 60. 60.))
+
+    (SETF (DATA-CHAN-NET-DATA-STREAM OUTPUT-CHANNEL) DATA-STREAM)
+    (SETF (DATA-CHAN-NET-DATA-STREAM INPUT-CHANNEL) DATA-STREAM)
+
+    (SETF (DATA-CHAN-SIBLING INPUT-CHANNEL) OUTPUT-CHANNEL)
+    (SETF (DATA-CHAN-SIBLING OUTPUT-CHANNEL) INPUT-CHANNEL)
+
+    (WITHOUT-INTERRUPTS
+      (PUSH INPUT-CHANNEL DATA-CHANNELS)
+      (PUSH OUTPUT-CHANNEL DATA-CHANNELS))))
+
+;;; Called by scavenger
+(DEFMETHOD (:CLOSE-DATA-CONNECTION NFILE-SERVER-UNIT) (INPUT-CHANNEL)
+  ;; Called locked, otherwise meaningless.
+  (LET ((SIB (DATA-CHAN-SIBLING INPUT-CHANNEL)))
+    (SEND SELF ':SIMPLE-COMMAND ':UNDATA-CONNECTION
+	  "Close Data Connection"
+	  (DATA-CHAN-HANDLE INPUT-CHANNEL) 
+	  (DATA-CHAN-HANDLE SIB))
+    (SEND (DATA-CHAN-NET-STREAM INPUT-CHANNEL) ':CLOSE-WITH-REASON "Undata" T)
+    (SETQ DATA-CHANNELS (DELQ INPUT-CHANNEL (DELQ SIB DATA-CHANNELS)))))
+
+(DEFMETHOD (:RESYNCHRONIZE-DATA-CHANNEL NFILE-SERVER-UNIT) (CHANNEL)
+  (SELECTQ (DATA-CHAN-DIRECTION CHANNEL)
+    (:INPUT
+     (NFILE-DESTRUCTURE-WITH-TYPES
+       ((RESYNC-IDENTIFIER :STRING))
+       (SEND SELF ':SIMPLE-COMMAND
+	     ':RESYNCHRONIZE-DATA-CHANNEL
+	     "Resync Data Channel"
+	     (DATA-CHAN-HANDLE CHANNEL) NIL)       
+       (READ-DATA-STREAM-FOR-RESYNC-MESSAGE
+	 (DATA-CHAN-NET-DATA-STREAM CHANNEL) RESYNC-IDENTIFIER)))
+    (:OUTPUT
+     (LET ((RESYNC-IDENTIFIER (FILE-GENSYM "UDCRSY")))
+       (LET ((TID (SEND SELF ':ASYNCHRONOUS-COMMAND-START
+			:RESYNCHRONIZE-DATA-CHANNEL NIL NIL
+			(DATA-CHAN-HANDLE CHANNEL) RESYNC-IDENTIFIER)))
+	 (SEND (DATA-CHAN-NET-STREAM CHANNEL)
+	       ':SEND-TOKEN-LIST "DATA-CHANNEL-RESYNC-DUMMY" T)
+	 (SEND (DATA-CHAN-NET-STREAM CHANNEL)
+	       ':SEND-TOKEN-LIST `("RESYNCHRONIZE" ,RESYNC-IDENTIFIER) T)
+	 (SEND (DATA-CHAN-NET-STREAM CHANNEL) ':FORCE-OUTPUT)
+	 (SEND SELF ':ASYNCHRONOUS-COMMAND-WAIT TID
+	       ':RESYNCHRONIZE-DATA-CHANNEL "Resync Data Channel" NIL)))))
+  (SETF (DATA-CHAN-UNSAFE CHANNEL) NIL))
+
+(DEFUN READ-DATA-STREAM-FOR-RESYNC-MESSAGE (STREAM RESYNC-IDENTIFIER)
+  (WITH-STACK-LIST (SOUGHT-MESSAGE "RESYNCHRONIZE" RESYNC-IDENTIFIER)
+    (LOOP UNTIL (EQUAL (READ-DATA-STREAM-UNTIL-MARK-MESSAGE STREAM)
+		       SOUGHT-MESSAGE))))
+
+(DEFUN READ-DATA-STREAM-UNTIL-MARK-MESSAGE (DATA-STREAM)
+  (SEND DATA-STREAM ':CLEAR-EOF)
+  (SEND (SEND DATA-STREAM ':RAW-STREAM) ':READ-TOKEN-LIST T))
+
+
+(DEFCONST *NFILE-LOGIN-VALUE-DESCRIPTORS*
+	  `((:NAME :STRING)
+	    (:PERSONAL-NAME :STRING)
+	    (:HOMEDIR-PATHNAME :PATHNAME)
+	    (:GROUP-AFFILIATION :STRING)
+
+	    (:SERVER-VERSION :SEXP)
+	    (:PROPERTY-INDEX-TABLE :KEYWORD-LIST)))
+
+(DEFGENERIC NFILE-SERVER-UNIT-LOGIN (NFILE-SERVER-UNIT LOGIN-P &OPTIONAL CONDITION))
+  
+(DEFMETHOD (FS:FILE-ACCESS-PATH-LOGIN NFILE-ACCESS-PATH) (LOGIN-P &KEY FORCE-PASSWORD)
+  (LOOP FOR UNIT IN SERVER-UNITS
+	DO (NFILE-SERVER-UNIT-LOGIN UNIT LOGIN-P FORCE-PASSWORD)))
+
+(DEFMETHOD (:LOGIN-COMMAND-PARAMETERS NFILE-ACCESS-PATH) ()
+  (LIST ':USER-VERSION *NFILE-USER-VERSION*))
+
+(DEFMETHOD (NFILE-SERVER-UNIT-LOGIN NFILE-SERVER-UNIT) (LOGIN-P &OPTIONAL CONDITION)
+  (COND ((OR (NULL CONTROL-STREAM)
+	     (NOT (SEND CONTROL-STREAM ':CONNECTED-P)))
+	 ;; No control connection - don't do anything, return NIL.
+	 NIL)
+	((NOT LOGIN-P)
+	 ;; Log out this file connection.
+	 (SEND SELF ':RESET T "Logging out")
+	 T)
+	(T
+	 ;; Really log in this file connection.
+	 ;; If the connection was newly created, or isn't logged in yet, and
+	 ;; we know a login name to use for this host, quietly try it.
+	 ;; Otherwise, or if that fails, loop asking the user for a name and password
+	 ;; until we get one that works.  If we abort out while the connection isn't
+	 ;; logged in yet, close the connection so it doesn't hang around forever
+	 ;; without being logged in.
+	 (LET* ((NEW-USER-ID NIL)
+		(PASSWORD NIL)
+		(REAL-USER-ID NIL)
+		(LOGGED-IN (AND CONDITION
+				(NOT (TYPEP CONDITION 'NOT-LOGGED-IN)))))
+	   (UNWIND-PROTECT
+	     (LOOP DO
+		   (MULTIPLE-VALUE (NEW-USER-ID PASSWORD)
+		     (GET-USER-ID-AND-PASSWORD ACCESS-PATH NEW-USER-ID PASSWORD CONDITION))
+		   (CONDITION-CASE (CONDITION2)
+		       (NFILE-DESTRUCTURE-WITH-TYPES
+			 (&REST (PLIST
+				  :KEYWORD-PAIRS
+				*NFILE-LOGIN-VALUE-DESCRIPTORS*
+				(SEND ACCESS-PATH ':SAMPLE-PATHNAME)))
+			 
+			 (LET ((*DONT-HACK-LOGIN* T))
+			   (NFILE-KEYWORD-LIST-CALLER
+			     SELF :LOGIN "Login" NIL
+			     (LIST NEW-USER-ID PASSWORD)
+			     (SEND ACCESS-PATH :LOGIN-COMMAND-PARAMETERS)))
+
+			 (SETQ SERVER-INFO PLIST)
+
+			 ;; File server successfully logged in
+			 (SETQ LOGGED-IN T)
+		       
+			 (SETQ PROPERTY-INDEX-TABLE
+			       (LET ((TBL (GET (LOCF PLIST) ':PROPERTY-INDEX-TABLE)))
+				 (WHEN TBL
+				   ;; Can't use FILLARRAY.  It was excommunicated from
+				   ;; the language, and there is no in-cold-load replacement.
+				   (LET ((ARRAY (MAKE-ARRAY (LENGTH TBL) :TYPE ART-Q)))
+				     (LOOP FOR I UPFROM 0 AND E IN TBL
+					   DO (SETF (AREF ARRAY I) E))
+				     ARRAY))))
+
+			 (SETQ REAL-USER-ID (GET (LOCF PLIST) ':NAME))
+		       
+			 (SEND SI:*USER* ':PROPERTIES-FROM-FILE-SERVER HOST
+			       REAL-USER-ID (GET (LOCF PLIST) ':PERSONAL-NAME)
+			       (GET (LOCF PLIST) ':GROUP-AFFILIATION))
+
+			 (WHEN REAL-USER-ID
+			   ;; The host gets to canonicalize user id's; for example,
+			   ;; Unix usually converts to lower case.
+			   (SEND ACCESS-PATH ':SET-HOST-USER-ID REAL-USER-ID))
+			 
+			 ;; Reset cached information about the user
+			 (NETI:COMPUTE-FINGER-STRING T)
+		       
+			 (SEND ACCESS-PATH ':SET-HOMEDIR-PATHNAME
+			       (OR (GET (LOCF PLIST) ':HOMEDIR-PATHNAME)
+				   ;; HS stands for....
+				   (SEND ACCESS-PATH ':HSNAME-PATHNAME
+					 (OR REAL-USER-ID NEW-USER-ID USER-ID))))
+		       
+			 ;; Some semblance of security...
+			 (UNLESS (OR *REMEMBER-PASSWORDS* (NULL PASSWORD))
+			   (COPY-ARRAY-CONTENTS "" PASSWORD))
+			 (RETURN T))
+		     (CORRECTABLE-LOGIN-PROBLEMS
+		       (SETQ CONDITION CONDITION2))))
+	     ;; Aborted without logging in, so logout the file server
+	     (IF (NOT LOGGED-IN)
+		 (NFILE-SERVER-UNIT-LOGIN SELF NIL))))))) 
+
+(DEFMETHOD (NFILE-SERVER-UNIT-LOGIN NFILE-SERVER-UNIT :AFTER) (LOGIN-P &OPTIONAL CONDITION)
+  (IGNORE CONDITION)
+  (WHEN LOGIN-P
+    (LOOP FOR CAP IN (SEND HOST ':GET ':ENABLED-CAPABILITIES)
+	  DO (SEND SELF ':PROCESS-UNIT-CAPABILITY CAP ':ENABLE-CAPABILITIES
+		   "Enable Capability"))
+    (LOOP FOR CAP IN (SEND HOST ':GET ':DISABLED-CAPABILITIES)
+	  DO (SEND SELF ':PROCESS-UNIT-CAPABILITY CAP ':DISABLE-CAPABILITIES
+		   "Disable Capability"))))
+
+;; Enable one capability on one server unit
+;; Return the A-list of capability names (strings) and on/off values
+(DEFMETHOD (:PROCESS-UNIT-CAPABILITY NFILE-SERVER-UNIT) (CAPABILITY COMMAND WHOSTATE)
+  (LOOP DO
+    (CONDITION-CASE ()
+	 (LET ((PASSWORD (AND (EQ COMMAND ':ENABLE-CAPABILITIES)
+			      (SEND ACCESS-PATH ':PASSWORD-FOR-CAPABILITY CAPABILITY))))
+	   (RETURN
+	     (LOCK-NSERVER-UNIT-SELF
+	       (WHEN (SEND SELF ':VALIDATE-CONTROL-STREAM)
+		 (LET ((CAPLIST
+			 (IF PASSWORD
+			     (SEND SELF
+				   ':SIMPLE-COMMAND COMMAND WHOSTATE CAPABILITY PASSWORD)
+			     (SEND SELF
+				   ':SIMPLE-COMMAND COMMAND WHOSTATE CAPABILITY))))
+		   (LOOP FOR (CAP WHICHWAY) IN CAPLIST
+			 ;; NIL will come as true nil (()), but T as symbol.
+			 COLLECT `(,CAP . ,(AND WHICHWAY T))))))))
+       (INVALID-CAPABILITY-PASSWORD
+	 (SEND ACCESS-PATH :INVALID-PASSWORD-FOR-CAPABILITY CAPABILITY)
+	 NIL))))
+
+(DEFMETHOD (:INVALID-PASSWORD-FOR-CAPABILITY LMFS-NFILE-ACCESS-PATH) (CAPABILITY)
+  (LET* ((PASSWORDS (SEND HOST :GET ':CAPABILITY-PASSWORDS))
+	 (PASSWORD (ASSOC CAPABILITY PASSWORDS)))
+    (FORMAT QUERY-IO "~&Invalid password capability ~A on ~A" CAPABILITY HOST)
+    (WHEN PASSWORD
+      (SEND HOST :PUTPROP (REMOVE PASSWORD PASSWORDS)
+	    ':CAPABILITY-PASSWORDS)))
+  (SEND SELF :PASSWORD-FOR-CAPABILITY CAPABILITY))
+
+(DEFMETHOD (:PASSWORD-FOR-CAPABILITY NFILE-ACCESS-PATH :DEFAULT) (IGNORE) NIL)
+
+(DEFVAR *REMEMBER-CAPABILITY-PASSWORDS* NIL
+  "Remember the last password given for each capability.
+Note that it is very easy for someone else to access this information once remembered.")
+
+(DEFMETHOD (:PASSWORD-FOR-CAPABILITY LMFS-NFILE-ACCESS-PATH) (CAPABILITY)
+  (LET* ((PASSWORDS (SEND HOST :GET ':CAPABILITY-PASSWORDS))
+	 (PASSWORD (CDR (ASSOC CAPABILITY PASSWORDS))))
+    (COND (PASSWORD PASSWORD)
+	  (T
+	   (FORMAT QUERY-IO "~&Password for ~A capability on host ~A: " CAPABILITY HOST)
+	   (SETQ PASSWORD (STRING-UPCASE (STRING-TRIM '(#\SP #\TAB)
+						      (READLINE-NO-ECHO QUERY-IO))))
+	   (WHEN *REMEMBER-CAPABILITY-PASSWORDS*
+	     (IF PASSWORDS
+		 (PUSH (CONS CAPABILITY PASSWORD) PASSWORDS)
+		 (SEND HOST :PUTPROP (LISP:ACONS CAPABILITY PASSWORD NIL)
+		       ':CAPABILITY-PASSWORDS)))
+	   PASSWORD))))
+
+(DEFMETHOD (file-access-path-add-capability-improves-access LMFS-NFILE-ACCESS-PATH) ()
+  T)
+
+(DEFMETHOD (FILE-ACCESS-PATH-LOGIN-IMPROVES-ACCESS LMFS-NFILE-ACCESS-PATH) ()
+  :PASSWORD)
+
+;;; Directly copped from QFILE, with WHOSTATE stuff removed.
+(DEFMETHOD (:PROCESS-CAPABILITIES NFILE-ACCESS-PATH)
+	   (CAPABILITIES ENABLE-P &AUX COMMAND ADD-KEY REMOVE-KEY RESULT-ALIST)
+  (IF ENABLE-P
+      (SETQ COMMAND ':ENABLE-CAPABILITIES
+	    ADD-KEY ':ENABLED-CAPABILITIES
+	    REMOVE-KEY ':DISABLED-CAPABILITIES)
+      (SETQ COMMAND ':DISABLE-CAPABILITIES
+	    ADD-KEY ':DISABLED-CAPABILITIES
+	    REMOVE-KEY ':ENABLED-CAPABILITIES))
+  (LOOP FOR CAP IN CAPABILITIES
+	WITH BAD-CAPS = NIL
+	DO (CONDITION-CASE (.ERROR.)
+	       (LOOP FOR SERVER-UNIT IN (SEND SELF ':SERVER-UNITS)
+		     DO (SETQ RESULT-ALIST
+			      (SEND SERVER-UNIT
+				    ':PROCESS-UNIT-CAPABILITY CAP COMMAND
+				    (CDR (ASSQ COMMAND
+					   '((:ENABLE-CAPABILITIES . "Enable Capability")
+					     (:DISABLE-CAPABILITIES . "Disable Capability"))))
+				    )))
+	     ((UNIMPLEMENTED-OPTION UNKNOWN-OPERATION UNHANDLED-CAPABILITY)
+	      (PUSH (CONS CAP .ERROR.) BAD-CAPS))
+	     (:NO-ERROR (SEND HOST ':RECORD-CAPABILITY CAP ADD-KEY REMOVE-KEY)))
+	FINALLY
+	(IF BAD-CAPS
+	    (LET* ((CONDITION (MAKE-CONDITION
+				'UNHANDLED-CAPABILITIES ':ERRORS BAD-CAPS
+				':HOST SELF ':OPERATION
+				(CDR (ASSQ COMMAND
+					   '((:ENABLE-CAPABILITIES . "enable")
+					     (:DISABLE-CAPABILITIES . "disable"))))))
+		   (RESULT (SIGNAL CONDITION)))
+	      (OR RESULT
+		  (FORMAT QUERY-IO "~A" CONDITION))))
+	(RETURN RESULT-ALIST)))
+
+(DEFMETHOD (:ENABLE-CAPABILITIES NFILE-ACCESS-PATH) (&REST CAPABILITIES)
+  (SEND SELF ':PROCESS-CAPABILITIES CAPABILITIES T))
+
+(DEFMETHOD (:DISABLE-CAPABILITIES NFILE-ACCESS-PATH) (&REST CAPABILITIES)
+  (SEND SELF ':PROCESS-CAPABILITIES CAPABILITIES NIL))
+
+
+(DEFCONST *NFILE-RESPONSE-READER-PERIODIC-WAKEUP-TIME* (* 60. 60.))
+(DEFVAR *NFILE-RESPONSE-READER* (MAKE-PROCESS "NFILE Response Reader" :SYSTEM-PROCESS T))
+(DEFVAR *NFILE-RESPONSE-READER-NEXT-WAKEUP-TIME* NIL)
+
+(DEFUN INITIALIZE-NFILE-RESPONSE-READER ()
+  (PROCESS:WITH-PREEMPTION-DISABLED
+    (SETQ *NFILE-RESPONSE-READER-NEXT-WAKEUP-TIME* (TIME))
+    (SI:PROCESS-PRESET *NFILE-RESPONSE-READER* 'NFILE-RESPONSE-READER-TOP-LEVEL)
+    (LOOP FOR REASON IN (SI:PROCESS-ARREST-REASONS *NFILE-RESPONSE-READER*) DO
+      (SI:PROCESS-DISABLE-ARREST-REASON *NFILE-RESPONSE-READER* REASON))
+    (SI:PROCESS-ENABLE-RUN-REASON *NFILE-RESPONSE-READER* 'T)))
+
+;; if no file activity in two minutes, then it's probably idle.
+(DEFVAR *NFILE-EXPECTED-IDLE-TIME* (* 2. 60. 60.))
+
+(DEFUN NFILE-RESPONSE-READER-TOP-LEVEL ()
+  (LET ((LAST-TIME (ZL:TIME)))
+    (LOOP DOING
+      (LET* ((NOW (ZL:TIME))
+	     (INTERVAL (TIME-DIFFERENCE NOW LAST-TIME)))
+	(WHEN (TIME-LESSP *NFILE-RESPONSE-READER-NEXT-WAKEUP-TIME* (TIME))
+	  (LOOP FOR SERVER-UNIT IN *NFILE-SERVER-UNITS-FOR-PERIODIC-POLLING*
+		DO (IGNORE-ERRORS
+		     (SEND SERVER-UNIT ':READ-RESPONSE-FOR-INTERRUPT)))
+	  (SETQ *NFILE-RESPONSE-READER-NEXT-WAKEUP-TIME*
+		(TIME-INCREMENT (TIME) *NFILE-RESPONSE-READER-PERIODIC-WAKEUP-TIME*)))
+	(LOOP FOR SERVER-UNIT IN *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*
+	      DO (IGNORE-ERRORS
+		   (WHEN
+		     (SEND SERVER-UNIT ':CONTROL-INPUT-LISTEN)
+		     (SETF LAST-TIME NOW)
+		     ;; random heuristic
+		     (SETF INTERVAL (* 60. PROCESS::*PROCESS-WAIT-INTERVAL*))
+		     (SEND SERVER-UNIT ':READ-RESPONSE-FOR-INTERRUPT))))
+	;; if there were a stream interface to "register for event", then this would *never*
+	;; have to poll; and would be event driven...
+	(IF *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*
+	    (PROCESS:PROCESS-BLOCK-AND-POLL-WAIT-FUNCTION
+	      "NFILE Reader Wait"
+	      ;; let polling interval decay...
+	      (SCL:// (IF (< INTERVAL *NFILE-EXPECTED-IDLE-TIME*)
+			  (* 60. PROCESS::*PROCESS-WAIT-INTERVAL*)
+			  (MAX (* 60. PROCESS::*PROCESS-WAIT-INTERVAL*)
+			       (MIN (FLOOR (- INTERVAL *NFILE-EXPECTED-IDLE-TIME*) 500.)
+				    20.)))
+		 60s0)
+	      #'(LAMBDA (TIME-TO-ADJUST-RATE)
+		  (OR (NULL *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*)
+		      (WHEN TIME-TO-ADJUST-RATE
+			(TIME-LESSP TIME-TO-ADJUST-RATE (SYS:%MICROSECOND-CLOCK)))
+		      (NFILE-RESPONSE-READER-CONDITION)))
+	      (IF (< INTERVAL *NFILE-EXPECTED-IDLE-TIME*)
+		  (SYS:%32-BIT-PLUS (FLOOR (* 16666. (- *NFILE-EXPECTED-IDLE-TIME* INTERVAL)))
+				    (SYS:%MICROSECOND-CLOCK))
+		  (LET ((OVERDUE (- INTERVAL *NFILE-EXPECTED-IDLE-TIME*)))
+		    (WHEN (< OVERDUE (* 500. 20.))
+		      (SYS:%32-BIT-PLUS (SYS:%MICROSECOND-CLOCK) (* 16666. OVERDUE))))))
+	    (PROCESS:PROCESS-BLOCK-AND-POLL-WAIT-FUNCTION
+	      "NFile Reader Wait"
+	      ;; we're in Idle state.
+	      (SCL:// *NFILE-RESPONSE-READER-PERIODIC-WAKEUP-TIME* 60s0)
+	      #'(LAMBDA ()
+		  (OR (NOT (NULL *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*))
+		      (NFILE-RESPONSE-READER-CONDITION)))))))))
+
+
+
+(DEFUN NFILE-RESPONSE-READER-CONDITION ()
+  (NOT (NULL (OR (AND *NFILE-SERVER-UNITS-FOR-PERIODIC-POLLING*
+		      (TIME-LESSP *NFILE-RESPONSE-READER-NEXT-WAKEUP-TIME* (TIME)))
+		 (LOOP FOR SERVER-UNIT IN *NFILE-SERVER-UNITS-FOR-REQUIRED-POLLING*
+		       THEREIS (SEND SERVER-UNIT ':CONTROL-INPUT-LISTEN))))))
+
+(DEFMETHOD (:CONTROL-INPUT-LISTEN NFILE-SERVER-UNIT) ()
+  (AND CONTROL-STREAM
+       (NULL CONTROL-STREAM-READ-ERROR)
+       (SEND CONTROL-STREAM ':LISTEN)))
+
+(DEFMETHOD (:COMMAND NFILE-SERVER-UNIT) (&REST DATA)
+  (SEND SELF ':SEND-IN-COMMAND-CONDITION-ENVIRONMENT
+	':SEND-AND-WAIT-FOR-COMMAND DATA))
+
+(DEFMETHOD (:ASYNCHRONOUS-COMMAND-START NFILE-SERVER-UNIT) (&REST DATA)
+  (SEND SELF ':SEND-IN-COMMAND-CONDITION-ENVIRONMENT ':SEND-COMMAND DATA))
+
+(DEFMETHOD (:ASYNCHRONOUS-COMMAND-WAIT NFILE-SERVER-UNIT) (&REST TID-CONS-ARGS)
+  (SEND SELF ':SEND-IN-COMMAND-CONDITION-ENVIRONMENT ':WAIT-FOR-COMMAND TID-CONS-ARGS))
+
+
+(DEFCONST *NFILE-ERROR-VALUE-DESCRIPTORS*
+	  '((:PATHNAME :PATHNAME)
+	    (:NEW-PATHNAME :PATHNAME)
+	    (:DIRECTORY-PATHNAME :PATHNAME)
+	    (:OPERATION :KEYWORD)
+	    (:RESTARTABLE :BOOLEAN)))
+
+(DEFMETHOD (:SEND-IN-COMMAND-CONDITION-ENVIRONMENT NFILE-SERVER-UNIT) (MESSAGE DATA)
+  (CATCH 'COMMAND-RESULT    
+    (LOOP DOING
+      (CONDITION-CASE-IF (NOT *DONT-HACK-LOGIN*)
+			 (CONDITION)
+	   (CONDITION-CASE ()
+		(RETURN (SEND SELF MESSAGE DATA))
+	      (NETI:TOKEN-IO-UNSAFE
+		(SEND SELF ':RESYNCHRONIZE-CONTROL-CHANNEL))
+	      (NETI:MARK-SEEN
+		;; Mark-seen here is deep confusion.  The server should not be
+		;; generating marks we didn't ask for.
+		;; (unless somebody aborted during a blast-to-all-servers-- to be coded)
+		;; Perhaps treat it as another
+		;; provocation for resynchronization? (same as TOKEN-IO-UNSAFE?)
+		(FERROR "Mark seen during NFILE control channel interaction.")))
+	 (CORRECTABLE-LOGIN-PROBLEMS
+	   (NFILE-SERVER-UNIT-LOGIN SELF T CONDITION))))))
+
+(DEFMETHOD (:RESYNCHRONIZE-CONTROL-CHANNEL NFILE-SERVER-UNIT) ()
+  (LOCK-NSERVER-UNIT-SELF
+    (LET ((RESYNC-IDENTIFIER "USER-RESYNC-DUMMY"))	;user ctrl chan resynchronize
+      (SEND CONTROL-STREAM ':SEND-TOKEN-LIST RESYNC-IDENTIFIER T)	;mark-p
+      ;; Gotta send 2.  See comments in server side.
+      (SETQ RESYNC-IDENTIFIER (FILE-GENSYM "UCCRSY"))
+      (SEND CONTROL-STREAM ':SEND-TOKEN-LIST (LIST RESYNC-IDENTIFIER) T)
+      (LOOP DO
+	    (CONDITION-CASE ()
+		(WHEN (READ-CC-FOR-CC-RESYNC-ID CONTROL-STREAM RESYNC-IDENTIFIER T)
+		  (RETURN T))
+	      (NETI:MARK-SEEN
+		;; Next read should not be condition-cased.
+		;; There is NO REASON why it should not be a complete transmission.
+		;; The server does not ever recoverably abort.
+		(WHEN (READ-CC-FOR-CC-RESYNC-ID CONTROL-STREAM RESYNC-IDENTIFIER NIL)
+		  (RETURN T))))))))
+
+(DEFUN READ-CC-FOR-CC-RESYNC-ID (STREAM IDENTIFIER MARK-P)
+  (LET ((WHAT-I-READ (SEND STREAM ':READ-TOKEN-LIST MARK-P)))
+    (AND (LISTP WHAT-I-READ)
+	 (EQUAL (CAR WHAT-I-READ) IDENTIFIER))))
+
+(DEFMETHOD (:SEND-COMMAND NFILE-SERVER-UNIT) (DATA)
+  (DESTRUCTURING-BIND (COMMAND-NAME IGNORE IGNORE . COMMAND-ARGS) DATA
+    (LET ((TID (FILE-GENSYM "T")))
+      ;;Enqueue a wait-element.
+      (LOOP WITH QCELL = (CONS TID NIL)
+	    WITH QEL = (CONS QCELL NIL)
+	    AS QCONT = RESPONSES
+	    DO (RPLACD QEL RESPONSES)
+	    UNTIL (STORE-CONDITIONAL (LOCF RESPONSES) QCONT QEL))
+
+      ;; Send the command.
+      (WITH-STACK-LIST* (COMMAND COMMAND-NAME TID COMMAND-ARGS)
+	(SEND CONTROL-STREAM ':SEND-TOKEN-LIST COMMAND))
+
+      TID)))
+    
+(DEFMETHOD (:SEND-AND-WAIT-FOR-COMMAND NFILE-SERVER-UNIT) (DATA)
+  (DESTRUCTURING-BIND (COMMAND-NAME WHOSTATE DATA-CHANNEL) DATA
+    (WHEN DATA-CHANNEL
+      (SETF (DATA-CHAN-UNSAFE DATA-CHANNEL) COMMAND-NAME))
+	
+    (LET ((COMMAND-TID (SEND SELF ':SEND-COMMAND DATA)))
+
+      (WITH-STACK-LIST (PSEUDOARGS COMMAND-TID COMMAND-NAME WHOSTATE DATA-CHANNEL)
+	(SEND SELF ':WAIT-FOR-COMMAND PSEUDOARGS)))))
+
+(DEFMETHOD (:WAIT-FOR-NFILE-RESPONSE NFILE-SERVER-UNIT) (TID WHOSTATE)
+  (LOOP WITH QEL = (LOOP FOR QE ON RESPONSES
+			     ;; Perhaps immorally using EQ here..
+			 WHEN (EQ (CAAR QE) TID)
+			   RETURN QE
+			 FINALLY (FERROR "NFILE TID ~A not found in TID queue." TID))
+	DO
+    (SELECTQ RESPONSE-READING-CONTROL
+      (NIL					;do it ourself
+	;; but, nudge the nfile process...
+	(WHEN FS:*NFILE-RESPONSE-READER*
+	  (PROCESS:PROCESS-WAKEUP FS:*NFILE-RESPONSE-READER*))
+       (PROCESS-WAIT WHOSTATE
+	 #'(LAMBDA ()
+	     (OR (CDAR QEL)			;someone else found it
+		 CONTROL-STREAM-READ-ERROR
+		 ;;Lassie's trying to tell us something..
+		 (SEND CONTROL-STREAM ':LISTEN))))
+       (SEND SELF ':READ-AND-PROCESS-CONTROL-STREAM))
+      ((:READER :INTERRUPT)
+	;; but, nudge the nfile process...
+	(WHEN FS:*NFILE-RESPONSE-READER*
+	  (PROCESS:PROCESS-WAKEUP FS:*NFILE-RESPONSE-READER*))
+       (PROCESS-WAIT WHOSTATE
+	 #'(LAMBDA () (OR (CDAR QEL) CONTROL-STREAM-READ-ERROR)))
+       (IF CONTROL-STREAM-READ-ERROR
+	   (SETQ RESPONSE-READING-CONTROL NIL))))	;do it here, probably blow out.
+	WHEN (CDAR QEL)
+	  RETURN (DEQUEUE-NFILE-RESPONSE RESPONSE-LOCK (VARIABLE-LOCATION RESPONSES) QEL)))
+
+(DEFMETHOD (:READ-AND-PROCESS-CONTROL-STREAM NFILE-SERVER-UNIT) ()
+  ;; Inside him, he has a lock...
+  (LET ((DATUM (SEND CONTROL-STREAM ':READ-TOKEN-LIST NIL ':NO-MESSAGE)))
+    (SETQ CONTROL-STREAM-READ (TIME))
+    (COND ((EQ DATUM ':NO-MESSAGE) NIL)
+	  (T (SEND SELF ':PROCESS-CONTROL-INPUT-FROM-SERVER DATUM)
+	     T))))
+
+(DEFUN NFILE-INPUT-INTERRUPT-FUNCTION (SERVER-UNIT)
+  (SEND SERVER-UNIT ':READ-RESPONSE-FOR-INTERRUPT))
+
+(DEFMETHOD (:READ-RESPONSE-FOR-INTERRUPT NFILE-SERVER-UNIT) ()
+  (LOOP WHILE (NULL CONTROL-STREAM-READ-ERROR)
+	DO
+	(CONDITION-CASE (ERR)
+	    (WHEN (NULL (SEND SELF ':READ-AND-PROCESS-CONTROL-STREAM))
+	      ;;could lose in window, or have no more
+	      (RETURN NIL))
+	  (NETI:TOKEN-IO-UNSAFE
+	    ;; We do it entirely in this process, no control responses to be read.
+	    (CONDITION-CASE (ERR)
+		(SEND SELF ':RESYNCHRONIZE-CONTROL-CHANNEL)
+	      (ERROR (SETQ CONTROL-STREAM-READ-ERROR ERR))))
+	  (ERROR
+	    (SETQ CONTROL-STREAM-READ-ERROR ERR)))))
+
+;; This is based on the true fact that the enqueuer only enqueues in the front.
+(DEFUN DEQUEUE-NFILE-RESPONSE (LOCK QHLOC QEL)
+  (PROCESS:WITH-LOCK (LOCK)
+    (LOOP DO
+      (CATCH 'RETRY
+	(LOOP FOR PREVPTR FIRST QHLOC THEN (CDR PREVPTR)
+	      WHILE PREVPTR
+	      FINALLY (FERROR "NFILE response queue element ~S not found in queue?" QEL)
+	      WHEN (EQ (CDR PREVPTR) QEL)
+		DO
+	      ;; Some guy might have threaded in in the FRONT.
+	      ;; We know these conses aren't CDR-coded, so we can
+	      ;; develop locatives to their CDR's even though the language
+	      ;; doesn't really like it.
+	      ;;--- (This will break if we have cdr-coding GC!)
+		  (WHEN (LISTP PREVPTR)
+		    (SETQ PREVPTR (%MAKE-POINTER-OFFSET DTP-LOCATIVE PREVPTR 1)))
+		  (UNLESS (STORE-CONDITIONAL PREVPTR QEL (CDR QEL))
+		    (THROW 'RETRY NIL))
+		  (RETURN-FROM DEQUEUE-NFILE-RESPONSE (CDAR QEL))
+	      WHILE (CDR PREVPTR))))))
+
+(DEFMETHOD (:PROCESS-CONTROL-INPUT-FROM-SERVER NFILE-SERVER-UNIT) (RESPONSE)
+  (SI:DESTRUCTURING-BIND (RESPONSE-NAME RESPONSE-TID . RESPONSE-ARGS) RESPONSE
+    (SELECTQ RESPONSE-NAME
+      (:NOTIFICATION (TV:NOTIFY
+		       NIL (FORMAT NIL "From file server ~A: ~A" HOST (CAR RESPONSE-ARGS))))
+      (:ASYNC-ERROR
+       ;;TID is really a file handle.
+       (SEND SELF ':SET-ASYNC-ERROR RESPONSE-TID RESPONSE-ARGS))
+      (OTHERWISE
+	(LOOP FOR QEL ON RESPONSES
+	      ;; They can only queue in front of us, and only we can dequeue ourself,
+	      ;; and anyone who we miss because he threads out doesn't matter.
+	      AS QCELL = (CAR QEL)
+	      WHEN (STRING-EQUAL (CAR QCELL) RESPONSE-TID)
+	      RETURN (SETF (CDR QCELL) RESPONSE)
+	      FINALLY
+	      (FERROR "NFILE response for transaction ~A.  No such pending transaction."
+		      RESPONSE-TID))))))		;f.s.f.
+
+(DEFMETHOD (:WAIT-FOR-COMMAND NFILE-SERVER-UNIT) (TID-CONS-ARGS)
+  (DESTRUCTURING-BIND (COMMAND-TID COMMAND-NAME WHOSTATE DATA-CHANNEL) TID-CONS-ARGS
+    (DESTRUCTURING-BIND (RESPONSE-NAME NIL . RESPONSE-ARGS)
+			(SEND SELF ':WAIT-FOR-NFILE-RESPONSE COMMAND-TID WHOSTATE)
+      (SELECTOR RESPONSE-NAME EQ
+	(COMMAND-NAME
+	  ;; The "good answer.."
+	  (WHEN DATA-CHANNEL
+	    (SETF (DATA-CHAN-UNSAFE DATA-CHANNEL) ':COMMAND-IN-PROGRESS))
+	  (THROW 'COMMAND-RESULT RESPONSE-ARGS))
+	
+	;; The "bad answer.."
+	(:ERROR
+	 ;; A solid error, we can say for sure that
+	 ;; the data channel is safe, and was not allocated by the server.
+	 (WHEN DATA-CHANNEL
+	   (SETF (DATA-CHAN-UNSAFE DATA-CHANNEL) ':CLEAN-ERROR))
+	 (NFILE-ERROR-SIGNALLER RESPONSE-ARGS (SEND ACCESS-PATH ':SAMPLE-PATHNAME)))
+	(OTHERWISE
+	  ;; The "Zippy answer..."
+	  (FERROR "NFILE Command for TID ~A was ~A, but response is for ~A?"
+		  COMMAND-TID COMMAND-NAME RESPONSE-NAME))))))
+
+;;; This is NOT the condition that the user sees...
+;;; It is based on DBG:DEBUGGER-CONDITION so that we get a blowout as opposed to a
+;;; coverup if it should in fact be signalled uncaught.
+(DEFFLAVOR NFILE-USER-OUTPUT-EXCEPTION ()
+	   (DBG:DEBUGGER-CONDITION))
+
+(DEFMETHOD (:REPORT NFILE-USER-OUTPUT-EXCEPTION) (STREAM)
+  (FORMAT STREAM "The NFILE User-side implementation has signalled an output exception.~@
+		  This is normally an internal condition only.  There is a malfunction~@
+		  if this error appears visibly."))
+
+(DEFMETHOD (:PROCEED NFILE-USER-OUTPUT-EXCEPTION :PROCEED) ()
+  T)
+
+(DEFMETHOD (:DOCUMENT-PROCEED-TYPE NFILE-USER-OUTPUT-EXCEPTION :PROCEED) (REPORT-STREAM)
+  (FORMAT REPORT-STREAM "Retry sending data to output byte stream."))
+
+(COMPILE-FLAVOR-METHODS NFILE-USER-OUTPUT-EXCEPTION)
+
+(DEFMETHOD (:SET-ASYNC-ERROR NFILE-SERVER-UNIT) (HANDLE ARGS)
+  (LOOP FOR CHANNEL IN DATA-CHANNELS
+	WHEN (STRING-EQUAL HANDLE (DATA-CHAN-HANDLE CHANNEL))
+	RETURN (PROGN
+		 (SETF (DATA-CHAN-ASYNC-ERROR CHANNEL) ARGS)
+		 (SEND (DATA-CHAN-NET-STREAM CHANNEL) ':SET-OUTPUT-EXCEPTION
+		       'NFILE-USER-OUTPUT-EXCEPTION))
+	FINALLY (FERROR "Can't find handle ~A in ~S for output exception." HANDLE SELF)))
+
+(DEFUN NFILE-ERROR-SIGNALLER (RESPONSE-ARGS SAMPLE-PATHNAME)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DESTRUCTURING-BIND (CODE ARGS DESCRIPTION) RESPONSE-ARGS
+    (LET ((VALUES
+	    (NFILE-USER-DECODE-KEYWORD-VALUES
+	      ARGS
+	      *NFILE-ERROR-VALUE-DESCRIPTORS*
+	      SAMPLE-PATHNAME)))
+      (LET ((RESTARTABLE-P (AND (EQ (CAR VALUES) ':RESTARTABLE)
+				(CADR VALUES)
+				(PROGN (SETQ VALUES (CDDR VALUES))
+				       T))))
+	(FILE-ERROR-SIGNALLER
+	  CODE (IF RESTARTABLE-P ':RESTARTABLE ':FATAL)
+	  DESCRIPTION
+	  (GET (LOCF VALUES) ':PATHNAME)
+	  (PROGN (SI:NREMPROP (LOCF VALUES)':PATHNAME) VALUES)
+	  (IF RESTARTABLE-P
+	      #'SIGNAL
+	      #'ERROR))))))
+
+
+	
+
+(DEFCONST *NFILE-OPEN-VALUE-DESCRIPTORS*
+	  '((:CREATION-DATE :UNIVERSAL-TIME)
+	    (:AUTHOR :STRING)
+	    (:BYTE-SIZE :NUMBER)
+	    (:LENGTH :NUMBER)
+	    (:POINTER-BASE :NUMBER)
+	    (:CREATION-TIME :UNIVERSAL-TIME)))
+
+(DEFMETHOD (FS:FILE-ACCESS-PATH-OPEN NFILE-ACCESS-PATH)
+	   (REAL-PATHNAME
+	     COMMAND-PATHNAME
+	     &KEY
+	     ELEMENT-TYPE
+	     (DIRECTION ':INPUT)
+	     ESTIMATED-LENGTH DELETED PRESERVE-DATES
+	     RAW SUPER-IMAGE SUBMIT FILE-TYPE CREATOR-SIGNATURE
+	     IF-EXISTS
+	     IF-DOES-NOT-EXIST
+	     DIRECT
+	     FAKE-CHARACTERS
+	     &ALLOW-OTHER-KEYS
+	     &AUX DIRECT-FILE-ID SERVER-UNIT DATA-CHANNEL PROBE BYTE-SIZE CHARACTERS
+	     BINARY-FLAVOR-P
+	     (REAL-BYTE-SIZE NIL))  
+  (CHECK-STREAM-ELEMENT-TYPE ELEMENT-TYPE :PROTOCOL "NFILE")
+  (SETQ BYTE-SIZE (BYTE-SIZE-FROM-ELEMENT-TYPE ELEMENT-TYPE))
+  (SETQ CHARACTERS
+	(IF (EQ ELEMENT-TYPE ':DEFAULT)
+	      ':DEFAULT
+	      (CL:SUBTYPEP ELEMENT-TYPE 'CL:CHARACTER)))
+  (SELECTQ DIRECTION
+    ((:INPUT :OUTPUT :IO))
+    ((:PROBE :PROBE-LINK :PROBE-DIRECTORY)
+     (SETQ PROBE T))
+    (OTHERWISE (FERROR "~S is an invalid direction" DIRECTION)))
+  
+  (IF DIRECT (SETQ DIRECT-FILE-ID (FILE-GENSYM "D")))
+  
+  (WHEN (AND (EQ DIRECTION ':IO)
+	     (NOT DIRECT))
+    (FERROR "Bidirectional openings only supported for :DIRECT."))
+  
+  (WHEN (EQ BYTE-SIZE ':DEFAULT) (SETQ BYTE-SIZE NIL))
+  
+  (COND ((OR DIRECT PROBE)
+	 ;;PROBE implies no need for data channel
+	 (SETQ SERVER-UNIT (SEND SELF ':GET-SERVER-UNIT)))
+	(T					;real I/O
+	 (MULTIPLE-VALUE (DATA-CHANNEL SERVER-UNIT)
+	   (SEND SELF ':GET-DATA-CHANNEL DIRECTION))))
+  
+  ;; Don't use allocation-protecting macros because there's conditionality
+  ;; about whether or not there is a data channel.
+  (UNWIND-PROTECT
+      (NFILE-DESTRUCTURE-WITH-TYPES
+	((TRUENAME :PATHNAME)
+	 (BINARY-P :BOOLEAN)
+	 (OTHER-PROPERTIES :KEYWORD-PAIRS *NFILE-OPEN-VALUE-DESCRIPTORS* COMMAND-PATHNAME))
+	
+	(ISSUE-NFILE-COMMAND SERVER-UNIT ':OPEN
+	  (AND DATA-CHANNEL (DATA-CHAN-HANDLE DATA-CHANNEL))
+	  REAL-PATHNAME
+	  DIRECTION
+	  (IF (EQ CHARACTERS ':DEFAULT) ':DEFAULT (NULL CHARACTERS))
+	  &WHOSTATE (IF PROBE "Probe" "Open")
+	  &DATA-CHANNEL DATA-CHANNEL
+	  &KEY
+	  BYTE-SIZE DELETED PRESERVE-DATES RAW SUPER-IMAGE SUBMIT FILE-TYPE CREATOR-SIGNATURE
+	  ESTIMATED-LENGTH DIRECT-FILE-ID IF-EXISTS IF-DOES-NOT-EXIST)
+	;; Our caller will pass fake-characters t if the element type is character
+	;; or if the element type is undetermined (:characters :default).
+	;; in the latter case, the server may have responded to the open
+	;; by setting binary-p to t.
+	;; if characters is :default, that means that we return a binary stream
+	;; and an indication that we did so.  If characters is T, then we go ahead
+	;; and return a character stream.  The User Is In Charge.
+	(SETQ REAL-BYTE-SIZE (GET (LOCF OTHER-PROPERTIES) :BYTE-SIZE))
+
+	(SETQ BINARY-FLAVOR-P
+	      (OR (NULL CHARACTERS)		;:element-type 'unsigned-byte
+						;so we force a binary stream
+		  (AND (EQ CHARACTERS ':DEFAULT) BINARY-P) ; user said "whatever" and
+						; the file was recorded as binary.
+		  (AND FAKE-CHARACTERS		;the user asked to turn characters into
+						;unsigned-byte 8
+		       (OR (NOT BINARY-P)	;it was a character file -or-
+			   (EQ CHARACTERS 'T)))));the user asked us to force it.
+	(IF BINARY-FLAVOR-P
+	    (UNLESS REAL-BYTE-SIZE		; unlikely but possible,
+						; especially for FAKE-CHARACTERS
+	      ;; say "8" as complexly as possible.
+	      (SETQ REAL-BYTE-SIZE (AREF SI:*ARRAY-BITS-PER-ELEMENT* ART-STRING))
+	      (PUTPROP (LOCF OTHER-PROPERTIES) REAL-BYTE-SIZE ':BYTE-SIZE))
+	    (SI:NREMPROP (LOCF OTHER-PROPERTIES) ':BYTE-SIZE))
+	(MULTIPLE-VALUE-PROG1
+	  (VALUES
+	    (MAKE-INSTANCE (NFILE-STREAM-FLAVOR
+			     DIRECTION BINARY-FLAVOR-P DIRECT REAL-BYTE-SIZE)
+			   '%FILE-STREAM-FILE-ELEMENT-TYPE
+			   (ELEMENT-TYPE-FROM-OLD-FS-INFO (NOT BINARY-P) REAL-BYTE-SIZE)
+			   ':FILE-ACCESS-PATH SELF
+			   ':SERVER-UNIT SERVER-UNIT
+			   ':DIRECT-FILE-ID DIRECT-FILE-ID
+			   ':DATA-CHANNEL DATA-CHANNEL
+			   ':PROPERTY-LIST (LIST* ':TRUENAME TRUENAME OTHER-PROPERTIES)
+			   ':PATHNAME COMMAND-PATHNAME)
+	    BINARY-P)
+	  (WHEN DATA-CHANNEL
+	    (WITHOUT-INTERRUPTS
+	      (SETF (DATA-CHAN-UNSAFE DATA-CHANNEL) NIL)	;known clean in-use
+	      (SETQ DATA-CHANNEL NIL)))))
+    (WHEN DATA-CHANNEL
+						; it actually MAY have been "safe", but resync anyway.
+      (SETF (DATA-CHAN-UNSAFE DATA-CHANNEL)
+	    (IF (EQ (DATA-CHAN-UNSAFE DATA-CHANNEL) ':CLEAN-ERROR)
+		NIL
+		':OPEN-ABORTED))
+      (SEND SERVER-UNIT ':FREE-DATA-CHANNEL DATA-CHANNEL T))))
+
+(DEFUN NFILE-STREAM-FLAVOR (DIRECTION BINARY-P DIRECT BYTE-SIZE)
+  (SELECTQ DIRECTION
+    ((:PROBE :PROBE-DIRECTORY :PROBE-LINK) 'NFILE-PROBE-STREAM)
+    (:INPUT (IF DIRECT
+		(IF BINARY-P
+		    (IF (> BYTE-SIZE 8)
+			'NFILE-INPUT-DIRECT-WIDE-BINARY-STREAM
+			'NFILE-INPUT-DIRECT-BINARY-STREAM)
+		    'NFILE-INPUT-DIRECT-CHARACTER-STREAM)
+		(IF BINARY-P
+		    (IF (> BYTE-SIZE 8)
+			'NFILE-INPUT-WIDE-BINARY-STREAM
+			'NFILE-INPUT-BINARY-STREAM)
+		    'NFILE-INPUT-CHARACTER-STREAM)))
+    (:OUTPUT (IF DIRECT
+		 (IF BINARY-P
+		     (IF (> BYTE-SIZE 8)
+			 'NFILE-OUTPUT-DIRECT-WIDE-BINARY-STREAM
+			 'NFILE-OUTPUT-DIRECT-BINARY-STREAM)
+		     'NFILE-OUTPUT-DIRECT-CHARACTER-STREAM)
+		 (IF BINARY-P
+		     (IF (> BYTE-SIZE 8)
+			 'NFILE-OUTPUT-WIDE-BINARY-STREAM
+			 'NFILE-OUTPUT-BINARY-STREAM)
+		     'NFILE-OUTPUT-CHARACTER-STREAM)))
+    (:IO
+     (IF BINARY-P
+	 (IF (> BYTE-SIZE 8)
+	     'NFILE-BIDIRECTIONAL-DIRECT-WIDE-BINARY-STREAM
+	     'NFILE-BIDIRECTIONAL-DIRECT-BINARY-STREAM)
+	 'NFILE-BIDIRECTIONAL-DIRECT-CHARACTER-STREAM))))
+
+(DEFUN-IN-FLAVOR (PATHNAME-FOR-THIS-HOST-P NFILE-ACCESS-PATH) (OBJECT)
+  (AND (TYPEP OBJECT 'PATHNAME)
+       (SEND SELF ':PATHNAME-FOR-THIS-HOST-P OBJECT)))
+
+;; Remote fep shadows this
+(DEFMETHOD (:PATHNAME-FOR-THIS-HOST-P NFILE-ACCESS-PATH) (PATHNAME)
+  (NETI:NS-EQ (SEND PATHNAME ':HOST) HOST))
+
+(DEFMETHOD (:SIMPLE-COMMAND NFILE-SERVER-UNIT) (COMMAND-NAME WHOSTATE &REST ARGS)
+  (NFILE-KEYWORD-LIST-CALLER SELF COMMAND-NAME WHOSTATE NIL ARGS NIL))
+
+(DEFMETHOD (:SIMPLE-COMMAND NFILE-ACCESS-PATH) (COMMAND-NAME WHOSTATE &REST ARGS)
+  ;; No data channel involved, no keyword pairs.
+  (NFILE-KEYWORD-LIST-CALLER (SEND SELF ':GET-SERVER-UNIT)
+			     COMMAND-NAME WHOSTATE NIL ARGS NIL))
+
+(DEFMETHOD (:RENAME NFILE-ACCESS-PATH) (OLD-PATHNAME NEW-PATHNAME)
+  (CHECK-ARG OLD-PATHNAME PATHNAME-FOR-THIS-HOST-P "a pathname for this host")
+  (CHECK-ARG NEW-PATHNAME PATHNAME-FOR-THIS-HOST-P "a pathname for this host")
+  (LET ((RESULT (SEND SELF ':SIMPLE-COMMAND ':RENAME "Rename" NIL OLD-PATHNAME NEW-PATHNAME)))
+    (WHEN RESULT
+      (NFILE-DESTRUCTURE-WITH-TYPES
+	((FROM-PATHNAME :PATHNAME) (TO-PATHNAME :PATHNAME)) RESULT
+	(VALUES FROM-PATHNAME TO-PATHNAME)))))
+
+(DEFMETHOD (:DELETE NFILE-ACCESS-PATH) (PATHNAME)
+  (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "a pathname for this host")
+  (SEND SELF ':SIMPLE-COMMAND ':DELETE "Delete" NIL PATHNAME))
+
+(DEFMETHOD (:EXPUNGE NFILE-ACCESS-PATH) (PATHNAME &REST IGNORE)
+ (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "a pathname for this host")
+ (LET ((RESULT (SEND SELF ':SIMPLE-COMMAND ':EXPUNGE "Expunge" PATHNAME)))
+   (IF RESULT
+       (NFILE-DESTRUCTURE-WITH-TYPES ((:RETURN-VALUE :NUMBER)) RESULT)
+       0)))
+       
+(DEFMETHOD (:CREATE-DIRECTORY NFILE-ACCESS-PATH) (PATHNAME &REST OPTIONS)
+ (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "a pathname for this host")
+ (NFILE-DESTRUCTURE-WITH-TYPES
+   ((:RETURN-VALUE :PATHNAME))
+   (SEND SELF ':SIMPLE-COMMAND ':CREATE-DIRECTORY "Create Directory" PATHNAME OPTIONS)))
+
+(DEFMETHOD (:CREATE-LINK NFILE-ACCESS-PATH) (LINKFROM-PATH LINKTO-PATH &REST OPTIONS)
+  (CHECK-ARG LINKFROM-PATH PATHNAME-FOR-THIS-HOST-P "a pathname for this host")
+  (CHECK-ARG LINKTO-PATH PATHNAME-FOR-THIS-HOST-P "A pathname for this host")
+  (NFILE-DESTRUCTURE-WITH-TYPES
+    ((:RETURN-VALUE :PATHNAME))
+    (SEND SELF ':SIMPLE-COMMAND ':CREATE-LINK "Create Link"
+	  LINKFROM-PATH LINKTO-PATH OPTIONS)))
+
+
+;;; This is not COMPLETE CHAOS!
+(DEFMETHOD (:COMPLETE-STRING NFILE-ACCESS-PATH) (DEFAULT-PATHNAME STRING OPTIONS
+						  &AUX DELETED DIRECTION NEW-OK)
+  (DOLIST (KEY OPTIONS)
+    (SELECTQ KEY
+      (:DELETED (SETQ DELETED T))
+      ((:READ :IN) (SETQ DIRECTION ':INPUT))
+      ((:PRINT :OUT :WRITE) (SETQ DIRECTION ':OUTPUT))
+      (:OLD (SETQ NEW-OK NIL))
+      (:NEW-OK (SETQ NEW-OK T))
+      (OTHERWISE (FERROR "~S is not a recognized completion option" KEY))))
+
+  (CONDITION-CASE ()
+     (NFILE-DESTRUCTURE-WITH-TYPES
+       ((RESULT :STRING) (SUCCESS :BOOLKEY))
+       (ISSUE-NFILE-COMMAND (SEND SELF ':GET-SERVER-UNIT) :COMPLETE
+	 STRING DEFAULT-PATHNAME
+	 &KEY
+	 DELETED DIRECTION NEW-OK)
+       
+       (VALUES RESULT SUCCESS))
+    (FILE-OPERATION-FAILURE STRING)))		;No success.
+
+(DEFMETHOD (:CHANGE-PROPERTIES NFILE-ACCESS-PATH) (PATHNAME &REST PROPERTIES)
+  (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "A pathname for this host")
+  (SEND SELF ':SIMPLE-COMMAND ':CHANGE-PROPERTIES 
+	"Change Properties"
+	NIL					;Haendel
+	PATHNAME
+	(NFILE-CONVERT-PROPERTY-LIST-TO-TOKENS
+	  ;; Maybe this copy isn't necessary?   Is it guaranteed to be stack-consed?
+	  (COPYLIST PROPERTIES))))
+
+
+(DEFMETHOD (:DIRECTORY-LIST NFILE-ACCESS-PATH) (PATHNAME OPTIONS
+							 &AUX
+							 SORTED RESULT INDEX-TABLE)
+  (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "A pathname for this host")
+  
+  (WHEN (MEMQ ':SORTED OPTIONS)
+    (SETQ SORTED T 
+	  OPTIONS (REMQ ':SORTED OPTIONS)))
+  
+  (WITH-PROTECTED-ALLOCATION-OF-DATA-CHANNEL (DATA-CHANNEL ':INPUT SERVER-UNIT)
+    
+    (SETQ INDEX-TABLE (SEND SERVER-UNIT ':PROPERTY-INDEX-TABLE))
+      
+    (ISSUE-NFILE-COMMAND SERVER-UNIT :DIRECTORY
+      (DATA-CHAN-HANDLE DATA-CHANNEL)
+      PATHNAME
+      OPTIONS					;NIL is real list
+      '()					;another real empty list
+      &DATA-CHANNEL DATA-CHANNEL)
+	  
+    (SETF (DATA-CHAN-FILE-STREAM DATA-CHANNEL) 'DIRECTORY)
+    (SETQ RESULT (SEND (DATA-CHAN-NET-STREAM DATA-CHANNEL) ':READ-TOKEN-LIST NIL))  
+    (SEND SERVER-UNIT ':FREE-DATA-CHANNEL (PROG1 DATA-CHANNEL (SETQ DATA-CHANNEL NIL))))
+
+  (EXPAND-TABLE-ENCODED-PROPERTIES RESULT INDEX-TABLE)
+  
+  (LET ((PROCESSED-RESULT (NFILE-PROCESS-DIRLIST-RESULT SELF RESULT)))
+    (WHEN SORTED
+      (SETF (CDR PROCESSED-RESULT) (SORTCAR (CDR PROCESSED-RESULT) #'PATHNAME-LESSP)))
+  
+    PROCESSED-RESULT))
+
+(DEFMETHOD (:PROPERTIES NFILE-ACCESS-PATH) (PATHNAME &OPTIONAL OPTIONS)
+  (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "A pathname for this host")
+  
+  (SEND SELF ':PROPERTIES-1 (SEND SELF ':GET-SERVER-UNIT) PATHNAME NIL OPTIONS))
+  
+(DEFMETHOD (:PROPERTIES-1 NFILE-ACCESS-PATH) (SERVER-UNIT PATHNAME HANDLE OPTIONS
+							  &AUX INDEX-TABLE PROPERTIES)
+  (SETQ INDEX-TABLE (SEND SERVER-UNIT ':PROPERTY-INDEX-TABLE))
+  
+  (NFILE-DESTRUCTURE-WITH-TYPES ((RESULT :SEXP) (CHANGEABLES :KEYWORD-LIST))
+				(ISSUE-NFILE-COMMAND SERVER-UNIT :PROPERTIES
+				  HANDLE PATHNAME OPTIONS PROPERTIES)
+    (EXPAND-TABLE-ENCODED-PROPERTIES-1 RESULT INDEX-TABLE)
+    (VALUES (NFILE-CONVERT-DIRECTORY-ENTRY-FROM-TOKENS RESULT SELF)
+	    CHANGEABLES)))
+
+(DEFMETHOD (:MULTIPLE-FILE-PLISTS NFILE-ACCESS-PATH) (PATHNAMES OPTIONS
+								&AUX
+								(PROPERTIES
+								  '(:CREATION-DATE :LENGTH))
+								(CHARACTERS T)
+								RESULT INDEX-TABLE)
+  
+  (LOOP FOR PATHNAME IN PATHNAMES
+	DO (CHECK-ARG PATHNAME PATHNAME-FOR-THIS-HOST-P "A pathname for this host"))
+  
+  (LOOP FOR (IND VAL) ON OPTIONS BY 'CDDR
+	DO (SELECTQ IND
+	     (:CHARACTERS (UNLESS (MEMQ VAL '(T NIL :DEFAULT))
+			    (FERROR "Invalid :CHARACTERS value ~S, for :MULTIPLE-FILE-PLISTS"
+				    VAL))
+	      (SETQ CHARACTERS VAL))
+	     (T (FERROR "Unknown indicator ~S for :MULTIPLE-FILE-PLISTS." IND))))
+
+  (WITH-PROTECTED-ALLOCATION-OF-DATA-CHANNEL (DATA-CHANNEL ':INPUT SERVER-UNIT)
+    
+    (SETQ INDEX-TABLE (SEND SERVER-UNIT ':PROPERTY-INDEX-TABLE))
+      
+    (ISSUE-NFILE-COMMAND SERVER-UNIT :MULTIPLE-FILE-PLISTS
+      (DATA-CHAN-HANDLE DATA-CHANNEL)
+      (LOOP FOR PATHNAME IN PATHNAMES COLLECT (SEND PATHNAME ':STRING-FOR-HOST))
+      CHARACTERS PROPERTIES
+      &WHOSTATE "Multiple File PLISTs"
+      &DATA-CHANNEL DATA-CHANNEL)
+	  
+    (SETF (DATA-CHAN-FILE-STREAM DATA-CHANNEL) 'DIRECTORY)
+    (SETQ RESULT (SEND (DATA-CHAN-NET-STREAM DATA-CHANNEL) ':READ-TOKEN-LIST NIL))  
+    (SEND SERVER-UNIT ':FREE-DATA-CHANNEL (PROG1 DATA-CHANNEL (SETQ DATA-CHANNEL NIL))))
+
+  (EXPAND-TABLE-ENCODED-PROPERTIES RESULT INDEX-TABLE)
+  
+  (UNLESS (= (LENGTH RESULT) (LENGTH PATHNAMES))
+    (FERROR "NFILE server ~A returned ~D pathname~:P instead of ~D for :MULTIPLE-FILE-PLISTS."
+	    (LENGTH RESULT) (LENGTH PATHNAMES)))
+
+  ;; Now rebogify result to look like LispM manual expects....
+  (LOOP FOR RETURNED-ELEMENT IN (NFILE-PROCESS-DIRLIST-RESULT SELF RESULT)
+	FOR PATHNAME IN PATHNAMES		;MUST correspond in order
+	WHEN RETURNED-ELEMENT
+	DO (PUTPROP RETURNED-ELEMENT (CAR RETURNED-ELEMENT) ':TRUENAME)
+	ELSE
+	DO (SETQ RETURNED-ELEMENT (NCONS NIL))
+	COLLECT (RPLACA RETURNED-ELEMENT PATHNAME)))
+
+(DEFUN EXPAND-TABLE-ENCODED-PROPERTIES (DIRLIST TABLE)
+  (LOOP	FOR NODE IN DIRLIST
+	WHEN NODE				;mfplists magic
+	DO (EXPAND-TABLE-ENCODED-PROPERTIES-1 NODE TABLE)))
+
+(DEFUN EXPAND-TABLE-ENCODED-PROPERTIES-1 (NODE TABLE)
+  (COND ((NULL TABLE)
+	 (LOOP FOR PTR ON (CDR NODE) BY 'CDDR
+	       AS (INDEX) = PTR
+	       WHEN (NUMBERP INDEX)
+		 DO (FERROR "The host failed to provide a property index table, ~@
+			   but attempted to encode properties anyway.")
+	       DO (RPLACA PTR (INTERN INDEX PKG-KEYWORD-PACKAGE))))
+	(T
+	 (LET ((LEN (ARRAY-LENGTH TABLE))
+	       (TABLE TABLE))
+	   (DECLARE (ARRAY-REGISTER TABLE))
+	   (LOOP FOR PTR ON (CDR NODE) BY 'CDDR
+		 AS (INDEX) = PTR
+		 WHEN (NUMBERP INDEX)
+		   DO
+		     (UNLESS (< INDEX LEN)
+		       (FERROR "Property index-value ~D. given; property table is only ~D. ~
+			      long." INDEX LEN))
+		     (RPLACA PTR (AREF TABLE INDEX))
+		 ELSE DO (RPLACA PTR (INTERN INDEX PKG-KEYWORD-PACKAGE)))))))
+
+(DEFUN NFILE-PROCESS-DIRLIST-RESULT (ACCESS-PATH DATA)
+  (LOOP FOR ENTRY IN DATA
+	DO (NFILE-CONVERT-DIRECTORY-ENTRY-FROM-TOKENS ENTRY ACCESS-PATH))
+  DATA)
+
+;;; These are the understood indicators
+;;; Format is ((NFILE-ENCODER NFILE-DECODE) . INDICATORS)
+;;; All others are supposed to be transmittable as is.
+
+
+(DEFCONST *NFILE-DIRECTORY-PROPERTIES*
+  '(((NFILE-FORCE-STRING-COERCE NULL-FUNCTION) . (:PARTITION :VOLUME-NAME))
+    ))
+
+(DEFUN NFILE-STRING-FOR-HOST-COERCE (X)
+  (SEND X ':STRING-FOR-HOST))
+
+(DEFUN NULL-FUNCTION (X) X)
+
+(DEFUN NFILE-FORCE-STRING-COERCE (X)		;kludge for lmfs partitions.
+  (FORMAT NIL "~A" X))
+
+;; It is assumed that the PLIST is clobberable,
+;; but not list-values of the individual properties!
+(DEFUN NFILE-CONVERT-PROPERTY-LIST-TO-TOKENS (PLIST)
+  (LOOP FOR PTR ON PLIST BY 'CDDR
+	AS (KEYWORD VALUE) = PTR
+	DO
+	(LOOP FOR (CVINFO . PROPS-OF-THIS-TYPE) IN *NFILE-DIRECTORY-PROPERTIES*
+	      WHEN (MEMQ KEYWORD PROPS-OF-THIS-TYPE)
+	      RETURN
+	      (RPLACA (CDR PTR) (FUNCALL (FIRST CVINFO) VALUE))))
+  PLIST)
+
+(DEFUN NFILE-CONVERT-DIRECTORY-ENTRY-FROM-TOKENS (ENTRY ACCESS-PATH)
+  (WHEN (CAR ENTRY)
+    (RPLACA ENTRY (SEND ACCESS-PATH :PARSE-TRUENAME (CAR ENTRY))))
+  (LOOP FOR PTR ON (CDR ENTRY) BY 'CDDR
+	AS (KEYWORD VALUE) = PTR
+	DO
+	(RPLACA (CDR PTR)
+		(LOOP FOR (CVINFO . PROPS-OF-THIS-TYPE) IN *NFILE-DIRECTORY-PROPERTIES*
+		      WHEN (MEM #'STRING-EQUAL KEYWORD PROPS-OF-THIS-TYPE)
+		      RETURN (FUNCALL (SECOND CVINFO) VALUE)
+		      FINALLY (RETURN VALUE))))
+  ENTRY)
+
+;;; Perhaps this would be a reasonable default for the way all hosts should work?
+(DEFMETHOD (:ALL-DIRECTORIES NFILE-ACCESS-PATH) (PATHNAME OPTIONS)
+  (LOOP FOR X IN (CDR (SEND PATHNAME ':DIRECTORY-LIST (CONS ':DIRECTORIES-ONLY OPTIONS)))
+	COLLECT (RPLACD
+		  (RPLACA X (SEND (CAR X) ':NEW-PATHNAME ':NAME NIL ':TYPE NIL ':VERSION NIL))
+		  NIL)))
+
+(DEFMETHOD (:UPDATE-HOMEDIR NFILE-ACCESS-PATH) (IGNORE)
+  (SEND SELF ':GET-SERVER-UNIT)) ;This will make sure someone is logged in
+
+
+
+
+
+(DEFFLAVOR NFILE-STREAM-MIXIN
+	(SERVER-UNIT
+	 STATUS)
+	(%FILE-STREAM-STORED-FILE-ELEMENT-TYPE-MIXIN
+	 FLAVOR:PROPERTY-LIST-MIXIN SI:FILE-STREAM-MIXIN)
+  (:SETTABLE-INSTANCE-VARIABLES STATUS)
+  (:INITABLE-INSTANCE-VARIABLES SERVER-UNIT)
+  (:INIT-KEYWORDS :FILE-HANDLE))
+
+(DEFMACRO NFILE-STREAM-CHECK-STATE (OPERATION &REST STATES)
+  `(UNLESS ,(IF (NULL STATES)
+		`(EQ STATUS ':OPEN)
+		`(MEMQ STATUS ',(COPYLIST STATES)))
+     (NFILE-STREAM-STATE-BARF ,OPERATION)))
+
+(DEFUN-IN-FLAVOR (NFILE-STREAM-STATE-BARF NFILE-STREAM-MIXIN) (OPERATION)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (IF (EQ STATUS ':CLOSED)
+      (ERROR 'STREAM-CLOSED :ATTEMPT OPERATION :STREAM SELF)
+      (FERROR "Attempt to ~S on ~A,~@
+	      which is in state ~S, which is not a valid state for ~0G~S."
+	      OPERATION SELF STATUS)))
+
+;;; Shouldn't be needed, :CHARACTERS works.
+(DEFMETHOD (:QFASLP NFILE-STREAM-MIXIN) ()
+  (NOT (SEND SELF ':CHARACTERS)))
+
+(DEFMETHOD (:PARSE-TRUENAME NFILE-STREAM-MIXIN) (PATHNAME)
+  (SEND SERVER-UNIT :PARSE-TRUENAME PATHNAME))
+
+(DEFMETHOD (:TRUENAME NFILE-STREAM-MIXIN) ()
+  (CL:GETF FLAVOR:PROPERTY-LIST ':TRUENAME))
+
+(DEFMETHOD (:LENGTH NFILE-STREAM-MIXIN) ()
+  (CL:GETF FLAVOR:PROPERTY-LIST ':LENGTH))
+
+;;; Flavors that really have an open connection
+;;; STATUS is one of
+;;;  :OPEN - a file is currently open on this channel
+;;;  :CLOSED - no file is open, but the channel exists
+;;;  :EOF - a file is open, but is at its end (no more data available).
+
+(DEFFLAVOR NFILE-DATA-STREAM-MIXIN
+	((STATUS ':OPEN))
+	(NFILE-STREAM-MIXIN SI:FILE-DATA-STREAM-MIXIN)
+  (:INIT-KEYWORDS :DIRECT-FILE-ID :DATA-CHANNEL))
+
+(DEFFLAVOR NFILE-INPUT-STREAM-MIXIN
+	((INPUT-DATA-CHANNEL NIL)
+	 (BUFFER-GIVEN NIL))
+	(NFILE-DATA-STREAM-MIXIN
+	 SI:AREG-CACHING-BUFFERED-INPUT-STREAM-MIXIN
+	 SI:INPUT-FILE-STREAM-MIXIN))
+
+(DEFMETHOD (:CANONICAL-HANDLE NFILE-INPUT-STREAM-MIXIN) ()
+  (DATA-CHAN-HANDLE INPUT-DATA-CHANNEL))
+
+(DEFMETHOD (MAKE-INSTANCE NFILE-INPUT-STREAM-MIXIN) (&KEY DATA-CHANNEL &ALLOW-OTHER-KEYS)
+  (SEND SELF :BIND-DATA-CHANNEL DATA-CHANNEL))
+
+(DEFMETHOD (:BIND-DATA-CHANNEL NFILE-INPUT-STREAM-MIXIN) (CHANNEL)
+  (SETQ INPUT-DATA-CHANNEL
+	(OR CHANNEL (FERROR "No data channel given for input stream?")))
+  (SETF (DATA-CHAN-FILE-STREAM CHANNEL) SELF))
+
+(DEFFLAVOR NFILE-OUTPUT-STREAM-MIXIN
+	((OUTPUT-DATA-CHANNEL NIL)
+	 (BUFFER-GIVEN NIL))
+	(NFILE-DATA-STREAM-MIXIN
+	 SI:AREG-CACHING-BUFFERED-OUTPUT-STREAM-MIXIN
+	 SI:OUTPUT-FILE-STREAM-MIXIN))
+
+
+(DEFMETHOD (:CANONICAL-HANDLE NFILE-OUTPUT-STREAM-MIXIN) ()
+  (DATA-CHAN-HANDLE OUTPUT-DATA-CHANNEL))
+
+
+(DEFMETHOD (MAKE-INSTANCE NFILE-OUTPUT-STREAM-MIXIN) (&KEY DATA-CHANNEL &ALLOW-OTHER-KEYS)
+  (SEND SELF :BIND-DATA-CHANNEL DATA-CHANNEL)
+  (LET ((POINTER-BASE (SEND SELF :GET ':POINTER-BASE)))
+    (IF (AND POINTER-BASE
+	     (PLUSP POINTER-BASE))
+	(SEND SELF :SET-OUTPUT-POINTER-BASE POINTER-BASE))))
+
+(DEFMETHOD (:BIND-DATA-CHANNEL NFILE-OUTPUT-STREAM-MIXIN) (CHANNEL)
+  (SETQ OUTPUT-DATA-CHANNEL
+	(OR CHANNEL (FERROR "No data channel given for output stream?")))
+  (SETF (DATA-CHAN-FILE-STREAM CHANNEL) SELF))
+  
+(DEFMETHOD (:CLOSE NFILE-DATA-STREAM-MIXIN) (&OPTIONAL ABORT-P)
+  (LOOP DOING
+    ;; This is to get around :TEST-CONTROL-STREAM sometimes not working on TCP streams.
+    ;; When sending the close command discovers that the control connection
+    ;; has gone away, the Debugger Resume command will come back here instead
+    ;; of querying the user about attempting to throw through an unwind-protect.
+    (CATCH-ERROR-RESTART-IF (OR ABORT-P (EQ (SEND SELF :DIRECTION) :INPUT))
+			    ((ERROR) "Close ~A in abort mode."
+				     (SEND SELF :PATHNAME))
+      (RETURN
+	(COND ((EQ STATUS ':CLOSED) NIL)
+	      ((AND ABORT-P (NOT (SEND SERVER-UNIT ':TEST-CONTROL-STREAM)))
+	       (SETQ STATUS ':CLOSED)
+	       T)
+	      (T
+	       (UNWIND-PROTECT
+		 (PROGN (SEND SELF ':REAL-CLOSE ABORT-P)
+			(SETQ STATUS ':CLOSED))
+		 (UNLESS (OR ABORT-P (EQ STATUS ':CLOSED))
+		   (SEND SELF ':CLOSE ':ABORT)))))))
+    (SETQ ABORT-P T)))
+
+(DEFMETHOD (:REAL-CLOSE NFILE-INPUT-STREAM-MIXIN) (ABORT-P)
+  (WHEN (AND (EQ STATUS ':OPEN)
+	     (NOT ABORT-P))
+    (WHEN INPUT-DATA-CHANNEL
+      (SEND SELF ':DISCARD-CURRENT-INPUT-BUFFER)
+      (WHEN (= (SEND SELF ':READ-POINTER) (SEND SELF ':LENGTH))	;LOAD does this
+	(SEND SELF ':TYI)))			;read to get in EOF state, so as not
+						;to require resync next time.
+    (UNLESS (EQ STATUS ':EOF)			;try again, or in general.
+      (SETQ ABORT-P T)))
+  (SEND SELF ':HEART-OF-REAL-CLOSE ABORT-P INPUT-DATA-CHANNEL)
+  (SETQ INPUT-DATA-CHANNEL NIL)
+  (SETQ STATUS ':CLOSED))
+
+(DEFMETHOD (:HEART-OF-REAL-CLOSE NFILE-DATA-STREAM-MIXIN) (ABORT-P CHANNEL)
+  (LET ((WAS-STATUS STATUS))
+    (UNLESS (EQ STATUS ':CLOSING)
+      (WHEN CHANNEL
+	(SETF (DATA-CHAN-UNSAFE CHANNEL) T))
+      (SETQ STATUS ':CLOSING)
+      (LOOP DOING
+	(CATCH 'RETRY
+	  (CONDITION-BIND ((ERROR-PENDING-ON-CHANNEL
+			     #'(LAMBDA (IGNORE)
+				 (WHEN (DATA-CHAN-ASYNC-ERROR CHANNEL)
+				   (SEND SELF :ASYNC-ERROR-FROM-CLOSE CHANNEL)
+				   (THROW 'RETRY NIL)))))
+	    (RETURN (SEND SELF :SEND-CLOSE ABORT-P))))))
+    (WHEN (AND CHANNEL
+	       ;; This allows multiple aborted closes...
+	       (EQ (DATA-CHAN-FILE-STREAM CHANNEL) SELF))
+      (SEND SERVER-UNIT ':FREE-DATA-CHANNEL CHANNEL (NEQ WAS-STATUS ':EOF)))))
+  
+(DEFMETHOD (:SEND-CLOSE NFILE-DATA-STREAM-MIXIN) (ABORT-P)
+  (NFILE-STREAM-DESTRUCTURE-WITH-TYPES
+    ((TRUENAME :PATHNAME)
+     (BINARY-P :BOOLEAN)
+     (OTHER-PROPERTIES
+       :KEYWORD-PAIRS *NFILE-OPEN-VALUE-DESCRIPTORS* (SEND SELF ':PATHNAME)))
+    
+    (ISSUE-NFILE-COMMAND SERVER-UNIT :CLOSE
+      (SEND SELF ':CANONICAL-HANDLE)
+      (NOT (NULL ABORT-P)))
+    BINARY-P
+    OTHER-PROPERTIES
+    (SEND SELF ':PUTPROP TRUENAME ':TRUENAME)
+    (SETQ FLAVOR:PROPERTY-LIST (NCONC OTHER-PROPERTIES FLAVOR:PROPERTY-LIST))))
+
+
+(DEFMETHOD (:FINISH NFILE-OUTPUT-STREAM-MIXIN) ()
+  (NFILE-STREAM-CHECK-STATE :FINISH)
+  (SEND SELF ':EOF)
+
+  (NFILE-STREAM-DESTRUCTURE-WITH-TYPES
+    ((TRUENAME :PATHNAME)
+     (BINARY-P :BOOLEAN)
+     (OTHER-PROPERTIES
+       :KEYWORD-PAIRS *NFILE-OPEN-VALUE-DESCRIPTORS* (SEND SELF ':PATHNAME)))
+    
+    (ISSUE-NFILE-COMMAND SERVER-UNIT :FINISH
+      (SEND SELF ':CANONICAL-HANDLE))
+    BINARY-P
+    (SEND SELF ':PUTPROP TRUENAME ':TRUENAME)
+    (SETQ FLAVOR:PROPERTY-LIST (NCONC OTHER-PROPERTIES FLAVOR:PROPERTY-LIST)))
+  (SETQ STATUS ':OPEN))
+
+(DEFMETHOD (:REAL-CLOSE NFILE-OUTPUT-STREAM-MIXIN) (ABORT-P)
+  (WHEN OUTPUT-DATA-CHANNEL
+    (UNLESS (OR ABORT-P (MEMQ STATUS '(:EOF :ASYNC-MARKED)))	;LEAVE aborted writes unsafe!
+      (SEND SELF ':EOF)))
+  (SEND SELF ':HEART-OF-REAL-CLOSE ABORT-P OUTPUT-DATA-CHANNEL)
+  (SETQ OUTPUT-DATA-CHANNEL NIL))
+
+(DEFMETHOD (:DELETE NFILE-DATA-STREAM-MIXIN) (&OPTIONAL (ERROR-P T))
+  (NFILE-STREAM-CHECK-STATE :DELETE :OPEN :EOF)
+  (CONDITION-CASE-IF (NOT ERROR-P) (.ERROR.)
+      (SEND SERVER-UNIT ':SIMPLE-COMMAND ':DELETE "Delete" (SEND SELF ':CANONICAL-HANDLE) NIL)
+    (FILE-OPERATION-FAILURE .ERROR.)))
+
+(DEFMETHOD (:RENAME NFILE-DATA-STREAM-MIXIN) (NEW-NAME &OPTIONAL (ERROR-P T))
+  (NFILE-STREAM-CHECK-STATE :RENAME :OPEN :EOF)
+  (CONDITION-CASE-IF (NOT ERROR-P) (.ERROR.)
+      (NFILE-STREAM-DESTRUCTURE-WITH-TYPES
+	((PATH :PATHNAME) (NEWPATH :PATHNAME))
+	(SEND SERVER-UNIT ':SIMPLE-COMMAND ':RENAME "Rename"
+	      (SEND SELF ':CANONICAL-HANDLE) NIL NEW-NAME)
+	(SETQ SI:PATHNAME NEW-NAME)
+	(WHEN TV:WHO-LINE-FILE-STATE-SHEET
+	  (SEND TV:WHO-LINE-FILE-STATE-SHEET ':CLOBBERED))
+	(VALUES PATH NEWPATH))
+    (FILE-OPERATION-FAILURE .ERROR.)))
+
+;; Need protocol for OPTIONS, ATTRIBUTES-WANTED
+(DEFMETHOD (:PROPERTIES NFILE-DATA-STREAM-MIXIN) ()
+  (NFILE-STREAM-CHECK-STATE :PROPERTIES :OPEN :EOF :ASYNC-MARKED)
+  (SEND (SEND SERVER-UNIT ':ACCESS-PATH) ':PROPERTIES-1
+	SERVER-UNIT NIL (SEND SELF ':CANONICAL-HANDLE) NIL))
+
+(DEFMETHOD (:CHANGE-PROPERTIES NFILE-DATA-STREAM-MIXIN)
+	   (ERROR-P &REST PROPERTIES)
+  (NFILE-STREAM-CHECK-STATE :CHANGE-PROPERTIES :OPEN :EOF)
+  (CONDITION-CASE-IF (NOT ERROR-P) (.ERROR.)
+      (ISSUE-NFILE-COMMAND SERVER-UNIT :CHANGE-PROPERTIES
+	(SEND SELF ':CANONICAL-HANDLE)
+	NIL					;pathname
+	(NFILE-CONVERT-PROPERTY-LIST-TO-TOKENS
+	  ;; Maybe this copy isn't necessary?   Is it guaranteed to be stack-consed?
+	  (COPYLIST PROPERTIES)))
+    (FILE-OPERATION-FAILURE .ERROR.)))
+
+(DEFMETHOD (:CONTINUE NFILE-DATA-STREAM-MIXIN) (CHANNEL)
+  (NFILE-STREAM-CHECK-STATE :CONTINUE :ASYNC-MARKED)
+  ;; Use the handle of the channel that actually erred.
+  (ISSUE-NFILE-COMMAND SERVER-UNIT :CONTINUE (DATA-CHAN-HANDLE CHANNEL))
+  (SETQ STATUS ':OPEN))
+
+(DEFMETHOD (:SET-BUFFER-POINTER NFILE-DATA-STREAM-MIXIN :BEFORE) (IGNORE)
+  (NFILE-STREAM-CHECK-STATE :FILEPOS :OPEN :EOF))	;yuk yuk
+
+(DEFMETHOD (:SET-BUFFER-POINTER NFILE-INPUT-STREAM-MIXIN) (NEW-POINTER)
+  (LET ((RESYNC-IDENTIFIER (AND INPUT-DATA-CHANNEL (FILE-GENSYM "UIFPRS"))))
+    (SETQ STATUS ':OPEN)
+    (ISSUE-NFILE-COMMAND SERVER-UNIT :FILEPOS
+      (SEND SELF ':CANONICAL-HANDLE) NEW-POINTER RESYNC-IDENTIFIER
+      &WHOSTATE "Set Pointer")
+    (WHEN INPUT-DATA-CHANNEL
+      (READ-DATA-STREAM-FOR-RESYNC-MESSAGE
+	(DATA-CHAN-NET-DATA-STREAM INPUT-DATA-CHANNEL) RESYNC-IDENTIFIER)))
+  NEW-POINTER)
+	      
+;;; Bidirectional gets this one, not the input one.  Ramification of
+;;; bidirectional state management policy.  Note that this one gets quite
+;;; null and efficient if a :DIRECT-OUTPUT has not yet been done.
+(DEFMETHOD (:SET-BUFFER-POINTER NFILE-OUTPUT-STREAM-MIXIN) (NEW-POINTER)
+  ;;;******** We have to do something more intelligent about possible async output error here.
+  ;;;
+  (WHEN OUTPUT-DATA-CHANNEL
+    (SEND SELF ':EOF)				;he should be reading for them.
+    (SETQ STATUS ':OPEN))
+  (ISSUE-NFILE-COMMAND SERVER-UNIT :FILEPOS
+    (SEND SELF ':CANONICAL-HANDLE) NEW-POINTER NIL
+    &WHOSTATE "Set Pointer")
+  NEW-POINTER)
+
+(DEFMETHOD (:EOF NFILE-OUTPUT-STREAM-MIXIN) ()
+  (SEND SELF ':FORCE-OUTPUT)			;should be done by daemons, anyway.
+  (WHEN OUTPUT-DATA-CHANNEL
+    (SEND (DATA-CHAN-NET-DATA-STREAM OUTPUT-DATA-CHANNEL) ':EOF)
+    (SETQ STATUS ':EOF)))
+
+(DEFFLAVOR NFILE-CHARACTER-STREAM-MIXIN () (NFILE-DATA-STREAM-MIXIN))
+
+(DEFFLAVOR NFILE-BINARY-STREAM-MIXIN () (NFILE-DATA-STREAM-MIXIN))
+
+(DEFFLAVOR NFILE-DIRECT-STREAM-MIXIN
+	((DIRECT-FILE-ID NIL))
+	(NFILE-DATA-STREAM-MIXIN NFILE-STREAM-MIXIN)
+  (:INITABLE-INSTANCE-VARIABLES DIRECT-FILE-ID))
+
+(DEFMETHOD (:BIND-DATA-CHANNEL NFILE-DIRECT-STREAM-MIXIN) (IGNORE) T)	;hacked dynamically
+
+(DEFMETHOD (:CANONICAL-HANDLE NFILE-DIRECT-STREAM-MIXIN) ()
+  DIRECT-FILE-ID)
+
+(DEFMETHOD (MAKE-INSTANCE NFILE-DIRECT-STREAM-MIXIN) (&REST IGNORE)
+  (SEND SELF :PUTPROP T ':DIRECT)
+  (UNLESS DIRECT-FILE-ID
+    (FERROR "No direct access file identifier//handle.")))
+
+(DEFFLAVOR NFILE-DIRECT-INPUT-STREAM-MIXIN
+	((INPUT-FILE-HANDLE NIL))
+	(NFILE-DIRECT-STREAM-MIXIN)
+  (:REQUIRED-FLAVORS NFILE-STREAM-MIXIN NFILE-DATA-STREAM-MIXIN NFILE-INPUT-STREAM-MIXIN
+		     SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+		     SI:INPUT-POINTER-REMEMBERING-MIXIN))
+
+
+(DEFMETHOD (:READ-BYTES NFILE-DIRECT-INPUT-STREAM-MIXIN) (NBYTES &OPTIONAL FILEPOS)
+  (NFILE-STREAM-CHECK-STATE :READ-BYTES :OPEN :EOF :ASYNC-MARKED)
+  (IF (EQ STATUS ':EOF)
+      (SETQ STATUS ':OPEN))
+  ;; If there already is a channel, it better be aborted.
+  (IF INPUT-DATA-CHANNEL (SEND SELF ':ABORT-DIRECT-READ))
+  
+  (SETQ INPUT-DATA-CHANNEL
+	(WITH-PROTECTED-ALLOCATION-OF-DATA-CHANNEL (DATA-CHANNEL ':INPUT :NEED-DATA-CHANNEL)
+	  (ISSUE-NFILE-COMMAND SERVER-UNIT :READ
+	    DIRECT-FILE-ID
+	    (DATA-CHAN-HANDLE DATA-CHANNEL)
+	    NBYTES
+	    &DATA-CHANNEL DATA-CHANNEL
+	    &WHOSTATE "Read Bytes"
+	    &KEY FILEPOS)
+	  DATA-CHANNEL))
+  (SETF (DATA-CHAN-FILE-STREAM INPUT-DATA-CHANNEL) SELF)	;mainly for peek
+  (SETF (DATA-CHAN-UNSAFE INPUT-DATA-CHANNEL) NIL)	;In use, which is worse.
+  (IF FILEPOS (SETQ SI:INPUT-POINTER-BASE FILEPOS)))
+
+(DEFMETHOD (:DISCARD-LAST-BYTE NFILE-DIRECT-INPUT-STREAM-MIXIN) ()
+  (WHEN INPUT-DATA-CHANNEL
+    (SEND SERVER-UNIT ':FREE-DATA-CHANNEL
+	  (PROG1 INPUT-DATA-CHANNEL (SETQ INPUT-DATA-CHANNEL NIL)))))
+
+(DEFMETHOD (:ABORT-DIRECT-READ NFILE-DIRECT-INPUT-STREAM-MIXIN) ()
+  (SEND SELF ':DISCARD-CURRENT-INPUT-BUFFER)
+  ;(tyo #/)
+  (SETF (DATA-CHAN-UNSAFE INPUT-DATA-CHANNEL) ':ABORT-DIRECT-READ)	;Make it unsafe..
+  (PROG1
+    (ISSUE-NFILE-COMMAND SERVER-UNIT :ABORT (DATA-CHAN-HANDLE INPUT-DATA-CHANNEL))
+    (SEND SERVER-UNIT ':FREE-DATA-CHANNEL
+	  (PROG1 INPUT-DATA-CHANNEL
+		 (SETQ INPUT-DATA-CHANNEL NIL))
+	  T)))					;  ... and leave it unsafe.
+
+(DEFFLAVOR NFILE-DIRECT-OUTPUT-STREAM-MIXIN
+	((OUTPUT-FILE-HANDLE NIL))
+	(NFILE-DIRECT-STREAM-MIXIN)
+  (:REQUIRED-FLAVORS NFILE-STREAM-MIXIN NFILE-DATA-STREAM-MIXIN NFILE-OUTPUT-STREAM-MIXIN
+		     SI:OUTPUT-POINTER-REMEMBERING-MIXIN))
+
+(DEFMETHOD (:NEW-OUTPUT-BUFFER NFILE-DIRECT-OUTPUT-STREAM-MIXIN :BEFORE) ()
+  (UNLESS OUTPUT-DATA-CHANNEL
+    (SEND SELF ':DIRECT-OUTPUT)))
+
+;;; This needs moby work ********************God willing, it will never get called.
+;;; It is hopelessly ill-defined for non-bidirectional streams.
+;;;(DEFMETHOD (NFILE-DIRECT-OUTPUT-STREAM-MIXIN :GET-OLD-DATA) (IGNORE OFFSET)
+;;; Let it err with an undefined method.
+
+(DEFMETHOD (:SET-POINTER NFILE-DIRECT-OUTPUT-STREAM-MIXIN :BEFORE) (IGNORE)
+  (SEND SELF ':SEND-CURRENT-OUTPUT-BUFFER NIL))	;Never let POINTER-REMEMBERer optimize.
+
+(DEFMETHOD (:DIRECT-OUTPUT NFILE-DIRECT-OUTPUT-STREAM-MIXIN) ()
+  (NFILE-STREAM-CHECK-STATE :DIRECT-OUTPUT :OPEN :EOF :ASYNC-MARKED)
+  (IF (EQ STATUS ':EOF)
+      (SETQ STATUS ':OPEN))
+  ;; If there already is a channel, this is peculiar.
+  (IF OUTPUT-DATA-CHANNEL
+      (FERROR "Why are we doing a :DIRECT-OUTPUT if we already have an output channel? ~S"
+	      SELF))
+  
+  (SETQ OUTPUT-DATA-CHANNEL
+	(WITH-PROTECTED-ALLOCATION-OF-DATA-CHANNEL (DATA-CHANNEL ':OUTPUT :NEED-DATA-CHANNEL)
+	  (ISSUE-NFILE-COMMAND SERVER-UNIT :DIRECT-OUTPUT
+	    DIRECT-FILE-ID
+	    (DATA-CHAN-HANDLE DATA-CHANNEL)
+	    &DATA-CHANNEL DATA-CHANNEL)
+	  DATA-CHANNEL))
+  (SETF (DATA-CHAN-FILE-STREAM OUTPUT-DATA-CHANNEL) SELF)	;for PEEK and async errors
+  (SETF (DATA-CHAN-UNSAFE OUTPUT-DATA-CHANNEL) NIL)	;In use, which is worse.
+  NIL)
+
+(DEFMETHOD (:UNDIRECT-OUTPUT NFILE-DIRECT-OUTPUT-STREAM-MIXIN) ()
+  (NFILE-STREAM-CHECK-STATE :UNDIRECT-OUTPUT :OPEN :EOF :ASYNC-MARKED) 
+  (SEND SELF ':SEND-CURRENT-OUTPUT-BUFFER NIL)	;Just to make sure
+  (WHEN OUTPUT-DATA-CHANNEL			;wimp??
+    ;; Maybe this can never work, and EOF must be sent after CC command?
+    (SEND SELF ':EOF)
+    (PROTECT-DATA-CHANNEL-DEALLOCATION (OUTPUT-DATA-CHANNEL UNSAFE-FLAG)
+      (ISSUE-NFILE-COMMAND SERVER-UNIT :DIRECT-OUTPUT
+	DIRECT-FILE-ID NIL)			;null output-handle means dissociate
+      (UNLESS (EQ STATUS ':EOF) (SETQ UNSAFE-FLAG T)))
+    (SETQ STATUS ':OPEN)))
+
+(DEFWHOPPER (:EOF NFILE-DIRECT-OUTPUT-STREAM-MIXIN) ()
+  (IF OUTPUT-DATA-CHANNEL			;Punt if no data connection
+      (CONTINUE-WHOPPER)))
+
+(DEFFLAVOR NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN
+	()
+	()
+  (:REQUIRED-FLAVORS
+   NFILE-DIRECT-INPUT-STREAM-MIXIN NFILE-DIRECT-OUTPUT-STREAM-MIXIN
+   SI:BUFFERED-INPUT-STREAM SI:BUFFERED-OUTPUT-STREAM
+   SI:INPUT-POINTER-REMEMBERING-MIXIN SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+   NFILE-DATA-STREAM-MIXIN))
+
+(DEFMETHOD (:NEXT-INPUT-BUFFER NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN :BEFORE) (&REST IGNORE)
+  (IF OUTPUT-DATA-CHANNEL
+      (SEND SELF ':UNDIRECT-OUTPUT)))
+
+(DEFMETHOD (:READ-BYTES NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN :BEFORE) (&REST IGNORE)
+  (IF OUTPUT-DATA-CHANNEL
+      (SEND SELF ':UNDIRECT-OUTPUT)))
+
+(DEFMETHOD (:SET-POINTER NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN) (POINTER)
+  (WHEN INPUT-DATA-CHANNEL
+    (SEND SELF ':ABORT-DIRECT-READ))
+  (SEND SELF ':DISCARD-CURRENT-INPUT-BUFFER)
+  (SETQ SI:INPUT-POINTER-BASE POINTER))
+;;;Hairy bidirectional stream mixin daemon will actually set the pointer
+
+(DEFMETHOD (:REAL-CLOSE NFILE-DIRECT-INPUT-STREAM-MIXIN :BEFORE) (IGNORE)
+  (IF INPUT-DATA-CHANNEL (SEND SELF ':ABORT-DIRECT-READ)))
+
+(DEFSELECT ((NFILE-INPUT-INDIRECT-ARRAY NAMED-STRUCTURE-INVOKE))
+  (:PRINT-SELF (OBJECT STREAM &REST IGNORE) 
+   (FORMAT STREAM "#<NFILE-INPUT-INDIRECT-ARRAY ~\si:address\  ~S>"
+	   (%POINTER OBJECT) (SI:ARRAY-INDIRECT-POINTER OBJECT))))
+
+(DEFFLAVOR NFILE-INPUT-CHARACTER-STREAM-MIXIN
+	((INPUT-INDIRECT-ARRAY
+	   (MAKE-ARRAY 2048.
+		       ':DISPLACED-TO "" ':DISPLACED-INDEX-OFFSET 0
+		       ':NAMED-STRUCTURE-SYMBOL 'NFILE-INPUT-INDIRECT-ARRAY
+		       ':TYPE 'ART-STRING)))
+	(NFILE-INPUT-STREAM-MIXIN NFILE-CHARACTER-STREAM-MIXIN))
+
+
+(DEFMETHOD (:NEXT-INPUT-BUFFER NFILE-INPUT-CHARACTER-STREAM-MIXIN) (&OPTIONAL NO-HANG-P)
+  (WHEN BUFFER-GIVEN
+    (FERROR "I gave you ~S, but yet, you have asked for another input buffer." BUFFER-GIVEN))
+  (MULTIPLE-VALUE-BIND (BUF START END)
+      (SEND SELF ':READ-DATA-STREAM ':READ-INPUT-BUFFER NIL NO-HANG-P)
+    (COND (BUF
+	   (SETQ BUFFER-GIVEN INPUT-INDIRECT-ARRAY)
+	   (SI:CHANGE-INDIRECT-ARRAY INPUT-INDIRECT-ARRAY 'ART-STRING END BUF 0)
+	   (VALUES INPUT-INDIRECT-ARRAY START END))
+	  (NO-HANG-P NIL)
+	  (T
+	   (SETQ STATUS ':EOF)
+	   (VALUES NIL NIL)))))
+
+(DEFMETHOD (:DISCARD-INPUT-BUFFER NFILE-INPUT-CHARACTER-STREAM-MIXIN) (BUF)
+  ;; Improperia...
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I gave you no buffer at all, yet now you ask to discard ~S?" BUF))
+  (UNLESS (EQ BUFFER-GIVEN BUF)
+    (FERROR "I gave you buffer ~S, yet now you ask to discard ~S?" BUFFER-GIVEN BUF))
+  (SETQ BUFFER-GIVEN NIL)
+  (SEND SELF ':READ-DATA-STREAM ':ADVANCE-INPUT-BUFFER))
+
+
+(DEFFLAVOR NFILE-INPUT-BINARY-STREAM-MIXIN ()
+	   (NFILE-INPUT-STREAM-MIXIN NFILE-BINARY-STREAM-MIXIN))
+
+(DEFFLAVOR NFILE-OUTPUT-CHARACTER-STREAM-MIXIN
+	((OUTPUT-INDIRECT-ARRAY
+	   (MAKE-ARRAY 2048.
+		       ':DISPLACED-TO "" ':DISPLACED-INDEX-OFFSET 0
+		       ':NAMED-STRUCTURE-SYMBOL 'NFILE-INPUT-INDIRECT-ARRAY
+		       ':TYPE 'ART-STRING)))
+	(NFILE-OUTPUT-STREAM-MIXIN NFILE-CHARACTER-STREAM-MIXIN))
+
+(DEFMETHOD (:NEW-OUTPUT-BUFFER NFILE-OUTPUT-CHARACTER-STREAM-MIXIN) ()
+  (WHEN BUFFER-GIVEN
+    (FERROR "I gave you ~S, but yet, you have asked for another output buffer." BUFFER-GIVEN))
+  (MULTIPLE-VALUE-BIND (BUF START END)
+      (SEND SELF ':WRITE-DATA-STREAM ':GET-OUTPUT-BUFFER)	;handles exceptions
+    (WHEN BUF
+      (SI:CHANGE-INDIRECT-ARRAY OUTPUT-INDIRECT-ARRAY 'ART-STRING END BUF 0)
+      (SETF BUFFER-GIVEN OUTPUT-INDIRECT-ARRAY)
+      (VALUES BUFFER-GIVEN START END))))
+
+;;; "WIDE" binary streams, i.e., byte-size > 8.  They maintain their own buffer, because
+;;; the target stream is 8-bit, and copying will thus have to be done.
+
+;;; The right way to do this is to ask the target stream.
+(DEFCONST *NFILE-WIDE-BINARY-BUFFER-SIZE* (// CHAOS:MAX-DATA-BYTES-PER-PKT 2))
+
+(DEFRESOURCE NFILE-WIDE-BINARY-BUFFER (SIZE)
+  :CONSTRUCTOR (LET* ((BUF (MAKE-ARRAY SIZE ':TYPE ART-16B ':LEADER-LENGTH 2))
+		      (INDIR (MAKE-ARRAY (* 2 SIZE) ':TYPE ART-8B
+					 ':DISPLACED-TO BUF ':DISPLACED-INDEX-OFFSET 0)))
+		 (SETF (ARRAY-LEADER BUF 1) INDIR)
+		 BUF)
+  :MATCHER ( (ARRAY-LENGTH OBJECT) SIZE))
+
+(DEFFLAVOR NFILE-WIDE-BINARY-INPUT-MIXIN
+	(INPUT-BUFFER)
+	(NFILE-INPUT-STREAM-MIXIN NFILE-DATA-STREAM-MIXIN))
+
+(DEFFLAVOR NFILE-WIDE-BINARY-OUTPUT-MIXIN
+	((OUTPUT-BUFFER NIL))
+	(NFILE-OUTPUT-STREAM-MIXIN NFILE-DATA-STREAM-MIXIN))
+
+(DEFMETHOD (MAKE-INSTANCE NFILE-WIDE-BINARY-INPUT-MIXIN) (&REST IGNORE)
+  (SETQ INPUT-BUFFER (ALLOCATE-RESOURCE 'NFILE-WIDE-BINARY-BUFFER
+					 *NFILE-WIDE-BINARY-BUFFER-SIZE*))
+  (SETF (FILL-POINTER INPUT-BUFFER) 0))
+
+(DEFMETHOD (:CLOSE NFILE-WIDE-BINARY-INPUT-MIXIN :AFTER) (&OPTIONAL IGNORE)
+  (WHEN INPUT-BUFFER
+    (DEALLOCATE-RESOURCE 'NFILE-WIDE-BINARY-BUFFER
+			 (PROG1 INPUT-BUFFER (SETQ INPUT-BUFFER NIL)))))
+
+(DEFMETHOD (MAKE-INSTANCE NFILE-WIDE-BINARY-OUTPUT-MIXIN) (&REST IGNORE)
+  (SETQ OUTPUT-BUFFER (ALLOCATE-RESOURCE 'NFILE-WIDE-BINARY-BUFFER
+					 *NFILE-WIDE-BINARY-BUFFER-SIZE*))
+  (SETF (FILL-POINTER OUTPUT-BUFFER) 0))
+
+(DEFMETHOD (:CLOSE NFILE-WIDE-BINARY-OUTPUT-MIXIN :AFTER) (&OPTIONAL IGNORE)
+  (WHEN OUTPUT-BUFFER
+    (DEALLOCATE-RESOURCE 'NFILE-WIDE-BINARY-BUFFER
+			 (PROG1 OUTPUT-BUFFER (SETQ OUTPUT-BUFFER NIL)))))
+
+
+
+(DEFFLAVOR NFILE-OUTPUT-BINARY-STREAM-MIXIN ()
+	   (NFILE-OUTPUT-STREAM-MIXIN NFILE-BINARY-STREAM-MIXIN))
+
+(DEFFLAVOR NFILE-INPUT-CHARACTER-STREAM
+	()
+	(NFILE-INPUT-CHARACTER-STREAM-MIXIN SI:INPUT-FILE-STREAM-MIXIN
+	 SI:BUFFERED-INPUT-CHARACTER-STREAM SI:INPUT-POINTER-REMEMBERING-MIXIN))
+
+(DEFFLAVOR NFILE-OUTPUT-CHARACTER-STREAM
+	()
+	(NFILE-OUTPUT-CHARACTER-STREAM-MIXIN SI:OUTPUT-FILE-STREAM-MIXIN
+	 SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	 SI:BUFFERED-OUTPUT-CHARACTER-STREAM))
+
+(DEFFLAVOR NFILE-INPUT-BINARY-STREAM
+	()
+	(NFILE-INPUT-BINARY-STREAM-MIXIN SI:INPUT-FILE-STREAM-MIXIN
+	 SI:INPUT-POINTER-REMEMBERING-MIXIN
+	 SI:BUFFERED-INPUT-BINARY-STREAM
+	 SI:UNSIGNED-BYTE-8-WITH-CHARACTER-INPUT-MIXIN))
+
+(DEFFLAVOR NFILE-OUTPUT-BINARY-STREAM
+	()
+	(NFILE-OUTPUT-BINARY-STREAM-MIXIN SI:OUTPUT-FILE-STREAM-MIXIN
+	 SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	 SI:BUFFERED-OUTPUT-BINARY-STREAM
+	 SI:UNSIGNED-BYTE-8-WITH-CHARACTER-OUTPUT-MIXIN))
+
+(DEFFLAVOR NFILE-OUTPUT-DIRECT-CHARACTER-STREAM
+	()
+	(NFILE-DIRECT-OUTPUT-STREAM-MIXIN
+	 SI:DIRECT-ACCESS-BUFFERED-OUTPUT-STREAM-MIXIN
+	 NFILE-OUTPUT-CHARACTER-STREAM-MIXIN SI:OUTPUT-FILE-STREAM-MIXIN
+	 SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	 SI:BUFFERED-OUTPUT-CHARACTER-STREAM))
+
+(DEFFLAVOR NFILE-INPUT-DIRECT-CHARACTER-STREAM
+	()
+	(NFILE-DIRECT-INPUT-STREAM-MIXIN SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+	 NFILE-INPUT-CHARACTER-STREAM-MIXIN SI:INPUT-FILE-STREAM-MIXIN
+	 SI:BUFFERED-INPUT-CHARACTER-STREAM SI:INPUT-POINTER-REMEMBERING-MIXIN))
+
+(DEFFLAVOR NFILE-OUTPUT-DIRECT-BINARY-STREAM
+	()
+	(NFILE-DIRECT-OUTPUT-STREAM-MIXIN
+	 SI:DIRECT-ACCESS-BUFFERED-OUTPUT-STREAM-MIXIN
+	 NFILE-OUTPUT-BINARY-STREAM-MIXIN SI:OUTPUT-FILE-STREAM-MIXIN
+	 SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	 SI:BUFFERED-OUTPUT-BINARY-STREAM
+	 SI:UNSIGNED-BYTE-8-WITH-CHARACTER-OUTPUT-MIXIN))
+
+(DEFFLAVOR NFILE-INPUT-DIRECT-BINARY-STREAM
+	()
+	(NFILE-DIRECT-INPUT-STREAM-MIXIN
+	 SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+	 NFILE-INPUT-BINARY-STREAM-MIXIN SI:INPUT-FILE-STREAM-MIXIN
+	 SI:INPUT-POINTER-REMEMBERING-MIXIN
+	 SI:BUFFERED-INPUT-BINARY-STREAM
+	 SI:UNSIGNED-BYTE-8-WITH-CHARACTER-INPUT-MIXIN))
+
+(DEFFLAVOR NFILE-INPUT-WIDE-BINARY-STREAM ()
+	   (NFILE-WIDE-BINARY-INPUT-MIXIN NFILE-INPUT-BINARY-STREAM-MIXIN
+	    SI:INPUT-FILE-STREAM-MIXIN SI:INPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-INPUT-BINARY-STREAM))
+
+(DEFFLAVOR NFILE-OUTPUT-WIDE-BINARY-STREAM ()
+	   (NFILE-WIDE-BINARY-OUTPUT-MIXIN NFILE-OUTPUT-BINARY-STREAM-MIXIN
+	    SI:OUTPUT-FILE-STREAM-MIXIN SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-OUTPUT-BINARY-STREAM))
+
+(DEFFLAVOR NFILE-BIDIRECTIONAL-DIRECT-CHARACTER-STREAM ()
+	   (NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN
+	    NFILE-DIRECT-INPUT-STREAM-MIXIN
+	    NFILE-DIRECT-OUTPUT-STREAM-MIXIN 
+	    SI:BIDIRECTIONAL-POINTER-REMEMBERING-MIXIN 
+	    SI:BIDIRECTIONAL-STREAM
+	    SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+	    SI:DIRECT-ACCESS-BUFFERED-OUTPUT-STREAM-MIXIN
+	    NFILE-OUTPUT-CHARACTER-STREAM-MIXIN	;get :real-close from him, and
+						;:SET-BUFFER-POINTER
+	    NFILE-INPUT-CHARACTER-STREAM-MIXIN
+	    SI:INPUT-POINTER-REMEMBERING-MIXIN
+	    SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-INPUT-STREAM
+	    SI:BUFFERED-OUTPUT-STREAM
+	    ))
+
+(DEFFLAVOR NFILE-BIDIRECTIONAL-DIRECT-BINARY-STREAM ()
+	   (NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN
+	    NFILE-DIRECT-INPUT-STREAM-MIXIN
+	    NFILE-DIRECT-OUTPUT-STREAM-MIXIN 
+	    SI:BIDIRECTIONAL-POINTER-REMEMBERING-MIXIN 
+	    SI:BIDIRECTIONAL-STREAM
+	    SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+	    SI:DIRECT-ACCESS-BUFFERED-OUTPUT-STREAM-MIXIN
+	    NFILE-OUTPUT-BINARY-STREAM-MIXIN 
+	    NFILE-INPUT-BINARY-STREAM-MIXIN
+	    SI:INPUT-POINTER-REMEMBERING-MIXIN
+	    SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-INPUT-BINARY-STREAM
+	    SI:BUFFERED-OUTPUT-BINARY-STREAM
+	    SI:UNSIGNED-BYTE-8-WITH-CHARACTER-IO-MIXIN
+	    ))
+
+(DEFFLAVOR NFILE-INPUT-DIRECT-WIDE-BINARY-STREAM ()
+	   (NFILE-WIDE-BINARY-INPUT-MIXIN NFILE-DIRECT-INPUT-STREAM-MIXIN
+	    SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+	    NFILE-INPUT-BINARY-STREAM-MIXIN SI:INPUT-FILE-STREAM-MIXIN
+	    SI:INPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-INPUT-BINARY-STREAM))
+
+(DEFFLAVOR NFILE-OUTPUT-DIRECT-WIDE-BINARY-STREAM ()
+	   (NFILE-WIDE-BINARY-OUTPUT-MIXIN NFILE-DIRECT-OUTPUT-STREAM-MIXIN
+	    SI:DIRECT-ACCESS-BUFFERED-OUTPUT-STREAM-MIXIN
+	    NFILE-OUTPUT-BINARY-STREAM-MIXIN SI:OUTPUT-FILE-STREAM-MIXIN
+	    SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-OUTPUT-BINARY-STREAM))
+
+(DEFFLAVOR NFILE-BIDIRECTIONAL-DIRECT-WIDE-BINARY-STREAM ()
+	   (NFILE-WIDE-BINARY-OUTPUT-MIXIN NFILE-WIDE-BINARY-INPUT-MIXIN
+	    NFILE-DIRECT-BIDIRECTIONAL-STREAM-MIXIN
+	    NFILE-DIRECT-INPUT-STREAM-MIXIN
+	    NFILE-DIRECT-OUTPUT-STREAM-MIXIN 
+	    SI:BIDIRECTIONAL-POINTER-REMEMBERING-MIXIN 
+	    SI:BIDIRECTIONAL-STREAM
+	    SI:DIRECT-ACCESS-BUFFERED-INPUT-STREAM-MIXIN
+	    SI:DIRECT-ACCESS-BUFFERED-OUTPUT-STREAM-MIXIN
+	    NFILE-OUTPUT-BINARY-STREAM-MIXIN 
+	    NFILE-INPUT-BINARY-STREAM-MIXIN
+	    SI:INPUT-POINTER-REMEMBERING-MIXIN
+	    SI:OUTPUT-POINTER-REMEMBERING-MIXIN
+	    SI:BUFFERED-INPUT-BINARY-STREAM
+	    SI:BUFFERED-OUTPUT-BINARY-STREAM))
+
+(DEFFLAVOR NFILE-PROBE-STREAM
+	((STATUS ':CLOSED))
+	(NFILE-STREAM-MIXIN SI:STREAM)
+  (:GETTABLE-INSTANCE-VARIABLES STATUS)
+  (:INIT-KEYWORDS :FILE-ACCESS-PATH :DATA-CHANNEL :DIRECT-FILE-ID))
+
+
+;;; These are the serious methods that handle character movement for all
+;;; the NFILE stream flavors.  The "easy" ones work for character files
+;;; and "skinny" ( 8 bit) binary files.
+
+(DEFMETHOD (:DISCARD-OUTPUT-BUFFER NFILE-OUTPUT-STREAM-MIXIN) (BUF)
+  ;; Improperia...
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I gave you no buffer at all, yet now you ask to discard ~S?" BUF))
+  (UNLESS (EQ BUFFER-GIVEN BUF)
+    (FERROR "I gave you buffer ~S, yet now you ask to discard ~S?" BUFFER-GIVEN BUF))
+  ;; Pass integrity check first, to make it abortable.
+  (SETQ BUFFER-GIVEN NIL) 
+  (SEND (DATA-CHAN-NET-DATA-STREAM OUTPUT-DATA-CHANNEL) ':DISCARD-CURRENT-OUTPUT-BUFFER))
+
+(DEFMETHOD (:NEW-OUTPUT-BUFFER NFILE-OUTPUT-STREAM-MIXIN) ()
+  (WHEN BUFFER-GIVEN
+    (FERROR "I gave you ~S, but yet, you have asked for another output buffer." BUFFER-GIVEN))
+   (MULTIPLE-VALUE-BIND (BUF START END)
+       (SEND SELF ':WRITE-DATA-STREAM ':GET-OUTPUT-BUFFER)	;handles exceptions
+     (VALUES (SETQ BUFFER-GIVEN
+		   (OR BUF (FERROR "Failed to get output buffer.")))
+	     START END)))
+
+(DEFMETHOD (:SEND-OUTPUT-BUFFER NFILE-OUTPUT-STREAM-MIXIN) (BUF END EXPLICIT)
+  (NFILE-STREAM-CHECK-STATE :SEND-OUTPUT-BUFFER)
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I haven't given you any buffer.  Why are you trying to write ~S?" BUF))
+  (UNLESS (EQ BUF BUFFER-GIVEN)
+    (FERROR "I gave you ~S, but you are trying to write ~S?" BUFFER-GIVEN BUF))
+  ;; First make check ok.
+  (SETQ BUFFER-GIVEN NIL)
+  (SEND SELF ':WRITE-DATA-STREAM ':ADVANCE-OUTPUT-BUFFER END)
+  (WHEN EXPLICIT
+    (SEND SELF ':WRITE-DATA-STREAM ':FORCE-OUTPUT))) 
+
+(DEFMETHOD (:READ-DATA-STREAM NFILE-INPUT-STREAM-MIXIN) (MESSAGE &REST ARGS)
+  ;;This interface basically worries about asynchronous marks and retrying.
+  (NFILE-STREAM-CHECK-STATE MESSAGE :OPEN :EOF)		;just in case nobody else got it.
+  (CONDITION-BIND ((NETI:TOKEN-DATA-WAS-LIST
+		     #'(LAMBDA (ERROR) (SEND SELF ':ASYNC-INPUT-ERROR ERROR))))
+    (SEND (DATA-CHAN-NET-STREAM INPUT-DATA-CHANNEL) ':CHECK-INPUT-EXCEPTION)
+    (LEXPR-SEND (DATA-CHAN-NET-DATA-STREAM INPUT-DATA-CHANNEL) MESSAGE ARGS)))
+
+
+(DEFUN-IN-FLAVOR (NFILE-USER-ASYNC-ERROR-COMMON NFILE-DATA-STREAM-MIXIN) (CHANNEL CONDITION)
+  (SETQ STATUS ':ASYNC-MARKED)
+  (NFILE-ERROR-SIGNALLER (DATA-CHAN-ASYNC-ERROR CHANNEL) (SEND SELF ':TRUENAME))
+  ;; If person hits ’, ....
+  (SETF (DATA-CHAN-ASYNC-ERROR CHANNEL) NIL)
+  (SEND SELF ':CONTINUE CHANNEL)		;:CONTINUE will clean up STATE if it wins.
+  (WHEN CONDITION
+    (SEND CONDITION ':PROCEED ':PROCEED)))
+
+;;;F*** this brain damage with defun methods.
+(DEFMETHOD (:ASYNC-ERROR-FROM-CLOSE NFILE-DATA-STREAM-MIXIN) (CHANNEL)
+  (NFILE-USER-ASYNC-ERROR-COMMON CHANNEL NIL))
+
+(DEFMETHOD (:ASYNC-INPUT-ERROR NFILE-INPUT-STREAM-MIXIN) (CONDITION)
+  (LET ((WHAT-I-READ (SEND CONDITION ':LIST)))
+    (UNLESS (EQ (CAR WHAT-I-READ) ':ASYNC-ERROR)
+      (FERROR "Unexpected message in error list on ~S: ~S." SELF WHAT-I-READ))
+    (SETF (DATA-CHAN-ASYNC-ERROR INPUT-DATA-CHANNEL) (CDDR WHAT-I-READ))
+    (NFILE-USER-ASYNC-ERROR-COMMON INPUT-DATA-CHANNEL CONDITION)))
+
+(DEFMETHOD (:WRITE-DATA-STREAM NFILE-OUTPUT-STREAM-MIXIN) (MESSAGE &REST ARGS)
+  ;;This interface basically worries about asynchronous marks and retrying.
+  (NFILE-STREAM-CHECK-STATE MESSAGE :OPEN :EOF)
+  (CONDITION-BIND ((NFILE-USER-OUTPUT-EXCEPTION
+		     #'(LAMBDA (CONDITION)
+			 (WHEN (AND OUTPUT-DATA-CHANNEL
+				    (DATA-CHAN-ASYNC-ERROR OUTPUT-DATA-CHANNEL))
+			   (NFILE-USER-ASYNC-ERROR-COMMON OUTPUT-DATA-CHANNEL CONDITION)))))
+    ;;If it doesn't block, it doesn't check.
+    (SEND (DATA-CHAN-NET-STREAM OUTPUT-DATA-CHANNEL) ':CHECK-OUTPUT-EXCEPTION)
+    (LEXPR-SEND (DATA-CHAN-NET-DATA-STREAM OUTPUT-DATA-CHANNEL) MESSAGE ARGS)))
+
+(DEFMETHOD (:NEXT-INPUT-BUFFER NFILE-INPUT-STREAM-MIXIN) (&OPTIONAL NO-HANG-P)
+  (WHEN BUFFER-GIVEN
+    (FERROR "I gave you ~S, but yet, you have asked for another input buffer." BUFFER-GIVEN))
+  (MULTIPLE-VALUE-BIND (BUF START END)
+      (SEND SELF ':READ-DATA-STREAM ':READ-INPUT-BUFFER NIL NO-HANG-P)
+    (COND (BUF
+	   (SETQ BUFFER-GIVEN BUF)
+	   (VALUES BUF START END))
+	  (NO-HANG-P NIL)
+	  (T
+	   (SETQ STATUS ':EOF)
+	   (VALUES NIL NIL)))))
+
+(DEFMETHOD (:DISCARD-INPUT-BUFFER NFILE-INPUT-STREAM-MIXIN) (BUF)
+  ;; Improperia...
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I gave you no buffer at all, yet now you ask to discard ~S?" BUF))
+  (UNLESS (EQ BUFFER-GIVEN BUF)
+    (FERROR "I gave you buffer ~S, yet now you ask to discard ~S?" BUFFER-GIVEN BUF))
+  (UNLESS INPUT-DATA-CHANNEL
+    (FERROR ":DISCARD-INPUT-BUFFER called, but input-data-channel deallocated."))
+  (SETQ BUFFER-GIVEN NIL)
+  (SEND (DATA-CHAN-NET-DATA-STREAM INPUT-DATA-CHANNEL) ':ADVANCE-INPUT-BUFFER))
+
+
+(DEFGENERIC NEXT-INPUT-BUFFER-LEN (NFILE-BINARY-INPUT-STREAM)
+	    "Length in user-side bytes of next read of binary stream"
+  (:METHOD-COMBINATION :MIN))
+				 
+(DEFMETHOD (NEXT-INPUT-BUFFER-LEN NFILE-WIDE-BINARY-INPUT-MIXIN) ()
+  (ARRAY-LENGTH INPUT-BUFFER))
+
+(DEFMETHOD (NEXT-INPUT-BUFFER-LEN NFILE-DIRECT-INPUT-STREAM-MIXIN) ()
+  SI:REMAINING-REQUESTED-COUNT)
+
+(DEFMETHOD (:NEXT-INPUT-BUFFER NFILE-WIDE-BINARY-INPUT-MIXIN) (&OPTIONAL NO-HANG-P)
+  (NFILE-STREAM-CHECK-STATE :NEXT-INPUT-BUFFER :OPEN :EOF)	;don't array-leader NIL....
+  (WHEN BUFFER-GIVEN
+    (FERROR "I gave you ~S, but yet, you have asked for another input buffer." BUFFER-GIVEN))
+  (LET ((HOW-MANY-8S (SEND SELF ':READ-DATA-STREAM
+			   ':STRING-IN NIL
+			   (ARRAY-LEADER INPUT-BUFFER 1)
+			   0 (* 2 (NEXT-INPUT-BUFFER-LEN SELF)))))
+    (WHEN (ODDP HOW-MANY-8S)
+      (FERROR "Stream ~S was supposed to be reading an even number of bytes, but read ~
+	      an odd number." (DATA-CHAN-NET-DATA-STREAM INPUT-DATA-CHANNEL)))
+    (COND ((PLUSP HOW-MANY-8S)
+	   (VALUES (SETQ BUFFER-GIVEN INPUT-BUFFER) 0 (// HOW-MANY-8S 2)))
+	  (NO-HANG-P NIL)
+	  (T (SETQ STATUS ':EOF)
+	     (VALUES NIL NIL)))))
+
+(DEFMETHOD (:DISCARD-INPUT-BUFFER NFILE-WIDE-BINARY-INPUT-MIXIN) (BUF)
+  ;; Improperia...
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I gave you no buffer at all, yet now you ask to discard ~S?" BUF))
+  (UNLESS (EQ BUFFER-GIVEN BUF)
+    (FERROR "I gave you buffer ~S, yet now you ask to discard ~S?" BUFFER-GIVEN BUF))
+  (SETQ BUFFER-GIVEN NIL))
+
+(DEFMETHOD (:DISCARD-OUTPUT-BUFFER NFILE-WIDE-BINARY-OUTPUT-MIXIN) (BUF)
+  ;; Improperia...
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I gave you no buffer at all, yet now you ask to discard ~S?" BUF))
+  (UNLESS (EQ BUF BUFFER-GIVEN)
+    (FERROR "I gave you buffer ~S, yet now you ask to discard ~S?" BUFFER-GIVEN BUF))
+  (SETQ BUFFER-GIVEN NIL))
+
+(DEFMETHOD (:NEW-OUTPUT-BUFFER NFILE-WIDE-BINARY-OUTPUT-MIXIN) ()
+  (NFILE-STREAM-CHECK-STATE :NEW-OUTPUT-BUFFER)
+  (WHEN BUFFER-GIVEN
+    (FERROR "I gave you ~S, but yet, you have asked for another output buffer." BUFFER-GIVEN))
+  (VALUES (SETQ BUFFER-GIVEN OUTPUT-BUFFER)
+	  0
+	  (ARRAY-LENGTH OUTPUT-BUFFER)))
+
+
+(DEFMETHOD (:SEND-OUTPUT-BUFFER NFILE-WIDE-BINARY-OUTPUT-MIXIN) (BUF END EXPLICIT)
+  (NFILE-STREAM-CHECK-STATE :SEND-OUTPUT-BUFFER)
+  (UNLESS BUFFER-GIVEN
+    (FERROR "I haven't given you any buffer.  Why are you trying to write ~S?" BUF))
+  (UNLESS (EQ BUF BUFFER-GIVEN)
+    (FERROR "I gave you ~S, but you are trying to write ~S?" BUFFER-GIVEN BUF))
+  (SETQ BUFFER-GIVEN NIL)
+  (SEND SELF ':WRITE-DATA-STREAM
+	':STRING-OUT (ARRAY-LEADER OUTPUT-BUFFER 1) 0 (* 2 END))
+  (WHEN EXPLICIT
+    (SEND SELF ':WRITE-DATA-STREAM ':FORCE-OUTPUT)))
+
+(COMPILE-FLAVOR-METHODS NFILE-INPUT-CHARACTER-STREAM NFILE-INPUT-BINARY-STREAM
+			NFILE-OUTPUT-CHARACTER-STREAM NFILE-OUTPUT-BINARY-STREAM
+			NFILE-PROBE-STREAM
+			NFILE-INPUT-DIRECT-CHARACTER-STREAM
+			NFILE-OUTPUT-DIRECT-CHARACTER-STREAM
+			NFILE-INPUT-DIRECT-BINARY-STREAM
+			NFILE-OUTPUT-DIRECT-BINARY-STREAM
+			NFILE-BIDIRECTIONAL-DIRECT-CHARACTER-STREAM
+			NFILE-BIDIRECTIONAL-DIRECT-BINARY-STREAM
+			NFILE-INPUT-WIDE-BINARY-STREAM
+			NFILE-OUTPUT-WIDE-BINARY-STREAM)
+
+
+(DEFMETHOD (:SCAVENGE NFILE-ACCESS-PATH) ()
+  (LET ((TIMEOUT (SEND SELF ':SEND-IF-HANDLES ':CONTROL-CONNECTION-LIFETIME))
+	(HOST-ACTIVE-P NIL))
+    (LOOP FOR SERVER-UNIT IN SERVER-UNITS
+	  WHEN (SEND SERVER-UNIT ':SCAVENGE TIMEOUT)
+	  DO (SETQ HOST-ACTIVE-P T))
+    HOST-ACTIVE-P))
+
+(DEFMETHOD (:SCAVENGE NFILE-SERVER-UNIT) (TIMEOUT &AUX HOST-ACTIVE-P)
+  (LOCK-NSERVER-UNIT-SELF
+    (COND ((NOT (SEND SELF ':TEST-CONTROL-STREAM)))
+	  (T
+	   (LOOP WITH TIME = (TIME)
+		 WITH KILL-SERVER-UNIT = T
+		 WITH FIRST = T
+		 WITH RESYNC-DATA-CHANNELS = NIL
+		 WITH KILL-DATA-CHANNELS = NIL
+		 FOR DATA-CHANNEL IN DATA-CHANNELS
+		 AS L = (IF FIRST *FILE-DATA-LIFE* *FILE-ADDITIONAL-DATA-LIFE*)
+		 WHEN  (EQ (DATA-CHAN-DIRECTION DATA-CHANNEL) ':INPUT)	;do only input halves
+		   DO (LET ((SIB (DATA-CHAN-SIBLING DATA-CHANNEL)))
+			(COND
+			  ((AND (NULL (DATA-CHAN-FILE-STREAM DATA-CHANNEL))
+				(NULL (DATA-CHAN-FILE-STREAM SIB))
+				(> (TIME-DIFFERENCE TIME (DATA-CHAN-TIME DATA-CHANNEL)) L)
+				(> (TIME-DIFFERENCE TIME (DATA-CHAN-TIME SIB)) L))
+			   (SETQ FIRST NIL)
+			   (PUSH DATA-CHANNEL KILL-DATA-CHANNELS))
+			  (T (SETQ HOST-ACTIVE-P T)
+			     (WHEN (AND (NOT (DATA-CHAN-FILE-STREAM DATA-CHANNEL))
+					(DATA-CHAN-UNSAFE DATA-CHANNEL))
+			       (PUSH DATA-CHANNEL RESYNC-DATA-CHANNELS))
+			     (WHEN (AND (NOT (DATA-CHAN-FILE-STREAM SIB))
+					(DATA-CHAN-UNSAFE SIB))
+			       (PUSH SIB RESYNC-DATA-CHANNELS)))))
+		 FINALLY
+		   (WHEN (OR HOST-ACTIVE-P
+			     ( (TIME-DIFFERENCE TIME CONTROL-STREAM-TOUCHED) TIMEOUT))
+		     (SETQ HOST-ACTIVE-P T KILL-SERVER-UNIT NIL))
+		   (WHEN (OR KILL-DATA-CHANNELS RESYNC-DATA-CHANNELS KILL-SERVER-UNIT)
+		     (SCAVENGE-NFILE-CONNECTIONS
+		       SELF RESYNC-DATA-CHANNELS KILL-DATA-CHANNELS KILL-SERVER-UNIT))))))
+  HOST-ACTIVE-P)
+
+;; This needs to run in a real process because is has to PROCESS-WAIT.
+(DEFUN SCAVENGE-NFILE-CONNECTIONS (SERVER-UNIT RESYNC-DATA-CHANNELS
+				   KILL-DATA-CHANNELS KILL-SERVER-UNIT)
+  ;; Do data channels first, so blowing out there gets ignored if gonna kill
+  ;;whole server unit.
+  (LOOP FOR DATA-CHANNEL IN KILL-DATA-CHANNELS
+	DO (IGNORE-ERRORS			;nobody cares.
+						; Ther might have been a race in determining freeness..
+	     (WHEN
+	       (AND (NULL (DATA-CHAN-FILE-STREAM DATA-CHANNEL))
+		    (NULL (DATA-CHAN-FILE-STREAM (DATA-CHAN-SIBLING DATA-CHANNEL))))
+	       (SEND SERVER-UNIT ':CLOSE-DATA-CONNECTION DATA-CHANNEL))))
+  (LOOP FOR DATA-CHANNEL IN RESYNC-DATA-CHANNELS
+	DO (IGNORE-ERRORS			;nobody cares, if it blows, somebody will do better.
+	     (WHEN (NULL (DATA-CHAN-FILE-STREAM DATA-CHANNEL))
+	       (SEND SERVER-UNIT ':RESYNCHRONIZE-DATA-CHANNEL DATA-CHANNEL))))
+  (WHEN KILL-SERVER-UNIT
+    (IGNORE-ERRORS
+      (SEND SERVER-UNIT ':RESET T "NFILE Connection Scavenge"))))
+
+(DEFUN NFILE-USER-INIT ()
+  (INITIALIZE-NFILE-RESPONSE-READER))
+
+(FLAVOR:NOTICE-RUN-TIME-METHOD '(FLAVOR:METHOD :PEEK-FILE-SYSTEM NFILE-ACCESS-PATH))
+
+(COMPILE-FLAVOR-METHODS NFILE-ACCESS-PATH LMFS-NFILE-ACCESS-PATH
+			NFILE-SERVER-UNIT)
+
+(ADD-INITIALIZATION "NFILE-USER-INIT" '(NFILE-USER-INIT) '(SYSTEM))

@@ -1,0 +1,346 @@
+;;;-*- Syntax: Ansi-Common-Lisp; Base: 10; Mode: lisp; Package: http -*-
+
+;;; (C) Copyright 1996-97, Christopher R. Vincent
+;;;     All Rights Reserved.
+;;; (C) Enhancements 1998, John C. Mallery
+;;;
+;;;------------------------------------------------------------------- 
+;;;
+;;; CL-HTTP PROXY SERVER
+;;;
+
+
+(in-package :http)
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; CACHE SUBSTRATE
+;;;
+
+(defclass cache ()
+  ((name :initarg :name :accessor cache-name)
+   (description :initarg :description :accessor cache-description)
+   (database :initarg :database :accessor cache-database)
+   (max-size :initarg :max-size :accessor cache-max-size))
+  (:documentation "Basic cache."))
+
+(defmethod print-object ((cache cache) stream)
+  (with-slots (name) cache
+    (print-unreadable-object (cache stream :type t :identity t)
+      (when (slot-boundp cache 'name)
+        (write-string (string name) stream)))))
+
+(defclass cache-object ()
+  ((cache :initarg :cache :accessor cache-object-cache)
+   (creation-date :initarg :creation-date :accessor cache-object-creation-date)
+   (size :initform 0 :initarg :size :accessor cache-object-size))
+  (:documentation "Basic cache object."))
+
+(defgeneric remove-cache-object (cache-object cache)
+  (:documentation "Remove an object from a cache."))
+
+(defgeneric map-cache (function cache)
+  (:documentation "Call FUNCTION on all the cache-objects in CACHE."))
+
+(defgeneric cache-size (cache)
+  (:documentation "Returns the total size of a cache."))
+
+; Specialize this for efficiency.
+(defmethod cache-size ((cache cache) &aux (total 0))
+  (flet ((accum (object)
+           (incf total (cache-object-size object))))
+    (map-cache cache #'accum)
+    total))
+
+(defgeneric clear-cache (cache)
+  (:documentation "Remove all objects from a cache."))
+
+(defmethod clear-cache ((cache cache))
+  (map-cache cache #'remove-cache-object))
+
+(defgeneric expunge-cache (cache space)
+  (:documentation "Clear SPACE bytes of data from the cache."))
+
+; Specialize this for more intelligent replacement.
+(defmethod expunge-cache ((cache cache) (space integer) &aux (removed nil))
+  (flet ((do-it (cache-object)
+           (decf space (cache-object-size cache-object))
+           (remove-cache-object cache-object cache)
+           (push cache-object removed)
+           (if (<= space 0)
+             (return-from expunge-cache removed))))
+    (declare (inline do-it))
+    (map-cache cache #'do-it)
+    removed))
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; HTTP CACHE
+;;;
+
+(defclass http-cache (cache)
+  ((resource-table :initarg :resource-table :accessor cache-resource-table)
+   (resource-table-lock :initarg :resource-table-lock :accessor cache-resource-table-lock))
+  (:documentation "HTTP resource cache."))
+
+(defun make-http-cache (name &key database description (max-size 10240))
+  "Create an instance of an HTTP cache."
+  (let ((cache (make-instance 'http-cache
+                 :name name 
+                 :database (or database (make-http-cache-database))
+                 :max-size max-size
+                 :description (or description "An HTTP resource cache.")
+                 :resource-table (make-hash-table :test #'equalp)
+                 :resource-table-lock (make-lock "Cache Resource Table"))))
+    cache))
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; RESOURCES
+;;;
+
+(defclass cached-resource (cache-object)
+  ((uri-string :initarg :uri-string :accessor cached-resource-uri-string)
+   (representations  :initform nil :initarg :representations :accessor cached-resource-representations)
+   (vary :initform nil :initarg :vary :accessor cached-resource-vary))
+  (:documentation "A cached HTTP resource."))
+
+(defmethod print-object ((cached-resource cached-resource) stream)
+  (with-slots (uri-string) cached-resource
+    (print-unreadable-object (cached-resource stream :type t :identity t)
+      (when (slot-boundp cached-resource 'uri-string)
+        (write-string uri-string stream)))))
+
+(defun make-cached-resource (cache uri)
+  "Create an instance of a cached-resource."
+  (make-instance 'cached-resource
+    :cache cache
+    :uri-string uri))
+
+(defun %get-cached-resource (uri cache)
+  "Retrieve a cached resource from its uri-string."
+  (check-type uri string)
+  (with-lock-held ((cache-resource-table-lock cache) :read)
+    (gethash uri (cache-resource-table cache))))
+
+(defun intern-cached-resource (resource cache &key (if-does-not-exist :error))
+  "Intern a uri as a cached HTTP resource."
+  (declare (values cached-resource newly-interned-p))
+  (flet ((intern-uri (uri)
+           (or (%get-cached-resource uri cache)
+	       (ecase if-does-not-exist
+		 (:soft nil)
+		 (:create
+		   (let ((object (make-cached-resource cache uri)))
+		     (with-lock-held ((cache-resource-table-lock cache) :write)
+		       (gethash uri (cache-resource-table cache)) object)
+		     (setf (cache-object-creation-date object) (get-universal-time))
+		     (values object t)))
+		 (:error (error "~S is not a cached HTTP resource." uri))))))
+    (declare (inline intern-uri))
+    (etypecase resource
+      (string (intern-uri resource))
+      (url (intern-uri (coerce-url-string resource)))
+      (cached-resource resource))))
+
+(defmethod unintern-cached-resource ((resource cached-resource))
+  "Unintern a cached resource."
+  (let* ((cache (cache-object-cache resource))
+         (cache-table (cache-resource-table cache)))
+    (with-lock-held ((cache-resource-table-lock cache) :write)
+      (remhash (cached-resource-uri-string resource) cache-table))))
+
+(defmethod remove-cache-object ((cache-object cached-resource) (cache http-cache))
+  (loop for rep in (cached-resource-representations cache-object)
+        doing (unintern-cached-representation rep))
+  (unintern-cached-resource cache-object))
+
+(defmethod cached-resource-size (resource)
+  "Total size, including all the representations."
+  (+ (cache-object-size resource)
+     (loop for rep in (cached-resource-representations resource)
+           sum (cache-object-size rep))))
+
+(defun map-cached-resources (function cache)
+  "FUNCTION accepts two args, URI-string and resource."
+  (with-lock-held ((cache-resource-table-lock cache) :read)
+    (maphash function (cache-resource-table cache))))
+
+(defun cached-resources-count (cache)
+  "Returns the number of HTTP resources in a cache."
+  (with-lock-held ((cache-resource-table-lock cache) :read)
+    (hash-table-count (cache-resource-table cache))))
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; REPRESENTATIONS
+;;;
+
+(defclass cached-representation (cache-object)
+  ((identifier :initarg :identifier :accessor cached-representation-identifier)
+   (resource :initarg :resource :accessor cached-representation-resource)
+   (entity :initarg :entity :accessor cached-representation-entity)
+   (creation-date :initarg :creation-date :accessor cached-representation-creation-date)
+   (verified-date :initform nil :initarg :modified-date :accessor cached-representation-verified-date)
+   (request-headers :initform nil :initarg :request-headers :accessor cached-representation-request-headers)
+   (response-headers :initform nil :initarg :response-headers :accessor cached-representation-response-headers))
+  (:documentation "A cached representations of an HTTP resource."))
+
+(defmethod print-object ((cached-representation cached-representation) stream)
+  (print-unreadable-object (cached-representation stream :type t :identity t)
+    (when (slot-boundp cached-representation 'resource)
+      (with-slots (uri-string) (cached-representation-resource cached-representation)
+        (write-string uri-string stream)))))
+
+(defun make-cached-representation (resource)
+  "Create an instance of a resource representation."
+  (make-instance 'cached-representation
+    :cache (cache-object-cache resource)
+    :resource resource))
+
+(defparameter *representation-identifier-counter* 1000
+  "Used for generating cached-representation identifiers.")
+
+
+(defun make-representation-identifier (representation)
+  "Generate a unique identifier that can be used to refer to a resource representation."
+  (declare (ignore representation))
+  (atomic-incf *representation-identifier-counter* 1))
+
+(defmethod clear-cache ((cache http-cache))
+  (flet ((%clear-resource (uri res)
+           (declare (ignore uri))
+           (remove-cache-object res cache)))
+    (map-cached-resources #'%clear-resource cache)))
+
+(defun variant-matches-request-p (vary variant header-alist)
+  "Determine if request headers satisfy the vary requirements for a variant."
+  (flet ((header-values-equal (a b)
+           (equal a b)))
+    (declare (inline header-values-equal)) 
+    (loop for field in vary
+          with variant-request = (cached-representation-request-headers variant)
+          unless (header-values-equal (get-header field header-alist)
+                                      (get-header field variant-request))
+          return nil
+          finally (return t))))
+
+(defgeneric intern-cached-representation (resource header-alist &key if-does-not-exist)
+  (declare (values cached-representation newly-created-p))
+  (:documentation "Intern a cached HTTP representation of a resource from the resource and request headers"))
+
+(defmethod intern-cached-representation ((resource cached-resource) header-alist &key (if-does-not-exist :error))
+  (flet ((%get-cached-representation (resource header-alist)
+	   "Find a representation of resource that is the same variant implied by request headers in header-alist"
+	   (let ((representations (cached-resource-representations resource)))
+	     (when representations
+	       (let ((vary (cached-resource-vary resource)))
+		 (cond ((eq vary :*) nil)
+		       (vary
+			(loop for variant in representations
+			      when (variant-matches-request-p vary variant header-alist)
+				return variant))      
+		       (t (car representations))))))))
+    (declare (inline %get-cached-representation))
+    (or (%get-cached-representation resource header-alist)
+	(ecase if-does-not-exist
+	  (:soft nil)
+	  (:create
+	    (let* ((cache (cache-object-cache resource))
+		   (database (cache-database cache))
+		   (object (make-cached-representation resource))
+		   (now (get-universal-time)))
+	      (setf (cached-representation-identifier object) (make-representation-identifier object)
+		    (cached-representation-creation-date object) now
+		    (cached-representation-request-headers object) header-alist
+		    (cached-representation-entity object) (make-http-cache-database-identifier database))
+	      (push object (cached-resource-representations resource))
+	      (values object t)))
+	  (:error (error (format nil "There is no matching representation cached for ~S." 
+				 (cached-resource-uri-string resource))))))))
+
+(defun get-cached-representation (resource identifier &optional (errorp t))
+  "Find a representation using its unique identifier, use for documentation, gc, etc."
+  (check-type resource cached-resource)
+  (let ((match (loop for variant in (cached-resource-representations resource)
+                     when (equal identifier (cached-representation-identifier variant))
+                     return variant)))
+    (unless (or match (not errorp))
+      (error (format nil "There is no matching representation cached for ~S."
+                     (cached-resource-uri-string resource))))
+    match))
+  
+(defun unintern-cached-representation (representation)
+  "Unintern a representation of a cached resource."
+  (check-type representation cached-representation)
+  (let ((resource (cached-representation-resource representation)))
+    (remove-database-object (cached-representation-entity representation))
+    (setf (cached-resource-representations resource)
+          (remove representation (cached-resource-representations resource) :test #'eq))))
+
+(defmethod remove-cache-object ((cache-object cached-representation) (cache http-cache))
+  (unintern-cached-representation cache-object))
+
+(defmethod map-cache ((cache http-cache) (function function))
+  (flet ((do-it (uri res)
+           (declare (ignore uri))
+           (loop for rep in (cached-resource-representations res)
+                 doing (funcall function rep))
+           (funcall function res)))
+    (declare (inline do-it))
+    (map-cached-resources #'do-it cache)))
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; OPERATIONS ON REPRESENTATIONS
+;;;
+
+(defun representation-age (representation &optional (now (get-universal-time)))
+  "return the current age of a cached representation"
+  (- now (cached-representation-verified-date representation)))
+
+;;maybe return negative for remaining fresh?
+(defun representation-expired (representation &optional (now (get-universal-time)))
+  "if expired returns staleness in seconds, otherwise nil"
+  (with-header-values (expires) (cached-representation-response-headers representation)
+    (when (and expires (>= now expires))
+      (- now expires))))
+
+;; figure out what happens when there is no expires
+(defun representation-freshness-lifetime (representation)
+  "return the freshness lifetime of a cached representation."
+  (with-header-values (expires) (cached-representation-response-headers representation)
+    (when expires
+      (- expires (cached-representation-verified-date representation)))))
+
+(defmacro with-open-representation ((stream representation direction) &body body)
+  "Execute BODY with STREAM bound to a stream into REPRESENTATION.
+DIRECTION is either :INPUT or :OUTPUT and is evaluated at compile time."
+  `(let ((identifier (cached-representation-entity ,representation)))
+     ,(ecase direction
+	(:output
+	  `(progn 
+	     (setf (cache-object-size ,representation) 0)
+	     (multiple-value-prog1
+	       (with-open-resource (,stream identifier :output)
+		 ,@body)
+	       (setf (cache-object-size ,representation) (database-object-size identifier)))))
+	(:input
+	  `(with-open-resource (,stream identifier :input)
+	     ,@body)))))
+
+(defmacro with-input-from-representation-entity ((stream representation) &body body)
+  "Execute BODY with STREAM bound to an input stream from a representation's entity."
+  `(let ((identifier (cached-representation-entity ,representation)))
+     (with-open-resource (,stream identifier :input)
+       ,@body)))
+
+(defun write-representation-entity (representation output-stream)
+  "write a representation of a resource to a stream"
+  (with-open-representation (data-stream representation :input)
+    (stream-copy-until-eof data-stream output-stream :binary)))
+
+(defun write-representation-entity-byte-range (representation output-stream start end)
+  "write a representation of a resource to a stream"
+  (with-open-representation (data-stream representation :input)
+    (stream-copy-byte-range data-stream output-stream start end)))

@@ -1,0 +1,3274 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: DW; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; A standard way of doing things; can also be used by Zwei and Zmail
+;;; until they can be converted entirely (if ever).
+(defflavor dynamic-mouse-mixin
+	((mouse-motion-pending nil)
+	 (mouse-x-position 0)
+	 (mouse-y-position 0)
+
+	 (who-line-documentation-string nil)
+	 (who-line-more-documentation-string nil)
+	 (who-line-documentation-last-shifts nil)
+	 highlighting-blinker
+	 (last-highlighted-presentation nil)
+	 (last-context-tick -1)
+
+	 (documentation-blanking-pending-timeout nil)
+	 (documentation-blanking-pending-timeout-time nil)
+
+	 (mouse-blinker-type :default)
+	 (mouse-blinker-character #\mouse:nw-arrow)
+
+	 (documentation-string-buffer-1 nil)
+	 (documentation-string-buffer-2 nil)
+
+	 (last-special-stable-context nil)
+	 (last-stable-visibility nil)
+	 (update-documentation-timer nil)
+	 )
+	()
+  (:required-flavors tv:essential-mouse)
+  (:required-methods :displayed-presentation-at-position)
+  (:settable-instance-variables mouse-x-position mouse-y-position
+				who-line-documentation-last-shifts highlighting-blinker
+				last-highlighted-presentation last-context-tick
+				mouse-blinker-type mouse-blinker-character))
+
+(defmethod (time-to-update-mouse-doc dynamic-mouse-mixin) ()
+  (let ((proc (let ((sw (sys:console-selected-window (tv:sheet-console self))))
+		(and sw (send-if-handles sw :process)))))
+    (when proc (process:process-wakeup proc))))
+
+(defmethod (:init dynamic-mouse-mixin :after) (ignore)
+  (setq highlighting-blinker (tv:make-blinker self 'tv:boxes-blinker :visibility nil))
+  (setf update-documentation-timer
+	(process:create-timer-call
+	  #'dw::time-to-update-mouse-doc (list self)
+	  :name (with-output-to-string (s)
+		  (format s "Update Mouse Documentation For ~S" (tv:sheet-name self))))))
+
+(defmethod (:still-the-mouse-window tv:essential-mouse) ()
+  (tv:sheet-is-mouse-window-p self))
+
+(defmethod (:clear-mouse-motion dynamic-mouse-mixin) ()
+  (setq mouse-motion-pending nil))
+
+;;; Although this doesn't look like it needs to be a separate function,
+;;; it really helps for debugging to have all state transitions funnel 
+;;; through a single place.
+(defun mouse-tracking-state-transition (mouse new-state)
+  #+|This is sure useful for making the state visible during debugging|
+  (let ((new-run-light-size
+	  (ecase new-state
+	    (:typing 2)				;tiny = hardly pays attention to mouse
+	    (:sluggish 14)			;medium = sluggish
+	    (:rapid 31))))			;big = very responsive
+    (sys:%p-store-contents (- tv:who-line-run-light-loc 6)
+			   (ldb (byte new-run-light-size 0) -1)))
+  (setf (tv:mouse-tracking-state mouse) new-state))
+
+(defmethod (:mouse-motion-pending dynamic-mouse-mixin) ()
+  (cond (mouse-motion-pending t)
+	((not (send self :still-the-mouse-window))
+	 ;;Ignore shift changes if not the mouse window
+	 nil)
+	(T
+	 (check-mouse-tracking-state-transition (tv:sheet-mouse self)
+						 who-line-documentation-last-shifts))))
+
+(defun check-mouse-tracking-state-transition (mouse who-line-documentation-last-shifts)
+  (macrolet ((time< (time timeout)	;Arguments are in 60ths
+	       `( (- ,time ,timeout)	;Allow for timers possibly going off early
+		   (- (%fixnum-floor process:*timer-resolution* 16384))))
+	     (time> (time timeout)	;Arguments are in 60ths
+	       `( (- ,time ,timeout)	;Allow for timers possibly going off early
+		   (- (%fixnum-floor process:*timer-resolution* 16384)))))
+    ;; Logic:
+    
+    ;; mouse motion always puts us in state :RAPID
+    ;; keys always put us into state :TYPING
+    
+    ;; if state is :SLUGGISH, then if a shift is pressed go into this special
+    ;; wait state.  If a key is pressed before this timeout times out, then go
+    ;; into state :TYPING
+    ;; otherwise timeout into :RAPID.
+    
+    ;; if state is :TYPING,
+    ;; then if shifts pressed, nothing happens
+    ;; D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")Holding a shift for a while will timeout into :RAPID --RLB
+0    ;; if shifts released, timeout after some time into state :SLUGGISH.
+    
+    ;; if state is :RAPID, shifts keep us in :RAPID
+    ;; no shifts times out into :SLUGGISH.
+    
+    (let* ((shifts (tv:mouse-chord-shifts mouse))
+	   (time (sys:time))
+	   (time-since-mouse (time-difference time (tv:mouse-last-real-motion-time mouse)))
+	   (time-since-kbd (time-difference time (console-last-activity-time
+						   (tv:mouse-console mouse))))
+	   (time-since-shift (time-difference time (tv:mouse-last-shift-time mouse)))
+	   (most-recent
+	     (if (< time-since-mouse time-since-kbd)
+		 ;; kbd is out of it
+		 (if (< time-since-mouse time-since-shift)
+			:mouse :shift)
+		 ;; mouse is out of it
+		 (if (< time-since-kbd time-since-shift)
+		     :kbd :shift))))
+      (when (not (eql shifts (tv:mouse-tracking-state-last-shifts mouse)))
+	(setf (tv:mouse-last-shift-time mouse) time)
+	(setq time-since-shift 0)
+	(setf (tv:mouse-tracking-state-last-shifts mouse) shifts))
+      (ecase (tv:mouse-tracking-state mouse)
+	(:sluggish
+	  (cond ((eql most-recent :mouse)
+		 ;; If the mouse was the most recent, switch to rapid,
+		 ;; unless the mouse was moved so long ago that that state
+		 ;; will immediately come back to sluggish.
+		 (unless (time> time-since-mouse *rapid-to-sluggish-timeout*)
+		   (mouse-tracking-state-transition mouse :rapid)
+		   T))
+		((eql shifts 0)
+		 (cond ((eql shifts who-line-documentation-last-shifts)
+			;; no shifts were pressed and nothing's changed
+			(when (time< time-since-kbd *typing-to-sluggish-timeout*)
+			  (mouse-tracking-state-transition mouse :typing))
+			nil)
+		       (T
+			;; I don't think this can happen.  But, correct the mouse doc if so.
+			T)))
+		((time> (min time-since-shift time-since-kbd)
+			*sluggish-to-rapid-timeout*)
+		 ;; Some shifts have been held down long enough.
+		 (mouse-tracking-state-transition mouse :rapid)
+		 T)
+		((time< time-since-kbd *typing-to-sluggish-timeout*)
+		 ;; There was typing: switch to :typing state.  Except, if that
+		 ;; typing was so long ago that :typing already switched to :sluggish.
+		 (mouse-tracking-state-transition mouse :typing)
+		 nil)
+		(T
+		 nil)))
+	(:rapid
+	  (ecase most-recent
+	    (:kbd
+	      (cond ((time< time-since-kbd *typing-to-sluggish-timeout*)
+		     ;; There was recent typing.
+		     (mouse-tracking-state-transition mouse :typing)
+		     (not (eql shifts who-line-documentation-last-shifts)))
+		    (T
+		     ;; The typing is stale, see whether to update mouse doc
+		     (not (eql shifts who-line-documentation-last-shifts)))))
+	    (:mouse
+	      (when (time> time-since-mouse *rapid-to-sluggish-timeout*)
+		;; The most recent was mouse, and even that is stale.
+		(mouse-tracking-state-transition mouse :sluggish)
+		(not (eql shifts who-line-documentation-last-shifts))))
+	    (:shift
+	      (cond ((not (zerop shifts))
+		     ;; Shifts down, and mouse doc is wrong.
+		     (not (eql shifts who-line-documentation-last-shifts)))
+		    ((time> time-since-shift *rapid-to-sluggish-timeout*)
+		     ;; All shifts up
+		     (mouse-tracking-state-transition mouse :sluggish)
+		     (not (eql shifts who-line-documentation-last-shifts)))
+		    (T (not (eql shifts who-line-documentation-last-shifts)))))))
+	(:typing
+	  (ecase most-recent
+	    (:mouse
+	      (mouse-tracking-state-transition mouse :rapid)
+	      T)
+	    ((:kbd :shift)
+	     (cond ((zerop shifts)
+		    (cond ((time> (min time-since-shift time-since-kbd)
+				  *typing-to-sluggish-timeout*)
+			   (mouse-tracking-state-transition mouse :sluggish)
+			   (not (eql shifts who-line-documentation-last-shifts)))
+			  (T nil ;(not (eql shifts who-line-documentation-last-shifts))
+			     )))
+		   ((time> (min time-since-shift time-since-kbd)
+			   *rapid-to-sluggish-timeout*)
+		    (mouse-tracking-state-transition mouse :rapid)
+		    T)
+		   (T nil)))))))))
+
+;;; These are actually per-mouse.  The special variables just hold the main-mouse version.
+(defvar *last-real-mouse-motion-time* 0)
+(defvar *last-shift-time* 0)
+(defvar *mouse-tracking-state* :sluggish)
+(defvar *mouse-tracking-state-last-shifts* 0)
+
+(defmethod (:mouse-moves dynamic-mouse-mixin) (x y)
+  (tv:mouse-set-blinker-cursorpos self)
+  (multiple-value-setq (x y)
+    (send self :convert-to-inside-coordinates x y))
+  (let ((mouse-motion-was-pending mouse-motion-pending)
+	(really-moved-p (not (and (= x mouse-x-position)
+				  (= y mouse-y-position)))))
+    (when really-moved-p
+      tv:(setf (mouse-last-real-motion-time (sheet-mouse self)) (time)))
+    (without-interrupts
+      (setq mouse-x-position x
+	    mouse-y-position y
+	    mouse-motion-pending t))
+    (when really-moved-p
+      (let ((proc (let ((sw (sys:console-selected-window (tv:sheet-console self))))
+		    (and sw (send-if-handles sw :process)))))
+	;; making sure that all :process's of windows have been converted is hard,
+	;; we only have to do this the first time, but it isn't too expensive, so let's
+	;; play safe until we have a cold-bootable new-scheduler world.
+	(when proc
+	  (process:process-wakeup proc))))
+    (unless mouse-motion-was-pending
+      (send self :update-blinker-motion-pending really-moved-p))))
+
+(defmethod (:change-of-shift-keys dynamic-mouse-mixin) (mouse shifts)
+  ;; Logic:
+    
+  ;; mouse motion always puts us in state :RAPID
+  ;; keys always put us into state :TYPING
+  
+  ;; if state is :SLUGGISH, then if a shift is pressed go into this special
+  ;; wait state.  If a key is pressed before this timeout times out, then go
+  ;; into state :TYPING
+  ;; otherwise timeout into :RAPID.
+  
+  ;; if state is :TYPING,
+  ;; then if shifts pressed, nothing happens
+  ;; 1Holding a shift for a while will timeout into :RAPID --RLB
+0  ;; if shifts released, timeout after some time into state :SLUGGISH.
+  
+  ;; if state is :RAPID, shifts keep us in :RAPID
+  ;; no shifts times out into :SLUGGISH.
+  
+  (let* ((time (sys:time))
+	 (time-since-mouse (time-difference time (tv:mouse-last-real-motion-time mouse)))
+	 (time-since-kbd (time-difference time (console-last-activity-time
+						 (tv:mouse-console mouse))))
+	 (time-since-shift (time-difference time (tv:mouse-last-shift-time mouse)))
+	 (next-timeout nil)		;nil or number of 60ths
+	 (most-recent
+	   (if (< time-since-mouse time-since-kbd)
+	       ;; kbd is out of it
+	       (if (< time-since-mouse time-since-shift)
+		   :mouse :shift)
+	       ;; mouse is out of it
+	       (if (< time-since-kbd time-since-shift)
+		   :kbd :shift))))
+    (when (not (eql shifts (tv:mouse-tracking-state-last-shifts mouse)))
+      (setf (tv:mouse-last-shift-time mouse) time)
+      (setq time-since-shift 0)
+      (setf (tv:mouse-tracking-state-last-shifts mouse) shifts))
+    (case
+      (ecase (tv:mouse-tracking-state mouse)
+	(:sluggish
+	  (cond ((eql most-recent :mouse)
+		 ;; If the mouse was the most recent, switch to rapid,
+		 ;; unless the mouse was moved so long ago that that state
+		 ;; will immediately come back to sluggish.
+		 (unless (> time-since-mouse *rapid-to-sluggish-timeout*)
+		   (mouse-tracking-state-transition mouse :rapid))
+		 :wakeup)
+		((eql shifts 0)
+		 (cond ((eql shifts who-line-documentation-last-shifts)
+			;; no shifts were pressed and nothing's changed
+			(when (< time-since-kbd *typing-to-sluggish-timeout*)
+			  (mouse-tracking-state-transition mouse :typing))
+			nil)
+		       (T
+			;; I don't think this can happen.  But, correct the mouse doc if so.
+			:wakeup)))
+		(( (min time-since-shift time-since-kbd)
+		    *sluggish-to-rapid-timeout*)
+		 ;; Some shifts have been held down long enough.
+		 (mouse-tracking-state-transition mouse :rapid)
+		 :wakeup)
+		((< time-since-kbd *typing-to-sluggish-timeout*)
+		 ;; There was typing: switch to :typing state.  Except, if that
+		 ;; typing was so long ago that :typing already switched to :sluggish.
+		 (mouse-tracking-state-transition mouse :typing)
+		 (setq next-timeout (- *typing-to-sluggish-timeout* time-since-kbd))
+		 :timer)
+		((and (eql most-recent :shift) (zerop time-since-shift))
+		 (mouse-tracking-state-transition mouse :rapid)
+		 :wakeup)
+		((or (eql most-recent :shift)
+		     (< time-since-shift *typing-to-sluggish-timeout*))
+		 (setq next-timeout (- *typing-to-sluggish-timeout* time-since-shift))
+		 :timer)
+		(t
+		 ;; the magic 2 seconds is to make sure that sys:time has flipped appropriately.
+		 (setq next-timeout (* 2 60))
+		 :timer)))
+	(:rapid
+	  (ecase most-recent
+	    (:kbd
+	      (cond ((< time-since-kbd *typing-to-sluggish-timeout*)
+		     ;; There was recent typing.
+		     (mouse-tracking-state-transition mouse :typing)
+		     (if (not (eql shifts who-line-documentation-last-shifts))
+			 :wakeup
+			 nil))
+		    (T
+		     ;; The typing is stale, see whether to update mouse doc
+		     (if (not (eql shifts who-line-documentation-last-shifts))
+			 :wakeup
+			 nil))))
+	    (:mouse
+	      (when (> time-since-mouse *rapid-to-sluggish-timeout*)
+		;; The most recent was mouse, and even that is stale.
+		(mouse-tracking-state-transition mouse :sluggish))
+	      (if (not (eql shifts who-line-documentation-last-shifts))
+		  (progn 
+		    (setq next-timeout (- *rapid-to-sluggish-timeout* time-since-mouse))
+		    :timer)
+		  nil))
+	    (:shift
+	      (cond ((not (zerop shifts))
+		     ;; Shifts down, and mouse doc is wrong.
+		     (if (not (eql shifts who-line-documentation-last-shifts))
+			 :wakeup
+			 nil))
+		    ((> time-since-shift *rapid-to-sluggish-timeout*)
+		     ;; All shifts up
+		     (mouse-tracking-state-transition mouse :sluggish)
+		     (not (eql shifts who-line-documentation-last-shifts)))
+		    (T (not (eql shifts who-line-documentation-last-shifts)))))))
+	(:typing
+	  (ecase most-recent
+	    (:mouse
+	      (mouse-tracking-state-transition mouse :rapid)
+	      :wakeup)
+	    ((:kbd :shift)
+	     (cond ((zerop shifts)
+		    (cond ((> (min time-since-shift time-since-kbd)
+			      *typing-to-sluggish-timeout*)
+			   (mouse-tracking-state-transition mouse :sluggish)
+			   (when (not (eql shifts who-line-documentation-last-shifts))
+			    :wakeup))
+			  (T nil      ;(not (eql shifts who-line-documentation-last-shifts))
+			     )))
+		   ((> (min time-since-shift time-since-kbd)
+		       *rapid-to-sluggish-timeout*)
+		    (mouse-tracking-state-transition mouse :rapid)
+		    T)
+		   (T
+		    (setq next-timeout (- *rapid-to-sluggish-timeout*
+					  (min time-since-shift time-since-kbd)))
+		    :timer))))))
+      ((t :wakeup)
+       (when (and (not tv:cold-load-stream-selected)
+		  (not dbg:*debugger-might-have-system-problems*))
+	 (process:clear-timer update-documentation-timer))
+       (let ((proc (let ((sw (sys:console-selected-window (tv:sheet-console self))))
+		     (and sw (send-if-handles sw :process)))))
+	 (when proc (process:process-wakeup proc))))
+      (:timer
+	(when (and next-timeout
+		   (not tv:cold-load-stream-selected)
+		   (not dbg:*debugger-might-have-system-problems*))
+	  (process:reset-timer-relative-timer-units update-documentation-timer
+						    (* (max next-timeout 0) 16666))))
+      (otherwise
+	(when (and (not tv:cold-load-stream-selected)
+		   (not dbg:*debugger-might-have-system-problems*))
+	  (process:clear-timer update-documentation-timer))))))
+
+(defmethod (:convert-to-inside-coordinates dynamic-mouse-mixin) (x y)
+  (values (- x (tv:sheet-inside-left))
+	  (- y (tv:sheet-inside-top))))
+
+(defmethod (:new-mouse-position dynamic-mouse-mixin) ()
+  (declare (values moved-p x y))
+  (when (send self :mouse-motion-pending)
+    (without-interrupts
+      (multiple-value-prog1 
+	(values t mouse-x-position mouse-y-position)
+	(setq mouse-motion-pending nil)))))
+
+;;; If you start typing, and haven't moved the mouse for this long, 1get0 1rid0 of
+;;; the mouse doc and replace it with "(2 0 (NIL 0) (:SWISS NIL NIL) "HL12")Move the mouse to restore mouse documentation.0"
+;;; "Interval between keyboard input and mouse motion after which to blank documentation line"
+(defvar *steady-mouse-documentation-blanking-keyboard-activity-time* nil)	;off
+
+;;; If you move the mouse, or change the context, or something, that would
+;;; make the mouse doc blank, don't blank it right away.  Wait this long
+;;; before really blanking it.
+;;; "Interval before mouse documentation line goes blank after exiting input context"
+(defvar *mouse-documentation-blanking-hysteresis* 60)	;1 second
+
+(defvar *sluggish-to-rapid-timeout* 42)
+(defvar *rapid-to-sluggish-timeout* 120)
+(defvar *typing-to-sluggish-timeout* 120)
+
+(defmethod (:who-line-documentation-string dynamic-mouse-mixin) ()
+  (when (and documentation-blanking-pending-timeout
+	     (> (time-difference (sys:time) documentation-blanking-pending-timeout-time)
+		documentation-blanking-pending-timeout))
+    (setq documentation-blanking-pending-timeout nil
+	  documentation-blanking-pending-timeout-time nil
+	  who-line-documentation-string nil
+	  who-line-more-documentation-string nil))
+  (if (and *steady-mouse-documentation-blanking-keyboard-activity-time*
+	   (> (let ((mouse (tv:sheet-mouse self)))
+		(- (time-difference (sys:time) (tv:mouse-last-real-motion-time mouse))
+		   (time-difference (sys:time)
+				    (console-last-activity-time (tv:mouse-console mouse)))))
+	      *steady-mouse-documentation-blanking-keyboard-activity-time*))
+      (values "Move the mouse to restore mouse documentation."
+	      who-line-more-documentation-string)
+      (values who-line-documentation-string
+	      who-line-more-documentation-string)))
+
+(defmethod (:set-highlighted-shapes dynamic-mouse-mixin)
+	   (documentation more-documentation shifts hollow-boxes solid-boxes slanted-lines)
+  (without-interrupts
+    (if (or (and (null hollow-boxes) (null solid-boxes) (null slanted-lines))
+	    (not (send self :still-the-mouse-window)))	;Kludge around timing error
+	(send highlighting-blinker :set-visibility nil)
+      (unless (multiple-value-bind (old-hollow-boxes old-solid-boxes old-slanted-lines)
+		  (send highlighting-blinker :shapes)
+		(and (equal hollow-boxes old-hollow-boxes)
+		     (equal solid-boxes old-solid-boxes)
+		     (equal slanted-lines old-slanted-lines)))
+	(send highlighting-blinker :set-shapes hollow-boxes solid-boxes slanted-lines))
+      (send highlighting-blinker :set-visibility t)))
+  (when shifts
+    (setq who-line-documentation-last-shifts shifts))
+  (if (and (null documentation) (null more-documentation)
+	   *mouse-documentation-blanking-hysteresis*)
+      (setq documentation-blanking-pending-timeout-time (sys:time)
+	    documentation-blanking-pending-timeout *mouse-documentation-blanking-hysteresis*)
+    (setq documentation-blanking-pending-timeout nil)
+    (unless (string= who-line-documentation-string documentation)
+      (setq who-line-documentation-string documentation))
+    (unless (string= who-line-more-documentation-string more-documentation)
+      (setq who-line-more-documentation-string more-documentation))
+    (tv:need-mouse-documentation-update)))
+
+(defmethod (:set-highlighted-boxes dynamic-mouse-mixin)
+	   (boxes lines documentation shifts more-documentation)
+  (send self :set-highlighted-shapes documentation more-documentation shifts
+				     boxes nil lines))
+
+(defmethod (:set-highlighted-presentation dynamic-mouse-mixin)
+	   (presentation &optional documentation shifts more-documentation)
+  (multiple-value-bind (hollow-boxes slanted-lines solid-boxes)
+      (and presentation (presentation-mouse-sensitive-boxes presentation self))
+    (send self :set-highlighted-shapes documentation more-documentation shifts
+				       hollow-boxes solid-boxes slanted-lines)))
+
+;;; If the mouse keeps moving for longer than this, update highlighting
+;;; anyway, and also return so that some other part of the input wait
+;;; stuff gets run, in case that's the problem.
+(defparameter *mouse-motion-force-update-time* 250000)	;1/4 second
+
+;;; Special case for the editor top-level context: manage to keep the
+;;; constant line with a minimum of consing.
+(defparameter *special-stable-contexts*
+	      '((((or zwei:presentation-command si:input-editor)) nil t)))
+
+(defun-in-flavor (get-dynamic-mouse-documentation-buffer dynamic-mouse-mixin) ()
+  (without-interrupts
+    (when (null documentation-string-buffer-1)
+      (setq documentation-string-buffer-1 (make-array 100 :element-type 'character
+							  :fill-pointer 0)
+	    documentation-string-buffer-2 (make-array 100 :element-type 'character
+							  :fill-pointer 0)))
+    (let ((buffer-to-fill
+	    ;; Check against state displayed in who-line, not stored
+	    ;;  in window; an update may not have happened yet.
+	    (if (let ((window (dynamic-mouse-documentation-window self)))
+		  (and window
+		       (eq (send window :who-line-item-state)
+			   documentation-string-buffer-1)))
+		documentation-string-buffer-2
+		documentation-string-buffer-1)))
+      (when (eq buffer-to-fill who-line-documentation-string)
+	;; If the wholine display is going to use the buffer we're
+	;; filling, blank the wholine instead.  This only happens
+	;; in the case where the wholine has fallen behind.
+	(setq who-line-documentation-string nil))
+      buffer-to-fill)))
+
+(defmethod (dynamic-mouse-documentation-window dynamic-mouse-mixin) ()
+  (let ((console (tv:sheet-console self)))
+    (if (eq console *main-console*)
+	tv:who-line-documentation-window
+	(let ((who-screen (tv:console-who-line-screen console)))
+	  (and who-screen
+	       (tv:get-who-line-field :mouse-documentation who-screen))))))
+
+(defvar *maybe-skip-mouse-update-function* nil)
+
+;;; If the mouse has moved out of the orignal sensitivity box, punt
+;;; all documentation, etc. computations
+(defun maybe-skip-mouse-update (&optional presentation (id 'anonymous))
+  (ignore id)					; for metering
+  (when *maybe-skip-mouse-update-function*
+    (funcall *maybe-skip-mouse-update-function* presentation)))
+
+;;; This method is typically the :input-wait-handler of a dynamic window.  Therefore,
+;;; it gets called from inside the input editor (ie-tyi) when the input-wait function
+;;; says there is some kind of pending input event (mouse motion or keystroke).  When
+;;; this method returns, ie-tyi will attempt to read a character (without hanging)
+;;; and process it.
+(defmethod (:update-highlighted-presentation dynamic-mouse-mixin) ()
+  (let ((start-time (%microsecond-clock)))
+    ;; This internal function is called at key points throughout the mouse 
+    ;; sensitivity computation.  Its job is to look for changes in the environment
+    ;; that would cause this sensitivity computation to be obsolete and abort it if
+    ;; any are found.  The goal of this is to provide better perceived interactive
+    ;; response time by preventing the user from "Getting stuck" uselessly computing
+    ;; sensitivity.   The two conditions that can trigger a bail-out are 1) the user
+    ;; moving the mouse off of the presentation that we are working on and 2) the user
+    ;; typing (we are assuming that the user isn't interested in a correct sensitivity
+    ;; box while he is typing).
+    ;; This function can either cause
+    ;; :update-highlighted-presentation to return, which will take us around the full
+    ;; top-level IE loop back into input-wait, or it can throw to skip-mouse-update,
+    ;; which will cause another trip through the sensitivity-computing loop below
+    ;; using the most recent mouse position.  Or, it can do nothing, allowing the
+    ;; sensitivity computation to complete.
+    (flet ((maybe-skip-mouse-update-internal (presentation)
+	     (declare (sys:downward-function))
+	     ;; Keyboard (or mouse-click) input:
+	     ;; If the user has typed or clicked, punt this sensitivity computation,
+	     ;; but set the mouse-motion-pending flag so that the next input-wait
+	     ;; will immediately return and reinvoke update-highlighted-presentation.
+	     ;; That way, we don't get "hung up" computing mouse sensitivity when we
+	     ;; should be providing good typein echoing response.
+	     (when (and (stream-selected-p self) (stream-typeahead-p self))
+	       ;; Trigger a new sensitivity computation the next time 'round.
+	       (setq mouse-motion-pending t)
+	       ;; And stop this one now so the pending keyboard char can be processed.
+	       (return-from :update-highlighted-presentation nil))
+
+	     ;; Mouse motion:
+	     ;; Two reasons to throw (is the second redundant?):
+	     ;; 1) The mouse has moved outside of the presentation under consideration
+	     (when (and presentation
+			mouse-motion-pending
+			(not (position-inside-presentation presentation mouse-x-position mouse-y-position)))
+	       (throw 'skip-mouse-update 'clear-highlighting))
+	     ;; 2) The mouse has moved outside of the (visible) highlighting blinker.  This is useful
+	     ;; in later phases of sensitivity computation (e.g. mouse documentation) where we may not
+	     ;; have hold of the presentation, but we already drew the highlighting box.
+	     (when (and mouse-motion-pending
+			(not (null (send highlighting-blinker :visibility)))
+			(not (point-inside-boxes self
+						 mouse-x-position mouse-y-position
+						 (send highlighting-blinker :boxes))))
+	       (throw 'skip-mouse-update 'clear-highlighting))))
+    (loop
+      (unless (send self :still-the-mouse-window)
+	(return))
+      (multiple-value-bind (moved-p inner-presentation)
+	  (send self :new-mouse-position-presentation)
+	(unless moved-p
+	  (send self :update-blinker-motion-pending)
+	  (return))
+	(let* ((mouse (tv:sheet-mouse self))
+	       ;; --- force-p isn't used any more, but we may want it back
+	       (force-p ( (time-difference (%microsecond-clock) start-time)
+			   *mouse-motion-force-update-time*))
+	       (stable-documentation (member (tv:mouse-tracking-state mouse)
+					     '(:typing :sluggish)))
+	       (shifts (if stable-documentation 0 (tv:mouse-chord-shifts mouse)))
+	       (mouse-chars (mouse-chord-possible-mouse-chars shifts)))
+	  (block update-complete
+	    (when (and (eq last-highlighted-presentation inner-presentation)
+		       (eql shifts who-line-documentation-last-shifts))
+	      ;; If the input context hasn't changed and the mouse is still over
+	      ;; the same object it was last time, and the shifts haven't changed,
+	      ;; we don't have to recompute the sensitivities.
+	      (when (= last-context-tick *presentation-input-context-tick*)
+		(return-from update-complete))
+	      (without-interrupts
+		;; If the input context is one of the known stable ones, and the mouse is
+		;; in one of the fixed states, don't need to do any computation again.
+		;; Just use previous highlighting and documentation.
+		(when (and stable-documentation
+			   inner-presentation
+			   who-line-documentation-string
+			   last-special-stable-context
+			   (equal *presentation-input-context* last-special-stable-context))
+		  (send highlighting-blinker :set-visibility last-stable-visibility)
+		  (setq documentation-blanking-pending-timeout nil)
+		  (return-from update-complete))))
+	    (when (eq 'clear-highlighting
+		      (catch 'skip-mouse-update
+			(let ((*maybe-skip-mouse-update-function* #'maybe-skip-mouse-update-internal))
+			  (multiple-value-bind (outer-presentation first-line second-line)
+			      (find-innermost-sensitive-presentation
+				inner-presentation self mouse-chars
+				(get-dynamic-mouse-documentation-buffer)
+				nil (unless force-p (locf mouse-motion-pending)))
+			    (send self :set-highlighted-presentation
+				  (unless (eq outer-presentation *null-presentation*)
+				    outer-presentation)
+				  first-line shifts second-line))
+			  (setq last-highlighted-presentation inner-presentation
+				last-context-tick *presentation-input-context-tick*)
+			  (when stable-documentation
+			    (setq last-special-stable-context
+				  (car (member *presentation-input-context* *special-stable-contexts*
+					       :test #'equal))
+				  last-stable-visibility (send highlighting-blinker :visibility))))))
+	      (send highlighting-blinker :set-visibility nil))))))))
+  nil)
+
+(defun point-inside-boxes (window window-mouse-x window-mouse-y boxes)
+  (loop for (left top right bottom) in boxes
+	do (multiple-value-setq (left top)
+	     (send window :convert-to-inside-coordinates left top))
+	   (multiple-value-setq (right bottom)
+	     (send window :convert-to-inside-coordinates right bottom))
+	thereis (and ( left window-mouse-x)
+		     (< window-mouse-x right)
+		     ( top window-mouse-y)
+		     (< window-mouse-y bottom))))
+
+;;; A default handler for things that index by mouse position.
+(defmethod (:new-mouse-position-presentation dynamic-mouse-mixin) ()
+  (declare (values moved-p presentation))
+  (multiple-value-bind (moved-p x y)
+      (send self :new-mouse-position)
+    (when moved-p
+      (values t (send self :displayed-presentation-at-position x y)))))
+
+(defmethod (:handle-mouse dynamic-mouse-mixin :after) ()
+  ;; If we are the mouse window still, clear it so that :still-the-mouse-window will
+  ;; not say true during the period after :handle-mouse and before it is recomputed
+  ;; by mouse-overseer (which has a process-sleep in it!), which would leave a blinker
+  ;; turd.
+  (let ((mouse (tv:sheet-mouse self)))
+    (when (eq (tv:mouse-window mouse) self)
+      (setf (tv:mouse-window mouse) nil)))
+  (setq mouse-motion-pending nil)
+  (setq last-highlighted-presentation nil)
+  (send self :turn-off-mouse-highlighting))
+
+(defmethod (:turn-off-mouse-highlighting dynamic-mouse-mixin) ()
+  (tv:blinker-set-visibility highlighting-blinker nil))
+
+;;; Lock out the keyboard process while we are inside
+;;; tv:mouse-button-encode, so that it won't insert characters while we
+;;; are constructing the blip to insert (which can be a long delay with
+;;; double-click enabled).
+(defwhopper (:mouse-buttons dynamic-mouse-mixin) (&rest args)
+  (unwind-protect
+      (let-globally (((cli::console-input-lock (tv:sheet-console self)) t))
+	(lexpr-continue-whopper args))
+    ;; In case a wakeup was ignored while the console-input-lock was set
+    (process:wakeup (cli::console-keyboard-process (tv:sheet-console self)))))
+
+;;; Blips record the absolute address of what you click on, in case the
+;;; window scrolls before it gets processed.  Try to put the blip into
+;;; the system io-buffer, allowing clicking on presentations in a window
+;;; other than the selected window.
+(defmethod (:mouse-click dynamic-mouse-mixin) (mouse-char x y)
+  (multiple-value-setq (x y)
+    (send self :convert-to-inside-coordinates x y))
+  (let ((blip `(:mouse-click ,mouse-char ,self ,x ,y))
+	(console (tv:sheet-console self)))
+    (if (let ((sw (console-selected-window console)))
+	  (and (instancep sw)
+	       (operation-handled-p sw :presentation-input-blip-handler)))
+	(tv:io-buffer-put (console-system-io-buffer console) blip t)
+	(send self :force-kbd-input blip t))))
+
+(defmethod (:presentation-input-blip-handler dynamic-mouse-mixin) (blip)
+  (when (eq (first blip) :mouse-click)
+    (dynamic-window-presentation-input-blip-handler blip)))
+
+(defun dynamic-window-presentation-input-blip-handler (blip)
+  (destructuring-bind (nil mouse-char window x y) blip
+    (call-presentation-mouse-handler (send window :displayed-presentation-at-position
+						  x y mouse-char)
+				     :mouse-char mouse-char :x x :y y
+				     :window window)))
+
+;;; List of (character x-offset y-offset &optional hollow-version)
+(defvar *mouse-blinker-characters*
+  '((#\mouse:nw-arrow 0 0 #\mouse:hollow-nw-arrow)
+    (#\mouse:ne-arrow 8 0 #\mouse:hollow-ne-arrow)
+    (#\mouse:up-arrow 4 0 #\mouse:hollow-up-arrow)
+    (#\mouse:times 4 5 )
+    (#\mouse:plus 4 5)
+    (#\mouse:big-triangle 14 7)
+    (#\mouse:boxed-down-triangle 7 7)
+    (#\mouse:boxed-up-triangle 7 8)
+    (#\mouse:circle-plus 5 7)
+    (#\mouse:circle-times 5 7)
+    (#\mouse:down-arrow 4 15)
+    (#\mouse:down-arrow-to-bar 7 13)
+    (#\mouse:fat-circle 6 6)
+    (#\mouse:fat-circle-minus 6 6)
+    (#\mouse:fat-circle-plus 6 6)
+    (#\mouse:fat-double-horizontal-arrow 7 7)
+    (#\mouse:fat-double-vertical-arrow 7 7)
+    (#\mouse:fat-down-arrow 7 15)
+    (#\mouse:fat-left-arrow 0 7)
+    (#\mouse:fat-right-arrow 15 7)
+    (#\mouse:fat-times 7 7)
+    (#\mouse:fat-plus 7 7)
+    (#\mouse:fat-up-arrow 7 0)
+    (#\mouse:filled-circle 7 7)
+    (#\mouse:filled-lozenge 7 7)
+    (#\mouse:horizontal-double-arrow 7 5)
+    (#\mouse:inverse-down-arrow 7 13)
+    (#\mouse:inverse-up-arrow 7 2)
+    (#\mouse:left-arrow 0 5)
+    (#\mouse:medium-triangle 10 6)
+    (#\mouse:nw-corner 0 0)
+    (#\mouse:right-arrow 15 6)
+    (#\mouse:short-down-arrow 7 14)
+    (#\mouse:short-up-arrow 7 0)
+    (#\mouse:small-filled-circle 7 7)
+    (#\mouse:small-triangle 5 5)
+    (#\mouse:up-arrow-to-bar 7 2)
+    (#\mouse:vertical-double-arrow 5 7)
+    (#\mouse:maltese-cross 7 7)
+    ))
+
+(defun-in-flavor (mouse-standard-blinker-characters dynamic-mouse-mixin)
+		 (&optional (solid-char mouse-blinker-character))
+  (let ((x-off 0) (y-off 0)
+	(hollow-char solid-char))
+    (let ((elem (assoc solid-char *mouse-blinker-characters*)))
+      (when elem
+	(setq x-off (second elem)
+	      y-off (third elem))
+	(when (fourth elem)
+	  (setq hollow-char (fourth elem)))))
+    (values solid-char hollow-char x-off y-off)))
+
+(defparameter *default-mouse-blinker-type* :sometimes-hollow-character)
+
+(defmethod (:mouse-standard-blinker dynamic-mouse-mixin) ()
+  (let ((type mouse-blinker-type))
+    (when (eq type :default)
+      (setq type *default-mouse-blinker-type*))
+    (case type
+      (:sometimes-hollow-character
+	(multiple-value-bind (solid-char hollow-char x-off y-off)
+	    (mouse-standard-blinker-characters)
+	  (tv:mouse-set-blinker-definition-internal (tv:sheet-mouse self)
+	    :sometimes-hollow-character x-off y-off :on
+	    :set-solid-and-hollow-characters solid-char hollow-char)))
+      (:character
+	(multiple-value-bind (character nil x-off y-off)
+	    (mouse-standard-blinker-characters)
+	  (tv:mouse-set-blinker-definition-internal (tv:sheet-mouse self)
+	    :character x-off y-off :on :set-character character)))
+      (otherwise
+	(let ((args '(:which-operations)))
+	  (when (consp type)
+	    (setf (cons type args) mouse-blinker-type))
+	  (if (member type '(:character-and-other-character
+			     :character-and-string-and-other-character))
+	      (multiple-value-bind (nil nil x-off y-off)
+		  (mouse-standard-blinker-characters (getf args :set-character
+							   #\mouse:fat-circle))
+		(apply #'tv:mouse-set-blinker-definition-internal (tv:sheet-mouse self)
+		       type x-off y-off :on args))
+	      (apply #'tv:mouse-set-blinker-definition-internal (tv:sheet-mouse self)
+		     type 0 0 :on args)))))))
+
+(defmethod (:update-blinker-motion-pending dynamic-mouse-mixin) (&optional force-p)
+  (send self :set-blinker-motion-pending
+	(and mouse-motion-pending
+	     (or force-p (neq (tv:mouse-tracking-state (tv:sheet-mouse self)) :typing)))))
+
+(defmethod (:set-blinker-motion-pending dynamic-mouse-mixin) (pending-p)
+  (send (tv:mouse-blinker (tv:sheet-mouse self)) :set-motion-pending pending-p))
+
+;;;; Sub-presentation mouse tracking
+
+(defmacro tracking-mouse ((&optional stream &rest options) &body clauses &environment env)
+  (declare (arglist (&optional stream &key (whostate "Track Mouse")
+					   (who-line-documentation-string nil)
+					   (who-line-more-documentation-string nil)
+					   (multiple-window nil))
+		    &body clauses))
+  (format-output-macro-default-stream stream)
+  (multiple-value-bind (functions definitions)
+      (loop for (type arglist . body) in clauses
+	    as fun = (make-symbol (string type))
+	    nconc (list (intern (string-append (string type) "-FUNCTION")
+				si:pkg-keyword-package)
+			`#',fun)
+	      into functions
+	    collect `(,fun ,arglist
+		      (declare (downward-function))
+		      . ,body)
+	      into definitions
+	    finally (return (values functions definitions)))
+    (let ((additional-options nil))
+      (let ((clause (assoc :mouse-motion-feedback clauses)))
+	(when clause
+	  (multiple-value-bind (function points relative-ps additional-args additional-keywords
+				drawing-keywords free-vars)
+	      (graphics::decode-point-relative-graphics-form (second clause)
+							     (rest (rest clause))
+							     :environment env)
+	    (when function
+	      (ignore free-vars)		;Should really check that no one sets them
+	      (setf (getf additional-options :mouse-motion-feedback-points)
+		    `(list ',function (list . ,points) ',relative-ps
+			   (list ,@additional-args . ,additional-keywords)
+			   (list . ,drawing-keywords)))))))
+      `(block nil
+	 (flet ,definitions
+	   (tracking-mouse-internal-1
+	     ,stream
+	     ,@functions
+	     ,@options
+	     . ,additional-options))))))
+
+(defun tracking-mouse-internal-1 (stream
+				  &key presentation-function
+				       mouse-motion-function
+				       mouse-motion-feedback-function
+				       who-line-documentation-string-function
+				       release-mouse-function
+				       presentation-hold-function
+				       mouse-motion-hold-function
+				       keyboard-function
+				       presentation-click-function
+				       mouse-click-function
+
+				       (whostate "Track Mouse")
+				       (who-line-documentation-string nil)
+				       (who-line-more-documentation-string nil)
+				       (multiple-window nil)
+
+				       mouse-motion-feedback-points)
+  (let* ((last-documentation nil) (last-shifts nil) (highlighted-shapes nil)
+	 (mouse (tv:sheet-mouse (send stream :screen)))
+	 (current-mouse-window (si:follow-syn-stream stream))
+	 (mouse-hold (not (zerop (tv:mouse-last-buttons mouse))))
+	 (first t) (last-x nil) (last-y nil) (last-window nil)
+	 (remote-motion-feedback nil))
+    (flet ((funcall-maybe-with-window (function window &rest args)
+	     (if multiple-window
+		 (apply function window args)
+		 (apply function args))))
+      (when (not mouse-hold)
+	;; User may have lifted mouse before we got in here.
+	(when release-mouse-function
+	  (funcall release-mouse-function)))
+      (when mouse-motion-feedback-points
+	(setq remote-motion-feedback (apply #'tv:window-set-remote-mouse-handler
+					    current-mouse-window
+					    mouse-motion-feedback-points)))
+      (unwind-protect
+	  (loop do
+	    (when multiple-window
+	      (setq current-mouse-window (dynamic-mouse-window :new-mouse-position stream)))
+	    (when who-line-documentation-string-function
+	      (multiple-value-setq (who-line-documentation-string
+				    who-line-more-documentation-string)
+		(funcall who-line-documentation-string-function)))
+	    (let ((shifts (tv:mouse-chord-shifts mouse)))
+	      (unless (and (eq who-line-documentation-string last-documentation)
+			   (eql shifts last-shifts))
+		(lexpr-send stream :set-highlighted-shapes
+			    who-line-documentation-string who-line-more-documentation-string
+			    shifts (or highlighted-shapes '(nil nil nil)))
+		(setq last-documentation who-line-documentation-string
+		      last-shifts shifts)))
+	    (when mouse-hold
+	      (when (zerop (tv:mouse-last-buttons mouse))
+		(when release-mouse-function
+		  (funcall release-mouse-function))
+		(setq mouse-hold nil)))
+	    (when current-mouse-window
+	      (block handle-mouse-motion
+		(when (not mouse-motion-feedback-function)
+		  (let ((function (or (and mouse-hold presentation-hold-function)
+				      presentation-function)))
+		    (when function
+		      (multiple-value-bind (moved-p presentation)
+			  ;; This part of the protocol also works for ZWEI windows.
+			  (send current-mouse-window :new-mouse-position-presentation)
+			(when moved-p
+			  (funcall-maybe-with-window function current-mouse-window
+						     presentation)))
+		      (return-from handle-mouse-motion))))
+		(multiple-value-bind (moved-p x y)
+		    (send current-mouse-window :new-mouse-position)
+		  (unless moved-p
+		    (when first
+		      (multiple-value-setq (x y) (send current-mouse-window :mouse-position))
+		      (setq moved-p t)))
+		  (when moved-p
+		    (when (and mouse-motion-feedback-function (not remote-motion-feedback))
+		      (when last-window
+			(with-output-recording-disabled (last-window)
+			  (funcall-maybe-with-window mouse-motion-feedback-function
+						     last-window last-x last-y)))
+		      (with-output-recording-disabled (current-mouse-window)
+			(funcall-maybe-with-window mouse-motion-feedback-function
+						   current-mouse-window x y)))
+		    (setq last-window current-mouse-window last-x x last-y y)
+		  
+		    (let ((function (or (and mouse-hold presentation-hold-function)
+					presentation-function)))
+		      (when function
+			(funcall-maybe-with-window function current-mouse-window
+			  (send current-mouse-window :displayed-presentation-at-position x y))
+			(return-from handle-mouse-motion)))
+		    (let ((function (or (and mouse-hold mouse-motion-hold-function)
+					mouse-motion-function)))
+		      (when function
+			(funcall-maybe-with-window function current-mouse-window x y))))))
+	      ;; Pick up any highlighting state change due to user functions.
+	      (setq highlighted-shapes (let ((blinker (send current-mouse-window
+							    :highlighting-blinker)))
+					 (and (send blinker :visibility)
+					      (multiple-value-list (send blinker :shapes)))))
+	      (setq first nil)
+	      (send current-mouse-window :update-blinker-motion-pending))
+	    (send stream :input-wait whostate
+		  (if multiple-window
+		      #'mouse-motion-pending
+		      #'(lambda (window) (send window :mouse-motion-pending)))
+		  (si:follow-syn-stream stream))
+	    (loop do
+	      (let ((char (send stream :any-tyi-no-hang)))
+		(block handle-char
+		  (cond ((null char)
+			 (return))
+			((characterp char)
+			 (when keyboard-function
+			   (funcall keyboard-function char)
+			   (return-from handle-char)))
+			((and (consp char) (eq (first char) :mouse-click))
+			 (setq mouse-hold t)
+			 (destructuring-bind (nil click window x y) char
+			   (when presentation-click-function
+			     (let* ((*allow-sensitive-raw-text-override* t)
+				    (presentation (send window
+							:displayed-presentation-at-position
+							x y)))
+			       (when presentation
+				 (funcall-maybe-with-window presentation-click-function window
+							    click presentation)
+				 (return-from handle-char))))
+			   (when (or multiple-window
+				     (eq window (send stream :window-and-offsets)))
+			     (when mouse-click-function
+			       (funcall-maybe-with-window mouse-click-function window
+							  click x y)
+			       (return-from handle-char)))))
+			((and (consp char) (presentation-blip-p char)
+			      (presentation-blip-typep char 'window-wakeup))
+			 (return-from handle-char)))
+		  (beep)))))
+	(when (and mouse-motion-feedback-function (not remote-motion-feedback)
+		   last-window)
+	  (with-output-recording-disabled (last-window)
+	    (funcall-maybe-with-window mouse-motion-feedback-function last-window
+				       last-x last-y)))
+	(when remote-motion-feedback
+	  (tv:window-clear-remote-mouse-handler current-mouse-window))
+	(send stream :set-highlighted-presentation nil)))))
+
+;;; For compatibility with old compiled files.
+(defun tracking-mouse-internal (stream coroutines &rest args)
+  (declare (downward-funarg coroutines))
+  (apply #'tracking-mouse-internal-1 stream
+	 :presentation-function (funcall coroutines :presentation)
+	 :mouse-motion-function (funcall coroutines :mouse-motion)
+	 :who-line-documentation-string-function
+	   (funcall coroutines :who-line-documentation-string)
+	 :release-mouse-function (funcall coroutines :release-mouse)
+	 :presentation-hold-function (funcall coroutines :presentation-hold)
+	 :mouse-motion-hold-function (funcall coroutines :mouse-motion-hold)
+	 :keyboard-function (funcall coroutines :keyboard)
+	 :presentation-click-function (funcall coroutines :presentation-click)
+	 :mouse-click-function (funcall coroutines :mouse-click)
+	 args))
+
+;;;; Other synchronous stuff -- send wakeup's in the io-buffer to the
+;;;; main program.  the presentation types themselves are in redisplay.
+
+(defun-in-flavor (insert-window-wakeup dynamic-mouse-mixin)
+		 (&optional (presentation-type 'window-wakeup) options)
+  (when tv:*asynchronous-window-operation*
+    (send self :force-kbd-input
+	  (make-presentation-blip :presentation-type presentation-type
+				  :object self
+				  :options options)
+	  t)))
+
+(defmethod (:select dynamic-mouse-mixin :after) (&rest ignore)
+  (insert-window-wakeup 'window-wakeup-select))
+
+(defmethod (:expose dynamic-mouse-mixin :after) (&rest ignore)
+  (insert-window-wakeup 'window-wakeup-expose))
+
+(defmethod (:refresh dynamic-mouse-mixin :after) (&optional type)
+  (when (or (not tv:restored-bits-p)
+	    (eq type :size-changed))
+    (insert-window-wakeup 'window-wakeup-refresh)))
+
+(defmethod (tv:refresh-rectangle dynamic-mouse-mixin :after) (left top right bottom)
+  (ignore left top right bottom)
+  (let ((tv:*asynchronous-window-operation* t))
+    (insert-window-wakeup 'window-wakeup-redisplay)))
+
+(defmethod (:set-viewport-position dynamic-mouse-mixin :after) (x y)
+  (insert-window-wakeup 'window-wakeup-viewport-position-changed (list x y)))
+
+
+(defflavor margin-component
+	((left-margin 0)
+	 (top-margin 0)
+	 (right-margin 0)
+	 (bottom-margin 0))
+	()
+  :readable-instance-variables
+  (:init-keywords :window)
+  (:required-methods margin-component-allocate-margins))
+
+(defmethod (margin-component-edges margin-component) (window)
+  (let ((width (tv:sheet-width window))
+	(height (tv:sheet-height window)))
+    (flet ((make-margin-absolute (margin against limit-p)
+	     (if (or (plusp margin)
+		     (and (zerop margin) (not limit-p)))
+		 margin
+		 (+ against margin))))
+      (values (make-margin-absolute left-margin width nil)
+	      (make-margin-absolute top-margin height nil)
+	      (make-margin-absolute right-margin width t)
+	      (make-margin-absolute bottom-margin height t)))))
+
+(defmethod (margin-component-erase margin-component) (window)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    (tv:sheet-force-access (window)
+      (tv:sheet-draw-rectangle (- right left) (- bottom top) left top
+			       (tv:sheet-erase-aluf window) window))))
+
+(defgeneric margin-component-allocate-margins
+	    (margin-component window left-margin top-margin right-margin bottom-margin)
+  (declare (values left-margin top-margin right-margin bottom-margin)))
+
+(defmethod (margin-component-after-window-init-kludge margin-component) (window)
+  (ignore window))
+(defmethod (margin-component-after-redefine-margins-kludge margin-component) (window)
+  (ignore window))
+
+(defgeneric margin-component-draw (margin-component window alu) )
+
+(defmethod (margin-component-draw margin-component) (window alu)
+  (ignore window alu)
+  )
+
+(defmethod (margin-component-need-mouse-position margin-component) () nil)
+
+(defun-in-flavor (allocate-single-margin-area margin-component)
+		 (margin thickness ignore left top right bottom)
+  (setq left-margin left
+	top-margin top
+	right-margin (- right)
+	bottom-margin (- bottom))
+  (ecase margin
+    (:left (setq right-margin (incf left thickness)))
+    (:top (setq bottom-margin (incf top thickness)))
+    (:right (setq left-margin (- (incf right thickness))))
+    (:bottom (setq top-margin (- (incf bottom thickness)))))
+  (values left top right bottom))
+
+(defun-in-flavor (allocate-box-margin-area margin-component)
+		 (thickness ignore left top right bottom)
+  (setq left-margin left
+	top-margin top
+	right-margin (- right)
+	bottom-margin (- bottom))
+  (values (+ left thickness)
+	  (+ top thickness)
+	  (+ right thickness)
+	  (+ bottom thickness)))
+
+(defmethod (margin-component-new-scroll-position margin-component) (window)
+  (ignore window)
+  )
+
+(defmethod (margin-component-change-of-size-or-margins margin-component) (window)
+  (ignore window)
+  )
+
+(defmethod (tv:mouse-exit-target-direction-sensitive-1 margin-component) (direction window)
+  (ignore direction window)
+  nil)
+
+ (defmacro define-margin-alterant ((name flavor) variable-specs)
+  (zwei:zcollecting-into (variables keywords new-values adjusters)
+    (flet ((do-sym (sym adjuster)
+	     (zwei:zcollect variables sym)
+	     (zwei:zcollect keywords (intern (string sym) ""))
+	     (zwei:zcollect new-values (fintern "~a-new" sym))
+	     (zwei:zcollect adjusters adjuster)
+	     nil))
+      (dolist (spec variable-specs)
+	(etypecase spec
+	  (symbol (do-sym spec nil))
+	  (cons (destructuring-bind (sym adjuster) spec
+		  (do-sym sym adjuster))))))
+    (let ((unsupplied '#:unsupplied))
+      `(defmethod (,name ,flavor) (&key ,@(map 'list (lambda (keyword new-value)
+						       `((,keyword ,new-value) ',unsupplied))
+					       keywords new-values))
+	 (declare (arglist &key ,@variables))
+	 ,@(map 'list (lambda (variable new-value)
+			(let ((variable (if (eq variable 'character-style) 'style variable)))
+			  `(unless (eq ,new-value ',unsupplied)
+			     (setf ,variable
+				 ,(if (eq variable 'style)
+				      `(si:parse-character-style ,new-value)
+				    new-value)))))
+		variables new-values)
+	 self))))
+
+
+(defflavor margin-white-borders ((thickness 1)) (margin-component)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (margin-component-allocate-margins margin-white-borders) (&rest args)
+  (apply #'allocate-box-margin-area thickness args))
+
+(defflavor margin-borders () (margin-white-borders))
+
+(defmethod (margin-component-draw margin-borders) (window alu)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    (tv:sheet-draw-rectangle thickness (- bottom top thickness) left top alu window)
+    (tv:sheet-draw-rectangle (- right left (* thickness 2)) thickness (+ left thickness) top
+			     alu window)
+    (tv:sheet-draw-rectangle thickness (- bottom top) (- right thickness) top alu window)
+    (tv:sheet-draw-rectangle (- right left thickness) thickness left (- bottom thickness)
+			     alu window)))
+
+(defflavor margin-asymmetrical-borders
+	(left-thickness top-thickness right-thickness bottom-thickness)
+	(margin-component)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (margin-component-allocate-margins margin-asymmetrical-borders)
+	   (ignore left top right bottom)
+  (setq left-margin left
+	top-margin top
+	right-margin (- right)
+	bottom-margin (- bottom))
+  (values (+ left left-thickness)
+	  (+ top top-thickness)
+	  (+ right right-thickness)
+	  (+ bottom bottom-thickness)))
+
+(defmethod (margin-component-draw margin-asymmetrical-borders) (window alu)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    (tv:sheet-draw-rectangle left-thickness (- bottom top bottom-thickness)
+			     left top alu window)
+    (tv:sheet-draw-rectangle (- right left left-thickness right-thickness) top-thickness
+			     (+ left left-thickness) top alu window)
+    (tv:sheet-draw-rectangle right-thickness (- bottom top)
+			     (- right right-thickness) top alu window)
+    (tv:sheet-draw-rectangle (- right left right-thickness) bottom-thickness
+			     left (- bottom bottom-thickness) alu window)))
+
+#||
+(3 0 (NIL 0) (NIL NIL :SMALL) "TVFONT");; Former definition.  Replaced by bitbltbum below.
+(defun draw-horizontal-ragged-border (width height left top alu window)
+  (when (> top height)
+    (decf top 2))
+  (let ((right (+ left width))
+	(bottom (+ top height 1)))
+    (do ((south t (not south))
+	 (cur-left right)
+	 (cur-l (1- right)))
+	(( cur-left left)) 
+      (tv:sheet-draw-line cur-left (if south top bottom)
+			  (max left (setq cur-left (- cur-left 5))) (if south bottom top)
+			  alu nil window)
+      (when (> (- bottom top) 1)
+	(tv:sheet-draw-line cur-l (if south top bottom)
+			    (max left (setq cur-l (- cur-l 5))) (if south bottom top)
+			    alu nil window)))))
+0||#
+
+(defun draw-straight-border (width height left top alu window)
+  (tv:sheet-draw-rectangle width height left top alu window))
+
+(defun draw-horizontal-ragged-border (width height left top alu window)
+  (when (> top height)
+    (decf top 2))
+  (stack-let ((temp (make-raster-array 320 (+ height 2) :element-type 'bit)))
+    (flet ((dl (x1 y1 x2 y2)
+	     (sys:%draw-line x1 y1 x2 y2 tv:alu-seta T temp)))
+      ;; Draw the first copy
+      (dl 10 0 5 (1+ height))
+      (dl 5 (1+ height) 0 0)
+      (when (> height 0)
+	(dl 11 0 6 (1+ height))
+	(dl 6 (1+ height) 1 0)))
+    ;; Duplicate it through the temp array
+    (loop with limit = (min width 320)
+	  for w = 10 then (+ w w) while (< w limit)
+	  do (bitblt tv:alu-seta (min (- limit w) w) (+ 2 height) temp 0 0 temp w 0))
+    (multiple-value-bind (wholes minor-width) (floor width 10)
+      (let ((major-width (* 10 wholes)))
+	;; Draw a whole bunch, letting BITBLT replicate it as necessary
+	(tv:sheet-draw-1-bit-raster major-width (+ 2 height)
+				    temp 0 0 nil (- (+ left width) major-width) top
+				    alu color:alu-noop window))
+      (when (> minor-width 0)
+	;; Draw the little fraction at the left -- our caller aligns on the right.
+	(tv:sheet-draw-1-bit-raster minor-width (+ 2 height)
+				    temp (- 10 minor-width) 0 nil left top
+				    alu color:alu-noop window)))))
+
+(defun draw-vertical-ragged-border (width height left top alu window)
+  (stack-let ((temp (make-raster-array (* (%fixnum-ceiling (1+ width) 32) 32) 320
+				       :element-type 'bit)))
+    (flet ((dl (x1 y1 x2 y2)
+	     (sys:%draw-line x1 y1 x2 y2 tv:alu-seta T temp)))
+      ;; Draw the first copy
+      (dl 0 10 width 5)
+      (dl width 5 0 0)
+      (when (> width 1)
+	(dl 0 11 width 6)
+	(dl width 6 0 1)))
+    ;; Duplicate it through the temp array
+    (bitblt tv:alu-seta (1+ width) (- (min height 320) 10) temp 0 0 temp 0 10)
+    (multiple-value-bind (wholes minor-height) (floor height 10)
+      (let ((major-height (* 10 wholes)))
+	;; Draw a whole bunch, letting BITBLT replicate it as necessary
+	(tv:sheet-draw-1-bit-raster (1+ width) major-height
+				    temp 0 0 nil left (- (+ top height) major-height)
+				    alu color:alu-noop window))
+      (when (> minor-height 0)
+	;; Draw the little fraction at the top -- our caller aligns on the bottom.
+	(tv:sheet-draw-1-bit-raster (1+ width) minor-height
+				    temp 0 (- 10 minor-height) nil left top
+				    alu color:alu-noop window)))))
+
+(defflavor margin-ragged-borders
+	((thickness 2)
+	 (left-ragged-p nil)
+	 (top-ragged-p nil)
+	 (right-ragged-p nil)
+	 (bottom-ragged-p nil)
+	 (horizontal-too t))
+	(margin-borders)
+  (:initable-instance-variables horizontal-too))
+
+(defmethod (margin-component-allocate-margins margin-ragged-borders)
+	   (window left-margin top-margin right-margin bottom-margin)
+  (multiple-value-bind (new-left new-top new-right new-bottom)
+      ;; We need a couple pixels more than the thickness of the solid bar for the wavy lines.
+      (allocate-box-margin-area (+ thickness 2) window
+				left-margin top-margin right-margin bottom-margin)
+    (setq top-margin new-top
+	  bottom-margin new-bottom)
+    (when horizontal-too
+      (setq left-margin new-left
+	    right-margin new-right))
+    (values left-margin top-margin right-margin bottom-margin)))
+
+(defmethod (margin-component-draw margin-ragged-borders) (window alu)
+  (multiple-value-bind (left-p top-p right-p bottom-p)
+      (send window :ragged-borders-p)
+    (multiple-value-bind (left top right bottom)
+	(margin-component-edges self window)
+      (funcall (if top-p #'draw-horizontal-ragged-border #'draw-straight-border)
+	       (- right left (* thickness 2)) thickness (+ left thickness) top alu window)
+      (funcall (if bottom-p #'draw-horizontal-ragged-border #'draw-straight-border)
+	       (- right left thickness) thickness left (- bottom thickness) alu window)
+      (when horizontal-too
+	(funcall (if left-p #'draw-vertical-ragged-border #'draw-straight-border)
+		 thickness (- bottom top thickness) left top alu window)
+	;; When one point is in the corner, will get an error because it isn't careful
+	;; about which end is the one that doesn't get drawn.  Prevent this.
+	(let ((boundary-offset (if right-p 1 0)))
+	  (funcall (if right-p #'draw-vertical-ragged-border #'draw-straight-border)
+		   thickness
+		   (- bottom top boundary-offset) (- right thickness boundary-offset)
+		   top alu window))))
+    (setq left-ragged-p left-p
+	  top-ragged-p top-p
+	  right-ragged-p right-p
+	  bottom-ragged-p bottom-p)))
+
+(defmethod (margin-component-new-scroll-position margin-ragged-borders) (window)
+  (multiple-value-bind (left-p top-p right-p bottom-p)
+      (send window :ragged-borders-p)
+    (multiple-value-bind (left top right bottom)
+	(margin-component-edges self window)
+      (tv:sheet-force-access (window)
+	(let ((erase (tv:sheet-erase-aluf window))
+	      (draw (tv:sheet-char-aluf window)))
+	  (unless (eq top-ragged-p top-p)
+	    (funcall (if top-ragged-p #'draw-horizontal-ragged-border #'draw-straight-border)
+		     (- right left (* thickness 2)) thickness (+ left thickness) top erase
+		     window)
+	    (funcall (if top-p #'draw-horizontal-ragged-border #'draw-straight-border)
+		     (- right left (* thickness 2)) thickness (+ left thickness) top draw
+		     window)
+	    (setq top-ragged-p top-p))
+	  (unless (eq bottom-ragged-p bottom-p)
+	    (funcall (if bottom-ragged-p #'draw-horizontal-ragged-border #'draw-straight-border)
+		     (- right left thickness) thickness left (- bottom thickness) erase
+		     window)
+	    (funcall (if bottom-p #'draw-horizontal-ragged-border #'draw-straight-border)
+		     (- right left thickness) thickness left (- bottom thickness) draw window)
+	    (setq bottom-ragged-p bottom-p))
+	  (when horizontal-too
+	    (unless (eq left-ragged-p left-p)
+	      (funcall (if left-ragged-p #'draw-vertical-ragged-border #'draw-straight-border)
+		       thickness (- bottom top thickness) left top erase window)
+	      (funcall (if left-p #'draw-vertical-ragged-border #'draw-straight-border)
+		       thickness (- bottom top thickness) left top draw window)
+	      (setq left-ragged-p left-p))
+	    (unless (eq right-ragged-p right-p)
+	      (let ((boundary-offset (if right-ragged-p 1 0)))
+		(funcall (if right-ragged-p #'draw-vertical-ragged-border
+					    #'draw-straight-border)
+			 thickness
+			 (- bottom top boundary-offset) (- right thickness boundary-offset)
+			 top erase window))
+	      (let ((boundary-offset (if right-p 1 0)))
+		(funcall (if right-p #'draw-vertical-ragged-border #'draw-straight-border)
+			 thickness
+			 (- bottom top boundary-offset) (- right thickness boundary-offset)
+			 top draw window))
+	      (setq right-ragged-p right-p))))))))
+
+(defflavor margin-drop-shadow-borders
+	((non-shadow-thickness 2)
+	 (shadow-thickness 7)
+	 (outside-margin 1))
+	(margin-borders)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (margin-component-allocate-margins margin-drop-shadow-borders)
+	   (ignore left top right bottom)
+  (setq left-margin left
+	top-margin top
+	right-margin (- right)
+	bottom-margin (- bottom))
+  (incf left (+ non-shadow-thickness outside-margin))
+  (incf top (+ non-shadow-thickness outside-margin))
+  (incf right (+ non-shadow-thickness shadow-thickness))
+  (incf bottom (+ non-shadow-thickness shadow-thickness))
+  (values left top right bottom))
+
+(defvar *margin-drop-shadow-gray* tv:50%-gray)
+
+(defmethod (margin-component-draw margin-drop-shadow-borders) (window alu)
+  (multiple-value-bind (outside-left outside-top outside-right outside-bottom)
+      (margin-component-edges self window)
+    (let ((gray-array *margin-drop-shadow-gray*))
+      (flet ((rectangle (color left top right bottom)
+	       (ecase color
+		 (:black
+		   (tv:sheet-draw-rectangle (- right left) (- bottom top)
+					    left top alu window))
+		 (:gray
+		   (tv:sheet-draw-1-bit-raster (- right left) (- bottom top)
+					       gray-array left top nil left top
+					       alu color:alu-noop window))))
+	     (copy-rectangle-under (left top right bottom)
+	       (let ((temporary-bit-array (send window :temporary-bit-array)))
+		 (let ((width (- right left))
+		       (height (- bottom top)))
+		   (if (and temporary-bit-array (neq temporary-bit-array t))
+		       ;; If this window has a temporary bit save array, include the
+		       ;; bits from the part of the window under the shadow (border).
+		       ;; If not, there will be a blank "hole" at the top of the margin.
+		       (tv:sheet-bitblt tv:alu-seta width height
+					temporary-bit-array left top
+					() left top window)
+		       ;; otherwise clear the border
+		       (tv:sheet-draw-rectangle width height left top
+						(tv:sheet-erase-aluf window) window))))))
+	;; Draw the backgrounds first, since we are getting seta of the whole image.
+	;; Then overlay the gray.  There is no function like draw-1-bit-raster that works
+	;; for arbitrary depth arrays and just copies the non background pixels.
+	;; Right background
+	(let ((left (- outside-right (- shadow-thickness outside-margin)))
+	      (top outside-top)
+	      (right outside-right)
+	      (bottom (- outside-bottom shadow-thickness)))
+	  (copy-rectangle-under left top right bottom))
+	;; Bottom background
+	(let ((left outside-left)
+	      (top (- outside-bottom (- shadow-thickness outside-margin)))
+	      (right outside-right)
+	      (bottom outside-bottom))
+	  (copy-rectangle-under left top right bottom))
+	;; The way the corners are matched is based on knowing that it is faster to draw
+	;; wide,short rectangles than narrow, tall ones.
+	;; Left border
+	(let ((left (+ outside-left outside-margin))
+	      (top (+ outside-top outside-margin non-shadow-thickness))
+	      (right (+ outside-left outside-margin non-shadow-thickness))
+	      (bottom (- outside-bottom shadow-thickness non-shadow-thickness)))
+	  (rectangle :black left top right bottom))
+	;; Top border
+	(let ((left (+ outside-left outside-margin))
+	      (top (+ outside-top outside-margin))
+	      (right (- outside-right shadow-thickness))
+	      (bottom (+ outside-top outside-margin non-shadow-thickness)))
+	  (rectangle :black left top right bottom))
+	;; Right border
+	(let ((left (- outside-right shadow-thickness non-shadow-thickness))
+	      (top (+ outside-top outside-margin non-shadow-thickness))
+	      (right (- outside-right shadow-thickness))
+	      (bottom (- outside-bottom shadow-thickness non-shadow-thickness)))
+	  (rectangle :black left top right bottom))
+	;; Bottom border
+	(let ((left (+ outside-left outside-margin))
+	      (top (- outside-bottom shadow-thickness non-shadow-thickness))
+	      (right (- outside-right shadow-thickness))
+	      (bottom (- outside-bottom shadow-thickness)))
+	  (rectangle :black left top right bottom))
+	;; Right shadow
+	(let ((left (- outside-right shadow-thickness))
+	      (top (+ outside-top outside-margin shadow-thickness))
+	      (right outside-right)
+	      (bottom (- outside-bottom shadow-thickness)))
+	  (rectangle :gray left top right bottom))
+	;; Bottom shadow
+	(let ((left (+ outside-left outside-margin shadow-thickness))
+	      (top (- outside-bottom shadow-thickness))
+	      (right outside-right)
+	      (bottom outside-bottom))
+	  (rectangle :gray left top right bottom))
+	))))
+
+(defflavor margin-whitespace
+	(margin
+	 (thickness 1))
+	(margin-component)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (margin-component-allocate-margins margin-whitespace) (&rest args)
+  (apply #'allocate-single-margin-area margin thickness args))
+
+(defflavor margin-pattern ((pattern :white)) (margin-whitespace)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (margin-component-draw margin-pattern) (window alu)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    (case pattern
+      ((nil :white))
+      ((T :black)
+       (tv:sheet-draw-rectangle (- right left) (- bottom top) left top alu window))
+      (otherwise
+	(flet ((doit (array)
+		 (tv:sheet-draw-1-bit-raster (- right left) (- bottom top)
+					     array left top nil left top
+					     alu color:alu-noop window)))
+	  (etypecase pattern
+	    (array (doit pattern))
+	    (symbol (doit (symbol-value		;---Like, tv:50%-gray
+			    pattern)))))))))
+
+(defflavor margin-label
+	((string nil)
+	 (style nil)
+	 (margin :bottom)
+	 (background-gray nil)
+	 (box nil)
+	 (box-thickness 1)
+	 (extend-box-p t)
+	 (centered-p nil)
+	 (label-needs-updating nil))
+	(margin-component)
+  :initable-instance-variables
+  (:init-keywords :character-style)
+  :writable-instance-variables)
+
+(define-margin-alterant (alter-margin-label margin-label)
+			(string character-style style margin background-gray
+			 box box-thickness extend-box-p centered-p))
+
+(defvar *window-name-place-holder* "The name of the window when it gets one")
+
+(defmethod (make-instance margin-label) (&key window character-style &allow-other-keys)
+  (check-type margin (member :top :bottom))
+  (check-type box (member nil :outside :inside))
+  (unless string
+    (setq string (or (send window :name) *window-name-place-holder*)))
+  (setq style (si:merge-character-styles (or character-style style)
+					 (tv:screen-default-style (tv:sheet-screen window)))))
+
+(defun label-string-height (string window character-style)
+  (if (null string)
+      0
+    (unless (variable-boundp (tv:sheet-merged-current-style window))
+      ;; Get a stream that works.
+      (setq window (tv:sheet-screen window)))
+    (multiple-value-bind (nil nil nil nil total-height)
+	(with-character-style (character-style window :bind-line-height t)
+	  (send window :string-length string))
+      ;; The final line doesn't get any VSP; the intermediate do.
+      (- total-height (send window :vsp)))))
+
+;;; This window system is sooo confused!
+(defmethod (margin-component-after-window-init-kludge margin-label) (window)
+  (when (eq string *window-name-place-holder*)
+    (setq string (send window :name))))
+
+(defmethod (margin-component-allocate-margins margin-label)
+	   (window left top right bottom)
+  (setq left-margin left
+	right-margin (- right))
+  (let ((height (label-string-height string window style)))
+    (when box
+      (incf height box-thickness))
+    (ecase margin
+      (:top
+	(setq top-margin top
+	      bottom-margin (incf top height)))
+      (:bottom
+	(setq bottom-margin (- bottom)
+	      top-margin (- (incf bottom height))))))
+  (values left top right bottom))
+
+(defmethod (margin-component-draw margin-label) (window alu)
+  (tv:with-margin-output (window)
+    (when string
+      (multiple-value-bind (left top right bottom)
+	  (margin-component-edges self window)
+	(when (eq box :outside)
+	  (incf top box-thickness))
+	;; This could use the thing that zmacs will need that computes the
+	;; width and height of some characters.
+	(with-character-style (style window :bind-line-height t)
+	  (let (next-line-height
+		(string (si:some-string string)))
+	    (do-delimited-substrings ((string) (ignore start end))
+		(multiple-value-bind (width index nil nil line-height baseline)
+		    (send window :string-length string start end right style
+								 0 (- right left))
+		  (unless index (setq index end))
+		  (let* ((box-left (+ left (if box box-thickness 0)))
+			 (text-left (if centered-p
+					(- (floor (+ left right) 2) (floor width 2))
+					box-left))
+			 (box-right (if extend-box-p
+					(- right (if box box-thickness 0))
+					(+ text-left width)))
+			 (box-height (if (= end (string-length string))
+					 (- bottom top) line-height)))
+		    (tv:with-current-baseline (window baseline)
+		      (send window :string-out-explicit string text-left top
+							box-right alu start index))
+		    (when background-gray
+		      (tv:sheet-draw-1-bit-raster
+			(- box-right box-left) box-height
+			background-gray 0 0 nil box-left top
+			alu color:alu-noop window))
+		    (when box
+		      (when (eq box :outside)
+			(tv:sheet-draw-rectangle box-thickness box-height
+						 (- box-left box-thickness)
+						 top alu window)
+			(tv:sheet-draw-rectangle box-thickness box-height
+						 box-right top alu window))
+		      (when (and (zerop start)
+				 (if (eq box :inside)
+				     (eq margin :bottom)
+				     (eq margin :top)))
+			(tv:sheet-draw-rectangle (+ (- box-right box-left)
+						    (* box-thickness 2))
+						 box-thickness
+						 (- box-left box-thickness)
+						 (- top box-thickness)
+						 alu window))
+		      (when (and (= end (string-length string))
+				 (if (eq box :inside)
+				     (eq margin :top)
+				     (eq margin :bottom)))
+			(tv:sheet-draw-rectangle (+ (- box-right box-left)
+						    (* box-thickness 2))
+						 box-thickness
+						 (- box-left box-thickness)
+						 (- bottom box-thickness)
+						 alu window)))
+		    (setq next-line-height line-height)))
+	      (#\Return
+	       (incf top next-line-height)))))))))
+
+(defun margin-label-size (label window)
+  (multiple-value-bind (nil nil label-width nil label-height)	;Maximum x, not final x
+      (send window :string-length (if (consp label)
+				      (getf label :string)
+				      label)
+	    0 nil nil
+	    (si:merge-character-styles (and (consp label)
+					    (or (getf label :character-style)
+						(getf label :style)))
+				       (or (let ((current (find-margin-component
+							    window
+							    'margin-label)))
+					     (and current
+						  (margin-label-style current)))
+					   ;; Inited to this, not window's default style.
+					   (tv:screen-default-style (send window :screen)))))
+    (values label-width label-height)))
+
+(defflavor mouse-margin-component () (margin-component))
+
+(defmethod (mouse-margin-component-inside-p margin-component) (window x y)
+  (ignore window x y)
+  nil)
+
+(defmethod (mouse-margin-component-inside-p mouse-margin-component) (window x y)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    (and ( x left) ( y top) (< x right) (< y bottom))))
+
+(defmethod (mouse-margin-component-mouse-enters mouse-margin-component) (window x y)
+  (ignore window x y)
+  )
+
+(defmethod (mouse-margin-component-mouse-leaves mouse-margin-component) (window)
+  (ignore window)
+  )
+
+(defmethod (mouse-margin-component-who-line-documentation-string mouse-margin-component)
+	   (window)
+  (ignore window)
+  )
+
+(defmethod (mouse-margin-component-mouse-moves mouse-margin-component) (window x y)
+  (ignore window x y)
+  )
+
+(defmethod (mouse-margin-component-mouse-click mouse-margin-component) (window button x y)
+  (ignore window button x y)
+  )
+
+(defparameter *elevator-box-thickness* 1)
+(defparameter *elevator-cable-thickness* 1)
+(defparameter *elevator-minimum-size* 8)
+
+;;; Variables that control click-and-hold on the scroll bar
+
+(defvar *scroll-bar-auto-repeat-enable* t
+  "NIL to disable auto-repeating, T if mouse clicks in the scroll bar should auto-repeat.")
+
+(defvar *scroll-bar-auto-repeat-initial-delay* 30
+  "The number of 60ths before mouse clicks in the scroll bar start auto-repeating")
+
+(defvar *scroll-bar-auto-repeat-screen-interval* 30
+  "The number of 60ths between screens when scrolling a screenful at a time")
+
+(defvar *scroll-bar-auto-repeat-minimum-lines-per-second* 2
+  "The number of lines scrolled per second when mouse is at the slow end of the scroll bar")
+
+(defvar *scroll-bar-auto-repeat-maximum-lines-per-second* 50
+  "The number of lines scrolled per second when mouse is at the fast end of the scroll bar")
+
+;Scrolling a full-screen dynamic window by one line takes 0.09 seconds on a 3640
+;in the absence of page faults redrawing the newly visible line.  That's 6 60ths.
+;So assume we can't scroll any faster than that.
+(defvar *scroll-bar-auto-repeat-line-interval* 6)	;Min number of 60ths between lines
+
+(defstruct (range :tree :conc-name (:constructor make-range (min max)))
+  min max)
+
+(defun alter-range (range min max)
+  (setf (range-min range) min)
+  (setf (range-max range) max)
+  range)
+
+(defun range-size (range) (- (range-max range) (range-min range)))
+
+(defun range-equal (range1 range2)
+  (and (eql (range-min range1) (range-min range2))
+       (eql (range-max range1) (range-max range2))))
+
+(defun compute-scroll-bar-ends (available-range visible-range screen-range)
+  (declare (values bar-min bar-max))
+  (let* ((window-min (range-min screen-range))
+	 (window-max (range-max screen-range))
+	 (window-size (range-size screen-range))
+	 (available-min (range-min available-range))
+	 (available-size (range-size available-range)))
+    (flet ((interpolate (x if-empty)
+	     (max window-min
+		  (min window-max
+		       (+ window-min
+			  (if (zerop available-size)
+			      (* if-empty (- window-max window-min))
+			      (round (* window-size (- x available-min))
+				     available-size)))))))
+      (let ((bar-min (interpolate (range-min visible-range) 0))
+	    (bar-max (interpolate (range-max visible-range) 1)))
+	;; Make sure the bar is big enough to be seen.  
+	(when (< (- bar-max bar-min) *elevator-minimum-size*)
+	  (if (< (+ bar-min *elevator-minimum-size*) window-max)
+	      ;; We prefer to displace the bottom/right.
+	      (setq bar-max (min (+ bar-min *elevator-minimum-size*) window-max))
+	      ;; Otherwise place it as near to that end as we can.
+	      (setq bar-max window-max
+		    bar-min (max (- window-max *elevator-minimum-size*) window-min))))
+	(when (> bar-min bar-max)
+	  (setq bar-max bar-min))
+	(values bar-min bar-max)))))
+
+(defvar *default-scroll-bar-margin* :left 
+  "Margin in which scroll bar is allocated, one of :left or :right.")
+
+(defflavor margin-scroll-bar
+	((margin :default)
+	 (elevator-thickness 10)
+	 (shaft-whitespace-thickness 2)
+	 (displayed-range (make-range nil nil))
+	 (window-range (make-range nil nil))
+	 (current-portion nil)
+	 (visibility :normal)
+	 (cable-drawn nil)
+	 (mouse-location nil)
+	 (history-noun nil)
+	 (process-doing-drawing nil))
+	(mouse-margin-component)
+  :initable-instance-variables
+  :readable-instance-variables
+  (:writable-instance-variables visibility margin history-noun process-doing-drawing)
+  (:functions scroll-bar-margin margin-scroll-bar-mouse-portion
+	      margin-scroll-bar-set-mouse-blinker-according-to-portion))
+
+(defun-in-flavor (scroll-bar-margin margin-scroll-bar) ()
+  (if (eq margin :default) *default-scroll-bar-margin* margin))
+
+(defmethod (margin-component-allocate-margins margin-scroll-bar) (&rest args)
+  (apply #'allocate-single-margin-area (scroll-bar-margin)
+	 (+ elevator-thickness (* shaft-whitespace-thickness 2))
+	 args))
+
+(defmethod (margin-scroll-bar-minimum-height margin-scroll-bar) ()
+  ;; Room for top and bottom boxes, and a couple pixels of grey.
+  (+ (* (+ elevator-thickness 2) 2) 2))
+
+(defun set-default-scroll-bar-margin (new-margin)
+  (check-type new-margin (member :left :right))
+  (unless (eq *default-scroll-bar-margin* new-margin)
+    (setq *default-scroll-bar-margin* new-margin)
+    (si:map-over-objects-in-area tv:sheet-area #'si:region-predicate-structure
+				 #'(lambda (ignore ignore window ignore ignore)
+				     (when (and (typep window 'margin-mixin)
+						(find-margin-component window
+								       'margin-scroll-bar))
+				       (send window :set-margin-components
+					     (send window :margin-components)))))))
+
+;;; The ends of the scroll bars want to be the same as the inside of the window.
+;;; We can't just ask the window when drawing the scroll bars, though, because
+;;; with-viewport-margins increases the margins temporarily.  This happens commonly
+;;; for :tyo (which uses with-viewport-margins)  :end-of-page-exception  
+;;; :glitch-for-end-of-page   :set-viewport-position  :adjust-cursorpos-and-visibility 
+;;; :new-scroll-position  draw the scroll bar.  This little kludge lets the scroll
+;;; bar get its chance to ask the window its inside edges after all the margin components
+;;; have allocated their space.
+
+(defmethod (margin-component-after-redefine-margins-kludge margin-scroll-bar) (window)
+  (multiple-value-bind (left top right bottom) (send window :inside-edges)
+    (ecase (scroll-bar-margin)
+      ((:left :right)
+       (alter-range window-range top bottom))
+      ((:top :bottom)
+       (alter-range window-range left right)))))
+
+(defmethod (margin-component-draw margin-scroll-bar) (window alu)
+  (margin-scroll-bar-draw-elevator self window alu t))
+
+;;; available-range (client units): what the client says could be scrolled into the window.
+;;; visible-range (client units): what the client says what the window is actually showing.
+;;; window-range (window pixels): where the elevator/shaft can be drawn
+;;; displayed-range (window pixels): where the elevator itself is currently.
+;;; position is the "other" coordinate of the scroll bar (x for a vertical one)
+;;; width is the "other" to be used by the elevator (width for a vertical one, else height)
+;;; alu, window are something you could figure out for yourself
+;;; direction (:vertical or :horizontal) says what kind of scroll bar to draw.
+;;; force, do-cable, do-car (booleans).
+(defun redraw-elevator (available-range visible-range window-range displayed-range
+			position width alu window direction force do-cable do-car)
+  (declare (values elevator-min elevator-max))
+  (labels ((temp-array-dims (height)
+	     (ecase direction
+	       (:vertical (values height (tv:round-up width 32)))
+	       (:horizontal (values width (tv:round-up height 32)))))
+	   (rectangle (width height x y temp)
+	     (when (and (plusp width) (plusp height))
+	       (ecase direction
+		 (:vertical
+		   (%draw-rectangle width height x y boole-ior temp))
+		 (:horizontal
+		   (%draw-rectangle height width y x boole-ior temp)))))
+	   (bblt (width height x y pattern phase temp)
+	     (when (and (plusp width) (plusp height))
+	       (ecase direction
+		 (:vertical (bitblt boole-ior width height pattern 0 phase temp x y))
+		 (:horizontal (bitblt boole-ior height width pattern phase 0 temp y x)))))
+	   (a-box (begin end edge-thickness fill-pattern fill-phase temp)
+	     ;; Top, bottom
+	     (rectangle width edge-thickness 0 begin temp)
+	     (rectangle width edge-thickness 0 (- end edge-thickness) temp)
+	     ;; Left
+	     (rectangle edge-thickness
+			(- (- end begin) (* edge-thickness 2))
+			0 (+ begin edge-thickness) temp)
+	     ;; Right
+	     (rectangle edge-thickness
+			(- (- end begin) (* edge-thickness 2))
+			(- (+ 0 width) edge-thickness)
+			(+ begin edge-thickness) temp)
+	     (when fill-pattern
+	       (bblt (- width (* edge-thickness 2))
+		     (- (- end begin) (* edge-thickness 2))
+		     (+ 0 edge-thickness)
+		     (+ begin edge-thickness)
+		     fill-pattern (+ fill-phase edge-thickness) temp)))
+	   (draw-cable (begin end phase temp)
+	     (let ((shaft-gray tv:50%-gray))
+	       (bblt *elevator-cable-thickness* (- end begin) 0
+		     begin shaft-gray phase temp)
+	       (bblt *elevator-cable-thickness* (- end begin) (1- width)
+		     begin shaft-gray phase temp)))
+	   (put-down-temp (begin height temp)
+	     (let ((inverse-alu (inverse-alu alu window)))
+	       (ecase direction
+		 (:vertical
+		   (tv:sheet-draw-1-bit-raster width height temp 0 0 nil position begin
+					       alu inverse-alu window))
+		 (:horizontal
+		   (tv:sheet-draw-1-bit-raster height width temp 0 0 nil begin position
+					       alu inverse-alu window))))))
+    (macrolet ((with-temp-array ((var height) &body body)
+		 `(multiple-value-bind (temp-dim-1 temp-dim-2)
+		      (temp-array-dims ,height)
+		    (stack-let ((,var (make-array (list temp-dim-1 temp-dim-2)
+						  :element-type 'bit)))
+		      . ,body))))
+
+      (let ((car-gray tv:33%-gray)
+	    (end-size width)
+	    (window-min (range-min window-range))
+	    (window-max (range-max window-range)))
+
+	(multiple-value-bind (elevator-min elevator-max)
+	    (and do-car 
+		 (stack-let ((shaft-range (make-range (min (+ window-min end-size) window-max)
+						      (max (- window-max end-size) window-min)
+						      )))
+		   (compute-scroll-bar-ends available-range visible-range shaft-range)))
+	  (when (or (null elevator-min) (> elevator-max elevator-min))
+	  (when force
+	    ;; Draw the whole thing.
+	    (with-temp-array (temp (range-size window-range))
+	      (when do-cable
+		;; Draw the top and bottom targets
+		(a-box 0 (+ 0 end-size) *elevator-box-thickness* nil nil temp)
+		(a-box (- (- window-max window-min) end-size) (- window-max window-min)
+		       *elevator-box-thickness* nil nil temp)
+		;; Draw the elevator car
+		(when do-car
+		  (a-box (- elevator-min window-min) (- elevator-max window-min)
+			 1 car-gray (- elevator-min window-min) temp))
+		;; Draw the cables
+		(cond (do-car
+		       (draw-cable (+ 0 end-size) (- elevator-min window-min) 0 temp)
+		       (draw-cable (- elevator-max window-min)
+				   (- window-max window-min end-size)
+				   0 temp))
+		      (T
+		       (draw-cable (+ 0 end-size) (- window-max window-min end-size)
+				   0 temp))))
+	      (put-down-temp (range-min window-range) (range-size window-range) temp))
+	    (return-from redraw-elevator
+	      (values elevator-min elevator-max)))
+
+	  (let ((displayed-min (range-min displayed-range))
+		(displayed-max (range-max displayed-range)))
+
+	    (when (and (eql elevator-min displayed-min)
+		       (eql elevator-max displayed-max))
+	      ;; What's there is correct, no work to be done.
+	      (return-from redraw-elevator
+		(values elevator-min elevator-max)))
+
+	    (cond ((null displayed-min)
+		   ;; Drawing car for first time.
+		   (let ((height (- elevator-max elevator-min)))
+		     (with-temp-array (temp height)
+		       (a-box 0 height 1 car-gray (- elevator-min window-min) temp)
+		       (put-down-temp elevator-min height temp))))
+		  ((null elevator-min)
+		   ;; Taking it away
+		   (let ((height (- displayed-max displayed-min)))
+		     (with-temp-array (temp height)
+		       (draw-cable 0 height (- displayed-min window-min) temp)
+		       (put-down-temp displayed-min height temp))))
+		  ((or ( displayed-min elevator-max) ( elevator-min displayed-max))
+		   ;; Car positions do not overlap (much).
+		   (let* ((changed-min (min elevator-min displayed-min))
+			  (changed-max (max elevator-max displayed-max))
+			  (height (- changed-max changed-min)))
+		     (with-temp-array (temp height)
+		       (a-box (- elevator-min changed-min) (- elevator-max changed-min)
+			      1 car-gray (- elevator-min window-min) temp)
+		       (if (= elevator-min changed-min)
+			   (draw-cable (- elevator-max changed-min)
+				       (- displayed-max changed-min)
+				       (- elevator-max window-min)
+				       temp)
+			   (draw-cable 0 (- elevator-min changed-min)
+				       (- changed-min window-min) temp))
+		       (put-down-temp changed-min height temp))))
+		  (t
+		   (let ((edge-thickness 1))
+		     ;; Handle changes above overlap.
+		     (unless (= elevator-min displayed-min)
+		       (let* ((changed-min (min elevator-min displayed-min))
+			      (overlap-min (max elevator-min displayed-min))
+			      (height (+ (- overlap-min changed-min) edge-thickness)))
+			 (with-temp-array (temp height)
+			   (cond ((= changed-min displayed-min)
+				  ;; Cable above overlap
+				  (draw-cable 0 height (- changed-min window-min) temp)
+				  (rectangle width edge-thickness 0
+					     (- height edge-thickness) temp))
+				 (t
+				  (rectangle width edge-thickness 0 0 temp)
+				  (rectangle edge-thickness (- height edge-thickness)
+					     0 edge-thickness temp)
+				  (rectangle edge-thickness (- height edge-thickness)
+					     (- width edge-thickness) edge-thickness temp)
+				  (bblt (- width (* edge-thickness 2))
+					(- height edge-thickness)
+					edge-thickness edge-thickness car-gray
+					(- (+ changed-min edge-thickness) window-min) temp)))
+			   (put-down-temp changed-min height temp))))
+  
+		     ;; Handle changes below overlap.
+		     (unless (= elevator-max displayed-max)
+		       (let* ((changed-max (max elevator-max displayed-max))
+			      (overlap-max (min elevator-max displayed-max))
+			      (height (+ (- changed-max overlap-max) edge-thickness)))
+			 (with-temp-array (temp height)
+			   (cond ((= changed-max displayed-max)
+				  ;; Cable below overlap
+				  (draw-cable 0 height
+					      (- overlap-max edge-thickness window-min) temp)
+				  (rectangle width edge-thickness 0 0 temp))
+				 (t
+				  (rectangle width edge-thickness 0 (- height edge-thickness)
+					     temp)
+				  (rectangle edge-thickness (- height edge-thickness)
+					     0 0 temp)
+				  (rectangle edge-thickness (- height edge-thickness)
+					     (- width edge-thickness) 0 temp)
+				  (bblt (- width (* edge-thickness 2))
+					(- height edge-thickness)
+					edge-thickness 0 car-gray
+					(- overlap-max edge-thickness window-min)
+					temp)))
+			   (put-down-temp (- overlap-max edge-thickness) height temp)))))))))
+	    
+	    (values elevator-min elevator-max))))))
+
+;;; Special used for communication with background processes.  It gets
+;;; bound dynamically in the background process and evaluated only in
+;;; that context, so it can be a special instead of an IV.
+(defvar-resettable *asking-window-for-scroll-position* ())
+
+(defmethod (margin-scroll-bar-draw-elevator margin-scroll-bar) (window alu &optional force)
+  (unless (eq visibility :suppressed)
+    (unless (and (range-min window-range) (range-max window-range))
+      ;; If we somehow escaped initialization, clean up
+      (margin-component-after-redefine-margins-kludge self window))
+    (multiple-value-bind (left top ignore ignore)
+	(margin-component-edges self window)
+      (let-if (eq (cli::follow-synonym-stream *debug-io*) window)
+	      ((*debug-io* "Error drawing scroll bar"))
+	(flet ((doit ()
+		 (flet ((with-stuff (message continuation)
+			  (macrolet ((with-vis-avail (&body body)
+				       `(multiple-value-bind (min-visible total-visible
+							      min-available max-available)
+					    (send window message)
+					  (stack-let ((vis (make-range min-visible
+								       (+ min-visible
+									  total-visible)))
+						      (avail (make-range min-available
+									 max-available)))
+					    (tv:prepare-sheet (window)
+					      ,@body)))))
+			    (ecase visibility
+			      ((:normal :temporary-normal)
+				(with-vis-avail (funcall continuation vis avail T T)))
+			      (:if-requested
+				(if (null current-portion)
+				    (tv:prepare-sheet (window)
+				      (funcall continuation nil nil T nil))
+				    (with-vis-avail (funcall continuation vis avail T T))))
+			      (:if-needed
+				(with-vis-avail
+				  (let ((range-nequal (not (range-equal vis avail))))
+				    (funcall continuation vis avail
+					     range-nequal range-nequal))))))))
+		   (macrolet ((set-displayed-range (values)
+				 `(%multiple-value-call-n alter-range
+							  displayed-range 1
+							  ,values 2)))
+		     (ecase (scroll-bar-margin)
+		       ((:left :right)
+			(with-stuff
+			  :y-scroll-position
+			  (lambda (visible-range available-range do-cable do-car)
+			    (declare (sys:downward-function))
+			    (set-displayed-range
+				  (redraw-elevator available-range visible-range
+						   window-range displayed-range
+						   (+ left shaft-whitespace-thickness)
+						   elevator-thickness
+						   alu window :vertical
+						   (or force (neq do-cable cable-drawn))
+						   do-cable do-car))
+			    (setq cable-drawn do-cable))))
+		       ((:top :bottom)
+			(with-stuff
+			  :x-scroll-position
+			  (lambda (visible-range available-range do-cable do-car)
+			    (declare (sys:downward-function))
+			    (set-displayed-range
+				  (redraw-elevator available-range visible-range
+						   window-range displayed-range
+						   (+ top shaft-whitespace-thickness)
+						   elevator-thickness
+						   alu window :horizontal
+						   (or force (neq do-cable cable-drawn))
+						   do-cable do-car))
+			    (setq cable-drawn do-cable)))))))))
+	  (unless (catch-error-restart (error "Suppress the scroll bar entirely")
+		    (catch-error-restart (abort "Skip drawing the scroll bar")
+		      (doit))
+		    T)
+	    (setq visibility :suppressed)))))))
+
+(defmethod (margin-component-new-scroll-position margin-scroll-bar) (window)
+  (tv:sheet-force-access (window)
+    (margin-scroll-bar-draw-elevator self window (tv:sheet-char-aluf window))))
+
+(defmethod (margin-component-change-of-size-or-margins margin-scroll-bar) (window)
+  (tv:sheet-force-access (window)
+    (margin-component-erase self window))
+  (setq cable-drawn nil)
+  (alter-range displayed-range nil nil))
+
+(defun-in-flavor (margin-scroll-bar-set-mouse-blinker-according-to-portion margin-scroll-bar)
+		 (window x y)
+  (let ((portion (margin-scroll-bar-mouse-portion window x y)))
+    (unless (eq portion current-portion)
+      (when (tv:mouse-exit-target-direction-sensitive-1 self
+							(ecase (scroll-bar-margin)
+							  ((:left :right) :vertical)
+							  ((:top :bottom) :horizontal))
+							window)
+	(multiple-value-bind (char x-off y-off)
+	    (ecase (scroll-bar-margin)
+	      ((:left :right)
+	       (ecase portion
+		 (:start
+		   (values #\mouse:short-up-arrow 5 0))
+		 (:end
+		   (values #\mouse:short-down-arrow 5 13))
+		 (:middle
+		   (values #\mouse:vertical-double-arrow 5 7))))
+	      ((:top :bottom)
+	       (ecase portion
+		 (:start
+		   (values #\mouse:left-arrow 0 5))
+		 (:end
+		   (values #\mouse:right-arrow 16 5))
+		 (:middle
+		   (values #\mouse:horizontal-double-arrow 8 5)))))
+	  (multiple-value-bind (wl wt wr wb) (send window :inside-edges)
+	    (multiple-value-bind (dx dy mouse) (tv:sheet-mouse-offsets window)
+	      (tv:mouse-set-blinker-definition-internal mouse
+							:character-with-inside-line x-off y-off
+							:on
+							:set-char-direction-and-bounds char
+							(ecase (scroll-bar-margin)
+							  ((:left :right) :horizontal)
+							  ((:top :bottom) :vertical))
+							(+ wl dx) (+ wt dy)
+							(+ wr dx) (+ wb dy))))
+	  (setq current-portion portion))))))
+
+(defmethod (mouse-margin-component-mouse-enters margin-scroll-bar) (window x y)
+  (setq current-portion nil)			;make sure it redefines the mouse blinker
+  (unless (and (range-min window-range) (range-max window-range))
+    ;; If we somehow escaped initialization, clean up
+    (margin-component-after-redefine-margins-kludge self window))
+  (setq mouse-location (compute-mouse-location self window x y))
+  (margin-scroll-bar-set-mouse-blinker-according-to-portion window x y)
+  (when (eq visibility :if-requested)
+    ;; Draw the elevator in a separate process so that the mouse process can keep
+    ;; tracking the mouse cursor while that process is computing the scroll-position.
+    ;; This would not be necessary if Zwei could compute scroll-position instantaneously.
+    ;; Priority is more than computational processes and less than the mouse process.
+    (setq process-doing-drawing 
+	  (process-run-function '(:name "Draw Scroll Bar" :priority 5)
+	    #'(lambda (self window)
+		;; Don't prepare-sheet until after asking the window for its scroll-position,
+		;; so that blinkers are not turned off during that time-consuming operation.
+		(unwind-protect
+		    (tv:sheet-force-access (window t)
+		      (margin-scroll-bar-draw-elevator self window
+						       (tv:sheet-char-aluf window)))
+		  (setf (margin-scroll-bar-process-doing-drawing self) nil)))
+	    self window))
+    #||
+    ;; This code would be used instead if Zmacs could compute scroll-position instantaneously.
+    ;; There is this funny case where the sheet could be locked by the person waiting
+    ;; for the mouse process to back out.  For us to block here would be a disaster.
+    (tv:maybe-lock-sheet window
+      ;; Don't prepare-sheet until after asking the window for its scroll-position,
+      ;; so that blinkers are not turned off during that time-consuming operation.
+      (tv:sheet-force-access (window t)
+	(margin-scroll-bar-draw-elevator self window (tv:sheet-char-aluf window)))
+      (process-run-function '(:name "Draw Scroll Bar" :priority 5)
+	#'(lambda (self window)
+	    ;; Don't prepare-sheet until after asking the window for its scroll-position,
+	    ;; so that blinkers are not turned off during that time-consuming operation.
+	    (tv:sheet-force-access (window t)
+	      (margin-scroll-bar-draw-elevator self window (tv:sheet-char-aluf window))))
+	self window))
+    ||#
+    ))
+
+(defun-in-flavor (margin-scroll-bar-mouse-portion margin-scroll-bar) (window x y)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    (when (and ( left x) (< x right) ( top y) (< y bottom))
+      (let ((displayable-start (range-min window-range))
+	    (displayable-end (range-max window-range)))
+	(ecase (scroll-bar-margin)
+	  ((:left :right)
+	   (cond ((< y (+ (max top displayable-start) elevator-thickness))
+		  :start)
+		 (( y (- (min bottom displayable-end) elevator-thickness))
+		  :end)
+		 (T :middle)))
+	  ((:top :bottom)
+	   (cond ((< x (+ (max left displayable-start) elevator-thickness))
+		  :start)
+		 (( x (- (min right displayable-end) elevator-thickness))
+		  :end)
+		 (T :middle))))))))
+
+(defmethod (mouse-margin-component-mouse-moves margin-scroll-bar) (window x y)
+  (setq mouse-location (compute-mouse-location self window x y))
+  (margin-scroll-bar-set-mouse-blinker-according-to-portion window x y))
+
+(defmethod (mouse-margin-component-mouse-leaves margin-scroll-bar) (window)
+  (tv:mouse-standard-blinker window)
+  (without-interrupts
+    (when process-doing-drawing
+      ;; Only reset the process if it's still figuring out the scroll position.
+      ;; Otherwise, let it finish unmolested -- it won't take long now.
+      (when (and (string-equal (si:process-name process-doing-drawing) "Draw Scroll Bar")
+		 (ignore-errors
+		   (sys:symeval-in-stack-group '*asking-window-for-scroll-position*
+					       (si:process-stack-group process-doing-drawing))))
+	(si:process-reset process-doing-drawing nil nil nil)
+	(setq process-doing-drawing nil))))
+  (setq current-portion nil))
+
+(defmethod (compute-mouse-location margin-scroll-bar) (window window-mouse-x window-mouse-y)
+  (multiple-value-bind (left top right bottom)
+      (margin-component-edges self window)
+    ;; keep in 0-100% range
+    (min 100
+	 (max 0
+	      (round (* 100
+			(multiple-value-bind (low high coord)
+			    (ecase (scroll-bar-margin)
+			      ((:left :right)
+			       (values top bottom window-mouse-y))
+			      ((:top :bottom)
+			       (values left right window-mouse-x)))
+			  (maxf low (range-min window-range))
+			  (minf high (range-max window-range))
+			  ;; subtract off the end box size
+			  (/ (float (- coord (+ low elevator-thickness)))
+			     (- (- high low)
+				;; reduce bar length by the two end boxes
+				(* elevator-thickness 2))))))))))
+
+(defstruct (who-line-doc-buffer :named-array-leader
+				(:make-array (:length 200
+					      ;; can't write fat chars into this, but
+					      ;; we have complete control of contents
+					      :type 'sys:art-string
+					      :fill-pointer 0)))
+  ;; need to reserve one slot in the leader for the fill pointer...
+  fill-pointer
+  (displayed-current-portion nil)
+  (displayed-mouse-location nil)
+  (window nil))
+
+(defvar *who-line-doc-buffer* (make-who-line-doc-buffer))
+(defvar *other-who-line-doc-buffer* (make-who-line-doc-buffer))
+
+(defmethod (mouse-margin-component-who-line-documentation-string margin-scroll-bar) (window)
+  (labels ((display-doc (formatter)
+	     (declare (sys:downward-funarg formatter))
+	     ;; if the % hasn't changed, use the old doc
+	     (unless (and (eq window
+			      (who-line-doc-buffer-window *who-line-doc-buffer*))
+			  (eq current-portion
+			      (who-line-doc-buffer-displayed-current-portion
+				*who-line-doc-buffer*))
+			  (eql mouse-location
+			       (who-line-doc-buffer-displayed-mouse-location
+				 *who-line-doc-buffer*)))
+	       ;; otherwise, use the other buffer (so the scheduler will know to update)
+	       ;; and fill in the new data
+	       (rotatef *who-line-doc-buffer* *other-who-line-doc-buffer*)
+	       (setf (who-line-doc-buffer-window *who-line-doc-buffer*) window)
+	       (setf (who-line-doc-buffer-displayed-mouse-location *who-line-doc-buffer*)
+		     mouse-location)
+	       (setf (who-line-doc-buffer-displayed-current-portion *who-line-doc-buffer*)
+		     current-portion)
+	       (setf (fill-pointer *who-line-doc-buffer*) 0)
+	       (funcall formatter *who-line-doc-buffer*))
+	     *who-line-doc-buffer*)
+	   (display-box-doc (next-what first-p)
+	     (display-doc
+	       (lambda (buffer)		;Don't use FORMAT, it is too slow
+		 (string-nconc buffer "Left: Next " next-what
+				      (if first-p
+					  "; Middle: First screenful (0%)"
+					  "; Middle: Last screenful (100%)"))
+		 (when history-noun
+		   (string-nconc buffer " of " history-noun))
+		 (string-nconc buffer "; Right: Previous " next-what "."))))
+	   (display-middle-doc-1 (left right)
+	     (display-doc 
+	       (lambda (buffer)		;Don't use FORMAT, it is too slow
+		 (string-nconc buffer left)
+		 (let ((number mouse-location))	;inline decimal print for speed
+		   (when (integerp number)	;can mouse-location ever be NIL?
+		     (when (> number 99)
+		       (multiple-value-bind (quo rem) (floor number 100)
+			 (vector-push (digit-char quo) buffer)
+			 (setq number rem)))
+		     (when (> mouse-location 9)	;not number, heh, heh, think about 100
+		       (multiple-value-bind (quo rem) (floor number 10)
+			 (vector-push (digit-char quo) buffer)
+			 (setq number rem)))
+		     (vector-push (digit-char number) buffer)))
+		 (vector-push #\% buffer)
+		 (when history-noun
+		   (string-nconc buffer " of " history-noun))
+		 (string-nconc buffer right)))))
+   (macrolet ((display-middle-doc (type left shift-left right)
+		`(display-middle-doc-1 ,(string-append "Left: Marked " type " to " left
+						       " (shift-Left: to " shift-left
+						       "); Middle: Move to ")
+				       ,(string-append "; Right: " right " to mark."))))
+    ;; return the string, but setq the needs-update flag after it is constructed
+    (values (and current-portion		;return nil if :if-needed and not needed
+		 (ecase (scroll-bar-margin)
+		   ((:left :right)
+		    (ecase current-portion
+		      (:start
+			(display-box-doc "line" t))
+		      (:middle
+			(display-middle-doc "line" "top" "bottom" "Top line"))
+		      (:end
+			(display-box-doc "screenful" nil))))
+		   ((:top :bottom)
+		    (ecase current-portion
+		      (:start
+			(display-box-doc "column" t))
+		      (:middle
+			(display-middle-doc "column" "left edge" "right edge" "Left edge"))
+		      (:end
+			(display-box-doc "screenful" nil))))))
+	    (and *scroll-bar-auto-repeat-enable*
+		 (if (sys:console-key-state (tv:sheet-console window) :shift)
+		     (if (member (scroll-bar-margin) '(:left :right))
+   "Press and hold Left mouse button to scroll downwards repeatedly.  Right: upwards."
+   "Press and hold Left mouse button to scroll rightwards repeatedly.  Right: leftwards.")
+		     (if (member (scroll-bar-margin) '(:left :right))
+   "Press and hold Left mouse button to scroll upwards repeatedly.  Right: downwards."
+   "Press and hold Left mouse button to scroll leftwards repeatedly.  Right: rightwards.")
+		     ))))))
+
+(defmethod (mouse-margin-component-mouse-click margin-scroll-bar) (window mouse-char x y)
+  (unless current-portion	;:if-needed and not needed
+    (return-from mouse-margin-component-mouse-click nil))
+  (let ((shaft-min (+ (range-min window-range) elevator-thickness))	;bounds for Mouse-M
+	(shaft-max (- (range-max window-range) elevator-thickness))
+	;; Enable sending of a WINDOW-WAKEUP-VIEWPORT-POSITION-CHANGED blip
+	(tv:*asynchronous-window-operation* T))
+
+    ;; Isolate the Mouse-Middle case
+    (when (eql mouse-char #\Mouse-M)
+      ;; Middle: Jump to a proportional place in the "buffer"
+      ;; If we are n% of the window down, we want the point
+      ;; n% through the buffer to appear at the top of the window.
+      (multiple-value-bind (scroll-position scroll-to coordinate)
+	  (ecase (scroll-bar-margin)
+	    ((:left :right) (values :y-scroll-position :y-scroll-to y))
+	    ((:top :bottom) (values :x-scroll-position :x-scroll-to x)))
+	(multiple-value-bind (nil nil min-scrollable max-scrollable)
+	    (send window scroll-position)
+	  (let ((to-where (case current-portion
+			    (:start min-scrollable)
+			    (:end max-scrollable)
+			    (otherwise
+			      (+ min-scrollable
+				 (round (* (- max-scrollable min-scrollable)
+					   (max (- (min coordinate shaft-max) shaft-min) 0))
+					(- shaft-max shaft-min)))))))
+	    (send window scroll-to to-where :absolute)
+	    (return-from mouse-margin-component-mouse-click t)))))
+
+    ;; Mouse-Left, -Right cases
+    (multiple-value-bind (scroll-to start end here)
+	(ecase (scroll-bar-margin)
+	  ((:left :right)
+	   (values :y-scroll-to :top :bottom (if (eq current-portion :end) :bottom y)))
+	  ((:top :bottom)
+	   (values :x-scroll-to :left :right (if (eq current-portion :end) :right x))))
+      (labels ((scroll-relative (from to)
+		 (if (and (plusp cp::*scroll-one-screenful-number-of-lines-left*)
+			  (operation-handled-p window :scroll-one-screenful)
+			  (or (and (eq from :top) (eq to :bottom))
+			      (and (eq from :bottom) (eq to :top))))
+		     (send window :scroll-one-screenful (eq to :bottom)
+			   cp::*scroll-one-screenful-number-of-lines-left*)
+		     (send window :scroll-relative from to))))
+	(if (eq current-portion :start)
+	    (case mouse-char
+	      (#\Mouse-L (send window scroll-to +1 :relative-jump))
+	      (#\Mouse-R (send window scroll-to -1 :relative-jump))
+	      (otherwise (return-from mouse-margin-component-mouse-click nil)))
+	    (case mouse-char
+	      (#\Mouse-L (scroll-relative here start))
+	      (#\Mouse-R (scroll-relative start here))
+	      (#\sh-mouse-L (scroll-relative here end))
+	      (#\sh-mouse-R (scroll-relative end here))	;Of course, you can't click sh-mouse-R
+	      (otherwise (return-from mouse-margin-component-mouse-click nil))))
+
+	(when *scroll-bar-auto-repeat-enable*
+	  ;; Repeat while mouse button is held
+	  ;; It would be nice if this would stop when it had scrolled as far as you
+	  ;; can go.  Unfortunately, we can't do that by calling :y-scroll-position
+	  ;; to see where we are, because it's very slow for zwei, and we can't do
+	  ;; it by calling :ragged-borders-p, because it stops too soon when scrolling
+	  ;; to the end of a dynamic window: it stops before the line with input
+	  ;; echoing and the cursor on it becomes visible.
+	  (multiple-value-bind (mouse-x-offset mouse-y-offset)
+	      (tv:sheet-mouse-offsets window)
+	    ;; Compute which way we are moving, which end of the scroll bar is fast, and
+	    ;; what the initial state of the mouse was
+	    (let* ((mouse (tv:sheet-mouse window))
+		   (vertical (eq start :top))
+		   (backwards (or (eql mouse-char #\Mouse-R) (eql mouse-char #\sh-mouse-L)))
+		   (inverse (or (eql mouse-char #\sh-mouse-L) (eql mouse-char #\sh-mouse-R)))
+		   (current-buttons (lsh 1 (char-mouse-button mouse-char)))
+		   (old-buttons current-buttons)
+		   (old-x (+ x mouse-x-offset))
+		   (old-y (+ y mouse-y-offset))
+		   (time (sys:time))
+		   (initial-delay t))
+	      (labels ((scroll-once (delta)
+			 (if (symbolp here)	;scrolling by screens rather than lines
+			     (if backwards
+				 (scroll-relative start here)
+				 (scroll-relative here start))
+			     (send window scroll-to delta :relative-jump)))
+		       (scroll-again (delta)
+			 ;; Unfortunately, to get right-looking behavior we have to use
+			 ;; two different algorithms, depending on whether or not this is
+			 ;; zwei, which does its scrolling in another process
+			 (cond ((typep window 'zwei:zwei)
+				;; Try not to outrace the redisplay process.  But wait with
+				;; a timeout so we don't wedge up the mouse if there is a
+				;; problem with the zwei process.
+				(process-wait-with-timeout "I/O buffer" 30
+				  #'send window :io-buffer-empty-p)
+				(process-wait-with-timeout "Await Redisplay" 120
+				  (lambda (window)
+				    (= (zwei:window-redisplay-degree window) zwei:dis-none))
+				  (send window :zwei-window))
+				;; After that delay, make sure buttons are still held
+				(unless (zerop (tv:mouse-buttons t mouse))
+				  (scroll-once delta)))
+			       (t
+				;; Lock the sheet so as to synchronize with scroll-windows
+				;; Don't wait forever for the sheet lock, since we could get
+				;; into a deadlock if a menu is covering the sheet and
+				;; waiting for us to ungrab the mouse.  The scroll method
+				;; might wait for the sheet lock, so lock before calling it.
+				(tv:maybe-lock-sheet window (scroll-once delta) nil)))))
+		;; Grab the buttons so tv:mouse-wait-internal will let us see transitions
+		(setf (tv:mouse-buttons-grabbed mouse) t)
+		(setf (tv:mouse-window mouse) t)
+		;; Unwind-protect ungrabs the buttons when we exit
+		(unwind-protect
+		    ;; This loop iterates each time we switch direction
+		    (loop named outer do
+		      ;; Set the mouse cursor and documentation so the user knows what's up
+		      (setf (tv:who-line-mouse-grabbed-documentation mouse)
+			    (if (logtest 1 old-buttons)
+				(if vertical
+				    (if backwards
+					(if (symbolp here)
+    "Hold the Left mouse button to keep scrolling the window down a screenful at a time."
+    "Hold the Left mouse button to keep scrolling the window contents downwards.")
+					(if (symbolp here)
+    "Hold the Left mouse button to keep scrolling the window up a screenful at a time."
+    "Hold the Left mouse button to keep scrolling the window contents upwards."))
+				    (if backwards
+					(if (symbolp here)
+    "Hold the Left mouse button to keep scrolling the window right a screenful at a time."
+    "Hold the Left mouse button to keep scrolling the window contents rightwards.")
+					(if (symbolp here)
+    "Hold the Left mouse button to keep scrolling the window left a screenful at a time."
+    "Hold the Left mouse button to keep scrolling the window contents leftwards.")))
+				(if vertical
+				    (if backwards
+					(if (symbolp here)
+    "Hold the Right mouse button to keep scrolling the window down a screenful at a time."
+    "Hold the Right mouse button to keep scrolling the window contents downwards.")
+					(if (symbolp here)
+    "Hold the Right mouse button to keep scrolling the window up a screenful at a time."
+    "Hold the Right mouse button to keep scrolling the window contents upwards."))
+				    (if backwards
+					(if (symbolp here)
+    "Hold the Right mouse button to keep scrolling the window right a screenful at a time."
+    "Hold the Right mouse button to keep scrolling the window contents rightwards.")
+					(if (symbolp here)
+    "Hold the Right mouse button to keep scrolling the window left a screenful at a time."
+    "Hold the Right mouse button to keep scrolling the window contents leftwards.")))))
+		      (setf (tv:who-line-mouse-grabbed-more-documentation mouse)
+			    (if (logtest 1 old-buttons)
+				(if (symbolp here)
+    "Mouse-Right: Reverse direction."
+				    (if vertical
+    "Vertical position of mouse controls the speed.  Mouse-Right: Reverse direction."
+    "Horizontal position of mouse controls the speed.  Mouse-Right: Reverse direction."))
+				(if (symbolp here)
+    "Mouse-Left: Reverse direction."
+				    (if vertical
+    "Vertical position of mouse controls the speed.  Mouse-Left: Reverse direction."
+    "Horizontal position of mouse controls the speed.  Mouse-Left: Reverse direction."))))
+		      ;; Mouse cursor is a fat arrow in the direction the window contents move
+		      (multiple-value-bind (character x-off y-off)
+			  (if vertical
+			      (if backwards
+				  (values #\mouse:fat-down-arrow 8 15)
+				  (values #\mouse:fat-up-arrow 8 0))
+			      (if backwards
+				  (values #\mouse:fat-right-arrow 15 8)
+				  (values #\mouse:fat-left-arrow 0 8)))
+			(tv:mouse-set-blinker-definition-internal mouse :character
+								  x-off y-off :on
+								  :set-character character))
+		      ;; Setup complete, loop while buttons are held
+		      (loop named inner with time-interval and delta do 
+			;; Figure out how fast to scroll, based on the current mouse position
+			;; Recompute this each time we go around (i.e. whenever mouse moves)
+			(cond (initial-delay
+			       (setq time-interval *scroll-bar-auto-repeat-initial-delay*))
+			      ((symbolp here)	;scrolling by screens rather than lines
+			       (setq time-interval *scroll-bar-auto-repeat-screen-interval*))
+			      (t
+			       (let ((rate		;number of lines per second
+				      (+ (round
+					  (* *scroll-bar-auto-repeat-maximum-lines-per-second*
+					     (if inverse
+						 (- shaft-max
+						    (min (max (if vertical y x) shaft-min)
+							 shaft-max))
+						 (- (min (max (if vertical y x) shaft-min)
+							 shaft-max)
+						    shaft-min)))
+					  (- shaft-max shaft-min))
+					 *scroll-bar-auto-repeat-minimum-lines-per-second*)))
+				 (setq time-interval
+				         (max (round 60 rate)
+					      *scroll-bar-auto-repeat-line-interval*)
+				       delta (ceiling (* rate time-interval) 60))
+				 (when backwards
+				   (setq delta (- delta))))))
+			;; Don't get ahead of screen redrawing
+			(send window :finish)
+			;; Wait for the button to be released or for the mouse to move
+			(multiple-value-bind (buttons new-x new-y)
+			    (tv:mouse-wait-internal mouse old-x old-y old-buttons
+						    "Scrolling while button down"
+						    (- time-interval
+						       (time-difference (sys:time) time)))
+			  ;; Track the mouse
+			  (unless (and (= new-x old-x) (= new-y old-y))
+			    (setq x (- new-x mouse-x-offset)
+				  y (- new-y mouse-y-offset))
+			    (setq old-x new-x old-y new-y)
+			    (tv:mouse-set-blinker-cursorpos-internal mouse))
+			  ;; Return if buttons have been released
+			  (setq old-buttons buttons)
+			  (when (zerop buttons)
+			    (return-from outer))
+			  ;; Reverse direction if user is pressing a different button
+			  (unless (logtest current-buttons buttons)
+			    (setq backwards (not backwards)
+				  current-buttons (logxor current-buttons 5))
+			    (return-from inner))
+			  ;; See if it's time to scroll
+			  (when (time-elapsed-p time-interval time)
+			    (setq time (sys:time))
+			    (if initial-delay
+				(setq initial-delay nil)
+				(scroll-again delta))))))
+		  ;; unwind-protect cleanup
+		  (setf (tv:mouse-buttons-grabbed mouse) nil)
+		  (setf (tv:mouse-window mouse) window)
+		  ;; This restores the mouse cursor
+		  (mouse-margin-component-mouse-enters self window x y))))))
+	;; Return t to indicate that the mouse click was handled
+	t))))
+
+(defmethod (tv:mouse-exit-target-direction-sensitive-1 margin-scroll-bar) (direction window)
+  (let ((message (ecase (scroll-bar-margin)
+		   ((:left :right) :y-scroll-position)
+		   ((:top :bottom) :x-scroll-position))))
+    (and ;; Same logic as in the margin-scroll-bar-draw-elevator method, disentangled
+	 ;; from everything else that method does, returning T if the scroll bar shaft
+	 ;; is visible.  This doesn't say anything about the visibility of the car.
+	 (ecase visibility
+	   (:suppressed nil)
+	   ((:normal :temporary-normal :if-requested) t)
+	   (:if-needed
+	     (multiple-value-bind (min-visible total-visible min-available max-available)
+		 (send window message)
+	       (not (and (eql min-visible min-available)
+			 (eql (+ min-visible total-visible) max-available))))))
+	 (cl:ecase direction
+	   (:vertical (eq message :y-scroll-position))
+	   (:horizontal (eq message :x-scroll-position))))))
+
+(defflavor margin-ruler
+	((scale-transform (copy-list graphics:*identity-transform*))
+	 (scale-units-per-major-division 100)
+	 (scale-units-per-minor-division 25)
+	 (dash-pattern #(1 2))
+	 (margin :bottom)
+	 (visibility t)
+	 (thickness 20)
+	 (position nil)				;In window units
+	 (displayed-viewport-position nil)
+	 )
+	(margin-component)
+  :initable-instance-variables
+  :writable-instance-variables)
+
+(define-margin-alterant (alter-margin-ruler margin-ruler)
+			(scale-transform scale-units-per-major-division
+			 scale-units-per-minor-division visibility thickness
+			 dash-pattern))
+
+(defmethod (margin-component-allocate-margins margin-ruler)
+	   (window left top right bottom)
+  (when visibility
+    (multiple-value-setq (left top right bottom)
+      (allocate-single-margin-area margin (1+ thickness) window left top right bottom)))
+  (values left top right bottom))
+
+(defmethod (margin-component-erase margin-ruler :after) (ignore)
+  (setq position nil))
+
+(defun-in-flavor (margin-ruler-xor-mark margin-ruler) (window)
+  (multiple-value-bind (left top)
+      (margin-component-edges self window)
+    (let ((flip-alu (graphics::standardize-alu window :flip)))
+      (ecase margin
+	((:top :bottom)
+	 (when (and (plusp position)
+		    (< position (tv:sheet-inside-width window)))
+	   (let ((raster (graphics::dash-pattern-to-bitblt-pattern dash-pattern t)))
+	     (tv:prepare-sheet (window)
+	       (tv:sheet-draw-1-bit-raster 1 thickness raster 0 0 nil
+					   (+ position (tv:sheet-inside-left window)) top
+					   flip-alu color:alu-noop window)))))
+	((:left :right)
+	 (when (and (plusp position)
+		    (< position (tv:sheet-inside-height window)))
+	   (let ((raster (graphics::dash-pattern-to-bitblt-pattern dash-pattern nil)))
+	     (tv:prepare-sheet (window)
+	       (tv:sheet-draw-1-bit-raster thickness 1 raster 0 0 nil
+					   left (+ position (tv:sheet-inside-top window))
+					   flip-alu color:alu-noop window)))))))))
+
+(defmethod (margin-component-draw margin-ruler) (window alu)
+  (when (eq visibility t)
+    (multiple-value-bind (wleft wtop wright wbottom)
+	(send window :visible-cursorpos-limits)
+      (multiple-value-bind (mleft mtop mright mbottom)
+	  (margin-component-edges self window)
+	(ecase margin
+	  (:left
+	    (tv:sheet-draw-rectangle 1 (- mbottom mtop) (1- mright) mtop alu window))
+	  (:top
+	    (tv:sheet-draw-rectangle (- mright mleft) 1 mleft (1- mbottom) alu window))
+	  (:right
+	    (tv:sheet-draw-rectangle 1 (- mbottom mtop) mleft mtop alu window))
+	  (:bottom
+	    (tv:sheet-draw-rectangle (- mright mleft) 1 mleft mtop alu window)))
+	(multiple-value-bind (horizontal-p scale-min scale-max)
+	    (ecase margin
+	      ((:top :bottom)
+	       (values t
+		       (graphics:untransform-point wleft wtop scale-transform)
+		       (graphics:untransform-point wright wbottom scale-transform)))
+	      ((:left :right)
+	       (values nil
+		       (multiple-value-bind (nil y)
+			   (graphics:untransform-point wleft wtop scale-transform)
+			 y)
+		       (multiple-value-bind (nil y)
+			   (graphics:untransform-point wright wbottom scale-transform)
+			 y))))
+	  (let ((wleft (- (tv:sheet-left-margin-size window) wleft))
+		(wtop (- (tv:sheet-top-margin-size window) wtop))
+		(size (floor thickness 4)))
+	    (loop for i from (ceiling (min scale-min scale-max)
+				      scale-units-per-minor-division)
+			below (ceiling (max scale-min scale-max)
+				       scale-units-per-minor-division)
+		  as j = (* i scale-units-per-minor-division)
+		  do
+	      (let ((pos (round (if horizontal-p
+				    (graphics:transform-point j 0 scale-transform)
+				    (multiple-value-bind (nil y)
+					(graphics:transform-point 0 j scale-transform)
+				      y)))))
+		(if horizontal-p
+		    (tv:sheet-draw-rectangle 1 size (+ wleft pos) mtop alu window)
+		    (tv:sheet-draw-rectangle size 1 mleft (+ wtop pos) alu window))))
+	    (loop for i from (ceiling (min scale-min scale-max)
+				      scale-units-per-major-division)
+			below (ceiling (max scale-min scale-max)
+				       scale-units-per-major-division)
+		  as j = (* i scale-units-per-major-division)
+		  do
+	      (let ((pos (round (if horizontal-p
+				    (graphics:transform-point j 0 scale-transform)
+				    (multiple-value-bind (nil y)
+					(graphics:transform-point 0 j scale-transform)
+				      y)))))
+		(stack-let ((name (make-array 4 :element-type 'string-char
+						:fill-pointer 0)))
+		  (format name "~D" j)
+		  (let* ((length (fill-pointer name))
+			 (style (if (and horizontal-p (< length 3))
+				    (si:parse-character-style '(:fix :roman :small))
+				    (si:parse-character-style '(:fix :roman :very-small)))))
+		    (with-character-style (style window :bind-line-height t)
+		      (let ((width (send window :string-length name))
+			    (height (send window :baseline)))
+			(cond (horizontal-p
+			       (send window :string-out-explicit name
+				     (+ wleft (- pos (floor width 2)))
+				     (+ mtop size 1) (+ wleft pos width) alu)
+			       (tv:sheet-draw-rectangle 1 size
+							(+ wleft pos) (- mbottom size)
+							alu window))
+			      (t
+			       (loop for i below length
+				     for y from (+ wtop (- pos (floor (* height length) 2)))
+					   by height
+				     with x = (+ mleft size 2)
+				     do
+				 (send window :string-out-explicit name x y (+ x width)
+				       alu i (1+ i)))
+			       (tv:sheet-draw-rectangle size 1
+							(- mright size) (+ wtop pos)
+							alu window))))))))))))
+      (when position
+	(margin-ruler-xor-mark window))
+      (setq displayed-viewport-position (ecase margin
+					  ((:left :right) wtop)
+					  ((:top :bottom) wleft))))))
+
+(defmethod (margin-component-need-mouse-position margin-ruler) () visibility)
+
+(defmethod (margin-component-update-mouse-position-display margin-ruler) (window x y)
+  (when (eq visibility t)
+    (let ((new-position (ecase margin
+			  ((:top :bottom) x)
+			  ((:left :right) y))))
+      (tv:prepare-sheet (window)
+	(unless (eql new-position position)
+	  (when position
+	    (margin-ruler-xor-mark window)
+	    (setq position nil))
+	  (when new-position
+	    (setq position new-position)
+	    (margin-ruler-xor-mark window)))))))
+
+(defmethod (margin-component-new-scroll-position margin-ruler) (window)
+  (when (and (eq visibility t) displayed-viewport-position
+	     (not (= displayed-viewport-position
+		     (multiple-value-bind (x y)
+			 (send window :viewport-position)
+		       (ecase margin
+			 ((:left :right) y)
+			 ((:top :bottom) x))))))
+    (tv:sheet-force-access (window)
+      (margin-component-erase self window)
+      (margin-component-draw self window (send window :char-aluf)))))
+
+;;; This is just like normal windows before.
+(defparameter *thin-borders-and-label-margin-components*
+  `((margin-borders )
+    (margin-white-borders )
+    (margin-label )))
+
+(defparameter *ragged-borders-label-and-scroll-bars-margin-components*
+  `((margin-ragged-borders )
+    (margin-scroll-bar :history-noun "history")
+    (margin-scroll-bar :margin :bottom :history-noun "history")
+    (margin-white-borders :thickness 2)
+    (margin-label )))
+
+(defparameter *listener-margin-components*
+  `((margin-ragged-borders )
+    ;; Scroll bar has slightly wider target, also adding a little more margin.
+    (margin-scroll-bar :shaft-whitespace-thickness 4 :history-noun "history")
+    ;; Listeners have labels at bottom, in hl italic.
+    (margin-label :margin :bottom
+		  :style (:swiss :italic :normal))
+    ;; The bottom scroll bar is inside the label
+    (margin-scroll-bar :margin :bottom :history-noun "history")
+    (margin-white-borders :thickness 2)))
+
+(defparameter *drop-shadow-and-outside-box-label-margin-components*
+  `((margin-drop-shadow-borders )
+    (margin-label :box :inside :margin :top)
+    (margin-white-borders :thickness 2)))
+
+(defparameter *tombstone-borders-with-scroll-bars-margin-components*
+  '((margin-borders :thickness 1)
+    (margin-white-borders :thickness 3)
+    (margin-borders :thickness 10)
+    (margin-white-borders :thickness 8)
+    (margin-ragged-borders :thickness 3)
+    (margin-whitespace :margin :left :thickness 23)
+    (margin-scroll-bar :history-noun "history")
+    (margin-whitespace :margin :left :thickness 20)
+    (margin-label :margin :bottom
+		  :style (:swiss :italic :normal))
+    (margin-whitespace :margin :top :thickness 7)
+    (margin-whitespace :margin :right :thickness 7)
+    (margin-white-borders :thickness 3)
+    (margin-scroll-bar :margin :bottom :history-noun "history")))
+
+(defvar *standard-margin-components* *thin-borders-and-label-margin-components*)
+
+(defflavor margin-mixin
+	((margin-components *standard-margin-components*)
+	 (mouse-margin-component nil)
+	 (mouse-position-margin-components nil))
+	(tv:margin-hacker-mixin)
+  :initable-instance-variables
+  :gettable-instance-variables
+  (:init-keywords :borders :border-margin-width :label)	;Compatibility
+  )
+
+(defun find-margin-component (margin-components lisp-object-type)
+  (find lisp-object-type
+	(etypecase margin-components
+	  (sequence margin-components)
+	  (margin-mixin (send margin-components :margin-components)))
+	:test (lambda (x y) (si:typep-flavor y x))))
+
+(defmethod (:init margin-mixin :before) (plist)
+  ;; Is this right?  Any keyword given overrides what else might happen.
+  ;; So, you have to give all or none.
+  (destructuring-bind (&key (borders t borders-p)
+			    (border-margin-width 1 border-margin-width-p)
+			    (label t label-p)
+			    ((:margin-components ignore) *standard-margin-components*
+							 margin-components-p)
+			    &allow-other-keys)
+		      (location-contents plist)
+    (unless (and (not borders-p)
+		 (not border-margin-width-p)
+		 (not label-p))
+      (when margin-components-p
+	(error "You cannot specify :BORDERS or :LABEL except with the standard margin components.
+You need to write the borders or label in terms of them."))
+      (setq margin-components
+	    (append (when borders
+		      (when (eq borders t)
+			(setq borders 1))
+		      `(,(if (consp borders)
+			     (destructuring-bind (left top right bottom) borders
+			       `(margin-asymmetrical-borders :left-thickness ,left
+							     :top-thickness ,top
+							     :right-thickness ,right
+							     :bottom-thickness ,bottom))
+			     `(margin-borders :thickness ,borders))
+			(margin-white-borders :thickness ,border-margin-width)))
+		    (remove-if #'(lambda (spec)
+				   (subtypep (first spec)
+					     '(or margin-white-borders
+						  margin-ragged-borders
+						  margin-borders
+						  margin-asymmetrical-borders
+						  margin-whitespace
+						  margin-label)))
+			       margin-components)
+		    (when label
+		      (let ((label-string nil)
+			    (label-style nil)
+			    (label-margin :bottom))
+			(cond ((CONSP label)
+			       ;; See (PARSE-LABEL-SPEC LABEL-MIXIN).
+			       (let ((list label))
+				 (loop while list doing
+				   (ecase (pop list)
+				     (:string (setq label-string (pop list)))
+				     ((:style :character-style)
+				      (setq label-style (pop list)))
+				     (:top (setq label-margin :top))
+				     (:bottom (setq label-margin :bottom))))))
+			      ((si:some-string label)
+			       (setq label-string label)))
+			`((margin-label :string ,label-string
+					:character-style ,label-style
+					:margin ,label-margin))))))))
+  (tv:adjust-margins 'margin-components :parse-margin-components-spec plist nil))
+
+
+
+;;; MARGIN-COMPONENTS are specified with lists in init plist.
+;;; When changing a flavor to add margin-mixin, the flavor system
+;;; sets margin-components to the lists, which is inappropriate.
+;;; Change them here.
+(defmethod (flavor:transform-instance margin-mixin :before) (&rest ignore)
+  (when (some #'consp margin-components)
+    (send self :reconsider-margin-components)))
+
+(defmethod (:init margin-mixin :after) (ignore)
+  (dolist (margin-component margin-components)
+    (margin-component-after-window-init-kludge margin-component self)))
+
+;;; Compatibility
+
+(defmethod (:borders margin-mixin) ()
+  (let ((border (find-margin-component margin-components 'margin-borders)))
+    (when border (margin-white-borders-thickness border))))
+
+(defmethod (:set-borders margin-mixin) (borders)
+  (let ((border-margin-width 1)
+	(spec margin-components))
+    (setq spec (delete-if (lambda (margin-component)
+			    ;; The purpose of all this is to make :SET-BORDERS T undo
+			    ;; tombstones.
+			    (typecase margin-component
+			      ((or margin-borders margin-asymmetrical-borders
+				   margin-whitespace) t)
+			      (margin-white-borders
+				(setq border-margin-width (margin-white-borders-thickness
+							    margin-component))
+				t)))
+			  spec))
+    (send self :set-margin-components
+	  (nconc (when borders
+		   (when (eq borders t)
+		     (setq borders 1))
+		   `(,(if (consp borders)
+			  (destructuring-bind (left top right bottom) borders
+			    `(margin-asymmetrical-borders :left-thickness ,left
+							  :top-thickness ,top
+							  :right-thickness ,right
+							  :bottom-thickness ,bottom))
+			  `(margin-borders :thickness ,borders))
+		     (margin-white-borders :thickness ,border-margin-width)))
+		 spec))))
+
+(defmethod (:label margin-mixin) ()
+  (let ((label (find-margin-component margin-components 'margin-label)))
+    (when label (margin-label-string label))))
+
+(defmethod (:set-label margin-mixin) (label)
+  (let ((old-label (find-margin-component margin-components 'margin-label)))
+    (cond ((and (null label) (null old-label)) )
+	  ((and (null label) old-label)
+	   (alter-margin-label old-label :string nil)
+	   (send self :reconsider-margin-components))
+	  ((and label (null old-label))
+	   (send self :set-margin-components
+		 (nconc margin-components
+			(ncons
+			  (cond ((consp label)
+				 (apply #'make-instance 'margin-label
+					:window self label))
+				((si:some-string label)
+				 (make-instance 'margin-label
+						:window self
+						:string label))
+				(t (make-instance 'margin-label
+						  :window self
+						  :string (string tv:name))))
+			  ))))
+	  (T
+	   (let ((old-style (margin-label-style old-label))
+		 (old-margin (margin-label-margin old-label))
+		 (old-string (margin-label-string old-label)))
+	     (cond ((consp label)
+		    (apply #'alter-margin-label old-label label))
+		   ((si:some-string label)
+		    (alter-margin-label old-label :string label))
+		   (t (alter-margin-label old-label :string (string tv:name)))
+		   )
+	     ;; Avoid expensive margin recomputation if label will be the same size
+	     ;; in the same place.
+	     (when (cond ((or (neq old-margin (margin-label-margin old-label))
+			      ( (label-string-height old-string self old-style)
+				 (label-string-height (margin-label-string old-label)
+						      self
+						      (margin-label-style old-label))))
+			  (send self :reconsider-margin-components)
+			  tv:restored-bits-p)
+			 (t t))
+	       (tv:sheet-force-access (self)
+		 (margin-component-erase old-label self)
+		 (margin-component-draw old-label self tv:char-aluf))))))))
+
+(defmethod (:delayed-set-label margin-mixin) (new-label)
+  (unless new-label
+    (setq new-label 'null))			;No label versus no updating
+  (let ((old-label (find-margin-component margin-components 'margin-label)))
+    (if old-label
+	(setf (margin-label-label-needs-updating old-label) new-label)
+	(send self :set-margin-components
+	      (nconc margin-components
+		     (ncons (make-instance 'margin-label
+					   :window self
+					   :label-needs-updating new-label)))))))
+
+(defmethod (:update-label margin-mixin) ()
+  (let ((old-label (find-margin-component margin-components 'margin-label)))
+    (when old-label
+      (let ((new-label (margin-label-label-needs-updating old-label)))
+	(when new-label
+	  (setf (margin-label-label-needs-updating old-label) nil)
+	  (send self :set-label (if (eq new-label 'null) nil new-label)))))))
+
+(defmethod (:set-margin-components margin-mixin) (new-components)
+  (let ((plist `(:margin-components ,new-components)))
+    (send self :redefine-margins (locf plist))))
+
+(defmethod (:reconsider-margin-components margin-mixin) ()
+  (send self :set-margin-components (send self :margin-components)))
+
+(defmethod (:redefine-margins margin-mixin :before) (plist)
+  (tv:adjust-margins 'margin-components :parse-margin-components-spec plist
+		     :margin-components))
+
+(defmethod (:redefine-margins margin-mixin :after) (ignore)
+  (setq mouse-position-margin-components (loop for component in margin-components
+					       when (margin-component-need-mouse-position
+						      component)
+						 collect component)))
+
+(defmethod (:parse-margin-components-spec margin-mixin)
+	   (spec left-margin top-margin right-margin bottom-margin)
+  (check-type spec list)
+  (values
+    (let ((list (make-list (length spec))))
+      (loop for subspec in spec
+	    for sublist = list then (cdr sublist)
+	    do (etypecase subspec
+		 (margin-component )
+		 (cons (setq subspec (apply #'make-instance (first subspec) :window self
+					    (rest subspec)))))
+	       (multiple-value-setq (left-margin top-margin right-margin bottom-margin)
+		 (margin-component-allocate-margins subspec self
+						    left-margin top-margin
+						    right-margin bottom-margin))
+	       (setf (car sublist) subspec))
+      list)
+    left-margin top-margin right-margin bottom-margin))
+
+(defmethod (:refresh-margins margin-mixin :after) ()
+  (tv:sheet-force-access (self)
+    (dolist (margin-component margin-components)
+      (margin-component-draw margin-component self tv:char-aluf))))
+
+(defmethod (tv:refresh-margins-rectangle margin-mixin) (left top right bottom)
+  ;; If the rectangle overlaps the margins, refresh the particular ones it overlaps
+  ;; The affected margins have already been erased
+  (when (or (< left (tv:sheet-inside-left)) (< top (tv:sheet-inside-top))
+	    (< (tv:sheet-inside-right) right) (< (tv:sheet-inside-bottom) bottom))
+    (dolist (margin-component margin-components)
+      (multiple-value-bind (margin-left margin-top margin-right margin-bottom)
+	  (margin-component-edges margin-component self)
+	(when (and (< left margin-right) (< margin-left right)
+		   (< top margin-bottom) (< margin-top bottom))
+	  (tv:prepare-sheet (self)
+	    (margin-component-draw margin-component self tv:char-aluf)))))))
+
+(defmethod (:refresh margin-mixin :after) (&optional (type nil))
+  ;; the :refresh method for SHEET does not send a :refresh-margins message
+  ;; if the :USE-OLD-BITS keyword is supplied.  Hopefully this is just an
+  ;; efficiency optimization (why redraw the borders since the bits are supposed
+  ;; to be the same), but these drop shadow borders need to be redrawn on every :EXPOSE
+  (when (eq type :use-old-bits)			; don't refresh them twice
+    (when (find-margin-component margin-components 'margin-drop-shadow-borders)
+    (send self :refresh-margins))))
+
+
+(defun relocate-margin-scroll-bars (window before after)
+  (dolist (inf (send window :inferiors))
+    (relocate-margin-scroll-bars inf before after))
+  (let ((margin-components (send-if-handles window :margin-components))
+	(did-one nil))
+    (dolist (comp margin-components)
+      (when (typep comp 'margin-scroll-bar)
+	(when (eq (margin-scroll-bar-margin comp) before)
+	  (setf (margin-scroll-bar-margin comp) after)
+	  (setq did-one T))))
+    (when did-one
+      (send window :reconsider-margin-components))))
+
+(defmethod (:set-margin-ruler-parameters margin-mixin) (&rest options)
+  (let ((changed-p nil))
+    (dolist (component margin-components)
+      (when (typep component 'margin-ruler)
+	(let ((old-visibility (margin-ruler-visibility component)))
+	  (apply #'alter-margin-ruler component options)
+	  (unless (and (null old-visibility) (null (margin-ruler-visibility component)))
+	    (setq changed-p t)))))
+    (when changed-p
+      (send self :reconsider-margin-components)
+      (when tv:restored-bits-p			;This means size did not change.
+	(dolist (component margin-components)
+	  (when (typep component 'margin-ruler)
+	    (tv:sheet-force-access (self)
+	      (margin-component-erase component self)
+	      (margin-component-draw component self tv:char-aluf))))))))
+
+(defmethod (:update-margin-component-mouse-position-display margin-mixin)
+	   (&optional x y)
+  (unless (and x y)
+    (multiple-value-setq (x y)
+      (send self :mouse-position)))
+  (dolist (component mouse-position-margin-components)
+    (margin-component-update-mouse-position-display component self x y)))
+
+(defmethod (:set-blinker-motion-pending margin-mixin :after) (pending-p)
+  (when pending-p
+    (dolist (component mouse-position-margin-components)
+      (margin-component-update-mouse-position-display component self nil nil))))
+
+(defwhopper (:who-line-documentation-string margin-mixin) ()
+  (multiple-value-bind (line-1 line-2)
+      (and mouse-margin-component
+	   (mouse-margin-component-who-line-documentation-string mouse-margin-component self))
+    (if (null line-1)
+	(continue-whopper)
+	(values line-1 line-2))))
+
+(defun-in-flavor (margin-mixin-after-handle-mouse margin-mixin) ()
+  (when mouse-margin-component
+    (mouse-margin-component-mouse-leaves mouse-margin-component self)
+    (setq mouse-margin-component nil))
+  (dolist (component mouse-position-margin-components)
+    (margin-component-update-mouse-position-display component self nil nil)))
+
+(defwhopper-subst (:handle-mouse margin-mixin) ()
+  (unwind-protect
+      (continue-whopper)
+    (margin-mixin-after-handle-mouse)))
+
+(defwhopper (:mouse-moves margin-mixin) (x y)
+  (let* ((margin-component (and (or (< x (tv:sheet-inside-left))
+				    ( x (tv:sheet-inside-right))
+				    (< y (tv:sheet-inside-top))
+				    ( y (tv:sheet-inside-bottom)))
+				(dolist (margin-component margin-components)
+				  (when (mouse-margin-component-inside-p margin-component self
+									 x y)
+				    (return margin-component)))))
+	 (entirely-in-margin margin-component))
+    (unless (eq mouse-margin-component margin-component)
+      (when (or (null mouse-margin-component) (null margin-component))
+	(setq entirely-in-margin nil))		;Moving in or out of the window interior
+      (when mouse-margin-component
+	(mouse-margin-component-mouse-leaves mouse-margin-component self))
+      (setq mouse-margin-component margin-component)
+      (when mouse-margin-component
+	(mouse-margin-component-mouse-enters mouse-margin-component self x y))
+      (tv:need-mouse-documentation-update))
+    (if entirely-in-margin			;If the mouse is just moving around in the
+	(tv:mouse-set-blinker-cursorpos self)	;margin, don't bother thinking about the
+	(continue-whopper x y))			;window interior and waking up the process
+    (when mouse-margin-component
+      (mouse-margin-component-mouse-moves mouse-margin-component self x y)
+      (tv:need-mouse-documentation-update))))
+
+(defmethod (:mouse-click margin-mixin) (button x y)
+  (when mouse-margin-component
+    (mouse-margin-component-mouse-click mouse-margin-component self button x y)))
+
+(defmethod (:new-scroll-position margin-mixin :after) (&optional ignore)
+  (dolist (margin-component margin-components)
+    (margin-component-new-scroll-position margin-component self)))
+
+(defmethod (:change-of-size-or-margins margin-mixin :before) (&rest ignore)
+  (dolist (margin-component margin-components)
+    (margin-component-change-of-size-or-margins margin-component self)))
+
+(defmethod (:change-of-size-or-margins margin-mixin :after) (&rest ignore)
+  (dolist (margin-component margin-components)
+    (margin-component-after-redefine-margins-kludge margin-component self)))
+
+;;; Copied from BASIC-SCROLL-BAR.  This is really just an abbreviation
+;;; for the other messages and doesn't depend on anything else.
+(defun scroll-relative-1 (edge-spec window)
+  (if (numberp edge-spec)
+      (values edge-spec nil nil nil)
+      (ecase edge-spec
+	(:left
+	  (values (tv:sheet-inside-left window) (tv:sheet-inside-width window)
+		  :x-scroll-to :x-scroll-position))
+	(:top
+	  (values (tv:sheet-inside-top window) (tv:sheet-inside-height window)
+		  :y-scroll-to :y-scroll-position))
+	(:right
+	  (values (tv:sheet-inside-right window) (tv:sheet-inside-width window)
+		  :x-scroll-to :x-scroll-position))
+	(:bottom
+	  (values (tv:sheet-inside-bottom window) (tv:sheet-inside-height window)
+		  :y-scroll-to :y-scroll-position)))))
+
+;;; This is a :default method so it doesn't shadow the one on tv:basic-scroll-window
+(defmethod (:scroll-relative margin-mixin :default) (from to)
+  (multiple-value-bind (from-number from-range from-msg from-pos)
+      (scroll-relative-1 from self)
+    (multiple-value-bind (to-number to-range to-msg to-pos)
+	(scroll-relative-1 to self)
+      (when (or (and (null from-msg) (null to-msg))
+		(and (not (null from-msg))
+		     (not (null to-msg))
+		     (neq from-msg to-msg)))
+	(error "Incompatible arguments to :SCROLL-RELATIVE."))
+      (multiple-value-bind (nil display-size nil nil)
+	  (send self (or from-pos to-pos))
+	(send self (or from-msg to-msg)
+	      (round (* display-size (- from-number to-number))
+		     (or from-range to-range))
+	      :relative)))))
+
+;;; Mouse exit targets are sensitive if scrolling via scroll-bar is possible
+(defmethod (tv:mouse-exit-target-direction-sensitive margin-mixin) (direction)
+  (loop for component in margin-components
+	thereis (tv:mouse-exit-target-direction-sensitive-1 component direction self)))
+
+(defflavor momentary-window-mixin
+	((deactivation-in-progress nil))
+	(tv:essential-mouse))
+
+(defwhopper (:deactivate momentary-window-mixin) (&rest args)
+  (unless deactivation-in-progress
+    (let-globally ((deactivation-in-progress t))
+      (lexpr-continue-whopper args))))
+
+(defmethod (:handle-mouse momentary-window-mixin :after) (&rest ignore)
+  (unless (or (eq (send self :status) :deactivated)
+	      ;; Don't flush if mouse is still geographically within this window.
+	      ;; It might be in another (temporary) window that overlaps this one.
+	      (let ((mouse (tv:sheet-mouse self)))
+		(tv:sheet-contains-sheet-point-p self (tv:mouse-sheet mouse)
+						 (tv:mouse-x mouse) (tv:mouse-y mouse)))
+	      deactivation-in-progress)
+    (process-run-function "Momentary deactivate" #'send self :deactivate)))

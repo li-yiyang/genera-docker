@@ -1,0 +1,1687 @@
+;;; -*- Base: 8; Mode: Lisp; Package: COMPILER; Lowercase: T -*-   10/5/81
+;;; This file is >llc>phase-2.
+;;; This file contains Phase Two of the compiler.  (lcp_cement_)
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; 
+
+;;; Notes: Lexington changes merged with SYS: L-COMPILER; PHASE-2.LISP.116 on 10/4/84
+;;;
+
+;;; The main job of this phase is to follow the levels of the stacks.  The L machine
+;;; control stack pointer points to the last used location on the stack, but
+;;; the hardware adds one to the offset given in an address-operand instruction,
+;;; so it is sort of as if the stack pointer pointed to the first free location
+;;; on the stack.  The offset 377 should be used with stack-pointer addressing
+;;; to access the top of the stack in real instructions.  The values in the
+;;; lexical-location slot are actually the numbers that go into the real FP|n
+;;; instructions, rather than a zero-based count of the level.
+
+;;; Run phase 2 on a given interval.  This function is for effect.
+
+;;; For debugging
+;(defun run-phase-2 ()
+;  (dolist (*function* *function-list*)
+;    (print-interval (function-interval *function*))))
+
+(defun run-phase-2 ()
+  ;; [Note to maintainers: Do not alter the order of the calls in this
+  ;;  function unless you REALLY know what you are doing.]
+  (determine-function-quickness)
+  (determine-frame-sharing)
+  (fixup-uids)
+  (determine-lexical-closure-consing)
+  (determine-lexical-residence)
+  (dolist (function *function-list*)
+    (let* ((default-warning-function (function-pr function))
+	   (*all-vars-stack-resident* nil))
+      (cement-function function)
+      (dolist (function (function-frame-sharers function))
+	(cement-function function)))))
+
+(defun cement-function (function)
+  (let* ((*function* function)
+	 (shuffle-amount (if (function-needs-to-shuffle-stack function) 2 0))
+	 (*max-level* shuffle-amount)	   ; Max value of *level*.
+	 (*max-l-level*)
+	 (*l-level*)
+	 (*local-block-offset*)			;See (CEMENT ALLOCATE-LOCAL-BLOCK)
+	 (interval (function-interval function)))
+    (cement-interval interval shuffle-amount)
+    ;; Now go through and update the levels for the actual local block size
+    (let* ((local-offset *local-block-offset*)
+	   (local-block-size (- *max-l-level* local-offset)))
+      (when (> local-block-size 0)
+	(dolist (var (function-lexical-variables function))
+	  (when (and (not (lexical-argument-p var))
+		     (not (lexical-supplied-p var))
+		     (lexical-stack-resident-p var)
+		     (lexical-location var)
+		     ;; This is a horrible kludge to keep us from adjusting the
+		     ;; variables which are used in initializing optionals.
+		     (lexical-local-block-offset var))
+	    (incf (lexical-location var) local-block-size)))
+	;; Adjusting the TAKE-ARGS purposefully does not adjust the instructions in
+	;; that interval, since they come before the local block gets allocated.
+	(loop for inst first (inst-next (find-first-inst-with-opcode (interval-first interval)
+								     'allocate-local-block))
+		       then (inst-next inst)
+	      while inst
+	      doing
+	  (let ((inst-level (inst-level inst)))
+	    (when inst-level (setf (inst-level inst) (+ inst-level local-block-size))))
+	  (adjust inst local-block-size)))
+      (setf (function-local-block-size function) local-block-size)
+      (incf *max-level* local-block-size))
+    (setf (interval-max-level interval) *max-level*)
+    ;; Make sure there's no chance of overflowing the stack buffer.
+    (let ((max (max-frame-size *compiler*)))
+      (when (> *max-level* max)
+	(cond (*enable-frame-splitting*
+	       (decf *n-retries*)
+	       (when ( *n-retries* 0)
+		 (llc-error "Can't frame split this function small enough;~&~
+				max size ~D exceeds architectural limit ~D"
+			    *max-level* max))
+	       (incf *local-block-size-adjustment* (- *max-level* max))
+	       (throw 'retry-compile nil))
+	      (t
+	       (llc-error
+		 "Maximum stack level for this function (~D) exceeds architectural limit (~D)."
+		 *max-level* max)))))))
+
+;;; Function to determine if a function needs to have its stack shuffled around.
+;;; This is useful only for internal lambdas of methods which need to reference
+;;; instance variables.
+(defun function-needs-to-shuffle-stack (function)
+  (and (eq (function-type function) 'internal)
+       (function-refers-lexically-p function)
+       (function-mapping-table-p function)))
+
+;;; Determine the quickness of all internal functions.
+;;; For now, don't make anything quick unless phase 1 forces us.
+;;; Eventually this will take into account function-funarg-p, whether there is
+;;; recursion, whether there are rest arguments and maybe whether there is hairy
+;;; optional argument initialization.
+(defun determine-function-quickness ()
+  (dolist (f *function-list*)
+    (cond ((eq (function-type f) 'internal)
+	   (selectq (function-quick-p f)
+	     ((:undecided)
+	      (setf (function-quick-p f) nil))
+	     ((t)
+	      (setf (function-quick-tag f) (make-tag))))))))
+
+(defun fixup-quick-internal-lexicals ()
+  (dolist (function *function-list*)
+    (when (neq function (function-frame-owner function))
+      (ferror "Internal compiler error - function ~S does not own frame" function))
+    (dolist (sharer (function-frame-sharers function))
+      (if (function-quick-p sharer)
+	  (fixup-quick-internal-lexicals-1 sharer function)
+	  (ferror "Internal compiler error - frame sharing function ~S is unquick"
+		  function)))))
+
+(defun fixup-quick-internal-lexicals-1 (function owner)
+  ;; If FUNCTION has come out of Phase 1 thinking that it has free lexical references,
+  ;; we now need to check to make sure that these aren't just references to
+  ;; the frame owner's (or other frame sharers') variables.
+  (when (function-refers-lexically-p function)
+    (let ((free-var-list (function-free-lexical-variables function)))
+      (if (null free-var-list)
+	  (ferror "Compiler error - ~S refers lexically, but no free vars" function)
+	  (dolist (v free-var-list)
+	    (cond ((or (eq (lexical-function v) owner)
+		       (memq (lexical-function v) (function-frame-sharers owner)))
+		   ;; This variable should not be referred to in the same way
+		   ;; as out of frame free lexicals, since it's a local of the
+		   ;; same frame.
+		   (setf (function-free-lexical-variables function)
+			 (delq v free-var-list))
+		   (when (null (function-free-lexical-variables function))
+		     (setf (function-refers-lexically-p function) nil))
+		   ;; Also, if the only lexical-referencing-functions for this variable
+		   ;; are quick internals, then make it non-captive.
+		   (let ((fun-list (lexical-referencing-functions v))
+			 truly-captive-p)
+		     (if (null fun-list)
+			 (ferror "Compiler error - ~S has no referencing functions" v)
+			 (setq truly-captive-p
+			       (loop for f in fun-list
+				     when (not (function-quick-p f))
+				     return 't)))
+		     (setf (lexical-captive-p v) truly-captive-p)))
+		  ;;
+		  (t
+		   ;; The variable is a bona fide out-of-frame lexical variable
+		   ;; that must be referenced within some environment structure.
+		   ;; Indicate in the variable and function structures that the
+		   ;; frame owner function refers to it - this will guarantee that
+		   ;; the frame owner will be implemented as a lexical closure.
+		   (if (neq (function-type owner) 'internal)
+		       (ferror "Internal compiler error - owner function not internal")
+		       (setf (function-refers-lexically-p owner) t)
+		       (push* v (function-free-lexical-variables owner)))
+		   (push* owner (lexical-referencing-functions v)))))))))
+
+;;; Now that we know which functions are quick internal, remove quick internal
+;;; functions from *function-list* and set up the function-frame-owner and
+;;; function-frame-sharer slots of the functions.
+(defun determine-frame-sharing ()
+  (dolist (f *function-list*)
+    (cond ((quick-internal-function-p f)
+	   ;; This use to DELQ f from *function-list* here.
+	   ;; Since that will not work if *function-list* is cdr-coded,
+	   ;; I changed it to remove quick internal functions below where
+	   ;; *function-list* can be safely modified.
+	   (let ((owner (frame-owner f)))
+	     (setf (function-frame-owner f) owner)
+	     (push f (function-frame-sharers owner))))
+	  (t (setf (function-frame-owner f) f))))
+  ;; Delete all quick internal functions which have been merged into other functions now.
+  (setq *function-list* (cl:delete-if #'quick-internal-function-p *function-list*))
+  (fixup-quick-internal-lexicals))
+
+(defun frame-owner (function)
+  (loop for f = function then (function-parent-function f)
+	when (not (quick-internal-function-p f)) return f))
+
+;;; Some stuff for fixing up uids
+(defun parent-of-function-p (possible-parent function)
+  (let ((parent (function-parent-function function)))
+    (or (eq possible-parent parent) (memq parent (function-frame-sharers possible-parent)))))
+
+(defun function-children (fun funs)
+  "FUN is a function, FUNS is a list of its internal function descendants.
+This function returns a list of lists of children functions and the list of their
+descendants, e.g.
+  ((CHILD-0 NIL) (CHILD-1 ((CHILD-0-OF-CHILD-1 NIL) (CHILD-1-OF-CHILD-1 NIL))) (CHILD-2 NIL))"
+  (loop for f in funs
+	when (and (parent-of-function-p fun f) (not (quick-internal-function-p f)))
+	  collect (list f (function-children f funs))))
+
+(defun get-real-uid (f funs)
+  (let ((elem (assq f funs)))
+    (if elem
+	(find-position-in-list elem funs)
+	(loop for c in funs
+	      with real-uid 
+	      do
+	      (setq real-uid (get-real-uid f (cadr c)))
+	      when real-uid return real-uid))))
+
+(defun fixup-uids ()
+  (dolist (fun *function-list*)
+    (when (eq (function-type fun) 'external)
+      (let* ((internals (function-internal-function-offsets fun))
+	     ;; [Note: because internal functions don't have a
+	     ;; function-internal-function-offsets field (don't ask why)
+	     ;; at this point internals will contain all generations of
+	     ;; descendants of function.]
+	     (children (function-children fun internals)))	;Format the internals nicely
+	(dolist (int internals)
+	  (setf (function-uid int) (get-real-uid int children)))))))
+
+
+;;; These functions determine whether an internal function implemented as a lexical closure
+;;; needs to be consed on the stack or not.
+(defun function-internal-closure-type-p (f type)
+  "TYPE should either be :STACK or :HEAP"
+  (and (memq f *function-list*)
+       (eq (function-type f) 'internal)
+       (function-refers-lexically-p f)
+       (let ((stack-p (function-use-stack-closure-p f)))
+	 (if (eq type :heap)
+	     (not stack-p)
+	     stack-p))))
+
+(defun all-sharing-closures-use-same-consing-p (function type)
+  "TYPE should either be :STACK or :HEAP"
+  (and (loop for v in (function-free-lexical-variables function)
+	     always (loop for f in (lexical-referencing-functions v)
+			  never (and (neq function f)
+				     (eq (function-type f) 'internal)
+				     (not (function-quick-p f))	;Ignore quicks
+				     (memq f *function-list*)	;Ignore dead functions - this
+								; may be redundant with the
+								; previous check.
+				     (not (function-internal-closure-type-p f type)))))
+       ;; Make sure all closure offspring are consed in the same place
+       (not (loop for f in *function-list*
+		  thereis (and (function-internal-closure-type-p
+				 f (if (eq type ':heap) ':stack ':heap))
+			       (eq (function-parent-function f) function))))))
+
+(defun closure-variable-sharers (function)
+  (loop for v in (function-free-lexical-variables function)
+	with sharers
+	do (loop for f in (lexical-referencing-functions v)
+		 when (eq (function-type f) 'internal)
+		   do (push* f sharers))
+	finally (return sharers)))
+
+(defun dependent-closures (function)
+    (loop for old-set first nil then set
+	  for set first `(,function) then (lexpr-funcall
+					    #'union
+					    (loop for e in set
+						  collect (closure-variable-sharers e)))
+	  until (null (cl:set-exclusive-or old-set set))
+	  finally (return set)))
+
+(defun lexical-functions-called (function)
+  (loop for old-set first nil then set
+	for set first `(,function) then
+	    (union set
+		   (lexpr-funcall
+		     #'union
+		     (loop for e in set
+			   collect (function-lexical-functions-called e))))
+	until (null (cl:set-exclusive-or old-set set))
+	finally (return set))) 
+
+(defun fixup-stack-closure-function (function)
+  ;; Called only for effect
+  (setf (function-use-stack-closure-p function)
+	(and (function-refers-lexically-p function)
+	     (function-use-stack-closure-p function)
+	     (all-sharing-closures-use-same-consing-p function ':stack)))
+  (unless (function-use-stack-closure-p function)
+    ;; If can't use stack closure, make sure that all other closures that share
+    ;; variables, and those that are generated for lexical functions also do not
+    ;; get consed on the stack.
+    (dolist (d-f (dependent-closures function))
+      (when (function-use-stack-closure-p d-f)
+	(setf (function-use-stack-closure-p d-f) nil)
+	(fixup-stack-closure-function d-f)))
+    (dolist (l-f (lexical-functions-called function))
+      (when (function-use-stack-closure-p l-f)
+	(setf (function-use-stack-closure-p l-f) nil)
+	(fixup-stack-closure-function l-f)))))
+
+(defun function-needs-push-stack-closure-inst (function)
+  (when (and (eq (function-type function) 'internal)
+	     (function-refers-lexically-p function)
+	     (function-use-stack-closure-p function))
+    (loop with push-stack-closure-inst
+	  for starting-inst first (interval-first (function-interval function)) then
+				  (inst-next push-stack-closure-inst)
+	  do
+	  (setq push-stack-closure-inst
+		(find-first-inst-with-opcode starting-inst 'push-stack-closure nil))
+          when (null push-stack-closure-inst)
+	    return t
+	  when (eq function (push-stack-closure-function push-stack-closure-inst))
+	    return nil)))
+
+;; Needed by the COMPILER:EVACUABLE-DOWNWARD-CLOSURES kludge
+(defun need-push-stack-closure-for-heap-closure? (function)
+  (when (and (eq (function-type function) 'internal)
+	     (function-refers-lexically-p function)
+	     (not (function-use-stack-closure-p function)))	;Only heap closures
+    (loop with push-stack-closure-inst
+	  for starting-inst first (interval-first (function-interval function)) then
+				  (inst-next push-stack-closure-inst)
+	  do (setq push-stack-closure-inst
+		   (find-first-inst-with-opcode starting-inst 'push-stack-closure nil))
+          when (null push-stack-closure-inst)
+	    return t
+	  when (eq function (push-stack-closure-function push-stack-closure-inst))
+	    return nil)))
+
+(defun emit-push-stack-closure (internal-function)
+  (insert-inst-at-beginning-of-interval
+    (make-push-stack-closure-instruction :push-stack-closure-function internal-function)
+    (function-interval (function-frame-owner (function-parent-function internal-function)))))
+
+(defun determine-lexical-closure-consing ()
+  (dolist (f *function-list*)
+    (when (eq (function-type f) 'internal) (fixup-stack-closure-function f)))
+  (dolist (f *function-list*)
+    (when (function-needs-push-stack-closure-inst f)
+      (emit-push-stack-closure f))))
+
+;;;
+;;; Various sub-routines of DETERMINE-LEXICAL-RESIDENCE
+;;;
+(defun insert-inst-at-beginning-of-interval (inst interval)
+  (let* ((first-inst (interval-first interval))
+	 (target-inst (or (find-first-inst-with-opcode first-inst 'allocate-local-block nil)
+			  (find-first-inst-with-opcode first-inst 'take-args nil)
+			  (find-last-inst-with-opcode first-inst 'take-arg nil)
+			  first-inst)))
+    (insert-new-inst inst target-inst)))
+
+(defun add-function-environment-pointer-variable (function)
+  (let ((first (interval-first (function-interval function)))
+	(var (make-environment-pointer-variable function)))
+    (incf (take-args-n-required (find-first-inst-with-opcode first 'take-args)))
+    (push var (name-variables (find-first-inst-with-opcode first 'name)))
+    (incf (function-argument-block-size function))
+    (incf (ldb %%arg-desc-min-args (function-args-info function)))
+    (unless (= (ldb %%arg-desc-max-args (function-args-info function))
+	       (1- (ash 1 (byte-size %%arg-desc-max-args))))
+      (incf (ldb %%arg-desc-max-args (function-args-info function))))
+    (push (variable-name var) (function-lambda-list function))))
+
+(defun update-arg-variable (function var)
+  (when (eq (function-type function) 'internal)
+    (when (function-refers-lexically-p function)
+      (incf (lexical-location var))
+      (when (function-mapping-table-p function)
+	(incf (lexical-location var) 2)))))
+
+(defun function-has-free-and-captive-lexicals-p (function)
+  (and (eq (function-type function) 'internal)
+       (function-refers-lexically-p function)
+       (function-has-captive-lexicals-p function)))
+
+(defun function-has-true-captive-lexicals-p (function)
+  ;; The hair here is to guarantee that the captive variables are truly
+  ;; captive, and not just referred to by some other frame at their stack
+  ;; location.  This function is called for value and effect.  It cleans up
+  ;; the function and variable objects.
+  (loop with fun-has-true-captives-p
+	for v in (function-lexical-variables function)
+	when (lexical-captive-p v)
+	  do
+	    (loop for f in (lexical-referencing-functions v)
+		  with var-truly-captive
+		  do
+		  (cond
+		    ;; If the function is dead, so to speak, remove it from the variable's
+		    ;; list
+		    ((not (memq f *function-list*))
+		     (setf (lexical-referencing-functions v)
+			   (delq f (lexical-referencing-functions v))))
+		    ;; For a variable to be truly captive, it must be
+		    ;; referenced by a function that is not its
+		    ;; lexical-function, that is an internal, but not
+		    ;; a quick internal, and that is not going to be
+		    ;; implemented as a stack closure.
+		    ((and (neq f (lexical-function v))
+			  (eq (function-type f) 'internal)
+			  (not (function-quick-p f))
+			  (not (function-use-stack-closure-p f)))
+		     (setq fun-has-true-captives-p (setq var-truly-captive 't))))
+		  finally (setf (lexical-captive-p v) var-truly-captive))
+	finally (return fun-has-true-captives-p)))
+
+(defun function-has-nested-captives-p (function)
+  (loop for v in (function-lexical-variables function)
+	when (lexical-nested-captive-p v) return 't))
+
+(defun adjust-if-lexical-closure (function)
+  (when (eq (function-type function) 'internal)
+    (when (function-refers-lexically-p function)
+      (add-function-environment-pointer-variable function)
+      (when (function-mapping-table-p function)
+	(incf (function-argument-block-size function) 2)))))
+
+(defun emit-byte-lap-for-captive-variables
+       (function ncells captive-arguments conc-free-and-captive-blocks-p)
+  (let ((interval (function-interval function)))
+    (check-arg-type interval interval)
+    (let* ((stack-cons-heap-format-closures
+	     (assq 'compiler:evacuable-downward-closures
+		   (function-user-declares (function-frame-owner function))))
+	   (allocate-local-inst (find-first-inst-with-opcode
+				  (interval-first interval) 'allocate-local-block))
+	   (*last-inst* (if stack-cons-heap-format-closures
+			    (inst-prev allocate-local-inst)
+			    allocate-local-inst))
+	   (next-inst-after-take-args (inst-next *last-inst*))
+	   (captive-block-pointer (make-kludge-lexical-variable '.lexical-captive-block-pointer.))
+	   environment-pointer)
+      ;; If the environment will be relocated, use the original.
+      (when conc-free-and-captive-blocks-p
+	(setf environment-pointer (get-environment-list-pointer function))
+	(setf environment-pointer (or (lexical-original-variable environment-pointer)
+				      environment-pointer)))
+      ;; If no captive variables, don't allocate a captive block, but do set up the
+      ;; required pointers for later
+      (if (plusp ncells)
+	  (cond (stack-cons-heap-format-closures
+		 ;; We're stack-consing heap-closures - push a bunch of NILs for the
+		 ;;  captive block
+		 (loop repeat ncells
+		       do (emit-const nil))
+		 ;; Change CDR-CODE to CDR-NIL for last word
+		 (emit-relative-push-address 0)
+		 (emit-call (external-function 'sys:%set-cdr-code-1) 1 *destination-ignore*)
+		 ;; Emit a place-holder for the pointer itself so that the NAME instruction
+		 ;; we're about to emit has a place to pop the value into.
+		 (emit-const nil)
+		 ;; Push the DTP-LIST pointer
+		 (emit-relative-push-address ncells)
+		 (emit-const (get-data-type-number *compiler* 'dtp-list))
+		 (emit-call (external-function 'compiler:inverted-%make-pointer) 2 *destination-stack*))
+		;; Normal way, heap-cons the closure
+		(t
+		 ;; Make a cdr-coded list and set the captive block pointer
+		 (emit-%make-lexical-environment *compiler* ncells)))
+	  ;; Just push this frame's free pointer, or nil, since there's no captive block
+	  (if conc-free-and-captive-blocks-p
+	      (emit-var environment-pointer)
+	      (emit-const nil)))
+      (emit-name `(,captive-block-pointer) nil nil)
+      ;; Emit the push-stack-closure instructions
+      (when stack-cons-heap-format-closures
+	(dolist (f *function-list*)
+	  (when (need-push-stack-closure-for-heap-closure? f)
+	    (emit (make-push-stack-closure-instruction :push-stack-closure-function f)))))
+      ;; Concatenate (so to speak) the free and captive blocks, if necessary
+      (when conc-free-and-captive-blocks-p
+	(emit-var captive-block-pointer)
+	(emit-var environment-pointer)
+	(emit-call (external-function 'rplaca) 2 *destination-ignore*))
+      ;; Relocate any captive arguments to captive block
+      (loop for v in captive-arguments
+	    do (emit-capture-argument v))
+      ;; Sew the interval's instruction list back up
+      (setf (inst-next *last-inst*) next-inst-after-take-args)
+      (when next-inst-after-take-args
+	(setf (inst-prev next-inst-after-take-args) *last-inst*)))))
+
+;;; Determine the residence of all lexical variables.  Lexical variables
+;;; may reside either in the stack, in the locals block, in the lexical
+;;; environment block (which is composed of the local function's captive
+;;; and free lists).  Most arguments reside in the local block, but they
+;;; have already had their addresses assigned - captive arguments need to
+;;; be moved out to the captive block.
+(defun determine-lexical-residence ()
+  (dolist (function *function-list*)
+    (adjust-if-lexical-closure function)
+    (let* ((*function* function)
+	   (frame-sharers (cons function (function-frame-sharers function)))
+	   (captive-block-size 0)
+	   (captive-offset 0)
+	   (kludge-closures
+	     (assq 'compiler:evacuable-downward-closures (function-user-declares *function*)))
+	   captive-arguments)
+      ;; Reserve the first local slots for the captive variable pointers if needed.
+      (when (some frame-sharers #'function-has-true-captive-lexicals-p)
+	(setf (function-has-captive-lexicals-p function) 't))
+      ;; Add a cell to the captive list to point to the parent's list if necessary
+      (when (function-has-free-and-captive-lexicals-p function)
+	(incf captive-offset)
+	(incf captive-block-size))
+      ;; Relocate the &REST argument.
+      (loop for var in (function-lexical-variables function) do
+	(when (and (lexical-rest-arg-p var)
+		   (not (variable-ignored-p var))
+		   (not (lexical-dynamic-extent var))
+		   (lexical-captive-p var))
+	  (relocate-arguments-elsewhere function (list var))))
+      ;; Do anything else that may need to be done
+      (determine-argument-residence *compiler* function)
+      ;; 
+      (dolist (fun frame-sharers)
+	(dolist (var (reverse (function-lexical-variables fun)))
+	  (cond
+	    ;; If the variable is a captive lexical, set its location within the captive
+	    ;; block and bump the number of captives and the running offset.  If the
+	    ;; variable is also an argument, move it from the argument block to the captive
+	    ;; block, and update its lexical-location.
+	    ((and (function-has-captive-lexicals-p function) (lexical-captive-p var))
+	     (cond ((lexical-nested-captive-p var)
+		    (setf (lexical-captive-location var) 0)
+		    (setf (lexical-stack-resident-p var)
+			  (variable-stack-resident-p var)))
+		   (t 
+		    (incf captive-block-size)
+		    (setf (lexical-captive-location var) captive-offset)
+		    (incf captive-offset)
+		    (when (or (lexical-argument-p var)
+			      (lexical-supplied-p var))
+		      (push var captive-arguments)
+		      (update-arg-variable function var)))))
+	    ;; Arguments are already assigned, update the lexical location for the case
+	    ;; where we have an environment pointer as first argument
+	    ((lexical-argument-p var)
+	     (update-arg-variable function var)
+	     (setf (lexical-captive-location var) (lexical-location var)))
+	    ;; 
+	    ((variable-stack-resident-p var)
+	     (setf (lexical-stack-resident-p var) t))
+	    ;;
+	    (t))))
+      ;; If there are truly captive variable which don't get iterated over, generate the
+      ;; byte-lap to make the frame's captive block.
+      (when (or (function-has-captive-lexicals-p function) kludge-closures)
+	(setf (function-captive-block-size function) captive-block-size)
+	;; Now emit the byte-lap to cons the frame's block of captives.
+	(emit-byte-lap-for-captive-variables
+	  function captive-block-size captive-arguments
+	  (function-has-free-and-captive-lexicals-p function)))))
+  ;; And do a little fixup.
+  (determine-free-lexical-nesting-level))
+
+(defun relocate-arguments-elsewhere (function args)
+  (let ((substitutions nil))
+    ;; Generate new variables.
+    (dolist (arg args)
+      (let ((new-var (make-normal-lexical-variable
+		       :lexical-location (lexical-location arg)
+		       :lexical-bound-in-loop-p (lexical-bound-in-loop-p arg)
+		       :lexical-argument-p t
+		       :lexical-rest-arg-p (lexical-rest-arg-p arg)
+		       :variable-name (variable-name arg)
+		       :variable-ignored-p (variable-ignored-p arg)
+		       :lexical-referencing-functions nil
+		       :lexical-uid (incf *lexical-uid*)
+		       :lexical-multiple-count 0
+		       :lexical-multiple-mismatch-p nil
+		       :lexical-gensym-p nil
+		       :lexical-source-locator (lexical-source-locator arg)
+		       :lexical-control-stack-state (lexical-control-stack-state arg)
+		       :lexical-dynamic-extent (lexical-dynamic-extent arg)
+		       )))
+	(setf (getf substitutions arg) new-var)
+	(cl:nsubstitute new-var arg (function-lexical-variables function))
+	(push arg (function-lexical-variables function))
+	(setf (lexical-original-variable arg) new-var)
+	(setf (lexical-location arg) nil)
+	(setf (lexical-argument-p arg) nil)))
+    ;; Update existing byte-lap.
+    (let ((inst (interval-first (function-interval function))))
+      (loop until (eq (inst-opcode inst) 'allocate-local-block) do
+	(change-variable inst substitutions)
+	(setf inst (inst-next inst)))
+      (loop for (arg new-var) on substitutions by #'cddr do
+	(setf inst (insert-new-inst (make-var-instruction :var-variable new-var) inst))
+	(setf inst (insert-new-inst (make-name-instruction :name-variables (list arg)) inst))))))
+
+(defun pad-argument-block (n &key shuffle)
+  (let ((name-inst (find-first-inst-with-opcode (interval-first (function-interval *function*))
+						'name)))
+    (if shuffle
+	(insert-new-inst
+	  (make-instance 'pad-argument-block-instruction :pad-argument-block-n n)
+	  name-inst)
+	(loop repeat n do
+	  (insert-new-inst (make-const-instruction :const-value nil) name-inst))))
+  (incf (function-argument-block-size *function*) n))
+
+(defun determine-free-lexical-nesting-level ()
+  (dolist (function *function-list*)
+    (when (and (eq (function-type function) 'internal)
+	       (function-refers-lexically-p function)
+	       (not (function-use-stack-closure-p function)))
+      (loop for f first (function-parent-function function) then (function-parent-function f)
+	    with nesting-list
+	    when (function-has-captive-lexicals-p f)
+	      ;; If this "generation" is adding to the environment, then include
+	      ;; its nesting level in the nesting list.
+	      do (loop with n = 0
+		       for (name . var) in (function-lexical-contour function)
+		       do (ignore name)
+		       when (and (typep var 'variable)
+				 (eq 'lexical (variable-type var))
+				 (not (lexical-superseding-variable var))
+				 (lexical-nested-captive-p var)
+				 (eq (lexical-function var) f))
+			 do (incf n)
+		       finally (push n nesting-list))
+	    until (eq (function-type f) 'external)
+	    finally
+	      (setf (function-n-nested-frees function) (nreverse nesting-list))))))
+
+(defvartype-method (lexical-mismatches-p lexical)
+		   ()
+  (or (null lexical-control-stack-state)
+      (let ((unknown-groups (control-stack-state-unknown-group-count
+			      lexical-control-stack-state)))
+	(loop for reference in lexical-referencing-control-stack-states doing
+	  (unless (eql (control-stack-state-unknown-group-count reference) unknown-groups)
+	    (return-from lexical-mismatches-p t))))))
+
+;;; Decide whether a lexical variable is stack-resident.  Don't call this on
+;;; arguments.
+(defun variable-stack-resident-p (var)
+  ;; If there is no local declaration ORDERED-LOCAL-VARIABLES.  [>>> Why not??? <<<]
+  (if (not (function-ordered-local-variables *function*))
+      (not (or
+	     ;; If a var cannot be referred to relative to the base of the stack frame,
+	     ;; NOR relative to the top of the stack, then it must live in the local block.
+	     (and
+	       ;; If there is a multiple group under the var, or the var is from a
+	       ;; quick function, then can't be referred to relative to base of frame.
+	       (or (plusp (lexical-multiple-count var))
+		   (let ((control-stack-state (lexical-control-stack-state var)))
+		     (and control-stack-state
+			  (plusp (control-stack-state-unknown-group-count
+				   control-stack-state))))
+		   (quick-internal-function-p (lexical-function var)))
+	       ;; If there are multiple groups between the var and a ref, or if the
+	       ;; var is referred to by any internal function (quick or not), then it
+	       ;; can't be referred to relative to the top of the stack.
+	       (or (lexical-mismatches-p var)
+		   (not (null (lexical-referencing-functions var)))))
+	     ;; For now, to avoid dealing with magic pops, if variable-location is taken,
+	     ;; make the variable local-block resident so that function return will allocate
+	     ;; it in the heap if necessary.
+	     ;;--- Remove this for now, since we're not dealing with phantom stacks.
+	     #+ignore (lexical-variable-location-p var)))))
+
+;;; Traverse the interval from beginning to end, converting abstract Byte Lap into
+;;; concrete Byte Lap.  This alters the inst-next and inst-prev fields of the old
+;;; chain of instructions to produce the new chain of instructions, deleting some
+;;; instructions and adding some new ones.  The interval is altered to point to the
+;;; new chain, and it is returned.
+(defun cement-interval (interval initial-level)
+  (let ((*dead* nil)			   ; If T, the current code is unreachable.
+	(*level* initial-level)		   ; The control stack level.
+	(*b-level* 0)	   ; The binding stack level.
+	(inst (interval-first interval))   ; The instruction under consideration.
+	(*last-inst* nil)		   ; The previous instruction.  Used by "emit"!
+	(*dead-tags* nil))
+    ;; Debugging printout.
+    (cond (*phase-2-debug-p*
+	   (format t "~2&")))
+    ;; If there is already a leading no-op, use it; otherwise make a new one.
+    ;; (This is just to beautify the debugging typeouts and doesn't really matter.)
+    (cond ((eq (inst-opcode inst) 'no-op)
+	   (setq *last-inst* inst
+		 inst (inst-next *last-inst*)))
+	  (t
+	   (setq *last-inst* (make-no-op-instruction))))
+    ;; This is the first instruction in the new interval.
+    (setf (interval-first interval) *last-inst*)
+    ;; Run consider-instruction over each instruction and build a new chain.
+    (loop for next-inst = (inst-next inst)
+	  for keep = (if *dead*
+			 (consider-instruction-dead inst)
+			 (consider-instruction inst))
+	  do
+	  (if keep (emit inst))
+	  (setq inst next-inst) until (null next-inst))
+    ;; This is the last instruction in the new interval.
+    (emit (make-no-op-instruction))
+    (setf (inst-next *last-inst*) nil) ;stop chain here for print-interval
+    (setf (interval-last interval) *last-inst*)
+    ;; Now ensure that any tags which have been flushed really don't have branches to them.
+    (loop for tag in *dead-tags*
+	  unless (null (tag-jumps tag))
+	    do (llc-error "~S was flushed by phase 2 but is still referenced." tag))
+    ;; Debugging printout.
+    (cond (*phase-2-debug-p*
+	   (format t "~&Cemented Byte-lap:")
+	   (print-interval interval)
+	   (if *dead*
+	       (format t "~&Final state: Dead.")
+	       (format t "~&Final state: Level: ~S  L-Level: ~s B-Level: ~S"
+		       *level* *l-level* *b-level*))
+	   (format t "  Max level: ~D" *max-level*))))
+  interval)
+
+;;; Return the number of words on the stack used by a given destination.
+;;; For return and multiple, just pass back the arg (a symbol); for other
+;;; destinations, return the correct fixnum.
+(defun destination-size (destination)
+  (if (destination-for-return destination)
+      'return
+      (or (destination-n-values destination)
+	  'multiple)))
+
+;;; This does some error checking and calls the cement function
+;;; particular to the Byte Lap instruction under consideration.  The
+;;; following is the contract of this function, and so is the contract
+;;; of all of the individual cement functions:
+;;; Return NIL if it should just be flushed; otherwise keep the
+;;; instruction as it is.  Set *dead* to t if following code cannot be
+;;; reached.  It is OK to emit new instructions.
+
+(defgeneric cement (inst))
+
+(defgeneric cement-dead (inst))
+
+(defun consider-instruction (inst)
+  (when *phase-2-debug-p*
+    (format t "~&Level: ~D L-Level: ~D B-Level: ~D  Next: ~S"
+	    *level* *l-level* *b-level* inst))
+  (setf (inst-level inst) *level*)
+  (cement inst))
+
+(defun consider-instruction-dead (inst)
+  (when *phase-2-debug-p*
+    (format t "~&(Dead) Next: ~S" inst))
+  (cement-dead inst))
+
+(defmethod (cement-dead byte-lap-instruction :default) ()
+  ;; Remove backpointers from tags to this instruction.
+  (note-instruction-deleted self)
+  nil)
+
+(defun incf-level (&optional (amount 1))
+  (incf *level* amount)
+  (when (minusp *level*)
+    (llc-error "The control stack level became negative."))
+  (when (> *level* *max-level*)
+    (setq *max-level* *level*)))
+
+(defun decf-level (&optional (amount 1))
+  (incf-level (- amount)))
+
+(defun incf-l-level (&optional (amount 1))
+  (incf *l-level* amount)
+  (when (minusp *l-level*)
+    (llc-error "The local block size became negative."))
+  (when (> *l-level* *max-l-level*)
+    (setq *max-l-level* *l-level*)))
+
+(defun decf-l-level (&optional (amount 1))
+  (incf-l-level (- amount)))
+
+(defun incf-b-level (&optional (amount 1))
+  (incf *b-level* amount)
+  (when (minusp *b-level*)
+    (llc-error "The binding stack level became negative.")))
+
+(defun decf-b-level (&optional (amount 1))
+  (incf-b-level (- amount)))
+
+;;;; Individual cement handlers.
+
+(defun push-one-object (inst)
+  inst ;ignored
+  (incf-level)
+  t)
+
+(definst-method (cement no-op) ()
+  ;; Get rid of no-ops.
+  nil)
+
+(definst-method (cement capture-argument) ()
+  t)
+
+(definst-method (cement push-stack-closure) ()
+  (cond ((or (function-use-stack-closure-p push-stack-closure-function)
+	     (assq 'compiler:evacuable-downward-closures (function-user-declares *function*)))
+	 (setf push-stack-closure-level *level*)
+	 ;; We will be pushing two words on the stack
+	 (incf-level 2)
+	 t)
+	;; Some so declared have later turned out not to be permitted to be stack closures,
+	;; by virtue of with whom they share lexical variables.
+	(t nil)))
+
+(definst-method (cement push-logic-variable) ()
+  (let ((variable (cl:ecase (inst-opcode inst-next)
+		    (setq (setq-variable inst-next))
+		    (name (cl:find push-logic-variable-name (name-variables inst-next)
+				   :key #'variable-name))
+		    (bind (bind-variable inst-next)))))
+    (unless (and variable
+		 (eql push-logic-variable-name (variable-name variable)))
+      (llc-error "PUSH-LOGIC-VARIABLE in bad place"))
+    (setf push-logic-variable-variable variable)
+    (setf push-logic-variable-level *level*)
+    (incf *level*)
+    t))
+
+(definst-method (cement var) ()
+  ;; Remember the level before the var instruction, for phase 4.
+  (setf var-level *level*)
+  (incf-level)
+  t)
+
+(definst-method (cement fun) ()
+  (setf fun-level *level*)
+  (incf *level*)
+  t)
+
+(definst-method (cement const) ()
+  (push-one-object self))
+
+(definst-method (cement pop) ()
+  ;; Pop n things off the stack.
+  (decf-level pop-n)
+  t)
+
+(definst-method (cement computed-pop) ()
+  ;; Pop n things off the stack.
+  (decf-level computed-pop-n)
+  t)
+
+(definst-method (cement setq) ()
+  ;; Remember the level before the var instruction, for phase 4.
+  (setf setq-level *level*)
+  t)
+
+(definst-method (cement copy) ()
+  (push-one-object self))
+
+(defmethod (call-force-external call-instruction) ()
+  (eq call-inline-p 'cl:notinline))
+
+(definst-method (cement start-call) ()
+  ;; >>> This should be generic, since only the I front end emits these. <<<
+  (declare (special *functions-without-extra-args*))
+  (setq start-call-l-level *l-level*)
+  (setq start-call-b-level *b-level*)
+  (let* ((finish start-call-call)
+	 (n-args (call-n-args finish))
+	 (spec (function-spec start-call-function))
+	 tem)
+    (cond ((call-force-external finish)
+	   (setq start-call-level *level*)
+	   (if (memq spec *functions-without-extra-args*)
+		 (incf-level 2)
+		 (incf-level 3))
+	   t)
+	  ((get-kludged-built-in *compiler* spec)
+	   ;; If one of the kludged compiler built-ins, don't keep the instruction
+	   nil)
+	  ((and (memq (function-type start-call-function) '(external reference))
+		(symbolp spec)
+		(or (setq tem (get-assemble-function *compiler* spec))
+		    (setq tem (get-built-in *compiler* spec n-args))))
+	   (setf (call-builtin finish) tem)
+	   nil)				;Don't keep this instruction.
+	  ((memq spec *funcalling-functions*)
+	   (setq start-call-level (1- *level*))	;Continuation already pushed
+	   (let ((prev (inst-prev self)))
+	     ;; Note:  CEMENT-UNWIND knows about this
+	     (if (and (typep prev 'compiler:fun-instruction)
+		      (memq (function-spec (fun-function prev))
+			    *functions-without-extra-args*))
+		 (incf-level 1)
+		 (incf-level 2)))
+	   t)
+	  (t
+	   (setq start-call-level *level*)
+	   (if (memq spec *functions-without-extra-args*)
+	       (incf-level 2)
+	       (incf-level 3))			;worst-case
+	   t))))
+
+(definst-method (cement call) ()
+  (unless call-builtin
+    ;; Not all calls have call-starters (e.g. builtins like RPLACA that have a
+    ;; PHASE-1-HOOK property, since they don't go through PHASE-1-FUNCTION-CALL).
+    (setf call-builtin (get-built-in *compiler* (function-spec call-function) call-n-args)))
+  (cement-args-and-destination *compiler* self call-n-args call-destination)
+  (when (code-dead-after self)
+    (setq *dead* t))
+  t)
+
+;;; Tags
+
+(defgeneric jump-to-tag (tag))
+
+(defmethod (cement tag-instruction :default) ()
+  (jump-to-tag self)
+  t)
+
+(defmethod (cement-dead tag-instruction :default) ()
+  (llc-error "Unknown tag type"))
+
+;;;
+(deftag-method (jump-to-tag internal) ()
+  (cond ((null tag-level)
+	 (setf tag-level *level*)
+	 (setf tag-l-level *l-level*)
+	 (setf tag-b-level *b-level*))
+	(t
+	 (when (neq tag-level *level*)
+	   (llc-error "Inconsistent control stack level in tag ~S" self))
+	 (when (neq tag-l-level *l-level*)
+	   (llc-error "Inconsistent local-block level in tag ~s" self))
+	 (when (neq tag-b-level *b-level*)
+	   (llc-error "Inconsistent binding stack level in tag ~S" self)))))
+
+(deftag-method (cement-dead internal) ()
+  (setq *level* tag-level)
+  (setq *l-level* tag-l-level)
+  (setq *b-level* tag-b-level)
+  (cond ((null *level*)
+	 ;; This tag has NIL level because the jump to it became dead code.
+	 ;; Therefore, *dead* should stay true and this tag should be ignored.
+	 (push self *dead-tags*)
+	 nil)
+	(t
+	 (setq *dead* nil)
+	 t)))
+
+;;;
+
+(deftag-method (cement pc) ()
+  t)
+
+(deftag-method (cement-dead pc) ()
+  (push self *dead-tags*)
+  nil)
+
+;;;
+
+(deftag-method (jump-to-tag go) ()
+  (when (neq (nlg-level tag-pframe) *level*)
+    (llc-error "Inconsistent control stack level in tag ~S" self))
+  (when (neq (nlg-l-level tag-pframe) *l-level*)
+    (llc-error "Inconsistent control local-block level in tag ~S" self))
+  (when (neq (nlg-b-level tag-pframe) *b-level*)
+    (llc-error "Inconsistent binding stack level in tag ~S" self)))
+
+(deftag-method (cement-dead go) ()
+  (unless (eq (nlg-level tag-pframe) 'dead)
+    (setq *level* (nlg-level tag-pframe))
+    (setq *l-level* (nlg-l-level tag-pframe))
+    (setq *b-level* (nlg-b-level tag-pframe))
+    (when (null *level*)
+      (llc-error "GO tag seen before the level of the PROG was learned"))
+    (setq *dead* nil)
+    t))
+
+;;;
+
+(definst-method (cement jump) ()
+  (decf-level jump-pops-if-successful)
+  (jump-to-tag jump-tag)
+  (incf-level (- jump-pops-if-successful jump-pops-if-not-successful))
+  (when (eq jump-condition 'always)
+    (setq *dead* t))
+  t)
+
+(definst-method (cement return) ()
+  (setq *dead* t)
+  t)
+
+(definst-method (cement var-location) ()
+  (setf var-location-level *level*)
+  (incf *level*)
+  t)
+
+(definst-method (cement bind) ()
+  ;; Pop one thing off the control stack and onto the binding stack.
+  (incf-level (- (bindings-in-control-stack *compiler*)
+		 (if bind-variable 1 2)))
+  (incf-b-level)
+  t)
+
+(definst-method (cement unbind) ()
+  ;; Pop n things off the binding stack.
+  (decf-b-level unbind-n)
+  t)
+
+(definst-method (cement start-catch) ()
+  (let* ((pframe start-catch-pframe)		;Cache some IV's
+	 (dest-size (destination-size start-catch-destination))
+	 (tag (catch-internal-tag pframe)))
+    (decf-level)				;Catch-open D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD-ITALIC NIL) "CPTFONTBI")byte-lap0 pops arg
+    (setf (catch-level pframe)  *level*)
+    (setf (catch-l-level pframe) *l-level*)
+    (setf (catch-b-level pframe) *b-level*)
+    (unless (eq dest-size 'return)
+      (setf (tag-level tag)
+	    (+ *level*
+	       (if (eq dest-size 'multiple) 0 dest-size)))
+      (setf (tag-l-level tag) *l-level*)
+      (setf (tag-b-level tag) *b-level*))
+    (incf-level (catch-pframe-size pframe)))
+  t)
+
+(definst-method (cement start-unwind-protect) ()
+  (let ((pframe start-unwind-protect-pframe))	;Cache IV
+    (setf (catch-level pframe) *level*)
+    (setf (catch-l-level pframe) *l-level*)
+    (setf (catch-b-level pframe) *b-level*)
+    (jump-to-tag start-unwind-protect-handler)
+    (incf-level (catch-pframe-size pframe))
+    t))
+
+(definst-method (cement end-catch) ()
+  (decf-level (catch-pframe-size end-catch-pframe))
+  t)
+
+(definst-method (cement take-args) ()
+  (cement-take-args *compiler* self))
+
+(definst-method (cement take-arg) ()
+  (push-one-object self))
+
+(definst-method (cement require-args) ()
+  t)
+
+(definst-method (cement take-keyword-argument) ()
+  (setf take-keyword-argument-level *level*)
+  (cement-interval take-keyword-argument-interval (1- *level*))
+  t)
+
+(definst-method (cement arg-supplied-p) ()
+  (incf-level)
+  t)
+
+(definst-method (cement pad-argument-block) ()
+  t)
+
+(definst-method (cement take-values) ()
+  (incf-level take-values-destination)
+  t)
+
+(definst-method (cement relative-push-address) ()
+  (push-one-object self))
+
+(definst-method (cement throw) ()
+  (cement-throw *compiler* self))
+
+
+(definst-method (cement allocate-local-block) ()
+  (let ((level *level*))
+    (setf *l-level* level)
+    (setf *max-l-level* level)
+    (setf *local-block-offset* level))       
+  t)
+
+(definst-method (cement popj) ()
+  (setq *dead* t)
+  t)
+
+(definst-method (cement unwind-quick-internal) ()
+  ;; Lexical closures may be pushed, and need to be popped.
+  (when (plusp *level*)
+    (emit-pop *level* unwind-quick-internal-save-n)
+    (setq *level* 0))
+  nil)
+
+(defun name-internal-allocate (var)
+  (cond ((lexical-nested-captive-p var)
+	 (setf (lexical-location var) *l-level*)
+	 (setf (lexical-captive-location var) *l-level*)
+	 (incf-l-level (lexical-size var)))
+	(t
+	 (when (and (not (lexical-argument-p var))
+		    (not (lexical-stack-resident-p var))
+		    (not (lexical-captive-p var)))
+	   (setf (lexical-location var) *l-level*)
+	   (setf (lexical-captive-location var) *l-level*)
+	   (setf (lexical-control-stack-state var) (make-control-stack-state))
+	   (incf-l-level (lexical-size var))))))
+
+(defun name-internal (depth var setq-p top-captive)
+  (cond ((lexical-nested-captive-p var)
+	 (let* ((cv-function (external-function 'capture-variable))
+		(start-call (emit-start-call-if-needed
+			      *compiler* cv-function *destination-stack* 2))
+		(level *level*))
+	   (when start-call
+	     (setf (inst-level start-call) *level*)
+	     (setf (start-call-level start-call) *level*)
+	     (incf-level 2))
+	   (setf (inst-level (emit-copy (+ depth (- *level* level))))
+		 *level*)
+	   (incf-level)
+	   (let ((inst (cond (top-captive
+			      (emit (make-var-instruction
+				      :var-variable top-captive
+				      :var-nested-captive-environment t)))
+			     ((function-has-captive-lexicals-p *function*)
+			      (emit-var (get-function-captive-block-pointer *function*)))
+			     (t
+			      (emit-var (get-environment-list-pointer *function*))))))
+	     (setf (inst-level inst) *level*)
+	     (setf (var-level inst) *level*)
+	     (incf-level))
+	   (setf (inst-level (emit-call cv-function 2 *destination-stack* nil start-call))
+		 *level*)
+	   (setf *level* (1+ level)))
+	 (cond ((zerop depth)
+		(cond (setq-p
+		       (let ((setq (emit (make-setq-instruction :setq-variable var
+								:setq-nested-captive-environment t))))
+			 (setf (inst-level setq) *level*)
+			 (setf (setq-level setq) *level*))
+		       (setf (inst-level (emit-pop 2)) *level*)
+		       (decf-level 2))
+		      (t
+		       (setf (inst-level (emit-pop 1 1)) *level*)
+		       (decf-level))))
+	       (t
+		(let ((setq (emit (make-setq-instruction :setq-variable var
+							 :setq-nested-captive-environment t))))
+		  (setf (inst-level setq) *level*)
+		  (setf (setq-level setq) *level*))
+		(setf (inst-level (emit-pop 1)) *level*)
+		(decf-level)))
+	 (setf top-captive var))
+	(t
+	 (when setq-p
+	   (when (plusp depth)
+	     (setf (inst-level (emit-copy depth)) *level*)
+	     (incf-level))
+	   (let ((setq (emit (make-setq-instruction :setq-variable var))))
+	     (setf (inst-level setq) *level*)
+	     (setf (setq-level setq) *level*))
+	   (setf (inst-level (emit-pop 1)) *level*)
+	   (decf-level))))
+  top-captive)
+
+(definst-method (cement name) ()
+  (let* ((nvars (length name-variables))
+	 (vars (cl:make-array nvars :initial-contents name-variables))
+	 (stack-slots 0)
+	 (top-captive (loop for (name . v) in name-lexical-contour
+			    do (ignore name)
+			    when (and (typep v 'variable)
+				      (eq 'lexical (variable-type v))
+				      (null (lexical-superseding-variable v))
+				      (lexical-nested-captive-p v)
+				      (eq (lexical-function v) *function*))
+			      return v)))
+    (cl:loop for this-var below nvars
+       do (let ((var (aref vars this-var)))
+	    (cond ((lexical-argument-p var))
+		  ((null *l-level*))		;no local block
+		  ((or *all-vars-stack-resident* (lexical-stack-resident-p var)))
+		  (t
+		   ;; Non-stack resident.  Copy into home and adjust stack.
+		   (name-internal-allocate var)))))
+    ;; First work from the end popping off things that don't go in the stack.
+    ;; This lets us do better later because there is less to shuffle on the stack.
+    ;; Keep track of the number of stack slots we are using.
+    (let ((this-var (1- nvars)))
+      (cl:loop
+	 (when (minusp this-var) (return))	;all done
+	 (let* ((var (aref vars this-var))
+		(size (lexical-size var)))
+	   (setf (lexical-local-block-offset var) *local-block-offset*)
+	   (cond ((or (plusp stack-slots)	;trapped and has to be handled below
+		      (lexical-argument-p var)
+		      (null *l-level*)		;No local block
+		      *all-vars-stack-resident*
+		      (lexical-stack-resident-p var))
+		  (incf stack-slots size))
+		 ;; Pop the value of this non-stack-resident variable off of the stack.
+		 (t
+		  (unless (= size 1)
+		    (setf (inst-level (emit-pop (1- size))) *level*)
+		    (decf-level (1- size)))
+		  (setf top-captive (name-internal 0 var t top-captive))
+		  (decf nvars)))
+	   ;; On to the next
+	   (decf this-var))))
+    ;; Now work from the beginning.
+    ;; NVARS is the number of variables left to process.
+    ;; STACK-SLOTS is the number of stack slots these variables take up.
+    (let ((this-var 0))
+      (cl:loop
+	 (unless (plusp nvars) (return))	;all done
+	 (let* ((var (aref vars this-var))
+		(size (lexical-size var))
+		(depth (1- stack-slots)))
+	   (decf stack-slots size)		;correct for size of this variable
+	   (cond ((lexical-argument-p var)
+		  (when (and (lexical-rest-arg-p var)
+			     (not (variable-ignored-p var))
+			     (not (lexical-dynamic-extent var)))
+		    (cement-copy-&rest-argument *compiler* var)))
+		 ((null *l-level*)		;no local block
+		  (setf (lexical-location var)
+			(+ (lexical-offset var)
+			   (- *level* stack-slots size))))
+		 ((or *all-vars-stack-resident* (lexical-stack-resident-p var))
+		  (setf (lexical-location var) 
+			(+ (lexical-offset var)
+			   (- *level* stack-slots size)))
+		  (setf top-captive (name-internal depth var nil top-captive)))
+		 (t
+		  ;; Non-stack resident.  Copy into home and adjust stack.
+		  (setf top-captive (name-internal depth var t top-captive))
+		  ;; Adjust the rest of the stack.
+		  (setf (inst-level (emit-pop size stack-slots)) *level*)
+		  (decf-level size)))
+	   ;; On to the next.  STACK-SLOTS is already corrected above.
+	   (incf this-var)
+	   (decf nvars)))))
+  ;; Done
+  (setf (inst-level (emit-name name-variables nil nil)) *level*)
+  nil)
+
+(definst-method (cement pop-vars) ()
+  (let ((binding-stack 0)
+	(control-stack 0)
+	(vars nil))
+    (dolist (var pop-vars-list)
+      (cl:case (variable-type var)
+	(special
+	  (incf binding-stack)
+	  (incf control-stack (bindings-in-control-stack *compiler*)))
+	(lexical
+	  (cond ((or *all-vars-stack-resident* (lexical-stack-resident-p var))
+		 (incf control-stack (lexical-size var))
+		 (push var vars))
+		((lexical-nested-captive-p var)
+		 (decf-l-level))
+		((and (not (lexical-argument-p var))
+		      (not (lexical-stack-resident-p var))
+		      (not (lexical-captive-p var)))
+		 (decf-l-level (lexical-size var)))))))
+    (when (plusp binding-stack)
+      (emit-unbind binding-stack)
+      (decf-b-level binding-stack))
+    (when (plusp control-stack)
+      (when (back-end-requires-pop-vars *compiler*)
+	(setf (inst-level (emit-pop-vars (nreverse vars) pop-vars-destination)) *level*))
+      (setf (inst-level (emit-pop control-stack (destination-size pop-vars-destination)))
+	    *level*)
+      (decf-level control-stack)))
+  nil)
+
+(definst-method (cement start-dbs) ()
+  (let ((pframe start-dbs-pframe))
+    (when (and (dbs-bind-p pframe)
+	       (or (dbs-save-binding-stack pframe)
+		   (pframe-unwind-p pframe)))
+      (setf (dbs-b-level pframe) *b-level*)
+      (setf (dbs-var-level pframe) *level*)
+      (setf (dbs-l-level pframe) *l-level*)
+      (emit-binding-stack-level *compiler*)
+      (incf-level)))
+  nil)
+
+(definst-method (cement end-dbs) ()
+  (let ((pframe end-dbs-pframe))
+    (when (and (dbs-bind-p pframe)
+	       (or (dbs-save-binding-stack pframe)
+		   (pframe-unwind-p pframe)))
+      (setq *b-level* (dbs-b-level pframe))
+      (setq *l-level* (dbs-l-level pframe))
+      (let ((size (destination-size (dbs-destination pframe))))
+	;; Call restore binding stack level.  Optimization: if size=0 then the binding
+	;; stack level is on top of the stack, so avoid the push and pop.
+	(unless (eql 0 size)			;Don't use ZEROP, since it could be a symbol
+	  (setf (inst-level (emit-copy size)) *level*)
+	  (incf-level))
+	(setf (inst-level
+		(emit-call
+		  (external-function 'system:%restore-binding-stack-level) 1 *destination-ignore*))
+	      *level*)
+	(decf-level 1)
+	(unless (eql 0 size)
+	  (setf (inst-level (emit-pop 1 size)) *level*)
+	  (decf-level)))))
+  nil)
+
+(definst-method (cement start-prog) ()
+  (let ((pframe start-prog-pframe))
+    (setf (nlg-level pframe) *level*)
+    (setf (nlg-l-level pframe) *l-level*)
+    (setf (nlg-b-level pframe) *b-level*)
+    nil))
+
+(definst-method (cement-dead start-prog) ()
+  (setf (nlg-level start-prog-pframe) 'dead)
+  nil)
+
+(definst-method (cement end-prog) ()
+  (let ((pframe end-prog-pframe))
+    pframe)
+  nil)
+  
+(definst-method (cement unwind) ()
+  (cement-unwind *compiler* self))
+
+
+(definst-method (cement start-multiple) ()
+  (setf (multiple-level start-multiple-pframe) *level*)
+  (setf (multiple-l-level start-multiple-pframe) *l-level*)
+  (setf (multiple-b-level start-multiple-pframe) *b-level*)
+  nil)
+
+(definst-method (cement end-multiple) ()
+  nil)
+
+(definst-method (cement start-saved-multiple) ()
+  (dolist (pframe start-saved-multiple-pframes)
+    (setf (saved-multiple-level pframe) *level*)
+    (setf (saved-multiple-l-level pframe) *l-level*)
+    (setf (saved-multiple-b-level pframe) *b-level*))
+  nil)
+
+(definst-method (cement save-level) ()
+  (setf (level-saver-level save-level-saver) *level*)
+  (setf (level-saver-l-level save-level-saver) *l-level*)
+  nil)
+
+(definst-method (cement restore-level) ()
+  (setq *level* (level-saver-level restore-level-saver))
+  (setq *l-level* (level-saver-l-level restore-level-saver))
+  nil)
+
+(definst-method (cement kludge-stack) ()
+  (if kludge-stack-binding-p
+      (incf *b-level* kludge-stack-amount)
+      (incf *level* kludge-stack-amount))
+  nil)
+
+(definst-method (cement fixup-labels) ()
+  ;; Because LABELS'ed functions close over each other by simply referencing the local
+  ;; function cells, we'd have a problem if the function cells are being bound inside
+  ;; loops: forward references will lose.  So we have to make this pass over the internal
+  ;; functions, adding all referenced function cell vars to the front of the closure's
+  ;; environment.
+  (let ((nested-captive (cl:find-if #'lexical-nested-captive-p fixup-labels-fcell-vars
+				    :from-end t)))
+    (when nested-captive
+      ;; Go through all the closures and set their environments to be the current
+      ;; environment, after all the necessary function cells have been captured
+      (dolist (v fixup-labels-fcell-vars)
+	(let ((fun (function-cell-function v)))
+	  (when (function-refers-lexically-p fun)
+	    (let* ((function (external-function 'set-closure-environment))
+		   (start-call (emit-start-call-if-needed *compiler* function *destination-ignore* 2))
+		   (level *level*))
+	      (when start-call
+		(setf (start-call-level start-call) *level*)
+		(setf (inst-level start-call) *level*)
+		(setf (start-call-l-level start-call) *l-level*)
+		(incf-level 2))
+	      (let ((var (emit-var v)))		;The closure
+		(setf (inst-level var) *level*)
+		(setf (var-level var) *level*)
+		(incf-level))
+	      (let ((inst (emit (make-var-instruction :var-variable nested-captive
+						      :var-nested-captive-environment t))))
+		(setf (inst-level inst) *level*)
+		(setf (var-level inst) *level*)
+		(incf-level))
+	      (setf (inst-level (emit-call function 2 *destination-ignore* nil start-call))
+		    *level*)
+	      (setf *level* level))))))
+    ;; Don't pass this instruction on from Phase 2 under any circumstances.
+    nil))
+
+(definst-method (cement flavor-mapping-table) ()
+  t)
+
+(defun cement-n-to-destination (n destination)
+  (let ((size (destination-size destination)))
+    (selectq size
+      (return
+       ;; Return from function, it's all over.
+       (setq *dead* t))
+      (multiple
+       ;; Multiple value group left on stack.  Note it, pop arguments.
+       (decf-level n))
+      (otherwise
+       ;; Pop off the arguments and push the returned values.
+       (incf-level (- size n))))))
+
+(definst-method (cement fast-aref) ()
+  (setf fast-aref-level *level*)
+  t)
+
+(definst-method (cement fast-aref-begin) ()
+  (let* ((fast-aref-inst fast-aref-begin-inst)
+	 (fast-aref-variable (fast-aref-variable fast-aref-inst)))
+    (let ((array-register-p (eq (lexical-class fast-aref-variable) 'array-register)))
+      (unless (and array-register-p
+		   (eq *function* (lexical-function fast-aref-variable))
+		   (lexical-stack-resident-p fast-aref-variable)
+		   (not (lexical-nested-captive-p fast-aref-variable)))
+	(let* ((function (if (or (eq fast-aref-begin-function 'sys:%1d-aref)
+				 (and (eq (lexical-class fast-aref-variable) 'array-register)
+				      (eq (array-register-type fast-aref-variable) 'force-1d)))
+			     'sys:%1d-aref
+			     'ar-1))
+	       (aref-external (external-function function))
+	       (start-call
+		 (let ((start-call
+			 (emit-start-call-if-needed
+			   *compiler* aref-external *destination-stack* 2)))
+		   (when start-call
+		     (setf (start-call-level start-call) *level*)
+		     (setf (inst-level start-call) *level*)
+		     (setf (start-call-l-level start-call) *l-level*)
+		     (incf-level 2))
+		   start-call)))
+	  (let ((var (emit-var fast-aref-variable)))
+	    (setf (var-level var) *level*)
+	    (setf (inst-level var) *level*)
+	    (incf-level))
+	  (let ((aref (make-call-instruction
+			:call-function (external-function function)
+			:call-n-args 2
+			:call-destination *destination-stack*
+			:call-inline-p t
+			:inst-next (inst-next fast-aref-inst)
+			:inst-prev (inst-prev fast-aref-inst)
+			:call-start-call (and start-call `(,start-call)))))
+	    (when start-call
+	      (setf (start-call-call start-call) aref))
+	    (when (and array-register-p (array-register-warn fast-aref-variable))
+	      (setf (array-register-warn fast-aref-variable) nil)
+	      (warn "FAST-AREF of ~s being turned into ~s"
+		    (variable-name fast-aref-variable)
+		    (if (eq function 'ar-1) 'aref function)))
+	    (setf (inst-next (inst-prev aref)) aref)
+	    (setf (inst-prev (inst-next aref)) aref))))
+      nil)))
+
+(definst-method (cement fast-aset) ()
+  (setf fast-aset-level *level*)
+  (decf-level 2)
+  t)
+
+(definst-method (cement fast-aset-begin) ()
+  (let* ((fast-aset-inst fast-aset-begin-inst)
+	 (fast-aset-variable (fast-aset-variable fast-aset-inst)))
+    (let ((array-register-p (eq (lexical-class fast-aset-variable) 'array-register)))
+      (unless (and array-register-p
+		   (eq *function* (lexical-function fast-aset-variable))
+		   (lexical-stack-resident-p fast-aset-variable)
+		   (not (lexical-nested-captive-p fast-aset-variable)))
+	(let* ((function (if (or (eq fast-aset-begin-function 'sys:%1d-aset)
+				 (and (eq (lexical-class fast-aset-variable) 'array-register)
+				      (eq (array-register-type fast-aset-variable) 'force-1d)))
+			     'sys:%1d-aset
+			     'as-1))
+	       (aset-external (external-function function))
+	       (start-call
+		 (let ((start-call
+			 (emit-start-call-if-needed
+			   *compiler* aset-external *destination-ignore* 3)))
+		   (when start-call
+		     (when (typep inst-next 'copy-instruction)
+		       (incf (copy-n inst-next) 2))
+		     (setf (start-call-level start-call) *level*)
+		     (setf (start-call-l-level start-call) *l-level*)
+		     (setf (inst-level start-call) *level*)
+		     (incf-level 2))
+		   start-call))
+	       (var (make-var-instruction :var-variable fast-aset-variable
+					  :inst-next (inst-next fast-aset-last-value-inst)
+					  :inst-prev fast-aset-last-value-inst))
+	       (aset (make-call-instruction
+		       :call-function (external-function function)
+		       :call-n-args 3
+		       :call-destination *destination-ignore*
+		       :call-inline-p t
+		       :inst-next (inst-next fast-aset-inst)
+		       :inst-prev (inst-prev fast-aset-inst)
+		       :call-start-call (and start-call `(,start-call)))))
+	  (when start-call
+	    (setf (start-call-call start-call) aset))
+	  (when (and array-register-p (array-register-warn fast-aset-variable))
+	    (setf (array-register-warn fast-aset-variable) nil)
+	    (warn "FAST-ASET of ~s being turned into ~s"
+		  (variable-name fast-aset-variable)
+		  (if (eq function 'as-1) 'aset function)))
+	  (setf (inst-prev (inst-next var)) var)
+	  (setf (inst-next (inst-prev var)) var)
+	  (setf (inst-next (inst-prev aset)) aset)
+	  (setf (inst-prev (inst-next aset)) aset)))
+      nil)))
+
+(definst-method (cement setup-array) ()
+  (let ((variable setup-array-register-variable))
+    (cond ((and (eq *function* (lexical-function variable))
+		(lexical-stack-resident-p variable))
+	   (incf-level 3)
+	   t)
+	  (t
+	   (when (array-register-warn variable)
+	     (warn "~a declaration for ~s being ignored"
+		   (cl:ecase (array-register-type variable)
+		     (normal "ARRAY-REGISTER")
+		     (force-1d "ARRAY-REGISTER-1D"))
+		   (variable-name variable)))
+	   (change-instance-flavor variable 'normal-lexical-variable)
+	   (setf (lexical-size variable) 1)
+	   nil))))
+
+(definst-method (cement push-pc) ()
+  (incf *level*)
+  t)
+
+(definst-method (cement push-pc-array) ()
+  (incf *level*)
+  t)
+
+(definst-method (cement macro-instruction) ()
+  (cement-macro-instruction *compiler* self))
+
+(definst-method (cement block-read-test) ()
+  (jump-to-tag block-read-test-tag)
+  t)
+
+(definst-method (adjust push-stack-closure)
+		(local-block-size)
+  (incf push-stack-closure-level local-block-size))
+
+(definst-method (adjust var)
+		(local-block-size)
+  (when var-level
+    (incf var-level local-block-size)))
+
+(definst-method (adjust fun)
+		(local-block-size)
+  (incf fun-level local-block-size))
+
+(definst-method (adjust setq)
+		(local-block-size)
+  (when setq-level
+    (incf setq-level local-block-size)))
+
+(definst-method (adjust start-call)
+		(local-block-size)
+  (when start-call-level
+    (incf start-call-level local-block-size)))
+
+(deftag-method (adjust internal)
+	       (local-block-size)
+  (when tag-level
+    (incf tag-level local-block-size)))
+
+(definst-method (adjust var-location)
+		(local-block-size)
+  (when var-location-level
+    (incf var-location-level local-block-size)))
+
+(definst-method (adjust start-catch)
+		(local-block-size)
+  (let ((old-level (catch-level start-catch-pframe)))
+    (when (numberp old-level)
+      (incf (catch-level start-catch-pframe) local-block-size))))
+
+(definst-method (adjust start-unwind-protect)
+		(local-block-size)
+  (let ((old-level (catch-level start-unwind-protect-pframe)))
+    (when (numberp old-level)
+      (incf (catch-level start-unwind-protect-pframe) local-block-size))))
+
+(definst-method (adjust take-keyword-argument)
+		(local-block-size)
+  (incf take-keyword-argument-level local-block-size)
+  (loop for inst first (interval-first take-keyword-argument-interval) then (inst-next inst)
+	while inst
+	doing
+    (adjust inst local-block-size)))
+
+(definst-method (adjust start-dbs)
+		(local-block-size)
+  (let ((old-level (dbs-var-level start-dbs-pframe)))
+    (when (numberp old-level)
+      (incf (dbs-var-level start-dbs-pframe) local-block-size))))
+
+(definst-method (adjust start-prog)
+		(local-block-size)
+  (let ((old-level (dbs-var-level start-prog-pframe)))
+    (when (numberp old-level)
+      (incf (dbs-var-level start-prog-pframe) local-block-size))))
+
+(definst-method (adjust start-multiple)
+		(local-block-size)
+  (let ((old-level (multiple-level start-multiple-pframe)))
+    (when (numberp old-level)
+      (incf (multiple-level start-multiple-pframe) local-block-size))))
+
+(definst-method (adjust save-level)
+		(local-block-size)
+  (let ((old-level (level-saver-level save-level-saver)))
+    (when (numberp old-level)
+      (incf (level-saver-level save-level-saver) local-block-size))))
+
+(definst-method (adjust fast-aref)
+		(local-block-size)
+  (incf fast-aref-level local-block-size))
+
+(definst-method (adjust fast-aset)
+		(local-block-size)
+  (incf fast-aset-level local-block-size))
+
+(defgeneric adjust (inst local-block-size))
+
+(defmethod (adjust byte-lap-instruction :default) (local-block-size)
+  (declare (ignore local-block-size))
+  nil)

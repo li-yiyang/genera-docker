@@ -1,0 +1,468 @@
+ ;-*- Mode:LISP; Package:TAPE; Base:8; Lowercase:T -*- 
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;;; The Lisp Machine server for the RTAPE (Remote Tape) protocol.
+
+(defvar *server-interact* nil)
+(defvar *debug-server* nil)
+
+(net:define-server :rtape (:medium :byte-stream :stream (stream :accept-p nil :characters nil)
+			   :who-line t :no-eof t :flavor rtape-server-instance))
+(defflavor rtape-server-instance
+	(state (tape-stream nil) net-stream status
+	       (dont-flush nil)
+	       (write-error nil)
+	       (status-string nil)
+	       foreign-host
+	       (peek-op -1)
+	       (peek-state "Created")
+	       (cart-p nil)
+	       (writes-discarded-valid nil)
+	       (write-pointer 0))
+	(neti:byte-stream-server)
+  (:functions rtape-server-probe rtape-server-status rtape-server-read
+	      rtape-server-parse-asciinum rtape-server-really-read)
+  (:gettable-instance-variables status-string peek-op peek-state tape-stream))
+
+(defmethod (:server-top-level rtape-server-instance) ()
+  (let ((stream (send self :stream)))
+    (if (not (tape-exists-p))
+	(send stream ':reject (format nil "Machine ~A has no local tape." si:local-host))
+	(send stream ':accept)
+	(unwind-protect
+	  (progn
+	    (condition-case-if (not *debug-server*)
+			       (err)
+		(send self ':serve stream (send self :foreign-host))
+	      (error
+		(let ((reason (string-append
+				"RTAPE Server program error: "
+				(with-output-to-string (error-output)
+				  (send err ':report error-output)))))
+		  (send stream ':close-with-reason reason ':abort)))))
+	  (send self ':close)))))
+						
+(defun-in-flavor (rtape-server-probe rtape-server-instance) ()
+  (let* ((low (send net-stream ':tyi))
+	 (high (send net-stream ':tyi))
+	 (uid (dpb high (byte 8. 8.) low)))
+    (rtape-server-status uid)))
+(defun-in-flavor (rtape-server-status rtape-server-instance) (id)
+  (setf (rtape-status-bot-p status) (and tape-stream (send tape-stream ':bot-p)))
+  (setf (rtape-status-offline status)
+	(and tape-stream (not cart-p)
+	     (not (send tape-stream ':ready-p))))
+  (and tape-stream (setf (rtape-status-density status)
+			 (or (send tape-stream ':send-if-handles ':density)
+			     0)))
+  (setf (rtape-status-no-records status) cart-p)
+  (setf (rtape-status-writes-discarded-valid status) writes-discarded-valid)
+  (setf (rtape-status-probe-uid status) id)
+  (setf (rtape-status-solicited status) (not (zerop id)))
+  (setf (rtape-status-explanatory-string-follows status)
+	(not (null status-string)))
+  (setf (rtape-status-can-limit-cart-write status) t)
+  (send net-stream ':string-out status)
+  (when status-string
+    (si:with-indirect-array (ia 'art-8b status-string)
+      (send net-stream :string-out ia)))
+  (send net-stream ':set-opcode rtape-STATUS-op)
+  (send net-stream ':real-force-output))
+
+(defmacro server-mount-error (&rest args)
+  `(progn
+     (server-protocol-error ,@args)
+     (throw 'server-mount nil)))
+
+(defun-in-flavor (server-protocol-error rtape-server-instance) (&rest format-args)
+  (setf (rtape-status-hard-error status) t)
+  (setq status-string (lexpr-funcall #'format nil format-args)))
+
+(defun-in-flavor (server-mount-parse-number rtape-server-instance) (value description)
+  (or (parse-number value)
+      (server-mount-error "Non-numeric ~A: ~A" description value)))
+
+(defun simulated-line-in (stream)		;this makes me sick.
+  (let ((string (make-array 50. :fill-pointer 0 :type 'art-string)))
+    (loop as c = (send stream :tyi)
+	  unless c return nil
+	  as cc = (code-char c)
+	  if (char= cc #\CR)
+	    return nil
+	  do (array-push-extend string cc))
+    string))
+
+(defun-in-flavor (rtape-server-mount rtape-server-instance) ()
+  (setq peek-state "Mounting")
+  (destructuring-bind (direction reel-spec drive-spec max-block-size density . opts)
+		      (rtape-server-parse-atoms (simulated-line-in net-stream))
+    (let ((operator-msg (simulated-line-in net-stream)))
+      (if (equal operator-msg "") (setq operator-msg nil))
+      (catch 'server-mount
+	(or direction (server-mount-error "No direction given."))
+	(loop for opt in opts
+	      unless (member opt '("NOREWIND"))
+	      do  (server-mount-error "Unknown option: ~A" opt))
+	(or (member direction '("READ" "WRITE" "BOTH"))
+	    (server-mount-error "Invalid direction given: ~A" direction))
+	(and max-block-size
+	     (setq max-block-size (server-mount-parse-number max-block-size "block size")))
+	(setq density (if density
+			  (server-mount-parse-number density "density")
+			  1600.))
+	(if *server-interact*
+	    (format t "Mount reel ~@[~A ~]for host ~A~@[: ~A~]"
+		    reel-spec
+		    (send foreign-host ':pretty-name)
+		    operator-msg))
+	(setq direction (cdr (assoc direction
+				    '(("READ" . :input) ("WRITE" . :output)
+				      ("BOTH" . :bidirectional)))))
+	;;As of 9/24/82 drive offline will be counted as a mount error
+	(condition-case (error)
+	    (setq tape-stream
+		  (make-stream
+		    ':host net:local-host
+		    ':unit drive-spec
+		    ':direction direction
+		    ':lock-reason (format nil "Tape server serving ~A"
+					  (send foreign-host ':pretty-name))
+		    ':reel (or reel-spec "")
+		    ':background t
+		    ':density density
+		    ':minimum-record-length-granularity nil
+		    ':buffer-size max-block-size
+		    ':norewind (member "NOREWIND" opts)
+		    ':no-bot-prompt t
+		    ':input-stream-mode nil))
+	  (tape:tape-error (server-mount-error (send error ':message))))
+	;;we hack records; user hacks streams
+	(setq cart-p (eq (send tape-stream ':send-if-handles ':device-type) ':cart))
+	(setf writes-discarded-valid
+	      (and (operation-handled-p tape-stream 'tape:tape-stream-file-position)
+		   (not (null (tape:tape-stream-file-position tape-stream)))))
+	(send net-stream ':new-block-size
+	      (send tape-stream
+		    (if cart-p			;MEANS something different...
+			':buffer-length
+			':record-length)))
+	(setq status-string nil)
+	(setf (rtape-status-actual-drive-name status)
+	      (format nil "~D" (send tape-stream ':unit)))
+	(setf (rtape-status-mounted status) t)))))
+
+(defun-in-flavor (rtape-server-read rtape-server-instance) ()
+  (let ((count (rtape-server-parse-asciinum ':plus-only)))
+    (cond ((stringp count))			;already erred
+	  (t (rtape-server-really-read count)))))	;could be nil
+
+(defun-in-flavor (rtape-server-parse-asciinum rtape-server-instance) (&optional plusp
+									   &aux how-many)
+  (let ((read-control-string (simulated-line-in net-stream)))
+    (cond ((equal read-control-string "")
+	   nil)
+	  ((null (setq how-many (parse-number read-control-string)))
+	   (server-protocol-error "Invalid record count in command: ~A"
+				  read-control-string)
+	   (rtape-server-status 0)
+	   "Error")
+	  ((and plusp (or (minusp how-many) (zerop how-many)))
+	   (server-protocol-error "Negative or zero record count in read command: ~D"
+				  how-many)
+	   (rtape-server-status 0)
+	   "Error")
+	  (t how-many))))
+
+(defun-in-flavor (rtape-server-really-read rtape-server-instance) (how-many)
+  (setq peek-state "Reading")
+  (send net-stream ':discard-current-record)
+  (setf (rtape-status-number-of-blocks-read status) 0)
+  (setf (rtape-status-hard-error status) nil)
+  (setq status-string nil)
+  (setf (rtape-status-eof status) nil)
+  (if cart-p (setq how-many nil))
+  (loop for record-count from 1
+	until (and how-many (> record-count how-many))
+	when (send net-stream ':listen) return nil
+	do
+    (condition-case (err)
+	 (let ((tape-state (and (not cart-p) (send tape-stream ':record-status))))
+	   (when cart-p
+	     (multiple-value-bind (buf index limit)
+		 (send tape-stream ':read-input-buffer)
+	       (cond ((null buf)		;eof
+		      (setq tape-state ':eof))
+		     (t (send net-stream ':write-record rtape-DATA-op buf index limit)
+			(send tape-stream ':advance-input-buffer limit)
+			#+hornig (incf (rtape-status-number-of-blocks-read status))
+			#-hornig (setf (rtape-status-number-of-blocks-read status)
+				       (1+ (rtape-status-number-of-blocks-read status)))))))
+	   (cond ((and cart-p (null tape-state)))
+		 ((numberp tape-state)		;good record
+		  (stream-copy-until-eof tape-stream net-stream)
+		  #+hornig (incf (rtape-status-number-of-blocks-read status))
+		  #-hornig (setf (rtape-status-number-of-blocks-read status)
+				 (1+ (rtape-status-number-of-blocks-read status)))
+		  (send tape-stream ':discard-current-record)
+		  (send net-stream ':end-record rtape-DATA-op))
+		 ((eq tape-state ':eof)
+		  (setf (rtape-status-eof status) t)
+		  (send tape-stream ':clear-eof)
+		  (send net-stream ':write-record rtape-EOF-op "")	;r-f-o at end of loop
+		  (loop-finish))
+		 (t (ferror "Unknown tape state: ~S" tape-state))))
+       ((end-of-tape)
+	(setf (rtape-status-past-eot status) t)
+	(setf (rtape-status-hard-error status) t)
+	(setf status-string (send err :message))
+	(send tape-stream :clear-error)
+	(rtape-server-status 0)
+	(loop-finish))
+       ((transfer-error offline-condition)
+	(setf (rtape-status-hard-error status) t)
+	(setq status-string (send err ':message))
+	(send tape-stream ':clear-error)
+	(rtape-server-status 0)
+	(loop-finish))))
+  (send net-stream ':real-force-output)
+  (setq dont-flush t))
+(defun-in-flavor (rtape-server-write rtape-server-instance) (first)
+  (cond ((and write-error (not first))
+	 (incf (rtape-status-writes-discarded status)))
+	(t
+	 (setf write-error nil)
+	 (when (plusp (send net-stream ':record-length))
+	   (setq peek-state "WriteStatus")
+	   (send self ':write-error-status)
+	   (cond ((null (send self ':write-error-status))
+		  (setf (rtape-status-writes-discarded status) 0)
+		  (stream-copy-until-eof net-stream tape-stream)
+		  (send tape-stream ':force-output))
+		 (t (setf (rtape-status-writes-discarded status) 0)))))))
+;;;due to cartridge tape brain damage, status is inaccessible without halting the device.
+(defun-in-flavor (rtape-server-cart-write rtape-server-instance) (first)
+  (let ((record-length (send net-stream ':record-length)))
+    (cond ((and write-error (not first))
+	   (incf (rtape-status-writes-discarded status)
+		 (if writes-discarded-valid record-length 1)))
+	  (t
+	   (setf write-error nil)
+	   (if writes-discarded-valid
+	       (setf write-pointer (+ (tape-stream-file-position tape-stream) record-length))
+	       (setf (rtape-status-writes-discarded status) 0))
+	   (when (plusp record-length)
+	     (condition-case (errstat)
+		  (stream-copy-until-eof net-stream tape-stream)
+		(tape:end-of-tape (send self ':write-error-status ':end-of-tape))
+		(tape:tape-error (send self ':write-error-status errstat))))))))
+
+(defmethod (:close rtape-server-instance) ()
+  (and tape-stream (ignore-errors (send tape-stream ':close ':abort))))
+(defmethod (:serve rtape-server-instance) (stream host)
+  (setq foreign-host host)
+  (setq net-stream
+	(make-instance 'si:record-stream-8-bit-io-stream ':target-stream stream)
+	status (allocate-resource 'rtape-status-buffer)
+	status-string nil)
+  (copy-array-contents "" status)
+  (setf (rtape-status-version status) 1)
+  (loop for lastop = -1 then op
+	do (setq peek-state "Idle")
+	for op = (prog1 (setq peek-op (send net-stream ':opcode))
+			(setq peek-state "Processing"))
+	when (and (= lastop rtape-WRITE-op)
+		  ( op rtape-WRITE-op))
+	  do   (send self ':write-error-status)
+	when ( op rtape-PROBE-op)
+	  do   (setf (rtape-status-last-opcode status) op)
+	       (setf (rtape-status-hard-error status) nil)
+	       (setq status-string nil)
+	do
+    (select op
+      (rtape-LOGIN-op 1)
+      (rtape-MOUNT-op  (rtape-server-mount))
+      (rtape-PROBE-op  (rtape-server-probe))
+      (rtape-READ-op   (rtape-server-read))
+      (rtape-WRITE-op  
+       (if cart-p
+	   (rtape-server-cart-write (not (= lastop rtape-WRITE-op)))
+	   (rtape-server-write (not (= lastop rtape-WRITE-op)))))
+      (rtape-REWIND-op
+       (send tape-stream ':rewind))
+      (rtape-REWIND-SYNC-op
+       (send tape-stream ':await-rewind))
+      (rtape-OFFLINE-op
+       (send tape-stream ':set-offline))
+      (rtape-FILE-op  
+       (let ((howmany (rtape-server-parse-asciinum)))
+	 (cond ((stringp howmany))
+	       (t (send tape-stream ':skip-file (or howmany 1))))))
+      (rtape-BLOCK-op
+       (let ((howmany (rtape-server-parse-asciinum)))
+	 (cond ((stringp howmany))
+	       (t (send tape-stream ':space-records (or howmany 1))))))
+      (rtape-WRITE-EOF-op
+       (send tape-stream ':eof))
+      (rtape-CLOSE-op
+       (send tape-stream ':close)
+       (return nil))				;??
+      (rtape-SET-CART-MAX-BYTES-TO-WRITE-op
+       (let ((howmany (rtape-server-parse-asciinum)))
+	 (when (eq (send tape-stream :device-type) ':cart)
+	   (setf (cart-max-bytes-to-write tape-stream) howmany))))
+      (t (ferror "Unknown op - ~D." op)))
+    (if dont-flush
+	(setq dont-flush nil)
+	(send net-stream ':discard-current-record))))
+
+(defmethod (:display-status rtape-server-instance) (&optional (stream t))
+  (display-rtape-status status status-string stream))
+
+(defun rtape-server-parse-atoms (string)
+  (loop with finx = (or (string-search-char #\CR string) (string-length string))
+	initially (setq endx 0)
+	for startx = endx
+	for endx = (string-search-char #\SP string startx finx)
+	when (if endx
+		 (= endx startx)
+		 (= startx finx))
+	     collect nil
+	else
+	     collect (substring string startx (or endx finx))
+	while endx
+	do (incf endx)))
+
+(defmethod (:write-net-record rtape-server-instance) (op string &optional (first 0)
+							 (end (string-length string)))
+  (send net-stream ':write-record op string first end)
+  (send net-stream ':real-force-output))
+(defmethod (:write-error-status rtape-server-instance) (&optional errstat)
+  (or errstat (setq errstat (send tape-stream ':write-error-status)))
+  (setq peek-state "Writing")
+  (when (null errstat)
+    (return-from :write-error-status nil))
+  (when (and writes-discarded-valid (not write-error))
+    (send tape-stream :clear-output)
+    (setf (rtape-status-writes-discarded status)
+	  (- write-pointer (tape-stream-file-position tape-stream))))
+  (setf write-error t)    
+  (cond ((eq errstat ':end-of-tape)
+	 ;;main loop will clear out data
+	 (setf (rtape-status-past-eot status) t)
+	 (rtape-server-status 0)
+	 ':end-of-tape)
+	(t
+	 (setf (rtape-status-hard-error status) t)
+	 (setq status-string (send errstat ':message))
+	 (rtape-server-status 0)
+	 status-string)))
+
+(defmethod (:printable-peek-op rtape-server-instance) ()
+  (rtape-command-name peek-op))
+
+(defun null-function (x) x)
+
+(defmethod (:peek rtape-server-instance) ()
+  (list ()
+	(tv:scroll-parse-item
+	  "   Server "
+	  `(:mouse
+	    (nil :buttons
+		 ((nil :kbd  (:execute (nil :eval (describe ',self))))
+		  (nil :kbd  (:execute (nil :eval (inspect ',self))))
+		  (nil :eval (tv:beep)))
+		 :documentation "L: Describe the server instance.  M: Inspect it.")
+	    :function ,#'null-function (,self))
+	  " State: "
+	  `(:function ,self (:peek-state))
+	  "   Last command: "
+	  `(:function ,self (:printable-peek-op)))
+	(tv:scroll-parse-item
+          "   "
+	  `(:mouse
+	    (nil :buttons
+		 ((nil :kbd  (:execute (nil :eval
+					    (let ((ts (send ',self ':tape-stream)))
+					      (if ts (describe ts) (tv:beep))))))
+		  (nil :kbd  (:execute
+			      (nil :eval (let ((ts (send ',self ':tape-stream)))
+					   (if ts (inspect ts) (tv:beep))))))
+		  (nil :eval (tv:beep)))
+		 :documentation
+		 "L: Describe the local tape stream.  M: Inspect it.")
+	    :function
+	    ,self
+	    (:tape-stream-description)))
+	(tv:scroll-parse-item
+          "   "
+	  `(:mouse
+	    (nil :kbd  (:execute (nil :eval (send ',self ':display-status)))
+		 :documentation
+		 "Display the tape server tape status structure")
+	    :function
+	    ,#'(lambda (i) (or (send i ':status-string) "No tape status message."))
+	    ,(ncons self)))))
+
+(defmethod (:tape-stream-description rtape-server-instance) ()
+  (cond (tape-stream
+	 (if cart-p
+	     "Cartridge tape"
+	     (format nil "~A, drive ~D, reel ~A, density ~D."
+		     tape-stream
+		     (send tape-stream ':unit)
+		     (or (send tape-stream ':reel) "???")
+		     (send tape-stream ':density))))
+	(t "Tape stream not attached yet")))
+

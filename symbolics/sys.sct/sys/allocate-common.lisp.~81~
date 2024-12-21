@@ -1,0 +1,1370 @@
+;;; -*- Package:SYSTEM-INTERNALS; Mode:LISP; Base:8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Machine-independent storage allocation
+;;; This file is in the cold load.
+
+(DEFVAR-SAFEGUARDED *CONS-WORK-DONE* 0)	;Number of words consed
+(DEFVAR-SAFEGUARDED *SCAV-WORK-DONE* 0)	;Number of words scanned + number copied
+
+;; The only place that knows the ratio between *SCAV-WORK-DONE* and *CONS-WORK-DONE*
+;; is the NOTE-CONS-WORK-DONE macro (and of course the compiled code produced by it).
+
+(DEFVAR-SAFEGUARDED *SCAVENGE-REGION* NIL)	;Region to be scavenged next
+
+(DEFVAR *EPHEMERAL-AREAS* NIL)			;List of elements (area-name top-level-number)
+
+(DEFWIREDVAR *NUMBER-OF-ACTIVE-REGIONS*)	;wired because used by storage initialization
+
+(DEFVAR-SAFEGUARDED *FREE-REGION*)		;First region on free list.
+
+;; This is wired into the communications area on Ivory.
+#+3600 (DECLARE-STORAGE-CATEGORY :VARIABLE *OBLAST-FREE-SIZE* :SAFEGUARDED)
+(DEFVAR *OBLAST-FREE-SIZE*)			;An array mapping oblast number to size.
+
+;; Declarations for variables otherwise set up by the cold load.
+
+(DEFVAR-WIRED *AREA-NAME*)
+(DEFVAR-WIRED *AREA-MAXIMUM-QUANTUM-SIZE*)
+(DEFVAR-WIRED *AREA-REGION-QUANTUM-SIZE*)
+(DEFVAR-WIRED *AREA-REGION-BITS*)
+(DEFVAR-WIRED *AREA-REGION-LIST*)
+(DEFVAR-WIRED *REGION-GC-POINTER*)
+(DEFVAR-WIRED *REGION-FREE-POINTER-BEFORE-FLIP*)
+(DEFVAR-WIRED *REGION-CREATED-PAGES*)
+(DEFVAR-WIRED *REGION-LIST-THREAD*)
+(DEFVAR-SAFEGUARDED *LEVEL-TYPE*)
+
+;; Level allocation and deallocation
+
+(DEFSUBST LEVEL-VALID-P (LEVEL)
+  (NOT (CL:LOGTEST (LSH 1 6) LEVEL)))
+
+(DEFSUBST EPHEMERAL-LEVEL-P (LEVEL)
+  (< LEVEL %NUMBER-OF-EPHEMERAL-LEVELS))
+
+;;; Allocate a new level for a specified section type.  This is currently used when
+;;; creating new ephemeral levels.
+(DEFUN ALLOCATE-LEVEL (TYPE)
+  (WITH-FAST-STORAGE-ACCESSORS (LEVEL-TYPE)
+    (MULTIPLE-VALUE-BIND (FIRST-LEVEL LAST-LEVEL)
+	(IF (= TYPE %LEVEL-TYPE-EPHEMERAL)
+	    (VALUES 0 %NUMBER-OF-EPHEMERAL-LEVELS)
+	    (VALUES %NUMBER-OF-EPHEMERAL-LEVELS %NUMBER-OF-LEVELS))
+      (LOOP FOR LEVEL FROM FIRST-LEVEL BELOW LAST-LEVEL
+	    WHEN (= (LEVEL-TYPE LEVEL) %LEVEL-TYPE-UNALLOCATED)
+	      DO (SETF (LEVEL-TYPE LEVEL) TYPE)
+		 (RETURN-FROM ALLOCATE-LEVEL LEVEL)
+	    FINALLY (ERROR "No more levels")))))
+
+(DEFUN DEALLOCATE-LEVEL (LEVEL &OPTIONAL (ERROR-IF-UNALLOCATED T))
+  (COND ((= (LEVEL-TYPE LEVEL) %LEVEL-TYPE-UNALLOCATED)
+	 (RETURN-FROM DEALLOCATE-LEVEL
+	   (WHEN ERROR-IF-UNALLOCATED
+	     (ERROR "Attempt to deallocate level ~S, which is already deallocated." LEVEL))))
+	((AND ( LEVEL %WIRED-LEVEL) ( LEVEL %DYNAMIC-LEVEL))
+	 (RETURN-FROM DEALLOCATE-LEVEL
+	   (ERROR "Attempt to deallocate ~S."
+		  (NTH (- LEVEL %WIRED-LEVEL) *PREALLOCATED-LEVELS*))))
+	((OR #+IMACH (IF (EPHEMERAL-LEVEL-P LEVEL)
+			(LOOP FOR DEMILEVEL BELOW %NUMBER-OF-DEMILEVELS
+			      THEREIS (= (DEMILEVEL-LEVEL DEMILEVEL) LEVEL))
+			(LOOP FOR ZONE BELOW %NUMBER-OF-ZONES
+			      THEREIS (= (ZONE-LEVEL ZONE) LEVEL)))
+	     (LOOP FOR AREA BELOW (N-AREAS)
+		   THEREIS (= (LDB %%REGION-LEVEL (AREA-REGION-BITS AREA)) LEVEL))
+	     (LOOP FOR REGION BELOW (N-REGIONS)
+		   AS BITS = (REGION-BITS REGION)
+		   THEREIS (AND ( (LDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-FREE)
+				(= (LDB %%REGION-LEVEL BITS) LEVEL)))
+	     (CL:FIND LEVEL *EPHEMERAL-AREAS* :KEY #'CADR))
+	 (RETURN-FROM DEALLOCATE-LEVEL
+	   (ERROR "Attempt to deallocate level ~S, which is still in use" LEVEL))))
+  (SETF (LEVEL-TYPE LEVEL) %LEVEL-TYPE-UNALLOCATED)
+  LEVEL)
+
+;; Objects which survive SYSTEM-RELEASE-GC go into this level.
+(DEFVAR-SAFEGUARDED %PERMANENT-LEVEL)
+
+(ADD-INITIALIZATION '%PERMANENT-LEVEL
+		    '(SETQ %PERMANENT-LEVEL (ALLOCATE-LEVEL %LEVEL-TYPE-STATIC))
+		    '(:ONCE))
+
+
+
+;;; Buffering scheme:
+;;; Pages are created in CHUNKS, and must align to CHUNK boundaries
+;;; Thus CHUNK size must be smaller than and align to the region size
+;;; All space setup for the microcode counts in *CONS-WORK-DONE*, for the non-transport
+;;; case.
+
+(DEFMACRO CHUNK-BASE-ADDRESS (X)
+  `(%LOGDPB 0 %%WORD-WITHIN-CHUNK ,X))
+
+(DEFMACRO ROUND-TO-CHUNK (X)
+  `(CHUNK-BASE-ADDRESS (SYS:%32-BIT-PLUS ,X (1- %ADDRESS-SPACE-CHUNK-SIZE))))
+
+(DEFMACRO ROUND-TO-QUANTUM (X)
+  `(%LOGDPB 0 %%WORD-WITHIN-QUANTUM (SYS:%32-BIT-PLUS ,X (1- %ADDRESS-SPACE-QUANTUM-SIZE))))
+
+;; The only places that know the ratio between *SCAV-WORK-DONE* and *CONS-WORK-DONE*
+;; are the NOTE-CONS-WORK-DONE macro (and of course the compiled code produced by it)
+;; and the function GC-GET-COMMITTED-FREE-SPACE.
+;; Currently this is set for a ratio of 4, the traditional value.
+
+(DEFMACRO NOTE-CONS-WORK-DONE (CONS-WORK)
+  `(IF D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")(and0 %GC-FLIP-READY 1gc-reclaimed-oldspace)
+0       (WHEN (AND GC-ON
+		  (NEQ CURRENT-PROCESS GC-PROCESS)
+		  (> (GC-PAGE-CONS-ALARM) GC-PAGE-CONS-ALARM-MARK))
+	 ;; Allow GC process to wake up as soon as possible, 
+	 ;; before too much more consing happens.
+	 (PROCESS:WAKEUP GC-PROCESS)
+	 NIL)
+       (WHEN (AND (#+3600 < #+IMACH %UNSIGNED-LESSP
+		   *SCAV-WORK-DONE*
+		   (%FIXNUM-MULTIPLY *CONS-WORK-DONE* 4))
+		  (NOT INHIBIT-SCAVENGING-FLAG))
+	 1(if %GC-FLIP-READY
+0	     1(gc-reclaim-oldspace)0		;sigh, not incremental (PTW says
+						;`fixed in Minima')
+	 (%GC-SCAVENGE (%FIXNUM-MULTIPLY ,CONS-WORK 4) NIL T))))1)
+
+0;True if has an address (not an immediate object)
+(DEFUN %POINTERP (OBJECT)
+  (%POINTER-TYPE-P (%DATA-TYPE OBJECT)))
+
+
+;must be called without-interrupts
+;clears out the tables, bits and origin are essential, rest may be just for cleanliness
+(DEFUN %FREE-REGION (REGION)
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  (FREE-ADDRESS-SPACE (REGION-QUANTUM-ORIGIN REGION) (REGION-QUANTUM-LENGTH REGION) REGION)
+  (SETF (REGION-BITS REGION) 0)	;%REGION-SPACE-FREE
+  (SETF (REGION-QUANTUM-ORIGIN REGION) NIL)
+  (SETF (REGION-QUANTUM-LENGTH REGION) 0)
+  (SETF (REGION-FREE-POINTER REGION) 0)
+  (SETF (REGION-GC-POINTER REGION) 0)
+  (SETF (REGION-CREATED-PAGES REGION) 0)
+  ;; Put region onto free list
+  (SETF (REGION-LIST-THREAD REGION) *FREE-REGION*)
+  (LOOP WHILE (= (1+ REGION) *NUMBER-OF-ACTIVE-REGIONS*)
+	DO (SETQ *NUMBER-OF-ACTIVE-REGIONS* REGION)
+	   (SETQ REGION (REGION-LIST-THREAD REGION)))
+  (SETQ *FREE-REGION* REGION))
+
+;must be called without-interrupts, args are in quanta
+;assumes the address space is at the end of the region
+(DEFUN FREE-ADDRESS-SPACE (ORIGIN LENGTH REGION)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE ERROR))
+  (LET ((VMA-ORIGIN (%LOGDPB ORIGIN %%VMA-QUANTUM-NUM 0)))
+    #+3600 (FILL-GC-MAP VMA-ORIGIN (%LOGDPB LENGTH %%VMA-QUANTUM-NUM 0) %GC-MAP-NORMAL)
+    ;; Only destroy pages which exist.  This assumes the region tables are still valid.
+    (LET* ((CREATED-PAGES (REGION-CREATED-PAGES REGION))
+	   (REGION-ORIGIN (REGION-ORIGIN REGION))
+	   (WORDS-TO-DESTROY (- (+ REGION-ORIGIN CREATED-PAGES) VMA-ORIGIN)))
+      (WHEN (PLUSP WORDS-TO-DESTROY)
+	;; Pages are allocated by the storage systems in blocks of %SMPT-QUANTUM pages,
+	;; regardless of what REGION-CREATED-PAGES says.  We therefore have to violate
+	;; modularity a little here and destroy all pages up to the next %SMPT-QUANTUM
+	;; multiple.  But don't go past the end of what we were asked to destroy.
+	;; (The MIN below is a no-op as long as quanta are multiples of SMPT quanta.)
+        ;; On the VLM, storage is allocated in CHUNKS
+	(SETQ WORDS-TO-DESTROY (MIN (%FIXNUM-MULTIPLY
+				      (%FIXNUM-CEILING WORDS-TO-DESTROY
+						       #+VLM %ADDRESS-SPACE-CHUNK-SIZE
+						       #-VLM (* PAGE-SIZE %SMPT-QUANTUM))
+				      #+VLM %ADDRESS-SPACE-CHUNK-SIZE
+				      #-VLM (* PAGE-SIZE %SMPT-QUANTUM))
+				    (%LOGDPB LENGTH %%VMA-QUANTUM-NUM 0)))
+	(DESTROY-PAGES VMA-ORIGIN WORDS-TO-DESTROY)))
+    ;; We don't want to do this, since DESTROY-PAGES will spend an inordinate amount of
+    ;; time destroying pages which don't exist at the end of the region.
+;   (DESTROY-PAGES (%LOGDPB ORIGIN %%VMA-QUANTUM-NUM 0) (%LOGDPB LENGTH %%VMA-QUANTUM-NUM 0))
+    (LOOP FOR Q FROM ORIGIN REPEAT LENGTH DO
+      (COMPILER:%ERROR-UNLESS (EQL (%REGION-NUMBER (%LOGDPB Q %%VMA-QUANTUM-NUM 0)) REGION)
+	(ERROR "INTERNAL ERROR: *ADDRESS-SPACE-MAP* ~O contains ~O where ~O expected"
+	       Q (%REGION-NUMBER (%LOGDPB Q %%VMA-QUANTUM-NUM 0)) REGION)))
+    (%SET-ADDRESS-SPACE-MAP ORIGIN LENGTH NIL)
+    (LOOP WITH LIMIT = (%FIXNUM-FLOOR (+ ORIGIN LENGTH -1) %OBLAST-SIZE-IN-QUANTA) ;inclusive
+	  FOR OBLAST FROM (%FIXNUM-FLOOR ORIGIN %OBLAST-SIZE-IN-QUANTA) TO LIMIT
+	  AS START = (%FIXNUM-MOD ORIGIN %OBLAST-SIZE-IN-QUANTA) THEN 0
+	  AS END = (IF (= OBLAST LIMIT)
+		       (%FIXNUM-MOD (+ ORIGIN LENGTH -1) %OBLAST-SIZE-IN-QUANTA)
+		       (1- %OBLAST-SIZE-IN-QUANTA))				;inclusive
+	  AS THIS-LENGTH = (1+ (- END START)) DO
+      (COND ((= (+ (AREF *OBLAST-FREE-SIZE* OBLAST) THIS-LENGTH) %OBLAST-SIZE-IN-QUANTA)
+	     ;; Entire oblast becomes free (passed quick test for common case)
+	     (SETF (AREF *OBLAST-FREE-SIZE* OBLAST) %OBLAST-SIZE-IN-QUANTA)
+	     #+3600 (SETQ *LOWEST-FREE-OBLAST* (MIN *LOWEST-FREE-OBLAST* OBLAST)))
+	    (T
+	     ;; Recompute largest hole in this oblast
+	     (LOOP FOR Q FROM (%FIXNUM-MULTIPLY OBLAST %OBLAST-SIZE-IN-QUANTA)
+		   REPEAT %OBLAST-SIZE-IN-QUANTA
+		   WITH MAX-FOUND = 0 WITH N-FOUND = 0
+		   DO (IF (%REGION-NUMBER (%LOGDPB Q %%VMA-QUANTUM-NUM 0))
+			  (SETQ MAX-FOUND (MAX MAX-FOUND N-FOUND)
+				N-FOUND 0)
+			  (INCF N-FOUND))
+		   FINALLY
+		     (SETQ MAX-FOUND (MAX MAX-FOUND N-FOUND))
+		     (SETF (AREF *OBLAST-FREE-SIZE* OBLAST) MAX-FOUND)
+		     #+3600 (WHEN (= MAX-FOUND %OBLAST-SIZE-IN-QUANTA)
+			      (SETQ *LOWEST-FREE-OBLAST* (MIN *LOWEST-FREE-OBLAST* OBLAST))))))
+      #+3600 (SETQ *LOWEST-UNFULL-OBLAST* (MIN *LOWEST-UNFULL-OBLAST* OBLAST)))
+    #+IMACH (MAYBE-FREE-ZONES-OR-DEMILEVELS ORIGIN LENGTH)))
+
+;This function is used to adjust the free pointer of a region up or down,
+;for functions other than the normal allocation functions assisted by microcode cons cache.
+;This function must do the following:
+; Store into REGION-FREE-POINTER
+; If REGION-GC-POINTER >= the new free pointer, set it to the new free pointer
+; Adjust the cons-cache
+; Adjust the amount of cons-work done
+; If the free-pointer was made larger, create pages and run the scavenger
+; If the free-pointer was made smaller, smash any garbage in pages that will
+;  not be reinitialized when they are put back into the cons-cache, and
+;  destroy any other pages so their disk space is made free.
+;  Only destroy pages if the DESTROY-PAGES argument is T, to avoid thrashing
+;  in trim-bignum that leads to a process getting constant cons-cache misses
+;  and never making any progress, when allocating a big object while another
+;  process is playing with bignums.
+;--- Some day, fix things so this doesn't have to be called with scheduling inhibited;
+;--- Make it work more like the way new-object allocation works.
+;--- If someone keeps allocating and deallocating objects while the free-pointer happens
+;--- to lie on a chunk boundary, a lot of extra work will be incurred.  We could put
+;--- in extra mechanism to put hysteresis into the create-pages/destroy-pages, but for
+;--- now I'm going to assume that it is not worth worrying about.
+(DEFUN GC-RESET-FREE-POINTER (REGION NEWFP &OPTIONAL DESTROY-PAGES)
+  (UNLESS INHIBIT-SCHEDULING-FLAG
+    (FERROR "This function must be called with scheduling inhibited"))
+  (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+  (LET ((OLDFP (REGION-FREE-POINTER REGION)))
+    (COND ((< OLDFP NEWFP)			;Allocating new space
+	   (LET ((END-OF-CACHE (REGION-CREATED-PAGES REGION))
+		 (NEW-END-OF-CACHE (ROUND-TO-CHUNK NEWFP))
+		 (ORIGIN (REGION-ORIGIN REGION))
+		 (WORK (- NEWFP OLDFP)))
+	     (WHEN (> NEW-END-OF-CACHE END-OF-CACHE)
+	       (CREATE-PAGES (+ END-OF-CACHE ORIGIN) (- NEW-END-OF-CACHE END-OF-CACHE))
+	       (SETF (REGION-CREATED-PAGES REGION) NEW-END-OF-CACHE))
+	     (SETF (REGION-FREE-POINTER REGION) NEWFP)
+	     (WHEN (EQL REGION (%STRUCTURE-CACHE-REGION))
+	       (DECF WORK (%STRUCTURE-CACHE-LENGTH))
+	       (SETF (%STRUCTURE-CACHE-VIRTUAL-ADDRESS) (+ ORIGIN NEWFP))
+	       (LET ((LENGTH (- NEW-END-OF-CACHE NEWFP)))
+		 (SETF (%STRUCTURE-CACHE-LENGTH) LENGTH)
+		 (INCF WORK LENGTH)))
+	     (WHEN (EQL REGION (%LIST-CACHE-REGION))
+	       (DECF WORK (%LIST-CACHE-LENGTH))
+	       (SETF (%LIST-CACHE-VIRTUAL-ADDRESS) (+ ORIGIN NEWFP))
+	       (LET ((LENGTH (- NEW-END-OF-CACHE NEWFP)))
+		 (SETF (%LIST-CACHE-LENGTH) LENGTH)
+		 (INCF WORK LENGTH)))
+	     #+3600 (WHEN (EQL REGION (%STRUCTURE-TRANSPORT-CACHE-REGION))
+		      (SETF (%STRUCTURE-TRANSPORT-CACHE-AREA) NIL))
+	     #+3600 (WHEN (EQL REGION (%LIST-TRANSPORT-CACHE-REGION))
+		      (SETF (%LIST-TRANSPORT-CACHE-AREA) NIL))
+	     (INCF *CONS-WORK-DONE* WORK)
+	     (WHEN (PLUSP (SETQ WORK (- NEW-END-OF-CACHE END-OF-CACHE)))
+	       (NOTE-CONS-WORK-DONE WORK))))
+	  ((> OLDFP NEWFP)			;Deallocating some space
+	   (DECF *CONS-WORK-DONE* (- OLDFP NEWFP))
+	   (LET* ((END-OF-QUANTUM (ROUND-TO-QUANTUM (REGION-CREATED-PAGES REGION)))
+		  (NEW-END-OF-CACHE (ROUND-TO-CHUNK NEWFP))
+		  (NEW-END-OF-QUANTUM (IF DESTROY-PAGES (ROUND-TO-QUANTUM NEW-END-OF-CACHE)
+					  END-OF-QUANTUM))
+		  (ORIGIN (REGION-ORIGIN REGION))
+		  (FIRST-ADDRESS-AFTER-NEW-CACHE (+ ORIGIN NEW-END-OF-CACHE)))
+	     (WHEN (EQL REGION (%STRUCTURE-CACHE-REGION))
+	       (DECF *CONS-WORK-DONE* (%STRUCTURE-CACHE-LENGTH))
+	       (SETF (%STRUCTURE-CACHE-VIRTUAL-ADDRESS) (+ ORIGIN NEWFP))
+	       (LET ((LENGTH (- FIRST-ADDRESS-AFTER-NEW-CACHE
+				(%STRUCTURE-CACHE-VIRTUAL-ADDRESS))))
+		 (COND ((PLUSP LENGTH)
+			(INCF *CONS-WORK-DONE* LENGTH)
+			(SETF (%STRUCTURE-CACHE-LENGTH) LENGTH))
+		       (T
+			(SETF (%STRUCTURE-CACHE-LENGTH) 0)
+			(SETF (%STRUCTURE-CACHE-AREA) NIL)))))
+	     (WHEN (EQL REGION (%LIST-CACHE-REGION))
+	       (DECF *CONS-WORK-DONE* (%LIST-CACHE-LENGTH))
+	       (SETF (%LIST-CACHE-VIRTUAL-ADDRESS) (+ ORIGIN NEWFP))
+	       (LET ((LENGTH (- FIRST-ADDRESS-AFTER-NEW-CACHE (%LIST-CACHE-VIRTUAL-ADDRESS))))
+		 (COND ((PLUSP LENGTH)
+			(INCF *CONS-WORK-DONE* LENGTH)
+			(SETF (%LIST-CACHE-LENGTH) LENGTH))
+		       (T
+			(SETF (%LIST-CACHE-LENGTH) 0)
+			(SETF (%LIST-CACHE-AREA) NIL)))))
+	     #+3600 (WHEN (EQL REGION (%STRUCTURE-TRANSPORT-CACHE-REGION))
+		      (SETF (%STRUCTURE-TRANSPORT-CACHE-AREA) NIL))
+	     #+3600 (WHEN (EQL REGION (%LIST-TRANSPORT-CACHE-REGION))
+		      (SETF (%LIST-TRANSPORT-CACHE-AREA) NIL))
+	     ;; Reinitialize pages that are past the new free pointer, not past the
+	     ;; old free pointer, and not about to be destroyed.  These pages contain
+	     ;; rubbish that will still be there when consing advances into them.
+	     (%BLOCK-STORE-TAG-AND-POINTER (+ ORIGIN NEWFP)
+					   (- (MIN OLDFP NEW-END-OF-QUANTUM) NEWFP)
+					   DTP-NULL
+					   (+ ORIGIN NEWFP)
+					   1)
+	     (WHEN (> (REGION-GC-POINTER REGION) NEWFP)
+	       (SETF (REGION-GC-POINTER REGION) NEWFP))
+	     (WHEN (> (REGION-FREE-POINTER-BEFORE-FLIP REGION) NEWFP)
+	       (SETF (REGION-FREE-POINTER-BEFORE-FLIP REGION) NEWFP))
+	     (SETF (REGION-FREE-POINTER REGION) NEWFP)
+	     (WHEN (< NEW-END-OF-QUANTUM END-OF-QUANTUM)
+	       ;; Crossed a cache boundary.  Since the storage system
+	       ;; currently (12/3/84) allocates disk blocks in units of
+	       ;; 64 (much larger than a chunk), returning chunks will result in
+	       ;; a swap space that keeps getting little chunks added to
+	       ;; it, eventually running out of swap space.  Therefore,
+	       ;; only return entire quanta.  (A quantum is currently twice
+	       ;; the size of the storage system allocation units.)
+	       ;; As the comment at the front of this function says, there could
+	       ;; also be some hysteresis so hovering around the quantum boundary
+	       ;; isn't expensive.
+	       (DESTROY-PAGES (+ ORIGIN NEW-END-OF-QUANTUM)
+			      (- END-OF-QUANTUM NEW-END-OF-QUANTUM))
+	       (SETF (REGION-CREATED-PAGES REGION) NEW-END-OF-QUANTUM)))))))
+
+(DEFUN %AREA-NUMBER (ADDRESS)
+  (LET ((REGION (%REGION-NUMBER ADDRESS)))
+    (AND REGION (REGION-AREA REGION))))
+
+
+;;; Create an area.  Takes keyword argument pairs as follows:
+;;;  :NAME - name of area, this is required
+;;;  :SIZE - maximum size (default=infinite)
+;;;  :REGION-SIZE - size for regions, defaults to :SIZE if specified else medium-size.
+;;;  :REPRESENTATION (:LIST, :STRUCTURE, number) - just for the initial region, default=struc
+;;;  :GC (:SAFEGUARDED, :STATIC, :DYNAMIC, :TEMPORARY, :EPHEMERAL) - default = dynamic
+;;;  :N-LEVELS :N-EXTRA-LEVELS :CAPACITY :CAPACITY-RATIO -- ephemeral GC attributes
+;;;  :READ-ONLY - attribute
+;;;  :ROOM - if specified, push this area onto ROOM, so that (ROOM) will list it.
+;;;  %%REGION-LEVEL - level number of region
+;;;  %%REGION-SPACE-TYPE - space type number
+;;;  %%REGION-SCAVENGE-ENABLE - 1 or 0
+;;;  :SWAP-RECOMMENDATIONS - swapin quantum size for area minus 1.
+;;;   (more attributes to be added, especially for additional region-space-types)
+(DEFUN MAKE-AREA (&KEY NAME SIZE REGION-SIZE REPRESENTATION GC
+		       READ-ONLY SWAP-RECOMMENDATIONS
+		       (N-LEVELS 2 N-LEVELS-P)
+		       ;; The N-EXTRA-LEVELS feature was never finished and doesn't work
+		       ;; so do not accept the argument, for now.  The code to handle
+		       ;; it remains in this function, but needs some work.
+		       ;; (N-EXTRA-LEVELS 0 N-EXTRA-LEVELS-P)
+		       (CAPACITY 200000. CAPACITY-P)
+		       (CAPACITY-RATIO 0.5 CAPACITY-RATIO-P)
+		       ((:ROOM ROOM-P) NIL ROOM-P-P)
+		       FIXED-SIZE
+		       ((%%REGION-LEVEL REGION-LEVEL))
+		       ((%%REGION-SPACE-TYPE SPACE-TYPE))
+		       ((%%REGION-SCAVENGE-ENABLE SCAV-ENB) 1)
+		       ;; This features is experimental.  Let the user beware.
+		       (N-EXTRA-LEVELS 0 N-EXTRA-LEVELS-P)
+		  &AUX AREA-NUMBER REGION-NUMBER (BITS 0) TOP-LEVEL)
+  
+  ;; Validate the keyword arguments that were supplied, perform defaulting and concordance
+  (CHECK-ARG NAME (AND (NOT (NULL NAME)) (SYMBOLP NAME))
+	     "an explicitly specified :NAME which is a symbol")
+  (WHEN SIZE
+    (CHECK-ARG-TYPE SIZE :POSITIVE-FIXNUM))
+  (WHEN REGION-SIZE
+    (CHECK-ARG-TYPE REGION-SIZE :POSITIVE-FIXNUM))
+  (WHEN REPRESENTATION
+    (CHECK-ARG REPRESENTATION (OR (NUMBERP REPRESENTATION)
+				  (CL:MEMBER REPRESENTATION '(:LIST :STRUCTURE)))
+	       "a valid representation-type (:LIST, :STRUCTURE, or a number)"))
+  (SETF (LDB %%REGION-REPRESENTATION-TYPE BITS)
+	(COND ((EQ REPRESENTATION ':LIST) %REGION-REPRESENTATION-TYPE-LIST)
+	      ((OR (EQ REPRESENTATION ':STRUCTURE) (NULL REPRESENTATION))
+	       %REGION-REPRESENTATION-TYPE-STRUCTURE)
+	      (T REPRESENTATION)))
+  (SETQ AREA-NUMBER (FIND-POSITION-IN-LIST NAME AREA-LIST))
+  (COND (GC
+	 (CHECK-ARG GC (CL:MEMBER GC '(:SAFEGUARDED :STATIC :DYNAMIC :EPHEMERAL :TEMPORARY))
+		    "a GC mode (:SAFEGUARDED, :STATIC, :DYNAMIC, :EPHEMERAL, or :TEMPORARY)"))
+	(AREA-NUMBER
+	 ;; GC type was not specified, and area already exists.  Use current type.
+	 (SETQ GC (COND ((LDB-TEST %%REGION-TEMPORARY (AREA-REGION-BITS AREA-NUMBER))
+			 ':TEMPORARY)
+			((CL:ASSOC NAME *EPHEMERAL-AREAS*)
+			 ':EPHEMERAL)
+			(T (SELECTOR (LEVEL-TYPE (OR REGION-LEVEL
+						     (LDB %%REGION-LEVEL
+							  (AREA-REGION-BITS AREA-NUMBER))))
+				     =
+			     (%LEVEL-TYPE-DYNAMIC :DYNAMIC)
+			     (%LEVEL-TYPE-STATIC  :STATIC)
+			     (OTHERWISE           :SAFEGUARDED))))))
+	(T
+	 ;; Creating new area, default type is Dynamic
+	 (SETQ GC ':DYNAMIC)))
+  (WHEN (AND AREA-NUMBER (NOT REGION-LEVEL) (NOT (EQ GC ':EPHEMERAL)))
+    ;; Level was not specified, and area already exists.  Use current level unless ephemeral,
+    ;; in case a special level was allocated for this area.
+    (SETQ REGION-LEVEL (LDB %%REGION-LEVEL (AREA-REGION-BITS AREA-NUMBER))))
+  (WHEN (EQ GC ':TEMPORARY)
+    (SETF (LDB %%REGION-TEMPORARY BITS) 1)
+    (SETQ GC ':STATIC))
+  (WHEN READ-ONLY
+    (SETF (LDB %%REGION-READ-ONLY BITS) 1))
+  (WHEN SWAP-RECOMMENDATIONS
+    (SETF (LDB %%REGION-SWAPIN-QUANTUM BITS) SWAP-RECOMMENDATIONS))
+  (UNLESS SPACE-TYPE
+    (SETQ SPACE-TYPE %REGION-SPACE-NEW))
+  (SETF (LDB %%REGION-SPACE-TYPE BITS) SPACE-TYPE)
+  (SETF (LDB %%REGION-ADJUSTABLE-SIZE BITS) (IF FIXED-SIZE 0 1))
+  (SETF (LDB %%REGION-SCAVENGE-ENABLE BITS) SCAV-ENB)
+
+  ;; Deal with the keyword arguments that apply only to ephemeral areas
+  (COND ((EQ GC ':EPHEMERAL)
+	 (CHECK-ARG N-LEVELS (AND (FIXP N-LEVELS) (PLUSP N-LEVELS)) "an integer  1")
+	 (CHECK-ARG N-EXTRA-LEVELS (AND (FIXP N-EXTRA-LEVELS) ( N-EXTRA-LEVELS 0))
+		    "an integer  0")
+	 (CHECK-ARG CAPACITY (OR (FIXP CAPACITY)
+				 (AND (LISTP CAPACITY)
+				      (EVERY CAPACITY #'FIXP)))
+		    "an integer or a non-empty list of integers")
+	 (CHECK-ARG-TYPE CAPACITY-RATIO :NUMBER))
+	((OR N-LEVELS-P N-EXTRA-LEVELS-P CAPACITY-P CAPACITY-RATIO-P)
+	 (LET ((L `(,@(AND N-LEVELS-P `(:N-LEVELS))
+		    ,@(AND N-EXTRA-LEVELS-P `(:N-EXTRA-LEVELS))
+		    ,@(AND CAPACITY-P `(:CAPACITY))
+		    ,@(AND CAPACITY-RATIO-P `(:CAPACITY-RATIO)))))
+	   (FERROR "The keyword~P ~{~S~^, ~} may only be used with :GC :EPHEMERAL"
+		   (LENGTH L) L))))
+  
+  ;; All arguments parsed, lock the area data-structure and make/modify the area
+  (LET ((INHIBIT-SCHEDULING-FLAG T)
+	(INHIBIT-SCAVENGING-FLAG T))
+
+    ;; Check that the area number is available before allocating anything
+    (UNLESS AREA-NUMBER
+      (SETQ AREA-NUMBER (N-AREAS))
+      (WHEN ( (1+ AREA-NUMBER) (ARRAY-LENGTH *AREA-NAME*))
+	(FERROR "Out of area numbers, cannot create ~S" NAME)))
+
+    ;; Allocate ephemeral levels if required
+    (WHEN (EQ GC ':EPHEMERAL)
+      ;; Count the number of free ephemeral levels, used in several places below
+      ;;--- Remaining to be done:
+      ;;---   Maybe rewrite this crap.
+      ;;---   Setup EPHEMERAL-LEVEL-GROUP, possibly by global evaluation at end.
+      ;;---   Look through scott's code to see if I missed anything.
+      ;;---   Search through this file for LEVEL and %%REGION-EPHEMERAL.
+      (LET ((FREE (LOOP FOR LEVEL BELOW %NUMBER-OF-EPHEMERAL-LEVELS
+			COUNT (= (LEVEL-TYPE LEVEL) %LEVEL-TYPE-UNALLOCATED))))
+	(COND ((SETQ TOP-LEVEL (SECOND (ASSQ NAME *EPHEMERAL-AREAS*)))
+	       ;; Area is already ephemeral, possibly change parameters
+	       (LET ((N-LEVELS-NOW
+			(LOOP FOR LEVEL = TOP-LEVEL 
+					  THEN (AREF *EPHEMERAL-GC-NORMAL-NEXT-LEVEL* LEVEL)
+			      WHILE (EPHEMERAL-LEVEL-P LEVEL)
+			      COUNT T)))
+		 ;; If the capacity was not specified, default to the current capacity
+		 (UNLESS CAPACITY-P
+		   (SETQ CAPACITY (AREF *EPHEMERAL-GC-FLIP-CAPACITY* TOP-LEVEL)
+			 CAPACITY-P T))
+		 (UNLESS CAPACITY-RATIO-P
+		   (WHEN (> N-LEVELS-NOW 1)
+		     (SETQ CAPACITY-RATIO (// (AREF *EPHEMERAL-GC-FLIP-CAPACITY*
+						    (AREF *EPHEMERAL-GC-NORMAL-NEXT-LEVEL*
+							  TOP-LEVEL))
+					      (FLOAT (AREF *EPHEMERAL-GC-FLIP-CAPACITY*
+							   TOP-LEVEL))))))
+		 ;; Adjust TOP-LEVEL up or down.
+		 (COND ((NOT N-LEVELS-P))
+		       ((> N-LEVELS-NOW N-LEVELS)
+			(LOOP FOR LEVEL = TOP-LEVEL 
+					  THEN (AREF *EPHEMERAL-GC-NORMAL-NEXT-LEVEL* LEVEL)
+			      REPEAT (1+ (- N-LEVELS-NOW N-LEVELS))
+			      DO (SETQ TOP-LEVEL LEVEL)))
+		       ((< N-LEVELS-NOW N-LEVELS)
+			(UNLESS ( (- N-LEVELS N-LEVELS-NOW) FREE)
+			  (FERROR "Ephemeral level table overflow; ~
+					~D levels needed but only ~D available."
+				  (- N-LEVELS N-LEVELS-NOW) FREE))
+			(LOOP REPEAT (- N-LEVELS N-LEVELS-NOW)
+			      AS LEVEL = (ALLOCATE-LEVEL %LEVEL-TYPE-EPHEMERAL)
+			      DO (SETF (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL) TOP-LEVEL)
+				 (SETF (AREF *EPHEMERAL-GC-NORMAL-NEXT-LEVEL* LEVEL) TOP-LEVEL)
+				 (SETQ TOP-LEVEL LEVEL))))
+		 (SETF (SECOND (ASSQ NAME *EPHEMERAL-AREAS*)) TOP-LEVEL))
+	       ;; Adjust extra levels if required
+	       (LET* ((BOTTOM-LEVEL
+			(LOOP FOR LEVEL = TOP-LEVEL THEN NEXT-LEVEL
+			      AS NEXT-LEVEL = (AREF *EPHEMERAL-GC-NORMAL-NEXT-LEVEL* LEVEL)
+			      WHILE (EPHEMERAL-LEVEL-P NEXT-LEVEL)
+			      FINALLY (RETURN LEVEL)))
+		      (N-EXTRA-LEVELS-NOW
+			(LOOP FOR LEVEL = BOTTOM-LEVEL THEN NEXT-LEVEL
+			      AS NEXT-LEVEL = (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)
+			      WHILE (EPHEMERAL-LEVEL-P NEXT-LEVEL)
+			      COUNT T)))
+		 (COND ((NOT N-EXTRA-LEVELS-P))
+		       ((> N-EXTRA-LEVELS-NOW N-EXTRA-LEVELS)
+			(LOOP FOR LEVEL = BOTTOM-LEVEL 
+					  THEN (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)
+			      REPEAT N-EXTRA-LEVELS
+			      FINALLY (SETF (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)
+					    %DYNAMIC-LEVEL)))
+		       ((< N-EXTRA-LEVELS-NOW N-EXTRA-LEVELS)
+			(UNLESS ( (- N-EXTRA-LEVELS N-EXTRA-LEVELS-NOW) FREE)
+			  (FERROR "Ephemeral level table overflow; ~
+					~D levels needed but only ~D available."
+				  (- N-EXTRA-LEVELS N-EXTRA-LEVELS-NOW) FREE))
+			(LOOP REPEAT (- N-EXTRA-LEVELS N-EXTRA-LEVELS-NOW)
+			      AS LEVEL = (ALLOCATE-LEVEL %LEVEL-TYPE-EPHEMERAL)
+			      DO (SETF (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)
+				       %DYNAMIC-LEVEL)
+				 (SETF (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* BOTTOM-LEVEL)
+				       LEVEL)
+				 (SETQ BOTTOM-LEVEL LEVEL)))))
+	       ;; Adjust capacities
+	       (WHEN (OR CAPACITY-P CAPACITY-RATIO-P)
+		 (LOOP FOR LEVEL = TOP-LEVEL THEN (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)
+		       WHILE (EPHEMERAL-LEVEL-P LEVEL)
+		       AS CAP = (IF (LISTP CAPACITY) (CAR CAPACITY) CAPACITY)
+		       DO (SETF (AREF *EPHEMERAL-GC-FLIP-CAPACITY* LEVEL) CAP)
+			  (SETQ CAPACITY (OR (AND (LISTP CAPACITY) (CDR CAPACITY))
+					     (ROUND (* CAP CAPACITY-RATIO)))))))
+	      (T
+	       (UNLESS ( FREE (+ N-LEVELS N-EXTRA-LEVELS))
+		 (FERROR "Ephemeral level table overflow; ~
+			  ~D levels needed but only ~D available."
+			 (+ N-LEVELS N-EXTRA-LEVELS) FREE))
+	       ;; Allocate the levels, chain them together, fill in their capacities
+	       (LOOP WITH NEXT-LEVEL = %DYNAMIC-LEVEL
+		     FOR COUNT DOWNFROM (+ N-LEVELS N-EXTRA-LEVELS) ABOVE 0
+		     AS LEVEL = (ALLOCATE-LEVEL %LEVEL-TYPE-EPHEMERAL)
+		     DO (SETF (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL) NEXT-LEVEL)
+			(SETF (AREF *EPHEMERAL-GC-NORMAL-NEXT-LEVEL* LEVEL)
+			      (IF ( COUNT N-LEVELS) %DYNAMIC-LEVEL NEXT-LEVEL))
+			(SETQ TOP-LEVEL (SETQ NEXT-LEVEL LEVEL)))
+	       (LOOP FOR LEVEL = TOP-LEVEL THEN (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)
+		     WHILE (EPHEMERAL-LEVEL-P LEVEL)
+		     AS CAP = (IF (LISTP CAPACITY) (CAR CAPACITY) CAPACITY)
+		     DO (SETF (AREF *EPHEMERAL-GC-FLIP-CAPACITY* LEVEL) CAP)
+			(SETQ CAPACITY (OR (AND (LISTP CAPACITY) (CDR CAPACITY))
+					   (ROUND (* CAP CAPACITY-RATIO)))))
+	       (PUSH (LIST NAME TOP-LEVEL) *EPHEMERAL-AREAS*))))
+      #+IMach (ASSIGN-EPHEMERAL-LEVEL-GROUPS))
+
+    ;; Set the level
+    (SETF (LDB %%REGION-LEVEL BITS)
+	  (OR REGION-LEVEL
+	      (COND ((EQ GC :SAFEGUARDED) %SAFEGUARDED-LEVEL)
+		    ((EQ GC :STATIC)
+		     (IF (LDB-TEST %%REGION-TEMPORARY BITS) %SAFEGUARDED-LEVEL %STATIC-LEVEL))
+		    ((EQ GC :STACK) %SAFEGUARDED-LEVEL)
+		    ;; Weakspace currently does not flip.  Put it in the permanent level
+		    ;; so that it will not slow down the flipping of other spaces by
+		    ;; getting into the same zone as dynamic or static spaces.
+		    ((= SPACE-TYPE %REGION-SPACE-WEAK) %PERMANENT-LEVEL)
+		    ;; If the ephemeral GC is turned on, cause new objects in this area to be
+		    ;; ephemeral.  If it isn't turned on, don't actually do that yet, since
+		    ;; we don't want a huge number of ephemeral objects to pile up.
+		    ((AND (EQ GC :EPHEMERAL) (GETF GC-ON :EPHEMERAL)) TOP-LEVEL)
+		    (T %DYNAMIC-LEVEL))))
+
+    (COND ((CL:MEMBER NAME AREA-LIST)
+	   ;; Area already exists, modify certain attributes
+	   (WHEN REGION-SIZE
+	     (SETF (AREA-REGION-QUANTUM-SIZE AREA-NUMBER)
+		   (%FIXNUM-CEILING REGION-SIZE %ADDRESS-SPACE-QUANTUM-SIZE)))
+	   (WHEN SIZE
+	     (SETF (AREA-MAXIMUM-QUANTUM-SIZE AREA-NUMBER)
+		   (%FIXNUM-CEILING SIZE %ADDRESS-SPACE-QUANTUM-SIZE)))
+	   (SETF (AREA-REGION-BITS AREA-NUMBER) BITS)
+	   (UNLESS (EQ GC ':EPHEMERAL)
+	     (SETQ *EPHEMERAL-AREAS* (DELQ (ASSQ NAME *EPHEMERAL-AREAS*) *EPHEMERAL-AREAS*))))
+	  (T
+	   ;; If no region size was specified, default to standard size for
+	   ;; regions of unpredictable size (one oblast), unless area size
+	   ;; is specified, in which case assume user wants a single region.  Round
+	   ;; up the sizes to a multiple of a quantum in case user specified them
+	   ;; some oddball size.
+	   (UNLESS REGION-SIZE
+	     (SETQ REGION-SIZE (OR SIZE %ADDRESS-SPACE-OBLAST-SIZE)))
+	   (SETQ REGION-SIZE (%FIXNUM-CEILING REGION-SIZE %ADDRESS-SPACE-QUANTUM-SIZE))
+	   (SETQ SIZE (IF SIZE (%FIXNUM-CEILING SIZE %ADDRESS-SPACE-QUANTUM-SIZE)
+			       %NUMBER-OF-QUANTA))
+	   ;; Create a new area
+	   (ARRAY-PUSH *AREA-NAME* NAME)
+	   (ARRAY-PUSH *AREA-REGION-QUANTUM-SIZE* REGION-SIZE)
+	   (ARRAY-PUSH *AREA-MAXIMUM-QUANTUM-SIZE* SIZE)
+	   (ARRAY-PUSH *AREA-REGION-BITS* BITS)
+	   (ARRAY-PUSH *AREA-REGION-LIST* -1)
+   #+IMach (WHEN REPRESENTATION
+	     (SETQ REGION-NUMBER (ALLOCATE-OR-EXTEND-REGION AREA-NUMBER REGION-SIZE -1 BITS))
+	     (IGNORE REGION-NUMBER))
+   #+3600  (WHEN REPRESENTATION
+	     (SETQ REGION-NUMBER (%MAKE-REGION BITS REGION-SIZE))
+	     (SETF (AREA-REGION-LIST AREA-NUMBER) REGION-NUMBER)
+	     (SETF (REGION-LIST-THREAD REGION-NUMBER) -1)
+	     (SETF (REGION-AREA REGION-NUMBER) AREA-NUMBER))
+	   (SET NAME AREA-NUMBER)))
+    
+    ;; Force the GC process to recompute its waiting condition
+    (WAKEUP-GC-PROCESS T)
+
+    ;; Maintain the ROOM function's list of interesting areas, but don't
+    ;; change current state without explicit action.
+    (WHEN ROOM-P-P
+      (IF ROOM-P
+	  (PUSH* NAME ROOM)
+	  (SETQ ROOM (DELQ NAME ROOM))))
+
+    ;; Always return the area number
+    AREA-NUMBER))
+
+;Given an address that is in a stack, find the stack
+;Returns NIL if not really in a stack
+;Must be called without-interrupts
+;If the stack belongs to the current stack group, the value returned is accurate
+;as of the instant this function returns, but of course the stack's height may
+;change immediately thereafter.
+(DEFUN DECODE-STACK-ADDRESS (ADDRESS)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (VALUES ORIGIN ACTIVE-SIZE SIZE STACK-NUMBER STACK-GROUP STACK-TYPE))
+  (MULTIPLE-VALUE-BIND (INDEX ORIGIN LENGTH)
+      (STACK-TABLE-EXTANT-INDEX ADDRESS)
+    (WHEN (NOT (NULL INDEX))
+      (LET ((SG (AREF *STACK-STACK-GROUP* INDEX)))
+	(MULTIPLE-VALUE-BIND (TYPE POINTER)
+	    (COND ((NULL SG)
+		   (VALUES NIL
+			   #+3600 (%MAKE-POINTER-OFFSET DTP-FIX ORIGIN -1)
+			   #+IMACH (%POINTER-PLUS ORIGIN -1)))
+		  ((= (%POINTER (SG-CONTROL-STACK-LOW SG)) ORIGIN)
+		   (VALUES :CONTROL (IF (EQ SG %CURRENT-STACK-GROUP)
+					(PROGN
+					  #+3600 (FRAME-PREVIOUS-TOP (%STACK-FRAME-POINTER))
+					  #+IMACH (%POINTER-PLUS (%STACK-FRAME-POINTER) -1))
+				      (SG-STACK-POINTER SG))))
+		  ((= (%POINTER (SG-BINDING-STACK-LOW SG))
+		      #+3600 (1+ ORIGIN)
+		      #+IMach ORIGIN)
+		   (VALUES :BIND (IF (EQ SG %CURRENT-STACK-GROUP)
+				     %BINDING-STACK-POINTER
+				     (SG-BINDING-STACK-POINTER SG))))
+		  ((= (%POINTER (SG-DATA-STACK-LOW SG)) ORIGIN)
+		   (VALUES :DATA (SG-REAL-DATA-STACK-POINTER SG)))
+		  ;; This can happen while creating a stack group, before the
+		  ;; slots above are initialized.  In this case, it's okay to treat the page
+		  ;; as if it's not really a stack.
+		  (T (RETURN-FROM DECODE-STACK-ADDRESS NIL)))
+	  (VALUES ORIGIN (1+ (%POINTER-DIFFERENCE POINTER ORIGIN)) LENGTH INDEX SG TYPE))))))
+
+;;; The stack number of the stack containing this address, or NIL if not in table
+(DEFUN STACK-TABLE-EXTANT-INDEX (ADDRESS)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (VALUES INDEX ORIGIN LENGTH))
+  ;; Round down to nearest 1protection0 multiple.
+  #-VLM
+  (SETQ ADDRESS (DPB 0 %%VMA-WORD-OFFSET (%POINTER ADDRESS)))
+  #+VLM
+  (SETQ ADDRESS (DPB 0 %%WORD-WITHIN-CHUNK (%POINTER ADDRESS)))
+  (LET ((STACK-ORIGIN *STACK-ORIGIN*))
+    (DECLARE (SYS:ARRAY-REGISTER STACK-ORIGIN))
+    (DO ((LOWER 0)
+	 (UPPER (1- *NUMBER-OF-ACTIVE-STACKS*)))
+	((> LOWER UPPER)
+	 ;; No exact match, so we have to look at the stack parameters.
+	 (AND #+IMach (NOT (MINUSP UPPER))
+	      #+3600 T
+	      (LET ((ORIGIN (AREF STACK-ORIGIN UPPER)))
+		(AND (NOT (%POINTER-LESSP ADDRESS ORIGIN))
+		     (LET ((LENGTH (AREF *STACK-LENGTH* UPPER)))
+		       (AND (%POINTER-LESSP ADDRESS (+ ORIGIN LENGTH))
+			    (VALUES UPPER ORIGIN LENGTH)))))))
+      (LET* ((PROBE (LDB (BYTE 31. 1) (+ LOWER UPPER)))	;fast divide by two
+	     (VALUE (AREF STACK-ORIGIN PROBE)))
+	(COND ((%POINTER-LESSP VALUE ADDRESS) (SETQ LOWER (1+ PROBE)))
+	      ((%POINTER-LESSP ADDRESS VALUE) (SETQ UPPER (1- PROBE)))
+	      (T (RETURN (VALUES PROBE VALUE (AREF *STACK-LENGTH* PROBE)))))))))
+
+;Make a stack
+;REP-TYPE is list for control stacks and binding stacks, structure for data stacks
+;No need to inhibit flips since stacks cannot be moved by the GC
+(DEFUN %MAKE-STACK (AREA SIZE STACK-GROUP REP-TYPE #+IMACH SPACE-TYPE &AUX ORIGIN)
+  (DECLARE (VALUES ORIGIN SIZE))
+  ;; Round size up to nearest 1protection0 multiple.
+  #-VLM
+  (SETQ SIZE (DPB 0 %%VMA-WORD-OFFSET (+ SIZE PAGE-SIZE -1)))
+  #+VLM
+  (SETQ SIZE (DPB 0 %%WORD-WITHIN-CHUNK (+ SIZE %ADDRESS-SPACE-CHUNK-SIZE -1)))
+  ;; Check the arguments
+  (OR AREA (SETQ AREA DEFAULT-CONS-AREA))
+  (CHECK-ARG AREA (AND (FIXNUMP AREA)
+		       (NOT (MINUSP AREA))
+		       (< AREA (N-AREAS)))
+	     "an area number")
+  (CHECK-ARG-TYPE STACK-GROUP :STACK-GROUP)
+  (WITHOUT-INTERRUPTS-AND-STACK-OVERFLOWS (500.)
+    (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+    ;; Allocate the address space from a stack region
+    ;; [Don't use ALLOCATE-BLOCK because only a small fraction of it is applicable]
+    (LOOP FOR REGION FIRST (AREA-REGION-LIST AREA) THEN (REGION-LIST-THREAD REGION)
+	  UNTIL (COND ((NOT (REGION-VALID-P REGION))
+		       (SETQ REGION
+			#+3600  (ALLOCATE-NEW-REGION AREA SIZE
+				  (= REP-TYPE %REGION-REPRESENTATION-TYPE-STRUCTURE)
+				  NIL T %SAFEGUARDED-LEVEL)
+			#+IMach (ALLOCATE-OR-EXTEND-REGION AREA SIZE
+				  (%LOGDPBS -1 %%REGION-READ-ONLY
+					    -1 %%REGION-REPRESENTATION-TYPE
+					    -1 %%REGION-LEVEL
+					    -1 %%REGION-SPACE-TYPE
+					    -1 %%REGION-NO-CONS 0)
+				  (%LOGDPBS REP-TYPE %%REGION-REPRESENTATION-TYPE
+					    %SAFEGUARDED-LEVEL %%REGION-LEVEL
+					    SPACE-TYPE %%REGION-SPACE-TYPE
+					    0 %%REGION-NO-CONS
+					    0 %%REGION-READ-ONLY 0)))
+		       T))
+	  UNTIL (LET ((REGION-BITS (REGION-BITS REGION)))
+		  (AND (= (LDB %%REGION-SPACE-TYPE REGION-BITS)
+			  #+3600 %REGION-SPACE-STACK #+IMACH SPACE-TYPE)
+		       (= (LDB %%REGION-REPRESENTATION-TYPE REGION-BITS) REP-TYPE)
+		       (ZEROP (LDB %%REGION-NO-CONS REGION-BITS))
+		       ( (+ (REGION-FREE-POINTER REGION) SIZE) (REGION-LENGTH REGION))))
+	  FINALLY
+	    (SETQ ORIGIN (+ (REGION-ORIGIN REGION) (REGION-FREE-POINTER REGION))) ;signs ok
+	    (CREATE-PAGES ORIGIN SIZE)
+	    (INCF (REGION-FREE-POINTER REGION) SIZE)
+	    (SETF (REGION-CREATED-PAGES REGION) (REGION-FREE-POINTER REGION))
+	    (INCF *CONS-WORK-DONE* SIZE))
+    ;; Make sure the stack tables are big enough.
+    (WHEN ( *NUMBER-OF-ACTIVE-STACKS* (ARRAY-LENGTH *STACK-ORIGIN*))
+      (LET ((NS (+ *NUMBER-OF-ACTIVE-STACKS* 100)))
+	(SETQ *STACK-STACK-GROUP* (ADJUST-ARRAY-SIZE *STACK-STACK-GROUP* NS)
+	      *STACK-LENGTH* (ADJUST-ARRAY-SIZE *STACK-LENGTH* NS)
+	      *STACK-ORIGIN* (ADJUST-ARRAY-SIZE *STACK-ORIGIN* NS))))
+    ;; Enter into the stack tables, sorted
+    (LET ((STACK-ORIGIN *STACK-ORIGIN*)
+	  (STACK-LENGTH *STACK-LENGTH*)
+	  (STACK-STACK-GROUP *STACK-STACK-GROUP*))
+      (DECLARE (SYS:ARRAY-REGISTER STACK-ORIGIN STACK-LENGTH STACK-STACK-GROUP))
+      (LET ((SN (DO ((LOWER 0)
+		     (UPPER (1- *NUMBER-OF-ACTIVE-STACKS*)))
+		    ((> LOWER UPPER) LOWER)
+		  (LET* ((PROBE (LDB (BYTE 31. 1) (+ LOWER UPPER)))	;Fast divide by two.
+			 (VALUE (AREF STACK-ORIGIN PROBE)))
+		    (COND ((%POINTER-LESSP VALUE ORIGIN) (SETQ LOWER (1+ PROBE)))
+			  ((%POINTER-LESSP ORIGIN VALUE) (SETQ UPPER (1- PROBE)))
+			  (T (ERROR "Newly created stack already in stack tables?!")))))))
+	(LOOP FOR I FROM *NUMBER-OF-ACTIVE-STACKS* ABOVE SN DO
+	  (LET ((S (1- I)))
+	    (ASET (AREF STACK-ORIGIN S) STACK-ORIGIN I)
+	    (ASET (AREF STACK-LENGTH S) STACK-LENGTH I)
+	    (ASET (AREF STACK-STACK-GROUP S) STACK-STACK-GROUP I)))
+	(INCF *NUMBER-OF-ACTIVE-STACKS*)
+	(ASET ORIGIN STACK-ORIGIN SN)
+	(ASET SIZE STACK-LENGTH SN)
+	(ASET STACK-GROUP STACK-STACK-GROUP SN))))
+  ;; Now, outside the without-interrupts, think about GC issues
+  (NOTE-CONS-WORK-DONE SIZE)
+  ;; Return pointer to stack, and size that was actually allocated
+  (VALUES (%MAKE-POINTER DTP-LOCATIVE ORIGIN) SIZE))
+
+;Increase the size of a stack if there happens to be unused address space right after it.
+;Returns non-NIL if it succeeds, NIL if there is insufficient space.
+;The value returned is the number of words consed.
+;The caller is responsible for calling NOTE-CONS-WORK-DONE.
+;Must be called without-interrupts.
+(DEFUN GROW-STACK-IF-POSSIBLE (SN NEW-SIZE)
+  (BLOCK GROW-STACK-IF-POSSIBLE
+    ;; Round size up to nearest 1protection0 multiple.
+    #-VLM
+    (SETQ NEW-SIZE (DPB 0 %%VMA-WORD-OFFSET (+ NEW-SIZE (1- PAGE-SIZE))))
+    #+VLM
+    (SETQ NEW-SIZE (DPB 0 %%WORD-WITHIN-CHUNK (+ NEW-SIZE (1- %ADDRESS-SPACE-CHUNK-SIZE))))
+    (LET* ((ORIGIN (AREF *STACK-ORIGIN* SN))
+	   (NEW-TOP (%32-BIT-PLUS ORIGIN NEW-SIZE))
+	   (NEW-TOP-QUANTUM			;round up to next quantum
+	     (LDB %%VMA-QUANTUM-NUM (%32-BIT-PLUS NEW-TOP (1- %ADDRESS-SPACE-QUANTUM-SIZE))))
+	   (REGION (%REGION-NUMBER ORIGIN))
+	   (REGION-TOP-QUANTUM
+	     (+ (REGION-QUANTUM-ORIGIN REGION) (REGION-QUANTUM-LENGTH REGION)))
+    #+3600 (REGION-TOP (%LOGDPB REGION-TOP-QUANTUM %%VMA-QUANTUM-NUM 0))
+	   (CONS-WORK-DONE 0))
+      ;; Any space between end of stack and free pointer must be vacant.
+      ;; Nothing could be there but a stack, and the stack table is sorted so
+      ;; checking for that is easy enough
+      (WHEN (AND (< (1+ SN) *NUMBER-OF-ACTIVE-STACKS*)	;When the next stack exists
+		 (%POINTER-LESSP (AREF *STACK-ORIGIN* (1+ SN)) NEW-TOP));and it's in the way
+	(RETURN-FROM GROW-STACK-IF-POSSIBLE NIL))	;then we can't grow this stack
+      ;; Do we need to grow the region?
+      (WHEN (> NEW-TOP-QUANTUM REGION-TOP-QUANTUM)
+	;; Any space needed after the end of the region must be unallocated
+	(UNLESS (AND #+3600 ( NEW-TOP-QUANTUM (* NUMBER-OF-OBLASTYI %OBLAST-SIZE-IN-QUANTA))
+		     ;; On the I machine, don't go into a different subzone.
+		     #+IMach (= (LDB %%QUANTUM-ZONE-AND-SUBZONE NEW-TOP-QUANTUM)
+				(LDB %%VMA-ZONE-AND-SUBZONE ORIGIN))
+		     (LOOP FOR Q FROM REGION-TOP-QUANTUM BELOW NEW-TOP-QUANTUM
+			   NEVER (%REGION-NUMBER (%LOGDPB Q %%VMA-QUANTUM-NUM 0))))
+	  (RETURN-FROM GROW-STACK-IF-POSSIBLE NIL))
+	;; Okay, it's going to work
+	#+IMach (EXTEND-REGION REGION (- NEW-TOP-QUANTUM REGION-TOP-QUANTUM))
+	#+3600 (%SET-ADDRESS-SPACE-MAP REGION-TOP-QUANTUM
+				       (- NEW-TOP-QUANTUM REGION-TOP-QUANTUM)
+				       REGION)
+	#+3600 (INCF (REGION-QUANTUM-LENGTH REGION) (- NEW-TOP-QUANTUM REGION-TOP-QUANTUM))
+	#+3600 (FILL-GC-MAP REGION-TOP
+			    (DPB (- NEW-TOP-QUANTUM REGION-TOP-QUANTUM) %%VMA-QUANTUM-NUM 0)
+			    %GC-MAP-NORMAL)
+	#+3600
+	;; Adjust oblast tables the slow, but less buggy, way
+	(LOOP FOR OBLAST FROM (%FIXNUM-FLOOR REGION-TOP-QUANTUM %OBLAST-SIZE-IN-QUANTA)
+			 TO (%FIXNUM-FLOOR (1- NEW-TOP-QUANTUM) %OBLAST-SIZE-IN-QUANTA) DO
+	  ;; Recompute largest hole in this oblast
+	  (LOOP FOR Q FROM (%FIXNUM-MULTIPLY OBLAST %OBLAST-SIZE-IN-QUANTA)
+		REPEAT %OBLAST-SIZE-IN-QUANTA
+		WITH MAX-FOUND = 0 WITH N-FOUND = 0
+		DO (IF (%REGION-NUMBER (%LOGDPB Q %%VMA-QUANTUM-NUM 0))
+		       (SETQ MAX-FOUND (MAX MAX-FOUND N-FOUND)
+			     N-FOUND 0)
+		       (INCF N-FOUND))
+		FINALLY
+		  (SETF (AREF *OBLAST-FREE-SIZE* OBLAST) (MAX N-FOUND MAX-FOUND)))))
+      ;; Advance free pointer if necessary
+      (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+      (LET* ((FREE (REGION-FREE-POINTER REGION))
+	     (FREE-TOP (+ (REGION-ORIGIN REGION) FREE))	;signs ok
+	     (WORDS (%POINTER-DIFFERENCE NEW-TOP FREE-TOP)))
+	(WHEN (> WORDS 0)
+	  (INCF FREE WORDS)
+	  (UNLESS ( FREE (REGION-LENGTH REGION))
+	    (ERROR "Internal Error:  Attempt to grow a stack beyond its length"))
+	  ;; This is actually gratuitous, since the pages would be created by faulting
+	  ;; upon them, since this is a stack area.  However, leave this here for
+	  ;; performance reasons (we're growing the stack, so it's likely we'll use
+	  ;; the space soon).
+	  (CREATE-PAGES FREE-TOP WORDS)
+	  (SETF (REGION-FREE-POINTER REGION) FREE)
+	  (SETF (REGION-CREATED-PAGES REGION) FREE)
+	  (INCF *CONS-WORK-DONE* WORDS)
+	  (SETQ CONS-WORK-DONE WORDS)))
+      ;; Adjust stack table
+      (SETF (AREF *STACK-LENGTH* SN) NEW-SIZE)
+      (RETURN-FROM GROW-STACK-IF-POSSIBLE CONS-WORK-DONE))))
+
+;;; Remove the stack at this address from the table, since no longer in use
+(DEFUN PURGE-STACK-TABLE (ADDR)
+  (LET ((SN (STACK-TABLE-EXTANT-INDEX ADDR))
+	(STACK-ORIGIN *STACK-ORIGIN*)
+	(STACK-LENGTH *STACK-LENGTH*)
+	(STACK-STACK-GROUP *STACK-STACK-GROUP*))
+    (DECLARE (SYS:ARRAY-REGISTER STACK-ORIGIN STACK-LENGTH STACK-STACK-GROUP))
+    (WHEN (NOT (NULL SN))
+      (LOOP FOR I FROM (1+ SN) BELOW *NUMBER-OF-ACTIVE-STACKS* DO
+	(LET ((D (1- I)))
+	  (ASET (AREF STACK-ORIGIN I) STACK-ORIGIN D)
+	  (ASET (AREF STACK-LENGTH I) STACK-LENGTH D)
+	  (ASET (AREF STACK-STACK-GROUP I) STACK-STACK-GROUP D)))
+      (DECF *NUMBER-OF-ACTIVE-STACKS*))))
+
+;;; The Data Stack
+
+;The primitive special form
+;Has to be a special form in the interpreter, because if the variable that
+;holds the old data stack pointer gets evacuated out of the stack, and then
+;the data stack overflows, it would fail to get relocated.
+
+(DEFINE-SPECIAL-FORM WITH-DATA-STACK EXPAND-WITH-DATA-STACK (&BODY BODY &ENVIRONMENT ENV)
+  (WITH-DATA-STACK
+    (EVAL-BODY BODY ENV)))
+
+(DEFUN EXPAND-WITH-DATA-STACK (FORM IGNORE)
+  ;; Bind the data-stack-pointer so that its old value will be restored when
+  ;; control leaves the body.  SG-REAL-DATA-STACK-POINTER knows how to retrieve
+  ;; the real value of the data-stack-pointer from inside our binding stack.
+  ;; CONTROL-STACK-FRAME-FOR-DATA-STACK-ADDRESS knows how to correlate
+  ;; data stack objects with control stack frames.
+  ;; ADJUST-ARRAY-SIZE knows that the data stack pointer is bound, and can change
+  ;; bindings other than the innermost one.  This is also true of GROW-DATA-STACK...
+  `(LETF (((SG-DATA-STACK-POINTER %CURRENT-STACK-GROUP)
+	   (SG-DATA-STACK-POINTER %CURRENT-STACK-GROUP)))
+     ,@(CDR FORM)))
+
+;;; Value of SG-DATA-STACK-POINTER that works from other stack groups
+;;; WITH-DATA-STACK binds SG-DATA-STACK-POINTER, so have to peek at binding stack
+(DEFUN SG-REAL-DATA-STACK-POINTER (SG)
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  (LOCATION-CONTENTS
+    (DBG:CELL-LOCATION-IN-STACK-GROUP (LOCF (SG-DATA-STACK-POINTER SG)) SG)))
+
+;; Only works if (EQ SG %CURRENT-STACK-GROUP)
+;; Should be called without interrupts, so that aborting doesn't leave the 
+;; pointers inconsistent.  Adjusts all data stack pointers which point to the
+;; top of the data stack.
+(DEFUN ADJUST-DATA-STACK-POINTER (SG OLD-VALUE NEW-VALUE)
+  (LET ((DS-PTR-LOC (LOCF (SG-DATA-STACK-POINTER SG))))
+    (UNLESS (STORE-CONDITIONAL DS-PTR-LOC OLD-VALUE NEW-VALUE)
+      (FERROR "Illegal adjustment of data stack pointer"))
+    (LOOP FOR BSP = %BINDING-STACK-POINTER
+		  THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE BSP -2)
+	  WITH LOW = (SG-BINDING-STACK-LOW SG)
+	  WHILE (%POINTER-LESSP LOW BSP)
+	  UNTIL (AND (EQ (BINDING-STACK-CELL BSP) DS-PTR-LOC)
+		     (NOT (STORE-CONDITIONAL (LOCF (BINDING-STACK-CONTENTS BSP))
+					     OLD-VALUE NEW-VALUE))))))
+
+;;; Data stack allocation routines
+
+;;; On the I machine, BAR-1 will contain the address allocated
+(DEFMACRO ALLOCATE-DATA-STACK (N-WORDS &ENVIRONMENT ENV)
+  (ONCE-ONLY (N-WORDS &ENVIRONMENT ENV)
+    `(PROG ((SG %CURRENT-STACK-GROUP))		;Copy special variable to save 3 microseconds
+       LOOP ;; Return here if stack had to be grown
+	    (WITHOUT-INTERRUPTS
+	      (LET ((P (SG-DATA-STACK-POINTER SG)))
+		(UNLESS (NULL P)		;Does SG have a data stack yet?
+		  (LET ((Q #+3600 (%MAKE-POINTER-OFFSET DTP-LOCATIVE P ,N-WORDS)
+			   #+IMACH (%POINTER-PLUS P ,N-WORDS)))
+		    (UNLESS (%POINTER-LESSP (SG-DATA-STACK-LIMIT SG) Q)
+		      (SETF (SG-DATA-STACK-POINTER SG) Q)
+		      (RETURN #+3600 (%MAKE-POINTER-OFFSET DTP-LOCATIVE P 1)
+			      #+IMACH (LET ((POINTER (%POINTER-PLUS P 1)))
+					(SETF (%BLOCK-REGISTER 1) POINTER)
+					(RETURN POINTER))))))))
+	    ;; Not enough space
+	    (GROW-DATA-STACK ,N-WORDS)
+	    (GO LOOP))))
+
+(DEFUN GROW-DATA-STACK (N-WORDS)
+  (DECLARE (DBG:ERROR-REPORTER))
+  ;; Decide whether it's a stack overflow or a stack creation
+  (LET ((SG %CURRENT-STACK-GROUP))
+    (COND ((NULL (SG-DATA-STACK-LOW SG))
+	   ;; Here there was no previous stack.  Allocate a new one.
+	   (MULTIPLE-VALUE-BIND (NEW-STACK NEW-SIZE)
+	       ;;--- Temporary Kludge
+	       ;;--- Make sure to allocate enough room on the initial data stack
+	       ;;--- to accommodate SLOW-GC.  This can be reduced back to #o10000
+	       ;;--- when stack-growing works.  Another solution would be to make
+	       ;;--- the cold-load generator allocate a big data stack in the initial
+	       ;;--- stack group.
+	       (%MAKE-STACK STACK-AREA (MAX (1+ N-WORDS)
+					    (IF (EQ SG %INITIAL-STACK-GROUP)
+						400000
+						10000))
+			    SG
+			    %REGION-REPRESENTATION-TYPE-STRUCTURE
+			    #+IMACH %REGION-SPACE-STACK)
+	     (SETF (SG-DATA-STACK-LOW SG) NEW-STACK)
+	     (SETF (SG-DATA-STACK-POINTER SG) NEW-STACK)
+	     (SETF (SG-DATA-STACK-LIMIT SG)
+		   (%MAKE-POINTER-OFFSET DTP-LOCATIVE NEW-STACK (1- NEW-SIZE)))
+	     (SETF (SG-ABSOLUTE-DATA-STACK-LIMIT SG)
+		   (MAX (* 25. 10000) NEW-SIZE))))
+	  ((NULL (SG-DATA-STACK-POINTER SG))
+	   ;; Possible timing error or c-Abort situation.  Be robust.
+	   (SETF (SG-DATA-STACK-POINTER SG)
+		 (SG-DATA-STACK-LOW SG)))
+	  (T
+	   ;; If there was on old stack, we must signal pdl overflow
+	   ;; The debugger uses the data stack, so grow before signalling
+	   (WITHOUT-INTERRUPTS
+	     (DBG:CALL-STACK-GROWER
+	      :DATA
+	      (IF (< (+ N-WORDS
+			(%POINTER-DIFFERENCE
+			  (SG-DATA-STACK-POINTER SG)
+			  (SG-DATA-STACK-LOW SG)))
+		     (* DBG:PDL-GROW-RATIO
+			(%POINTER-DIFFERENCE
+			  (SG-DATA-STACK-LIMIT SG)
+			  (SG-DATA-STACK-LOW SG))))
+		  DBG:PDL-GROW-RATIO		;Grow stack by at least this proportion
+		  N-WORDS)))			;And make sure it's big enough for the request
+	   (LET* ((ABSOLUTE-LIMIT (SG-ABSOLUTE-DATA-STACK-LIMIT SG))
+		  (NEW-SIZE (%POINTER-DIFFERENCE (SG-DATA-STACK-LIMIT SG)
+						 (SG-DATA-STACK-LOW SG))))
+	     (WHEN (OR (NULL ABSOLUTE-LIMIT)
+		       (> NEW-SIZE ABSOLUTE-LIMIT))
+	       ;; Don't enter the Debugger if we haven't exceeded the absolute limit
+	       (SIGNAL 'PDL-OVERFLOW :PDL-NAME "data")))))
+    ;; If SG-DATA-STACK-POINTER was NIL before it was bound, make sure the unbinding
+    ;; doesn't set it back to NIL again, because that would make things slow.
+    (LOOP FOR BSP = %BINDING-STACK-POINTER
+		  THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE BSP -2)
+	  WITH LOW = (PROGN #+3600 (SG-BINDING-STACK-LOW SG)
+			    #+IMACH (%POINTER-PLUS (SG-BINDING-STACK-LOW SG) 1)
+			    )
+	  WHILE (%POINTER-LESSP LOW BSP)
+	  WITH CELL = (LOCF (SG-DATA-STACK-POINTER SG)) DO
+      (WHEN (AND (EQ (BINDING-STACK-CELL BSP) CELL)
+		 (NULL (BINDING-STACK-CONTENTS BSP)))
+	(SETF (BINDING-STACK-CONTENTS BSP) (SG-DATA-STACK-LOW SG))))))
+
+(DEFUN %UNMAKE-STRUCTURE (LOCATION LENGTH &AUX REGION)
+  (WITHOUT-INTERRUPTS-AND-STACK-OVERFLOWS (200.)
+    (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+    (SETQ LOCATION (%POINTER LOCATION))
+    (COND (( LENGTH 0))  ;This check really is unnecessary
+	  ;; Check for common case where it is the most recently allocated structure
+	  ;; This just saves calling %REGION-NUMBER, although we could save more
+	  ;; by calling a specialized version of GC-RESET-FREE-POINTER.
+	  ((AND (%STRUCTURE-CACHE-AREA)
+		(= (+ LOCATION LENGTH) (%STRUCTURE-CACHE-VIRTUAL-ADDRESS)))
+	   (GC-RESET-FREE-POINTER (%STRUCTURE-CACHE-REGION)
+				  (- LOCATION (REGION-ORIGIN (%STRUCTURE-CACHE-REGION)))))
+	  ;; Could be at end of region but not in allocation cache
+	  ((= (+ LOCATION LENGTH)
+	      (+ (REGION-FREE-POINTER (SETQ REGION (%REGION-NUMBER LOCATION)))
+		 (REGION-ORIGIN REGION)))
+	   (GC-RESET-FREE-POINTER REGION (- LOCATION (REGION-ORIGIN REGION))))
+	  ;; Must fill the space with legitimate structures
+	  (T
+	   ;; Fill discarded words with ART-FIXNUM arrays
+	   (LOOP WHILE (PLUSP LENGTH)
+		 AS THIS-LENGTH = (MIN (DEFSYSBYTE-LIMIT-VALUE
+					 #+3600 ARRAY-NORMAL-LENGTH-FIELD
+					 #+IMACH ARRAY-SHORT-LENGTH-FIELD)
+				       LENGTH)
+		 DO (%P-STORE-CDR-TYPE-AND-POINTER LOCATION %HEADER-TYPE-ARRAY DTP-HEADER-I 0)
+		    #+3600
+		    (CL:SETF (ARRAY-DISPATCH-FIELD LOCATION) %ARRAY-DISPATCH-FIXNUM
+			     (ARRAY-TYPE-FIELD LOCATION) ART-FIXNUM
+			     (ARRAY-NORMAL-LENGTH-FIELD LOCATION) (1- THIS-LENGTH))
+		    #+IMACH
+		    (CL:SETF (ARRAY-TYPE-FIELD LOCATION) ART-FIXNUM
+			     (ARRAY-SHORT-LENGTH-FIELD LOCATION) (1- THIS-LENGTH))
+		    (%BLOCK-STORE-CDR-AND-CONTENTS (1+ LOCATION) (1- THIS-LENGTH) CDR-NIL 0 0)
+		    (INCF LOCATION THIS-LENGTH)
+		    (DECF LENGTH THIS-LENGTH))))))
+
+;;; Copy out of stacks and temporary areas
+(DEFUN IN-STACK-OR-TEMPORARY-AREA (THING)
+  (AND (NOT (FIXNUMP THING))			;Really a pointer
+       (NOT (FLONUMP THING))
+       (NOT (CHARACTERP THING))
+       (LET ((REGION (%REGION-NUMBER THING)))
+	 (AND REGION				;Really a pointer to normal memory
+	      (OR (PLUSP (%LOGLDB %%REGION-TEMPORARY (REGION-BITS REGION)))
+		  (LDB-TEST %%REGION-STACK (REGION-BITS REGION)))))))
+
+(DEFUN IN-STACK (THING)
+  (AND (NOT (FIXNUMP THING))			;Really a pointer
+       (NOT (FLONUMP THING))
+       (NOT (CHARACTERP THING))
+       (LET ((REGION (%REGION-NUMBER THING)))
+	 (AND REGION				;Really a pointer to normal memory
+	      (LDB-TEST %%REGION-STACK (REGION-BITS REGION))))))
+
+(DEFUN COPY-IF-NECESSARY (THING &OPTIONAL (DEFAULT-CONS-AREA WORKING-STORAGE-AREA))
+  (COND ((ATOM THING)
+	 (COND ((NOT (IN-STACK-OR-TEMPORARY-AREA THING)) THING)
+	       ((LOCATIVEP THING) THING)
+	       ((TYPEP THING :EXTENDED-NUMBER) (COPY-EXTENDED-NUMBER THING))
+	       ((STRINGP THING) (STRING-APPEND THING))
+	       ((SYMBOLP THING)
+		;; Make only one copy of any given symbol.  The copy remains uninterned,
+		;; just like the original.  The properties, value, and definition
+		;; as of the first time the symbol needed to be copied are copied,
+		;; in case the user program that created the symbol put something there.
+		;; Of course this won't work if properties are being put dynamically.
+		(OR (GET THING 'COPY-IF-NECESSARY)
+		    (LET ((NEW (MAKE-SYMBOL (COPY-IF-NECESSARY (GET-PNAME THING)
+							       DEFAULT-CONS-AREA))))
+		      (SETPLIST NEW (COPYLIST (PLIST THING)))
+		      (IF (BOUNDP THING)
+			  (SET NEW (COPY-IF-NECESSARY (SYMEVAL THING) DEFAULT-CONS-AREA)))
+		      (IF (FBOUNDP THING)
+			  (FSET NEW (COPY-IF-NECESSARY (FSYMEVAL THING) DEFAULT-CONS-AREA)))
+		      (PUTPROP THING NEW 'COPY-IF-NECESSARY)
+		      NEW)))
+	       ((ARRAYP THING)
+		(LET ((NEW (MAKE-ARRAY (IF (CL:VECTORP THING)
+					   (ARRAY-LENGTH THING)
+					   (ARRAY-DIMENSIONS THING))
+				       :TYPE (ARRAY-TYPE THING)
+				       :LEADER-LENGTH (ARRAY-LEADER-LENGTH THING))))
+		  (COPY-ARRAY-CONTENTS-AND-LEADER THING NEW)
+		  NEW))
+	       ((AND (LEXICAL-CLOSURE-P THING)
+		     (LISTP (LEXICAL-CLOSURE-ENVIRONMENT THING)))
+		;; If the environment is a list, we know the closure is in heap format
+		;; If it was in stack format, the environment would be a locative
+		(LET ((ENV (LEXICAL-CLOSURE-ENVIRONMENT THING)))
+		  (WHEN (IN-STACK-OR-TEMPORARY-AREA ENV)
+		    (SETQ ENV (COPYLIST ENV)))
+		  (MAKE-LEXICAL-CLOSURE ENV (LEXICAL-CLOSURE-FUNCTION THING))))
+	       (T (FERROR NIL "Don't know how to copy ~S out of ~A"
+			  THING (AREA-NAME (%AREA-NUMBER THING))))))
+	((COPY-TREE-P THING)
+	 (LET ((RES (MAKE-LIST (IF (CDR (LAST THING)) (1+ (LENGTH THING)) (LENGTH THING)))))
+	   (DO ((L1 THING (CDR L1))
+		(L2 RES (CDR L2)))
+	       ((ATOM L1)
+		(COND ((NOT (NULL L1))
+		       (RPLACA L2 (COPY-IF-NECESSARY L1 DEFAULT-CONS-AREA))
+		       (%P-DPB-OFFSET CDR-NORMAL %%Q-CDR-CODE L2 -1))))
+	     (RPLACA L2 (COPY-IF-NECESSARY (CAR L1) DEFAULT-CONS-AREA)))
+	   RES))
+	(T THING)))
+
+;;; version of the above that considers a copy `necessary' if the object
+;;; isn't in the appropriate area yet, instead of merely if its in the stack
+;;; or a temporary area.  If the top-level object is in the right place, the
+;;; rest is assumes to be as well.
+;;; this is cribbed from COPY-INTO-PATHNAME-AREA, and may be insufficient for'
+;;; some purposes at this point.
+(DEFUN COPY-INTO-AREA-IF-NOT-THERE (THING AREA)
+  (IF (EQL (%AREA-NUMBER THING) AREA) THING
+      (IF (ATOM THING)
+	  (TYPECASE THING
+	    (:EXTENDED-NUMBER (COPY-EXTENDED-NUMBER THING AREA))
+	    (:STRING (SUBSTRING THING 0 NIL AREA))
+	    (OTHERWISE THING))
+	  (SETQ THING (COPYLIST THING AREA))
+	  (DO ((O THING (CDR O))) (NIL)
+	    (SETF (CAR O) (COPY-INTO-AREA-IF-NOT-THERE (CAR O) AREA))
+	    (COND ((NLISTP (CDR O))
+		   (AND (CDR O)
+			(SETF (CDR O) (COPY-INTO-AREA-IF-NOT-THERE (CDR O) AREA)))
+		   (RETURN THING)))))))
+
+(DEFUN COPY-TREE-P (TREE)
+  (COND ((IN-STACK-OR-TEMPORARY-AREA TREE) T)
+	((ATOM TREE) NIL)
+	(T (DO ((L TREE (CDR L)) (BITS))
+	       ((ATOM L) (COPY-TREE-P L))
+	     (SETQ BITS (REGION-BITS (%REGION-NUMBER L)))
+	     (IF (OR (LDB-TEST %%REGION-STACK BITS)
+		     (PLUSP (%LOGLDB %%REGION-TEMPORARY BITS))
+		     (COPY-TREE-P (CAR L)))
+		 (RETURN T))))))
+
+;;; COPY-EXTENDED-NUMBER is machine dependent
+
+;; Shouldn't be here
+;; Used by #+3600 REGION-ZERO-OVERFLOW #+IMach REGION-ONE-OVERFLOW
+;; for informational purposes.
+(DEFUN FOOLPROOF-REBOOTING-COMMAND (&OPTIONAL (BAND (LOADED-BAND-NAME)))
+  (IF (NETBOOT::NETBOOT-REQUESTED-P)
+      ;; This cannot use PARSE-PATHNAME due to problems in distribution worlds.
+      ;; We can't pass the host name onto the server for the same reason.
+      (STRING-APPEND "Netboot " (SUBSTRING BAND
+				  (+ 2 (OR (STRING-SEARCH ":>" BAND) -2))
+				  (STRING-REVERSE-SEARCH #+3600  ".load.1"
+							 #+IMach ".ilod.1" BAND)))
+      (STRING-APPEND "Load World " BAND)))
+
+
+;; Describers and Debuggers
+
+(FORMAT:DEFFORMAT SI:LEVEL-TYPE (:ONE-ARG) (LEVEL-TYPE IGNORE)
+  (FORMAT FORMAT:*FORMAT-OUTPUT*
+	  "~[Unallocated~;Wired~;Safeguarded~;Static~;Dynamic~;Ephemeral~]" LEVEL-TYPE))
+
+(FORMAT:DEFFORMAT SI:LEVEL (:ONE-ARG) (LEVEL IGNORE)
+  (LET ((TYPE (IF (LEVEL-VALID-P LEVEL) (LEVEL-TYPE LEVEL) %LEVEL-TYPE-UNALLOCATED)))
+    (FORMAT FORMAT:*FORMAT-OUTPUT* "~\SI:LEVEL-TYPE\" TYPE)
+    (WHEN (AND ( TYPE %LEVEL-TYPE-UNALLOCATED)
+	       (OR (< LEVEL %WIRED-LEVEL)
+		   (> LEVEL %DYNAMIC-LEVEL)))
+      (FORMAT FORMAT:*FORMAT-OUTPUT* " level ~O" LEVEL))))
+
+(FORMAT:DEFFORMAT SI:REGION-SPACE-TYPE (:ONE-ARG) (SPACE-TYPE IGNORE)
+  (LET ((NAME (AREF #.(CL:VECTOR "Free" "Old" "New" "Copy"
+				 "Weak" NIL NIL NIL
+				 "Stack" "Structure Stack" "Control Stack" "Bind Stack"
+				 NIL NIL NIL NIL)
+		    SPACE-TYPE)))
+    (IF NAME
+	(SEND FORMAT:*FORMAT-OUTPUT* :STRING-OUT NAME)
+	(FORMAT FORMAT:*FORMAT-OUTPUT* "Space-type=~D" SPACE-TYPE))))
+
+(FORMAT:DEFFORMAT SI:REGION-REPRESENTATION-TYPE (:ONE-ARG) (REP-TYPE IGNORE)
+  (FORMAT FORMAT:*FORMAT-OUTPUT*
+	  "~[List~;Structure~:;~:*Representation-type=~D~]"
+	  REP-TYPE))
+
+(FORMAT:DEFFORMAT SI:REGION-BITS (:ONE-ARG) (REGION-BITS IGNORE)
+  (FORMAT FORMAT:*FORMAT-OUTPUT*
+       "~\SI:REGION-SPACE-TYPE\ ~\SI:REGION-REPRESENTATION-TYPE\, ~
+	~[~;Read only, ~]~[~;Temp, ~]~[~:;~:*Swapin ~O, ~]~[NoScav~;Scav~]~
+	~[~; NoCons~] ~\SI:LEVEL\~[ FixedSize~]"
+       (LDB %%REGION-SPACE-TYPE REGION-BITS)
+       (LDB %%REGION-REPRESENTATION-TYPE REGION-BITS)
+       (LDB %%REGION-READ-ONLY REGION-BITS)
+       (LDB %%REGION-TEMPORARY REGION-BITS)
+       (LDB %%REGION-SWAPIN-QUANTUM REGION-BITS)
+       (LDB %%REGION-SCAVENGE-ENABLE REGION-BITS)
+       (LDB %%REGION-NO-CONS REGION-BITS)
+       (LDB %%REGION-LEVEL REGION-BITS)
+       (LDB %%REGION-ADJUSTABLE-SIZE REGION-BITS)))
+
+(DEFUN DESCRIBE-AREA (AREA)
+  (WHEN (NUMBERP AREA) (SETQ AREA (AREA-NAME AREA)))
+  (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+  (DOTIMES (AREA-NUMBER (N-AREAS))
+    (WHEN (EQ (AREA-NAME AREA-NUMBER) AREA)
+      ;; Describe the area as a whole
+      (MULTIPLE-VALUE-BIND (LENGTH USED N-REGIONS)
+	  (ROOM-GET-AREA-LENGTH-USED AREA-NUMBER)
+	(IGNORE LENGTH USED)
+	(FORMAT T "~%Area #~O: ~S has ~D region~:P~@[, max size ~O~], region size ~O (octal):~%"
+		AREA-NUMBER AREA N-REGIONS
+		(AND ( (AREA-MAXIMUM-QUANTUM-SIZE AREA-NUMBER) %NUMBER-OF-QUANTA)
+		     (AREA-MAXIMUM-SIZE AREA-NUMBER))
+		(AREA-REGION-SIZE AREA-NUMBER)))
+      ;; Describe ephemeral levels of the area, if any
+      (LET ((LEVELS NIL))
+	(DO ((REGION (AREA-REGION-LIST AREA-NUMBER) (REGION-LIST-THREAD REGION)))
+	    ((NOT (REGION-VALID-P REGION)))
+	  (LET ((LEVEL (LDB %%REGION-LEVEL (REGION-BITS REGION))))
+	    (WHEN (EPHEMERAL-LEVEL-P LEVEL)
+	      (UNLESS (MEMQ LEVEL LEVELS)
+		(PUSH LEVEL LEVELS)))))
+	(LET ((START (OR (CADR (ASSQ AREA *EPHEMERAL-AREAS*))
+			 (LDB %%REGION-LEVEL (AREA-REGION-BITS AREA-NUMBER)))))
+	  ;; Make sure all levels in the object progression are mentioned, even if empty
+	  (DO ((LEVEL START (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL* LEVEL)))
+	      ((NOT (EPHEMERAL-LEVEL-P LEVEL)))
+	    (UNLESS (MEMQ LEVEL LEVELS)
+	      (PUSH LEVEL LEVELS)))
+	  (WHEN LEVELS
+	    ;; Sort levels in order of object progression, with any levels that are no
+	    ;; longer in the progression at the end
+	    (SETQ LEVELS (SORT LEVELS
+			       #'(LAMBDA (X Y)
+				   (DECLARE (SYS:DOWNWARD-FUNCTION))
+				   (DO ((LEVEL START
+					       (AREF *EPHEMERAL-GC-KEEP-NEXT-LEVEL*
+						     LEVEL)))
+				       ((NOT (EPHEMERAL-LEVEL-P LEVEL)) NIL)
+				     (WHEN (= LEVEL X) (RETURN T))
+				     (WHEN (= LEVEL Y) (RETURN NIL))))))
+	    (LOOP FOR LEVEL IN LEVELS FOR INDEX FROM 1 DO
+	      (MULTIPLE-VALUE-BIND (LENGTH USED N-REGIONS)
+		  (ROOM-GET-AREA-LENGTH-USED AREA-NUMBER LEVEL)
+		(FORMAT T "~&  ~:(~:R~) ephemeral level: ~
+			~D region~:P, ~@[capacity ~DK, ~]~DK allocated, ~DK used.~%"
+			INDEX N-REGIONS
+			(AND (AREF *EPHEMERAL-GC-FLIP-CAPACITY* LEVEL)
+			     (%FIXNUM-CEILING (AREF *EPHEMERAL-GC-FLIP-CAPACITY* LEVEL)
+					      2000))
+			(%FIXNUM-CEILING LENGTH 2000)
+			(%FIXNUM-CEILING USED 2000))))
+	    ;; Do the dynamic level
+	    (MULTIPLE-VALUE-BIND (LENGTH USED N-REGIONS)
+		(ROOM-GET-AREA-LENGTH-USED AREA-NUMBER %DYNAMIC-LEVEL)
+	      (FORMAT T "~&  Last (dynamic) level: ~D region~:P, ~@[capacity ~DK, ~]~
+                       ~DK allocated, ~DK used.~%"
+		      N-REGIONS NIL
+		      (%FIXNUM-CEILING LENGTH 2000) (%FIXNUM-CEILING USED 2000))))))
+      ;; Describe individual regions of the area
+      ;; First collect the regions and sort them into spaces
+      (LET ((REGIONS (SORT (LOOP FOR REGION = (AREA-REGION-LIST AREA-NUMBER)
+				            THEN (REGION-LIST-THREAD REGION)
+				 WHILE (REGION-VALID-P REGION)
+				 COLLECT REGION)
+			   #'(LAMBDA (R1 R2)
+			       (LET ((B1 (REGION-BITS R1)) (B2 (REGION-BITS R2)))
+				 #.`(COND ,@(LOOP FOR BYTE IN '(%%REGION-LEVEL
+								%%REGION-SPACE-TYPE
+								%%REGION-REPRESENTATION-TYPE)
+						  COLLECT `(( (LDB ,BYTE B1) (LDB ,BYTE B2))
+							    (> (LDB ,BYTE B1) (LDB ,BYTE B2)))
+						  )
+				          (T (< R1 R2))))))))
+	;; Now display the regions, with subtotals for each space
+	(LOOP FOR (REGION NEXT) ON REGIONS
+	      FOR BITS = (REGION-BITS REGION)
+	      SUM (REGION-FREE-POINTER REGION) INTO USED
+	      SUM (REGION-LENGTH REGION) INTO SIZE
+	      SUM (REGION-FREE-POINTER REGION) INTO TOTAL-USED
+	      SUM (REGION-LENGTH REGION) INTO TOTAL-SIZE
+	      DO (DESCRIBE-REGION REGION)
+		 (WHEN (OR (NOT NEXT)
+			   (LET ((NEXT-BITS (REGION-BITS NEXT)))
+			     (OR . #.(LOOP FOR BYTE IN '(%%REGION-LEVEL
+							 %%REGION-SPACE-TYPE
+							 %%REGION-REPRESENTATION-TYPE)
+					   COLLECT `( (LDB ,BYTE BITS) (LDB ,BYTE NEXT-BITS))
+					   ))))
+		   ;; Next region is a different space, or end of list, print subtotal
+		   (FORMAT T "~&  ~\SI:REGION-SPACE-TYPE\ ~\SI:REGION-REPRESENTATION-TYPE\ ~
+				  space: ~:D allocated, ~:D used."
+			   (LDB %%REGION-SPACE-TYPE BITS)
+			   (LDB %%REGION-REPRESENTATION-TYPE BITS) SIZE USED)
+		   (SETQ SIZE 0 USED 0))
+	      FINALLY
+	        (FORMAT T "~&  Total for ~S: ~:D allocated, ~:D used."
+			AREA TOTAL-SIZE TOTAL-USED)))
+      (RETURN T))))
+
+(DEFUN DESCRIBE-REGION (REGION)
+  (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+  (LET ((BITS (REGION-BITS REGION))
+	(GC (REGION-GC-POINTER REGION))
+	(ORIGIN (REGION-QUANTUM-ORIGIN REGION)))
+    (FORMAT T "~&    Region #~O: Origin ~\SI:ADDRESS\, Length ~O, Free ~O, "
+      REGION (AND ORIGIN (%LOGDPB ORIGIN %%VMA-QUANTUM-NUM 0))
+      (REGION-LENGTH REGION) (REGION-FREE-POINTER REGION))
+    #+IMACH (FORMAT T "~:[GC ~O~;GC-Level ~*~O Region ~O~]"
+		   (= (LDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-OLD) GC
+		   (LDB %%GC-POINTER-COPYSPACE-LEVEL GC)
+		   (LDB %%GC-POINTER-COPYSPACE-REGION GC))
+    #+3600 (FORMAT T "~:[GC ~O~;GC-Level ~*~O~]"
+		   (= (LDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-OLD) GC
+		   (LDB %%GC-POINTER-COPYSPACE-LEVEL GC))
+    (FORMAT T ", ~\SI:REGION-BITS\~%" BITS)))

@@ -1,0 +1,364 @@
+;;; -*- Mode: LISP; Package: Debugger; Base: 8; Lowercase: Yes -*- 
+
+;;; Debugger routines for the I machine
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Frame decoding
+
+(defun frame-number-of-args (frame)
+  (- (ldb %%cr.argument-size (frame-own-control-register frame))
+     (defstorage-size stack-frame)))
+
+(defun frame-instance-called (frame)
+  ;; No instance-called bit on the I-machine, so we assume that any frame whose
+  ;; function is some sort of method and whose "self" argument is an instance
+  ;; has probably been instance-called.
+  (let* ((function (frame-function frame))
+	 (function-spec (function-name function)))
+    (if (and (listp function-spec)
+	     (memq (first function-spec) flavor:*fdefinable-method-types*)
+	     (instancep (%p-contents-offset frame (+ 1 (defstorage-size stack-frame)))))
+	1
+      0)))
+
+(defun frame-lexical-called (frame)
+  ;; No lexical-called bit on the I-machine, so we assume that any frame whose
+  ;; function is an internal function and which has some lexical variables was
+  ;; called as a lexical closure.
+  (let* ((function (frame-function frame))
+	 (function-spec (function-name function)))
+    (if (and (listp function-spec)
+	     (eq (first function-spec) :internal)
+	     (not (null (assq :lexical-variable-instructions (debugging-info function)))))
+	1
+      0)))
+
+;; Return the number of spread args present in a given frame.
+;; This will not count any args which are part of a rest arg.
+;; TYPE says how to count missing arguments:
+;; :SUPPLIED means those given in the call, :EXPECTED those expected only, :ALLOCATED
+;; those for which stack slots exist.
+(defun frame-number-of-spread-args (frame &optional (type :supplied))
+  (ignore type)		;--- Don't need to hack this on the I-machine
+  (let* ((apply-bit (ldb %%cr.apply (frame-own-control-register frame)))
+	 (n-non-rest-args (- (frame-number-of-visible-args frame) apply-bit)))
+    n-non-rest-args))
+
+(defun frame-size (frame)
+  (multiple-value-bind (nil cr-loc) (frame-own-control-register frame)
+    (1- (%pointer-difference cr-loc frame))))
+
+(defun frame-number-of-stack-slots (frame)
+  (frame-size frame))
+
+;; Number of local slots in FRAME
+(defun frame-number-of-locals (frame)
+  (let ((pc (frame-relative-exit-pc frame)))
+    (- (cl:length (ilc:cache-local-names-for-debugger frame pc))
+       (defstorage-size stack-frame))))
+
+(defun frame-number-of-visible-args (frame)
+  ;; Same as FRAME-NUMBER-OF-ARGS
+  (- (ldb %%cr.argument-size (frame-own-control-register frame))
+     (defstorage-size stack-frame)))
+
+;; Trace up the stack and figure out if anyone cares what comes out of this frame.
+(defun frame-real-value-disposition (frame)
+  (loop for f = frame then (frame-previous-active-frame f)
+	as cr = (and f (frame-own-control-register f))
+	do (if (null f)
+	       (return :ignore)
+	     (select (ldb %%cr.value-disposition cr)
+	       (value-disposition-effect (return :ignore))
+	       (value-disposition-value (return :single))
+	       (value-disposition-return)
+	       (value-disposition-multiple (return :multiple))))))
+
+;; The Debugger itself avoids using this, since it is potentially quite slow
+(defun frame-bindings-bit (frame)
+  (ldb %%cr.cleanup-bindings (frame-own-control-register frame)))
+
+;; Return a pointer to the highest word in the special pdl relevant to this frame
+;; "Special pdl" is A-machine-ese for binding stack
+(defun frame-special-pdl-top (frame &optional (sg %current-stack-group))
+  (declare (safeguarded-function)
+	   (unsafeguarded-reference map-over-frames-in-stack frame-special-pdl-top ferror))
+  (let ((bsp (if (eq sg %current-stack-group)
+		 %binding-stack-pointer
+	       (sg-binding-stack-pointer sg))))
+    (map-over-frames-in-stack sg
+      #'(lambda (fp cr-loc ignore)
+	   (declare (unsafeguarded-reference sys:%return-from-lambda frame-special-pdl-top))
+	  (when (eq fp frame)
+	    (return-from frame-special-pdl-top bsp))
+	  (when (ldb-test %%cr.cleanup-bindings (location-contents cr-loc))
+	   ;; Move BSP down to the top of the previous binding frame
+	   (loop as osp = bsp
+		 doing (setq bsp (%pointer-plus bsp
+						(- (defstorage-size binding-stack-entry))))
+		 while (not (zerop (binding-stack-chain-bit osp))))))
+      t)
+    (ferror "Frame not found")))
+
+;; Given a frame, return locatives into the special pdl if it has
+;; bindings, or NIL if it doesn't.  Pointers to bindings point at
+;; the -second- word.  The first value points at the first binding,
+;; the second value points after the last binding.
+(defun frame-special-pdl-range (frame &optional (sg %current-stack-group))
+  (let ((bsp (if (eq sg %current-stack-group)
+		 %binding-stack-pointer
+	       (sg-binding-stack-pointer sg))))
+    (map-over-frames-in-stack sg
+      #'(lambda (fp cr-loc ignore)
+	  (when (ldb-test %%cr.cleanup-bindings (location-contents cr-loc))
+	    (loop with top = (%pointer-plus bsp (defstorage-size binding-stack-entry))
+		  as osp = bsp
+		  do (setq bsp (%pointer-plus bsp (- (defstorage-size binding-stack-entry))))
+		  while (not (zerop (binding-stack-chain-bit osp)))
+		  finally (when (eq fp frame)
+			    (return-from frame-special-pdl-range (values osp top)))))
+	  (when (eq fp frame)
+	    (return-from frame-special-pdl-range nil)))
+      t)))
+
+
+(defun describe-frame-instruction (frame &optional (stream standard-output))
+  (let ((function (frame-function frame)))
+    (when (closurep function)
+      (setq function (si:valid-function-definition (%p-contents-offset function 0))))
+    (argument-typecase function			;CL:ETYPECASE
+      (:compiled-function
+	(let* ((cca (compiled-function-cca function))
+	       (lim-pc (cca-n-instructions cca))
+	       ;; Minor kludge for bottom-most frame
+	       (pc (or (frame-relative-exit-pc frame) lim-pc)))
+	  (format stream "~&~VIn ~~S~V at PC ~~O:~%~2X"
+	    *deemphasis-character-style* (function-name function)
+	    *deemphasis-character-style* pc)
+	  (when ( pc lim-pc)
+	    (format stream "About to return to ")
+	    (present-stack-frame (frame-previous-frame frame) stream)
+	    (return-from describe-frame-instruction nil))
+	  (multiple-value-bind (cca extra-info vca relative-pc pc-0 pc-1 nil)
+	      (lframe-setup-for-disassembly (find-language-for-frame frame) frame function)
+	    (declare (ignore pc-0 pc-1))
+	    (multiple-value-bind (stack-description-array debug-alist)
+		(ilc:compute-stack-description function)
+	      (let* ((stack-array (i-lisp-compiler:compute-stack-description function))
+		     (stack-description
+		       (or (cdr (cl:assoc relative-pc debug-alist))
+			   (aref stack-description-array relative-pc)))
+		     (instruction
+		       (%memory-read
+			 (%pointer-plus cca (+ (ldb (byte 31. 1.) relative-pc)
+					       (defstorage-size compiled-function)))
+			 :cycle-type %memory-scavenge :set-cdr-next nil))
+		     (type (%data-type instruction)))
+		(ilc:disassemble-instruction
+		  cca
+		  relative-pc
+		  (cdr (cl:assoc relative-pc vca))
+		  stack-array
+		  (cdr extra-info))
+		;; We don't need to decode the full-word instructions any
+		;; further, since they take no operands (only entry, call, 
+		;; and push instructions are full-words)
+		(unless (ilc:packed-instruction-type-p type)
+		  (return-from describe-frame-instruction nil))
+		(let* ((instruction-bits
+			 (if (evenp relative-pc)
+			     (%set-tag instruction dtp-fixnum)
+			     (dpb type %%odd-instruction-tag-component
+				  (ldb %%q-odd-instruction-within-pointer
+				       (%set-tag instruction dtp-fixnum)))))
+		       (opcode (ldb %%packed-instruction-opcode instruction-bits))
+		       (format (ilc:get-opcode-format opcode))
+		       (n-args (ilc:opcode-format-n-args format))
+		       (top-of-stack
+			 (%pointer-plus
+			   frame
+			   (1- (frame-size frame)))))
+		  ;; Filter out things which have nothing more to show
+		  (unless (> n-args 0)
+		    (return-from describe-frame-instruction nil))
+		  (multiple-value-bind (mode offset-or-value entry)
+		      (if (cl:member 'ilc:fp (ilc:opcode-format-legal-operand-types format))
+			  (ilc:decode-address-operand instruction-bits stack-description)
+			  (values nil nil nil))
+		    (when (and (eq mode :immediate)
+			       (eql n-args 1))
+		      (return-from describe-frame-instruction nil))
+		    (with-indentation (stream 10.)
+		      (flet ((print-value-carefully (location)
+			       (let ((data-type
+				       (data-type-name (%p-data-type location))))
+				 (if (not (memq data-type *good-data-types*))
+				     (format stream "#<~A ~\si:address\>"
+					     data-type (%p-pointer location))
+				     (print-carefully "value"
+				       (prin1 (location-contents location) stream))))))
+			;; Print the arguments
+			(loop repeat (- n-args 1)
+			      for sp-offset from (- (if (eq offset-or-value :pop) 1 2) n-args)
+			      doing
+			  (format
+			    stream "~%SP|~D~@[ (~A)~]: "
+			    sp-offset 
+			    (ilc:stack-entry-name
+			      (ilc:stack-description-sp-n stack-description (- sp-offset))))
+			  (print-value-carefully (%pointer-plus top-of-stack sp-offset)))
+			;; Print the address operand, if it is not immediate or SP|POP
+			(select mode
+			  (:fp
+			   (format stream "~%FP|~D~@[ (~A)~]: "
+				   offset-or-value
+				   (ilc:stack-entry-name entry))
+			   (print-value-carefully (%pointer-plus frame offset-or-value)))
+			  (:lp
+			   (format stream "~%LP|~D~@[ (~A)~]: "
+				   offset-or-value
+				   (ilc:stack-entry-name entry))
+			   (let ((lp (ldb %%cr.argument-size
+					  (frame-own-control-register frame))))
+			     (print-value-carefully
+			       (%pointer-plus frame (+ lp offset-or-value)))))
+			  (:sp
+			   (format stream "~%SP|~D~@[ (~A)~]: "
+				   offset-or-value
+				   (ilc:stack-entry-name entry))
+			   (print-value-carefully
+			     (%pointer-plus top-of-stack
+					    (if (eq offset-or-value :pop)
+						0
+						offset-or-value)))))))))))))))))
+
+
+;;; Frame display
+
+(defun show-additional-frame-info (frame)
+  (let ((cr (frame-own-control-register frame)))
+    (when (ldb-test %%cr.cleanup-catch cr)
+      (format t " Frame has open catch or unwind-protect.~%"))
+    (when (ldb-test %%cr.cleanup-bindings cr)
+      (format t " Frame has special variable bindings.~%"))
+    (when (ldb-test %%cr.call-started cr)
+      (format t " Frame has started some calls.~%"))
+    (when (ldb-test %%cr.trap-mode cr)
+      (format t " Trap mode ~[extra-stack~;I/O~;FEP~].~%" (1- (ldb %%cr.trap-mode cr))))
+    (when (si:%funcall-in-aux-stack #'storage::trap-on-exit-flag
+				    frame (frame-next-active-frame frame) %current-stack-group)
+      (if (debugger-trace-flag frame)
+	  (format t " Trap on exit from this frame.~%")
+	(format t " Presentation cleanup actions on exit from this frame.~%")))
+    (format t " Called ~[for effect~;for value~;to return~;for multiple values~]"
+	    (ldb %%cr.value-disposition cr))
+    (when (ldb-test %%cr.apply cr)
+      (princ ", called by apply"))
+    (format t ".~2%")))
+
+;; There are no user-visible functions in microcode that call other user-visible functions
+;; and in any case all that state is unwound whenever we trap out to the debugger.
+(defun microcode-backtrace (ignore) nil)
+
+
+;;; Active frame manipulation
+
+;; The CONTINUATION is a function called with one argument in the newly-reset
+;; stack-group.  ARGUMENT is that argument.
+;; If PROCESS-P, rather than doing it now, in this process, we simply
+;; leave the stack-group in such a state that the next time it is called,
+;; e.g. by the scheduler, it will do it.
+(defun unwind-sg (stack-group continuation argument process-p)
+  (cond ((= (sg-arg-status stack-group) %sg-arg-none)
+	 ;; STACK-GROUP has not been run, or is preset, no need to unwind first.
+	 (si:stack-group-preset stack-group continuation argument))
+	((not (zerop (sg-nonresumability stack-group)))
+	 ;; As on the dog, if STACK-GROUP is in bad state (exhausted, active after warm boot)
+	 ;; just smash it.
+	 (cl:cerror "Smash the stack group without unwinding."
+		    "Stack group ~S is not resumable." stack-group)
+	 (si:stack-group-preset stack-group continuation argument))
+	(t
+	 ;; Force STACK-GROUP into %UNWIND-TO-FRAME-AND-FUNCALL
+	 ;; This code will work no matter what %SG-ARG-STATUS is, since nothing
+	 ;; is done with the cruft at the top of the innermost stack frame, and
+	 ;; in all cases there is a valid frame there.
+	 (sg-ensure-control-and-binding-stack-space stack-group 200 100)
+	 (si:sg-call stack-group sys:value-disposition-effect 0
+		     #'si:%unwind-to-frame-and-funcall nil continuation argument)
+	 (setf (sg-arg-status stack-group) %sg-arg-break)))
+  (unless process-p
+    (stack-group-resume stack-group nil)
+    (setf (sg-exhausted-bit stack-group) 1)))
+
+
+;; All functions start at the same place
+(defun compiled-function-initial-pc (ignore) 0)
+
+;; Give the local variable slot which is the start of the real local variables,
+;; as opposed to the arguments.
+(defun function-local-block-argument-offset (function)
+  (let* ((args-info (args-info function))
+	 (rest-arg-count (ldb %%arg-desc-rest-arg args-info)))
+    (if (typep function :compiled-function)
+	(+ (ldb %%arg-desc-max-args args-info) rest-arg-count)
+      rest-arg-count)))
+
+;; Get the symbol for a value cell, whether it be normal, wired, or A-memory.
+(defun symbol-from-value-cell-location (loc)
+  (multiple-value-bind (sym type)
+      (ilc:disassemble-decode-locative loc)
+    (if (eq type :variable) sym loc)))
+
+

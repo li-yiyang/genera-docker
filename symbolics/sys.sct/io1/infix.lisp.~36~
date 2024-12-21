@@ -1,0 +1,671 @@
+;;;-*-Mode:Lisp; Package:SI; Lowercase:T; Base:10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;Infix EXPRESSION reading.
+
+#|   >>> This is NOT intended to become a full alternative Lisp syntax like CGOL.
+
+Syntax supported:
+  Delimit expression with # ... 
+  Symbols:		Start with letter, may contain digits and underscore unless \ escaped.
+  Assignment:		x : y		(setf x y)
+  Function app:		f(x,y)		(f x y) -- also works for defstruct accessors, etc.
+  Array ref:		a[i,j]		(aref a i j)
+  Unary ops:		+ - not
+  Binary ops:		+ - * / ^ =  <  >  and or 
+  Conditional: 		if p then c {else a}
+  Grouping:		(a, b, c)		(progn a b c) -- even works for (1+2)/3
+  Character escape:	\
+  Escape to read Lisp:	!
+
+For instance,
+(defun matrix-multiply (a b)
+  (let ((n (array-dimension-n 2 a)))
+    (unless (= n (array-dimension-n 1 b))
+      (ferror "You lose"))
+    (let ((d1 (array-dimension-n 1 a))
+	  (d2 (array-dimension-n 2 b)))
+      (let ((c # make\-array(list(d1, d2), !':type, art\-float) ))
+	(dotimes (i d1)
+	  (dotimes (j d2)
+	    # c[i,j] : !(loop for k below n sum # a[i,k]*b[k,j] )))
+	c))))
+
+If that's too ugly, I don't know what to say.  I suppose the interesting line could
+be replaced with
+	    (let ((sum 0))
+	      (dotimes (k n) # sum:sum+a[i,k]*b[k,j] )
+	      # c[i,j]:sum )
+|#
+ 
+;;Structure to collect together the info for a parseable operator.
+(defstruct (infix-key :named-array :conc-name)
+  key						;for lookup and printing
+  lbp						;left binding power
+  rbp						;right binding power
+  led						;code to run for left denotation
+  nud						;code to run for null denotation
+  function					;lisp function to parse into
+  )
+
+;Named-structure handler
+(defselect ((infix-key named-structure-invoke))
+  (:print-self (self stream ignore ignore)
+   (si:printing-random-object (self stream :typep)
+     (princ (infix-key-key self) stream))))
+
+;;Where to store the association between source code string "*", "AND" and the structure.
+(defvar *infix-key-table* (make-equal-hash-table))
+
+;;Given a string, return the operator structure if one, else ()
+(defun infix-lookup (string)
+  (multiple-value-bind (str found) (gethash string *infix-key-table*)
+    (if found str ())))
+
+;;Given a string, return the operator structure if one already exists,
+;;else create a new one and install it.
+(defun infix-lookup-or-create (string)
+  (or (infix-lookup string)
+      (let ((str (make-infix-key key string)))
+	(puthash string str *infix-key-table*)
+	str)))
+
+;;Given something, return its NUD if its an operator structure, else ()
+(defun infix-lookup-nud (op)
+  (and (typep op 'infix-key)
+       (infix-key-nud op)))
+
+;;same for LED
+(defun infix-lookup-led (op)
+  (and (typep op 'infix-key)
+       (infix-key-led op)))
+
+;;return true if it's an operator and has NUD or LED.  I guess I don't see how it can be
+;;an operator but have neither.
+(defun infix-operatorp (op)
+  (and (typep op 'infix-key)
+       (or (infix-key-nud op) (infix-key-led op))))
+
+;;Return left binding power
+(defun infix-lbp (op)
+  (or (and (typep op 'infix-key) (infix-key-lbp op))
+      200.))
+;;Return right binding power
+(defun infix-rbp (op)
+  (or (and (typep op 'infix-key) (infix-key-rbp op))
+      200.))
+
+;;A table with a 1 bit for cussword characters that are operators.
+(defvar *infix-operator-char-table* (make-array #o400 ':type 'art-1b))
+
+;;Store LBPs for operators, and if one is 1 char long, enter it in the above table, too.
+(defun setup-infix-bps (lbp-stuff rbp-stuff)
+  (loop with a = *infix-operator-char-table*
+	for i below (array-length a)
+	do (setf (aref a i) 0))
+  (loop for (lbp . ops) in lbp-stuff
+	do (loop for op in ops
+		 for pname = (string op)
+		 for str = (infix-lookup-or-create pname)
+		 when (= 1 (string-length pname))
+		   do (setf (aref *infix-operator-char-table* (char-code (aref pname 0))) 1)
+		 do (setf (infix-key-lbp str) lbp)
+		    (setf (infix-key-rbp str) lbp)))
+  (loop for (rbp . ops) in rbp-stuff
+	do (loop for op in ops
+		 for str = (infix-lookup (string op))
+		 do (setf (infix-key-rbp str) rbp))))
+
+(setup-infix-bps
+  '((200. [ /( ! )
+    (180. /:)
+    (140. ^)
+    (120. * //)
+    (100. + -)
+    (80. < = >   )
+    (60. and)
+    (50. or)
+    (10. /,)
+    (5. ] /) then else)
+    (-1 ))
+  '((139. ^)))					;make ^ right associative
+
+;;For defining LED functions
+(defmacro def-infix-led (name fcn argl &body body)
+  (if (null body)
+      `(setup-infix-create ',name
+			   ,@(and fcn `(':function ',fcn))
+			   ':led ',argl)
+      (let ((fn-name (intern (format () "~a LED" name))))
+	`(progn 'compile 
+		(defun ,fn-name ,argl ,@body)
+		(setup-infix-create ',name
+				    ,@(and fcn `(':function ',fcn))
+				    ':led #',fn-name)))))
+;;For defining NUD functions.
+(defmacro def-infix-nud (name fcn argl &body body)
+  (if (null body)
+      `(setup-infix-create ',name
+			   ,@(and fcn `(':function ',fcn))
+			   ':nud ',argl)
+      (let ((fn-name (intern (format () "~a NUD" name))))
+	`(progn 'compile
+		(defun ,fn-name ,argl ,@body)
+		(setup-infix-create ',name
+				    ,@(and fcn `(':function ',fcn))
+				    ':nud #',fn-name)))))
+
+(defun setup-infix-create (name &key nud led function)
+  (let ((str (infix-lookup-or-create (string name))))
+    (unless (null nud) (setf (infix-key-nud str) nud))
+    (unless (null led) (setf (infix-key-led str) led))
+    (unless (null function) (setf (infix-key-function str) function))
+    T))
+
+;;This doesn't adhere to full input-stream protocol.
+;;You can TYI and UNTYI, so you can READ from it.
+;;Also, you can ask it for tokens (lexemes), and ask it to parse expressions.
+
+(defflavor infix-input-stream (token valid tyipeek
+				     (string-buf ())
+				     input-stream)
+	   ())
+
+(defmethod (:setup infix-input-stream) (stream)
+  (when (null string-buf)
+    (setq string-buf (make-array 100. ':type 'art-string ':fill-pointer 0)))
+  (setq token () valid () tyipeek () input-stream stream))
+
+(defmethod (:interactive infix-input-stream) (&rest ignore) ())
+
+;;We don't ask the inside stream to untyi because noone else asks it for characters
+;;without asking us first, until we return.
+(defmethod (:tyi infix-input-stream) ()
+  (if tyipeek
+      (prog1 tyipeek (setq tyipeek ()))
+      (send input-stream ':tyi)))
+
+(defmethod (:any-tyi infix-input-stream) ()
+  (send self :tyi))
+
+(defmethod (:untyi infix-input-stream) (ch)
+  (unless (null tyipeek)
+    (ferror "Can't untyi ~c because already have ~c" ch tyipeek))
+  (setq tyipeek ch))
+
+(defmethod (:peek-token infix-input-stream) ()
+  (if valid
+      token
+      (setq valid T token (send self ':next-token))))
+
+(defmethod (:get-token infix-input-stream) ()
+  (if valid
+      (prog1 token (setq valid () token ()))
+      (send self ':next-token)))
+
+(defmethod (:toplevel-parse infix-input-stream) (stream)
+  (send self ':setup stream)
+  (let ((result (send self ':parse -1)))
+    (unless (eq (send self ':get-token) (infix-lookup ""))
+      (ferror "Expression doesn't end with , somehow."))	;this is impossible, right?!
+    result))
+
+(defresource infix-input-stream ()
+  :constructor (make-instance 'infix-input-stream)
+  :initial-copies 1)
+
+(defun infix-read (ignore stream)
+  (using-resource (infix-stream infix-input-stream)
+    ;;(values x) = (just-one-value x)
+    (values (send infix-stream ':toplevel-parse stream))))
+
+(defun infix-error (format-string &rest format-args)
+  (error 'parse-ferror
+	 ':format-string format-string
+	 ':format-args (copylist format-args)))
+
+(defmethod (:parse infix-input-stream) (rbp)
+  (do ((left (let ((tok (send self ':get-token)))
+	       (if (infix-operatorp tok)
+		   (send self ':do-nud tok)
+		   tok))
+	     (send self ':do-led (send self ':get-token) left)))
+      (( rbp (infix-lbp (send self ':peek-token)))
+       left)))
+
+(defmethod (:do-nud infix-input-stream) (op)
+  (let ((nud (infix-lookup-nud op)))
+    (if nud
+	(funcall nud self op)
+	(infix-error "/"~a/" is not a prefix operator."
+		     (if (typep op 'infix-key) (infix-key-key op) op)))))
+
+(defmethod (:do-led infix-input-stream) (op left)
+  (let ((led (infix-lookup-led op)))
+    (if led
+	(funcall led self op left)
+	(infix-error "/"~a/" is not an infix operator."
+		     (if (typep op 'infix-key) (infix-key-key op) op)))))
+
+(defun infix-parse-matchfix (stream separator matcher)
+  (if (eq (send stream ':peek-token) matcher)
+      (progn (send stream ':get-token) ())
+      (do ((nl (list (send stream ':parse 10.)) (cons (send stream ':parse 10.) nl)))
+	  ((eq (send stream ':peek-token) matcher)
+	   (send stream ':get-token)
+	   (nreverse nl))
+	(if (eq (send stream ':peek-token) separator)
+	    (send stream ':get-token)
+	    (infix-error "Expecting separator /"~a/" or matcher /"~a/""
+			 (infix-key-key separator) (infix-key-key matcher))))))
+
+(defun infix-parse-infix (stream op left)
+  `(,(infix-key-function op) ,left ,(send stream ':parse (infix-rbp op))))
+
+;;Escape to lisp read, for one expression.
+(def-infix-nud ! () (stream ignore)
+  (read stream))
+
+(def-infix-led [ aref (stream ignore left)
+  `(aref ,left ,@(infix-parse-matchfix stream (infix-lookup ",") (infix-lookup "]"))))
+(def-infix-nud [ aref (ignore ignore)
+  (infix-error "[ is not a prefix operator"))
+
+(def-infix-led ] () (ignore ignore ignore)
+  (infix-error "Extra close bracket /"]/""))
+(def-infix-nud ] () (ignore ignore)
+  (infix-error "] is not a prefix operator"))
+
+(def-infix-nud /( () (stream ignore)
+  (if (eq (send stream ':peek-token) (infix-lookup ")"))
+      (progn (send stream ':get-token) ())
+      (let ((right (infix-parse-matchfix stream (infix-lookup ",") (infix-lookup ")"))))
+	(if (null (rest1 right))
+	    (first right)
+	    `(progn ,@right)))))
+(def-infix-led /( () (stream ignore left)
+  (if (eq (send stream ':peek-token) (infix-lookup ")"))
+      (progn (send stream ':get-token) `(,left))
+      (let ((right (infix-parse-matchfix stream (infix-lookup ",") (infix-lookup ")"))))
+	`(,left ,@right))))
+
+(def-infix-nud /) () (ignore ignore)
+  (infix-error ") is not a prefix operator"))
+(def-infix-led /) () (ignore ignore ignore)
+  (infix-error "Extra close paren /")/""))
+
+(def-infix-led /: setf (stream ignore left)
+  `(setf ,left ,(send stream ':parse 20.)))
+
+(def-infix-nud not () (stream ignore)
+  `(not ,(send stream ':parse 70.)))
+
+(def-infix-nud if if (stream ignore)
+  `(if ,(send stream ':parse 45.)
+       ,(if (eq (send stream ':peek-token) (infix-lookup "THEN"))
+	    (progn (send stream ':get-token) (send stream ':parse 25.))
+	    (infix-error "Missing /"THEN/""))
+       ,(if (eq (send stream ':peek-token) (infix-lookup "ELSE"))
+	    (progn (send stream ':get-token) (send stream ':parse 25.))
+	    ())))
+
+(def-infix-led   (stream op left)
+  stream op left
+  (ferror "Reached a terminating delimiter; should not happen!")
+  )
+
+(def-infix-nud + + (stream ignore)
+  (let ((next (send stream ':peek-token)))
+    (when (or (eq next (infix-lookup "+"))
+	      (eq next (infix-lookup "-")))
+      (infix-error "Plus sign followed by ~a" (infix-key-key next)))
+    (send stream ':parse 100.)))
+(def-infix-led + + (stream ignore left)
+  (loop with token+ = (infix-lookup "+")
+	with token- = (infix-lookup "-")
+	with nl = (list (send stream ':parse 100.) left)
+	for token = (send stream ':peek-token)
+	do (cond ((eq token token+)
+		  (send stream ':get-token)
+		  (push (send stream ':parse 100.) nl))
+		 ((eq token token-)
+		  (send stream ':get-token)
+		  (push `(- ,(send stream ':parse 100.)) nl))
+		 (T
+		  (return `(+ ,@(nreverse nl)))))))
+
+(def-infix-nud - - (stream ignore)
+  (when (eq (send stream ':peek-token) (infix-lookup "+"))
+    (infix-error "Minus sign followed by +"))
+  `(- ,(send stream ':parse 100.)))
+(def-infix-led - - (stream ignore left)
+  (loop with token+ = (infix-lookup "+")
+	with token- = (infix-lookup "-")
+	with nl = (list `(- ,(send stream ':parse 100.)) left)
+	for token = (send stream ':peek-token)
+	do (cond ((eq token token+)
+		  (send stream ':get-token)
+		  (push (send stream ':parse 100.) nl))
+		 ((eq token token-)
+		  (send stream ':get-token)
+		  (push `(- ,(send stream ':parse 100.)) nl))
+		 (T
+		  (return `(+ ,@(nreverse nl)))))))
+
+(def-infix-led ^ ^ infix-parse-infix)
+(def-infix-led * * infix-parse-infix)
+(def-infix-led // // (stream ignore left)
+  (let* ((syntax (getf (si:rdtbl-plist si:readtable) 'si:appropriate-file-syntax))
+	 (op (cond ((eq syntax :zetalisp) 'zl://)
+		   ((eq syntax :common-lisp) 'cl://)
+		   (t 'cl://))))
+    (list op left (send stream ':parse (infix-rbp (infix-lookup "//"))))))
+(def-infix-led /< /< infix-parse-infix)
+(def-infix-led /= /= infix-parse-infix)
+(def-infix-led /> /> infix-parse-infix)
+(def-infix-led / / infix-parse-infix)
+(def-infix-led / / infix-parse-infix)
+(def-infix-led / / infix-parse-infix)
+(def-infix-led and and infix-parse-infix)
+(def-infix-led or or infix-parse-infix)
+
+;;some sugar so I don't have to feel bad about writing PROGs and GOs.
+(defmacro fsm-body (&body body)
+  `(prog ()
+	 ,@(loop for stm in body
+		 when (and (listp stm) (eq (first stm) 'fsm-state))
+		 collect (second stm) and append (rest2 stm)
+		 else collect stm)))
+(defmacro fsm-state (name &body body)
+  name body
+  (ferror "This macro shouldn't get called"))
+
+(defmacro fsm-transition (new-state)
+  `(go ,new-state))
+
+(defun infix-letterp (ch)
+  (or (alpha-char-p ch) (char-equal ch #/_)))
+
+(defun infix-expt-letter (ch)
+  (not (not (string-search-char (char-upcase ch) "EBSD"))))
+
+(defun infix-whitespace (ch)
+  (mem #'char-equal ch '(#\space #\tab #\newline #\form)))
+
+(defun infix-operator-charp (ch)
+  (not (zerop (aref *infix-operator-char-table* (char-code ch)))))
+
+;;How many hundreds of times has code to do this been written?
+(defmethod (:next-token infix-input-stream) ()
+  (setf (fill-pointer string-buf) 0)
+  (let (ch)
+    (fsm-body
+      (fsm-state top
+	(setq ch (send self ':tyi))
+	(cond ((infix-letterp ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition symbol))
+	      ((digit-char-p ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number))
+	      ((infix-operator-charp ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition operator))
+	      ;; If . wasn't an operator, consider it the start of a number.
+	      ((char-equal ch #/.)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-first-after-point))
+	      ((infix-whitespace ch)
+	       (fsm-transition top))
+	      ((char-equal ch #/\)
+	       (array-push-extend string-buf #//)
+	       (array-push-extend string-buf (send self ':tyi))
+	       (fsm-transition symbol))
+	      (T (infix-error "~c isn't a valid character" ch))))
+      (fsm-state symbol
+	(setq ch (send self ':tyi))
+	(cond ((or (infix-letterp ch) (digit-char-p ch))
+	       (array-push-extend string-buf ch)
+	       (fsm-transition symbol))
+	      ((char-equal ch #/\)
+	       (array-push-extend string-buf #//)
+	       (array-push-extend string-buf (send self ':tyi))
+	       (fsm-transition symbol))
+	      (T (send self ':untyi ch)
+		 (let ((str (infix-lookup string-buf)))
+		   (return (or str (read-from-string string-buf)))))))
+      (fsm-state return-read-from-string
+	(send self ':untyi ch)
+	(return (read-from-string string-buf)))
+      (fsm-state operator
+	(return (infix-lookup string-buf)))
+      (fsm-state number
+	(setq ch (send self ':tyi))
+	(cond ((digit-char-p ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number))
+	      ((char-equal ch #/.)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-first-after-point))
+	      ((infix-expt-letter ch)
+	       (array-push-extend string-buf #/.)
+	       (array-push-extend string-buf #/0)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-first-after-e))
+	      (T (fsm-transition return-read-from-string))))
+      (fsm-state number-first-after-point
+	(setq ch (send self ':tyi))
+	(cond ((digit-char-p ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-after-point))
+	      ((infix-expt-letter ch)
+	       (array-push-extend string-buf #/0)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-first-after-e))
+	      (T (fsm-transition return-read-from-string))))
+      (fsm-state number-after-point
+	(setq ch (send self ':tyi))
+	(cond ((digit-char-p ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-after-point))
+	      ((infix-expt-letter ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-first-after-e))
+	      (T (fsm-transition return-read-from-string))))
+      (fsm-state number-first-after-e
+	(setq ch (send self ':tyi))
+	(cond ((or (digit-char-p ch) (char-equal ch #/+) (char-equal ch #/-))
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-after-e))
+	      (T (infix-error "~c is invalid after a flonum exponent letter" ch))))
+      (fsm-state number-after-e
+	(setq ch (send self ':tyi))
+	(cond ((digit-char-p ch)
+	       (array-push-extend string-buf ch)
+	       (fsm-transition number-after-e))
+	      (T (fsm-transition return-read-from-string)))))))
+
+(compile-flavor-methods infix-input-stream)
+
+#||
+(zwei:defcom com-test-infix "Test infix reader -- parse the current line between #..." ()
+  (let ((line (zwei:bp-line (zwei:point))))
+    (with-input-from-string (s (string-append line ""))
+      (format T "~&~s" (zwei:barf-on-errors (error) (infix-read nil s)))))
+  zwei:dis-none)
+(zwei:set-comtab zwei:*zmacs-comtab* '(#\c- com-test-infix))
+||#
+
+(defvar *infix-reader-test-cases*
+	'(
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")	  ;; Unary
+0	  ("3*+ 1" (* 3 1))
+	  ("3*-2" (* 3 (- 2)))
+	  ("3*not foo" (* 3 (not foo)))
+
+1	  ;; binary operators
+0	  ("1+2" (+ 1 2))
+	  ("1-2" (+ 1 (- 2)))
+	  ("1*2" (* 1 2))
+	  ("1//2" (// 1 2))
+	  ("1^2" (^ 1 2))
+	  ("1=2" (= 1 2))
+	  ("12" ( 1 2))
+	  ("1<2" (< 1 2))
+	  ("12" ( 1 2))
+	  ("1>2" (> 1 2))
+	  ("12" ( 1 2))
+	  ("1 and 2" (and 1 2))
+	  ("1 or 2" (or 1 2))
+
+1	  ;; errors
+0	  ("2 not 3" error)
+	  ("[4]" error)
+	  ("3]" error)
+	  ("]3" error)
+	  ("3)" error)
+	  (")3" error)
+	  (":mumble" error)
+	  ("" error)
+	  ("*3" error)
+	  ("//4" error)
+
+1	  ;; parens
+0	  ("(foo,bar)" (progn foo bar))
+	  ("foo(abc,def)" (foo abc def))
+	  ("foo(a,b,(d,e))" (foo a b (progn d e)))
+	  ("2*(3+4)" (* 2 (+ 3 4)))
+
+1	  ;; if
+0	  ("1+ if exp then mumble +3" (+ 1 (if exp (+ mumble 3) nil)))
+	  ("1+ (if exp then mumble) +3" (+ 1 (if exp mumble nil) 3))
+	  ("1+if 1 then 2 else 3*4" (+ 1 (if 1 2 (* 3 4))))
+	  ("1+(if 1 then 2 else 3)*4" (+ 1 (* (if 1 2 3) 4)))
+	  ("if a and b then c and d else e and f"
+	   (if (and a b) (and c d) (and e f)))
+	  ("if a or b then c or d else e or f"
+	   (if (or a b) (or c d) (or e f)))
+	  ("if a then if c then d else e"
+	   (if a (if c d e) nil))
+	  ("if a then (if c then d) else e"
+	   (if a (if c d nil) e))
+	  ("if a then if c then d else e else f"
+	   (if a (if c d e) f))
+
+1	  ;; escapes
+0	  ("3+\4-5" (+ 3 /4 (- 5)))
+	  ("3+foo-bar"  (+ 3 foo (- bar)))
+	  ("3+\foo-bar" (+ 3 |fOO| (- bar)))
+	  ("3+foo\-bar" (+ 3 foo-bar))
+	  ("3+!foo-bar+baz " (+ 3 foo-bar+baz))
+	  ("3+!foo-bar+baz" error)		;the error is basically eof
+
+1	  ;; numbers
+0	  ("3" 3)
+	  ("3." 3)
+	  ("3.0" 3.0)
+	  ("3e4" 3.0e4)
+	  ("3.1e4" 3.1e4)
+	  ("-3.1e-4" (- 3.1e-4))
+	  ("-3e-4" (- 3.0e-4))
+
+1	  ;; random
+0	  ("c[i,j] : !(loop for k below n sum # a[i,k]*b[k,j] )"
+	   (setf (aref c i j) (loop for k below n sum (* (aref a i k) (aref b k j)))))
+	  ("f(x,y):z[i,j]" (setf (f x y) (aref z i j)))
+	    
+1	  ;; operator precedence
+0	  ("1+a(b)+2" (+ 1 (a b) 2))
+	  ("a(b):p[q]" (setf (a b) (aref p q)))
+	  ("a[1]^b^c" (^ (aref a 1) (^ b c)))
+	  ("a//b*c" (* (// a b) c))
+	  ("a*b//c" (// (* a b) c))
+	  ("a+b-c" (+ a b (- c)))
+	  ("-a-b-c" (+ (- a) (- b) (- c)))
+	  ("(a<b+c<d and p or q, bar)"
+	   (progn (or (and (< (< a (+ b c)) d) p) q) bar))
+	  ))
+
+(defun test-infix-reader ()
+  (let ((cases *infix-reader-test-cases*)
+	(success T))
+    (let ((messages
+	    (with-output-to-string (standard-output)
+	      (dolist (case cases)
+		(if (cl:consp case)
+		    (destructuring-bind (string desired-result) case
+		      (let ((actual-result
+			      (with-input-from-string (s (string-append string ""))
+				(condition-case (error)
+				     (infix-read () s)
+				   (error 'error)))))
+			(unless (equal actual-result desired-result)
+			  (format T "~&Case ~s wanted ~s but got ~s"
+				  string desired-result actual-result)
+			  (setq success nil))))
+		    (with-input-from-string (s (string-append case ""))
+		      (condition-case (error)
+			   (infix-read () s)
+			 (error
+			   (format T "~&Case ~s resulted in error~&  ~~a~" case error)
+			   (setq success nil)))))))))
+      (unless success
+	(warn "Test of infix reader failed: ~&~a" messages)))))
+
+#||
+;; Wobblies: if this doesn't work because of loading order problems,
+;;  it should become an initialization.  Neither RLB nor Palter could 
+;; think of which initialization it should be, though.
+(test-infix-reader)
+||#

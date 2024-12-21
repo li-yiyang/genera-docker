@@ -1,0 +1,1168 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Package: (LOCK-SIMPLE SCL); Base: 10; Lowercase: Yes; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;
+
+;;; ---To Do: 
+;;; --- :LOCAL DEFINE-PROTOCOL.  This requires a LOCAL-INTERACTOR flavor that 
+;;; --- simulates the server top level.
+
+cl-user::
+(defpackage lock-simple
+  (:use SCL)
+  (:export
+    *default-max-wait-time*
+    ;; conditions and related items.
+    lock-user-error
+    lock-user-error-interactor
+    lock-user-error-lock-name
+    mylock
+    mylock-lock-type
+    unlock-lock-not-locked
+    downgrade-lock-not-write-locked
+    wait-timeout
+    wait-timeout-cur-timeout
+    ;;
+    read-lock
+    write-lock
+    break-lock
+    unlock
+    downgrade-lock
+    lock-status
+    server-aborted-lock-connection
+    start-server-reap
+    stop-server-reap
+    server-host-for-host
+    with-interactor
+    ))
+
+(chaos:add-contact-name-for-protocol :lock-simple)
+
+(when (zl:fboundp 'tcp:add-tcp-port-for-protocol)
+  (tcp:add-tcp-port-for-protocol :lock-simple 666))
+
+(defvar *lock-hash-table* nil "Hash table of all held locks.")
+(defvar *lock-hash-table-queue* (process:make-lock "Lock-simple Hash Table" :recursive t)
+  "Lock word for updating the lock data structure.")
+(defvar *all-servers* nil)
+
+(defmacro with-interactor ((interactor &key pathname host activity default-max-wait-time)
+			   &body body)
+  `(let ((.host. (or ,host
+		     (and ,pathname (fs:pathname-host (send ,pathname :translated-pathname)))
+		     (error "No host supplied.")))
+	 (.activity. ,activity))
+     (using-resource (,interactor *interactors* (server-host-for-host .host. :error-p t)
+		      .activity. :default-max-wait-time ,default-max-wait-time)
+       ,@body)))
+
+(eval-when (compile load eval)
+(defconstant read-lock 'read)
+(defconstant write-lock 'write)
+(defconstant unlocked-lock 'unlocked)
+)
+(deftype lock-type () `(member ,read-lock ,write-lock))
+(deftype lock-state () `(member ,read-lock ,write-lock ,unlocked-lock))
+
+(defstruct (entity :named (:print "#<LOCK-SIMPLE::ENTITY ~A~@[ ~S~]>"
+			   (entity-host entity)
+			   (entity-activity entity)))
+  (host nil)
+  (activity nil))
+
+(defstruct (locker :named)
+  (entity nil :type entity)	   
+  (time)
+  (type nil :type lock-type))
+
+(defstruct (waiter :named)
+  (entity nil :type entity)
+  (notify-function)
+  (type nil :type lock-type)
+  (time))
+
+(defstruct (lock-hash-table-entry (:conc-name lhte-))
+  (name "" :type string)
+  (write-locker nil :type (or locker nil))
+  (read-lockers nil :type (or locker nil))
+  (wait-queue nil :type list))
+
+(defun initialize-lock-database ()
+  (process:reset-lock *lock-hash-table-queue*)
+  (setq *lock-hash-table* (make-hash-table :locking nil :test #'string= :size 100))
+  (start-server-reap))
+  
+(defun shut-lock-database ()
+  (loop for server in *all-servers* do (kill server))
+  (process:reset-lock *lock-hash-table-queue*)
+  (setq *lock-hash-table* nil)
+  (reset-initializations '*lock-simple-initializations*))
+
+(defun find-locks (partial-lock-name &key (type :all))
+  (terpri)
+  (let (results)
+    (when *lock-hash-table*
+      (maphash
+	#'(lambda (lock-name lock)
+	    (when (and (string-search partial-lock-name lock-name)
+		       (or (eql type :all)
+			   (and (eql type :locked)
+				(lhte-write-locker lock))
+			   (and (eql type :unlocked)
+				(null (lhte-write-locker lock)))))
+	      (push (cons lock-name lock) results)))
+	*lock-hash-table*))
+    (if results
+	(formatting-table ()
+	  (formatting-column-headings (t :underline-p t)
+	    (with-character-face (:italic)
+	      (formatting-cell () "Lock Name")
+	      (formatting-cell () "Locked By")
+	      (formatting-cell () "Since")))
+	  (loop for (lock-name . lock) in (cl:sort results #'string-lessp :key #'car)
+		as write-locker = (lhte-write-locker lock)
+		as locking-host = (if write-locker
+				      (send (entity-host (locker-entity write-locker))
+					    :short-name)
+				      "")
+		as lock-time = (if write-locker
+				   (time:print-universal-time
+				     (locker-time write-locker) nil)
+				   "")
+		do
+	    (formatting-row ()
+	      (formatting-cell ()
+		(format t "~a" lock-name))
+	      (formatting-cell ()
+		(format t "~a" locking-host))
+	      (formatting-cell ()
+		(format t "~a" lock-time)))))
+	(format t "No locks match ~s" partial-lock-name))))
+
+(defmacro with-lht-locked (&body body)
+  (declare (zwei:indentation 0 2))
+  `(process:with-lock (*lock-hash-table-queue*)
+     ,@body))
+
+(defsubst entity-equal (e1 e2)
+  (and (eq (entity-host e1) (entity-host e2))
+       (equal (entity-activity e1) (entity-activity e2))))
+
+(defsubst lhte-locked (lhte)
+  (or (lhte-read-lockers lhte) (lhte-write-locker lhte)))
+
+(defsubst lhte-read-locked (lhte)
+  (not (null (lhte-read-lockers lhte))))
+
+(defsubst lhte-write-locked (lhte)
+  (not (null (lhte-write-locker lhte))))
+
+(defsubst locked-to (entity locker)
+  (and locker (entity-equal entity (locker-entity locker))))
+
+(defsubst lhte-read-locked-to (lhte entity)
+  (member entity (lhte-read-lockers lhte)
+	  :test #'locked-to))
+
+(defsubst lhte-write-locked-to (lhte entity)
+  (locked-to entity (lhte-write-locker lhte)))
+
+(defsubst lhte-locked-to (lhte entity)
+  (cond ((lhte-write-locked-to lhte entity) write-lock)
+	((lhte-read-locked-to lhte entity) read-lock)
+	(t nil)))
+
+(defparameter *default-max-wait-time* 5.)
+
+(defflavor interactor
+	((transaction-stream nil)
+	 host
+	 (activity nil)
+	 (default-max-wait-time *default-max-wait-time*))
+	()
+  (:required-init-keywords :host)
+  (:writable-instance-variables host default-max-wait-time)
+  (:readable-instance-variables activity)
+  (:initable-instance-variables host default-max-wait-time activity))
+
+(defmethod ((setf interactor-activity) interactor) (new-a)
+  (setq activity (intern-activity new-a)))
+
+(defmethod (get-connection interactor) ()
+  (when transaction-stream
+    (close transaction-stream :abort t))
+  (setq transaction-stream (net:invoke-service-on-host :lock-simple host)))
+
+(defmethod (make-instance interactor) (&rest ignore)
+  (get-connection self))
+
+(defflavor lock-user-error-in-server () ()
+  (:required-methods :token-list))
+
+(defflavor user-mylock (lock-name entity lock-type) (lock-user-error-in-server sys:error)
+  (:initable-instance-variables)
+  (:gettable-instance-variables)
+  (:required-init-keywords :lock-name :entity :lock-type))
+
+(defflavor user-unlock-lock-not-locked (lock-name entity)
+	   (lock-user-error-in-server sys:error)
+  (:initable-instance-variables)
+  (:gettable-instance-variables)
+  (:required-init-keywords :lock-name :entity))
+
+(defflavor user-downgrade-lock-not-write-locked (lock-name entity)
+	   (lock-user-error-in-server sys:error)
+  (:initable-instance-variables)
+  (:gettable-instance-variables)
+  (:required-init-keywords :lock-name :entity))
+
+(defmethod (:report user-mylock) (stream)
+  (format stream "Lock ~A already locked to ~A|~A as a ~A.~%"
+	  lock-name (entity-host entity) (entity-activity entity) lock-type))
+
+(defmethod (:token-list user-mylock) ()
+  `(:signal-error :mylock :lock-name ,lock-name :lock-type ,(symbol-name lock-type)))
+
+(defmethod (:report user-unlock-lock-not-locked) (stream)
+  (format stream "Lock ~A not locked to ~A|~A.~%"
+	  lock-name (entity-host entity) (entity-activity entity)))
+
+(defmethod (:token-list user-unlock-lock-not-locked) ()
+  `(:signal-error :unlock-lock-not-locked :lock-name ,lock-name))
+
+(defmethod (:report user-downgrade-lock-not-write-locked) (stream)
+  (format stream "Lock ~A not write locked to ~A|~A.~%"
+	  lock-name (entity-host entity) (entity-activity entity)))
+
+(defmethod (:token-list user-downgrade-lock-not-write-locked) ()
+  `(:signal-error :downgrade-lock-not-write-locked :lock-name ,lock-name))
+
+(defflavor lock-user-error (interactor lock-name) (dbg:special-commands-mixin)
+  (:readable-instance-variables)
+  (:initable-instance-variables interactor lock-name)) ; on the user side
+
+(defmethod (dbg:special-command lock-user-error :lock-status) (&rest ignore)
+  (show-lock-status
+    (with-interactor (i :host (interactor-host interactor))
+      (lock-status-internal i lock-name))
+    *error-output*))
+
+(defmethod (dbg:document-special-command lock-user-error :lock-status) (stream)
+  (format stream "Show status for lock ~A" lock-name))
+
+(defflavor mylock (lock-type) (lock-user-error sys:error)
+  (:initable-instance-variables)
+  (:readable-instance-variables)
+  (:init-keywords :interactor)
+  (:required-init-keywords :lock-name :lock-type))
+
+(defmethod (:report mylock) (stream)
+  (format stream "Lock ~A already locked as a ~A.~%"
+	  lock-name lock-type))
+
+(defflavor unlock-lock-not-locked ()
+	   (lock-user-error sys:error sys:no-action-mixin)
+  (:initable-instance-variables)
+  (:readable-instance-variables)
+  (:required-init-keywords :lock-name))
+
+(defmethod (:report unlock-lock-not-locked) (stream)
+  (format stream "Lock ~A not locked.~%"
+	  lock-name))
+
+(defmethod (signal-mylock interactor) (&key lock-name lock-type)
+  (signal-proceed-case
+    (() 'mylock :interactor self :lock-name lock-name :lock-type lock-type)
+    (:use-this-lock :proceed)
+    (:break (user-break-lock lock-name :host host)
+	   :retry)))				
+
+(defmethod (:proceed mylock :no-action) ()
+  "Continue using the existing lock."
+  (values :use-this-lock t))
+
+(defmethod (:proceed mylock :break) ()
+  "Break the existing lock and retry locking."
+  (values :break t))
+
+(defmethod (signal-unlock-lock-not-locked interactor) (&key lock-name lock-type)
+  (ignore lock-type)
+  (signal 'unlock-lock-not-locked :interactor self :lock-name lock-name)
+  :proceed) ; no need to post-process
+
+(defflavor downgrade-lock-not-write-locked ()
+	   (lock-user-error sys:error)
+  (:initable-instance-variables)
+  (:readable-instance-variables)
+  (:required-init-keywords :lock-name))
+
+(defmethod (:report downgrade-lock-not-write-locked) (stream)
+  (format stream "Lock ~A not write locked.~%"
+	  lock-name))
+
+(defmethod (signal-downgrade-lock-not-write-locked interactor) (&key lock-name lock-type)
+  (ignore lock-type)
+  (signal 'downgrade-lock-not-write-locked :interactor self :lock-name lock-name))
+
+(defflavor wait-timeout (cur-timeout) (lock-user-error error)
+  (:initable-instance-variables)
+  (:readable-instance-variables)
+  (:required-init-keywords :lock-name :cur-timeout))
+
+(defmethod (dbg:proceed wait-timeout :wait-again)
+	   ()
+  (values :wait-again t))
+
+(defmethod (:document-proceed-type wait-timeout :wait-again)
+	   (stream)
+  (format stream "Wait another ~D seconds." cur-timeout))
+
+(defmethod (dbg:proceed wait-timeout :wait-more)
+	   (&optional (how-long (prompt-and-read :number
+						 "Number of seconds to wait: ")))
+  "Supply an additional wait time."
+  (values :wait-more how-long))
+
+(defmethod (dbg:proceed wait-timeout :wait-forever) ()
+  "Wait indefinitely"
+  (values :wait-forever t))
+
+(defmethod (dbg:proceed wait-timeout :break) ()
+  "Break the existing lock and retry."
+  ;;; get and print lock status here.
+  (if (y-or-n-p "Break the existing lock on ~A? " lock-name)
+      (values :break t)
+      nil))
+
+(defmethod (dbg:report wait-timeout) (stream)
+  (format stream "Timed out after waiting ~D second~:P for lock ~A."
+	  cur-timeout lock-name))
+ 
+(compile-flavor-methods wait-timeout downgrade-lock-not-write-locked unlock-lock-not-locked
+			mylock user-downgrade-lock-not-write-locked
+			user-unlock-lock-not-locked
+			user-mylock)
+
+(defvar *server-errors*
+	`((:mylock . ,#'signal-mylock)
+	  (:unlock-lock-not-locked . ,#'signal-unlock-lock-not-locked)
+	  (:downgrade-lock-not-write-locked . ,#'signal-downgrade-lock-not-write-locked)
+	  ))
+
+
+(defmethod (close-interactor interactor) (&optional abort)
+  (send transaction-stream :close abort))
+
+(defmethod (connected-p interactor) ()
+  (send transaction-stream :connected-p))
+
+
+
+;;; When a :signal-error reply comes back to the user, a condition
+;;; is signalled as described in the remainder of that token list.
+;;; That condition can have proceed options.
+;;; To get good modularity in dealing with the proceed options,
+;;; each of these conditions must also have a method of
+;;; :signal-self.  This is expected to signal the condition object
+;;; with proceed cases, and return one of :retry or :continue,
+;;; to indicate the appropriate action.
+
+(defmethod (signal-lock-error interactor) (error-info)
+  (let ((error-msg (cdr (assoc (car error-info) *server-errors*))))
+    (unless error-msg
+      (error "Unknown server error type ~S." error-info))
+    (apply error-msg self (cdr error-info))))
+
+(defflavor server-aborted-lock-connection (interactor error-object) (error)
+  (:initable-instance-variables)
+  (:readable-instance-variables))
+
+(defmethod (:report server-aborted-lock-connection) (stream)
+  (format stream "Lock connection closed by server.")
+  (send error-object :report stream))
+
+(compile-flavor-methods server-aborted-lock-connection)
+
+;;; This retries the entire operation if the connection went
+;;; away. 
+
+(defmacro with-connection-error-handling
+	  ((&key (return-this-after-error nil rtaep)) &body body)
+  (let ((block-name (gensym)))
+    `(loop named ,block-name do
+       (catch 'connection-closed
+	 (flet ((.error-handler. (.error.)
+		  .error.
+; --- this should check to see if the error belongs to us.  It can't, because
+; --- the connection is far below our stream. Gruz.
+;			  (if (eq (send  .error. :connection) transaction-stream)
+		  ,(if rtaep `(return-from ,block-name ,return-this-after-error)
+		       `(throw 'connection-closed .error.))
+;			      nil)))
+		  ))
+	   (condition-bind 
+	     ((sys:remote-network-error #'.error-handler.)
+	      (sys:connection-lost #'.error-handler.)
+	      (sys:connection-closed #'.error-handler.))
+	     (return-from ,block-name (progn ,@body)))))
+       (get-connection self))))
+
+(defmacro lock-interface ((activity host pathname) &body body)
+  `(progn
+     ,@(and activity `((setq ,activity (or ,activity (default-activity)))))
+     (with-interactor (.interactor. :host ,host
+				    :pathname ,pathname
+				    :activity ,activity)
+       ,@body)))
+
+(defun default-activity () ; this is known to be wrong, but ....
+  si:current-process)
+
+(defun read-lock (lock-name &key host pathname activity max-wait-time)
+  (lock-interface (activity host pathname)
+    (user-lock-internal .interactor. :read-lock lock-name max-wait-time)))
+
+(defun write-lock (lock-name &key host pathname activity max-wait-time)
+  (lock-interface (activity host pathname)
+    (user-lock-internal .interactor. :write-lock lock-name max-wait-time)))
+
+(defparameter *retry-lock-time* 5 "seconds")
+
+(defmethod (user-lock-internal interactor) (type lock-name max-wait-time)
+  (unless max-wait-time (setq max-wait-time default-max-wait-time))
+  (unwind-protect-case ()
+      (loop named lock with tid = nil 
+	    as response = 'applesause
+	    do
+	(block retry-lock
+	  (with-connection-error-handling ()	;just retry this much at this point.
+	    (setq tid
+		  (net:send-transaction transaction-stream
+					`(,type :lock-name ,lock-name
+					  :activity ,activity
+					  )
+					:dont-await-reply t)))
+	  (loop named await-lock with lock-who-name = (format nil "Lock-simple ~A" lock-name)
+		with wait-until = (+ (get-universal-time) max-wait-time)
+		do
+	    (with-connection-error-handling ()
+	      (process-wait-with-timeout lock-who-name
+					 (* 60 (min *retry-lock-time* max-wait-time))
+		#'(lambda ()
+		    (send transaction-stream :listen)))
+	      (setq response
+		    (net:receive-transaction-reply transaction-stream tid 'applesause)))
+	    (cond ((neq response 'applesause)
+		   (cond ((eq response :locked) (return-from lock nil))
+			 ((and (listp response) (eq (car response) :signal-error))
+			  (let ((action 
+				  (signal-lock-error self (cdr response))))
+			    (case action
+			      (:proceed (return-from lock nil))
+			      (:retry (return-from retry-lock nil)))))
+			 (t (error "Error response ~S from server." response))))
+		  (t
+		   (when (> (get-universal-time) wait-until)
+		     (signal-proceed-case ((new-time) 'wait-timeout
+					   :interactor self
+					   :lock-name lock-name :cur-timeout max-wait-time)
+		       (:wait-again
+			 (setq wait-until (+ (get-universal-time) max-wait-time)))
+		       (:wait-more
+			 (setq max-wait-time new-time)
+			 (setq wait-until (+ (get-universal-time) max-wait-time)))
+		       
+		       (:wait-forever
+			 (setq max-wait-time 1000000000.)
+			 (setq wait-until (+ (get-universal-time) max-wait-time)))
+		       (:break
+			 (break-lock lock-name :host host :activity activity)))
+		     ;; since mylock is detected, this can't unlock something
+		     ;; that we haven't locked.
+		     ))))))
+    (:abort
+      (ignore-errors
+	(with-connection-error-handling ()
+	  (net:send-transaction transaction-stream
+				`(:abort-lock :lock-name ,lock-name
+					      :activity ,activity)))))))
+
+
+(defun unlock (lock-name &key host pathname activity)
+  (lock-interface (activity host pathname)
+    (unlock-internal .interactor. lock-name)))
+
+(defmethod (unlock-internal interactor) (lock-name)
+  (with-connection-error-handling ()
+    (let ((response
+	    (net:send-transaction transaction-stream `(:unlock :lock-name ,lock-name
+							       :activity ,activity))
+	    ))
+      (cond ((eq response :unlocked) t)
+	    ((and (listp response) (eq (car response) :signal-error))
+	     (signal-lock-error self (cdr response)))
+	    (t (error "Error response ~S from server." response))))))
+
+(defun lock-status (lock-name &key host pathname)
+  (lock-interface (nil host pathname)
+    (lock-status-internal .interactor. lock-name)))
+
+(defmethod (lock-status-internal interactor) (lock-name)
+  (with-connection-error-handling ()
+    (net:send-transaction transaction-stream `(:lock-status :lock-name ,lock-name))))	
+
+(defun show-lock-status (lock-status &optional (stream *standard-output*))
+  (flet ((show-entity (e)
+	   (format stream "Host: ~A, Activity: ~A, Time: ~\\time\\"
+		   (first e)
+		   (if (eq (net:parse-host (first e) t) net:*local-host*)
+		       (reverse-intern-activity (second e))
+		       (second e))
+		   (third e))))
+    (format stream "~&Lock ~A ~:[unlocked~;locked~]." (getf lock-status D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (:FIX :ROMAN :NORMAL) "CPTFONT"):lock-name0)
+	    (getf lock-status 1:locked0))
+    (when (getf lock-status 1:locked0)
+      (when (getf lock-status 1:write-locker0)
+	(format stream "~&Write locked to ")
+	(show-entity (getf lock-status 1:write-locker0)))
+      (when (getf lock-status 1:0read1-locker0s)
+	(format stream "~&Read locked to:")
+	(sys:with-indentation (stream 2)
+	  (loop for e in (getf lock-status 1:0read1-locker0s)
+		do (fresh-line stream)
+		   (show-entity e))))
+      (when (getf lock-status 1:wait-queue0)
+	(format stream "~&Wait queue:")
+	(sys:with-indentation (stream 2)
+	  (loop for e in (getf lock-status 1:0wait-queue)
+		do (fresh-line stream)
+		   (show-entity e)))))))
+
+(defun user-break-lock (lock-name &key host pathname activity)
+  (let ((status (lock-status lock-name :host host :pathname pathname)))
+    (show-lock-status status *query-io*))
+  (if
+    (y-or-n-p "Break lock ~A? " lock-name)
+    (progn 
+      (break-lock lock-name :host host :pathname pathname :activity activity)
+      t)
+    nil))
+
+(defun break-lock (lock-name &key host pathname activity)
+  (lock-interface (activity host pathname)
+    (break-lock-internal .interactor. lock-name)))
+
+(defmethod (break-lock-internal interactor) (lock-name)
+  (with-connection-error-handling ()
+    (let ((response
+	    (net:send-transaction transaction-stream `(:break-lock :lock-name ,lock-name))))
+      (cond ((eq response :done) t)
+	    ((and (listp response) (eq (car response) :signal-error))
+	     (signal-lock-error self (cdr response)))
+	    (t (error "Error response ~S from server." response))))))
+
+(defun downgrade-lock (lock-name &key host pathname activity)
+  (lock-interface (activity host pathname)
+    (downgrade-lock-internal .interactor. lock-name)))
+
+(defmethod (downgrade-lock-internal interactor) (lock-name)
+  (with-connection-error-handling ()		;this will blow up after a connection error 
+    (let ((response
+	    (net:send-transaction transaction-stream
+				  `(:downgrade-lock :lock-name ,lock-name
+						    :activity ,activity))))
+      (cond ((eq response :downgraded) t)
+	    ((and (listp response) (eq (car response) :signal-error))
+	     (signal-lock-error self (cdr response)))
+	    (t (error "Error response ~S from server." response))))))
+
+(net:define-protocol :lock-simple (:lock-simple :transaction-token-list)
+  (:invoke-with-stream ((transaction-stream))
+    transaction-stream))
+
+(net:define-server :lock-simple 
+    (:host host :reject-unless-trusted t :who-line t 
+	   :medium :transaction-token-list
+	   :stream (transaction-stream)
+	   :flavor server-instance))
+
+
+(defflavor server-instance
+	(entity
+	 host
+	 transaction-stream
+	 (n-locks 0)
+	 (last-interaction-time (get-universal-time)))
+	(neti:byte-stream-server)
+  (:writable-instance-variables n-locks)
+  (:readable-instance-variables))
+
+(defsubst punt-request-loop ()
+  (throw 'lock-request-loop nil))
+
+(defvar *server-instance* nil)			;its easier than wierdness with
+						;dispatching on flavor methods.
+
+(defmethod (:server-top-level server-instance) ()
+  (let ((*server-instance* self))
+    (unwind-protect
+	(progn
+	  (push self *all-servers*)
+	  (setq host (send self :foreign-host))
+	  (setq transaction-stream (send self :stream))
+	  (catch 'lock-request-loop
+	    (cl:loop
+	       (initializations '*lock-simple-initializations*)
+	       (multiple-value-bind (tid request)
+		   (condition-case (error)
+			(net:server-read-transaction transaction-stream)
+		      ((sys:end-of-file sys:connection-closed sys:connection-lost
+					sys:network-error)
+		       (punt-request-loop)))
+		 (setq last-interaction-time (get-universal-time))
+		 (unless (and request (listp request))
+		   (error-abort-connection transaction-stream tid "No operation given."))
+		 ;;a new entity every time around, since we don't know what the
+		 ;;activity will be.
+		 (setq entity (make-entity :host host
+					   :activity (getf (cdr request) :activity nil)))
+		 (si:with-rem-keywords (keywords (cdr request) '(:activity))
+		   (let ((opfun (get (car request) 'server-handler))
+			 (call-arg-list `(,transaction-stream ,entity ,tid
+					  ,@keywords)))
+		     (unless opfun
+		       (error-abort-connection
+			 transaction-stream tid "Undefined operation given."))
+		     (condition-case (error)
+			  (lt:check-arg-list (arglist opfun) call-arg-list)
+			(sys:error
+			  (error-abort-connection
+			    transaction-stream
+			    tid
+			    (send error :report-string))))
+		     (condition-case (error)
+			  (apply opfun call-arg-list)
+			(lock-user-error-in-server
+			  (net:server-reply-to-transaction transaction-stream tid
+							   (send error :token-list))))))))))
+      (setq *all-servers* (delete self *all-servers*)))))
+
+
+
+(defmacro define-lock-handler (operation (&rest keywords) &body body)
+  (declare (zwei:indentation 2 1))
+  `(progn
+     (defun (:property ,operation server-handler) (transaction-stream
+						   entity tid
+						   &key ,@keywords)
+       (declare (sys:function-parent ,operation define-lock-handler))
+       ,@body)
+     (record-source-file-name ',operation 'define-lock-handler)))
+
+(defprop define-lock-handler "Lock-simple server handler" si:definition-type-name)
+
+(define-lock-handler :read-lock (lock-name)
+  (wait-for-lock transaction-stream tid lock-name entity read-lock))
+
+(define-lock-handler :write-lock (lock-name)
+  (wait-for-lock transaction-stream tid lock-name entity write-lock))
+
+(define-lock-handler :unlock (lock-name)
+  (server-unlock lock-name entity)
+  (net:server-reply-to-transaction transaction-stream tid :unlocked))
+
+;;; this only happens if we get out of synch, and the user tries to give up
+;;; on a lock after we gave it to them.  We treat this as an unlock, since
+;;; we only exit from LOCK below if we have in fact locked the lock
+;;; or handled such an abort. 
+(define-lock-handler :abort-lock (lock-name)
+  (server-unlock lock-name entity)
+  (net:server-reply-to-transaction transaction-stream tid :unlocked))
+
+(define-lock-handler :unlock-if-locked (lock-name)
+  (server-unlock lock-name entity)
+  (net:server-reply-to-transaction transaction-stream tid :unlocked))
+
+(define-lock-handler :lock-status (lock-name)
+  (ignore entity)
+  (flet ((entity-list (entity time)
+	   (and entity
+		`(, (send (entity-host entity) :name)
+		  , (entity-activity entity)
+		  , time))))
+    (with-lht-locked
+       (multiple-value-bind (lhte present) (gethash lock-name *lock-hash-table*)
+	 (if (or (not present) (not (lhte-locked lhte)))
+	     (net:server-reply-to-transaction
+	       transaction-stream tid 
+	       `(:lock-name ,lock-name :locked nil))
+	     (net:server-reply-to-transaction
+	       transaction-stream tid 
+	       `(:lock-name ,lock-name :locked t
+			    :write-locker ,(and (lhte-write-locker lhte)
+						(entity-list
+						  (locker-entity
+						    (lhte-write-locker lhte))
+						  (locker-time (lhte-write-locker lhte))
+						  ))
+			    :read-lockers
+			    ,(loop for l in (lhte-read-lockers lhte)
+				   collect (entity-list (locker-entity l)
+							(locker-time l)))
+			    :wait-queue
+			    ,(loop for w in (lhte-wait-queue lhte)
+				   collect (entity-list (waiter-entity w)
+							(waiter-time w))))))))))
+
+(define-lock-handler :break-lock (lock-name)
+  (ignore entity)
+  (let ((result (unlock-forcibly lock-name)))
+    (ignore result) ; for now, at least.
+    (net:server-reply-to-transaction transaction-stream tid :done)))
+
+(define-lock-handler :downgrade-lock (lock-name)
+  (with-lht-locked
+     (multiple-value-bind (lhte present) (gethash lock-name *lock-hash-table*)
+       (if (or (not present) (not (lhte-write-locked-to lhte entity)))
+	   (signal 'user-downgrade-lock-not-write-locked 
+		   :lock-name lock-name :entity entity)
+	   (push (lhte-write-locker lhte)
+		 (lhte-read-lockers lhte))
+	   (setf (lhte-write-locker lhte) nil)
+	   (net:server-reply-to-transaction transaction-stream tid :downgraded)))))
+
+(defun wait-for-lock (transaction-stream tid lock-name entity lock-type)
+  (let ((wait-on nil)
+	(lock-result nil)) ; :locked, or something that can be handed in
+						; to remove ourself as a waiter.
+    (unwind-protect
+	(loop
+      with message with unlock-tid
+      with continue-fun = #'(lambda ()
+			      (setf lock-result nil)
+			      (setq wait-on t))
+      do
+	  (unless lock-result			;NIL when we have got a notify.
+	    (setq lock-result (lock lock-name entity continue-fun lock-type)))
+	  (when (eq lock-result :locked)
+	    (net:server-reply-to-transaction transaction-stream tid :locked)
+	    (return nil))
+	  (process-wait "lock-simple server lock wait"
+	    #'(lambda (stream)	;make the wait cheap by avoiding
+						;closure references.
+		(or wait-on
+		    (send stream :listen)))
+	    transaction-stream)
+  ;; within a transaction, it is legitimate for a straight token list
+  ;; to be sent to abort a locking operation.
+	  (let ((action 
+		  (condition-case (error)
+		       (progn
+			 (multiple-value-setq
+			   (unlock-tid message)
+			   (net:server-read-transaction transaction-stream '(nil applesauce)))
+			 message)
+		     ((sys:connection-closed sys:end-of-file) 'closed))))
+	    (cond ((eq action 'applesauce))	; around the loop again.
+		  ((equal action `(:abort-lock ,lock-name :activity ,(entity-activity entity)))
+		   ;; It can only be locked if we lock it, since notification just
+		   ;; notifies, it never locks.
+		   (with-lht-locked 
+		      (setq lock-result (lock lock-name entity continue-fun lock-type))
+		      (when (eq lock-result :locked)
+			(server-unlock lock-name entity)))
+		   (net:server-reply-to-transaction transaction-stream unlock-tid :unlocked)
+		   ;; the original transaction is never replied to in this case, noone
+		   ;; is interested
+		   (return nil))
+		  ((eq action 'closed)		;leave it locked if its locked.
+		   (punt-request-loop))
+		  (t (error-abort-connection	;ditto.
+		       transaction-stream
+		       tid
+		       (format nil "~S invalid during lock wait." action))))))
+      (remove-waiter lock-name lock-result)) ;on the way out, be sure we aren't
+						;a waiter.
+    ))
+
+(defun unlock-if-locked (lock-name entity)
+  (with-lht-locked
+     (unlock-simple lock-name entity t)))
+
+(defun unlock-forcibly (lock-name)
+  (with-lht-locked
+     (multiple-value-bind (lhte present)
+	 (gethash lock-name *lock-hash-table*)
+       (if (not present) :not-locked
+	   (setf (lhte-write-locker lhte) nil)
+	   (setf (lhte-read-lockers lhte) nil)
+	   (without-interrupts
+	     (notify lhte)
+	     (setf (lhte-wait-queue lhte) nil))
+	   :unlocked))))
+
+(defun unlock-all (entity)
+  (loop for lhte being the hash-elements of *lock-hash-table* 
+	when (lhte-locked-to lhte entity)
+	do (unlock-if-locked (lhte-name lhte) entity)))
+
+(defun error-abort-connection (stream tid reason)
+  (net:server-reply-to-transaction stream tid `(:error ,reason))
+  (send stream :close t)
+  (punt-request-loop))
+
+(defun lock (name entity notify-function read-or-write)
+  "locks a lock to an host and activity."
+  (check-type read-or-write lock-type "one of read-lock or write-lock")
+  (let ((result
+	  (with-lht-locked
+	     (multiple-value-bind (lhte present)
+		 (gethash name *lock-hash-table*)
+	       (cond (present
+		      (let ((locked-type (lhte-locked-to lhte entity)))
+			;; should read-locks be a mylock situation. Nope, they can stack.
+			;; questionable problem is deadlocks on the stack.
+			(when (eq locked-type write-lock)
+			  (signal 'user-mylock :lock-name name
+				  :entity entity :lock-type locked-type))))
+		     (t
+		      (setq lhte (make-lock-hash-table-entry :name name))
+		      (setf (gethash name *lock-hash-table*) lhte)))
+	       ;; its here, we don't have it locked
+	       (flet
+		 ((wait ()
+		    (declare (sys:downward-function))
+		    (let ((w (make-waiter :entity entity :notify-function notify-function
+					  :type read-or-write
+					  :time (get-universal-time))))
+		      (push w (lhte-wait-queue lhte))
+		      w))
+		  (me-locker ()
+		    (declare (sys:downward-function))
+		    (make-locker :entity entity
+				 :time (get-universal-time)
+				 :type read-or-write)))
+		 (cond ((eq read-or-write read-lock)
+			(cond ((lhte-write-locked lhte) (wait))
+			      (t
+			       (push (me-locker)
+				     (lhte-read-lockers lhte))
+			       :locked)))
+		       (t			; must be write
+			(cond ((lhte-write-locked lhte) (wait))
+			      ((lhte-read-locked lhte)
+			       (wait)
+			       :wait-on-readers)
+			      (t (setf (lhte-write-locker lhte) (me-locker))
+				 :locked)))))))))
+    (when (eq result :locked) (incf (server-instance-n-locks *server-instance*)))
+    result))
+
+(defun remove-waiter (lock-name waiter?)
+  (when (and waiter? (typep waiter? 'waiter))
+    (with-lht-locked
+       (multiple-value-bind (lhte present)
+	   (gethash lock-name *lock-hash-table*)
+	 (when present
+	   (setf (lhte-wait-queue lhte) (delete waiter? (lhte-wait-queue lhte))))))))
+
+(defun server-unlock (lock-name entity)
+  (with-lht-locked
+     (unlock-simple lock-name entity nil)))
+
+(defun unlock-simple (lock-name entity no-error-if-unlocked)
+  (multiple-value-bind (lhte present)
+      (gethash lock-name *lock-hash-table*)
+    (let ((locked-to-us (and lhte (lhte-locked-to lhte entity))))
+      (if (not (and present locked-to-us))
+	  (if no-error-if-unlocked nil
+	      (signal 'user-unlock-lock-not-locked :lock-name lock-name :entity entity))
+	  (cond ((lhte-write-locked-to lhte entity)
+		 (setf (lhte-write-locker lhte) nil)
+		 (notify lhte))			; always notify when unlocking a write lock
+		(t				; given check above, must be a read lock
+		 (setf (lhte-read-lockers lhte)
+		       (delete entity (lhte-read-lockers lhte)
+			       :test #'locked-to))
+		 (when (null (lhte-read-lockers lhte))
+		   (notify lhte))))
+	  (when locked-to-us
+	    (decf (server-instance-n-locks *server-instance*)))))))
+
+(defun notify (lhte)
+  ;; Two questions: (1) Do we notify that the lock is open, and let
+  ;; the waiters retry the lock request, or do we choose one to lock the lock to.
+  ;; (2) What do we do about the possibility that a waiter or a locker has
+  ;; died, but left the lock locked?
+  ;;
+  ;; The most robust technique is to notify all waiters, and lock to none of them.
+  ;; The first one to respond (probably the first notified, after all)
+  ;; gets the lock. 
+  ;;
+  (without-interrupts 
+    (loop for w in (lhte-wait-queue lhte) do
+	  (funcall (waiter-notify-function w))))
+  (setf (lhte-wait-queue lhte) nil)) 
+
+
+(defvar *peek-lock-choice* nil)
+
+(defun lock-menu (peek lhte &aux choice)
+  "Menu for interesting operations on lock-simple locks in a peek display"
+  (multiple-value-setq (choice *peek-lock-choice*)
+    (tv:menu-choose
+      '(("Break" :value break
+	 :documentation "Forcibly unlock the selected lock."))
+      (format nil "Operation on ~A:" (lhte-name lhte))
+      '(:mouse) *peek-lock-choice*))
+  (case choice
+    (break (unlock-forcibly (lhte-name lhte)))
+    (otherwise (beep))))
+
+(defun peek-lock-simple (ignore)
+  "Lock-simple Database"
+  (list ()
+	(tv:scroll-parse-item
+	  `(:function ,#'(lambda ()
+			   (format nil "~[No~;~:*~D~:;~:*~D~] Lock-simple lock~:P in database"
+				   (send *lock-hash-table* :filled-elements)))))
+	(tv:scroll-parse-item "")
+	(tv:scroll-maintain-list
+	  #'(lambda () (multiple-value-bind (slot key first)
+			   (send *lock-hash-table* :next-element nil)
+			 (list slot key first)))
+	  #'(lambda (lhte)
+	      (list ()
+		    (tv:peek-hidden-data
+		      "Show/hide details for this lock."
+		      (list ()
+			    (tv:peek-hidden-data
+			      "Show/hide read lockers."
+			      (tv:scroll-maintain-list
+				#'(lambda ()
+				    (lhte-read-lockers lhte))
+				#'(lambda (l)
+				    (tv:scroll-parse-item
+				      (format nil "~A ~A"
+					      (entity-host (locker-entity l))
+					      (entity-activity (locker-entity l))))))
+			      `(:function
+				 ,#'(lambda ()
+				      (let ((n-readers
+					      (length (lhte-read-lockers lhte))))
+					(if (zerop n-readers)
+					    (format nil "No read lockers.")
+					    (format nil "~D read locker~:P."
+						    n-readers))))))
+			    (tv:scroll-maintain-list
+			      #'(lambda () (lhte-write-locker lhte))
+			      #'(lambda (l)
+				  (if (null l)
+				      (tv:scroll-parse-item "Not write locked.")
+				      (list ()
+					    (tv:scroll-parse-item "Write locked to")
+					    (tv:scroll-parse-item
+					      (format
+						nil "~A ~A"
+						(entity-host (locker-entity l))
+						(entity-activity (locker-entity l)))))))
+			      nil
+			      #'(lambda (w-l-locker)
+				  (values w-l-locker nil t)))
+			    (tv:peek-hidden-data
+			      "Show/hide waiters."
+			      (tv:scroll-maintain-list
+				#'(lambda ()
+				    (lhte-wait-queue lhte))
+				#'(lambda (w)
+				    (list ()
+					  (tv:scroll-parse-item
+					    (format
+					      nil "~A ~A"
+					      (entity-host (waiter-entity w))
+					      (entity-activity (waiter-entity w))))
+					  )))
+			      `(:function ,#'(lambda ()
+					       (let ((n-waiters
+						       (length (lhte-wait-queue lhte))))
+						 (if (zerop n-waiters)
+						     (format nil "No waiters.")
+						     (format nil "~D waiters~:P."
+							     n-waiters)))))))
+		      `(:mouse-item (nil :kbd (lock-menu ,lhte)
+					 :documentation
+					 "Menu of interesting things to do to a lock.")
+				    :function		
+				    ,#'(lambda () (format nil "Lock ~40A" (lhte-name lhte))))
+		      
+		      `(:function
+			 ,#'(lambda () (format nil "~[No~:;~:*~D~] read lock~:P. "
+					       (length (lhte-read-lockers lhte)))))
+		      `(:function
+			 ,#'(lambda () (format nil "~:[Not write locked.~;Write locked.~] "
+					       (lhte-write-locker lhte))))
+		      `(:function
+			 ,#'(lambda () (format nil "~[No~:;~:*~D~] waiter~:P. "
+					       (length (lhte-wait-queue lhte)))))
+		      
+		      )))
+	  nil
+	  #'(lambda (info)
+	      (destructuring-bind (slot key element)
+				  info
+		(ignore key)
+		(multiple-value-bind (n-slot n-key n-element)
+		    (send *lock-hash-table* :next-element slot)
+		  (values element (list n-slot n-key n-element)
+			  (null n-element))))))))
+
+(defparameter *inactive-kill-threshold* (* 60 5) "5 minutes")
+
+(defun gc-old-servers ()
+  (unless *lock-hash-table* (return-from gc-old-servers nil))
+  ;;speedy pass over the candidates.
+  (loop for s in *all-servers*
+	do
+    (with-lht-locked
+       (when (and (member s *all-servers* :test #'eq)
+		  (> (- (get-universal-time) (server-instance-last-interaction-time s))
+		     *inactive-kill-threshold*)
+		  (not (plusp (server-instance-n-locks s))))
+	 (setq *all-servers* (delete s *all-servers* :test #'eq))
+	 (kill s))))
+  ;; Repeat
+  (start-server-reap))
+
+(defvar *server-reap-timer*
+	(process:create-timer-call #'gc-old-servers () :name "Lock-simple server reaper"))
+
+(defun start-server-reap ()
+  (process:reset-timer-relative-timer-units *server-reap-timer*
+					    ;; Ten minutes
+					    (/ (* 10 60) process:*timer-units*)))
+
+(defun stop-server-reap ()
+  (process:clear-timer *server-reap-timer*))
+
+(defmethod (kill server-instance) ()
+  (when transaction-stream
+    (close transaction-stream :abort t))
+  (process-kill (send self :process)))
+
+
+(defresource *interactors* (host activity &key default-max-wait-time)
+  :constructor (make-instance 'interactor :host host :activity activity
+			      :default-max-wait-time
+			      (or default-max-wait-time *default-max-wait-time*))
+  :checker (and (not in-use-p)
+		(or (not (connected-p object))
+		    (eq (interactor-host object) host)))
+  :initializer (progn
+		 (setf (interactor-activity object) activity
+		       (interactor-default-max-wait-time object)
+		       (or default-max-wait-time *default-max-wait-time*))
+		 (unless (connected-p object)
+		   (setf (interactor-host object) host)
+		   (get-connection object))))
+
+(defun server-host-for-host (host &key (error-p t))
+  (if (net:find-paths-to-service-on-host :lock-simple host)
+      host
+      (let* ((neti:*validate-once-per-boot* nil)
+	     (neti:*inhibit-validity-checking* nil)
+	     (surrogate-name (or (send host :user-get :lock-simple-server)
+				 ;;domain hosts don't have a site
+				 (and (send host :site)
+				      (send (send host :site) :user-get :lock-simple-server))))
+	     (surrogate (and surrogate-name (net:parse-host surrogate-name (not error-p)))))
+	(if surrogate surrogate
+	    (progn
+	      (if (null (send host :site))
+		  ;;use host where file resides in the domain host case, even if error-p true
+		  host
+		  (progn
+		    (when error-p
+		      (error
+			"~A does not support LOCK-SIMPLE, and site ~A does not define a default server."
+			host (send host :site)))
+		    host)))))))
+
+(defvar *activity-to-activity-string-ht* nil)
+(defvar *activity-string-to-activity-ht* nil)
+
+(defun setup-activity-hash-tables ()
+  (setq *activity-to-activity-string-ht* (make-hash-table :size 10))
+  (setq *activity-string-to-activity-ht* (make-hash-table :size 10 :test #'string=)))
+	    
+(defun intern-activity (act)
+  (unless *activity-to-activity-string-ht* (setup-activity-hash-tables))
+  (or (gethash act *activity-to-activity-string-ht*)
+      (let* ((base-string (format nil "~A" act))
+	    (test-string (copy-seq base-string)))
+	(loop while (gethash test-string *activity-string-to-activity-ht*)
+	      for count from 0
+		  do (setq test-string (format nil "~A-~D" base-string count)))
+	(setf (gethash test-string *activity-string-to-activity-ht*) act
+	      (gethash act *activity-to-activity-string-ht*) test-string))))
+
+(defun reverse-intern-activity (string)
+  (gethash string *activity-string-to-activity-ht*))
+
+(add-initialization "Initialize hash table and Q" '(initialize-lock-database) '()
+		    '*lock-simple-initializations*)
+(add-initialization "Show up in Peek" '(tv:define-peek-mode peek-lock-simple #\L "Lock-simple"
+							    "Show lock-simple lock database.")
+		    ()
+		    '*lock-simple-initializations*)
+
+(add-initialization "Shutdown lock 1" '(shut-lock-database) '(:disable-services))

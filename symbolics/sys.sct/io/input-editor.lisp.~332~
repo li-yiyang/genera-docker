@@ -1,0 +1,2597 @@
+;;; -*- Syntax: Zetalisp; MODE: Lisp; Package: System-internals; Base: 8 -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;; Input Editor (formerly known as the Rubout Handler)
+
+;; Disadvantages compared to ZTOP:
+;; * This editor duplicates functionality provided by Zwei.
+;; * It looks like the editor, but not everything is there, so one may be
+;;   led into typing editor commands which aren't present.
+;; * The mechanism for customizing the input editor is separate from that for
+;;   customizing the editor.
+
+;; Advantages compared to ZTOP:
+;; * It does not slow down the output side as ZTOP does.  This allows programs like
+;;   Macsyma to do graphics output and still have powerful rubout handling.  Often,
+;;   one is interested only in editing previous input to, not output from, a listener.
+;; * It can be used everyplace, with very little overhead.  It is there for every call
+;;   to READLINE and READ.  Getting ZTOP to work everyplace would be much harder.
+;; * It can provide functionality which is fundamentally different from what the editor
+;;   provides.  It can be oriented toward interactors like the Lisp or Macsyma listeners.
+;;   The input history commands are an example of this.  These are not oriented toward
+;;   editing buffers of text, but toward command line interaction.
+;; * It can be used from streams other than those going to the local console, since it is
+;;   written in terms of stream operations rather than sheet operations.
+
+;; The fill-pointer of an array only has meaning to FILL-POINTER, ARRAY-PUSH, ARRAY-POP,
+;; and the printer.  One can read and write anywhere into an array, regardless of where
+;; the fill pointer is set.  In this code, sometimes the fill pointer will be set
+;; after a write beyond it has taken place.
+
+;; General Utilities
+
+;; Make sure a buffer is large enough to contain N characters.
+;; If not, make it twice as large as it needs to be.
+
+(DEFUN ASSURE-ARRAY-SIZE (ARRAY N)
+  (IF (> N (ARRAY-LENGTH ARRAY)) (ADJUST-ARRAY-SIZE ARRAY (* 2 N))))
+
+;; Make sure a buffer with a fill pointer is large enough to contain N more characters.
+;; If not, make it twice as large as it needs to be.
+
+(DEFUN ASSURE-ARRAY-GROWTH (ARRAY N)
+  (ASSURE-ARRAY-SIZE ARRAY (+ (FILL-POINTER ARRAY) N)))
+
+;; Kludge to fix a bug in COPY-ARRAY-PORTION when TO-ARRAY and FROM-ARRAY are the same and
+;; FROM-X is less than TO-X.  COPY-ARRAY-PORTION should be fixed or a higher level
+;; primitive created.
+;;--- Why isn't this calling CL:REPLACE? --Moon
+
+(DEFCONST SHIFT-ARRAY-PORTION-BUFFER (MAKE-ARRAY 512. :TYPE ART-FAT-STRING))
+
+(DEFUN SHIFT-ARRAY-PORTION (ARRAY FROM TO WIDTH)
+  (COND ((> FROM TO)
+	 (COPY-ARRAY-PORTION ARRAY FROM (+ FROM WIDTH) ARRAY TO (+ TO WIDTH)))
+	((< FROM TO)
+	 (ASSURE-ARRAY-SIZE SHIFT-ARRAY-PORTION-BUFFER WIDTH)
+	 (WITHOUT-INTERRUPTS
+	   (COPY-ARRAY-PORTION ARRAY FROM (+ FROM WIDTH) SHIFT-ARRAY-PORTION-BUFFER 0 WIDTH)
+	   (COPY-ARRAY-PORTION SHIFT-ARRAY-PORTION-BUFFER 0 WIDTH ARRAY TO (+ TO WIDTH))))
+	(T NIL)))
+
+;; State associated with the input buffer:
+
+;;   IEB-FILL-POINTER points to what has been typed so far.
+;;   IEB-SCAN-POINTER points to what has been read so far.
+;;   IEB-TYPEIN-POINTER points to where in the middle of the line input is being typed.
+;;   IEB-NOISE-STRINGS are the noise strings associated with the current input.
+
+;; State associated with the stream:
+
+;;   ACTIVATOR is a saved activation character or blip.
+;;   MARK is used for delimiting yanked text, and as a mark in the traditional Emacs sense.
+;;   INPUT-HISTORY is a history all input to this stream.
+;;   YANK-HISTORY is the last history yanked from.  It can be either INPUT-HISTORY or
+;;     ZWEI:*KILL-HISTORY*.
+
+;; The input history is per-stream.  This seems to be more natural, since what may be copied
+;; is what appears directly preceding the current typein.  This is also the same way the + and
+;; * specials work.  After we have had more experience with it, we may want to make it global,
+;; or have both, e.g. some way of selecting the nth input globally as well as the nth input to
+;; this stream.  The kill ring is global and is shared with the editor.  It can be used for
+;; copying text from stream to stream, and to and from editor buffers.
+
+;; *COMMAND-ALIST* may be modified to globally change the input editor commands.
+;; An entry in this list is a cons of a character and a symbol with print-name prefix "COM-".
+
+(DEFVAR *COMMAND-ALIST* NIL :LOCALIZE T)
+
+;; ZWEI:*KILL-HISTORY-USER* points to the last editor command loop or stream in which a kill
+;; was done.  *KILL-POINTER* marks the point in the input buffer at which the kill was done.
+;; If *KILL-POINTER* is NIL, the next kill will not merge with the top of the kill ring.
+;; ZWEI:*KILL-HISTORY-USER* must always point to where the last kill came from for the benefit
+;; of ZWEI:COM-APPEND-NEXT-KILL.  *KILL-POINTER* eliminates the need for a FORWARDP argument
+;; as is used by ZWEI:KILL-RING-SAVE-INTERVAL.
+
+(DEFVAR *KILL-POINTER* NIL)
+
+;; If this variable is NIL, then the contents of the input buffer match the state of the read
+;; function.  It is never set to NIL.  It is bound to NIL only when (STANDARD-INPUT-EDITOR
+;; TYI) is entered.  It is also bound inside of (STANDARD-INPUT-EDITOR REPLACE-INPUT), since
+;; the read function is assumed to have updated its own state.
+
+;; When NIL, throw to INPUT-EDITOR-RETURN when activating or typing at the end of the line.
+;; When :EOL, throw to INPUT-EDITOR-RESCAN when activating or typing at the end of the line.
+;; When :ACTIVATION, throw to INPUT-EDITOR-RESCAN when activating; remain inside the input
+;;   editor when typing at the end of the line.
+;; When NIL, the reader state corresponds to the state of the input buffer to the left of the
+;; scan pointer.
+
+(DEFVAR *RESCAN-STATE*)
+
+;; *NUMERIC-ARG* is like ZWEI:*NUMERIC-ARG*.
+;; *NUMERIC-ARG-P* is like ZWEI:*NUMERIC-ARG-P*.
+
+(DEFVAR *NUMERIC-ARG*)
+(DEFVAR *NUMERIC-ARG-P*)
+
+;; This gets bound to a string to use temporarily as the first element of the history.
+
+(DEFVAR *INPUT-HISTORY-DEFAULT*)
+
+;; DEFUN-IE defines functions internal to the input editor, which have lexical
+;; access to the instance variables of INTERACTIVE-STREAM.  These functions can
+;; only be called from methods and from each other.
+
+(DEFPROP DEFUN-IE "Function" SI:DEFINITION-TYPE-NAME)
+
+(DEFMACRO DEFUN-IE (NAME ARGS &BODY BODY)
+  `(PROGN
+     (RECORD-SOURCE-FILE-NAME ',NAME 'DEFUN-IE)
+     (DEFUN-IN-FLAVOR (,NAME INTERACTIVE-STREAM) ,ARGS
+       (DECLARE (SYS:FUNCTION-PARENT ,NAME DEFUN-IE))
+       . ,BODY)))
+
+;; Primitive Operations
+
+;; Blips must not contain any constant list structure since the CP RPLACDs into them, so don't
+;; use backquote to build them.  Don't cdr-code the last cons cell so that this RPLACD is more
+;; efficient.
+
+(DEFUN IE-MAKE-BLIP (KEYWORD VALUE1 VALUE2)
+  (LIST* KEYWORD VALUE1 VALUE2 NIL))
+
+(DEFUN-IE IE-CHARACTER (I)
+  (IF ( I (IEB-FILL-POINTER))
+      (FERROR "The subscript ~D was beyond the input buffer length ~D" I (IEB-FILL-POINTER)))
+  (AREF INPUT-EDITOR-BUFFER I))
+
+(DEFUN-IE IE-CHARACTER-BEFORE (I)
+  (IF (= I 0) #\RETURN (IE-CHARACTER (1- I))))
+
+(DEFUN-IE IE-CHARACTER-AFTER (I)
+  (IF (= I (IEB-FILL-POINTER)) #\RETURN (IE-CHARACTER I)))
+
+(DEFUN-IE IE-SEARCH-CHAR (CHAR &OPTIONAL (FROM 0) (TO NIL))
+  (STRING-SEARCH-CHAR CHAR INPUT-EDITOR-BUFFER FROM TO))
+
+(DEFUN-IE IE-REVERSE-SEARCH-CHAR (CHAR &OPTIONAL (FROM NIL) (TO 0))
+  (STRING-REVERSE-SEARCH-CHAR CHAR INPUT-EDITOR-BUFFER FROM TO))
+
+;; Moves the cursor to a given position on the screen, with respect to the input buffer.
+;; Does no bounds checking.  If the index into the buffer corresponding with the screen
+;; cursor position is known, and it is before the position we want to go to, then this
+;; will run faster.  If a second argument is given, it almost always will be the value
+;; of (IEB-TYPEIN-POINTER).
+
+(DEFUN-IE IE-CURSOR-MOTION (POSITION &OPTIONAL CURRENT-POSITION)
+  (MULTIPLE-VALUE-BIND (X Y)
+      (IF (AND CURRENT-POSITION ( POSITION CURRENT-POSITION))
+	  (INPUT-EDITOR-COMPUTE-MOTION CURRENT-POSITION POSITION)
+	  (INPUT-EDITOR-COMPUTE-MOTION-FROM-START POSITION))
+    (SEND SELF :SET-CURSORPOS X Y)))
+
+;; Move the cursor on the screen and in the buffer.  If the cursor is at the end of the
+;; buffer, check if there has been some typeout other than character echoing.  If so,
+;; erase the typeout and reprint the buffer.  
+
+(DEFVAR *ERASE-ASYNCHRONOUS-TYPEOUT* T)
+
+(DEFUN-IE IE-SET-POSITION (POSITION)
+  ;; Disallow use of m-Y.
+  (SETF YANK-HISTORY NIL)
+  (LET ((TYPEIN-POINTER (IEB-TYPEIN-POINTER))
+	(FILL-POINTER (IEB-FILL-POINTER)))
+    (IF (AND (= TYPEIN-POINTER FILL-POINTER) *ERASE-ASYNCHRONOUS-TYPEOUT*)
+	(MULTIPLE-VALUE-BIND (X1 Y1) (SEND SELF :READ-CURSORPOS)
+	  (MULTIPLE-VALUE-BIND (X2 Y2) (INPUT-EDITOR-COMPUTE-MOTION-FROM-START NIL)
+	    (COND ((NOT (AND (= X1 X2) (= Y1 Y2)))
+		   (SEND SELF :CLEAR-BETWEEN-CURSORPOSES BUFFER-X BUFFER-Y X1 Y1)
+		   (SEND SELF :SET-CURSORPOS BUFFER-X BUFFER-Y)
+		   (INPUT-EDITOR-STRING-OUT))))))
+    (COND ((OR (AND (< POSITION 0) (= TYPEIN-POINTER 0))
+	       (AND (> POSITION FILL-POINTER) (= TYPEIN-POINTER FILL-POINTER)))
+	   (SEND SELF :BEEP))
+	  (T (SETQ POSITION (MIN (MAX POSITION 0) FILL-POINTER))
+	     (SETF (IEB-TYPEIN-POINTER) POSITION)
+	     (IE-CURSOR-MOTION POSITION TYPEIN-POINTER)))))
+
+;; To make life easier for The Wobblies
+(DEFMACRO IF-ZWEI-LOADED (ZWEI-BRANCH IE-BRANCH)
+  `(IF ZWEI:*ZMACS-NEEDS-INITIALIZATION*
+       ,IE-BRANCH
+       ,ZWEI-BRANCH))
+
+;; If ZWEI:*KILL-HISTORY-USER* is SELF, then the last saved kill took place in this
+;; buffer.  If *KILL-POINTER* is non-NIL, then kills are being merged.  If
+;; *KILL-POINTER* is BEGIN, then append to the right.  If *KILL-POINTER* is END, then
+;; append to the left.
+
+(DEFUN-IE IE-KILL-HISTORY-SAVE (BEGIN END TRY-TO-MERGE?)
+  (IF (< END BEGIN) (PSETQ BEGIN END END BEGIN))
+  ;; Interlock against kills in other processes
+  (WITHOUT-INTERRUPTS
+    (IF-ZWEI-LOADED
+	(LET (BP ZWEI:*INTERVAL*)
+	  (FLET ((INSERT (STRING &OPTIONAL (START 0) END)
+		   (SETQ BP (ZWEI:INSERT BP STRING START END))))
+	    (IF (AND TRY-TO-MERGE?
+		     (EQ ZWEI:*KILL-HISTORY-USER* SELF)
+		     (OR (EQL *KILL-POINTER* BEGIN)
+			 (EQL *KILL-POINTER* END)))
+		;; Merging kill
+		(LET ((INT (SEND ZWEI:*KILL-HISTORY* :ELEMENT 0)))
+		  (COND ((NOT (TYPEP INT 'ZWEI:KILL-RING-INTERVAL))
+			 (SETQ INT (ZWEI:CREATE-INTERVAL
+				     INT NIL (MAKE-INSTANCE 'ZWEI:KILL-RING-INTERVAL)))
+			 (SEND ZWEI:*KILL-HISTORY* :REPLACE-TOP INT)))
+		  (SETQ ZWEI:*INTERVAL* INT
+			BP (COND ((= *KILL-POINTER* BEGIN)
+				  (SETF (ZWEI:KILL-RING-INTERVAL-CHAR-AFTER INT)
+					(IE-CHARACTER-AFTER END))
+				  (ZWEI:INTERVAL-LAST-BP INT))
+				 (T (SETF (ZWEI:KILL-RING-INTERVAL-CHAR-BEFORE INT)
+					  (IE-CHARACTER-BEFORE BEGIN))
+				    (ZWEI:INTERVAL-FIRST-BP INT)))))
+		;; Non-merging kill
+		(LET ((INT (ZWEI:CREATE-INTERVAL
+			     NIL NIL (MAKE-INSTANCE 'ZWEI:KILL-RING-INTERVAL
+						    :CHAR-BEFORE (IE-CHARACTER-BEFORE BEGIN)
+						    :CHAR-AFTER (IE-CHARACTER-AFTER END)))))
+		  (SETQ ZWEI:*INTERVAL* INT
+			BP (ZWEI:INTERVAL-FIRST-BP INT))
+		  (SEND ZWEI:*KILL-HISTORY* :PUSH INT)))
+	    (MAP-OVER-INPUT-EDITOR-BUFFER INPUT-EDITOR-BUFFER BEGIN END
+					  ;; IGNORE seems better, since they don't yank back.
+					  #'INSERT #'IGNORE #'INSERT)))
+	(LET ((INTERVAL NIL))
+	  ;; None of the standard string functions does a reasonable job here.
+	  (FLET ((INSERT (STRING &OPTIONAL (START 0) END)
+		   (UNLESS END (SETQ END (STRING-LENGTH STRING)))
+		   (IF INTERVAL
+		       (WHEN (AND (STRING-FAT-P STRING)
+				  (NOT (STRING-FAT-P INTERVAL)))
+			 (SETQ INTERVAL (CL:MAKE-ARRAY (+ (STRING-LENGTH INTERVAL)
+							  (- END START))
+						       :ELEMENT-TYPE 'CL:CHARACTER
+						       :FILL-POINTER (STRING-LENGTH INTERVAL)
+						       :INITIAL-CONTENTS INTERVAL)))
+		       (SETQ INTERVAL (CL:MAKE-ARRAY (- END START)
+				       :ELEMENT-TYPE (CL:ARRAY-ELEMENT-TYPE STRING)
+				       :FILL-POINTER 0)))
+		   (SETQ INTERVAL (ARRAY-PUSH-PORTION-EXTEND INTERVAL STRING START END))))
+	    (MAP-OVER-INPUT-EDITOR-BUFFER INPUT-EDITOR-BUFFER BEGIN END
+					  ;; IGNORE seems better, since they don't yank back.
+					  #'INSERT #'IGNORE #'INSERT)
+	    (ZWEI:KILL-RING-PUSH INTERVAL))))
+    ;; Record the event
+    (SETQ ZWEI:*KILL-HISTORY-USER* SELF)
+    (SETQ *KILL-POINTER* BEGIN)))
+
+;; Insert a string into the buffer and print it on the screen.  The string is inserted
+;; at the current typein pointer, and the pointer is left after the string.
+
+(DEFUN-IE IE-INSERT-STRING-REFRESH-REGION (POSITION OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER)
+  ;; Locate the typein pointer.
+  (MULTIPLE-VALUE-BIND (BEGIN-X BEGIN-Y)
+      (SEND SELF :READ-CURSORPOS)
+    ;; Locate the end of the region.
+    (MULTIPLE-VALUE-BIND (END-X END-Y)
+	(INPUT-EDITOR-COMPUTE-MOTION NEW-TYPEIN-POINTER POSITION)
+      (SEND SELF :CLEAR-BETWEEN-CURSORPOSES BEGIN-X BEGIN-Y END-X END-Y))
+    ;; Retype, and move the cursor back where it belongs.
+    (INPUT-EDITOR-STRING-OUT OLD-TYPEIN-POINTER POSITION)
+    (IE-CURSOR-MOTION NEW-TYPEIN-POINTER)))
+
+(DEFVAR *INPUT-EDITOR-INSERT-HOOKS* NIL)
+
+(DEFUN-IE IE-INSERT-STRING (STRING &OPTIONAL (BEGIN 0) END (RETURN-OK? NIL) (MERGE-STYLE NIL)
+				   (NOISE-STRINGS NIL) (BUFFER-BLIPS NIL))
+  (OR END (SETQ END (STRING-LENGTH STRING)))
+  (LET* ((WIDTH (- END BEGIN))
+	 (OLD-TYPEIN-POINTER (IEB-TYPEIN-POINTER))
+	 (NEW-TYPEIN-POINTER (+ OLD-TYPEIN-POINTER WIDTH))
+	 (OLD-FILL-POINTER (IEB-FILL-POINTER))
+	 (NEW-FILL-POINTER (+ OLD-FILL-POINTER WIDTH))
+	 (NEWLINE-POS)
+	 (TAB-POS))
+    (COND
+      ;; If nothing is being inserted, don't rescan input.
+      ((= WIDTH 0))
+      ;; Don't try to insert enormous strings.
+      ((> WIDTH 1000000.) (SEND SELF :BEEP))
+      (T 
+       
+       ;; Do this before actually inserting, so that echoing doesn't repeat.
+       (SEND-IF-HANDLES SELF :SCROLL-TO-VISIBLE-CURSOR)
+
+       ;; Stop merging kills.  Disallow use of m-Y.  Remove mark.
+       (SETQ *KILL-POINTER* NIL)
+       (SETF YANK-HISTORY NIL)
+       (SETF MARK NIL)
+
+       (DOLIST (HOOK *INPUT-EDITOR-INSERT-HOOKS*)
+	 (FUNCALL HOOK SELF INPUT-EDITOR-BUFFER OLD-TYPEIN-POINTER STRING BEGIN END))
+
+       ;; Increase the size of of the typein buffer, if necessary.
+       (ASSURE-ARRAY-GROWTH INPUT-EDITOR-BUFFER WIDTH)
+       ;; Make room for the characters to be inserted.
+       (SHIFT-ARRAY-PORTION INPUT-EDITOR-BUFFER
+			    OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER
+			    (- OLD-FILL-POINTER OLD-TYPEIN-POINTER))
+       ;; Copy the string in.
+       (IF (AND MERGE-STYLE (NEQ MERGE-STYLE *NULL-STYLE*))
+	   (LOOP FOR C BEING THE ARRAY-ELEMENTS OF STRING FROM BEGIN BELOW END
+		 FOR TO-X FROM OLD-TYPEIN-POINTER BELOW NEW-TYPEIN-POINTER
+		 DO
+	     (SETF (CHAR-STYLE-INDEX C)
+		   (STYLE-INDEX (MERGE-CHARACTER-STYLES (CHAR-STYLE C) MERGE-STYLE)))
+	     (SETF (AREF INPUT-EDITOR-BUFFER TO-X) C))
+	   (COPY-ARRAY-PORTION STRING BEGIN END
+			       INPUT-EDITOR-BUFFER OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER))
+       ;; Adjust the indices of all noise strings to the right of the insertion.
+       (LOOP FOR NOISE IN (IEB-NOISE-STRINGS)
+	     AS INDEX = (CAR NOISE)
+	     WHEN (< OLD-TYPEIN-POINTER INDEX)
+	       DO (SETF (CAR NOISE) (+ INDEX WIDTH)))
+       (WHEN NOISE-STRINGS
+	 (SETF (IEB-NOISE-STRINGS)
+	       (SORTCAR (APPEND (IEB-NOISE-STRINGS)
+				(LOOP FOR (INDEX . STRING) IN NOISE-STRINGS
+				      WHEN (< BEGIN INDEX END)
+					COLLECT (CONS (+ (- INDEX BEGIN) OLD-TYPEIN-POINTER)
+						      STRING)))
+			#'<)))
+       (WHEN BUFFER-BLIPS
+	 (LOOP FOR INDEX FROM OLD-TYPEIN-POINTER BELOW NEW-TYPEIN-POINTER DO
+	   (LET ((CHAR (AREF INPUT-EDITOR-BUFFER INDEX)))
+	     (WHEN (EQ (CHAR-CHAR-SET-AND-INDEX CHAR) *BUFFER-BLIPS-CHARSET*)
+	       (LET* ((OLD-POSITION (CHAR-SUBINDEX CHAR))
+		      (ENTRY (NTH OLD-POSITION BUFFER-BLIPS))
+		      (OBJECT (FIRST ENTRY))
+		      (NEW-POSITION (CL:POSITION OBJECT (IEB-BUFFER-BLIPS) :KEY #'CAR)))
+		 (WHEN (NULL NEW-POSITION)
+		   (SETQ NEW-POSITION (LENGTH (IEB-BUFFER-BLIPS)))
+		   (SETF (IEB-BUFFER-BLIPS) (NCONC (IEB-BUFFER-BLIPS) (NCONS ENTRY))))
+		 (SETF (AREF INPUT-EDITOR-BUFFER INDEX)
+		       (CODE-CHAR (SEND *BUFFER-BLIPS-CHARSET* :MAKE-CHAR NEW-POSITION))))))))
+       
+       ;; Update the fill pointer and the typein pointer.
+       (SETF (IEB-FILL-POINTER)   NEW-FILL-POINTER)
+       (SETF (IEB-TYPEIN-POINTER) NEW-TYPEIN-POINTER)
+       
+       ;; Locate the first newline within or after the inserted string.
+       (SETQ NEWLINE-POS (IE-SEARCH-CHAR #\NEWLINE OLD-TYPEIN-POINTER))
+       ;; Locate the first tab after the inserted string.
+       (SETQ TAB-POS (IE-SEARCH-CHAR #\TAB NEW-TYPEIN-POINTER))
+       
+       ;; Update the screen.  There are four possible ways of doing the update, involving the
+       ;; messages :STRING-OUT, :CLEAR-BETWEEN-CURSORPOSES, :INSERT-STRING, and
+       ;; :CLEAR-REST-OF-LINE.  We need a more powerful message for consoles with region
+       ;; scroll.
+       (LET ((TV:MORE-PROCESSING-GLOBAL-ENABLE NIL))
+	 (COND
+	   
+	   ;; If the string is being inserted at the end of the buffer, just output it.
+	   ;; Check this case before checking for newlines in the string so that this
+	   ;; works when a read-time error message is visible.
+	   ((= OLD-TYPEIN-POINTER OLD-FILL-POINTER)
+	    (INPUT-EDITOR-STRING-OUT OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER))
+	   
+	   ;; If the string being inserted contains newlines or if the line being inserted
+	   ;; will wrap around the right edge of the window, reprint everything after the
+	   ;; insertion.
+	   ((OR (AND NEWLINE-POS (< NEWLINE-POS NEW-TYPEIN-POINTER))
+		(MULTIPLE-VALUE-BIND (IGNORE CURRENT-Y)
+		    (SEND SELF :READ-CURSORPOS)
+		  (MULTIPLE-VALUE-BIND (IGNORE NEWLINE-Y)
+		      (INPUT-EDITOR-COMPUTE-MOTION OLD-TYPEIN-POINTER NEWLINE-POS)
+		    ( CURRENT-Y NEWLINE-Y))))
+	    (IE-INSERT-STRING-REFRESH-REGION NEW-FILL-POINTER OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER))
+	   
+	   ;; If the string is being inserted at the end of a line, don't worry about
+	   ;; character insertion.  Just output the string.
+	   ((CHAR-EQUAL (IE-CHARACTER NEW-TYPEIN-POINTER) #\NEWLINE)
+	    (INPUT-EDITOR-STRING-OUT OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER))
+	   
+	   ;; If the line being inserted into contains tabs after the point of insertion,
+	   ;; reprint the line.
+	   ((AND TAB-POS (OR (NOT NEWLINE-POS) (< TAB-POS NEWLINE-POS)))
+	    (IE-INSERT-STRING-REFRESH-REGION NEWLINE-POS OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER))
+	   
+	   ;; If the console can insert characters, then do so.
+	   ;; Pass in the string to handle variable width fonts.
+	   ((OPERATION-HANDLED-P SELF :INSERT-STRING)
+	    (INPUT-EDITOR-INSERT-STRING OLD-TYPEIN-POINTER NEW-TYPEIN-POINTER))
+	   
+	   ;; Otherwise, simulate it VT52 style.  Only reprint the current line.
+	   (T (SEND SELF :CLEAR-REST-OF-LINE)
+	      (INPUT-EDITOR-STRING-OUT OLD-TYPEIN-POINTER NEWLINE-POS)
+	      (IE-CURSOR-MOTION NEW-TYPEIN-POINTER))))
+       
+       ;; Possibly return from the input editor.  If the string is being inserted in the
+       ;; middle of the line, don't throw.  If the string is being inserted at the end of the
+       ;; line, then return from the input editor in one of two ways:  If there have been no
+       ;; changes to the input buffer, return back to :ANY-TYI and let it read the next
+       ;; character after the scan pointer.  If there have been changes, then rescan the
+       ;; input.  Rescanning is expensive, so do it only when necessary.  For normal typein
+       ;; and the end of a line, the scan pointer keeps up with the typein pointer and rescans
+       ;; never happen.  Pass NIL to RETURN-OK? to force control to stay with the input
+       ;; editor.
+       (WHEN (AND (= OLD-TYPEIN-POINTER OLD-FILL-POINTER) RETURN-OK?)
+	 (IE-EOL-ACTIVATE))
+       
+       ;; If not throwing, then a rescan will be necessary.
+       (UNLESS (OR (AND (EQ *RESCAN-STATE* :ACTIVATION) (= OLD-TYPEIN-POINTER OLD-FILL-POINTER))
+		   (AND (NULL *RESCAN-STATE*) (> OLD-TYPEIN-POINTER (IEB-SCAN-POINTER))))
+	 (SETQ *RESCAN-STATE* :EOL))
+       ))))
+
+;;; Dynamic-window blip handling code.
+
+(DEFCONST *BLIP-PRINT-LEVEL* 3)
+(DEFCONST *BLIP-PRINT-LENGTH* 5)
+(DEFCONST *BLIP-PRINT-STRUCTURE-CONTENTS* NIL)
+(DEFCONST *BLIP-PRINT-ARRAY-LENGTH* 5)
+(DEFCONST *BLIP-PRINT-STRING-LENGTH* 80)
+(DEFCONST *BLIP-PRINT-BIT-VECTOR-LENGTH* 80)
+(DEFCONST *BLIP-PRINT-INTEGER-LENGTH* 80)
+
+;;; Translate dynamic windows blip into internal blips character set character.
+(DEFUN-IE IE-BLIP-BUFFER-BLIP (BLIP)
+  (DECLARE (VALUES STRING FIRST-CHAR LAST-CHAR))
+  (LET ((QUOTE-TYPE (CL:GETF (DW:PRESENTATION-BLIP-OPTIONS BLIP) :QUOTED-EXPRESSION))
+	(UNQUOTED-BLIP BLIP)
+	(INDEX (CL:POSITION BLIP (IEB-BUFFER-BLIPS) :KEY #'CAR)))
+    (WHEN (NULL INDEX)
+      (SETQ INDEX (LENGTH (IEB-BUFFER-BLIPS)))
+      (WHEN QUOTE-TYPE		;Strip the QUOTE, in a copy of the blip
+	(SETQ UNQUOTED-BLIP (DW::MAKE-PRESENTATION-BLIP
+			      :PRESENTATION-TYPE QUOTE-TYPE
+			      :OBJECT (SECOND (DW:PRESENTATION-BLIP-OBJECT BLIP))
+			      :MOUSE-CHAR (DW:PRESENTATION-BLIP-MOUSE-CHAR BLIP)
+			      :OPTIONS `(:QUOTED-BLIP ,BLIP
+					 ,@(DW:PRESENTATION-BLIP-OPTIONS BLIP))))
+	(SETF (CL:GETF (DW:PRESENTATION-BLIP-OPTIONS BLIP) :UNQUOTED-BLIP) UNQUOTED-BLIP))
+      (LET ((STRING (WITH-OUTPUT-TO-STRING (STREAM)
+		      (SCL:WITH-CHARACTER-FACE (:ITALIC STREAM)
+			;; Heavily abbreviate the echoing of blips
+			(LET ((CL:*PRINT-LEVEL* *BLIP-PRINT-LEVEL*)
+			      (CL:*PRINT-LENGTH* *BLIP-PRINT-LENGTH*)
+			      (SCL:*PRINT-STRUCTURE-CONTENTS* *BLIP-PRINT-STRUCTURE-CONTENTS*)
+			      (SCL:*PRINT-ARRAY-LENGTH* *BLIP-PRINT-ARRAY-LENGTH*)
+			      (SCL:*PRINT-STRING-LENGTH* *BLIP-PRINT-STRING-LENGTH*)
+			      (SCL:*PRINT-BIT-VECTOR-LENGTH* *BLIP-PRINT-BIT-VECTOR-LENGTH*)
+			      (SCL:*PRINT-INTEGER-LENGTH* *BLIP-PRINT-INTEGER-LENGTH*))
+			  ;; Note that we don't need :ACCEPTABLY here, since it's a blip
+			  (PRESENT (DW:PRESENTATION-BLIP-OBJECT UNQUOTED-BLIP)
+				   (DW:PRESENTATION-BLIP-PRESENTATION-TYPE UNQUOTED-BLIP)
+				   :STREAM STREAM))))))
+	(SETF (IEB-BUFFER-BLIPS) (NCONC (IEB-BUFFER-BLIPS)
+					(NCONS (LIST BLIP STRING))))))
+    (LET ((STRING (CL:MAKE-STRING (IF QUOTE-TYPE 2 1) :ELEMENT-TYPE 'CHARACTER))
+	  (ITALIC (SECOND (NTH INDEX (IEB-BUFFER-BLIPS)))))
+      (WHEN QUOTE-TYPE
+	(SETF (AREF STRING 0) #/'))
+      (SETF (AREF STRING (IF QUOTE-TYPE 1 0))
+	    (CODE-CHAR (SEND *BUFFER-BLIPS-CHARSET* :MAKE-CHAR INDEX)))
+      (VALUES STRING
+	      (IF QUOTE-TYPE #/' (AREF ITALIC 0))
+	      (AREF ITALIC (1- (STRING-LENGTH ITALIC)))))))
+
+;;; Insert an arbitrary blip into the input buffer.
+;;; The blip echos as its printed representation.
+(DEFUN-IE IE-INSERT-BLIP (BLIP &OPTIONAL RETURN-OK?)
+  (MULTIPLE-VALUE-BIND (STRING FIRST-CHAR LAST-CHAR) (IE-BLIP-BUFFER-BLIP BLIP)
+    (IE-FIXUP-WHITESPACE FIRST-CHAR T NIL)
+    (IE-INSERT-STRING STRING 0 NIL RETURN-OK? NIL)
+    (IE-FIXUP-WHITESPACE LAST-CHAR NIL NIL)))
+
+;;; Functions to decode and encode blips into magic place-holder characters
+;;; (see comments in definition of BLIP-CHARACTER-SET in interactive-stream.lisp
+
+(DEFUN-IE INPUT-EDITOR-RETURN-CHAR (CHAR)
+  (WHEN (EQ (CHAR-CHAR-SET-AND-INDEX CHAR) *BUFFER-BLIPS-CHARSET*)
+    (SETQ CHAR (FIRST (NTH (CHAR-SUBINDEX CHAR) (IEB-BUFFER-BLIPS))))
+    (SETQ CHAR (CL:GETF (DW:PRESENTATION-BLIP-OPTIONS CHAR) :UNQUOTED-BLIP CHAR)))
+  CHAR)
+
+(DEFUN-IE INPUT-EDITOR-UNRETURN-CHAR (CHAR)
+  (OR (AND (LISTP CHAR)
+	   (VARIABLE-BOUNDP INPUT-EDITOR-BUFFER)
+	   (LET ((INDEX (CL:POSITION (CL:GETF (DW:PRESENTATION-BLIP-OPTIONS CHAR)
+					      :QUOTED-BLIP
+					      CHAR)
+				     (IEB-BUFFER-BLIPS)
+				     :KEY #'FIRST)))
+	     (AND INDEX
+		  (CODE-CHAR (SEND *BUFFER-BLIPS-CHARSET* :MAKE-CHAR INDEX)))))
+      CHAR))
+
+;; Deletes a buffer interval as marked by two pointers.  The typein pointer is left at the
+;; beginning of the interval.
+
+(DEFUN-IE IE-DELETE-STRING-REFRESH-REGION (POSITION BEGIN END)
+  ;; Locate the beginning of the string.
+  (MULTIPLE-VALUE-BIND (BEGIN-X BEGIN-Y)
+      (SEND SELF :READ-CURSORPOS)
+    ;; Locate the end of the region.
+    (MULTIPLE-VALUE-BIND (END-X END-Y)
+	(INPUT-EDITOR-COMPUTE-MOTION BEGIN POSITION)
+      ;; Clear from the beginning of the string to the end of the buffer.
+      (SEND SELF :CLEAR-BETWEEN-CURSORPOSES BEGIN-X BEGIN-Y END-X END-Y)
+      ;; Retype, and move the cursor back where it belongs.
+      (INPUT-EDITOR-STRING-OUT END)
+      (SEND SELF :SET-CURSORPOS BEGIN-X BEGIN-Y))))
+
+(DEFVAR *INPUT-EDITOR-DELETE-HOOKS* NIL)
+
+(DEFUN-IE IE-DELETE-STRING (BEGIN END &OPTIONAL (SAVE? T))
+  (LET ((WIDTH)
+	(FILL-POINTER (IEB-FILL-POINTER))
+	(NEWLINE-POS)
+	(TAB-POS))
+    (COND ((NULL END)
+	   (SETQ END FILL-POINTER))
+	  ((< END BEGIN)
+	   (SWAPF BEGIN END)))
+    (SETQ BEGIN (MAX BEGIN 0))
+    (SETQ END (MIN END FILL-POINTER))
+    (SETQ WIDTH (- END BEGIN))
+
+    ;; Update the screen.  Move cursor to beginning of the string.  This
+    ;; also erases read-time error messages.
+    (IE-SET-POSITION BEGIN)			;Do This *EVEN* when width = 0!!!
+
+    (COND
+      ((= WIDTH 0)
+       ;; If nothing is being deleted, don't rescan input.
+       NIL)
+      (T
+       
+       ;; Disallow use of m-Y.  Remove mark.
+       (SETF YANK-HISTORY NIL)
+       (SETF MARK NIL)
+       ;; Possibly save the string, and possibly merge.
+       ;; If the string isn't saved, then stop merging kills.
+       (IF (OR (NOT SAVE?)
+	       (NOT (VARIABLE-BOUNDP ZWEI:*KILL-HISTORY*)))
+	   (SETQ *KILL-POINTER* NIL)
+	   (IE-KILL-HISTORY-SAVE BEGIN END T))
+
+       (DOLIST (HOOK *INPUT-EDITOR-DELETE-HOOKS*)
+	 (FUNCALL HOOK SELF INPUT-EDITOR-BUFFER BEGIN END SAVE?))
+       
+       ;; Locate the first newline within or after the string to be deleted.
+       (SETQ NEWLINE-POS (IE-SEARCH-CHAR #\NEWLINE BEGIN))
+       ;; Locate the first tab after the string to be deleted.
+       (SETQ TAB-POS (IE-SEARCH-CHAR #\TAB END))
+       
+       ;; We have four ways of updating the screen.  This is similar to IE-INSERT-STRING.
+       (LET ((TV:MORE-PROCESSING-GLOBAL-ENABLE NIL))
+	 (COND
+	   
+	   ;; If the string being deleted contains newlines, or if the line being deleted from
+	   ;; wraps around the right edge of the window, reprint everything after the
+	   ;; deletion.
+	   ((OR (AND NEWLINE-POS (< NEWLINE-POS END))
+		(MULTIPLE-VALUE-BIND (IGNORE CURRENT-Y)
+		    (SEND SELF :READ-CURSORPOS)
+		  (MULTIPLE-VALUE-BIND (IGNORE NEWLINE-Y)
+		      (INPUT-EDITOR-COMPUTE-MOTION BEGIN NEWLINE-POS)
+		    ( CURRENT-Y NEWLINE-Y))))
+	    (IE-DELETE-STRING-REFRESH-REGION FILL-POINTER BEGIN END))
+	   
+	   ;; If the string is at the very end of the buffer, just clear to the end of
+	   ;; the line.  This case isn't really needed, but it might speed things up slightly.
+	   ((OR (= FILL-POINTER END)
+		(CHAR-EQUAL (IE-CHARACTER END) #\NEWLINE))
+	    (SEND SELF :CLEAR-REST-OF-LINE))
+	   
+	   ;; If the line being deleted from contains tabs after the end of the string,
+	   ;; reprint the line.
+	   ((AND TAB-POS (OR (NOT NEWLINE-POS) (< TAB-POS NEWLINE-POS)))
+	    (IE-DELETE-STRING-REFRESH-REGION NEWLINE-POS BEGIN END))
+	   
+	   ;; If the console can delete characters, then do so.
+	   ;; Pass in the string to handle variable width fonts.
+	   ((OPERATION-HANDLED-P SELF :DELETE-STRING)
+	    (INPUT-EDITOR-DELETE-STRING BEGIN END))
+	   
+	   ;; Otherwise, simulate it VT52 style.  Only reprint the current line.
+	   (T (SEND SELF :CLEAR-REST-OF-LINE)
+	      (INPUT-EDITOR-STRING-OUT END NEWLINE-POS)
+	      (IE-CURSOR-MOTION BEGIN))))
+       
+       ;; Stuff got deleted.
+       (SETQ *RESCAN-STATE* :EOL)
+       ;; Delete the characters from the buffer.  Do this after updating the screen
+       ;; since we need the characters to delete correctly.
+       (SHIFT-ARRAY-PORTION INPUT-EDITOR-BUFFER END BEGIN (- FILL-POINTER END))
+       ;; Update the fill pointer.
+       (SETF (IEB-FILL-POINTER) (- FILL-POINTER WIDTH))
+       ;; Remove any noise strings in the deleted region.
+       ;; Adjust the indices of all those to the right of it.
+       (LOOP WITH L = (LOCF (IEB-NOISE-STRINGS))
+	     AS INDEX = (CAADR L)
+	     WHILE INDEX DO
+	     (COND (( INDEX BEGIN)
+		    (SETQ L (CDR L)))
+		   (( INDEX END)
+		    (SETF (CDR L) (CDDR L)))
+		   (T
+		    (SETF (CAADR L) (- INDEX WIDTH))
+		    (SETQ L (CDR L)))))
+       )))) 
+
+;; Insert N copies of a self-inserting character.  A character gets here by being
+;; non-control-meta and not having an editing command associated with it.  No characters
+;; with control-meta bits set should ever reach here.
+
+(DEFRESOURCE IE-INSERT-STRING ()
+  :CONSTRUCTOR (MAKE-ARRAY 128. :TYPE ART-FAT-STRING)
+  :INITIAL-COPIES 1)
+
+(DEFUN-IE IE-INSERT-CHAR (CHAR &OPTIONAL (RETURN-OK? NIL))
+  (IF (NOT ( 1 *NUMERIC-ARG* 1000.))
+      (SEND SELF :BEEP)
+      (USING-RESOURCE (STRING IE-INSERT-STRING)
+	(ASSURE-ARRAY-SIZE STRING *NUMERIC-ARG*)
+	(DOTIMES (I *NUMERIC-ARG*) (ASET CHAR STRING I))
+	(IE-INSERT-STRING STRING 0 *NUMERIC-ARG* RETURN-OK?))))
+
+;; After moving the cursor or changing the text beneath the cursor, adjust the size of the
+;; blinker to be the same as the character beneath it.  The top edge of the blinker always
+;; stays the same.  Only the bottom edge will move up and down.  In order to move the top
+;; edge down to the top of the character, the cursorpos of the blinker would have to be
+;; adjusted as well as the size.
+(DEFUN-IE IE-ADJUST-BLINKER ()
+  (WHEN (AND (TYPEP SELF 'TV:SHEET) (TV:SHEET-FOLLOWING-BLINKER SELF)
+	     (NOT (SEND SELF :LISTEN)))
+    (LET* ((FILL-POINTER (IEB-FILL-POINTER))
+	   (TYPEIN-POINTER (IEB-TYPEIN-POINTER))
+	   CHAR STYLE)
+      (COND
+	;; Empty buffer.
+	;; Use the typein stype
+	((ZEROP FILL-POINTER)
+	 (SETQ STYLE (INDEX-CHARACTER-STYLE TYPEIN-STYLE)))
+	;; Cursor at the end of the buffer, use standard blinker
+	((= FILL-POINTER TYPEIN-POINTER)
+	 (SETQ CHAR NIL))
+	;; Cursor in the middle of the buffer.
+	;; Use the character width of the character beneath the cursor.
+	(T (SETQ CHAR (AREF INPUT-EDITOR-BUFFER TYPEIN-POINTER))))
+      ;; If a specific character is given, find its width.
+      (SEND SELF :ADJUST-BLINKER CHAR (MERGE-CHARACTER-STYLES
+					STYLE (SEND SELF :DEFAULT-CHARACTER-STYLE))))))
+
+;; Wait until the user types a character, a notification is received, or a caller specified
+;; input-wait function goes off.  The :INPUT-WAIT-HANDLER is invoked whether or not an
+;; :INPUT-WAIT option is specified.
+(DEFUN-IE IE-INPUT-WAIT-1 (SUPPRESS-NOTIFICATIONS INPUT-WAIT INPUT-WAIT-HANDLER)
+  (IF (AND (OR (NOT INPUT-WAIT)
+	       (EQUAL (SYS:FUNCTION-NAME (CADR INPUT-WAIT)) 'DW::MOUSE-MOTION-PENDING))
+	   (OR SUPPRESS-NOTIFICATIONS
+	       (EQL *CURRENT-PROCESS* (SEND-IF-HANDLES SELF :PROCESS))))
+      (LEXPR-SEND SELF :INPUT-WAIT (CAR INPUT-WAIT)
+		  ;; this gross hack tells the lower level handlers that it's OK to
+		  ;; block.  I don't know the IE protocols well enough to know where to
+		  ;; implement all the required :INPUT-BLOCK companions to :INPUT-WAIT.
+		  'PROCESS::VERIFY-FUNCTION
+		  (LAMBDA (NOTE &REST INPUT-WAIT)
+		    (OR (AND NOTE (CDR NOTE))
+			(AND INPUT-WAIT (APPLY (CAR INPUT-WAIT) (CDR INPUT-WAIT)))))
+		  (UNLESS SUPPRESS-NOTIFICATIONS (LOCF NOTIFICATION))
+		  (CDR INPUT-WAIT))
+      (LEXPR-SEND SELF :INPUT-WAIT (CAR INPUT-WAIT)
+		  (LAMBDA (NOTE &REST INPUT-WAIT)
+		    (OR (AND NOTE (CDR NOTE))
+			(AND INPUT-WAIT (APPLY (CAR INPUT-WAIT) (CDR INPUT-WAIT)))))
+		  (UNLESS SUPPRESS-NOTIFICATIONS (LOCF NOTIFICATION))
+		  (CDR INPUT-WAIT)))
+  (WHEN INPUT-WAIT-HANDLER
+    (APPLY (CAR INPUT-WAIT-HANDLER) (CDR INPUT-WAIT-HANDLER))))
+
+;; Loop until either a valid character or a blip is read.   The input
+;; editor isn't called recursively since RUBOUT-HANDLER is bound to
+;; :TYI.  If this doesn't return a character, it returns NIL or :EOF.
+;; It never returns a blip.
+
+;;--- The blip handling looks asymmetrical: shouldn't all blips be able to turn
+;;--- into characters, not just blip-handler properties? --Moon
+;;--- Yes.  It was poorly thought out and should be redone.  --CWH
+
+(DEFUN-IE IE-TYI (&OPTIONAL TOP-LEVEL?)
+  (LET ((SUPPRESS-NOTIFICATIONS (INPUT-EDITOR-FLAG :SUPPRESS-NOTIFICATIONS))
+	(NOTIFICATION-HANDLER (INPUT-EDITOR-OPTION :NOTIFICATION-HANDLER))
+	(INPUT-WAIT (INPUT-EDITOR-OPTION :INPUT-WAIT))
+	(INPUT-WAIT-HANDLER (INPUT-EDITOR-OPTION :INPUT-WAIT-HANDLER)))
+    (DO (CHAR BLIP-HANDLER) (NIL)
+      (IE-ADJUST-BLINKER)
+      (IE-INPUT-WAIT-1 SUPPRESS-NOTIFICATIONS INPUT-WAIT INPUT-WAIT-HANDLER)
+      (COND ((AND (NOT SUPPRESS-NOTIFICATIONS) (SETQ CHAR (SEND SELF :RECEIVE-NOTIFICATION)))
+	     (COND (NOTIFICATION-HANDLER
+		    (LEXPR-FUNCALL (CAR NOTIFICATION-HANDLER) CHAR (CDR NOTIFICATION-HANDLER)))
+		   (T (SEND SELF :START-TYPEOUT :INSERT)
+		      (DISPLAY-NOTIFICATION SELF CHAR :STREAM)
+		      (SEND SELF :FINISH-TYPEOUT :FRESH-LINE))))
+	    ((SETQ CHAR
+		   (CONDITION-CASE ()
+		       (SEND SELF :ANY-TYI-NO-HANG T)
+		     (END-OF-FILE
+		       (IF TOP-LEVEL? (RETURN :EOF))
+		       (SEND SELF :BEEP)
+		       NIL)))
+	     (COND ((CHARACTERP CHAR)
+		    (UNLESS (CHAR-FAT-P CHAR)
+		      (SETF (CHAR-STYLE-INDEX CHAR) TYPEIN-STYLE))
+		    (RETURN CHAR))
+		   (T
+		    (BLOCK DEAD-BLIP
+		      (COND 
+			;; Allow a blip handler to be specified dynamically.
+			((AND (SETQ BLIP-HANDLER (INPUT-EDITOR-FLAG :BLIP-HANDLER))
+			      TOP-LEVEL?
+			      (FUNCALL BLIP-HANDLER CHAR SELF)))
+			;; Allow a blip handler to be specified statically.  Used by Japanese,
+			;; and by dynamic windows.
+			((AND (NOT (ATOM CHAR))
+			      (SETQ BLIP-HANDLER (OR (INPUT-EDITOR-FLAG :DYNAMIC-BLIP-HANDLER)
+						     (GET (CAR CHAR) 'BLIP-HANDLER))))
+			 (SETQ CHAR (FUNCALL BLIP-HANDLER CHAR SELF))
+			 (WHEN (LISTP CHAR)
+			   (WHEN (EQ (FIRST CHAR) 'DW:DEAD-BLIP)
+			     (RETURN-FROM DEAD-BLIP NIL))
+			   ;; This allows preemptable read to see non dw blips.
+			   (WHEN (AND (INPUT-EDITOR-FLAG :PREEMPTABLE)
+				      (NOT (DW:PRESENTATION-BLIP-P CHAR)))
+			     (SETF ACTIVATOR CHAR)
+			     (THROW 'INPUT-EDITOR-RESCAN NIL))
+			   (RETURN CHAR))
+			 (WHEN CHAR
+			   (UNLESS (CHAR-FAT-P CHAR)
+			     (SETF (CHAR-STYLE-INDEX CHAR) TYPEIN-STYLE))
+			   (RETURN CHAR)))
+			;; Throw out of the read function if this option is specified.
+			;; This should really take a predicate to determine whether or
+			;; not to throw, like :ACTIVATION and :COMMAND.
+			((INPUT-EDITOR-FLAG :PREEMPTABLE)
+			 (SETF ACTIVATOR CHAR)
+			 (THROW 'INPUT-EDITOR-RESCAN NIL))
+			(T (TYI-BLIP-HANDLER CHAR SELF))))
+		    ;; If a blip is received but no value is returned, then return now for
+		    ;; the benefit of :FULL-RUBOUT.
+		    (IF TOP-LEVEL? (RETURN NIL)))))))))
+
+(DEFUN-IE IE-BARF () (SEND SELF :BEEP) (THROW 'INPUT-EDITOR-BARF NIL))
+
+;; This is called whenever the contents of the buffer are displayed.  The ignored argument is
+;; the argument which is given to :REFRESH-RUBOUT-HANDLER.
+
+(DEFMETHOD (INPUT-EDITOR-REFRESH DISPLAY-INPUT-EDITOR) ()
+  (IE-CURSOR-MOTION (IEB-TYPEIN-POINTER)))
+
+(DEFMETHOD (INPUT-EDITOR-CURSOR-MOTION DISPLAY-INPUT-EDITOR) (POSITION)
+  (IE-CURSOR-MOTION POSITION))
+
+
+;;; What is the theory of styles here?  The old theory was that the style
+;;; of the string supplied here was irrelevant, and that the style of 
+;;; the replacing string was coerced to the default typein style.  
+;;; The new theory is that any styles in the new string must be merged against 
+;;; the typein style.  This may not be right, either.  Because it may be wrong,
+;;; the code has been left S-L-O-W.  It can be optimized when we finish figuring this out.
+;;; ---BIM
+
+(DEFMETHOD (INPUT-EDITOR-REPLACE-INPUT DISPLAY-INPUT-EDITOR)
+	   (N-CHARS STRING BEGIN END)
+  (FLET ((MERGED-CHAR (C)
+	   (SETF (CHAR-STYLE-INDEX C)
+		 (SI:STYLE-INDEX (SI:MERGE-CHARACTER-STYLES (CHAR-STYLE C)
+						  (SI:INDEX-CHARACTER-STYLE TYPEIN-STYLE))))
+	   C))	 
+    (LET* ((*RESCAN-STATE* NIL)
+	   (SCAN-POINTER (IEB-SCAN-POINTER))
+	   (END-POINTER (MIN SCAN-POINTER (IEB-FILL-POINTER)))
+	   (MATCH 0))
+      (LOOP FOR INPUT-INDEX FROM (- SCAN-POINTER N-CHARS) BELOW END-POINTER
+	    FOR SUPPLIED-STRING-CHAR BEING THE ARRAY-ELEMENTS OF STRING FROM BEGIN BELOW END
+	    AS NEW-CHAR = (MERGED-CHAR SUPPLIED-STRING-CHAR)
+	    AS BUFFER-CHAR = (IE-CHARACTER INPUT-INDEX)
+	    WHILE (CHAR= BUFFER-CHAR NEW-CHAR)	; ---CHAR=, so styles have to match.
+						; ---Is this right?
+	    DO (INCF MATCH))
+	(LET ((TYPEIN-POINTER (IEB-TYPEIN-POINTER)))
+	  (UNLESS (= MATCH N-CHARS (- END BEGIN))	;Chars to be replaced all match.
+	    ;; This is a crock of the highest order.  If we don't do this, redisplay will
+	    ;; get confused, thinking the noise string isn't there and updating the display
+	    ;; to only have as many characters of that string as are left in the buffer.
+	    ;; It just cannot work to store noise strings this way.
+	    (WHEN (ASSQ 0 (IEB-NOISE-STRINGS))
+	      (MULTIPLE-VALUE-BIND (X Y) (SEND SELF :READ-CURSORPOS)
+		(SEND SELF :CLEAR-BETWEEN-CURSORPOSES BUFFER-X BUFFER-Y X Y))
+	      (SEND SELF :SET-CURSORPOS BUFFER-X BUFFER-Y)
+	      (INPUT-EDITOR-STRING-OUT)
+	      (INPUT-EDITOR-REFRESH SELF))
+	    (IE-DELETE-STRING (+ (- SCAN-POINTER N-CHARS) MATCH) END-POINTER NIL)
+	    (IE-INSERT-STRING STRING (+ BEGIN MATCH) END NIL
+			      (SI:INDEX-CHARACTER-STYLE TYPEIN-STYLE)))
+	  (WHEN (> TYPEIN-POINTER END-POINTER)
+	    (INCF TYPEIN-POINTER (- (- END BEGIN) N-CHARS))
+	    (IE-CURSOR-MOTION TYPEIN-POINTER (IEB-TYPEIN-POINTER))
+	    (SETF (IEB-TYPEIN-POINTER) TYPEIN-POINTER))))))
+
+
+
+;; Main Loop
+
+(DEFUN IE-THROW ()
+  (IF *RESCAN-STATE*
+      (THROW 'INPUT-EDITOR-RESCAN NIL)
+      (THROW 'INPUT-EDITOR-RETURN NIL)))
+
+(DEFUN IE-EOL-ACTIVATE ()
+  (UNLESS (EQ *RESCAN-STATE* :ACTIVATION)
+    (IE-THROW)))
+
+(DEFUN-IE IE-ACTIVATE (THING &OPTIONAL (SET-POSITION? T))
+  (IF SET-POSITION? (IE-SET-POSITION (IEB-FILL-POINTER)))
+  (SETF ACTIVATOR THING)
+  (IE-THROW))
+
+;; input is called whenever a :TYI message is sent to a stream and we are inside the input
+;; editor.  If a normal character is typed, it is echoed, put in the buffer, and returned.  If
+;; a rubout or any other editing character is typed, any number of editing commands are
+;; processed by modifying the buffer, then, when the first non-editing character is typed, a
+;; throw is done back to the top level of the read function and the buffered input is
+;; re-scanned.  The character must be typed at the end of the line in order for the throw to
+;; take place.
+
+(DEFMETHOD (INPUT-EDITOR-TYI DISPLAY-INPUT-EDITOR) (*RESCAN-STATE*)
+  (LET ((KBD-CHAR) (STYLE-CHAR) (CHAR) (CONTROL-META) (HANDLER) (DIGIT) (FILL-POINTER-START)
+	(RESCAN (INPUT-EDITOR-OPTION :RESCAN))
+	(BLIP-CHARACTER (INPUT-EDITOR-OPTION :BLIP-CHARACTER))
+	(ACTIVATION (INPUT-EDITOR-OPTION :ACTIVATION))
+	(COMMAND (INPUT-EDITOR-OPTION :COMMAND))
+	(EDITOR-COMMAND (INPUT-EDITOR-OPTION :EDITOR-COMMAND))
+	(DO-NOT-ECHO (INPUT-EDITOR-OPTION :DO-NOT-ECHO))
+	(PASS-THROUGH (INPUT-EDITOR-OPTION :PASS-THROUGH))
+	(FULL-RUBOUT (INPUT-EDITOR-FLAG :FULL-RUBOUT))
+	(LIMITED-FULL-RUBOUT (INPUT-EDITOR-FLAG :LIMITED-FULL-RUBOUT))
+	(*INPUT-HISTORY-DEFAULT* (INPUT-EDITOR-FLAG :INPUT-HISTORY-DEFAULT))
+	(*NUMERIC-ARG* 1)
+	(*NUMERIC-ARG-P* NIL)
+	(RUBOUT-HANDLER :TYI)
+	(KBD-INTERCEPTED-CHARACTERS NIL))
+    
+    ;; Read characters.  If an ordinary character typed and nothing rubbed out, return
+    ;; immediately.  Otherwise, let all editing operations complete before returning. 
+    (CATCH 'INPUT-EDITOR-RETURN
+      (DO () (NIL)
+
+	(SETQ FILL-POINTER-START (IEB-FILL-POINTER))
+
+	(IF RESCAN-CHARACTER
+	    (PROGN 
+	      (SETQ KBD-CHAR RESCAN-CHARACTER) 
+	      (SETQ STYLE-CHAR RESCAN-CHARACTER)
+	      (SETF RESCAN-CHARACTER NIL)
+	      (SETF RESCAN-POINTER NIL))
+	    (SETQ STYLE-CHAR (IE-TYI T))
+	    (SETQ KBD-CHAR STYLE-CHAR)
+	    (WHEN (CHARACTERP KBD-CHAR)
+	      (SETF (CHAR-STYLE-INDEX KBD-CHAR) 0)))
+
+	(WHEN (CHARACTERP KBD-CHAR)
+	  (SETQ CHAR (MAKE-CHAR KBD-CHAR))	;Strip control bits, still no style.
+	  (SETQ CONTROL-META (CHAR-BITS KBD-CHAR)))
+
+	(COND
+
+	  ;; Check for blip here; should of course be done after user predicates, but they
+	  ;; tend to blow out on blips.
+	  ((LISTP KBD-CHAR)
+	   (IF (NOT (DW::PRESENTATION-BLIP-P KBD-CHAR))	;Keep old style blips out.
+	       (SELECTQ (FIRST KBD-CHAR)
+		 ;;+++ Kludge for dynamic editor
+		 ((ZWEI:REDISPLAY ZWEI:MUST-REDISPLAY-INTERVAL ZWEI:SELECT-WINDOW)
+		  ;Nice try, but you really cannot guarantee the right context.
+		  ;(APPLY #'ZWEI:PROCESS-SPECIAL-COMMAND KBD-CHAR)
+		  )
+		 (OTHERWISE
+		  (BEEP)))
+	       #||	;This is a nice idea, but doesn't work because the blip gets processed
+	       		;too soon and inserted before anything on rescan.
+	       (WHEN (OR (EQ *RESCAN-STATE* :EOL) ( (IEB-TYPEIN-POINTER) (IEB-SCAN-POINTER)))
+		 (SETF RESCAN-CHARACTER KBD-CHAR)
+		 (SETF RESCAN-POINTER (IEB-TYPEIN-POINTER))
+		 (THROW 'INPUT-EDITOR-RESCAN NIL))
+	       ||#
+	       ;;Put blip into input buffer.
+	       (DESTRUCTURING-BIND (&KEY ONCE-ONLY ACTIVATE &ALLOW-OTHER-KEYS)
+				   (DW:PRESENTATION-BLIP-OPTIONS KBD-CHAR)
+		 (IF ONCE-ONLY
+		     (THROW 'INPUT-EDITOR-RETURN KBD-CHAR)
+		   (DW:PRESENTATION-BLIP-CASE KBD-CHAR
+		     (DW::WINDOW-WAKEUP
+		       (LET ((HANDLER (INPUT-EDITOR-FLAG :WINDOW-WAKEUP)))
+			 (WHEN HANDLER
+			   (LET ((RUBOUT-HANDLER NIL))	;Fake out innocent redisplay
+			     (FUNCALL HANDLER KBD-CHAR))))
+		       (DW:PRESENTATION-BLIP-CASE KBD-CHAR
+			 ((OR DW::WINDOW-WAKEUP-REFRESH
+			      DW::WINDOW-WAKEUP-REDISPLAY  ;sometimes needs to refresh,
+							   ;sometimes doesn't, but it's fast
+			      DW::WINDOW-WAKEUP-VIEWPORT-POSITION-CHANGED)
+			   (WHEN (EQ SELF (DW:PRESENTATION-BLIP-OBJECT KBD-CHAR))
+			     (SEND-IF-HANDLES SELF
+					      :REFRESH-RUBOUT-HANDLER-BUFFER-IF-VISIBLE)))))
+		     (INPUT-EDITOR
+		       (IE-INSERT-FROM-HISTORY (DW:PRESENTATION-BLIP-OBJECT KBD-CHAR) NIL
+					       ACTIVATE))
+		     (T
+		       (IE-INSERT-BLIP KBD-CHAR T)))
+		   (WHEN ACTIVATE
+		     (IE-ACTIVATE (IE-MAKE-BLIP :ACTIVATION KBD-CHAR NIL)))))))
+
+	  ;; Blip being discarded.  Check for :FULL-RUBOUT.
+	  ((NOT KBD-CHAR))
+
+	  ;; Rescan character.  Make sure that the reader state
+	  ;; corresponds to the input editor state before examining this
+	  ;; character.  The reader state corresponds to the input
+	  ;; editor state if the input buffer has not been modified, and
+	  ;; if the typein pointer is at the scan pointer.
+	  ((AND RESCAN
+		;; Make sure we are not inside a parse-ferror.
+		(NOT (EQ *RESCAN-STATE* :ACTIVATION))
+		;; Either input buffer doesn't match reader state or cursor has been moved.
+		(OR (EQ *RESCAN-STATE* :EOL) ( (IEB-TYPEIN-POINTER) (IEB-SCAN-POINTER)))
+		(LEXPR-FUNCALL (CAR RESCAN) KBD-CHAR (CDR RESCAN)))
+	   (SETF RESCAN-CHARACTER KBD-CHAR)
+	   (SETF RESCAN-POINTER (IEB-TYPEIN-POINTER))
+	   (THROW 'INPUT-EDITOR-RESCAN NIL))
+
+	  ;; Do-not-echo character or EOF indicator turns into activation
+	  ((OR (AND DO-NOT-ECHO (MEM #'CHAR= KBD-CHAR DO-NOT-ECHO))	;--- CHAR-EQUAL?
+	       (EQ KBD-CHAR :EOF))
+	   (IE-ACTIVATE KBD-CHAR))
+
+	  ;; Blip character is just returned as a blip
+	  ((AND BLIP-CHARACTER (LEXPR-FUNCALL (CAR BLIP-CHARACTER) KBD-CHAR (CDR BLIP-CHARACTER)))
+	   (THROW 'INPUT-EDITOR-RETURN
+	     (IE-MAKE-BLIP :BLIP-CHARACTER KBD-CHAR (AND *NUMERIC-ARG-P* *NUMERIC-ARG*))))
+
+	  ;; Activation character turns into blip
+	  ((AND ACTIVATION (LEXPR-FUNCALL (CAR ACTIVATION) KBD-CHAR (CDR ACTIVATION)))
+	   (IE-ACTIVATE (IE-MAKE-BLIP :ACTIVATION KBD-CHAR (AND *NUMERIC-ARG-P* *NUMERIC-ARG*))))
+
+	  ;; Keystroke command
+	  ((AND COMMAND (LEXPR-FUNCALL (CAR COMMAND) KBD-CHAR (CDR COMMAND)))
+	   (SETF ACTIVATOR (IE-MAKE-BLIP :COMMAND KBD-CHAR (AND *NUMERIC-ARG-P* *NUMERIC-ARG*)))
+	   (THROW 'INPUT-EDITOR-RESCAN NIL))
+
+	  ;; Pass-through character: don't touch it, just treat it as self-inserting.
+	  ;; Don't even add a font to it.
+	  ((AND (ZEROP CONTROL-META) (MEM #'CHAR= CHAR PASS-THROUGH))	;--- CHAR-EQUAL?
+	   (IE-INSERT-CHAR CHAR T))
+
+	  ;; An editing command of some sort.  The function can examine the values of the
+	  ;; specials, and should set *RESCAN-STATE* to :EOL if throwing to INPUT-EDITOR-RESCAN
+	  ;; will be necessary.
+	  ((SETQ HANDLER (CDR (OR (ASS #'CHAR= KBD-CHAR EDITOR-COMMAND)
+				  (ASS #'CHAR= KBD-CHAR *COMMAND-ALIST*))))
+	   (CATCH 'INPUT-EDITOR-BARF
+	     (CONDITION-CASE ()
+		 (IF (LISTP HANDLER)
+		     (CL:APPLY (CAR HANDLER) SELF (CDR HANDLER))
+		     (FUNCALL HANDLER SELF))
+	       (ABORT)))
+	   (SETQ *NUMERIC-ARG* 1)
+	   (SETQ *NUMERIC-ARG-P* NIL))
+	  
+	  ;; An intercepted character that wasn't redefined in some other way.
+	  ;; KBD-INTERCEPTED-CHARACTERS is bound back to its usual value by BREAK
+	  ;; and the debugger rather than here since they may be invoked asynchronously.
+	  ((MEM #'CHAR= KBD-CHAR KBD-STANDARD-INTERCEPTED-CHARACTERS)
+	   (IE-CURSOR-MOTION (IEB-FILL-POINTER))
+	   (FUNCALL (OR (INPUT-EDITOR-FLAG :INTERCEPT-CHARACTER) #'KBD-INTERCEPT-CHARACTER)
+		    KBD-CHAR))
+
+	  ;; Handle c/m-number, c/m-minus, and c-U specially.
+	  ((AND (NOT (ZEROP CONTROL-META)) (SETQ DIGIT (DIGIT-CHAR-P CHAR)))
+	   (SETQ *NUMERIC-ARG*
+		 (SELECTQ *NUMERIC-ARG-P*
+		   (NIL DIGIT)
+		   (:SIGN (- DIGIT))
+		   (OTHERWISE (+ (* *NUMERIC-ARG* 10.)
+				 (IF (MINUSP *NUMERIC-ARG*) (- DIGIT) DIGIT)))))
+	   (SETQ *NUMERIC-ARG-P* :DIGITS))
+	  ((AND (NOT (ZEROP CONTROL-META)) (CHAR-EQUAL CHAR #\-))
+	   (SETQ *NUMERIC-ARG* -1)
+	   (SETQ *NUMERIC-ARG-P* :SIGN))
+	  ((CHAR-EQUAL KBD-CHAR #\CONTROL-U)
+	   (SETQ *NUMERIC-ARG* (* *NUMERIC-ARG* 4))
+	   (SETQ *NUMERIC-ARG-P* :CONTROL-U))
+	  
+	  ;; Some other random control character or format effector.  Beep and ignore.
+	  ((NOT (OR (GRAPHIC-CHAR-P KBD-CHAR)
+		    (MEM-CHAR KBD-CHAR '(#\RETURN #\TAB #\BACKSPACE))
+		    (DIACRITIC-CHAR-P KBD-CHAR)))
+	   (SEND SELF :BEEP)
+	   (SETQ *NUMERIC-ARG* 1)
+	   (SETQ *NUMERIC-ARG-P* NIL))
+	  
+	  ;; Self-inserting character.  Typing at the end of the line throws to IE-RETURN.
+	  (T (IE-INSERT-CHAR STYLE-CHAR T)
+	     (SETQ *NUMERIC-ARG* 1)
+	     (SETQ *NUMERIC-ARG-P* NIL)))
+	
+	;; If the buffer is empty and the :FULL-RUBOUT option is active, then throw now.
+	;; This will throw if the user types Rubout or Refresh immediately after
+	;; entering the read function.  It is important that we check for this here
+	;; and not in IE-DELETE-STRING since some commands, such as Yank-Pop, may
+	;; temporarily empty the buffer.  It wouldn't be the right thing to throw
+	;; if the buffer only contained whitespace since it is the responsibility
+	;; of the caller to discard whitespace when looking for special characters.
+	(WHEN (AND (NOT *NUMERIC-ARG-P*)
+		   (ZEROP (IEB-FILL-POINTER))
+		   (OR FULL-RUBOUT
+		       ;; If the input editor buffer had something in it
+		       ;; when we started, but has been emptied as a
+		       ;; side effect of this pass through the main
+		       ;; loop, force a rescan.  This causes RUBOUT,
+		       ;; CLEAR-INPUT, c-A c-K, etc. to return to the
+		       ;; top-level input context.
+		       (NOT (ZEROP FILL-POINTER-START))
+		       (AND LIMITED-FULL-RUBOUT
+			    (MEMBER KBD-CHAR '(#\Rubout #\Clear-Input)))))
+	  (IE-ADJUST-BLINKER)
+	  (THROW 'INPUT-EDITOR-RESCAN NIL))))))
+
+;; Commands
+
+(DEFPROP DEFINE-IE-COMMAND "Input Editor command" SI:DEFINITION-TYPE-NAME)
+
+(DEFMACRO DEFINE-IE-COMMAND (NAME CHARS &BODY BODY)
+  (LET ((COM-NAME (INTERN (STRING-APPEND "COM-" NAME)))
+	(ARGLIST (AND (EQ (CAR BODY) ':ARGLIST)		;Used with :EDITOR-COMMAND i.e. option
+		      (PROG1 (CADR BODY) (SETQ BODY (CDDR BODY))))))
+    (UNLESS (CL:LISTP CHARS)
+      (SETQ CHARS (LIST CHARS)))
+    `(PROGN
+       (RECORD-SOURCE-FILE-NAME ',NAME 'DEFINE-IE-COMMAND)
+       (DEFMETHOD (,COM-NAME INTERACTIVE-STREAM) ,ARGLIST
+	 (DECLARE (SYS:FUNCTION-PARENT ,NAME DEFINE-IE-COMMAND)
+		  (FLAVOR:SOLITARY-METHOD))
+	 ,@BODY)
+       ,@ (IF CHARS `((ADD-IE-COMMAND ',COM-NAME . ,CHARS)))
+       )))
+
+(DEFUN ADD-IE-COMMAND (NAME &REST CHARS)
+  (DOLIST (C CHARS)
+    (LET ((ENTRY (ASS #'CHAR= C *COMMAND-ALIST*)))
+      (IF ENTRY
+	  (RPLACD ENTRY NAME)
+	  (SETQ *COMMAND-ALIST* (NCONC *COMMAND-ALIST* (LIST (CONS C NAME))))))))
+
+(DEFUN (ADD-IE-COMMAND :UNDO-FUNCTION) (FORM)
+  (MAKE-UNDO-FOR-ADD//DELETE-IE-COMMAND (CDDR FORM)))
+
+(DEFUN DELETE-IE-COMMANDS (&REST CHARS)
+  (DOLIST (C CHARS)
+    (DEL #'(LAMBDA (X Y) (EQL X (CAR Y))) C *COMMAND-ALIST*)))
+
+(DEFUN (DELETE-IE-COMMANDS :UNDO-FUNCTION) (FORM)
+  (MAKE-UNDO-FOR-ADD//DELETE-IE-COMMAND (CDR FORM)))
+
+(DEFUN MAKE-UNDO-FOR-ADD//DELETE-IE-COMMAND (CHARS &AUX (RESULT '()))
+  (DOLIST (CHAR CHARS)
+    (SETQ CHAR (EVAL CHAR))
+    (LET ((ENTRY (ASS #'CHAR= CHAR *COMMAND-ALIST*)))
+      (PUSH (IF ENTRY
+		`(ADD-IE-COMMAND     ',(CDR ENTRY) ,CHAR)
+		`(DELETE-IE-COMMANDS ,CHAR))
+	    RESULT)))
+  (IF (CDR RESULT) `(PROGN ,@(NREVERSE RESULT)) (CAR RESULT)))
+
+;; So that we can use some Zwei primitives here...
+(DEFMACRO FAKING-ZWEI-NODE (((BP-VAR NODE-VAR) (INDEX STRING &OPTIONAL START END))
+			    &BODY BODY)
+  `(FAKING-ZWEI-NODE-1
+     ,INDEX ,STRING ,START ,END
+     (NAMED-LAMBDA FAKING-ZWEI-NODE (,BP-VAR ,NODE-VAR)
+       (DECLARE (SYS:DOWNWARD-FUNCTION))
+       ,@BODY)))
+
+(DEFUN FAKING-ZWEI-NODE-1 (INDEX STRING START END CONTINUATION)
+  (WHEN (NULL START) (SETQ START 0))
+  (WHEN (NULL END) (SETQ END (STRING-LENGTH STRING)))
+  (SYS:WITH-DATA-STACK
+    (LET (FIRST-LINE PREVIOUS-LINE FINAL-LINE LINE-FOLLOWED-BY-RETURN BP
+	  (NODE (MAKE-INSTANCE 'ZWEI:NODE :AREA :STACK)))
+      (DW::DO-DELIMITED-SUBSTRINGS ((STRING :START START :END END)
+				    (CHAR SUB-START SUB-END))
+	  (LET ((LINE (MAKE-ZWEI-LINE-ON-DATA-STACK
+			STRING SUB-START SUB-END
+			PREVIOUS-LINE NODE)))
+	    (WHEN (NULL FIRST-LINE)
+	      (SETQ FIRST-LINE LINE))
+	    (SETQ PREVIOUS-LINE LINE)
+	    (SETQ FINAL-LINE LINE)
+	    (WHEN (AND ( SUB-START INDEX)
+		       ( INDEX SUB-END))	;hack for cr
+	      (SETQ BP (ZWEI:CREATE-BP LINE (- INDEX SUB-START)
+				       :NORMAL NODE)))
+	    (SETQ LINE-FOLLOWED-BY-RETURN NIL))
+	((#\Return)
+	 (IGNORE CHAR)
+	 (SETQ LINE-FOLLOWED-BY-RETURN T)))
+      (WHEN LINE-FOLLOWED-BY-RETURN
+	(SETQ FINAL-LINE (MAKE-ZWEI-LINE-ON-DATA-STACK "" 0 0 PREVIOUS-LINE NODE)))
+      (SETF (ZWEI:NODE-FIRST-BP NODE)
+	    (ZWEI:CREATE-BP FIRST-LINE 0 :NORMAL NODE))
+      (SETF (ZWEI:NODE-LAST-BP NODE)
+	    (ZWEI:CREATE-BP FINAL-LINE (ZWEI:LINE-LENGTH FINAL-LINE) :MOVES NODE))
+      (FUNCALL CONTINUATION BP NODE))))
+
+(DEFUN MAKE-ZWEI-LINE-ON-DATA-STACK (STRING SUB-START SUB-END PREVIOUS-LINE NODE)
+  (LET ((LINE (SYS:MAKE-STACK-ARRAY (- SUB-END SUB-START)
+				    :TYPE (ARRAY-TYPE STRING)
+				    :LEADER-LENGTH ZWEI:LINE-LEADER-SIZE)))
+    (ZWEI:ALTER-LINE LINE
+      ZWEI:LINE-LENGTH (- SUB-END SUB-START)
+      ZWEI:LINE-PREVIOUS PREVIOUS-LINE
+      ZWEI:LINE-TICK ZWEI:*TICK*
+      ZWEI:LINE-NODE NODE)
+    (WHEN PREVIOUS-LINE (SETF (ZWEI:LINE-NEXT PREVIOUS-LINE) LINE))
+    (CL:REPLACE LINE STRING :START2 SUB-START :END2 SUB-END)
+    LINE))
+
+(DEFMACRO WITH-ZWEI-CONTEXT (&BODY BODY)
+  `(LET ((ZWEI:*MODE-LIST-SYNTAX-TABLE*
+	   (APPROPRIATE-ZWEI-LIST-SYNTAX-TABLE)))
+     ,@BODY))
+
+(DEFVAR *LISP-MODE-TO-APPROPRIATE-ZWEI-LIST-SYNTAX-TABLE*
+	`((:COMMON-LISP . ZWEI:*CL-LIST-SYNTAX-TABLE*)
+	  (:ZETALISP . ZWEI:*LIST-SYNTAX-TABLE*))
+  "Map from lisp mode to a Zwei syntax table.")
+
+(DEFUN APPROPRIATE-ZWEI-LIST-SYNTAX-TABLE ()
+  (LET* ((SYNTAX (CURRENT-LISP-SYNTAX))	
+	 (SYNTAX-NAME (AND SYNTAX (LISP-SYNTAX-NAME-SYMBOL SYNTAX))))
+    (OR (SYMEVAL (CDR (ASSQ SYNTAX-NAME
+			    *LISP-MODE-TO-APPROPRIATE-ZWEI-LIST-SYNTAX-TABLE*)))
+	ZWEI:*CL-LIST-SYNTAX-TABLE*)))
+
+(ZWEI:DEFINDENTATION (IE-APPLY-ZWEI-BP-FUNCTION 1 1))
+(DEFUN-IE IE-APPLY-ZWEI-BP-FUNCTION (ZWEI-FUNCTION POS &REST ARGS)
+  (DECLARE (VALUES NEW-POS FOUND-P))
+  (FAKING-ZWEI-NODE ((BP ZWEI:*INTERVAL*) (POS INPUT-EDITOR-BUFFER))
+    (LET ((BP (AND BP (WITH-ZWEI-CONTEXT
+			(SCL:APPLY ZWEI-FUNCTION BP ARGS)))))
+      (IF BP
+	  ;; Convert from a Zwei BP to a position
+	  (VALUES (ZWEI:COUNT-CHARS (ZWEI:NODE-FIRST-BP ZWEI:*INTERVAL*) BP T) T)
+	(VALUES POS NIL)))))
+
+;; Reprint input after clearing the window.
+
+(DEFINE-IE-COMMAND REFRESH-WINDOW #\REFRESH
+  (WHEN (SEND-IF-HANDLES SELF :VIEWPORT-POSITION)
+    ;; For the sake of streams in which :clear-window doesn't actually erase, don't
+    ;; duplicate the prompt.
+    (MULTIPLE-VALUE-BIND (X Y) (SEND SELF :READ-CURSORPOS)
+      (SEND SELF :CLEAR-BETWEEN-CURSORPOSES PROMPT-X PROMPT-Y X Y))
+    (SEND SELF :SET-CURSORPOS PROMPT-X PROMPT-Y))
+  (SEND SELF :CLEAR-WINDOW)
+  (SEND SELF :REFRESH-RUBOUT-HANDLER :REFRESH))
+
+(DEFINE-IE-COMMAND ERASE-TYPEOUT (#\PAGE)
+  (WHEN TYPEOUT-X
+    (MULTIPLE-VALUE-CALL
+      #'CLEAR-BETWEEN-CURSORPOSES SELF TYPEOUT-X TYPEOUT-Y
+      (INPUT-EDITOR-COMPUTE-MOTION (IEB-TYPEIN-POINTER)))
+    (SEND SELF :REFRESH-RUBOUT-HANDLER :ERASE-TYPEOUT)))
+
+;; Buffer Commands
+
+(DEFINE-IE-COMMAND BEGINNING-OF-BUFFER (#\META-< #\Meta-Keyboard:Up #\Keyboard:Home)
+  (IE-SET-POSITION 0))
+
+(DEFINE-IE-COMMAND END-OF-BUFFER (#\META-> #\Meta-Keyboard:Down)
+  (SEND-IF-HANDLES SELF :SCROLL-TO-VISIBLE-CURSOR)
+  (IE-SET-POSITION (IEB-FILL-POINTER)))
+
+;; Flush all buffered input.  If nothing is in the buffer, then erase :OVERWRITE typeout,
+;; if any exists.  If the full rubout option is in use, then we will throw out of here.
+;; No need to prompt since the prompt still there.
+
+(DEFINE-IE-COMMAND CLEAR-INPUT (#\CLEAR-INPUT)
+  (IE-DELETE-STRING 0 NIL)
+  ;;+++ Experiment: try rescanning now here to get context correct
+  (THROW 'INPUT-EDITOR-RESCAN NIL)
+  )
+
+;; Character Commands
+
+(DEFINE-IE-COMMAND FORWARD-CHARACTER (#\CONTROL-F #\Keyboard:Right)
+  (IE-SET-POSITION (+ (IEB-TYPEIN-POINTER) *NUMERIC-ARG*)))
+
+(DEFINE-IE-COMMAND BACKWARD-CHARACTER (#\CONTROL-B #\Keyboard:Left)
+  (IE-SET-POSITION (- (IEB-TYPEIN-POINTER) *NUMERIC-ARG*)))
+
+(DEFINE-IE-COMMAND DELETE-CHARACTER (#\CONTROL-D)
+  (IE-DELETE-STRING (IEB-TYPEIN-POINTER)
+		    (+ (IEB-TYPEIN-POINTER) *NUMERIC-ARG*)
+		    *NUMERIC-ARG-P*))
+
+(DEFINE-IE-COMMAND RUBOUT-CHARACTER (#\RUBOUT)
+  (IE-DELETE-STRING (- (IEB-TYPEIN-POINTER) *NUMERIC-ARG*)
+		    (IEB-TYPEIN-POINTER)
+		    *NUMERIC-ARG-P*))
+
+(DEFINE-IE-COMMAND EXCHANGE-CHARACTERS (#\CONTROL-T)
+  (IF (< (IEB-FILL-POINTER) 2) (IE-BARF))
+  (LET ((DELETE-POINTER (IEB-TYPEIN-POINTER))
+	(STRING))
+    ;; At end of line, go back two chars; in middle of line, one; at beginning, none.
+    (DECF DELETE-POINTER (COND ((= DELETE-POINTER 0) 0)
+			       ((= DELETE-POINTER (IEB-FILL-POINTER)) 2)
+			       (T 1)))
+    (SETQ STRING (SUBSTRING INPUT-EDITOR-BUFFER DELETE-POINTER (+ DELETE-POINTER 2)))
+    (IE-DELETE-STRING DELETE-POINTER (+ DELETE-POINTER 2) NIL)
+    (SETQ STRING (STRING-NREVERSE STRING))
+    (IE-INSERT-STRING STRING))) ; style aught to be OK as is
+
+;; Line Commands
+
+;; Returns the position of the first newline appearing after POS.
+
+(DEFUN-IE IE-SEARCH-FORWARD-NEWLINE (POS)
+  (LET ((FILL-POINTER (IEB-FILL-POINTER)))
+    (OR (STRING-SEARCH-CHAR #\NEWLINE INPUT-EDITOR-BUFFER POS FILL-POINTER)
+	FILL-POINTER)))
+
+;; Returns the position of the first newline appearing before POS-1.
+;; Returns -1 if reached the beginning of the buffer.
+
+(DEFUN-IE IE-SEARCH-BACKWARD-NEWLINE (POS)
+  (DO ((I (1- POS) (1- I))
+       (BUF INPUT-EDITOR-BUFFER))
+      ((OR (< I 0) (AND (CHARACTERP (AREF BUF I)) (CHAR-EQUAL (AREF BUF I) #\NEWLINE)))
+       I)
+    (DECLARE (ARRAY-REGISTER BUF))))
+
+(DEFINE-IE-COMMAND BEGINNING-OF-LINE (#\CONTROL-A #\Meta-Keyboard:Left)
+  (IE-SET-POSITION (1+ (IE-SEARCH-BACKWARD-NEWLINE (IEB-TYPEIN-POINTER)))))
+
+(DEFINE-IE-COMMAND END-OF-LINE (#\CONTROL-E #\Meta-Keyboard:Right)
+  (IE-SET-POSITION (IE-SEARCH-FORWARD-NEWLINE (IEB-TYPEIN-POINTER))))
+
+(DEFINE-IE-COMMAND PREVIOUS-LINE (#\CONTROL-P #\Keyboard:Up)
+  (LET* ((LINE-BEGIN (IE-SEARCH-BACKWARD-NEWLINE (IEB-TYPEIN-POINTER)))
+	 (INDENT (- (IEB-TYPEIN-POINTER) LINE-BEGIN)))
+    (DOTIMES (I *NUMERIC-ARG*)
+      (DECLARE (IGNORE I))
+      (IF (= LINE-BEGIN -1) (RETURN))
+      (SETQ LINE-BEGIN (IE-SEARCH-BACKWARD-NEWLINE LINE-BEGIN)))
+    ;; When moving from a long line to a short line, be sure not to go off the end.
+    (IE-SET-POSITION (MIN (+ LINE-BEGIN INDENT)
+			  (IE-SEARCH-FORWARD-NEWLINE (1+ LINE-BEGIN))))))
+
+(DEFINE-IE-COMMAND NEXT-LINE (#\CONTROL-N #\Keyboard:Down)
+  (LET* ((LINE-BEGIN (IE-SEARCH-BACKWARD-NEWLINE (IEB-TYPEIN-POINTER)))
+	 (INDENT (- (IEB-TYPEIN-POINTER) LINE-BEGIN)))
+    (DOTIMES (I *NUMERIC-ARG*)
+      (DECLARE (IGNORE I))
+      (COND ((= LINE-BEGIN (IEB-FILL-POINTER))
+	     (SETQ LINE-BEGIN (IE-SEARCH-BACKWARD-NEWLINE LINE-BEGIN))
+	     (RETURN)))
+      (SETQ LINE-BEGIN (IE-SEARCH-FORWARD-NEWLINE (1+ LINE-BEGIN))))
+    ;; When moving from a long line to a short line, be sure not to go off the end.
+    (IE-SET-POSITION (MIN (+ LINE-BEGIN INDENT)
+			  (IE-SEARCH-FORWARD-NEWLINE (1+ LINE-BEGIN))))))
+
+(DEFINE-IE-COMMAND KILL-LINE (#\CONTROL-K)
+  (LET* ((TYPEIN-POINTER (IEB-TYPEIN-POINTER))
+	 (SEARCH-POINTER (IE-SEARCH-FORWARD-NEWLINE TYPEIN-POINTER))
+	 (FILL-POINTER (IEB-FILL-POINTER)))
+    (COND ((NOT *NUMERIC-ARG-P*)
+	   ;; If at the end of a line, kill the newline, otherwise kill up to the newline.
+	   (AND (= TYPEIN-POINTER SEARCH-POINTER)
+		(< TYPEIN-POINTER FILL-POINTER)
+		(INCF SEARCH-POINTER)))
+	  (T
+	   ;; Kill specified number of lines
+	   (LOOP FOR N DOWNFROM *NUMERIC-ARG*
+		 DO (WHEN (< SEARCH-POINTER FILL-POINTER)
+		      (INCF SEARCH-POINTER))
+		 WHILE (> N 1)
+		 DO (SETQ SEARCH-POINTER (IE-SEARCH-FORWARD-NEWLINE SEARCH-POINTER)))))
+    (IE-DELETE-STRING TYPEIN-POINTER SEARCH-POINTER)))
+
+;; Word Commands
+
+;; Use ZWEI's syntax table if ZWEI is around.
+;; When reading pathnames, we bind this to point to ZWEI's pathname
+;; syntax table because it makes a few more useful things (like ) be delimiters
+(DEFVAR *SYNTAX-TABLE* 'ZWEI:*WORD-SYNTAX-TABLE*)
+
+(DEFUN IE-ALPHABETIC? (C)
+  (IF (BOUNDP *SYNTAX-TABLE*)
+      (= (ZWEI:CHAR-SYNTAX C (SYMEVAL *SYNTAX-TABLE*)) ZWEI:WORD-ALPHABETIC)
+      (ALPHA-CHAR-P C)))
+
+(DEFUN IE-NOT-ALPHABETIC? (C)
+  (NOT (IE-ALPHABETIC? C)))
+
+(DEFUN-IE IE-ALPHABETIC-CHARACTER? (I)
+  (IE-ALPHABETIC? (IE-CHARACTER I)))
+
+(DEFUN-IE IE-SEARCH-FORWARD (PREDICATE POS END-OF-BUFFER-MODE)
+  (IF (= POS -1) (INCF POS))
+  (DO ((FILL-POINTER (IEB-FILL-POINTER))
+       (I POS (1+ I)))
+      ((= I FILL-POINTER)
+       (SELECTQ END-OF-BUFFER-MODE
+	 (:BARF (IE-BARF))
+	 (:INDEX I)
+	 (:NIL NIL)))
+    (IF (FUNCALL PREDICATE (AREF INPUT-EDITOR-BUFFER I)) (RETURN I))))
+
+(DEFUN-IE IE-SEARCH-BACKWARD (PREDICATE POS END-OF-BUFFER-MODE)
+  (IF (= POS (IEB-FILL-POINTER)) (DECF POS))
+  (DO ((I POS (1- I)))
+      ((= I -1)
+       (SELECTQ END-OF-BUFFER-MODE
+	 (:BARF (IE-BARF))
+	 (:INDEX I)
+	 (:NIL NIL)))
+    (IF (FUNCALL PREDICATE (AREF INPUT-EDITOR-BUFFER I)) (RETURN I))))
+
+;; Return the position of the first alphabetic character in the buffer, searching in
+;; either direction.  If on an alphabetic character, return its position.  If none between
+;; current the typein position and the end of line, return nil.
+
+(DEFUN-IE IE-SEARCH-FORWARD-ALPHABETIC (POS &OPTIONAL BARF?)
+  (IE-SEARCH-FORWARD #'IE-ALPHABETIC? POS (IF BARF? :BARF :NIL)))
+
+(DEFUN-IE IE-SEARCH-BACKWARD-ALPHABETIC (POS &OPTIONAL BARF?)
+  (IE-SEARCH-BACKWARD #'IE-ALPHABETIC? POS (IF BARF? :BARF :NIL)))
+
+;; Return the position of the first non-alphabetic character in the buffer, searching in
+;; either direction.  If on a non-alphabetic character, return its position.  If none
+;; between current the typein position and the end of line, return the position of the end
+;; of the line.
+
+(DEFUN-IE IE-SEARCH-FORWARD-NON-ALPHABETIC (POS &OPTIONAL BARF?)
+  (IE-SEARCH-FORWARD #'IE-NOT-ALPHABETIC? POS (IF BARF? :BARF :INDEX)))
+
+(DEFUN-IE IE-SEARCH-BACKWARD-NON-ALPHABETIC (POS &OPTIONAL BARF?)
+  (IE-SEARCH-BACKWARD #'IE-NOT-ALPHABETIC? POS (IF BARF? :BARF :INDEX)))
+
+;; Search for a point N words away and return that point.
+;; If on an alphabetic character, skip to the first non alphabetic one.
+;; If on a non-alphabetic, skip over non-alphabetics and then over alphabetics,
+;; If no alphabetics follow the non-alphabetics, then don't move at all.
+
+(DEFUN-IE IE-SEARCH-FORWARD-WORD (N)
+  (IF (< N 0)
+      (IE-SEARCH-BACKWARD-WORD (- N))
+      (DO ((FILL-POINTER (IEB-FILL-POINTER))
+	   (POS (IEB-TYPEIN-POINTER))
+	   (SEARCH-POS)
+	   (I 0 (1+ I)))
+	  ((= I N) POS)
+	(COND
+	  ;; At the end of the buffer.
+	  ((= POS FILL-POINTER) (RETURN POS))
+	  ;; Inside a word.
+	  ((IE-ALPHABETIC-CHARACTER? POS)
+	   (SETQ POS (IE-SEARCH-FORWARD-NON-ALPHABETIC POS)))
+	  ;; Within whitespace.
+	  (T (SETQ SEARCH-POS (IE-SEARCH-FORWARD-ALPHABETIC POS))
+	     (IF (NOT SEARCH-POS) (RETURN POS))
+	     (SETQ POS (IE-SEARCH-FORWARD-NON-ALPHABETIC SEARCH-POS)))))))
+
+;; Search for a point N words back and return that point.
+;; If on an alphabetic character, skip to the character just following the
+;; first non-alphabetic one.  If on a non-alphabetic, skip over non-alphabetics
+;; and then over alphabetics.  If no alphabetics after non-alphabetics, then
+;; don't move at all.  Treat cursor on first character of a word as a special case.
+
+(DEFUN-IE IE-SEARCH-BACKWARD-WORD (N)
+  (IF (< N 0)
+      (IE-SEARCH-FORWARD-WORD (- N))
+      (DO ((FILL-POINTER (IEB-FILL-POINTER))
+	   (POS (IEB-TYPEIN-POINTER))
+	   (SEARCH-POS)
+	   (I 0 (1+ I)))
+	  ((= I N) POS)
+	(COND
+	  ;; At the beginning of the buffer.
+	  ((= POS 0) (RETURN POS))
+	  ;; At the end of the buffer.
+	  ((= POS FILL-POINTER)
+	   (SETQ SEARCH-POS (IE-SEARCH-BACKWARD-ALPHABETIC POS))
+	   (IF (NOT SEARCH-POS) (RETURN POS))
+	   (SETQ POS (IE-SEARCH-BACKWARD-NON-ALPHABETIC SEARCH-POS)))
+	  ;; Inside a word but not at the beginning of a word.
+	  ((AND (IE-ALPHABETIC-CHARACTER? POS)
+		(IE-ALPHABETIC-CHARACTER? (1- POS)))
+	   (SETQ POS (IE-SEARCH-BACKWARD-NON-ALPHABETIC POS)))
+	  ;; Within whitespace or at the beginning of a word.
+	  (T (SETQ SEARCH-POS (IF (IE-ALPHABETIC-CHARACTER? POS) (1- POS) POS))
+	     (SETQ SEARCH-POS (IE-SEARCH-BACKWARD-ALPHABETIC SEARCH-POS))
+	     (IF (NOT SEARCH-POS) (RETURN POS))
+	     (SETQ POS (IE-SEARCH-BACKWARD-NON-ALPHABETIC SEARCH-POS))))
+	;; Leave the cursor on the first character of the word.
+	(INCF POS)
+	)))
+
+(DEFINE-IE-COMMAND FORWARD-WORD (#\META-F)
+  (IE-SET-POSITION (IE-SEARCH-FORWARD-WORD *NUMERIC-ARG*)))
+
+(DEFINE-IE-COMMAND BACKWARD-WORD (#\META-B)
+  (IE-SET-POSITION (IE-SEARCH-BACKWARD-WORD *NUMERIC-ARG*)))
+
+(DEFINE-IE-COMMAND DELETE-WORD (#\META-D)
+  (IE-DELETE-STRING (IEB-TYPEIN-POINTER) (IE-SEARCH-FORWARD-WORD *NUMERIC-ARG*)))
+
+(DEFINE-IE-COMMAND RUBOUT-WORD (#\META-RUBOUT)
+  (IE-DELETE-STRING (IE-SEARCH-BACKWARD-WORD *NUMERIC-ARG*) (IEB-TYPEIN-POINTER)))
+
+(DEFINE-IE-COMMAND EXCHANGE-WORDS (#\META-T)
+  (LET ((B1) (E1) (S1)
+	(B2) (E2) (S2))
+    (SETQ E2 (IE-SEARCH-FORWARD-ALPHABETIC (IEB-TYPEIN-POINTER) T))
+    (SETQ E2 (IE-SEARCH-FORWARD-NON-ALPHABETIC E2))
+    (SETQ B2 (1+ (IE-SEARCH-BACKWARD-NON-ALPHABETIC (1- E2) T)))
+    (SETQ E1 (1+ (IE-SEARCH-BACKWARD-ALPHABETIC (1- B2) T)))
+    (SETQ B1 (1+ (IE-SEARCH-BACKWARD-NON-ALPHABETIC (1- E1))))
+    (SETQ S1 (SUBSTRING INPUT-EDITOR-BUFFER B1 E1))
+    (SETQ S2 (SUBSTRING INPUT-EDITOR-BUFFER B2 E2))
+    (IE-DELETE-STRING B2 E2 NIL)
+    (IE-DELETE-STRING B1 E1 NIL)
+    (IE-SET-POSITION B1)
+    (IE-INSERT-STRING S2)
+    (IE-SET-POSITION (+ B2 (- (STRING-LENGTH S2) (STRING-LENGTH S1))))
+    (IE-INSERT-STRING S1)))		; style ought to be OK as is.
+
+;; Change case of words
+(DEFUN-IE INPUT-EDITOR-STRING-CHANGE-CASE (FUNCTION &REST ARGS)
+  (LET ((B) (E) (S1) (S2))
+    (SETQ B (IEB-TYPEIN-POINTER))
+    (SETQ E (IE-SEARCH-FORWARD-WORD *NUMERIC-ARG*))
+    (WHEN (> B E)
+      (PSETQ B E E B))
+    (SETQ S1 (SUBSTRING INPUT-EDITOR-BUFFER B E))
+    (SETQ S2 (CL:APPLY FUNCTION S1 ARGS))
+    (IE-DELETE-STRING B E NIL)
+    (IE-SET-POSITION B)
+    (IE-INSERT-STRING S2)))
+
+(DEFINE-IE-COMMAND UPCASE-WORD (#\META-U)
+  (INPUT-EDITOR-STRING-CHANGE-CASE #'STRING-UPCASE))
+
+(DEFINE-IE-COMMAND DOWNCASE-WORD (#\META-L)
+  (INPUT-EDITOR-STRING-CHANGE-CASE #'STRING-DOWNCASE))
+
+(DEFINE-IE-COMMAND CAPITALIZE-WORD (#\META-C)
+  (INPUT-EDITOR-STRING-CHANGE-CASE #'STRING-CAPITALIZE-WORDS T T))
+
+
+;; Balanced Parentheses
+
+;; Try to move over sets of nested parentheses.  First value is the new position.  Second
+;; return value says if we succeeded or not.
+;; Actually, this searches forward over parens and atoms
+(DEFUN-IE IE-SEARCH-FORWARD-PARENS (POS &OPTIONAL (TOPLEVEL? T) &AUX NEW-POS)
+  (DECLARE (VALUES BP FOUND-P))
+  (IF-ZWEI-LOADED
+      (MULTIPLE-VALUE-BIND (NEW-POS FOUND-P)
+	  (IE-APPLY-ZWEI-BP-FUNCTION #'ZWEI:FORWARD-SEXP POS)
+	(VALUES NEW-POS FOUND-P))
+    (IF (AND
+	  ;; There must be an open after the cursor.
+	  (SETQ NEW-POS (IE-SEARCH-CHAR #/( POS))
+	  ;; It must appear before the first close, unless toplevel.
+	  (OR TOPLEVEL?
+	      (< NEW-POS (OR (IE-SEARCH-CHAR #/) POS) 1_20)))
+	  ;; Begin recursive searches after the first open paren.
+	  (INCF NEW-POS)
+	  ;; Jump over any parens in between.
+	  (DO ((CHANGE? T))
+	      ((NOT CHANGE?) T)
+	    (MULTIPLE-VALUE (NEW-POS CHANGE?) (IE-SEARCH-FORWARD-PARENS NEW-POS NIL)))
+	  ;; Move to the balancing close.
+	  (SETQ NEW-POS (IE-SEARCH-CHAR #/) NEW-POS)))
+	;; Leave ourselves after it.
+	(VALUES (1+ NEW-POS) T)
+      ;; Leave ourselves where we were.
+      (VALUES POS NIL))))
+
+(DEFUN-IE IE-SEARCH-BACKWARD-PARENS (POS &OPTIONAL (TOPLEVEL? T) &AUX NEW-POS)
+  (DECLARE (VALUES BP FOUND-P))
+  (IF-ZWEI-LOADED
+      (MULTIPLE-VALUE-BIND (NEW-POS FOUND-P)
+	  (IE-APPLY-ZWEI-BP-FUNCTION #'ZWEI:FORWARD-SEXP POS -1)
+	(VALUES NEW-POS FOUND-P))
+    (IF (AND
+	  ;; There must be a close before the cursor.
+	  (SETQ NEW-POS (IE-REVERSE-SEARCH-CHAR #/) POS))
+	  ;; It must appear after the first open, unless toplevel.
+	  (OR TOPLEVEL?
+	      (> NEW-POS (OR (IE-REVERSE-SEARCH-CHAR #/( POS) -1)))
+	  ;; Jump over any parens in between.
+	  (DO ((CHANGE? T))
+	      ((NOT CHANGE?) T)
+	    (MULTIPLE-VALUE (NEW-POS CHANGE?) (IE-SEARCH-BACKWARD-PARENS NEW-POS NIL)))
+	  ;; Move to the balancing open.
+	  (SETQ NEW-POS (IE-REVERSE-SEARCH-CHAR #/( NEW-POS)))
+	;; Leave ourselves on it.
+	(VALUES NEW-POS T)
+      ;; Leave ourselves where we were.
+      (VALUES POS NIL))))
+
+(DEFINE-IE-COMMAND FORWARD-EXPRESSION (#\CONTROL-META-F)
+  (IE-SET-POSITION (IE-SEARCH-FORWARD-PARENS (IEB-TYPEIN-POINTER))))
+
+(DEFINE-IE-COMMAND BACKWARD-EXPRESSION (#\CONTROL-META-B)
+  (IE-SET-POSITION (IE-SEARCH-BACKWARD-PARENS (IEB-TYPEIN-POINTER))))
+
+(DEFINE-IE-COMMAND DELETE-EXPRESSION (#\CONTROL-META-K)
+  (IE-DELETE-STRING (IEB-TYPEIN-POINTER) (IE-SEARCH-FORWARD-PARENS (IEB-TYPEIN-POINTER))))
+
+(DEFINE-IE-COMMAND RUBOUT-EXPRESSION (#\CONTROL-META-RUBOUT)
+  (IE-DELETE-STRING (IE-SEARCH-BACKWARD-PARENS (IEB-TYPEIN-POINTER)) (IEB-TYPEIN-POINTER)))
+
+(DEFUN-IE IE-DELETE-WHITESPACE-AROUND-CURSOR (N)
+  (LET ((WHITESPACE '(#\Space #\Tab)))
+    (LET* ((START (DO ((POS (IEB-TYPEIN-POINTER) (1- POS)))
+		      ((OR (ZEROP POS)
+			   (NOT (MEMBER (IE-CHARACTER-BEFORE POS) WHITESPACE)))
+		       POS)))
+	   (END   (DO ((POS START (1+ POS)) (EOB (IEB-FILL-POINTER)) )
+		      ((OR (= POS EOB)
+			   (NOT (MEMBER (IE-CHARACTER-AFTER POS) WHITESPACE)))
+		       POS))))
+      (SI:IE-DELETE-STRING START END NIL)
+      (SI:IE-INSERT-STRING (CL:MAKE-STRING N :INITIAL-ELEMENT #\Space)))))
+
+(DEFINE-IE-COMMAND DELETE-HORIZONTAL-SPACE (#\META-/\)
+  (IE-DELETE-WHITESPACE-AROUND-CURSOR (IF *NUMERIC-ARG-P* *NUMERIC-ARG* 0)))
+
+(DEFINE-IE-COMMAND JUST-ONE-SPACE (#\META-/|)
+  (IE-DELETE-WHITESPACE-AROUND-CURSOR (IF *NUMERIC-ARG-P* *NUMERIC-ARG* 1)))
+
+
+;; Miscellaneous
+
+(DEFINE-IE-COMMAND NEW-LINE (#\LINE)
+  (IE-INSERT-STRING #.(STRING-APPEND #\NEWLINE "  ") 0 NIL T))
+
+(ADD-IE-COMMAND 'COM-BACKWARD-CHARACTER #\OVERSTRIKE)
+(ADD-IE-COMMAND 'COM-REFRESH-WINDOW #\CONTROL-L)
+
+(DEFINE-IE-COMMAND OPEN-LINE (#\CONTROL-O)
+  (IE-INSERT-CHAR #\NEWLINE)
+  (IE-SET-POSITION (- (IEB-TYPEIN-POINTER) *NUMERIC-ARG*)))
+
+;; This command deliberately passes NIL as the value of the RETURN-OK? parameter to
+;; IE-INSERT-CHAR so that it can be used to force control to stay with the input editor.
+
+(DEFINE-IE-COMMAND QUOTE-CHARACTER (#\CONTROL-Q)
+  (LOOP DOING
+    (LET ((KBD-CHAR (IE-TYI)))
+      (WHEN (CHARACTERP KBD-CHAR)
+	(RETURN
+	  (IF (ZEROP (CHAR-BITS KBD-CHAR))
+	      (IE-INSERT-CHAR KBD-CHAR)
+	      (IE-BARF)))))))
+
+; These are finally obsolete.
+;(ADD-IE-COMMAND 'COM-YANK-INPUT #\CONTROL-C)
+;(ADD-IE-COMMAND 'COM-YANK-POP #\META-C)
+
+;; These are incompatible with Zwei, but will do for the time being.
+;
+;(DEFINE-IE-COMMAND SET-DEFAULT-FONT (#\CONTROL-J)
+;  (IE-BARF))
+
+;; Later, WITH-IE-TYPEIN should be clever enough to erase the prompt and typein, so this
+;; should refresh the input buffer in place, the same way the Square command to Japanese does.
+
+;(DEFINE-IE-COMMAND SET-FONT-MAP (#\META-J)
+;  (IE-BARF))
+
+(DEFVAR-STANDARD *IE-SETTING-TYPEIN-STYLE* NIL)
+
+(DEFINE-IE-COMMAND SET-TYPEIN-STYLE (#\CONTROL-META-J)
+  (WHEN *IE-SETTING-TYPEIN-STYLE*
+    (SI:WITH-IE-TYPEOUT (SELF *TYPEOUT-DEFAULT*)
+      (BEEP)
+      (FORMAT SELF "You can't set the typein style from within setting the typein style."))
+    (RETURN-FROM COM-SET-TYPEIN-STYLE NIL))	;!!
+  (LET ((*IE-SETTING-TYPEIN-STYLE* T)
+	(DW::*ACCEPT-ACTIVE* NIL)
+	(DW::*ACCEPT-ACTIVATION-CHARS* (STANDARD-VALUE 'DW::*ACCEPT-ACTIVATION-CHARS*))
+	(DW::*ACCEPT-BLIP-CHARS* (STANDARD-VALUE 'DW::*ACCEPT-BLIP-CHARS*)))
+    (WITH-IE-TYPEIN (SELF)
+      (DW:WITH-ACCEPT-HELP ((:SUBHELP "You are currently entering a character style."))
+	(LET ((NEW-STYLE (ACCEPT `((SCL:CHARACTER-FACE-OR-STYLE
+				     :DEVICE ,SI:*B&W-SCREEN*
+				     :AGAINST-DEFAULT ,(SEND SELF :DEFAULT-CHARACTER-STYLE)))
+				 :DEFAULT *NULL-STYLE*
+				 :PROMPT "Typein style")))
+	  (SEND SELF :SET-TYPEIN-CHARACTER-STYLE NEW-STYLE))))))
+
+
+;; Displaying Information
+
+;; General utility for the input editor to display information and reprint the current
+;; input.  Information may be displayed in different ways, corresponding to the keywords
+;; accepted by :START-TYPEOUT.  *TYPEOUT-DEFAULT* may be set to the typeout type to be
+;; used by default.  With an argument, :TEMPORARY, :OVERWRITE, or :APPEND becomes :INSERT,
+;; or :INSERT becomes :TEMPORARY.  [Instead of using *NUMERIC-ARG-P*, this should use
+;; some special prefix character instead.]
+
+;; This takes a function which will produce the output and passes it the width and height of
+;; the current window, and any additional arguments it may need. (This should really be
+;; done with downward lexical closures.)
+
+;; When the typeout type is :TEMPORARY, the printer function says whether or not to
+;; reprint or erase, since it knows how much stuff was output.  We could set up a special
+;; stream to keep track of how much was output, but that is too hairy for our needs.
+
+(DEFVAR *TYPEOUT-DEFAULT* :OVERWRITE)
+(DEFVAR *DISPLAY-MINIMUM-AREA* 200.)
+
+(DEFUN-IE IE-DISPLAY-INFO-INTERNAL (PRINTER &REST PRINTER-ARGS)
+  (DECLARE (SYS:DOWNWARD-FUNARG PRINTER))
+  (LET ((TYPE *TYPEOUT-DEFAULT*) FLAG SPACING)
+    (IF *NUMERIC-ARG-P*
+	(SETQ TYPE (IF (EQ TYPE :TEMPORARY) :OVERWRITE :TEMPORARY)))
+    (MULTIPLE-VALUE-BIND (WIDTH HEIGHT) (SEND SELF :SIZE-IN-CHARACTERS)
+      (IF (< (* WIDTH HEIGHT) *DISPLAY-MINIMUM-AREA*) (IE-BARF))
+      (SEND SELF :START-TYPEOUT TYPE)
+      (MULTIPLE-VALUE (FLAG SPACING)
+	(LEXPR-FUNCALL PRINTER WIDTH HEIGHT PRINTER-ARGS)))
+    (SEND SELF :FINISH-TYPEOUT (OR SPACING :BLANK-LINE) FLAG)))
+
+(DEFMACRO IE-DISPLAY-INFO ((&OPTIONAL WIDTH HEIGHT &REST PRINTER-ARGS) &BODY BODY)
+  (IF (NULL WIDTH) (SETQ WIDTH 'IGNORE))
+  (IF (NULL HEIGHT) (SETQ HEIGHT 'IGNORE))
+  `(IE-DISPLAY-INFO-INTERNAL #'(LAMBDA (,WIDTH ,HEIGHT . ,PRINTER-ARGS) . ,BODY)
+			     . ,PRINTER-ARGS))
+
+
+;; Self Documentation
+
+;; Brief help is being displayed on the same line as the typein.  This option is intended to
+;; be specified by programs such as FQUERY which only need to give a little information.  It
+;; is displayed in the default typeout font, and none of the usual input editor rules for
+;; typeout apply.
+
+(DEFUN-IE IE-DISPLAY-BRIEF-HELP (TYPEOUT? HELP-STREAM)
+  (LET ((HELP-OPTION (INPUT-EDITOR-OPTION :BRIEF-HELP)))
+    (WHEN HELP-OPTION
+      (WHEN (EQ SELF HELP-STREAM)
+	(WHEN TYPEOUT?
+	  (SEND SELF :START-TYPEOUT :APPEND :NONE))
+	(WHEN (NOT (ZEROP (IEB-FILL-POINTER)))
+	  (SEND SELF :TYO #\SPACE)))
+      (DISPLAY-HELP-OPTION HELP-STREAM HELP-OPTION)
+      (WHEN (AND TYPEOUT? (EQ SELF HELP-STREAM))
+	(SEND SELF :FINISH-TYPEOUT :NONE))
+      T)))
+
+;; If :COMPLETE-HELP is specified, display several lines of text, but don't merge in the rest
+;; of the usual input editor help message.  This option is intended to be specified by
+;; programs such as Schema which provide their own documentation for the interaction window.
+
+;; If :PARTIAL-HELP is specified, display a little information about where the user is, and
+;; then display the usual input editor help message.  This option is intended to be specified
+;; by programs which have an interactive top level which may be used by a naive user, such as
+;; the Lisp listener, BREAK, and the debugger.
+
+;; If :MERGED-HELP is specified, the option must always be a function and arguments.  The
+;; first argument to the function is the stream.  The second is a continuation to print the
+;; usual input editor help message.  Then come the arguments specified in the option.  This
+;; allows the function to decide whether or not to merge in the input editor help, and where
+;; to place it.  This option can do everything that :COMPLETE-HELP and :PARTIAL-HELP can do;
+;; the last two are just for convenience.
+
+(DEFUN IE-DISPLAY-STANDARD-HELP (STREAM EDITOR-HELP)
+  ;; Information which is always true about the input editor.
+  (SEND STREAM :FRESH-LINE)
+  (FORMAT STREAM EDITOR-HELP)
+  ;; Information which is always true about the stream.
+  (SEND STREAM :FRESH-LINE)
+  (SEND STREAM :INPUT-EDITOR-HELP))
+
+(DEFVAR *STANDARD-HELP-MESSAGE* "You are typing to ~A.")
+
+(DEFUN-IE IE-DISPLAY-LONG-HELP (EDITOR-HELP HELP-STREAM)
+  (LET (HELP-OPTION)
+    (COND
+      ((SETQ HELP-OPTION (INPUT-EDITOR-OPTION :COMPLETE-HELP))
+       (DISPLAY-HELP-OPTION HELP-STREAM HELP-OPTION))
+      ((SETQ HELP-OPTION (INPUT-EDITOR-OPTION :MERGED-HELP))
+       (WITH-STACK-LIST (CONTINUATION #'IE-DISPLAY-STANDARD-HELP HELP-STREAM EDITOR-HELP)
+	 (LEXPR-FUNCALL (CAR HELP-OPTION) HELP-STREAM CONTINUATION (CDR HELP-OPTION))))
+      (T 
+       (DISPLAY-HELP-OPTION HELP-STREAM
+			    (OR (INPUT-EDITOR-OPTION :PARTIAL-HELP) *STANDARD-HELP-MESSAGE*))
+       (IE-DISPLAY-STANDARD-HELP HELP-STREAM EDITOR-HELP)))))
+
+;; A toplevel help message.  It is written for computer-knowledgable users with no Lisp
+;; Machine experience.  It doesn't try to be helpful to computer-naive users.
+
+(DEFUN-IE IE-HELP-STREAM ()
+  (LET ((SPECIAL (INPUT-EDITOR-FLAG :HELP-STREAM)))
+    (IF SPECIAL
+	(FOLLOW-SYN-STREAM SPECIAL)
+	SELF)))
+
+(DEFMACRO WITH-IE-HELP-STREAM ((STREAM) &BODY BODY)
+  `(FUNCALL DW::*HELP-DISPLAYER*
+	    (LAMBDA (,STREAM)
+	      (DECLARE (SYS:DOWNWARD-FUNCTION))
+	      ,@BODY)
+	    (IE-HELP-STREAM)))
+
+(DEFUN-IE IE-DISPLAY-HELP ()
+  (LET ((HELP-MESSAGE "Control characters are interpreted as commands to edit input.~@
+                       Press Control-† for a list of input editor commands."))
+    (WITH-IE-HELP-STREAM (HELP-STREAM)
+      (UNLESS (IE-DISPLAY-BRIEF-HELP T HELP-STREAM)
+	(IF (EQ SELF HELP-STREAM)
+	    (IE-DISPLAY-INFO (WIDTH HEIGHT)
+	      (IE-DISPLAY-LONG-HELP HELP-MESSAGE SELF)
+	      ;; 14 is used as a fudge factor for the number of lines of input
+	      ;; plus the number of lines of additional information.  We
+	      ;; should really use :COMPUTE-MOTION to figure this out.
+	      (AND (> WIDTH 40.) (> HEIGHT 14.)))
+	    (IE-DISPLAY-LONG-HELP HELP-MESSAGE HELP-STREAM))))))
+
+(DEFMETHOD (INPUT-EDITOR-DISPLAY-HELP DISPLAY-INPUT-EDITOR) (NUMERIC-ARG)
+  (LET ((*NUMERIC-ARG* (OR NUMERIC-ARG 1))
+	(*NUMERIC-ARG-P* (NOT (NULL NUMERIC-ARG))))
+    (IE-DISPLAY-HELP)))
+
+(DEFINE-IE-COMMAND DISPLAY-DOCUMENTATION (#\HELP)
+  (IE-DISPLAY-HELP))
+
+;; Display a list of the input editor commands in the order in which they appear on
+;; the command alist.
+
+(DEFINE-IE-COMMAND DISPLAY-COMMANDS (#\CONTROL-HELP)
+  (WITH-IE-HELP-STREAM (HELP-STREAM)
+    (IF (EQ HELP-STREAM SELF)
+	(IE-DISPLAY-INFO (WIDTH HEIGHT)
+	  (DISPLAY-COMMANDS-INTERNAL SELF WIDTH HEIGHT))
+	(MULTIPLE-VALUE-BIND (WIDTH HEIGHT)
+	    (SEND HELP-STREAM :SIZE-IN-CHARACTERS)
+	  (DISPLAY-COMMANDS-INTERNAL HELP-STREAM WIDTH HEIGHT)))))
+
+;;; A slightly different interface for external (i.e., non-I.E.) applications to use.
+(DEFUN DISPLAY-IE-COMMANDS (&OPTIONAL (STREAM STANDARD-OUTPUT))
+  (MULTIPLE-VALUE-BIND (WIDTH HEIGHT) (SEND STREAM :SIZE-IN-CHARACTERS)
+    (COND ((< (* WIDTH HEIGHT) *DISPLAY-MINIMUM-AREA*)
+	   (FORMAT STREAM "Stream too small"))
+	  (T (SCL:FRESH-LINE)
+	     (DISPLAY-COMMANDS-INTERNAL STREAM WIDTH HEIGHT)))))
+
+;;; Needed: a format option that prints out the short form of all characters,
+;;; including mouse "characters" and those that would normally display as white
+;;; space with ~C.
+FORMAT::
+(DEFFORMAT KEYSTROKE (:ONE-ARG) (ARG IGNORE)
+  (LET* ((MOUSE-CHAR (MOUSE-CHAR-P ARG))
+	 (CHAR (UNLESS MOUSE-CHAR (MAKE-CHAR ARG 0))))	;Get char without the bits
+    (FORMAT-CHARACTER *FORMAT-OUTPUT* ARG NIL
+		      (UNLESS MOUSE-CHAR		;Whether to use the long-form name
+			(OR (NOT (GRAPHIC-CHAR-P CHAR))	;Do it for "format effectors"
+			    (CHAR-EQUAL CHAR #\SPACE)))	;"Space" needs special-casing
+		      NIL NIL)))
+
+(DEFUN DISPLAY-COMMANDS-INTERNAL (STREAM WIDTH HEIGHT)
+  ;; Width, height used in obsolete version to figure out about number of columns etc
+  (IGNORE WIDTH HEIGHT)
+  (FLET ((DO-ROW (STREAM CH COMMAND)		;---flet needed to get around compiler bug
+	   (SCL:FORMATTING-ROW (STREAM)		;13 Mar 86
+	     (SCL:FORMATTING-CELL (STREAM)
+	       ;;Have to use long name for Space, Backspace, etc
+	       (FORMAT STREAM "~\keystroke\" CH))
+	     (SCL:FORMATTING-CELL (STREAM)
+	       (SCL:WRITE-STRING (IE-COMMAND-NAME COMMAND) STREAM)))))
+    (FORMAT STREAM "Input Editor Commands:~@
+		    c-number, c-Minus and c-U provide numeric arguments.~%")
+    ;; Small kludge.  Knows about common formats for the :ACTIVATION option.
+    ;; Code has no visible effect in standard IE help situation
+    (DESTRUCTURING-BIND (FUNCTION ARG)
+			(INPUT-EDITOR-OPTION :ACTIVATION)
+      (COND ((OR (MEMQ FUNCTION '(= CHAR= CHAR-EQUAL EQ EQL))
+		 (AND (EQ FUNCTION 'MEMQ) ARG (NULL (CDR ARG)))
+		 (AND (EQ FUNCTION 'MEM) ARG
+		      (MEMQ (CAR ARG) '(CHAR= CHAR-EQUAL))
+		      (NULL (CDDR ARG)) (SETQ ARG (CDR ARG))))
+	     (FORMAT STREAM "~:C is an activation character.~%"
+		     (IF (ATOM ARG) ARG (CAR ARG))))
+	    ((OR (AND (EQ FUNCTION 'MEMQ) ARG)
+		 (AND (EQ FUNCTION 'MEM) (CDR ARG) (SETQ ARG (CDR ARG))))
+	     (FORMAT STREAM "~{~:C~^, ~} and ~:C are activation characters.~%"
+		     (BUTLAST ARG) (CAR (LAST ARG))))))
+    (TERPRI STREAM)
+    ;; Format the list, letting table code decide how many columns to use
+    (SCL:FORMATTING-TABLE (STREAM :MULTIPLE-COLUMNS T
+				  :OUTPUT-MULTIPLE-COLUMNS-ROW-WISE T
+				  :MULTIPLE-COLUMN-INTER-COLUMN-SPACING
+				    ;; Something that works on remote terminals as well.
+				    (SEND STREAM :STRING-LENGTH "    "))
+      (LOOP FOR (CHAR . COMMAND) IN *COMMAND-ALIST*
+	    DO (DO-ROW STREAM CHAR COMMAND)))))
+
+;;; Convert a string into human-readable form.  Remove leading COM-, or leading
+;;; and trailing *'s.  Convert hyphens into spaces, and capitalize each word.
+;;; This is used both for command names and variable names.
+(DEFUN MAKE-COMMAND-NAME (COMMAND)
+  (SETQ COMMAND (STRING COMMAND))
+  (LET ((CLEN (STRING-LENGTH COMMAND)))
+    (LET ((STR (SUBSTRING COMMAND
+			  (COND ;((STRING-EQUAL "COM-MOUSE-" COMMAND 0 0 12 12) 12)
+				((STRING-EQUAL "COM-" COMMAND 0 0 4 4) 4)
+				((STRING-EQUAL "*" COMMAND 0 0 1 1) 1)
+				(T 0))
+			  (COND ((CHAR-EQUAL #/* (AREF COMMAND (1- CLEN))) (1- CLEN))
+				(T CLEN)))))
+       (STRING-CAPITALIZE-WORDS STR NIL))))
+
+(DEFUN IE-COMMAND-NAME (COMMAND)
+  (WHEN (LISTP COMMAND) (SETQ COMMAND (CAR COMMAND)))
+  (OR (GET COMMAND 'IE-COMMAND-NAME)
+      (PUTPROP COMMAND (MAKE-COMMAND-NAME COMMAND) 'IE-COMMAND-NAME)))
+
+;; Display state information relating to the input editor:  the entries in the array leader
+;; and the options to the call to :INPUT-EDITOR.  This is setup as an input editor command
+;; rather than as a simple function since it must be invoked from within the context of the
+;; input editor.
+;; Use (ADD-IE-COMMAND 'COM-DISPLAY-INTERNAL-STATE #\m-Help) to install this on
+;; #\m-Help where it used to be
+(DEFINE-IE-COMMAND DISPLAY-INTERNAL-STATE ()
+  (WITH-IE-HELP-STREAM (HELP-STREAM)
+    (LET ((INDENTATION 21.))
+      (FLET ((DISPLAY-INFO (STREAM)
+	       (FORMAT STREAM "Terminal I//O:~VT~S~%" INDENTATION TERMINAL-IO)
+	       (FORMAT STREAM "Pointer Values:~VT~
+		      Fill pointer = ~D, Scan pointer = ~D, Typein pointer = ~D~%"
+		       INDENTATION (IEB-FILL-POINTER) (IEB-SCAN-POINTER) (IEB-TYPEIN-POINTER))
+	       (LET ((BASE 10.))
+		 (FORMAT STREAM "Noise Strings:~VT~S~%" INDENTATION (IEB-NOISE-STRINGS)))
+	       (FORMAT STREAM "Buffer Sizes:~VT~
+		      Input buffer = ~D, Shift buffer = ~D~%"
+		       INDENTATION
+		       (ARRAY-LENGTH INPUT-EDITOR-BUFFER)
+		       (ARRAY-LENGTH SHIFT-ARRAY-PORTION-BUFFER))
+	       (FORMAT STREAM "Input history:~VT~
+		      Length = ~D, Rotation = ~D~@[, Yank position = ~D~]~%"
+		       INDENTATION
+		       (SEND INPUT-HISTORY :LENGTH)
+		       (SEND INPUT-HISTORY :ROTATION)
+		       (SEND INPUT-HISTORY :YANK-POSITION))
+	       (FORMAT STREAM "Kill history:~VT~
+		      Length = ~D, Rotation = ~D~@[, Yank position = ~D~]~%"
+		       INDENTATION
+		       (SEND ZWEI:*KILL-HISTORY* :LENGTH)
+		       (SEND ZWEI:*KILL-HISTORY* :ROTATION)
+		       (SEND ZWEI:*KILL-HISTORY* :YANK-POSITION))
+	       (FORMAT STREAM "Yank info:~VTHistory = ~:[None~;~:*~A~], ~
+  Mark = ~:[None~;~:*~D~]~%"
+		       INDENTATION YANK-HISTORY MARK)
+	       (WHEN TYPEOUT-X
+		 (FORMAT STREAM "Typeout Cursorpos:~VTX = ~D, Y = ~D~%"
+			 INDENTATION TYPEOUT-X TYPEOUT-Y))
+	       (FORMAT STREAM "Prompt Cursorpos:~VTX = ~D, Y = ~D~%" INDENTATION
+		       PROMPT-X PROMPT-Y)
+	       (FORMAT STREAM "Starting Cursorpos:~VTX = ~D, Y = ~D~%" INDENTATION
+		       BUFFER-X BUFFER-Y)
+	       (FORMAT STREAM "Rescan state:~VT~S~%" INDENTATION *RESCAN-STATE*)
+	       (WHEN *INPUT-EDITOR-OPTIONS*
+		 (FORMAT STREAM "Options:~VT~~{~S~^~%~}~" INDENTATION
+			 *INPUT-EDITOR-OPTIONS*))
+	       T))
+	(IF (EQ HELP-STREAM SELF)
+	    (IE-DISPLAY-INFO ()
+	      (DISPLAY-INFO SELF))
+	    (DISPLAY-INFO HELP-STREAM))))))
+
+;; Display the first line of each string in the given ring.  Next to each entry is
+;; shown a number which, if given as an argument to c-Y, m-Y, or c-m-Y, will yank that entry.
+;;     If AMOUNT is T (i.e. no numeric argument), display ZWEI:*HISTORY-MENU-LENGTH* entries.
+;;     If AMOUNT is n, display n entries.
+;;     If AMOUNT is 0, display the entire history.
+
+(DEFUN-IE IE-DISPLAY-HISTORY (HISTORY META-Y AMOUNT &OPTIONAL STRING)
+  (WITH-IE-HELP-STREAM (HELP-STREAM)
+    (LET ((*NUMERIC-ARG-P* NIL))
+      (FLET ((DISPLAY-INTERNAL (STREAM HISTORY META-Y AMOUNT STRING)
+	       (ZWEI:DISPLAY-HISTORY-MENU STREAM HISTORY
+					  (UNLESS (EQUAL AMOUNT 0) AMOUNT)
+					  META-Y NIL STRING)))
+	(IF (EQ SELF HELP-STREAM)
+	    (IE-DISPLAY-INFO (IGNORE IGNORE HISTORY META-Y AMOUNT STRING)
+	      (DISPLAY-INTERNAL SELF HISTORY META-Y AMOUNT STRING)
+	      NIL)
+	    (DISPLAY-INTERNAL HELP-STREAM HISTORY META-Y AMOUNT STRING))))))
+
+(DEFMACRO WITH-INPUT-HISTORY-DEFAULT ((HISTORY) &BODY BODY)
+  `(LET ((,HISTORY (OR
+		     (INPUT-EDITOR-FLAG :INPUT-HISTORY)
+		     INPUT-HISTORY)))
+     (SEND HISTORY
+	   :FUNCALL-WITH-DEFAULT
+	   *INPUT-HISTORY-DEFAULT*
+	   (LAMBDA ()
+	     (DECLARE (DOWNWARD-FUNCTION))
+	     . ,BODY))))
+
+(DEFINE-IE-COMMAND DISPLAY-INPUT-HISTORY (#\ESCAPE)
+  (WITH-INPUT-HISTORY-DEFAULT (HISTORY)
+    (IE-DISPLAY-HISTORY HISTORY NIL (IF *NUMERIC-ARG-P* *NUMERIC-ARG* T))))
+
+(DEFINE-IE-COMMAND DISPLAY-KILL-HISTORY (#\C-ESCAPE)
+  (IE-DISPLAY-HISTORY ZWEI:*KILL-HISTORY* NIL (IF *NUMERIC-ARG-P* *NUMERIC-ARG* T)))
+
+;; Input/Kill Histories
+
+;; Allow the copying of killed text or previous input.  c-Y yanks killed text.
+;; c-m-Y yanks previous input.  IE-INSERT-STRING does not return even if inserting at the
+;; end of the line so that we don't get blown away by yanking unexpected stuff.
+
+(DEFUN-IE IE-COPY-HISTORY (HISTORY META-Y MESSAGE &REST ARGUMENTS)
+  (LET ((INTERVAL (LEXPR-SEND HISTORY MESSAGE ARGUMENTS)))
+    (IF (NULL INTERVAL) (IE-BARF))
+    (IE-INSERT-FROM-HISTORY INTERVAL META-Y NIL)
+    (SETF YANK-HISTORY HISTORY)))
+
+(DEFVAR *IE-FIXUP-WHITESPACE* ':LISP
+  "Controls whether input-editor yank commands are smart about whitespace:
+NIL => insert no extra whitespace
+:TEXT => insert extra whitespace according to text syntax.
+:LISP => insert extra whitespace according to Lisp syntax.")
+
+(DEFUN-IE IE-FIXUP-WHITESPACE (CH1 BEFORE DELIMITER)
+  (LET* ((INDEX (- (IEB-TYPEIN-POINTER) (IF BEFORE 1 0)))
+	 (CH2 (AND (PLUSP INDEX) (< INDEX (IEB-FILL-POINTER))
+		   (AREF INPUT-EDITOR-BUFFER INDEX))))
+    (UNLESS (OR (NOT (CHARACTERP CH1)) (NOT (CHARACTERP CH2)))
+      (WHEN (EQ (CHAR-CHAR-SET-AND-INDEX CH2) *BUFFER-BLIPS-CHARSET*)
+	(SETQ CH2 (SECOND (NTH (CHAR-SUBINDEX CH2) (IEB-BUFFER-BLIPS))))
+	(SETQ CH2 (AREF CH2 (IF BEFORE (1- (STRING-LENGTH CH2)) 0))))
+      (IF-ZWEI-LOADED
+	  (UNLESS (CL:ECASE *IE-FIXUP-WHITESPACE*
+		    ((NIL) T)
+		    ((:TEXT) (OR (= (ZWEI:ATOM-WORD-SYNTAX CH1) ZWEI:WORD-DELIMITER)
+				 (= (ZWEI:ATOM-WORD-SYNTAX CH2) ZWEI:WORD-DELIMITER)
+				 (AND DELIMITER
+				      ( (ZWEI:ATOM-WORD-SYNTAX DELIMITER)
+					 ZWEI:WORD-DELIMITER))))
+		    ((:LISP) (WITH-ZWEI-CONTEXT
+			       (LET ((SYN1 (ZWEI:LIST-SYNTAX CH1))
+				     (SYN2 (ZWEI:LIST-SYNTAX CH2)))
+				 (WHEN BEFORE
+				   (SWAPF SYN1 SYN2))
+				 (OR (= SYN1 ZWEI:LIST-OPEN) (= SYN1 ZWEI:LIST-SINGLE-QUOTE)
+				     (= SYN1 ZWEI:LIST-COLON) (= SYN1 ZWEI:LIST-DELIMITER)
+				     (= SYN2 ZWEI:LIST-DELIMITER) (= SYN2 ZWEI:LIST-CLOSE)
+				     (AND DELIMITER
+					  ( (ZWEI:ATOM-WORD-SYNTAX DELIMITER)
+					     ZWEI:WORD-DELIMITER)))))))
+	    (IE-INSERT-STRING " "))
+	  NIL))))
+
+(DEFUN-IE IE-INSERT-STRING-AND-FIXUP-WHITESPACE (STRING &OPTIONAL (BEGIN 0) END
+						 (RETURN-OK? NIL) (MERGE-STYLE NIL)
+						 (NOISE-STRINGS NIL) (BUFFER-BLIPS NIL)
+						 (CHAR-BEFORE NIL) (CHAR-AFTER NIL))
+  (OR END (SETQ END (STRING-LENGTH STRING)))
+  (WHEN (> END BEGIN)
+    (IE-FIXUP-WHITESPACE (AREF STRING BEGIN) T CHAR-BEFORE))
+  (IE-INSERT-STRING STRING BEGIN END RETURN-OK? MERGE-STYLE NOISE-STRINGS BUFFER-BLIPS)
+  (WHEN (> END BEGIN)
+    (IE-FIXUP-WHITESPACE (AREF STRING (1- END)) NIL CHAR-AFTER)))
+
+(DEFUN-IE IE-INSERT-FROM-HISTORY (INTERVAL META-Y RETURN-OK?)
+  (LET ((TYPEIN-POINTER (IEB-TYPEIN-POINTER)))
+    (IF META-Y
+	(SETQ TYPEIN-POINTER
+	      (PROG1 MARK
+		     (IE-DELETE-STRING MARK TYPEIN-POINTER NIL))))
+    (COND ((INPUT-EDITOR-BUFFER-P INTERVAL)
+	   (IE-INSERT-STRING-AND-FIXUP-WHITESPACE INTERVAL 0 NIL RETURN-OK? NIL
+						  (IEB-NOISE-STRINGS INTERVAL)
+						  (IEB-BUFFER-BLIPS INTERVAL)))
+	  ((STRINGP INTERVAL)
+	   (IE-INSERT-STRING-AND-FIXUP-WHITESPACE INTERVAL 0 NIL RETURN-OK?))
+	  ((TYPEP INTERVAL 'ZWEI:KILL-RING-INTERVAL)
+	   (IE-INSERT-STRING-AND-FIXUP-WHITESPACE (LET ((ZWEI:*INTERVAL* INTERVAL))
+						    (ZWEI:STRING-INTERVAL INTERVAL))
+						  0 NIL RETURN-OK? NIL NIL NIL
+						  (ZWEI:KILL-RING-INTERVAL-CHAR-BEFORE
+						    INTERVAL)
+						  (ZWEI:KILL-RING-INTERVAL-CHAR-AFTER
+						    INTERVAL)))
+	  (T
+	   (IE-INSERT-STRING-AND-FIXUP-WHITESPACE (LET ((ZWEI:*INTERVAL* INTERVAL))
+						    (ZWEI:STRING-INTERVAL INTERVAL))
+						  0 NIL RETURN-OK?)))
+    (COND ((OR META-Y (NEQ *NUMERIC-ARG-P* :CONTROL-U))
+	   (SETF MARK TYPEIN-POINTER))
+	  (T (SETF MARK (IEB-TYPEIN-POINTER))
+	     (SETF (IEB-TYPEIN-POINTER) TYPEIN-POINTER)
+	     (IE-CURSOR-MOTION (IEB-TYPEIN-POINTER))))))
+
+(DEFUN-IE IE-YANK-COMMAND (HISTORY)
+  (COND ((ZEROP *NUMERIC-ARG*)
+	 (IE-DISPLAY-HISTORY HISTORY NIL T))
+	(T (IE-COPY-HISTORY HISTORY NIL :YANK
+			    (IF (AND *NUMERIC-ARG-P* (NOT (EQ *NUMERIC-ARG-P* :CONTROL-U)))
+				*NUMERIC-ARG*)))))
+
+;; Try to match the head of the ring with the text before the cursor in the input editor
+;; buffer.  The ring may be null if it hasn't been created yet, i.e. the -TYI function was
+;; entered before the -ENTER function.  If the strings don't match, throw.  Otherwise,
+;; delete the old string from the screen and copy the next one on the ring.  Then cycle
+;; the ring forward.  If the loop isn't completely full, swap the first element and the
+;; first empty element in the ring.  Otherwise, just cdr.
+
+(DEFINE-IE-COMMAND YANK (#\CONTROL-Y)
+  (IE-YANK-COMMAND ZWEI:*KILL-HISTORY*))
+
+(DEFINE-IE-COMMAND YANK-POP (#\META-Y)
+  (IF (NULL YANK-HISTORY) (IE-BARF))
+  (WITH-INPUT-HISTORY-DEFAULT (HISTORY)	;what the hell history is this dealing with
+    (IF (ZEROP *NUMERIC-ARG*)
+	(IE-DISPLAY-HISTORY YANK-HISTORY T T)
+	(IE-COPY-HISTORY YANK-HISTORY T :YANK-NEXT *NUMERIC-ARG*))))
+
+(DEFINE-IE-COMMAND YANK-INPUT (#\CONTROL-META-Y)
+  (WITH-INPUT-HISTORY-DEFAULT (HISTORY)
+    (IE-YANK-COMMAND HISTORY)))
+
+(DEFINE-IE-COMMAND KILL-REGION (#\CONTROL-W)
+  (IF (NULL MARK) (IE-BARF))
+  (IE-DELETE-STRING MARK (IEB-TYPEIN-POINTER)))
+
+;; Don't merge the saved region with kills either before or after.
+;; This obviously prefers anything marked in the history to stuff marked
+;; in the input-buffer, mostly because the input-buffer marking is not
+;; well-known, and leaves no traces.
+(DEFINE-IE-COMMAND SAVE-REGION (#\Meta-W)
+  (UNLESS (CP::KILL-RING-PUSH-ALL-MARKED-TEXT :WINDOW SELF)
+    (WHEN (NULL MARK) (IE-BARF))
+    (IE-KILL-HISTORY-SAVE MARK (IEB-TYPEIN-POINTER) NIL)
+    (SETQ *KILL-POINTER* NIL)))
+
+;; Like meta-W, but never looks at the input buffer.
+(DEFINE-IE-COMMAND KILL-RING-PUSH-REGION-STRINGS (#\Super-W)
+  (UNLESS (CP::KILL-RING-PUSH-ALL-MARKED-TEXT :WINDOW SELF)
+    (IE-BARF)))
+
+(DEFINE-IE-COMMAND SET-MARK (#\CONTROL-SPACE)
+  (SETF MARK (IEB-TYPEIN-POINTER)))
+
+(DEFINE-IE-COMMAND MARK-BEGINNING (#\CONTROL-<)
+  (SETF MARK 0))
+
+(DEFINE-IE-COMMAND MARK-END (#\CONTROL->)
+  (SETF MARK (IEB-FILL-POINTER)))
+
+;;;; Matching yank commands
+
+;; Erase prompt after string is typed?
+(DEFUN IE-HISTORY-PROMPT (HISTORY)
+  ;; This used prompt-and-read because it knows how to use WITH-IE-TYPEIN.
+  (PROMPT-AND-READ :STRING "List elements of ~A history that match: " HISTORY))
+
+(DEFUN-IE IE-DISPLAY-HISTORY-MATCHING (HISTORY AMOUNT)
+  (IE-DISPLAY-HISTORY HISTORY NIL AMOUNT (IE-HISTORY-PROMPT HISTORY)))
+
+(DEFINE-IE-COMMAND DISPLAY-RECENT-INPUT-MATCHING ()
+  (IE-DISPLAY-HISTORY-MATCHING INPUT-HISTORY (IF *NUMERIC-ARG-P* *NUMERIC-ARG* T)))
+
+(DEFINE-IE-COMMAND DISPLAY-ALL-INPUT-MATCHING ()
+  (IE-DISPLAY-HISTORY-MATCHING INPUT-HISTORY NIL))
+
+(DEFINE-IE-COMMAND DISPLAY-RECENT-KILLS-MATCHING ()
+  (IE-DISPLAY-HISTORY-MATCHING ZWEI:*KILL-HISTORY* (IF *NUMERIC-ARG-P* *NUMERIC-ARG* T)))
+
+(DEFINE-IE-COMMAND DISPLAY-ALL-KILLS-MATCHING ()
+  (IE-DISPLAY-HISTORY-MATCHING ZWEI:*KILL-HISTORY* NIL))
+
+(DEFVAR *LAST-YANK-MATCHING* NIL)
+
+(DEFUN-IE IE-YANK-MATCHING-COMMAND (HISTORY)
+  (IF (ZEROP *NUMERIC-ARG*)
+      (IE-DISPLAY-HISTORY-MATCHING HISTORY T)
+    (SETQ *LAST-YANK-MATCHING* (PROMPT-AND-READ :STRING
+						"Yank text from ~A history that matches: "
+						HISTORY))
+    (IE-COPY-HISTORY HISTORY NIL :YANK-MATCHING
+		     *LAST-YANK-MATCHING*
+		      (AND *NUMERIC-ARG-P*
+			   (NOT (EQ *NUMERIC-ARG-P* :CONTROL-U))
+			   *NUMERIC-ARG*))))
+
+(DEFINE-IE-COMMAND YANK-MATCHING (#\Control-Shift-Y)
+  (IE-YANK-MATCHING-COMMAND ZWEI:*KILL-HISTORY*))
+
+;--- Should be smarter, if previous command was c-Y rather than c-sh-Y must ask for string
+(DEFINE-IE-COMMAND YANK-POP-MATCHING (#\Meta-Shift-Y)
+  (WHEN (OR (NULL YANK-HISTORY) (NULL *LAST-YANK-MATCHING*))
+    (IE-BARF))
+  (WITH-INPUT-HISTORY-DEFAULT (HISTORY)	;what the hell history is this dealing with
+    (IF (ZEROP *NUMERIC-ARG*)
+	(IE-DISPLAY-HISTORY YANK-HISTORY T T (IE-HISTORY-PROMPT YANK-HISTORY))
+	(IE-COPY-HISTORY YANK-HISTORY T :YANK-NEXT *NUMERIC-ARG* *LAST-YANK-MATCHING*))))
+
+(DEFINE-IE-COMMAND YANK-INPUT-MATCHING (#\Control-Meta-Shift-Y)
+  (WITH-INPUT-HISTORY-DEFAULT (HISTORY)
+    (IE-YANK-MATCHING-COMMAND HISTORY)))
+
+;;;; Scrolling
+
+(DEFINE-IE-COMMAND SCROLL-VERTICAL-FORWARD (#\Scroll #\Control-V)
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL (IF *NUMERIC-ARG-P* :LINE :SCREEN)
+				      *NUMERIC-ARG*
+				      :Y SELF))
+
+(DEFINE-IE-COMMAND SCROLL-VERTICAL-BACKWARD (#\Meta-Scroll #\Meta-V
+					     #\Keyboard:Back-Scroll)
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL (IF *NUMERIC-ARG-P* :LINE :SCREEN)
+				      (- *NUMERIC-ARG*)
+				      :Y SELF))
+
+(DEFINE-IE-COMMAND SCROLL-VERTICAL-BEGINNING ()
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL :BEGINNING 0 :Y SELF))
+
+(DEFINE-IE-COMMAND SCROLL-VERTICAL-END ()
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL :END 0 :Y SELF))
+
+(DEFINE-IE-COMMAND SCROLL-HORIZONTAL-FORWARD (#\Super-Scroll)
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL (IF *NUMERIC-ARG-P* :LINE :SCREEN)
+				      *NUMERIC-ARG*
+				      :X SELF))
+
+(DEFINE-IE-COMMAND SCROLL-HORIZONTAL-BACKWARD (#\Meta-Super-Scroll
+					       #\Super-Keyboard:Back-Scroll)
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL (IF *NUMERIC-ARG-P* :LINE :SCREEN)
+				      (- *NUMERIC-ARG*)
+				      :X SELF))
+
+(DEFINE-IE-COMMAND SCROLL-TYPEOUT-FORWARD (#\Control-Scroll)
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL (IF *NUMERIC-ARG-P* :LINE :SCREEN)
+				      *NUMERIC-ARG*
+				      :Y SELF T))
+
+(DEFINE-IE-COMMAND SCROLL-TYPEOUT-BACKWARD (#\Meta-Control-Scroll
+					    #\Control-Keyboard:Back-Scroll)
+  (CP::SCROLL-WINDOW-COMMAND-INTERNAL (IF *NUMERIC-ARG-P* :LINE :SCREEN)
+				      (- *NUMERIC-ARG*)
+				      :Y SELF T))
+
+(DEFINE-IE-COMMAND SAVE-SCROLL-POSITION (#\Control-Meta-S)
+  (LET ((WINDOW (CP::FIND-WINDOW-FOR-SCROLLING :WINDOW SELF)))
+    (UNLESS WINDOW
+      (IE-BARF))
+    (LET* ((POS (CONS WINDOW (MULTIPLE-VALUE-LIST (SEND WINDOW :VIEWPORT-POSITION))))
+	   (Q-REG (WITH-IE-TYPEIN (SELF)
+		    (LET ((DW::*ACCEPT-ACTIVE* NIL))
+		      (ACCEPT 'CL:CHARACTER :PROMPT "Save position in" :DEFAULT NIL)))))
+      (SETF (GETHASH Q-REG CP::*POSITION-Q-REGS*) POS)
+      (LEXPR-SEND WINDOW :SET-VIEWPORT-POSITION (REST1 POS)))))
+
+(DEFINE-IE-COMMAND RESTORE-SCROLL-POSITION (#\Control-Meta-R)
+  (LET ((WINDOW (CP::FIND-WINDOW-FOR-SCROLLING :WINDOW SELF)))
+    (UNLESS WINDOW
+      (IE-BARF))
+    (LET* ((Q-REG (WITH-IE-TYPEIN (SELF)
+		    (LET ((DW::*ACCEPT-ACTIVE* NIL))
+		      (ACCEPT 'CL:CHARACTER :PROMPT "Restore position from" :DEFAULT NIL))))
+	   (POS (GETHASH Q-REG CP::*POSITION-Q-REGS*)))
+      (UNLESS (AND POS (EQ (FIRST POS) WINDOW))
+	(IE-BARF))
+      (LEXPR-SEND WINDOW :SET-VIEWPORT-POSITION (REST1 POS)))))
+
+(DEFINE-IE-COMMAND KILL-RING-CLEAR-REGION-STRINGS (#\Super-G)
+  (UNLESS (CP::CLEAR-ALL-MARKED-TEXT :WINDOW SELF)
+    (IE-BARF)))
+
+(DEFINE-IE-COMMAND SCROLL-SEARCH-FORWARD (#\Control-S #\Super-S #\Keyboard:Find)
+  (CP::SCROLL-SEARCH-COMMAND-INTERNAL :WINDOW SELF :DIRECTION :FORWARD))
+
+(DEFINE-IE-COMMAND SCROLL-SEARCH-BACKWARD (#\Control-R #\Super-R #\Meta-Keyboard:Find)
+  (CP::SCROLL-SEARCH-COMMAND-INTERNAL :WINDOW SELF :DIRECTION :BACKWARD))
+
+;;; Not on any key.
+(DEFINE-IE-COMMAND CLEAR-HISTORY ()
+  (SEND-IF-HANDLES SELF :CLEAR-HISTORY))
+
+(DEFINE-IE-COMMAND CONSOLE-CUT (#\Keyboard:Cut)
+  (LET ((HISTORY (AND (TYPEP SELF 'TV:SHEET) (CONSOLE-KILL-HISTORY (TV:SHEET-CONSOLE SELF)))))
+    (WHEN (NULL HISTORY) (IE-BARF))
+    (LET ((STRINGS (LOOP FOR WINDOW IN (CP::WINDOWS-FOR-MARKING-AND-YANKING :WINDOW SELF)
+			 FOR TEXT = (SEND WINDOW :MARKED-TEXT :RETURN-AS-STRING T :UNMARK T
+					  :DELETE T)
+			 WHEN TEXT COLLECT TEXT)))
+      (WHEN (NULL STRINGS) (IE-BARF))
+      (LET ((STRING (APPLY #'STRING-APPEND STRINGS)))
+	(SEND ZWEI:*KILL-HISTORY* :PUSH STRING)
+	(SEND HISTORY :PUSH STRING)))))
+
+(DEFINE-IE-COMMAND CONSOLE-COPY (#\Keyboard:Copy)
+  (LET ((HISTORY (AND (TYPEP SELF 'TV:SHEET) (CONSOLE-KILL-HISTORY (TV:SHEET-CONSOLE SELF)))))
+    (WHEN (NULL HISTORY) (IE-BARF))
+    (LET ((STRINGS (LOOP FOR WINDOW IN (CP::WINDOWS-FOR-MARKING-AND-YANKING :WINDOW SELF)
+			 FOR TEXT = (SEND WINDOW :MARKED-TEXT :RETURN-AS-STRING T :UNMARK T)
+			 WHEN TEXT COLLECT TEXT)))
+      (WHEN (NULL STRINGS) (IE-BARF))
+      (LET ((STRING (APPLY #'STRING-APPEND STRINGS)))
+	(SEND ZWEI:*KILL-HISTORY* :PUSH STRING)
+	(SEND HISTORY :PUSH STRING)))))
+
+(DEFINE-IE-COMMAND CONSOLE-PASTE (#\Keyboard:Paste)
+  (LET ((HISTORY (AND (TYPEP SELF 'TV:SHEET) (CONSOLE-KILL-HISTORY (TV:SHEET-CONSOLE SELF)))))
+    (WHEN (NULL HISTORY) (IE-BARF))
+    (IE-YANK-COMMAND HISTORY)))
+
+(DEFINE-IE-COMMAND CONSOLE-PASTE-POP (#\M-Keyboard:Paste)
+  (WHEN (NULL MARK) (IE-BARF))
+  (LET ((HISTORY (AND (TYPEP SELF 'TV:SHEET) (CONSOLE-KILL-HISTORY (TV:SHEET-CONSOLE SELF)))))
+    (WHEN (NULL HISTORY) (IE-BARF))
+    (IF (ZEROP *NUMERIC-ARG*)
+	(IE-DISPLAY-HISTORY HISTORY T T)
+      (IE-COPY-HISTORY HISTORY T :YANK-NEXT *NUMERIC-ARG*))))
+
+
+;; Look, if we can support Fortran, then we can certainly support printing terminals.
+;; Printing terminals can be connected via the serial lines, or the TTYLINK or TELNET servers.
+
+(DEFFLAVOR PRINTING-INPUT-EDITOR () (INTERACTIVE-STREAM))
+
+;; T if an open bracket has been printed but not a close bracket.
+(DEFVAR *OPEN-BRACKET*)
+
+;; T if echoing happens by the input editor instead of by the remote terminal.
+(DEFVAR *ECHOPLEX*)
+
+;; This is only called when typing at the end of the line.  There is no such thing as typing
+;; in the middle of the line here.
+
+(DEFUN-IE PIE-INSERT-CHAR (CHAR)
+  (IF *OPEN-BRACKET* (SEND SELF :TYO #/]))
+  (IF *ECHOPLEX* (SEND SELF :TYO CHAR))
+  (ARRAY-PUSH-EXTEND INPUT-EDITOR-BUFFER CHAR)
+  (IE-EOL-ACTIVATE))
+
+(DEFUN-IE PIE-RUBOUT-CHAR ()
+  (UNLESS (ZEROP (IEB-FILL-POINTER))
+    (SETQ *RESCAN-STATE* :EOL)
+    (LET ((NOISE-STRINGS (IEB-NOISE-STRINGS))
+	  (NOISE-STRING-FLUSHED? NIL))
+      (WHEN (AND NOISE-STRINGS
+		 (= (IEB-FILL-POINTER) (CAAR (LAST NOISE-STRINGS))))
+	(SETF (IEB-NOISE-STRINGS) (NBUTLAST NOISE-STRINGS))
+	(SETQ NOISE-STRING-FLUSHED? T))
+      (LET ((CHAR (ARRAY-POP INPUT-EDITOR-BUFFER)))
+	;; If we're already rubbing out, then echo character.
+	;; If we're not rubbing out and the character is a space, then backspace.
+	;; If this is our first rubout, print "[" and echo.
+	(COND ((NOT *ECHOPLEX*))
+	      (*OPEN-BRACKET*
+	       (SEND SELF :TYO CHAR))
+	      ((AND (CHAR-EQUAL CHAR #\SPACE) (NOT NOISE-STRING-FLUSHED?))
+	       (SEND SELF :INCREMENT-CURSORPOS -1 0 :CHARACTER))
+	      (T (SETQ *OPEN-BRACKET* T)
+		 (SEND SELF :TYO #/[)
+		 (SEND SELF :TYO CHAR)))))))
+
+(DEFUN-IE PIE-CLOSE-BRACKET ()
+  (WHEN *OPEN-BRACKET*
+    (SETQ *OPEN-BRACKET* NIL)
+    (SEND SELF :TYO #/])))
+
+(DEFUN-IE PIE-NEW-LINE (&OPTIONAL FUNCTION &REST ARGUMENTS)
+  (DECLARE (SYS:DOWNWARD-FUNARG FUNCTION))
+  (PIE-CLOSE-BRACKET)
+  (IF FUNCTION (APPLY FUNCTION ARGUMENTS))
+  (SEND SELF :FRESH-LINE)
+  (SEND SELF :REFRESH-RUBOUT-HANDLER))
+
+(DEFUN-IE PIE-ACTIVATE (THING)
+  (PIE-CLOSE-BRACKET)
+  (IE-ACTIVATE THING NIL))
+
+(DEFUN-IE PIE-TYI (&OPTIONAL TOP-LEVEL?)
+  (LET ((SUPPRESS-NOTIFICATIONS (INPUT-EDITOR-FLAG :SUPPRESS-NOTIFICATIONS))
+	(INPUT-WAIT (INPUT-EDITOR-FLAG :INPUT-WAIT))
+	(INPUT-WAIT-HANDLER (INPUT-EDITOR-FLAG :INPUT-WAIT-HANDLER))
+	(NOTIFICATION-HANDLER (INPUT-EDITOR-OPTION :NOTIFICATION-HANDLER)))
+    (DO (CHAR) (NIL)
+      (IE-INPUT-WAIT-1 SUPPRESS-NOTIFICATIONS INPUT-WAIT INPUT-WAIT-HANDLER)
+      (COND ((AND (NOT SUPPRESS-NOTIFICATIONS) (SETQ CHAR (SEND SELF :RECEIVE-NOTIFICATION)))
+	     (IF NOTIFICATION-HANDLER
+		 (LEXPR-FUNCALL (CAR NOTIFICATION-HANDLER) CHAR (CDR NOTIFICATION-HANDLER))
+		 (PIE-NEW-LINE
+		   (LAMBDA () (DISPLAY-NOTIFICATION SELF CHAR :STREAM)))))
+	    ((SEND SELF :LISTEN)
+	     (SETQ CHAR (SEND SELF :ANY-TYI))
+	     (IF (OR (CHARACTERP CHAR) TOP-LEVEL?)
+		 (RETURN CHAR)))))))
+
+(DEFCONST *PIE-HELP-TEXT*
+	  "The printing terminal input editor is being used.  Commands are:~@
+	   ~4XRubout~23T-- Erase the last character~@
+	   ~4Xc-W or m-Rubout~23T-- Erase the last word~@
+	   ~4Xc-U or Clear-Input~23T-- Erase the current input~@
+	   ~4Xc-L or Refresh~23T-- Reprint the current input~@
+	   ~4Xc-Q~23T-- Quote the next character")
+
+;; Can't use :START-TYPEOUT and :FINISH-TYPEOUT here because scrolling breaks :SET-CURSORPOS.
+
+(DEFUN-IE PIE-DISPLAY-HELP (HELP-TEXT)
+  (WITH-IE-HELP-STREAM (HELP-STREAM)
+    (UNLESS (IE-DISPLAY-BRIEF-HELP NIL HELP-STREAM)
+      (SEND HELP-STREAM :FRESH-LINE)
+      (SEND HELP-STREAM :TYO #\NEWLINE)
+      (IE-DISPLAY-LONG-HELP HELP-TEXT HELP-STREAM)
+      (SEND HELP-STREAM :FRESH-LINE)
+      (SEND HELP-STREAM :TYO #\NEWLINE))
+    (WHEN (EQ HELP-STREAM SELF)
+      (SEND SELF :REFRESH-RUBOUT-HANDLER))))
+
+(DEFMETHOD (INPUT-EDITOR-DISPLAY-HELP PRINTING-INPUT-EDITOR) (IGNORE)
+  (PIE-DISPLAY-HELP *PIE-HELP-TEXT*))
+
+(DEFUN-IE PRINTING-INPUT-EDITOR-TYI-INTERNAL
+	  (HELP-TEXT RUBOUT-CHARS WORD-RUBOUT-CHARS LINE-KILL-CHARS
+	   LINE-REFRESH-CHARS HELP-CHARS QUOTE-CHARS)
+  (LET ((CHAR)
+	(*OPEN-BRACKET* NIL)
+	(RESCAN (INPUT-EDITOR-OPTION :RESCAN))
+	(ACTIVATION (INPUT-EDITOR-OPTION :ACTIVATION))
+	(COMMAND (INPUT-EDITOR-OPTION :COMMAND))
+	(BLIP-CHARACTER (INPUT-EDITOR-OPTION :BLIP-CHARACTER))
+	(DO-NOT-ECHO (INPUT-EDITOR-OPTION :DO-NOT-ECHO))
+	(RUBOUT-HANDLER :TYI))
+    (CATCH 'INPUT-EDITOR-RETURN
+      (DO () (NIL)
+
+	(SETQ CHAR
+	      (IF RESCAN-CHARACTER
+		  (PROG1 RESCAN-CHARACTER
+			 (SETQ RESCAN-CHARACTER NIL))
+		  (PIE-TYI)))
+	(COND
+	  ;; EOF indicator
+	  ((NULL CHAR)
+	   (PIE-ACTIVATE :EOF))
+	  ;; Throw away blips
+	  ((NOT (CHARACTERP CHAR)))
+	  ;; Rescan character.  The reader state will not correspond to the input editor state if
+	  ;; we have just been rubbing out and haven't yet typed a self-inserting character.
+	  ((AND RESCAN
+		;; Make sure we are not inside a parse-ferror.
+		(NOT (EQ *RESCAN-STATE* :ACTIVATION))
+		;; Input buffer doesn't match reader state.
+		(EQ *RESCAN-STATE* :EOL)
+		(LEXPR-FUNCALL (CAR RESCAN) CHAR (CDR RESCAN)))
+	   (SETF RESCAN-CHARACTER CHAR)
+	   (SETF RESCAN-POINTER (IEB-FILL-POINTER))
+	   (PIE-CLOSE-BRACKET)
+	   (THROW 'INPUT-EDITOR-RESCAN NIL))
+	  ;; Blip character is just returned as a blip
+	  ((AND BLIP-CHARACTER (LEXPR-FUNCALL (CAR BLIP-CHARACTER) CHAR (CDR BLIP-CHARACTER)))
+	   (PIE-CLOSE-BRACKET)
+	   (THROW 'INPUT-EDITOR-RETURN (IE-MAKE-BLIP :BLIP-CHARACTER CHAR NIL)))
+	  ;; Activation characters
+	  ((AND DO-NOT-ECHO (MEM #'CHAR= CHAR DO-NOT-ECHO))  ;--- Not CHAR-EQUAL?
+	   (PIE-ACTIVATE CHAR))
+	  ((AND ACTIVATION (LEXPR-FUNCALL (CAR ACTIVATION) CHAR (CDR ACTIVATION)))
+	   (PIE-ACTIVATE (IE-MAKE-BLIP :ACTIVATION CHAR NIL)))
+	  ;; Keystroke commands
+	  ((AND COMMAND (LEXPR-FUNCALL (CAR COMMAND) CHAR (CDR COMMAND)))
+	   (SETF ACTIVATOR (IE-MAKE-BLIP :COMMAND CHAR NIL))
+	   (PIE-CLOSE-BRACKET)
+	   (THROW 'INPUT-EDITOR-RESCAN NIL))
+	  ;; Echo characters backwards Unix style.
+	  ;; Use CHAR= rather than CHAR-EQUAL so that we don't mask off the bucky bits.
+	  ((MEM #'CHAR= CHAR RUBOUT-CHARS)
+	   (PIE-RUBOUT-CHAR))
+	  ;; Flush a word, echoing characters backwards.
+	  ((MEM #'CHAR= CHAR WORD-RUBOUT-CHARS)
+	   (UNLESS (ZEROP (IEB-FILL-POINTER))
+	     ;; First flush whitespace.
+	     (LOOP UNTIL (OR (ZEROP (IEB-FILL-POINTER))
+			     (IE-ALPHABETIC-CHARACTER? (1- (IEB-FILL-POINTER))))
+		   DO (PIE-RUBOUT-CHAR))
+	     ;; Then flush alphabetics.
+	     (LOOP UNTIL (OR (ZEROP (IEB-FILL-POINTER))
+			     (NOT (IE-ALPHABETIC-CHARACTER? (1- (IEB-FILL-POINTER)))))
+		   DO (PIE-RUBOUT-CHAR))))
+	  ;; If nothing in the buffer, don't do anything.
+	  ((MEM #'CHAR= CHAR LINE-KILL-CHARS)
+	   (UNLESS (ZEROP (IEB-FILL-POINTER))
+	     (SETQ *RESCAN-STATE* :EOL)
+	     (SETF (IEB-FILL-POINTER) 0)
+	     (SETF (IEB-NOISE-STRINGS) NIL)
+	     (PIE-NEW-LINE
+	       (LAMBDA ()
+		 (WHEN *ECHOPLEX* (SEND SELF :STRING-OUT " XXX"))))))
+	  ;; Control-K or Control-L echo themselves and then reprint the current
+	  ;; line, prompting if necessary.
+	  ((MEM #'CHAR= CHAR LINE-REFRESH-CHARS)
+	   (PIE-NEW-LINE
+	     (LAMBDA ()
+	       (WHEN *ECHOPLEX* (FORMAT SELF " ~C" CHAR)))))
+	  ;; Documentation.
+	  ((MEM #'CHAR= CHAR HELP-CHARS)
+	   (PIE-CLOSE-BRACKET)
+	   (PIE-DISPLAY-HELP HELP-TEXT))
+	  ;; Quote the next character
+	  ((MEM #'CHAR= CHAR QUOTE-CHARS)
+	   (PIE-INSERT-CHAR (PIE-TYI)))
+	  ;; Some other random control character or format effector.  Beep and ignore.
+	  ((NOT (OR (GRAPHIC-CHAR-P CHAR)
+		    (MEM #'CHAR= CHAR '(#\RETURN #\TAB #\BACKSPACE))))
+	   (SEND SELF :BEEP))
+	  ;; Self inserting character.
+	  (T (PIE-INSERT-CHAR CHAR)))
+	
+	;; Rubbed out everything.
+	(WHEN (ZEROP (IEB-FILL-POINTER))
+	  ;; Close the rubout and go to the next line.
+	  (IF *OPEN-BRACKET* (PIE-NEW-LINE))
+	  ;; If the :FULL-RUBOUT option active, then throw.
+	  (WHEN (OR (INPUT-EDITOR-FLAG :FULL-RUBOUT)
+		    (AND (INPUT-EDITOR-FLAG :LIMITED-FULL-RUBOUT)
+			 (MEMBER CHAR '(#\Rubout #\Clear-Input))))
+	    (THROW 'INPUT-EDITOR-RESCAN NIL)))
+	))))
+
+(DEFMETHOD (INPUT-EDITOR-TYI PRINTING-INPUT-EDITOR) (*RESCAN-STATE*)
+  (LET ((*ECHOPLEX* T))
+    (PRINTING-INPUT-EDITOR-TYI-INTERNAL
+      *PIE-HELP-TEXT*
+      '(#\RUBOUT)
+      '(#\META-RUBOUT #\CONTROL-W)
+      ;; Control-D and Control-U kill the current line, for compatibility with ITS and Twenex.
+      '(#\CLEAR-INPUT #\CONTROL-D #\CONTROL-U)
+      '(#\REFRESH #\CONTROL-K #\CONTROL-L)
+      '(#\HELP)
+      '(#\CONTROL-Q)
+      )))
+
+;; If line-buffered, don't try to redisplay.
+
+(DEFMETHOD (INPUT-EDITOR-REPLACE-INPUT PRINTING-INPUT-EDITOR) (N-CHARS STRING BEGIN END)
+  ;; If the scan pointer is before the fill pointer, then the CP is just being lazy, so don't
+  ;; do a thing.  STRING should exactly match what is already in the input buffer.
+  ;; Middle of the line completion isn't possible with this input editor.
+  (WHEN (= (IEB-SCAN-POINTER) (IEB-FILL-POINTER))
+    ;; If there are spaces at the end of the input buffer, flush them and move the
+    ;; print head backwards.
+    (LOOP FOR INDEX FROM (1- (IEB-FILL-POINTER)) DOWNTO (- (IEB-FILL-POINTER) N-CHARS)
+	  WHILE (CHAR-EQUAL (IE-CHARACTER INDEX) #\SPACE)
+	  DO
+      (DECF (IEB-FILL-POINTER))
+      (DECF N-CHARS)
+      (SEND SELF :INCREMENT-CURSORPOS -1 0 :CHARACTER))
+    ;; Now remove the printing characters.
+    (LET* ((SIZE (- END BEGIN))
+	   (REPLACE-POINTER (- (IEB-FILL-POINTER) N-CHARS))
+	   (NEW-FILL-POINTER (+ REPLACE-POINTER SIZE))
+	   (MATCH 0))
+      ;; Use CHAR-EQUAL as the predicate rather than CHAR= since it isn't worth reprinting
+      ;; the input buffer if only the case is changing.
+      (LOOP FOR INPUT-INDEX FROM REPLACE-POINTER BELOW (IEB-FILL-POINTER)
+	    FOR STRING-INDEX FROM BEGIN BELOW END
+	    WHILE (CHAR-EQUAL (IE-CHARACTER INPUT-INDEX) (AREF STRING STRING-INDEX))
+	    DO (INCF MATCH))
+      ;; Make sure there is enough room before doing the copy.
+      (ASSURE-ARRAY-SIZE INPUT-EDITOR-BUFFER NEW-FILL-POINTER)
+      ;; Don't bother looking at MATCH here, so that case changes will be visible the next
+      ;; time the buffer is reprinted.
+      (COPY-ARRAY-PORTION STRING BEGIN END
+			  INPUT-EDITOR-BUFFER REPLACE-POINTER NEW-FILL-POINTER)
+      (SETF (IEB-FILL-POINTER) NEW-FILL-POINTER)
+      ;; Optimize redisplay.
+      (COND ((= MATCH N-CHARS)
+	     (SEND SELF :STRING-OUT STRING (+ BEGIN MATCH) END))
+	    (T (SEND SELF :FRESH-LINE)
+	       (SEND SELF :REFRESH-RUBOUT-HANDLER))))))
+
+;; Well, if you thought the printing input editor was gross, get a load of this.
+;; This needs to be smarter about whether transmission is line-at-a-time or not.
+
+(DEFFLAVOR HALFDUPLEX-INPUT-EDITOR () (PRINTING-INPUT-EDITOR))
+
+(DEFCONST *HIE-HELP-TEXT*
+	  "The halfduplex input editor is being used.  Commands are:~@
+	   ~4X#~23T-- Erase the last character~@
+	   ~4X@~23T-- Erase the current input~@
+	   ~4X\~23T-- Quote the next character")
+
+(DEFMETHOD (INPUT-EDITOR-DISPLAY-HELP HALFDUPLEX-INPUT-EDITOR) (IGNORE)
+  (PIE-DISPLAY-HELP *HIE-HELP-TEXT*))
+
+(DEFMETHOD (INPUT-EDITOR-TYI HALFDUPLEX-INPUT-EDITOR) (*RESCAN-STATE*)
+  (LET ((*ECHOPLEX* NIL))
+    (PRINTING-INPUT-EDITOR-TYI-INTERNAL
+      *HIE-HELP-TEXT*
+      ;; # for Multics compatibility
+      ;; Backspace for video terminals
+      ;; Rubout if the guy is really confused
+      '(#\# #\BACKSPACE #\RUBOUT)
+      '(#\META-RUBOUT #\CONTROL-W)
+      '(#\CLEAR-INPUT #\CONTROL-D #\CONTROL-U #\@)
+      '(#\REFRESH #\CONTROL-K #\CONTROL-L)
+      '(#\HELP)
+      '(#\CONTROL-Q #\\))))
+
+

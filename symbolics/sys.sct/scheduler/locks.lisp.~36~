@@ -1,0 +1,839 @@
+;;; -*- Mode: Lisp; Syntax: Common-lisp; Package: PROCESS; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Interface to the scheduler proper.
+
+(defun corrupted-lock-arg-p (lock-arg)
+  (or ;; stale arg?
+    (and (si:in-stack lock-arg) 
+	 (member (multiple-value-bind
+		   (origin active-size size stack-number stack-group)
+		     (without-interrupts
+		       (si:decode-stack-address (si:%pointer lock-arg)))
+		   (ignore active-size size stack-number)
+		   (when origin stack-group))
+		 process::*stack-groups-not-unwound*))
+    ;; not stale, but wrong type.
+    (not (listp lock-arg))
+    ;; all lock-args are cdr-coded for the first 4 elts ---
+    (not (loop with ptr = (si:%pointer lock-arg)
+	       for elt below 3
+	       always (eql si:cdr-next (si:%p-cdr-code (si:%pointer-plus ptr elt)))))
+    (not (let ((lock (lock-argument-lock lock-arg)))
+	   (and (instancep lock) (typep lock 'basic-lock))))
+    (not (let ((process (lock-argument-process lock-arg)))
+	   (and (instancep process) (typep process 'process))))
+
+    ))
+
+;;; Add a lock-argument to a process' lock list.
+;;; This may happen at any time, so carefully interlock against asynchronous updates.
+;;; The lock is guaranteed to be latched.
+(defun process-note-lock-locked (process lock-argument)
+  ;; we'd really like this WHEN to be an IF, and we should RESET the
+  ;; lock if we get passed a bad PROCESS argument.  However, it's not
+  ;; safe to do a RESET-LOCK at this point.
+  (when (and (instancep process) (typep process 'process) (listp lock-argument))
+    (if (lock-argument-locked-p lock-argument)
+	(cond ((corrupted-lock-arg-p lock-argument)
+	       ;; Make sure we don't have our hands on a bogus
+	       ;; lock-argument.  this can happen if we are called on a
+	       ;; trashed lock by unsimplify-lock We should probably
+	       ;; reset the lock here, since the trashed lock-argument
+	       ;; has come to us from a trashed lock.  Unfortunately, at
+	       ;; this point, we have no good way of determining which
+	       ;; lock, and it is probably latched by a caller, so we
+	       ;; can't continue without throwing out.
+	       )
+	      (t (error "Lock argument in use.")))
+	(let ((lock-cell (locf (process-current-lock process))))
+	  (setf (lock-argument-locked-p lock-argument) t)
+	  (loop
+	    (let ((old-lock (location-contents lock-cell)))
+	      (setf (lock-argument-next-lock-argument lock-argument) old-lock)
+	      (when (store-conditional lock-cell old-lock lock-argument)
+		(return nil))))))))
+
+;;; Remove a lock-argument from a process' lock list.
+;;; The lock is guaranteed to be latched.
+(defun process-note-lock-unlocked (process lock-argument)
+  (when (and (instancep process) (typep process 'process))
+    (without-interrupts
+      (let ((cell (locf (process-current-lock process))))
+	(loop
+	  (let ((this-lock (location-contents cell)))
+	    (when (null this-lock)
+	      (cerror "Continue anyway." "Can't find this lock for this process.")
+	      (return nil))
+	    (when (eq lock-argument (sys:follow-list-forwarding this-lock))
+	      (shiftf (location-contents cell)
+		      (lock-argument-next-lock-argument lock-argument)
+		      nil)
+	      (setf (lock-argument-locked-p lock-argument) nil)
+	      (return t))
+	    ;; Don't check this until here, so that typical case isn't slowed down.
+	    (when (corrupted-lock-arg-p (sys:follow-list-forwarding this-lock))
+	      (return nil))
+	    (setf cell (locf (lock-argument-next-lock-argument this-lock)))))))))
+
+(defun process-collect-lock-arguments (process lock)
+  (without-interrupts
+    (loop for lock-argument first (process-current-lock process)
+			    then (lock-argument-next-lock-argument lock-argument)
+	  until (null lock-argument)
+	  when (eq lock (lock-argument-lock lock-argument))
+	    collect lock-argument)))
+
+
+
+;;; Internal Generic Functions
+
+;;; The 6 generic functions which follow form the interface between the generic locking code
+;;; and the particular type (mutual-exclusion, reader-writer, etc.) of lock.
+
+(defgeneric lock-note-locker (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-note-unlocker (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-map-over-conflicting-owners (lock lock-argument function)
+  (declare (sys:downward-funarg function)))
+
+(defgeneric lock-lockable (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-deadlocked (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-locked (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-idle (lock)
+  (:inline-methods :recursive))
+
+;;; The 6 generic functions which follow are used to deal with recursive locks (mylocks).
+;;; They are defined by the two mylock mixins.
+
+(defgeneric lock-exclusive-note-locker (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-exclusive-note-unlocker (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-exclusive-map-over-conflicting-owners (lock lock-argument function)
+  (declare (sys:downward-funarg function)))
+
+(defgeneric lock-exclusive-lockable (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-exclusive-deadlocked (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-exclusive-locked (lock lock-argument)
+  (:inline-methods :recursive))
+
+(defgeneric lock-exclusive-idle (lock)
+  (:inline-methods :recursive))
+
+
+
+;;; Flavors
+
+
+
+;;; macros for flavors that need "sets" that don't cons.
+
+;;;   We don't want to cons whenever we lock, so we'll use an array rather than a list to
+;;;   represent a set..
+;;;   However, for locks that never have contention, we don't want to cons the array.
+;;;   Therefore, we don't allocate the array until we have more than one element of the set.
+;;;   So, the representation of the SET can be:
+;;;     NIL      - No readers
+;;;     A list   - This list *is* a single lock argument for the single reader.
+;;;     An array - An array of the lock-arguments for readers.  If the fill-pointer is 0,
+;;;                then there are no readers.  (The representation never goes back to NIL.
+(defflavor lock-set-mixin () () :abstract-flavor (:required-flavors basic-lock))
+
+(defmacro-in-flavor (lock-member-of-set-p lock-set-mixin) (set elt)
+  (let ((set-var (gensym)))
+    `(and (not (null ,set))
+	  (if (arrayp ,set)
+	      (let ((,set-var ,set))
+		(declare (sys:array-register ,set-var))
+		(loop for i below (length ,set-var)
+		      thereis (eq (sys:follow-list-forwarding (aref ,set-var i)) ,elt)))
+	      (eql ,elt (sys:follow-list-forwarding ,set))))))
+
+(defmacro-in-flavor (lock-map-over-set lock-set-mixin) ((set varname) &body body)
+  `(if (listp ,set)
+       (when ,set
+	 (let ((,varname ,set)) ,@body))
+       (loop for ,varname being the array-elements of ,set do
+	 (progn ,@body))))
+
+(defmacro-in-flavor (lock-add-to-set lock-set-mixin) (set elt)
+  `(cond ((null ,set) (setf ,set ,elt))
+	 ((arrayp ,set) (vector-push-extend ,elt ,set))
+	 (t (let ((old-elt ,set))
+	      (setf ,set (make-array 4 :fill-pointer 2))
+	      (setf (aref ,set 0) old-elt)
+	      (setf (aref ,set 1) ,elt)))))
+
+(defmacro-in-flavor (lock-remove-from-set lock-set-mixin) (set elt)
+  (let ((set-var (gensym))
+	(length-var (gensym)))
+    `(progn
+       (when (not (null ,set))
+	 (if (listp ,set)
+	     (when (eql (sys:follow-list-forwarding ,set) ,elt)
+	       (setf ,set nil))
+	     (let* ((,set-var ,set)
+		    (,length-var (fill-pointer ,set-var)))
+	       (declare (sys:array-register ,set-var))
+	       (loop for i below ,length-var
+		     when (eq (sys:follow-list-forwarding (aref ,set-var i)) ,elt)
+		       do ;; Even if this is the topmost element, it will still work.
+			  ;; (Then, we just write the reader back in after the fill-pointer.
+			  (decf ,length-var)
+			  (setf (aref ,set-var i) (aref ,set-var ,length-var))
+			  (setf (fill-pointer ,set-var) ,length-var)
+			  (return nil)))))
+       ,set)))
+
+(defmacro-in-flavor (lock-set-empty-p lock-set-mixin) (set)
+  `(not (and ,set (or (listp ,set) (plusp (fill-pointer ,set))))))
+
+(defmacro-in-flavor (lock-element-of-set lock-set-mixin) (set)
+  `(and ,set
+	(if (listp ,set)
+	    ,set
+	    (and (plusp (fill-pointer ,set)) (aref ,set 0)))))
+
+
+
+
+
+;;; D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")Null lock:0 implements a null lock for disabling locking.
+
+(defflavor null-lock-mixin ((simple-latch nil)) ()
+  (:documentation "Doesn't actually do any locking operations; used to make lock a NOP.")
+  (:required-flavors basic-lock))
+
+;; Keep reseting simple-latch to NIL to make sure that we go through the
+;; fast store-conditional as much as possible.
+
+(defmethod (lock-internal null-lock-mixin) (&rest ignore)
+  (setq simple-latch nil)
+  t)
+
+(defmethod (unlock-internal null-lock-mixin) (&rest ignore)
+  (setq simple-latch nil)
+  t)
+
+(defmethod (reset-lock null-lock-mixin) ()
+  (setq simple-latch nil)
+  t)
+
+(defmethod (lock-idle-p-internal null-lock-mixin) () t)
+
+(defmethod (lock-lockable-p-internal null-lock-mixin) (lock-argument)
+  lock-argument
+  t)
+
+(defmethod (lock-process-lock-arguments-internal null-lock-mixin) (process)
+  process
+  nil)
+
+
+
+(defflavor queued-lock-mixin
+	((latch nil)
+	 (waiter-queue nil)
+	 (timer nil))
+	()
+  :abstract-flavor
+  (:required-flavors basic-lock)
+  (:required-methods
+   lock-note-locker lock-note-unlocker lock-map-over-conflicting-owners lock-lockable
+   lock-deadlocked lock-locked lock-idle))
+
+(defwhopper (reset-lock queued-lock-mixin) ()
+  (with-scheduler-locked
+    (continue-whopper)))
+
+(defmethod (reset-lock queued-lock-mixin) ()
+  (setf latch nil)
+  (when timer
+    (clear-timer timer))
+  (when waiter-queue
+    (loop until (scheduler-queue-empty? waiter-queue)
+	  do (process-wakeup-without-test
+	       (scheduler-queue-delete-and-return-head waiter-queue)))))
+
+
+
+;;; This is how the complex locks deal with internal synchronization.
+
+;;; Each lock is protected by a latch cell.  Any operation which wishes to manipulate any part
+;;; of the lock's state other than the simple-latch must wrap WITH-LATCH-LATCHED around
+;;; the manipulation.
+
+;;; Code within WITH-LATCH-LATCHED may not do anything which would cause the process to block.
+;;; This means it cannot itself wait for some condition or signal an error.
+;;; Local functions are provided to the body if it wishes to do any of these things.
+;;; These function will unwind the body's state, perform the operation, and restart the body.
+
+;;; The functions are:
+;;;	(LATCH-BLOCK-AND-RETRY verify-function &rest verify-function-args)
+;;;		-- Call PROCESS-BLOCK with the specified arguments and then restart the body.
+;;;	(LATCH-ERROR format-string &rest format-args)
+;;;		-- Call ERROR with the specified arguments.
+
+;;; For an example of the use of this macro, see any of the LOCK-INTERNAL method below.
+
+(defparameter *lock-timer-interval* 10000000)			;10 seconds
+
+(defmacro-in-flavor (with-latch-latched queued-lock-mixin)
+		    ((&key (process '*current-process*)) &body body)
+  `(block .latch-return.
+     (tagbody
+       .latch-retry-outer.
+	  (multiple-value-bind (function arg1 arg2 arg3)
+	      (with-scheduler-locked
+		(sys:without-aborts (lock-latch "internal state of lock is inconsistent")
+		  (unwind-protect
+		      (block .latch-block.
+			(unless (store-conditional (locf latch) nil ,process)
+			  (lock-latch-wait-internal self))
+			(tagbody
+			  .latch-retry-inner.
+			     (macrolet ((latch-error (format-string &rest format-args)
+					  `(return-from .latch-block.
+					     (values #'lock-error ,format-string
+						     ,(pop format-args)
+						     (list ,@format-args))))
+					(latch-block-and-retry (lock-argument)
+					  `(progn
+					     (lock-block-internal self ,lock-argument)
+					     (go .latch-retry-inner.))))
+			       (return-from .latch-return.
+				 (progn ,@body)))))
+		    (store-conditional (locf latch) ,process nil))))
+	    (apply function self arg1 arg2 arg3)
+	    (go .latch-retry-outer.)))))
+
+(defmethod (lock-error queued-lock-mixin) (format-string &rest format-args)
+  (declare (dbg:error-reporter))
+  (apply #'error format-string format-args))
+
+;;; This method should really be a DEFUN-IN-FLAVOR.
+;;; There is a bug in inline method combination that results in the wrong 
+;;; mapping table being used in that case.
+(defmethod (lock-latch-wait-internal queued-lock-mixin) ()
+  (loop until (store-conditional (locf latch) nil *current-process*)
+	do (sys:with-aborts-enabled (lock-latch)
+	     (when (eq latch *current-process*)
+	       (error "Latch deadlock."))
+	     (process-block-and-poll-wait-function
+	       "Latch Wait" .1 #'(lambda (loc) (null (location-contents loc))) (locf latch)))))
+
+;;; This method should really be a DEFUN-IN-FLAVOR.
+;;; There is a bug in inline method combination that results in the wrong 
+;;; mapping table being used in that case.
+(defmethod (lock-block-internal queued-lock-mixin) (lock-argument)
+  (declare (dbg:locking-function describe-process-lock-for-debugger self))
+  (when (null waiter-queue)
+    (setf waiter-queue (make-scheduler-queue :name name))
+    (setf timer (create-timer-call #'lock-timer-expired `(,self) :name name)))
+  (let ((process (lock-argument-process lock-argument)))
+    (unwind-protect
+	(progn
+	  (lock-map-over-conflicting-owners
+	    self lock-argument
+	    #'(lambda (other-lock-arg)
+		(add-promotion process lock-argument
+			       (lock-argument-process other-lock-arg) other-lock-arg)))
+	  (unless (timer-pending-p timer)
+	    (when (and (safe-to-use-timers %real-current-process)
+		       (not dbg:*debugger-might-have-system-problems*))
+	      (reset-timer-relative-timer-units timer *lock-timer-interval*)))
+	  (assert (store-conditional (locf latch) process nil))
+	  (sys:with-aborts-enabled (lock-latch)
+	    (let ((priority (process-process-priority *current-process*)))
+	      (if (ldb-test %%scheduler-priority-preemption-field priority)
+		  (promotion-block waiter-queue name #'lock-lockable self lock-argument)
+		  ;; Change to preemptive priority so that when unlock-internal wakes us up
+		  ;; so we can have the lock, we will really wake up right away
+		  (with-process-priority (dpb 1 %%scheduler-priority-preemption-field priority)
+		    (promotion-block waiter-queue name #'lock-lockable self lock-argument))))))
+      (unless (store-conditional (locf latch) nil process)
+	(lock-latch-wait-internal self))
+      (remove-promotions process lock-argument))))
+
+(defun describe-process-lock-for-debugger (lock)
+  ;; Always be robust
+  (when (typep lock 'basic-lock)
+    (multiple-value-bind (writer first-reader) (decode-lock-for-debugger lock)
+      (when (or writer FIRST-reader)
+	(format t "~& You are waiting for a lock")
+	(when (process::lock-name lock)
+	  (format t " named ~A" (process::lock-name lock)))
+	(let ((owner (ignore-errors (or (fourth writer) (fourth first-reader)))))
+	  (format t " currently held by process ~S (in state ~A)~A"
+		  owner
+		  (process-whostate owner)
+		  (cond ((and writer first-reader) " and some readers")
+			(first-reader " which is a reader")
+			(t ""))))))))
+
+;;; This function is called every once in a while whenever there are processes waiting for a 
+;;; lock.  It recovers from lost wakeups and does deadlock detection.
+(defmethod (lock-timer-expired queued-lock-mixin) ()
+  (let ((needs-to-be-reset nil))
+    (with-latch-latched ()
+      (when (not (scheduler-queue-empty? waiter-queue))
+	(unless (process-wakeup (scheduler-queue-head waiter-queue))
+	  (with-stack-list (lock-arg nil nil self (scheduler-queue-head waiter-queue))
+	    (lock-map-over-conflicting-owners
+	      self
+	      lock-arg
+	      #'(lambda (other-lock-arg)
+		  (when (corrupted-lock-arg-p other-lock-arg)
+		    (setq needs-to-be-reset t))))))
+	(reset-timer-relative-timer-units timer *lock-timer-interval*)))
+    ;; Eventually put code in here to detect multi-lock deadlocks.
+    (when needs-to-be-reset
+      (reset-lock self))))
+
+(defun reset-one-locker (lock-argument)
+  (when (and lock-argument (listp lock-argument))
+    (setf lock-argument (sys:follow-list-forwarding lock-argument))
+    (process-note-lock-unlocked (lock-argument-process lock-argument) lock-argument)))
+
+
+
+(defflavor nonrecursive-lock-mixin ((locker nil)) ()
+  :abstract-flavor)
+
+(defmethod (lock-exclusive-note-locker nonrecursive-lock-mixin) (lock-argument)
+  (setf locker lock-argument))
+
+(defmethod (lock-exclusive-map-over-conflicting-owners nonrecursive-lock-mixin)
+	   (lock-argument function)
+  lock-argument
+  (when locker
+    (funcall function locker)))
+
+;;; This is the verify-function when waiting on a simple-lock.
+(defmethod (lock-exclusive-lockable nonrecursive-lock-mixin) (ignore)
+  (null locker))
+
+(defmethod (lock-exclusive-deadlocked nonrecursive-lock-mixin) (lock-argument)
+  (eq (lock-argument-process lock-argument)
+      (lock-argument-process locker)))
+
+(defmethod (lock-exclusive-locked nonrecursive-lock-mixin) (lock-argument)
+  (and locker
+       (eq (sys:follow-list-forwarding locker) lock-argument)))
+
+(defmethod (lock-exclusive-note-unlocker nonrecursive-lock-mixin) (ignore)
+  (setf locker nil))
+
+(defmethod (lock-exclusive-idle nonrecursive-lock-mixin) ()
+  (null locker))
+
+(defmethod (reset-lock nonrecursive-lock-mixin) ()
+  (when locker
+    (reset-one-locker locker)
+    (setf locker nil)))
+
+;;;
+
+(defflavor recursive-lock-mixin ((lockers nil))
+	   (lock-set-mixin)
+  :abstract-flavor)
+
+(defmethod (lock-exclusive-note-locker recursive-lock-mixin) (lock-argument)
+  (lock-add-to-set lockers lock-argument))
+
+(defmethod (lock-exclusive-map-over-conflicting-owners recursive-lock-mixin) 
+	   (lock-argument function)
+  lock-argument
+  (lock-map-over-set (lockers locker) (funcall function locker)))
+
+
+(defmethod (lock-exclusive-lockable recursive-lock-mixin) (lock-argument)
+  (or (lock-set-empty-p lockers)
+      (eq (lock-argument-process lock-argument)
+	  (lock-argument-process (lock-element-of-set lockers)))))
+
+(defmethod (lock-exclusive-deadlocked recursive-lock-mixin) (ignore)
+  nil)
+
+(defmethod (lock-exclusive-locked recursive-lock-mixin) (lock-argument)
+  (lock-member-of-set-p lockers lock-argument))
+
+(defmethod (lock-exclusive-note-unlocker recursive-lock-mixin) (lock-argument)
+  (lock-remove-from-set lockers lock-argument))
+
+(defmethod (lock-exclusive-idle recursive-lock-mixin) ()
+  (lock-set-empty-p lockers))
+
+(defmethod (reset-lock recursive-lock-mixin) ()
+  (lock-map-over-set (lockers locker)
+		     (reset-one-locker locker))
+  (if (arrayp lockers)
+      (setf (fill-pointer lockers) 0)
+      (setf lockers nil)))
+
+
+
+
+;; Change the lock to slow mode, setting LOCKER if necessary.
+(defsubst-in-flavor (unsimplify-lock queued-lock-mixin) ()
+  (let ((old-simple-latch (atomic-replacef simple-latch t)))
+    (cond ((consp old-simple-latch)
+	   (process-note-lock-locked (lock-argument-process old-simple-latch)
+				     old-simple-latch)
+	   (lock-note-locker self old-simple-latch))
+	  (t
+	   (case old-simple-latch
+	     ((t nil))
+	     (otherwise (atomic-replacef simple-latch old-simple-latch)))))))  
+
+;;; This is the real guts of locking.
+(defmethod (lock-internal queued-lock-mixin) (lock-argument)
+  (let ((process (lock-argument-process lock-argument)))
+    (assert (eq process *current-process*))
+    (with-latch-latched (:process process)
+      (unsimplify-lock)
+      ;; Try to lock the lock.
+      (cond ((lock-lockable self lock-argument)	; Is lock free?
+	     ;; We're making progress so we don't need the timer to check for anything
+	     (when (and timer
+			(not dbg:*debugger-might-have-system-problems*)
+			(safe-to-use-timers %real-current-process))
+	       (clear-timer timer))
+	     (process-note-lock-locked process lock-argument)	;yes, lock it.
+	     (lock-note-locker self lock-argument)
+	     t)
+	    ((lock-deadlocked self lock-argument)
+	     (latch-error "DEADLOCK: Lock ~S is already held by the current process." self))
+	    (t					; It's locked by another process.
+	     (latch-block-and-retry lock-argument))))))
+
+;;; This is the real guts of unlocking.
+(defmethod (unlock-internal queued-lock-mixin) (lock-argument)
+  (let ((process *current-process*))
+    (assert (eq process *current-process*))
+    (with-latch-latched (:process process)
+      (unsimplify-lock)
+      ;; Various things this calls assume that forwarding pointers have been chased.
+      (setf lock-argument (sys:follow-list-forwarding lock-argument))
+      (cond ((lock-locked self lock-argument)	;Must be locked to this process.
+	     (lock-note-unlocker self lock-argument)
+	     (process-note-lock-unlocked process lock-argument)
+	     ;; Undo any promotions
+	     (finish-promotions process lock-argument)
+	     ;; Return the lock to fast mode.
+	     (when (lock-idle self)
+	       (store-conditional (locf simple-latch) t nil))
+	     ;; Wake up the next pending process.
+	     (when (and waiter-queue
+			(not (scheduler-queue-empty? waiter-queue)))
+	       ;; Wake up exactly one process.
+	       (loop for p first (scheduler-queue-head waiter-queue)
+			   then (process-next-process p)
+		     while p
+		     until (process-wakeup p))
+	       ;; If there are other waiters, set a timer so we don't lose the wakeup.
+	       ;; If not, clear the timer so it doesn't go off unnecessarily.
+	       (if (not (scheduler-queue-empty? waiter-queue))
+		   (reset-timer-relative-timer-units timer *lock-timer-interval*)
+		   (clear-timer timer))))
+	    ;; Lock isn't locked to this process -- bug trap unless we hit a window.
+	    ((lock-argument-locked-p lock-argument)
+	     (latch-error "Lock ~S is not held by this process." self)))
+      nil)))
+
+(defmethod (lock-idle-p-internal queued-lock-mixin) ()
+  (with-latch-latched ()
+    (unsimplify-lock)
+    (lock-idle self)))
+
+(defmethod (lock-lockable-p-internal queued-lock-mixin) (lock-argument)
+  (with-latch-latched ()
+    (unsimplify-lock)
+    (lock-lockable self lock-argument)))
+
+(defmethod (lock-process-lock-arguments-internal queued-lock-mixin) (process)
+  (with-latch-latched ()
+    (unsimplify-lock)
+    (process-collect-lock-arguments process self)))
+
+
+
+;;; Here's a real lock flavor.
+;;; SIMPLE-LOCK-MIXIN implements a simple mutual-exclusion lock.
+;;; Processes waiting for the lock are kept in a FIFO queue and are given the lock in order.
+
+;;; SIMPLE-LATCH is discussed with the BASIC-LOCK flavor.
+;;; LATCH is the latch for this instance.
+;;; LOCKER contains the list that would have been in SIMPLE-LATCH if the lock is running
+;;;   in slow mode.
+
+(defflavor simple-lock-mixin
+	((simple-latch nil))
+	(queued-lock-mixin)
+  :abstract-flavor)
+
+(defmethod (lock-note-locker simple-lock-mixin) (lock-argument)
+  (lock-exclusive-note-locker self lock-argument))
+
+(defmethod (lock-lockable simple-lock-mixin) (lock-argument)
+  (lock-exclusive-lockable self lock-argument))
+
+(defmethod (lock-map-over-conflicting-owners simple-lock-mixin) (lock-argument function)
+  (lock-exclusive-map-over-conflicting-owners self lock-argument function))
+
+(defmethod (lock-deadlocked simple-lock-mixin) (lock-argument)
+  (lock-exclusive-deadlocked self lock-argument))
+
+(defmethod (lock-locked simple-lock-mixin) (lock-argument)
+  (lock-exclusive-locked self lock-argument))
+
+(defmethod (lock-note-unlocker simple-lock-mixin) (lock-argument)
+  (lock-exclusive-note-unlocker self lock-argument))
+
+(defmethod (lock-idle simple-lock-mixin) ()
+  (lock-exclusive-idle self))
+
+(defmethod (reset-lock simple-lock-mixin) ()
+  (atomic-replacef simple-latch nil))
+
+
+
+
+;;; Here's a fancier lock flavor.
+;;; MULTIPLE-READER-SINGLE-WRITER-LOCK-MIXIN implements what its name says.
+;;; Processes waiting for the lock are kept in a FIFO queue and are given the lock in order.
+
+;;; SIMPLE-LATCH is discussed with the BASIC-LOCK flavor.
+;;; LOCKER is NIL if the lock is not write locked.  If the lock is write locked,
+;;;   it contains the list that would have been in SIMPLE-LATCH if the lock were running
+;;;   in slow mode.
+;;; READERS is the SET (see macros above) of lock-arguments for all active read lockers.
+
+(defflavor multiple-reader-single-writer-lock-mixin
+	((simple-latch nil)
+	 (readers nil))
+	(queued-lock-mixin lock-set-mixin)
+  :abstract-flavor)
+
+(defmethod (lock-note-locker multiple-reader-single-writer-lock-mixin) (lock-argument)
+  (ecase (lock-argument-getf lock-argument :mode :write)
+    ((:read)
+     (lock-add-to-set readers lock-argument))
+    ((:write :exclusive-read)
+     (lock-exclusive-note-locker self lock-argument))))
+
+(defmethod (lock-map-over-conflicting-owners multiple-reader-single-writer-lock-mixin)
+	   (lock-argument function)
+  (lock-exclusive-map-over-conflicting-owners self lock-argument function)
+  (ecase (lock-argument-getf lock-argument :mode :write)
+    ((:write)
+     (lock-map-over-set (readers reader) (funcall function reader)))
+    ((:read :exclusive-read))))
+
+(defmethod (lock-lockable multiple-reader-single-writer-lock-mixin) (lock-argument)
+  (block lock-lockable-body
+    (ecase (lock-argument-getf lock-argument :mode :write)
+      ((:read)
+       (lock-exclusive-lockable self lock-argument))
+      ((:write)
+       (and (lock-exclusive-lockable self lock-argument)
+	    (lock-set-empty-p readers)))
+      ((:exclusive-read)
+       (and (lock-exclusive-lockable self lock-argument)
+	    (let ((process (lock-argument-process lock-argument)))
+	      (lock-map-over-set (readers reader)
+		(when (eq process (lock-argument-process reader))
+		  (return-from lock-lockable-body nil)))
+	      t))))))
+
+(defmethod (lock-deadlocked multiple-reader-single-writer-lock-mixin) (lock-argument)
+  (block lock-deadlocked-body
+    (ecase (lock-argument-getf lock-argument :mode :write)
+      ((:read)
+       (lock-exclusive-deadlocked self lock-argument))
+      ((:write :exclusive-read)
+       (or (lock-exclusive-deadlocked self lock-argument)
+	   (let ((process (lock-argument-process lock-argument)))
+	     (lock-map-over-set (readers reader)
+	       (when (eq process (lock-argument-process reader))
+		 (return-from lock-deadlocked-body t)))
+	     nil))))))
+
+(defmethod (lock-locked multiple-reader-single-writer-lock-mixin) (lock-argument)
+  (ecase (lock-argument-getf lock-argument :mode :write)
+    ((:read)
+     (lock-member-of-set-p readers lock-argument))
+    ((:write :exclusive-read)
+     (lock-exclusive-locked self lock-argument))))
+
+(defmethod (lock-note-unlocker multiple-reader-single-writer-lock-mixin) (lock-argument)
+  (ecase (lock-argument-getf lock-argument :mode :write)
+    ((:read)
+     (lock-remove-from-set readers lock-argument))
+    ((:write :exclusive-read)
+     (lock-exclusive-note-unlocker self lock-argument))))
+
+(defmethod (lock-idle multiple-reader-single-writer-lock-mixin) ()
+  (and (lock-set-empty-p readers)
+       (lock-exclusive-idle self)))
+
+(defmethod (reset-lock multiple-reader-single-writer-lock-mixin) ()
+  (lock-map-over-set (readers reader)
+    (reset-one-locker reader))
+  (if (arrayp readers)
+      (setf (fill-pointer readers) 0)
+      (setf readers nil))
+  (atomic-replacef simple-latch nil))
+
+
+
+
+
+;;; Varieties
+
+(defflavor normal-lock () (basic-lock)
+  :abstract-flavor
+  (:init-keywords :recursive :type)
+  (:mixture
+   (:recursive
+     (nil nonrecursive-lock-mixin)
+     (otherwise recursive-lock-mixin))
+   (:type
+     (:null null-lock-mixin)
+     (:simple simple-lock-mixin)
+     (:multiple-reader-single-writer multiple-reader-single-writer-lock-mixin))))
+
+(compile-flavor-methods normal-lock)
+
+;;;; Lock Interface
+
+(defun make-lock (name &rest keys &key (type :simple) (flavor 'normal-lock) &allow-other-keys)
+  (declare (arglist name &key (type :simple) recursive area flavor))
+  ;; NAME can get used as a whostate.  Err now, or err later. -kmp 8-Aug-90
+  (check-type name (or string null))
+  (apply #'make-instance flavor :name (or name "Lock") :type type keys))
+
+(defun bootstrap-locks ()
+  (without-interrupts
+    (dolist (old-lock si:*cold-load-locks*)
+      (let ((new-lock (apply #'make-lock (sys:%instance-ref old-lock 2))))
+	(setf (sys:%instance-ref new-lock 1) (sys:%instance-ref old-lock 1))
+	(structure-forward old-lock new-lock)))
+    (variable-makunbound si:*cold-load-locks*)
+    (variable-makunbound si:*cold-load-lock-flavor*)
+    (dolist (fcn '(lock-internal unlock-internal abort-lock))
+      (setf (symbol-function fcn) (flavor:find-generic-function fcn))))
+  nil)
+
+
+;;; Support for describing locks
+
+(defmethod (decode-lock-for-debugger nonrecursive-lock-mixin) ()
+  locker)
+
+;; Just return the single "writer" holding the lock
+(defmethod (decode-lock-for-debugger recursive-lock-mixin) ()
+  (labels ((return-lockers (locks)
+	     (cond ((arrayp locks)
+		    (return-from decode-lock-for-debugger
+		      (and (not (zerop (fill-pointer locks)))
+			   (aref locks 0))))
+		   ((listp locks)
+		    (return-from decode-lock-for-debugger locks))
+		   (t (return-from decode-lock-for-debugger locks)))))
+    (return-lockers lockers)))
+
+;; Return the "writer", if any, and the very first "reader"
+(defwhopper (decode-lock-for-debugger multiple-reader-single-writer-lock-mixin) ()
+  (labels ((return-lockers (write-lock read-locks)
+	     (cond ((arrayp read-locks)
+		    (return-from decode-lock-for-debugger
+		      (values write-lock
+			      (and (not (zerop (fill-pointer read-locks)))
+				   (aref read-locks 0)))))
+		   ((listp read-locks)
+		    (return-from decode-lock-for-debugger
+		      (values write-lock read-locks)(2 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI"))0)
+		   (t (return-from decode-lock-for-debugger
+			(values write-lock read-locks))))))
+    (return-lockers (continue-whopper) readers)))
+
+;; Watch out, this can return a stack-consed list!
+(defwhopper (decode-lock-for-debugger basic-lock) ()
+  (multiple-value-bind (lock-writer first-lock-reader)
+      (continue-whopper)
+    (cond ((or (eq simple-latch t) (eq simple-latch ':complex))
+	   )
+	  ((null simple-latch)
+	   (setq lock-writer nil
+		 first-lock-reader nil))
+	  (t
+	   (setq lock-writer simple-latch)))
+    (values lock-writer first-lock-reader)))

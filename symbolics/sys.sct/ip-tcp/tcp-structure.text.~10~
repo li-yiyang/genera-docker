@@ -1,0 +1,451 @@
+-*- Mode: Text -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1992-1986 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary 
+;;;> to, and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve 
+;;;> them as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and 
+;;;> stored only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3670 (R), Symbolics 3675 (R), Symbolics
+;;;> 3630, Symbolics 3640, Symbolics 3645 (R), Symbolics 3650 (R), Symbolics 3653,
+;;;> Symbolics 3620 (R), Symbolics 3610 (R), Symbolics Common Lisp (R),
+;;;> Symbolics-Lisp (R), Zetalisp (R), Genera (R), Wheels (R), Dynamic Windows (R),
+;;;> SmartStore (R), Semanticue (R), Frame-Up (R), Firewall (R), Document Examiner (R),
+;;;> Delivery Document Examiner, "Your Next Step in Computing" (R), Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, Symbolics C, Symbolics Pascal (R), Symbolics 
+;;;> Prolog, Symbolics Fortran (R), CLOE (R), CLOE Application Generator, CLOE Developer,
+;;;> CLOE Runtime, Common Lisp Developer, Symbolics Concordia, Joshua, Statice (R), and
+;;;> Minima are trademarks of Symbolics, Inc.   
+;;;> 
+;;;> RESTRICTED RIGHTS LEGEND
+;;;>    Use, duplication, and disclosure by the Government are subject to restrictions 
+;;;> as set forth in subdivision (c)(1)(ii) of the Rights in Technical Data and Computer 
+;;;> Software Clause at DFAR 52.227-7013.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      8 New England Executive Park, East
+;;;>      Burlington, Massachusetts  01803
+;;;>      United States of America
+;;;>      617-221-1000
+;;;> *****************************************************************************************
+;;;>
+
+
+This file is an informal description of the internals of the Lisp
+Machine TCP implementation.  Where the description in this file and the
+code differ, the code takes precedence.
+
+.What
+
+As of January 8, 1984 (and probably for some time to come) the Lisp
+Machine implementation of TCP implements everthing in the specification
+except (** for complete non-implemtation, * for items that should not
+affect functionality):
+ ** Security/precedence/compartment.  These are never set on output and
+    are ignored on input.  (Actually, the interface to IP doesn't have
+    provision for them at this time.)
+ *  There is no way for the user to set the urgent pointer on output, so
+    it is effectively unimplemented.  All the code except the user
+    interface exists.
+ *  There is no way for the user to read the input urgent pointer. Also,
+    no special action is taken when the urgent flag is set on an
+    incoming segment.  The code exists to maintain the urgent pointer.
+ *  No special action is taken when an incoming segment contains a push
+    flag.  Timely acknowledgements are always sent, so this should never
+    be a problem.  There are probably some paths where the push flag may
+    get dropped from a segment, in case a user interface ever were
+    written.
+ *  Adaptive retransmission is not implemented.  The major reason is
+    that the algorithm described in the specification is meta-stable.
+    If the timer is not reset every time packets are retransmitted
+    then it is possible for the retransmit interval to shrink to a
+    minimum and never grow, causing highly excessive retransmissions.
+    If the timer is not reset when packets are retransmitted then it is
+    possible to have the retransmit interval grow to a maximum and cause
+    unnecessary delays.  I don't expect many people to understand this;
+    it took me several days to realize what was happening.
+
+(Somewhat) optional things that are implemented, in case you were
+wondering:
+ *  Push flag does get set when a user does a :FORCE-OUTPUT to the
+    stream.
+ *  Full Silly Window avoidance, both on the input and output sides.
+ *  Probing the zero window.
+ *  Variable MSS (foreign host's lower limit takes precedence, of
+    course).
+
+
+
+If TCP finds an internal inconsistency, an error is signalled with a
+brief description of the inconsistency.  If the problem is severe, TCP
+disables itself and calls ERROR.  The rest of the network system
+(including IP) is unaffected.  The user will have to decide whether the
+circumstances are severe enough to reset the entire network system.  If
+the problem is not severe and TCP can do something reasonable and
+moderately harmless, FSIGNAL is called allowing the user to continue.
+Please report any protocol implementation bugs; ones that TCP finds and
+ones that you may find.
+
+
+.File organization
+
+There are currently 5 files which contain code to implement TCP.  (IP is
+a separate system which has its own files).  These files are
+
+ * TCP-DEFS -- This file contains the definitions of data
+	structures, accessors for the structures, functions for doing
+	trivial computation on the structures, constants associated with
+	the structures, helping functions (e.g., sequence number
+	helpers), global variables for keeping track of things or for
+	tuning things, debugging support, metering support, interaction
+	with IP (which handles most of the interaction with the service
+	mechanism).
+
+ * TCP-ERROR -- This file contains the error conditions that TCP can
+	signal and the necessary support code.
+
+ * TCP -- This is the actual "NCP."  It interfaces with IP, handles
+	packets, TCBs, retransmission, etc.  It does not interact with
+	users, that is what TCP-USER does.
+
+ * TCP-USER -- This file contains the user interface to TCP. The
+	user/application always deals with a stream; never a TCB.  Most
+	messages to streams are handled, as well as most of the messages
+	expected of network streams.  In addition, there are a few
+	others to support some specific applications (such as TCP-FTP).
+
+ * TCP-DEBUG -- This file contains debugging support.  This includes
+	interacting with IP's debugging, interacting with PEEK, packet
+	header recording and displaying, and full dumping of TCP state
+	(dump-tcp-guts).
+
+
+
+.Segments
+
+Segments are art-8b packets (see the document Interfacing to the Network
+System) and all slots start with "SEG-".  The definition of the header
+of a segment is not completely straightforward.  This is because TCP is
+a big-ender protocol (most significant portion of a word is transmitted
+first) and the Lisp Machine is a little-ender machine (least significant
+portion of a word is transmitted first).  We get around this in the
+following way.
+
+Each byte of the header is given a name.  If a TCP value spans more than
+one byte (e.g., a port or sequence number) then the name is suffixed
+with something appropriate (see the code).  Then, macros are generated
+(with define-structure-substs) which allow accessing and setting the
+multi-byte TCP values.
+
+In addition to the TCP segment header, other information about the
+segment is kept in the array's leader.  Some of this information is for
+interaction with IP, some is computed, and some is bookkeeping.  Here is
+a slightly more detailed description of the slots than exists in the
+code.
+
+    SEG-LINK -- If this segment is on some list/queue/chain
+	(e.g., an input or output queue), then this is either NIL
+	(meaning the end of the list) or the next segment of the list.
+	(This helps avoid consing to keep track of lists of segments.
+	This is OK, since a packet can be on at most one queue in the
+	Lisp Machine network system.)  If it is not on a list, this slot
+	is T.  
+
+	This slot is carefully maintained (perhaps even in a paranoid
+	manner).  When a segment is output, this slot determines whether
+	the transmitter is to free the packet to the free pool or if it
+	is must not free it (there are no other options, and the
+        transmitter.  If this slot is T, the packet is not on any list
+        and must be freed on transmit.  If it is not T, the packet is on
+        a transmit queue and may need to be retransmitted, and
+        therefore may not be freed by the network system (it will later
+        be freed when the data bytes are ACKed or the TCB is reset).
+
+    SEG-SOURCE-ADDRESS, SEG-DESTINATION-ADDRESS -- These are the
+        Internet address (32 bit fixnums on the 3600, arrays on the
+        LM-2) which are the addresses of the sender and intended
+        destination of the TCP segment, respectively.  These are given
+        to TCP when IP sends TCP an input packet, and are given to IP
+        when TCP transmits a packet.  Actually, the destination is
+        always one of the machine's Internet address since IP is the
+        routing layer.
+
+    SEG-START -- This is the byte offset to the start of the data in the
+        segment.  This is the byte offset, not the number of 32 bit
+        quantities (that is kept in SEG-DATA-OFFSET in the TCP header).
+        Each is computed from the other.  This exists to save a few
+        cycles.
+
+    SEG-LENGTH -- This is what the spec calls SEG.LEN.  It is the number
+        of data bytes in the segment, which does not count the header
+        but does count the SYN and FIN control bits.  This is the number
+        of bytes occupying sequence space.
+
+    SEG-BOUND -- This is the highest array index (including
+        header) that is allowed to be used (exclusive, not inclusive).
+        For a received packet, this is the index of the end of the user
+        data portion (without control) of the segment.  On output, this
+        is the limit to the ammount of data that can be filled into this
+        segment (and is controlled by MSS).
+
+    SEG-TIME-TRANSMITTED, SEG-TIMES-TRANSMITTED -- These should be
+        rather obvious.  seg-time-transmitted is updated for
+        retransmission as well.  The time is the value returned by the
+        function TIME, which is a fixnum that ticks at 60 times per
+        second.  Currently these are not used very much, but may be used
+        more if/when adaptive retransmission is implemented.
+
+    SEG-ALLOCATED -- This is largely for debugging.  When a segment
+        enters the realm of TCP, this slot is set to T.  When it is
+        known to be leaving, it is set to NIL.  This is an aid to catch
+        bugs that are not returning segments and thereby stagnating the
+        entire network system.  See the discussion of the packet buffer
+        pool in the document Interfacing to the Network System.
+
+    SEG-OUTPUT-STATE -- This is a good trick.  When the user
+	requests an output buffer, TCP first checks the last segment on
+	the TCB's output queue.  If there is still more room (as
+	indicated by SEG-LENGTH and SEG-BOUND), then the segment is kept
+	from being freed when an ACK is received.  The user fills in
+	more bytes to the segment, and then tries to send the segment.
+	At this time, SEG-LENGTH is updated and the segment is
+	transmitted (if possible, if not retransmission will take care
+	of it).  User TELNET (SUPDUP, etc) probably make the most use of
+	this.  Instead of allocating many small packets while the user
+	types continuous text, it is often the case the that the same
+	packet is getting new data appended to it.  This takes full
+	advantage of the overlapping sequence number feature of TCP.
+
+	To implement this, this slot can take on four values:
+	    NIL -- not for output.
+	    :TCP-ONLY -- the segment is only on the transmit queue of
+		the TCB.  When an ACK comes in when is above the last
+		sequence number of the segment, the segment may be
+		removed from the output queue and returned to the free
+		pool.
+	    :USER-ONLY -- The user's stream is the sole posessor of the
+		packet.
+	    :TCP-AND-USER -- This is the fun state.  Here, the segment
+		has been sent for transmission at least once, but the
+		user has asked for (and received) this part of the
+		segment as the output buffer before an ACK has come in
+		from the foreigh host.  When the user sends the output
+		buffer, the segment fields are updated (usually just the
+		length) and the state is changed to :TCP-ONLY.  When an
+		ACK comes in for the previously sent sequence numbers
+		before the user sends the segment, instead of returning
+		the segment to the free pool the state is simply changed
+		to :USER-ONLY.
+
+    SEG-SPARE-1 -- This is a spare slot in case we need to implement
+	something else but don't want to (or can't) recompile all of
+	TCP.
+
+Trick: many places in the code use the fact that seg-syn and seg-fin
+return numbers (0 or 1) which just so happens to be the number of bytes
+occupied in sequence space by the control flags.  E.g., note the subst
+    (defsubst seg-length-data-only (seg)
+      (- (seg-length seg) (seg-syn seg) (seg-fin seg)))
+
+
+
+.Sequence numbers trick (quick note (Lisp sales pitch?))
+
+One of the great features of Lisp is the macro facility, which can often
+make code clearer.  Comparing TCP sequence numbers can serve as an
+example.  TCP sequence numbers are compared using modulo 2**32
+arithmetic.  The Lisp Machine deals with numbers generically and
+(currently) has no instructions for adding, subtracting or comparing
+numbers mod 2**32.  (Indeed, 32 bit numbers on the LM-2 are bignums!)
+Therefore, macros exists for adding subtracting and comparing TCP
+sequence numbers.  Most simple macro factilities can handle this, which
+is usually just simple substitution.  But what about something like
+	SEG.UNA < SEG.ACK =< SEG.NXT
+??  In the TCP implementation, this reads as
+	(SEQ-NUM-COMPARE SEG.UNA < SEG.ACK =< SEG.NXT)
+which expands into
+	(AND (SEQ-NUM-< SEG.UNA SEG.ACK)
+	     (SEQ-NUM-=< SEG.ACK SEG.NXT))
+which would further expand into machine dependent comparison functions.
+The SEQ-NUM-COMPARE macro actually looks at how many forms there are
+(some odd number, the odd numbered items are sequence numbers and the
+even numbers items are relation operations) and expands into the
+appropriate code to model it.
+
+Manipulating the multi-byte values in the TCP header could be another
+example.
+
+
+
+.TCBs
+
+A Lisp Machine TCP connection is in two pieces.  One is the so called
+"Transmission Control Block" (TCB).  This is the object that the
+internal network control code looks at.  The other piece is a stream.
+The user always sees the stream.  The two are separate to impose a
+modularity boundary between the user (stream) and the system (tcb).
+
+TCBs are implement as arrays and are declared with DEFSTRUCT.  They are
+reusable so some care must be taken to make sure a TCB is not used by
+two people.  One example is that errors must copy out information from a
+TCB since the TCB may be reused by the time the error reports.  Each
+slot of a TCB begins with "TCB-".
+
+There are some interesting divergences from the specification on
+maintaining a TCB, often for simplicity and clarity.  (Postel may adopt
+some of these ideas, he seemed to express some interest at one time.)
+One departure is not using computations such as RCV.NXT+RCV.WND but
+instead maintaing what would be called RCV.LIM.  RCV.LIM is always an
+exclusive number and other computations from the specification are
+converted to exclusive arithmetic.  For example, the segment-in-window
+computation in the specification reads as
+	   RCV.NXT =< SEG.SEQ            < RCV.NXT+RCV.WND
+	or RCV.NXT =< SEG.SEQ+SEG.LEN-1  < RCV.NXT+RCV.WND
+but the Lisp Machine implements this as
+	   RCV.NXT =< SEG.SEQ  < RCV.LIM
+	or RCV.NXT =< SEG.LIM =< RCV.LIM
+
+Another advantage of this is that RCV.WND does not need to be
+laboriously maintained.  Instead, when a segment is sent, SEG.WND is
+simply RCV.LIM-RCV.NXT.  Using limits also removes the SND.WL1 and
+SND.WL2 tcb variables mentioned in the specification.  Silly window
+avoidance is also made much simpler with limits.
+
+Details of the slots of a TCB:
+
+    TCB-STATE, TCB-SUBSTATE -- TCB-STATE is a keyword which
+	describes the major state of the connection and corresponds to
+	the states in the specification, namely one of :CLOSED, :LISTEN,
+	:SYN-SENT, :SYN-RECEIVED, :ESTABLISHED, :CLOSE-WAIT,
+	:LAST-ACKED, :FIN-WAIT-1, :FIN-WAIT-2, :CLOSING and :TIME-WAIT.
+	Sometimes the major state is not quite descriptive enough for
+	the Lisp Machine, so a substate is needed.  The currently
+	implemented substates are For :CLOSED --
+		    :INACTIVE
+		    :RESET
+		    :ABORTED
+		    :TIMEOUT
+		    :IMPLEMENTATION-ERROR
+		    :SYN-OUT-OF-WINDOW
+		    :DATA-WHILE-CLOSING
+	    For :LISTEN --
+		    :PASSIVE
+		    :DONT-AUTO-SYN
+	    For :ESTABLISHED, :SYN-SENT, SYN-RECEIVED, :CLOSE-WAIT
+		    :PASSIVE
+		    :ACTIVE
+		    :CLOSING
+
+	TCB-PROTOCOL -- This is the TCP-PROTOCOL instance that
+	    this TCB uses to communicate with IP.
+	TCB-NETWORK -- This is the IP-PROTOCOL instance that is
+	    the transport layer for packets.  This is NOT the
+	    INTERNET-NETWORK instance used for addresses.
+	TCB-ROUTE -- This is a structure used by the IP-PROTOCOLs
+	    for efficient routing of packets.
+
+	TCB-SERVER-DESCRIPTION -- If this TCB is the result of
+	    server creation and the service is declared to be
+	    noteworthy, then this is set to a structure returned
+	    by NETI:NOTE-SERVER-ESTABLISHED (see Interfacing to
+	    the Network System).
+
+	TCB-2MSL-TIMER -- TCP goes through great lengths to make
+	    sure connections close synchronously and to make it
+	    nearly impossible to reuse an old connection.  Part
+	    of this is to have a :TIME-WAIT state which is a
+	    placeholder for the connection for 2 Maximum Segment
+	    Lifetimes (2MSL).  When a TCB enters the :TIME-WAIT
+	    state this slot is set to the current time and the
+	    background removes it after 2MSLs.
+
+	TCB-LOCAL-ADDRESS -- is the 32 bit Internet address of
+	    the local side of the connection.  On the 3600 this
+	    is kept in a fixnum; on the LM-2 an array.
+	TCB-LOCAL-PORT -- is the port number of the local side of
+	    the connection.
+	TCB-LOCAL-WINDOW-SIZE -- is the number of bytes of
+	    buffering for receiving segments.  This is not always
+	    RCV.WND.  When the receive limit (RCV.LIM) is updated
+	    (with an eye out to avoid silly window) RCV.LIM is
+	    set to RCV.NXT + LOCAL-WINDOW-SIZE.
+
+	TCB-FOREIGN-HOST -- is the host object of the machine
+	    owning the foreign end of the connection.  This may
+	    be NIL if it has not been computed yet, since it is
+	    seldom needed for the operaton of TCP.
+	TCB-FOREIGN-ADDRESS -- is the 32 bit Internet address of
+	    the machine owning the foreign end of the connection.
+	TCB-FOREIGN-PORT -- is the port number of the foreign
+	    side of the connection.
+	TCB-MAX-SEG-SIZE -- is the maximum number of bytes the
+	    Lisp Machine may send in one packet to the other end
+	    of the connection.  This is actually the MIN of what
+	    the other end declared and what the Lisp Machine is
+	    comfortable sending.
+
+	TCB-READ-SEGS, TCB-READ-SEGS-LAST, TCB-READ-SEGS-LENGTH -- These
+	    implement the in order input queue.  TCB-READ-SEGS is either
+	    NIL or a segment containing the next expected byte(s),
+	    successive segments are fby chaining through SEG-LINK.
+	    TCB-READ-SEGS-LAST is the last segment on the chain and is used
+	    for quick insertion of a new segment to the end of the chain.
+	    TCB-READ-SEGS-LENGTH is simply the length of the chain.
+	TCB-RECEIVED-SEGS -- is the chain of out of order segments.  This
+	    chain is kept sorted to make sequence number testing, removal,
+	    splicing and end-insertion easier.
+	TCB-INITIAL-RECEIVE-SEQ -- (called IRS in the specification) is the
+	    sequence number of the foreign host's SYN.
+
+	TCB-SEQ-NUM-READ -- is the sequence number that has already been
+	    delivered to the user.
+	TCB-SEQ-NUM-RECEIVED -- This is what the specification calls
+	    RCV.NXT.  It is the next sequence number the connection is
+	    expecting.
+	TCB-SEQ-NUM-ACKED -- is the highest sequence number for which this
+	    the Lisp Machine has sent an ACK.  This usually has the same
+	    value as TCB-SEQ-NUM-RECEIVED; if it doesn't, and ACK should be
+	    sent in a timely manner.
+	TCB-SEQ-NUM-LIMIT -- is the highest sequence number the other side
+	    of the connection is allowed to send.  RCV.WND is
+	    TCB-SEQ-NUM-LIMIT - TCB-SEQ-NUM-RECEIVED, but keeping it as a
+	    limit has several advantages.
+	TCB-ADVANCE-WINDOW-THRESHOLD -- This implements the receive part of
+	    silly window avoidance.  TCB-SEQ-NUM-LIMIT is not updated when
+	    TCB-SEQ-NUM-RECEIVED is updated, as that would imply infinite
+	    buffer space since the user has not necessarily read out any of
+	    the data.  Nor is TCB-SEQ-NUM-LIMIT updated when
+	    TCB-SEQ-NUM-RECEIVED is updated, since that could lead to silly
+	    window.  Instead, when TCB-SEQ-NUM-READ advances beyond
+	    TCB-ADVANCE-WINDOW-THRESHOLD, then enough bytes have been read
+	    out that it is reasonable to open the window.
+	    TCB-SEQ-NUM-LIMIT is set to TCB-SEQ-NUM-READ +
+	    TCB-LOCAL-WINDOW-SIZE and TCB-ADVANCE-WINDOW-THRESHOLD is set
+	    to TCB-SEQ-NUM-READ + (3/8 * TCB-LOCAL-WINDOW-SIZE).  Thus,
+	    when the window is opened it is always opened by at least 3/8
+	    of the local window size.
+	TCB-READ-URGENT-POINTER -- is either NIL or the sequence number of
+	    the highest urgent pointer that has been received but not yet
+	    read by the user.
+	TCB-TIME-LAST-RECEIVED -- is used to timeout connections.  If there
+	    is outstanding send segments, then the data in them should be
+	    acknowledged in a timely manner.  If they aren't, then the
+	    connection is declared to be inoperative.  It is not sufficient
+	    to receive a valid ack; the ack must be useful.  There is an
+	    exception to this: it is OK not to acknowledge data only when
+	    the data is the single byte probing a zero send window.  In
+	    this case, the acknowledged thus received is useful in
+	    declaring the connection still alive.
+
+	TCB-SEND-SEGS, TCB-SEND-SEGS-LAST, TCB-SEND-SEGS-LENGTH --
+	    implement the output (and retransmission) segment chain.  These
+	    are similar to TCB-READ-SEGS et al.
+	TCB-INITIAL-SEND-SEQ -- s the sequence number of the SYN that was
+	    sent for this connection.  The spec calls this ISS.
+	

@@ -1,0 +1,453 @@
+;-*- Mode: LISP; Syntax: Zetalisp; Package: FILE-SYSTEM; Base: 8; Lowercase: T-*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;This file, along with FS-USER.LISP, contains everything a Lispm needing to access
+;;;an LMFS (Symbolics File System) remotely needs to have.  This includes all the
+;;;passive (syntactic) methods of generic LMFS pathnames.
+
+(defconst *path-delimiter* ">")
+(defconst *type-delimiter* ".")
+(defconst *version-delimiter* ".")
+(defconst *directory-entry-file-type-max-length* 14.)
+(defconst *lmfs-name-of-the-root* "The Root Directory")
+
+(defflavor lmfs-mailbox-pathname-mixin () (mailbox-pathname-mixin)
+  (:abstract-flavor)
+  (:documentation :mixin "for ZMAIL's methods"))
+
+(defflavor lmfs-pathname-mixin
+	()
+	(lmfs-mailbox-pathname-mixin
+	 no-device-mixin
+	 hierarchical-directory-mixin
+	 meaningful-root-mixin
+	 both-cases-same-lower-preferred-mixin)
+  (:required-flavors pathname)
+  (:functions lmfs-pathname-fname-string))	;This one is forward-referenced
+
+(defmethod (:system-type lmfs-pathname-mixin) ()
+  ':lispm)
+
+(putprop ':lispm '(:undelete) 'attributes)
+
+;;;(defmethod (lmfs-pathname-mixin :parse-directory-spec) is down below
+;;; there is a loading order dependence...
+
+(defconst *lmfs-bad-characters*
+	  '(#/> #/<))
+
+(defun lmfs-name-bad-string-p (s)
+  (or (string-search-set *lmfs-bad-characters* s)
+      (loop for c being the array-elements of s
+	    thereis ( (char-code c) #o200))))
+
+(defmethod (:valid-name-p lmfs-pathname-mixin) (spec)
+  (or (memq spec '(nil :wild))
+      (and (stringp spec)
+	   (not (lmfs-name-bad-string-p spec)))))
+
+(defmethod (:valid-type-p lmfs-pathname-mixin) (spec)
+  (or (memq spec '(nil :wild :directory))
+      (and (stringp spec)
+	   ( (pathname-component-min-length spec) *directory-entry-file-type-max-length*)
+	   (not (string-search-char #/. spec))
+	   (not (lmfs-name-bad-string-p spec)))))
+
+;;; If the problem is just that the string is too long, truncate it.
+(defmethod (:valid-type lmfs-pathname-mixin) (typ)
+  (cond ((send self ':valid-type-p typ)
+	 typ)
+	((eq typ ':unspecific)
+	 "")
+	((and (stringp typ) (> (string-length typ) *directory-entry-file-type-max-length*))
+	 (send self ':valid-type
+	       (substring typ 0 *directory-entry-file-type-max-length*)))
+	(t (send (send self ':new-canonical-type ':lisp) ':raw-type))))
+
+(defmethod (:valid-version-p lmfs-pathname-mixin) (spec)
+  (or (memq spec '(nil :wild :oldest :newest))
+      (and (fixp spec)
+	   (> spec 0)
+	   (< spec 1_24.))))
+
+(defmethod (:valid-directory-component-p lmfs-pathname-mixin) (comp-name ignore)
+  (or (and (stringp comp-name)
+	   (not (lmfs-name-bad-string-p comp-name)))
+      (memq comp-name '(nil :wild :wild-inferiors))))
+
+(DEFUN-IN-FLAVOR (lmfs-directory-string lmfs-pathname-mixin) (&aux tdir hunks nup argl)
+  (cond ((stringp directory) directory)
+	((eq directory ':root) *path-delimiter*)
+	((cl:listp directory)
+	 (setq tdir directory)
+	 (when (eq (car tdir) ':relative)
+	   (setq tdir (cdr tdir) nup 0)
+	   (loop while (eq (car tdir) ':up)
+		 do (pop tdir)
+		 (incf nup)))
+	 (setq hunks tdir)
+	 (when nup (loop repeat nup do (push "<" argl)))
+	 (do ((i 0 (1+ i))) ((null hunks))
+	   (or (and nup (zerop i)) (push *path-delimiter* argl))
+	   (push (selectq (car hunks)
+		   (:wild "*")
+		   (:wild-inferiors "**")
+		   (nil "")
+		   (t (car hunks)))
+		 argl)
+	   (pop hunks))
+	 (apply #'string-append (nreverse argl)))
+	((eq directory ':wild) ">**")
+	(t (string directory))))
+
+
+(defun-in-flavor (lmfs-pathname-pname-string lmfs-pathname-mixin) ()
+  (let ((ename (if (and (null name) (null type) (null version))
+		   ""
+		 (lmfs-pathname-fname-string))))
+    (cond ((eq directory ':wild)		;obsolete
+	   (string-append *path-delimiter* "**" *path-delimiter* ename))
+	  ((null directory) ename)
+	  ((stringp directory)
+	   (cond ((string-equal directory *path-delimiter*)
+		  (string-append *path-delimiter* ename))
+		 (t (string-append directory *path-delimiter* ename))))
+	  ((eq directory ':root)
+	   (string-append *path-delimiter* ename))
+	  (t (string-append (lmfs-directory-string)
+			    (if (and (listp directory)
+				     (eq (car directory) ':relative)
+				     (eq (car (last directory)) ':up))
+				""
+				*path-delimiter*)
+			    ename))))) 
+
+(defmethod (:string-for-printing lmfs-pathname-mixin) ()
+  (string-append (send host ':name-as-file-computer)
+		 ":"
+		 (lmfs-pathname-pname-string))) 
+
+(defmethod (:string-for-readable-printing lmfs-pathname-mixin) ()
+  (send self :string-for-printing))
+
+;; Unfortunately we inherit this message from CHAOS-PATHNAME rather than PATHNAME,
+;; so we have to duplicate some functionality here.
+;;--- if that comment is not obsolete, then something else is mighty confused.
+(defmethod (:homedir lmfs-pathname-mixin) ()
+  (neti:pathname-host-get-pathname
+    host
+    ':unspecific	;Device always ':UNSPECIFIC in current syntax
+    (list (send host ':host-user-id))	;Assume top-level directory
+    nil nil nil nil nil nil))	;Other components NIL
+	;Other components NIL
+
+(defun-in-flavor (lmfs-pathname-fname-string lmfs-pathname-mixin) (&optional suppress-newest)
+  (string-append
+    (cond ((eq name ':wild) "*")
+	  ((null name) "")
+	  (t name))
+    (cond ((and (null type)
+		(null version))	;implied semant.
+	   "")
+	  (t (string-append
+	       *type-delimiter*
+	       (cond ((equal type "") "")
+		     ((null type) "")
+		     ((eq type ':wild) "*")
+		     ;;this knowledge is also stored in the LMFS variable
+		     ;;lmfs:*the-user-visible-type-of-directories*
+		     ;;The only reason :directory appears in pathnames is that
+		     ;;local lmfs tools expect :directory-pathname-as-file
+		     ;;to work without being tricked.
+		     ((eq type ':directory) "directory")
+		     (t type))
+	       (cond ((null version) "")
+		     (t (if (and suppress-newest (eq version ':newest))
+			    ""
+			  *version-delimiter*)))
+	       (cond ((eq version ':newest)
+		      (if suppress-newest "" "newest"))
+		     ((eq version ':oldest) "oldest")
+		     ((null version) "")
+		     ((eq version ':wild) '*)
+		     ((numberp version) (format nil "~D" version))
+		     (t version))))))) 
+
+(defmethod (:string-for-editor lmfs-pathname-mixin) ()
+  (string-append
+    (lmfs-pathname-fname-string t)
+    " " (lmfs-directory-string) " " (send host ':name-as-file-computer) ":")) 
+
+(defmethod (:string-for-host lmfs-pathname-mixin) (&optional ignore)
+  (lmfs-pathname-pname-string)) 
+
+(defmethod (:string-for-dired lmfs-pathname-mixin) ()
+  (lmfs-pathname-fname-string)) 
+
+(defmethod (:condense-directory lmfs-pathname-mixin) (&rest whats)
+  	;;>a>b c :directory -> >a>b>c ()
+  (send (send self ':pathname-as-directory)
+	':new-pathname
+	':name (get (locf whats) ':name)
+	':type (get (locf whats) ':type)
+	':version (get (locf whats) ':version)))
+
+(defun lmfs-parse-directory-relative (s start end real-start real-end)
+  (if (string-search-char #/< s start real-end)
+      (parse-pathname-error "Embedded <? - ~A" (substring s real-start real-end)))
+  (loop with cx = start
+	with c = (character *path-delimiter*)
+	for x = (string-search-char c s cx end)
+	for temp-end = (or x end)
+	collect (cond ((= cx temp-end)
+		       (parse-pathname-error
+			 "Null directory components not allowed: ~A"
+			 (substring s real-start real-end)))
+		      ((string-equal s "*" cx 0 temp-end) ':wild)
+		      ((string-equal s  "**" cx 0 temp-end) ':wild-inferiors)
+		      ((string-equal s "" cx 0 temp-end) nil)
+		      (t (substring s cx temp-end)))
+	while x
+	do (setq cx (1+ x))))
+
+(defun lmfs-parse-directory (s start end real-end)
+  (cond ((= start end) ':root)
+	((char-equal (aref s start) #/<)
+	 `(:relative
+	    ,@(loop with nup = 0
+		    with cx = start
+		    when ( cx end) return (loop repeat nup collect ':up)
+		    while (char-equal (aref s cx) #/<)
+		    do (incf cx) (incf nup)
+		    finally (return (nconc (loop repeat nup collect ':up)
+					   (lmfs-parse-directory-relative
+					     s cx end start real-end))))))
+	((char-equal (aref s start) (character *path-delimiter*))
+	 (lmfs-parse-directory-relative s (1+ start) end start real-end))
+	(t (cons ':relative (lmfs-parse-directory-relative s start end start real-end)))))
+
+(defmethod (:parse-directory-spec lmfs-pathname-mixin) (input &aux l)
+  (cond ((or (listp input)
+	     (memq input '(:wild nil :root)))
+	 input)
+	((not (stringp input))
+	 (parse-pathname-error "Invalid LMFS directory spec: ~S" input))
+	((not (string-search *path-delimiter* input))
+	 (list input))				;grudgingly.  I, too, am coerced.
+	((equal input *path-delimiter*) ':root)
+	((lmfs-parse-directory input 0 (setq l (string-length input)) l))))
+
+(defmethod (:parse-namestring lmfs-pathname-mixin) (ignore namestring &optional (start 0) end
+						     &aux vdindex tdindex pdindex apdindex)
+  (or end (setq end (string-length namestring)))
+  ;; Take off leading and trailing spaces
+  (setq start (or (string-search-not-char #\SP namestring start end) start))
+  (setq end (1+ (or (string-reverse-search-not-char #\SP namestring end start) (1- end))))
+  ;; Figure out where if at all the various delimited fields are
+  (setq pdindex (string-reverse-search *path-delimiter* namestring end start)
+	apdindex pdindex
+	vdindex (string-reverse-search *version-delimiter* namestring
+				       end (or pdindex start))
+	tdindex (string-reverse-search *type-delimiter* namestring
+				       end (or vdindex pdindex start)))
+  (unless pdindex
+    (setq pdindex (string-reverse-search-char #/< namestring end start))
+    (if pdindex (setq apdindex (1+ pdindex))))
+  (when (and tdindex vdindex (= tdindex vdindex))
+    (setq tdindex (string-reverse-search *type-delimiter* namestring vdindex start))
+    (if (and tdindex pdindex (< tdindex pdindex))
+	(parse-pathname-error "Directory names may not have types: ~A" namestring))
+    (if (null tdindex) (setq tdindex vdindex vdindex nil)))
+  (if (and vdindex tdindex (< vdindex tdindex))
+      (parse-pathname-error "Type and version out of order: ~A" namestring))
+
+  ;Now actually extract the various fields and parse the version
+  (let ((t-dir (and apdindex (lmfs-parse-directory namestring start apdindex end)))
+	(t-name (substring namestring (1+ (or pdindex (1- start))) (or tdindex vdindex end)))
+	(t-type (and tdindex (substring namestring (1+ tdindex) (or vdindex end))))
+	(t-version
+	  (and vdindex
+	       (let ((vstart (1+ vdindex)))
+		 (cond ((and (> end vstart)
+			     (char-equal #/* (aref namestring vstart)))
+			':wild)
+		       ((string-equal namestring "NEWEST" vstart 0 end nil)
+			':newest)
+		       ((string-equal namestring "OLDEST" vstart 0 end nil)
+			':oldest)
+		       ((string-equal namestring "" vstart 0 end nil)
+			nil)
+		       ((parse-number namestring vstart end nil t))
+		       ;; Let :VALID-VERSION cause complaint.
+		       (t (substring namestring vstart end)))))))
+
+    ;; Convert wild names
+    (setq t-name
+	  (selector t-name string-equal
+	    (("" "") nil)
+	    ("*" ':wild)
+	    (otherwise t-name)))
+    (setq t-type
+	  (selector t-type string-equal
+	    ("" nil)
+	    ("*" ':wild)
+	    (otherwise t-type)))
+    ;; May we have the envelope with the answer, please?
+    (values ':unspecific t-dir t-name t-type t-version)))
+
+#||
+
+;; The following is a kludge because the type on patch system directories managed to change
+;; so much for LMFS.  It was DIRECTORY in Release 4.5, PATCH-DIR in Release 5.0, 
+;; and SYSTEM-DIR in Release 6.0.
+(defwhopper (:old-patch-file-pathname lmfs-pathname-mixin)
+	    (system-name same-directory-p patom patch-type
+			 &optional major-version minor-version file-type)
+  (let ((pathname (continue-whopper system-name same-directory-p patom patch-type
+				    major-version minor-version file-type)))
+    (selectq patch-type
+      ((:system-directory :version-directory)
+       (let ((older-pathname (send pathname :new-type "DIRECTORY")))
+	 (condition-case ()
+	     (unless (probef pathname)
+	       (setf pathname older-pathname))
+	   (file-lookup-error)))))
+    pathname))
+
+(defmethod (:old-patch-file-pathname lmfs-pathname-mixin)
+	   (system-name same-directory-p patom patch-type
+			&optional major-version minor-version file-type)
+  (selectq patch-type
+    (:system-directory
+     (send self ':new-pathname
+	   ':name (if same-directory-p patom (string system-name))
+	   ':type "PATCH-DIR"
+	   ':version ':newest))
+    (:version-directory
+     (send self ':new-pathname
+	   ':name (format nil "~:[~A~*~;~*~A~]-~D"
+			  same-directory-p system-name patom major-version)
+	   ':type "PATCH-DIR"
+	   ':version ':newest))
+    (:patch-file
+     (send self ':new-pathname
+	   ':name (format nil "~:[~A~*~;~*~A~]-~D-~D"
+			  same-directory-p system-name patom major-version minor-version)
+	   ':canonical-type file-type
+	   ':version ':newest))))
+||#		  
+
+(defmethod (:string-for-directory lmfs-pathname-mixin) ()
+  (lmfs-directory-string))
+
+(defmethod (:pathname-as-directory lmfs-pathname-mixin) ()
+  (send self ':new-pathname
+	':raw-directory
+	(cond ((or (equal directory *path-delimiter*) (eq directory ':root))
+	       (if (equal name *lmfs-name-of-the-root*)
+		   ':root
+		   (list name)))
+	      ((stringp directory)	;compatibility only
+		       (string-append directory *path-delimiter* name))
+	      ((listp directory) (append directory (list name)))
+	      (t (ferror "Cannot get pathname as directory.")))
+	':raw-name nil
+	':raw-type nil
+	':version nil))
+
+(defmethod (:directory-pathname-as-file lmfs-pathname-mixin) (&aux delimx)
+  (cond ((or (eq directory ':root)
+	     (equal directory *path-delimiter*))
+	 (cond ((equal name *lmfs-name-of-the-root*)
+		(ferror "The root has no containing directory."))
+	       (t (send self ':new-pathname ':raw-directory ':root
+			':raw-name *lmfs-name-of-the-root* ':raw-type ':directory
+			':version 1))))
+	((listp directory)
+	 (cond ((and (eq (car directory) ':relative)
+		     (or (= (length directory) 1)
+			 (eq (car (last directory)) :up)))
+		(ferror ":directory-pathname-as-file can't be expressed for~@[ the parent of~] ~a"
+			(EQ (CAR (LAST DIRECTORY)) :UP)
+			self)))
+	 (send self ':new-pathname
+	       ':raw-directory (if (null (cdr directory))
+				   ':root
+				   (butlast directory))
+	       ':raw-name (car (last directory))
+	       ':raw-type ':directory
+	       ':version 1))
+	;;All this is obsolete.....
+	((not (stringp directory)) (ferror "Can't make pathname as file - ~S" self))
+	((equal directory "")
+	 (ferror "Pathname has no real directory - ~S" self))
+	((null (setq delimx (string-reverse-search-char (character *path-delimiter*)
+							directory)))
+	 (ferror "No ~A in directory name?" *path-delimiter*))
+	((zerop delimx)				;off of root
+	 (send self ':new-pathname ':directory *path-delimiter*
+	       ':raw-name (substring directory 1) ':raw-type ':directory ':version 1))
+	(t
+	 (send self ':new-pathname
+	       ':raw-directory (substring directory 0 delimx)
+	       ':raw-name (substring directory (1+ delimx))
+	       ':raw-type ':directory ':version 1))))
+
+(defmethod (:heuristic-parse-maybe-hosted-pathname lmfs-pathname-mixin) (string)
+  ;;; if this thing lives on a LispM, somebody actively munged the
+  ;;; thing using a LispM: it must have a host.
+  (parse-pathname string nil self))
+
+(defmethod (:heuristic-print-maybe-hosted-pathname lmfs-pathname-mixin) (pathname)
+  (send pathname ':string-for-printing))

@@ -1,0 +1,1719 @@
+;;; -*- Base: 8; Mode: Lisp; Package: COMPILER; Lowercase: T -*-
+;;; This file is >llc>phase-3, as you probably already know.
+;;; This file contains Phase Three of the compiler.
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Returns the offset from SP, or NIL if none exists.
+(defun variable-stack-offset (variable control-stack-state level
+			      &key allow-logic-variables)
+  (when (and level
+	     control-stack-state
+	     (eq (variable-type variable) 'lexical)
+	     ;; Can't get heap-resident variables from SP
+	     (not (lexical-captive-p variable))
+	     ;; Can only reference variables in the same frame
+	     (or (eq (lexical-function variable) *frame-function*)
+		 (eq (lexical-function variable) *function*))
+	     (or allow-logic-variables
+		 ;; Don't do logic variables with SP
+		 (not (eq (lexical-class variable) 'logic)))
+	     (lexical-control-stack-state variable)
+	     (eql (control-stack-state-unknown-group-count
+		    (lexical-control-stack-state variable))
+		  (control-stack-state-unknown-group-count control-stack-state)))
+     (feature-case
+       (:imach
+	 (if (lexical-stack-resident-p variable)
+	     (- level (lexical-location variable))
+	     (if (lexical-rest-arg-p variable)
+		 level
+		 (if (ldb-test %%arg-desc-rest-arg (function-args-info *function*))
+		     nil
+		     (- level (lexical-location variable))))))
+       (3600.
+	 (- level (lexical-location variable))))))
+
+(defun variable-can-be-operand-p (var)
+  (and (eq (variable-type var) 'lexical)
+       ;; Don't optimize heap-resident vars
+       (not (lexical-captive-p var))
+       ;;Don't optimize references not in the
+       ;;parent function of the var
+       (or (eq (lexical-function var) *frame-function*)
+	   (eq (lexical-function var) *function*))
+       ;; don't optimize logic variables
+       (not (eq (lexical-class var) 'logic))))
+
+
+(defmacro defoptimizations opts
+  `(progn 'compile
+	  (defconst *optimizations* ',opts)
+	  . ,(loop for (var) in opts
+		   collect `(defvar ,var 0)
+		   collect `(defvar ,(intern (string-append var "-LAST-FSPEC")) nil))))
+
+(defoptimizations
+  (call-and-return-multiple	"Call-Multiple followed by Return-Multiple")
+  (combine-adjacent-pop-vars	"Adjacent POP-VARS")
+  (dead-code			"Dead code")
+  (delete-tag			"Dead tag")
+  (double-setq			"Double SETQ")
+  (invert-jump-sense		"Invert sense of jump")
+  (jump-.+1			"Jump to following instruction")
+  (jump-drop-through		"Jump drops through target jump")
+  (jump-duplicate-code		"Duplicate code before branch and destination")
+  (jump-in-line			"Jump destination moved in line")
+  (jump-through			"Jump through target jump")
+  (jump-through-conditional	"Unconditional jump to conditional jump")
+  (jump-to-copiable-instruction "Jump to a copiable instruction")
+  (jump-pop             	"Jump followed by a pop")
+  (jump-to-pop          	"Jump to a pop instruction")
+  (modify-function		"Call changed to variable modification function")
+  (not-jump			"NOT followed by conditional jump")
+  (not-not			"More than two sequential NOTs")
+  (not-not-jump			"NOT-NOT followed by conditional jump")
+  (pop-save-conditional		"POP-1-SAVE-1 followed by a conditional branch")
+  (pop-unbind			"Multiple POP and//or UNBIND instructions")
+  (pop-unbind-return		"POP and//or UNBIND instructions followed by RETURN")
+  (push-and-return-multiple	"Const-N followed by Return-Multiple")
+  (tag-merge			"Two tags in the same place")
+  (val-pop			"Val popped immediately")
+  (val-pop-val			"Val popped and pushed again")
+  (wierd-jump			"Wierd jump instruction generated somehow")	;Weird
+  (constant-jump		"Conditional jump with constant argument")
+  (take-equal-values    	"TAKE-VALUES of something with the right number of values")
+  (catch-jump			"CATCH target is unconditional jump")
+  (modify-tos                   "Modify TOS by using it as an argument and returned value")
+  (use-no-pop                   "Use a NO-POP version of an instruction")
+  (unneeded-push-tos            "PUSH of TOS not needed")
+  (setq-and-pop                 "Combine a SETQ and a POP")
+  (unneeded-setq                "SETQ to a popped location")
+  )
+
+(defmacro note-optimization (name)
+  `(progn (incf ,name)
+	  ;; Remember that this function got this optimization.
+	  ;; This helps to find an example of a function which has a particular optimization.
+	  (setq ,(intern (string-append name "-LAST-FSPEC") "COMPILER")
+		(function-spec *function*))
+	  (and *debug-phase-3*
+	       (report-optimization ',name))))
+
+(defun report-optimization (name)
+  (format t "~&~A"
+	  (or (cadr (assq name *optimizations*))
+	      (string name)))
+  (let* ((interval (function-interval *function*))
+	 (interval-first (interval-first interval))
+	 (interval-last (interval-last interval))
+	 (first-inst *phase-3-instruction*)
+	 (last-inst first-inst))
+    (loop until (eq first-inst interval-first) repeat 2 do
+      (setf first-inst (inst-prev first-inst)))
+    (loop until (eq last-inst interval-last) repeat 2 do
+      (setf last-inst (inst-next last-inst)))
+    (loop for inst = first-inst then (inst-next inst)
+	  do (with-character-style ((if (eq inst *phase-3-instruction*) '(nil :bold nil) '(nil nil nil)))
+	       (if (eq (inst-opcode inst) 'tag)
+		   (format t "~& ~A" inst)
+		   (format t "~&  ~A" inst)))
+	  until (eq inst last-inst))))
+
+(defun summarize-optimizations ()
+  (loop for (n string) in (sort (copylist *optimizations*)
+				#'(lambda (x y)
+				    (not (< (symeval (car x)) (symeval (car y))))))
+	do (format t "~&~A~50T~D" (or string n) (symeval n))))
+
+(defun reset-optimization-counts ()
+  (loop for (var) in *optimizations* do (set var 0)))
+
+(defun run-phase-3 ()
+  (let ((*phase-3-intervals-optimized* nil))
+    (loop for *frame-function* in *function-list*
+	  do
+      (let ((*function* *frame-function*))
+	(optimize-interval (function-interval *function*)))
+      (loop for *function* in (function-frame-sharers *frame-function*)
+	    do (optimize-interval (function-interval *function*)))))
+  (when *debug-phase-3*
+    (loop for function in *function-list*
+	  do (format t "~&~S" function)
+	     (print-interval (function-interval function))
+	     (loop for function in (function-frame-sharers function)
+		       do (format t "~&~S" function)
+			  (print-interval (function-interval function))))))
+
+(defun optimize-intermediate-representation (functions)
+  (let ((*function-list* functions))
+    (when *run-phase-3*
+      (run-phase-3))))
+
+(defun optimize-interval (interval)
+;  (declare (special interval))			;For breakpoints
+;  (and *debug-phase-3*
+;       (pkg-bind "COMPILER"
+;	 (break phase-3)))
+  (unless (memq interval *phase-3-intervals-optimized*)
+    (loop as win = nil
+	  do (loop named george
+		   with *phase-3-last-instruction* = (interval-last interval)
+		   for *phase-3-instruction* = (interval-first interval)
+					     then (inst-next *phase-3-instruction*)
+		   do
+	       (loop while
+		     (block martha
+		       (macrolet ((try-opt (opt)
+				    `(progn
+				       (when (funcall ,opt *phase-3-instruction*)
+					 (setq win t)
+					 (return-from martha t))
+				       (when (null *phase-3-instruction*)
+					 (return-from george)))))
+			 (let ((opcode (inst-opcode *phase-3-instruction*)))
+			   (dolist (opt (get-peep-hole-optimizers *compiler* opcode))
+			     (try-opt opt))
+			   (dolist (opt (get opcode 'compiler:peep-hole-optimizers))
+			     (try-opt opt))
+			   (let ((temp (get opcode 'compiler:phase-3)))
+			     (when temp
+			       (try-opt temp))))))
+		     doing
+		 (when (null *phase-3-instruction*)
+		   (return-from george)))
+	       until (eq *phase-3-instruction* *phase-3-last-instruction*))
+	  while win)
+    (push interval *phase-3-intervals-optimized*))
+  nil)
+
+
+;; Note that the bashing routines are responsible for making sure that
+;; *phase-3-instruction* is valid as well.
+
+(defun delete-inst (first &optional (last first) dont-note-deleted)
+  (let ((prev (inst-prev first))
+	(next (inst-next last)))
+    (setf (inst-next prev) next)
+    (setf (inst-prev next) prev)
+    (loop for i = first then (inst-next i)
+	  when (eq i *phase-3-instruction*)
+	    do (setq *phase-3-instruction* next)
+	  unless dont-note-deleted
+	    do (note-instruction-deleted i)
+	  until (eq i last))
+    t))
+
+(defun replace-inst (inst with)
+  (let ((prev (inst-prev inst))
+	(next (inst-next inst)))
+    (setf (inst-next prev) with)
+    (setf (inst-prev with) prev)
+    (setf (inst-next with) next)
+    (setf (inst-prev next) with)
+    (when (eq inst *phase-3-instruction*)
+      (setq *phase-3-instruction* with))
+    (note-instruction-deleted inst)
+    t))
+
+(defun insert-inst (before inst &optional (last inst))
+  (let ((after (inst-prev before)))
+    (setf (inst-prev before) last)
+    (setf (inst-next last) before)
+    (setf (inst-prev inst) after)
+    (setf (inst-next after) inst)))
+
+(defun divert (jump from to)
+  (setf (jump-tag jump) to)
+  (push jump (tag-jumps to))
+  (setf (tag-jumps from) (delq jump (tag-jumps from)))
+  (when (not (jumps-to-tag-p from))
+    (note-optimization delete-tag)
+    (delete-inst from)))
+
+(defun other (condition)
+  (cond ((eq condition 'true) 'false)
+	((eq condition 'false) 'true)
+	((eq condition 'error-if-true) 'error-if-false)
+	((eq condition 'error-if-false) 'error-if-true)
+	(t (llc-error "Can't invert ~S" condition))))
+
+(defun equal-inst (inst1 inst2)
+  (let ((op1 (inst-opcode inst1)))
+    (cond ((eq op1 (inst-opcode inst2))
+	   (funcall (or (get op1 'equal-inst-predicate)
+			#'default-equal-inst-predicate)
+		    inst1 inst2)))))
+
+(defun default-equal-inst-predicate (inst1 inst2)
+  (loop for iv-name in (flavor::flavor-local-instance-variables
+			 (flavor:find-flavor
+			   (cl:type-of inst1)))
+	always (eq (scl:symbol-value-in-instance inst1 iv-name)
+		   (scl:symbol-value-in-instance inst2 iv-name))))
+  
+(defun compiled-constant-equal (x y)
+  (or (eql x y)
+      (and (arrayp x)
+	   (not (funcall *compile-function* :to-core-p))
+	   (= (sys:%data-type x) (sys:%data-type y))
+	   (let ((type (sys:array-type-field x)))
+	     (and (= type (sys:array-type-field y))
+		  (not (= type sys:art-q))
+		  (not (= type sys:art-q-list))))
+	   (= (cl:array-total-size x) (cl:array-total-size y))
+	   (= (cl:array-rank x) (cl:array-rank y))
+	   (not (sys:array-displaced-p x))
+	   (not (sys:array-displaced-p y))
+	   (not (sys:array-has-leader-p x))
+	   (not (sys:array-has-leader-p y))
+	   (equal (cl:array-dimensions x) (cl:array-dimensions y))
+	   (let ((x x) (y y))
+	     (declare (sys:array-register-1d x y))
+	     (cl:dotimes (i (cl:array-total-size x) t)
+	       (unless (eql (sys:%1d-aref x i) (sys:%1d-aref y i))
+		 (return nil)))))))
+
+;;--- It really sucks that I have to work these all out.
+;;--- So I'm not going to try too hard.
+(defun (const equal-inst-predicate) (inst1 inst2)
+  (and (const-sharable inst1)
+       (eql (const-sharable inst1) (const-sharable inst2))
+       (eq (const-read-only inst1) (const-read-only inst2))
+       (compiled-constant-equal (const-value inst1) (const-value inst2))))
+
+(defsubst equal-variable (var1 var2) (eq var1 var2))
+
+(defun (var equal-inst-predicate) (inst1 inst2)
+  (and (equal-variable (var-variable inst1) (var-variable inst2))
+       (eq (not (var-nested-captive-environment inst1))
+	   (not (var-nested-captive-environment inst2)))))
+
+(defun (var-location equal-inst-predicate) (inst1 inst2)
+  (equal-variable (var-location-variable inst1) (var-location-variable inst2)))
+
+(defun (setq equal-inst-predicate) (inst1 inst2)
+  (and (equal-variable (setq-variable inst1) (setq-variable inst2))
+       (eq (not (setq-nested-captive-environment inst1))
+	   (not (setq-nested-captive-environment inst2)))))
+
+(defun (bind equal-inst-predicate) (inst1 inst2)
+  (equal-variable (bind-variable inst1) (bind-variable inst2)))
+
+(defun (fun equal-inst-predicate) (inst1 inst2)
+  (equal-function (fun-function inst1) (fun-function inst2)))
+
+(defun (start-call equal-inst-predicate) (inst1 inst2)
+  (equal-function (start-call-function inst1) (start-call-function inst2)))
+
+(defun (call equal-inst-predicate) (inst1 inst2)
+  (and (equal-function (call-function inst1) (call-function inst2))
+       (eql (call-n-args inst1) (call-n-args inst2))
+       (let ((dest1 (call-destination inst1))
+	     (dest2 (call-destination inst2)))
+	 (and (eql (destination-n-values dest1) (destination-n-values dest2))
+	      (eq (destination-for-return dest1) (destination-for-return dest2))))
+       ;; These "functions" are specially handled by (const peep-hole-optimizer)
+       ;; and cannot be separated from their associated constant argument.  For
+       ;; now do not optimize them at all.
+       (not (get-kludged-built-in *compiler* (function-spec (call-function inst1))))
+       (not (eq (call-inline-p inst1) 'cl:inline))
+       (not (eq (call-inline-p inst2) 'cl:inline))
+       (let ((prev1 (inst-prev inst1))
+	     (prev2 (inst-prev inst2)))
+	 (and ;; These "functions" are specially handled by (var peep-hole-optimizer)
+	      (not (and (eq (inst-opcode prev1) 'var)
+			(eq (variable-type (var-variable prev1)) 'lexical)
+			(eq (inst-opcode prev2) 'var)
+			(eq (variable-type (var-variable prev2)) 'lexical)
+			(not (equal-inst prev1 prev2))
+			(or (inst-call-to-address-builtin inst1)
+			    (inst-call-to-address-builtin inst2))))
+	      ;; These "functions" are specially handled by (const peep-hole-optimizer)
+	      (not (and (eq (inst-opcode prev1) 'const)
+			(eq (inst-opcode prev2) 'const)
+			(not (equal-inst prev1 prev2))
+			(or (inst-call-to-constant-builtin inst1 (const-value prev1))
+			    (inst-call-to-constant-builtin inst2 (const-value prev2)))))))))
+
+;;; This conditional is the same as (var peep-hole-optimizer)
+(defun inst-call-to-address-builtin (inst)
+  (and (eq (inst-opcode inst) 'call)
+       (let* ((name (function-spec (call-function inst)))
+	      (built-in (dolist (b (get-built-in *compiler* name nil))
+			  (when (built-in-address-operand-p *compiler* b)
+			    (return b)))))
+	 (and built-in
+	      (= (built-in-n-arguments built-in) (call-n-args inst))))))
+
+;;; This conditional is the same as (const peep-hole-optimizer)
+(defun inst-call-to-constant-builtin (inst const-value)
+  (let ((function (function-spec (call-function inst))))
+    (and (symbolp function)
+	 (numberp const-value)
+	 (dolist (built-in (get-built-in *compiler* function nil))
+	   (let ((built-in-format (built-in-format built-in)))
+	     ;; if numbers of args not equal, could be because phase-1
+	     ;; let through bad code like (car a b) after the error message
+	     (when (and (= (built-in-n-arguments built-in) (call-n-args inst))
+			(format-fits-arg *compiler* built-in-format const-value))
+	       (return t)))))))
+
+;;--- This is too restrictive
+(defun equal-function (fn1 fn2)
+  (or (eq fn1 fn2)
+      (let ((ft (function-type fn1)))
+	(and (or (eq ft 'external) (eq ft 'reference))
+	     (eq ft (function-type fn2))
+	     (equal (function-spec fn1) (function-spec fn2))))))
+
+;; Tags are never equal
+(defpf (tag equal-inst-predicate) #'ignore)
+
+;; Jumps are equal if they jump to the same tag.
+;; That is the reason for the tag-merge optimization.
+
+;; Note:  These are not really optimizations, but recursive calls to PHASE-3
+;; on the initialization code.
+
+(defun (take-args phase-3) (inst)
+  (mapc #'optimize-interval (take-args-init-intervals inst))
+  nil)
+
+(defun (take-keyword-argument phase-3) (inst)
+  (optimize-interval (take-keyword-argument-interval inst))
+  nil)
+
+(defgeneric code-dead-after (instruction))
+
+(definst-method (code-dead-after call) ()
+  (or (destination-for-return call-destination)
+      (and call-builtin
+	   (cl:member (function-spec call-function)
+		      '(%jump
+			#+IMach %generic-dispatch
+			#+IMach %message-dispatch
+			#+imach return-kludge
+			#+IMACH RETURN-MULTIPLE)))))
+
+;;--- Phase 1 should know about functions with no side effects compiled to IGNORE
+;; Hack NOTs, Flush dead code after calls to RETURN.
+(defun (call phase-3) (inst)
+  (or (and (code-dead-after inst)
+	   (flush-dead-code-after inst))
+      (let ((count 0) condition)
+	(loop for i = inst then (inst-next i)
+	      as op = (inst-opcode i)
+	      when (and (eq op 'call)
+			(eq (function-spec (call-function i)) 'not)	;null isn't generated
+			(eql (call-n-args i) 1))
+	        do (incf count)
+		   (unless (eql 1 (destination-n-values (call-destination i)))
+		     (return (not-not-optimization inst i count)))
+	      else when (and (eq op 'jump)
+			     (neq (setq condition (jump-condition i)) 'always)
+			     ;; As long as both directions pop off the result of NOT,
+			     ;; we can optimize it out.
+			     (plusp (jump-pops-if-successful i))
+			     (plusp (jump-pops-if-not-successful i)))
+	        do (note-optimization not-jump)
+		   (if (oddp count)
+		       (setf (jump-condition i) (other condition)))
+		   (delete-inst inst (inst-prev i))
+		   (return t)
+	      else when (and (eq op 'jump)
+			     (evenp count)
+			     (or (and (eq (jump-condition i) 'true)
+				      (plusp (jump-pops-if-successful i)))
+				 (and (eq (jump-condition i) 'false)
+				      (plusp (jump-pops-if-not-successful i)))))
+		do (note-optimization not-not-jump)
+		   (delete-inst inst (inst-prev i))
+		   (return t)
+	      else return (not-not-optimization inst (inst-prev i) count)))
+      (and (null (destination-n-values (call-destination inst)))
+	   (not (destination-for-return (call-destination inst)))
+	   (let ((next (inst-next inst)))
+	     (and (eq (inst-opcode next) 'return)
+		  (eq (return-n next) 'multiple)
+		  (progn (note-optimization call-and-return-multiple)
+			 (setf (call-destination inst) *destination-return*)
+			 (delete-inst next)
+			 t))))
+      ))
+
+;;;
+;;; Note that we can't optimize (not (not a)) ==> a, since (not (not a))
+;;; returns only t or nil, but a can be anything.  Sometime in the future we should
+;;; take care of the case of (not (not (zerop x))), which can be optimized, since zerop
+;;; and its predicate friends always return t or nil
+;;;
+(defun not-not-optimization (inst last count)
+  (when (> count 2)
+    (note-optimization not-not)
+    (setq last (inst-prev last))
+    (if (evenp count)
+	(setq last (inst-prev last)))
+    (delete-inst inst last)
+    t))
+
+;;;
+
+(defgeneric jumps-to-tag-p (tag)
+  (:method-combination :or))
+
+(defmethod (jumps-to-tag-p tag-instruction) ()
+  (not (null tag-jumps)))
+
+(deftag-method (jumps-to-tag-p go) ()
+  tag-non-local-target-p)
+
+;;;
+
+(defgeneric merge-tag-p (tag))
+
+(defmethod (merge-tag-p tag-instruction :default) ()
+  nil)
+
+(deftag-method (merge-tag-p internal) ()
+  t)
+
+(deftag-method (merge-tag-p go) ()
+  ;;(not tag-non-local-target-p)
+  ;; Always return NIL because phase 4 might need the tag-function.
+  ;; The modularity is wrong somewhere here.
+  nil)
+
+;;;
+
+(defgeneric replace-target-tag (inst old-tag new-tag))
+
+(definst-method (replace-target-tag jump) (old-tag new-tag)
+  (when (eq jump-tag old-tag)
+    (setf jump-tag new-tag)))
+
+(definst-method (replace-target-tag push-pc) (old-tag new-tag)
+  (when (eq push-pc-tag old-tag)
+    (setf push-pc-tag new-tag)))
+
+(definst-method (replace-target-tag push-pc-array) (old-tag new-tag)
+  (when (eq push-pc-array-default-tag old-tag)
+    (setf push-pc-array-default-tag new-tag))
+  (cl:nsubstitute new-tag old-tag push-pc-array-tags)
+  nil)
+
+(definst-method (replace-target-tag start-catch) (old-tag new-tag)
+  (when (eq (catch-internal-tag start-catch-pframe) old-tag)
+    (setf (catch-internal-tag start-catch-pframe) new-tag)))
+
+(definst-method (replace-target-tag end-catch) (old-tag new-tag)
+  (when (eq (catch-internal-tag end-catch-pframe) old-tag)
+    (setf (catch-internal-tag end-catch-pframe) new-tag)))
+
+(definst-method (replace-target-tag start-unwind-protect) (old-tag new-tag)
+  (when (eq start-unwind-protect-handler old-tag)
+    (setf start-unwind-protect-handler new-tag)))
+
+;;;---- Note:  This method is completely bogus!  It works because
+;;;---- the only caller is the MERGE-TAGS optimization, which is not changing
+;;;---- the destination of the branch, but just merging it with another tag.
+;;;---- IF this is ever called anywhere else, it will lose.
+(definst-method (replace-target-tag block-read-test) (old-tag new-tag)
+  (when (eq block-read-test-tag old-tag)
+    (setf block-read-test-tag new-tag)))
+
+;;;
+
+(defgeneric note-instruction-deleted (inst))
+
+(defmethod (note-instruction-deleted byte-lap-instruction :default) ()
+  nil)
+
+(definst-method (note-instruction-deleted jump) ()
+  (delete-tag-jump jump-tag self))
+
+(definst-method (note-instruction-deleted push-pc) ()
+  (delete-tag-jump push-pc-tag self))
+
+(definst-method (note-instruction-deleted push-pc-array) ()
+  (delete-tag-jump push-pc-array-default-tag self)
+  (dolist (tag push-pc-array-tags)
+    (delete-tag-jump tag self)))
+
+(definst-method (note-instruction-deleted start-catch) ()
+  (let ((tag (catch-internal-tag start-catch-pframe)))
+    (when tag
+      (delete-tag-jump tag self))))
+
+(definst-method (note-instruction-deleted end-catch) ()
+  (let ((tag (catch-internal-tag end-catch-pframe)))
+    (when tag
+      (delete-tag-jump tag self))))
+
+(definst-method (note-instruction-deleted start-unwind-protect) ()
+  (delete-tag-jump start-unwind-protect-handler self))
+
+(definst-method (note-instruction-deleted block-read-test) ()
+  (delete-tag-jump block-read-test-tag self))
+
+;;;
+
+(defun (tag phase-3) (inst)
+  (let ((next (inst-next inst)))
+    (cond ((not (jumps-to-tag-p inst))
+	   (note-optimization delete-tag)
+	   (delete-inst inst)
+	   t)
+	  ((and (tagp next)
+		(merge-tag-p next))
+	   (note-optimization tag-merge)
+	   (delete-inst next)
+	   (mapc #'(lambda (jump) (replace-target-tag jump next inst))
+		 (tag-jumps next))
+	   (setf (tag-jumps inst) (append (tag-jumps next) (tag-jumps inst)))
+	   t))))
+
+(defun next-executable-inst (inst)
+  (loop do (setq inst (inst-next inst))
+	until (executablep inst)
+	finally (return inst)))
+
+(defun prev-executable-inst (inst)
+  (loop do (setq inst (inst-prev inst))
+	until (executablep inst)
+	finally (return inst)))
+
+(defun (start-catch phase-3) (inst)
+  (and (not (destination-for-return (start-catch-destination inst)))
+       (let* ((pframe (start-catch-pframe inst))
+	      (d-tag (catch-internal-tag pframe))
+	      (destination (next-executable-inst d-tag)))
+	 (and (eq (inst-opcode destination) 'jump)
+	      (eq (jump-condition destination) 'always)
+	      (= (jump-pops-if-successful destination) 0)
+	      (progn (note-optimization catch-jump)
+		     (let ((to-tag (jump-tag destination)))
+		       (setf (catch-internal-tag pframe) to-tag)
+		       (push inst (tag-jumps to-tag))
+		       (setf (tag-jumps d-tag) (delq inst (tag-jumps d-tag)))
+		       (when (not (jumps-to-tag-p d-tag))
+			 (note-optimization delete-tag)
+			 (delete-inst destination)))
+		     t)))))
+
+(defgeneric code-may-be-copied (instruction))
+
+(defmethod (code-may-be-copied byte-lap-instruction) ()
+  nil)
+
+(defmethod (code-may-be-copied return-instruction) ()
+  t)
+
+(defmethod (code-may-be-copied popj-instruction) ()
+  t)
+
+(defmethod (code-may-be-copied call-instruction) ()
+  (code-dead-after self))
+
+(defun (jump phase-3) (inst)
+  (let* ((tag (jump-tag inst))
+	 (destination (next-executable-inst tag))
+	 (atomic-next (inst-next inst))
+	 (next (next-executable-inst inst))
+	 (prev (prev-executable-inst inst))
+	 (condition (jump-condition inst))
+	 (pops-if-successful (jump-pops-if-successful inst))
+	 (pops-if-not-successful (jump-pops-if-not-successful inst)))
+    (or (and (eq condition 'always)
+	     (or (flush-dead-code-after inst)
+		 (and (plusp pops-if-successful)
+		      (progn (note-optimization wierd-jump)
+			     (loop repeat pops-if-successful do
+			      (insert-inst inst (make-pop-instruction :pop-n 1 :pop-save-n 0)))
+			     (setf (jump-pops-if-successful inst) 0)
+			     (setf (jump-pops-if-not-successful inst) 0)
+			     t))
+		 (and (zerop pops-if-successful)	; redundant -- zeroed above
+		      ;; if the destination is a single instruction, copy it here
+		      ;; this could be generalized, if we could decide what else to copy
+		      (code-may-be-copied destination)
+		      (progn (note-optimization jump-to-copiable-instruction)
+			     (replace-inst inst (copy-inst destination))
+			     t))
+		 (and (null *inhibit-phase-3-crossjumping*)
+		      (neq (inst-opcode prev) 'jump) ;screws up jump-through-conditional
+		      (neq destination inst)
+		      (let ((d-prev (prev-executable-inst destination)))
+			(and (equal-inst prev d-prev)
+			     (progn (note-optimization jump-duplicate-code)
+				    ;; Relocate tags before branch
+				    (let ((first-tag (inst-next prev))
+					  (last-tag (inst-prev inst)))
+				      (unless (eq first-tag inst)	;No tags
+					(delete-inst first-tag last-tag t)
+					(insert-inst destination first-tag last-tag))
+				      (when (eq (inst-opcode prev) 'call)
+					;; This stuff may be ignored by the back-end or not.
+					(setf (call-start-call d-prev)
+					      (append (call-start-call prev)
+						      (call-start-call d-prev))))
+				      (delete-inst prev)
+				      (divert inst tag (tag-before d-prev))
+				      t)))))))
+	(and (eq destination next)
+	     ;; These can in fact differ if the code contains %PUSH!
+	     (= pops-if-successful pops-if-not-successful)
+	     (if (plusp pops-if-successful)
+		 (progn (note-optimization jump-.+1)
+			(replace-inst inst (make-pop-instruction :pop-n pops-if-successful
+								 :pop-save-n 0))
+			t)
+		 (progn (note-optimization jump-.+1)
+			(delete-inst inst)
+			t)))
+	(and (eq (inst-opcode destination) 'jump)
+	     (let ((d-condition (jump-condition destination))
+		   (d-pops-if-successful (jump-pops-if-successful destination))
+		   (d-pops-if-not-successful (jump-pops-if-not-successful destination))
+		   (d-tag (jump-tag destination)))
+	       (and (neq d-tag tag)
+		    (or (and ;; Check that the architecture supports the kind of jump
+			     ;; we want to create.
+			     (jump-pops-valid-p *compiler*
+						(+ pops-if-successful d-pops-if-successful)
+						pops-if-not-successful)
+			     ;; Check that the branch would actually go through.
+			     (or (eq d-condition 'always)
+				 (and (eq d-condition condition)
+				      (zerop pops-if-successful)))
+			     (null (jump-error-info inst))
+			     (progn (note-optimization jump-through)
+				    (divert inst tag d-tag)
+				    (setf (jump-pops-if-successful inst)
+					  (+ pops-if-successful d-pops-if-successful))
+				    (setf (jump-error-info inst)
+					  (copylist (jump-error-info destination)))
+				    t))
+			(and (neq condition 'always)
+			     (neq d-condition 'always)
+			     (neq condition d-condition)
+			     (zerop pops-if-successful)
+			     (jump-pops-valid-p *compiler*
+						pops-if-successful
+						d-pops-if-not-successful)
+			     (let ((new-tag (tag-after destination)))
+			       (note-optimization jump-drop-through)
+			       (divert inst tag new-tag)
+			       (setf (jump-pops-if-successful inst) d-pops-if-not-successful)
+			       t))
+			(and (eq condition 'always)
+			     (zerop pops-if-successful)
+			     (zerop pops-if-not-successful)
+			     (neq d-condition 'always)
+			     (let* ((new-tag (tag-after destination))
+				    (new-jump (make-jump-instruction
+						:jump-tag new-tag
+						:jump-condition 'always
+						:jump-pops-if-successful 0
+						:jump-pops-if-not-successful 0)))
+			      (note-optimization jump-through-conditional)
+			      (divert inst tag d-tag)
+			      (setf (jump-condition inst) d-condition)
+			      (setf (jump-pops-if-successful inst) d-pops-if-successful)
+			      (setf (jump-pops-if-not-successful inst) d-pops-if-not-successful)
+			      (setf (jump-error-info inst)
+				    (copylist (jump-error-info destination)))
+			      (push new-jump (tag-jumps new-tag))
+			      (insert-inst atomic-next new-jump)
+			      t))))))
+	(and (eq (inst-opcode atomic-next) 'jump)
+	     (neq condition 'always)
+	     (let ((n-condition (jump-condition atomic-next))
+		   (n-next (next-executable-inst atomic-next)))
+	       (and (eq n-condition 'always)
+		    (eq destination n-next)
+		    (progn (note-optimization invert-jump-sense)
+			   (divert inst tag (jump-tag atomic-next))
+			   (setf (jump-condition inst) (other condition))
+			   (setf (jump-pops-if-successful inst) pops-if-not-successful)
+			   (setf (jump-pops-if-not-successful inst) pops-if-successful)
+			   (delete-inst atomic-next)
+			   t))))
+	(and (eq condition 'always)
+	     (let* ((prev-executable (prev-executable-inst tag))
+		    (first-non-executable (inst-next prev-executable)))
+	       (and (inst-cannot-drop-through prev-executable)
+		    (neq atomic-next first-non-executable)	;Don't hack jump .+1
+		    ;; Kludge around the case where somebody else is doing jump .+1
+		    ;; but we haven't found him yet.
+		    (not (and (eq (inst-opcode prev-executable) 'jump)
+			      (eq (next-executable-inst (jump-tag prev-executable))
+				  destination)))
+		    (loop for i = destination then (inst-next i)
+			  when (or (eq i inst)
+				   (eq i *phase-3-last-instruction*))
+			    return nil
+			  when (inst-cannot-drop-through i)
+			    return (progn
+				     (note-optimization jump-in-line)
+				     (delete-inst first-non-executable i t)
+				     (insert-inst atomic-next first-non-executable i)
+				     (if (plusp pops-if-successful)
+					 (replace-inst inst (make-pop-instruction
+							      :pop-n pops-if-successful
+							      :pop-save-n 0))
+					 (delete-inst inst))
+				     t)))))
+	(and (memq condition '(true false))
+	     (or (and (eq (inst-opcode destination) 'pop)
+		      (eql (pop-save-n destination) 0)
+		      (let ((pop-n (pop-n destination))
+			    (jump-pop-n (jump-pops-if-successful inst)))
+			(and (fixp pop-n)
+			     (jump-pops-valid-p *compiler*
+						(+ pop-n jump-pop-n)
+						(jump-pops-if-not-successful inst))
+			     (progn (note-optimization jump-to-pop)
+				    (setf (jump-pops-if-successful inst) (+ pop-n jump-pop-n))
+				    (divert inst tag (tag-after destination))
+				    t))))
+		 (and (eq (inst-opcode atomic-next) 'pop)
+		      (eql (pop-save-n atomic-next) 0)
+		      (let ((pop-n (pop-n atomic-next))
+			    (jump-pop-n (jump-pops-if-not-successful inst)))
+			(and (fixp pop-n)
+			     (jump-pops-valid-p *compiler*
+						(jump-pops-if-successful inst)
+						(+ pop-n jump-pop-n))
+			     (progn (note-optimization jump-pop)
+				    (setf (jump-pops-if-not-successful inst)
+					  (+ pop-n jump-pop-n))
+				    (delete-inst atomic-next)
+				    t)))))))))
+
+(defpf (return phase-3) 'flush-dead-code-after)
+(defpf (throw phase-3) 'flush-dead-code-after)
+(defpf (popj phase-3) 'flush-dead-code-after)
+
+(defun flush-dead-code-after (inst)
+  (let ((start (inst-next inst)))
+    (loop for i = start then (inst-next i)
+	  when (or (eq i *phase-3-last-instruction*)	;End of chain (NO-OP)
+		   (and (eq (inst-opcode i) 'tag)
+			(jumps-to-tag-p i)))
+	    return (when (neq start i)
+		     (note-optimization dead-code)
+		     (delete-inst start (inst-prev i))
+		     t))))
+
+(defun inst-cannot-drop-through (inst)
+  (let ((op (inst-opcode inst)))
+    (or (eq op 'return)
+	(eq op 'popj)
+	(and (eq op 'jump)
+	     (eq (jump-condition inst) 'always))
+	(and (eq op 'call)
+	     (destination-for-return (call-destination inst))))))
+
+(defun tag-after (inst)
+  (let ((next (inst-next inst)))
+    (if (eq (inst-opcode next) 'tag)
+	next
+	(let ((tag (make-tag)))
+	  (insert-inst next tag)
+	  tag))))
+
+(defun tag-before (inst)
+  (let ((prev (inst-prev inst)))
+    (if (eq (inst-opcode prev) 'tag)
+	prev
+	(let ((tag (make-tag)))
+	  (insert-inst inst tag)
+	  tag))))
+
+(def-peep-hole (const const-is-multiple-count)
+  (let ((const const-value))
+    (when (cl:typep const '(cl:integer 0 *))
+      (let ((next inst-next))
+	(cl:case (inst-opcode next)
+	  (computed-pop
+	    (when (eq (computed-pop-save-n next) 'multiple)
+	      (delete-inst self)
+	      (setf (computed-pop-save-n next) const)
+	      (insert-inst (inst-next next) self)
+	      t))
+	  (pop
+	    (when (eq (pop-save-n next) 'multiple)
+	      (delete-inst self)
+	      (setf (pop-save-n next) const)
+	      (insert-inst (inst-next next) self)
+	      t))
+	  (return
+	    (when (eq (return-n next) 'multiple)
+	      (note-optimization push-and-return-multiple)
+	      (setf (return-n next) const)
+	      (delete-inst self)
+	      t))
+	  (take-values
+	    (when (eql const (take-values-destination next))
+	      (note-optimization take-equal-values)
+	      (delete-inst self next)
+	      t)))))))
+
+;; Foo, NAME is like SETQ but can't be deleted...
+(defpf (setq phase-3) 'phase-3-val)
+(defpf (var phase-3) 'phase-3-val)
+(defpf (const phase-3) 'phase-3-val)
+
+(defun phase-3-val (inst)
+  (let (value-on-stack				;The constant value on the stack if there is one.
+	value-on-stack-p			;T if there is a constant value on the stack.
+	variable-pushed				;What was initially pushed by a VAR instruction.
+	variables-on-stack			;Other variables which correspond to TOS due to SETQ's.
+	jumps					;Any conditional jumps.
+	pop)					;The instruction which popped the TOS.  May be a jump.
+    (selectq (inst-opcode inst)
+      (setq
+       (when (setq-nested-captive-environment inst) (return-from phase-3-val nil))
+       (setq variables-on-stack (list (setq-variable inst))))
+      (var
+       (when (var-nested-captive-environment inst) (return-from phase-3-val nil))
+       (setq variable-pushed (var-variable inst)))
+      (otherwise
+       (setq value-on-stack (const-value inst))
+       (when (and (listp value-on-stack)
+		  (eq (first value-on-stack) compiler:eval-at-load-time-marker))
+	 (return-from phase-3-val nil))
+       (setq value-on-stack-p t)))
+    (do ((i inst)) (nil)
+      (setq i (inst-next i))
+      (selectq (inst-opcode i)
+	(setq
+	 (when (setq-nested-captive-environment i) (return nil))
+	 (when pop (return nil))
+	 (let ((var (setq-variable i)))
+	   (when (or (memq var variables-on-stack)	;Already been SETQ'd.
+		     (eq var variable-pushed))	;(SETQ X X)
+	     (note-optimization double-setq)
+	     (delete-inst i)
+	     (return t))
+	   (push var variables-on-stack)))
+	(jump
+	 (when pop (return nil))
+	 (when (and (memq (jump-condition i) '(true false))
+		    value-on-stack-p)
+	   (note-optimization constant-jump)
+	   (cond ((if (eq (jump-condition i) 'true) value-on-stack (not value-on-stack))
+		  (let ((pops-if (jump-pops-if-successful i)))
+		    (when (and (plusp pops-if)
+			       (jump-pops-valid-p *compiler*
+						  (1- pops-if)
+						  (jump-pops-if-not-successful i)))
+		      (note-optimization val-pop)
+		      (setf (jump-pops-if-successful i) (1- pops-if))
+		      (if variables-on-stack	;Need to pop it someplace too.
+			  (insert-inst i (make-pop-instruction :pop-n 1 :pop-save-n 0))
+			  (delete-inst inst))))	;CONST
+		  (setf (jump-pops-if-not-successful i)
+			(jump-pops-if-successful i))
+		  (setf (jump-condition i) 'always))
+		 (t (let ((pops-if-not (jump-pops-if-not-successful i)))
+		      (cond ((plusp pops-if-not)
+			     (note-optimization val-pop)
+			     (cond (variables-on-stack
+				    (replace-inst i (make-pop-instruction :pop-n pops-if-not
+									  :pop-save-n 0)))
+				   (t 
+				    (delete-inst inst)	;CONST
+				    (if (> pops-if-not 1)
+					(replace-inst
+					  i (make-pop-instruction :pop-n (1- pops-if-not)
+								  :pop-save-n 0))
+					(delete-inst i)))))
+			    (t (delete-inst i))))))
+	   (return t))
+						;---Try following jump
+	 (when (eq (jump-condition i) 'always)
+	   (return nil))
+	 (selectq (jump-pops-if-not-successful i)
+	   (0)
+	   ;; The only reason we're remembering this jump is because we might
+	   ;; change jump-pops-if-not-successful to 0.  So only
+	   ;; remember this if it is legal for us to make this change.
+	   (1 (if (and (< (jump-pops-if-successful i) 2)
+		       (null (jump-error-info i)))
+		  (setf pop i)
+		  (return nil)))
+	   (otherwise (return nil)))
+	 (setf jumps t))
+	(var
+	 (when (var-nested-captive-environment i) (return nil))
+	 (return
+	   (when (and pop
+		      (let ((var (var-variable i)))
+			(or (eq var variable-pushed)
+			    (memq var variables-on-stack)))
+		      ;; Make sure (var) (jump) (var) (call 1+-local) doesn't get hacked.
+		      (not (let ((next (inst-next i)))
+			     (and (or (and (eq (inst-opcode next) 'call)
+					   (let ((spec
+						   (function-spec (call-function next))))
+					     (or (memq spec '(1+local 1-local
+								      car-local cdr-local
+								      %pointer-increment
+								      %p-contents-increment-pointer
+								      %p-contents-pointer-decrement
+								      ))
+						 (get-modification-function
+						   *compiler* spec))))
+				      (and (eq (inst-opcode next) 'const)
+					   (let ((next-next (inst-next next)))
+					     (and (eq (inst-opcode next-next) 'call)
+						  (get-modification-function
+						    *compiler*
+						    (function-spec
+						      (call-function next-next))
+						    (const-value next)))))))))
+		      (or (eq (inst-opcode pop) 'pop)
+			  (jump-pops-valid-p *compiler*
+					     (jump-pops-if-successful pop)
+					     0)))
+	     (note-optimization val-pop-val)
+	     (if (eq (inst-opcode pop) 'pop)
+		 (delete-inst pop)
+		 (setf (jump-pops-if-not-successful pop) 0))
+	     (delete-inst i)
+	     t)))
+	(const
+	 (return
+	   (when (and pop value-on-stack-p
+		      (eq (const-value i) value-on-stack)
+		      (or (eq (inst-opcode pop) 'pop)
+			  (jump-pops-valid-p *compiler*
+					     (jump-pops-if-successful pop)
+					     0)))
+	     (note-optimization val-pop-val)
+	     (if (eq (inst-opcode pop) 'pop)
+		 (delete-inst pop)
+		 (setf (jump-pops-if-not-successful pop) 0))
+	     (delete-inst i)
+	     t)))
+	(name)
+	(pop
+	 (when (or pop (neq (pop-save-n i) 0))
+	   (return nil))
+	 ;;--- Somewhere we have to have the (VAR FOO) (POP 3 SAVE 1) ==>
+	 ;;--- (POP 3) (VAR FOO).  Note the original pop can't pop away FOO!
+	 (cond ((eq (pop-n i) 'multiple)
+		(return nil))
+	       ((and (null jumps)		;---
+		     (null variables-on-stack)
+		     (or variable-pushed
+			 value-on-stack-p)
+		     (or (neq (inst-opcode inst) 'var)
+			 (neq (variable-type (var-variable inst)) 'lexical)
+			 (not (inst-call-to-address-builtin (inst-next inst)))))
+		(note-optimization val-pop)
+		(delete-inst inst)		;VAR or CONST
+		(if (> (pop-n i) 1)		;POP
+		    (decf (pop-n i))
+		    (delete-inst i))
+		(return t))
+	       ((= (pop-n i) 1)
+		(setq pop i))
+	       (t (return nil))))		;Pops more than just the one value
+	(otherwise				;--- Eventually search to see if vars SETQd are unused
+	 (return nil))))))
+
+(defun (pop phase-3) (inst &aux (next inst))
+  (or (phase-3-pop-unbind inst)
+      ;;--- This could be smarter, integrated with phase-3-val.
+      (and (jump-pops-valid-p *compiler* 2 2)
+	   (eq (pop-save-n inst) 1)
+	   (eq (pop-n inst) 1)
+	   (loop as opcode = (inst-opcode (setq next (inst-next next)))
+		 while (eq opcode 'unbind)	;skip over unbinds
+		 finally (return (eq opcode 'jump)))
+	   (cl:member (jump-condition next) '(true false))
+	   (= (jump-pops-if-successful next) 1)
+	   (= (jump-pops-if-not-successful next) 1)
+	   (null (jump-error-info next))	;Probably not necessary.
+	   (progn (note-optimization pop-save-conditional)
+		  (delete-inst inst)
+		  (setf (jump-pops-if-successful next) 2)
+		  (setf (jump-pops-if-not-successful next) 2)
+		  t))))
+
+(defpf (unbind phase-3) 'phase-3-pop-unbind)
+(defpf (computed-pop phase-3) 'phase-3-pop-unbind)
+
+(defun phase-3-pop-unbind (inst)
+  (let ((pops 0) (pop-variables nil) (merge-pops t)
+	(saves nil) (unbinds 0) (count 0)
+	(do-before-pop nil) (last inst) (return-n nil)
+	(last-non-name nil))
+    (loop doing
+      (selectq (inst-opcode last)
+	((pop computed-pop)
+	 (multiple-value-bind (save-n pop-n)
+	     (selectq (inst-opcode last)
+	       (computed-pop
+		(setq pop-variables (append pop-variables (computed-pop-variables last)))
+		(values (computed-pop-save-n last) (computed-pop-n last)))
+	       (otherwise
+		(values (pop-save-n last) (pop-n last))))
+	   (cond ((null saves) (setq saves save-n))	;First time
+		 ((eql save-n saves))
+		 ((or (not (fixp saves)) (not (fixp save-n))) (return))
+		 ((not (fixp pop-n)))
+		 ((and (< save-n saves) ( (+ save-n pop-n) saves))
+		  (setq saves save-n))
+		 ((zerop save-n)
+		  (if ( pop-n saves)		;Popping off all that were saved before
+		      (setq pop-n (- pop-n saves)
+			    saves 0)
+		      (push last do-before-pop)
+		      (decf saves pop-n)
+		      (setq pop-n 0)))
+		 (t (return)))			;Impossible to merge pops.
+	   (if (fixp pop-n)
+	       (incf pops pop-n)
+	       (setq merge-pops nil))
+	   (incf count))
+	 (setq last-non-name last))
+	(unbind 
+	 (incf unbinds (unbind-n last))
+	 (incf count)
+	 (setq last-non-name last))
+	(pop-vars
+	 (push last do-before-pop)
+	 (setq last-non-name last))
+	;; What we're trying to do here is hairy optimizations like
+	;;   POP N save 1		SETQ
+	;;   SETQ		==>	POP N+M+1
+	;;   POP M
+	;; However, we can't do optimizations like this when the SETQ variable
+	;; is stack resident, which is difficult to tell at this point.  So for the time
+	;; being (7.2) I'm just going to disable the optimization.  -- DLA 2/16/88 15:59:15
+	#+++ignore
+	(setq (cond ((and (plusp unbinds)
+			  (eq (variable-type (setq-variable last)) 'special))
+		     (return))			;Might be setq'ing into something bound
+		    ((and saves (plusp saves)) (push last do-before-pop))
+		    (t (return))))		;We are not setq'ing to one of the saves
+	(return
+	 (setq return-n (return-n last))
+	 (return))
+	(const
+	 (loop with count = 1
+	       for inst = (inst-next last) then (inst-next inst)
+	       do (selectq (inst-opcode inst)
+		    (const (incf count))
+		    (return
+		     (let ((n (return-n inst)))
+		       (when (and (cl:integerp n)
+				  (>= n count))
+			 (setq return-n (- n count))))
+		     (return))
+		    (otherwise (return))))
+	 (return))
+	(name
+	 ;; Throw intervening names away, since the contour they represent
+	 ;; isn't really there.
+	 )
+	(otherwise
+	 (return)))
+      (setq last (inst-next last)))
+    (let ((n-required (if (or (plusp pops) pop-variables) 1 0))
+	  (prev (inst-prev inst)))
+      (if (plusp unbinds) (incf n-required))
+      (setq do-before-pop (nreverse do-before-pop))
+      (when (and return-n
+		 (or (null saves)
+		     (eql return-n saves)
+		     (and (fixp return-n)
+			  (fixp saves)
+			  ( return-n saves)))
+		 (plusp n-required))
+	(note-optimization pop-unbind-return)
+	(delete-inst inst (inst-prev last))
+	(loop until (null do-before-pop)
+	      do (insert-inst last (pop do-before-pop)))
+	(setq *phase-3-instruction* (inst-next prev))
+	(return-from phase-3-pop-unbind t))
+      (when (and merge-pops (> count n-required))
+	;; Remember how we threw away intervening names above?  Well, we
+	;; can't do that if they are the last things in this interval
+	;; because they name locations at the top of the new contour.
+	(when last-non-name
+	  (setq last (inst-next last-non-name)))
+	(note-optimization pop-unbind)
+	(delete-inst inst (inst-prev last))
+	(loop until (null do-before-pop)
+	      do (insert-inst last (pop do-before-pop)))
+	(when (plusp unbinds)
+	  (insert-inst last (make-unbind-instruction :unbind-n unbinds)))
+	(if pop-variables
+	    (insert-inst last
+			 (make-computed-pop-instruction
+			   :computed-pop-variables pop-variables
+			   :computed-pop-n pops
+			   :computed-pop-save-n saves))
+	    (when (plusp pops)
+	      (insert-inst last
+			   (make-pop-instruction :pop-n pops :pop-save-n saves))))
+	(setq *phase-3-instruction* (inst-next prev))
+	(return-from phase-3-pop-unbind t)))))
+
+
+(defun-in-flavor (1-arg-call-optimizer call-instruction)
+		 ()
+  (when (feature-case
+	  (:imach call-builtin)
+	  (3600.
+	    (not (memq (function-spec call-function)
+		       '(%p-contents-increment-pointer %p-contents-pointer-decrement)))))
+    (let* ((arg inst-prev)
+	   (next
+	     (loop for inst first self then (inst-next inst)
+		   while
+		     (and (eql (inst-opcode inst) 'call)
+			  (eql (call-n-args inst) 1)
+			  (eql 1 (destination-n-values (call-destination inst)))
+			  (feature-case
+			    (:imach (call-builtin inst))
+			    (3600. t)))
+		   finally
+		     (return inst)))
+	   (next-opcode (inst-opcode next)))
+      (when (eq (inst-opcode arg) 'var)
+	(let ((variable (var-variable arg)))
+	  (when (variable-can-be-operand-p variable)
+	    (when (and (or (and (eq next-opcode 'call)
+				(destination-for-return (call-destination next))
+				(not (eql 0 (destination-n-values (call-destination next)))))
+			   (and (eq next-opcode 'setq)
+				(eq (setq-variable next) variable))
+			   (and (eq next-opcode 'pop)
+				(eql (pop-save-n next) 1)
+				(fixp (pop-n next))
+				(> (pop-n next) 0)))
+		       (eql (variable-stack-offset
+			      variable
+			      (inst-pre-control-stack-state arg)
+			      (var-level arg))
+			    1))
+	      (note-optimization modify-tos)
+	      ;; VAR can be arg, and is not used afterwards.
+	      (delete-inst arg)
+	      (decf inst-level)
+	      (setf (inst-source-locator (inst-prev next))
+		    (inst-source-locator next))
+	      (unless (and (eq next-opcode 'call)
+			   (destination-for-return (call-destination next))
+			   (not (eql 0 (destination-n-values (call-destination next)))))
+		(let ((var-inst (make-var-instruction
+				  :var-variable variable
+				  :var-level (var-level arg)
+				  :inst-source-locator (inst-source-locator next)
+				  :inst-level (inst-level arg)
+				  :inst-pre-control-stack-state
+				  (inst-post-control-stack-state arg)
+				  :inst-post-control-stack-state
+				  (inst-post-control-stack-state arg))))
+		  (if (eq next-opcode 'setq)
+		      (replace-inst next var-inst)
+		      (insert-inst next var-inst))))
+	      (return-from 1-arg-call-optimizer t))
+	    (when (and (eq next-opcode 'setq)
+		       (eq (setq-variable next) variable)
+		       (loop for inst first self then (inst-next inst)
+			     until (eq inst next)
+			     always (get-modification-function
+				      *compiler* (function-spec (call-function inst)))))
+	      (note-optimization modify-function)
+	      (loop for inst first self then (inst-next inst)
+		    until (eq inst next)
+		    doing
+		(insert-inst
+		  inst
+		  (make-call-instruction
+		    :call-function (external-function
+				     (get-modification-function
+				       *compiler* (function-spec (call-function inst))))
+		    :call-n-args 1
+		    :call-destination *destination-ignore*
+		    :call-inline-p 'cl:inline
+		    :inst-source-locator (inst-source-locator next)
+		    :inst-level (1- inst-level)
+		    :inst-pre-control-stack-state inst-pre-control-stack-state
+		    :inst-post-control-stack-state inst-post-control-stack-state))
+		(replace-inst
+		  inst
+		  (make-var-instruction
+		    :var-variable variable
+		    :var-level (var-level arg)
+		    :inst-source-locator (inst-source-locator next)
+		    :inst-level (inst-level arg)
+		    :inst-pre-control-stack-state inst-post-control-stack-state
+		    :inst-post-control-stack-state inst-post-control-stack-state)))
+	      (delete-inst next)
+	      (return-from 1-arg-call-optimizer t))))))))
+
+(defun-in-flavor (2-arg-call-optimizer call-instruction)
+		 ()
+  (let* ((arg2 inst-prev)
+	 (arg2-opcode (inst-opcode arg2))
+	 (arg1 (inst-prev arg2))
+	 (arg1-opcode (inst-opcode arg1))
+	 (next inst-next)
+	 (next-opcode (inst-opcode next)))
+    (when (and (eql arg1-opcode 'var)
+	       (memq arg2-opcode '(var const)))
+      (let ((variable (var-variable arg1)))
+	(when (and (or (and (destination-for-return call-destination)
+			    (not (eql 0 (destination-n-values call-destination))))
+		       (and (eq next-opcode 'setq)
+			    (eq (setq-variable next) variable))
+		       (and (eq next-opcode 'pop)
+			    (eql (pop-save-n next) 1)
+			    (fixp (pop-n next))
+			    (> (pop-n next) 0)))
+		   (variable-can-be-operand-p variable))
+	  ;; (SETQ VAR (Fn VAR arg2))
+	  (when (and (feature-case
+		       (:imach (or call-builtin
+				   ;; This compiler should be taken out and shot.
+				   (get-kludged-built-in *compiler*
+							 (function-spec call-function))))
+		       (3600. t))
+		     (eql (variable-stack-offset
+			    variable
+			    (inst-pre-control-stack-state arg1)
+			    (var-level arg1))
+			  1))
+	    ;; (SETQ TOS (Fn TOS arg2)) --> (Fn (%POP) arg2)
+	    (note-optimization modify-tos)
+	    (delete-inst arg1)
+	    (decf (inst-level arg2) 1)
+	    (decf inst-level)
+	    (when (eq arg2-opcode 'var)
+	      (decf (var-level arg2)))
+	    (setq inst-source-locator (inst-source-locator next))
+	    (let ((var-inst (make-var-instruction
+			      :var-variable variable
+			      :var-level (var-level arg1)
+			      :inst-source-locator (inst-source-locator next)
+			      :inst-level (inst-level arg1)
+			      :inst-pre-control-stack-state
+			      (inst-post-control-stack-state arg1)
+			      :inst-post-control-stack-state
+			      (inst-post-control-stack-state arg1))))
+	      (if (eq next-opcode 'setq)
+		  (replace-inst next var-inst)
+		  (insert-inst next var-inst)))
+	    (return-from 2-arg-call-optimizer t)))
+	(when (and (eq next-opcode 'setq)
+		   (eq (setq-variable next) variable)
+		   (variable-can-be-operand-p variable)
+		   (neq call-inline-p 'cl:notinline)
+		   (eql arg2-opcode 'const))
+	  (let ((modifier (get-modification-function
+			    *compiler* (function-spec call-function) (const-value arg2))))
+	    (when modifier
+	      (note-optimization modify-function)
+	      (delete-inst arg2)
+	      (replace-inst
+		next
+		(make-var-instruction
+		  :var-variable variable
+		  :var-level (var-level arg1)
+		  :inst-source-locator (inst-source-locator next)
+		  :inst-level (inst-level arg1)
+		  :inst-pre-control-stack-state inst-post-control-stack-state
+		  :inst-post-control-stack-state inst-post-control-stack-state))
+	      (replace-inst
+		self
+		(make-call-instruction
+		  :call-function (external-function modifier)
+		  :call-n-args 1
+		  :call-destination *destination-ignore*
+		  :call-inline-p 'cl:inline
+		  :inst-source-locator (inst-source-locator next)
+		  :inst-level (1- inst-level)
+		  :inst-pre-control-stack-state inst-pre-control-stack-state
+		  :inst-post-control-stack-state inst-post-control-stack-state))
+	      (return-from 2-arg-call-optimizer t))))))
+    (when (and (memq arg1-opcode '(var const))
+	       (eq arg2-opcode 'var)
+	       (eql next-opcode 'setq))
+      (let ((variable (var-variable arg2)))
+	(when (and (eq variable (setq-variable next))
+		   (eql (variable-stack-offset
+			  variable
+			  (inst-pre-control-stack-state arg2)
+			  (var-level arg2))
+			2)
+		   call-builtin
+		   (memq (function-spec call-function) '(+-internal *-internal)))
+	  (note-optimization modify-tos)
+	  (delete-inst arg2)
+	  (decf inst-level)
+	  (replace-inst
+	    next
+	    (make-var-instruction
+	      :var-variable variable
+	      :var-level (1- (var-level arg2))
+	      :inst-source-locator (inst-source-locator next)
+	      :inst-level (1- (inst-level arg1))
+	      :inst-pre-control-stack-state inst-post-control-stack-state
+	      :inst-post-control-stack-state inst-post-control-stack-state))
+	  (return-from 2-arg-call-optimizer t)))))
+  nil)
+
+(def-peep-hole (call built-in-call-optimizer)
+  ;; Debugging
+  (when (or (eql 1 (destination-n-values call-destination))
+	    (and (destination-for-return call-destination)
+		 (not (eql 0 (destination-n-values call-destination)))))
+    (selectq call-n-args
+      (1 (1-arg-call-optimizer))
+      (2 (2-arg-call-optimizer))
+      (otherwise nil))))
+
+(defun accessor-generic-function-p (fspec &optional (type 'clos:standard-accessor-method))
+  (when (and (boundp 'clos-internals::*clos-initialized-p*)
+	     clos-internals::*clos-initialized-p*)
+    #+ignore	;CLOS doesn't track methods at compile-time yet
+    (when (and compiler:undo-declarations-flag
+	       (clos-internals::fboundp-in-environment fspec 'future-common-lisp:compile-file))
+      (let ((def (clos-internals::fdefinition-in-environment
+		   fspec 'future-common-lisp:compile-file)))
+	(return-from accessor-generic-function-p
+	  (and (clos-internals::generic-function-p def)
+	       (lisp:some #'(lambda (method) (typep method type))
+			  (clos:generic-function-methods def))))))
+    (when (clos-internals::fboundp-in-environment fspec nil)
+      (let ((def (clos-internals::fdefinition-in-environment fspec nil)))
+	(return-from accessor-generic-function-p
+	  (and (clos-internals::generic-function-p def)
+	       (lisp:some #'(lambda (method) (typep method type))
+			  (clos:generic-function-methods def)))))))
+  nil)
+
+(defun decode-mapped-call (function destination)
+  (cond ((and (listp function)
+	      (eq (first function) 'future-common-lisp:setf))
+	 (cond ((eq (second function) 'clos:slot-value)
+		(if (eql (destination-n-values destination) 0)
+		    (values 3 :slot nil 'pop-instance-variable)
+		    (values 3 :slot nil 'movem-instance-variable)))
+	       ((accessor-generic-function-p function 'clos:standard-writer-method)
+		(selectq (destination-n-values destination)
+		  (0 (values 2 :writer function 'pop-instance-variable))
+		  (1 (values 2 :writer function 'movem-instance-variable))))))
+	((and (listp function)
+	      (eq (first function) 'locf))
+	 (cond ((eq (second function) 'clos:slot-value)
+		(values 2 :slot nil 'push-address-instance-variable))
+	       ((accessor-generic-function-p function 'clos:standard-locator-method)
+		(and (eql 1 (destination-n-values destination))
+		     (values 1 :locator function 'push-address-instance-variable)))))
+	(t
+	 (cond ((eq function 'clos:slot-value)
+		(values 2 :slot nil 'push-instance-variable))
+	       ((accessor-generic-function-p function 'clos:standard-reader-method)
+		(and (eql 1 (destination-n-values destination))
+		     (values 1 :reader function 'push-instance-variable)))))))
+
+(def-peep-hole (call mapped-access-optimizer)
+  (when (or (eq call-inline-p 'cl:notinline)
+	    (not (eq (function-type call-function) 'reference)))
+    (return-from mapped-access-optimizer nil))    
+  (multiple-value-bind (n-args map-type map-data instruction)
+      (decode-mapped-call (function-spec call-function) call-destination)
+    (unless (and map-type (= call-n-args n-args))
+      (return-from mapped-access-optimizer nil))
+    (let ((var inst-prev)
+	  variable
+	  mapping-information)
+      (when (eq map-type :slot)
+	(unless (eq (inst-opcode var) 'const)
+	  (return-from mapped-access-optimizer nil))
+	(setf map-data (const-value var))
+	(unless (and map-data (symbolp map-data))
+	  (return-from mapped-access-optimizer nil))
+	(setf var (inst-prev var))
+	(decf n-args))
+      (unless (eq (inst-opcode var) 'var)
+	(return-from mapped-access-optimizer nil))
+      (setf variable (var-variable var))
+      (unless (and (eq (variable-type variable) 'lexical)
+		   (null (lexical-modified-p variable))
+		   (setq mapping-information (lexical-mapping-table-info variable)))
+	(return-from mapped-access-optimizer nil))
+      (when call-start-call
+	(when (cdr call-start-call)
+	  (return-from mapped-access-optimizer nil))
+	(delete-inst (car call-start-call)))
+      ;; Work out the type form the function and the destination
+      (setf (lexical-mapped-access-p variable) t)
+      (multiple-value-bind (segment offset)
+	  (clos-internals:get-mapping-table-family-segment-number-and-offset
+	    (mapped-access-information-family mapping-information)
+	    (mapped-access-information-class-index mapping-information)
+	    map-type map-data)
+	(delete-inst var inst-prev)
+	(insert-inst self
+		     (make-ensure-mapping-information-instruction
+		       :inst-level (inst-level var)
+		       :ensure-mapping-information-segment segment
+		       :ensure-mapping-information-mapping-table
+		       (mapped-access-information-self-mapping-table-variable
+			 mapping-information)
+		       :ensure-mapping-information-self variable))
+	(insert-inst self (make-const-instruction :const-value offset))
+	(replace-inst self
+		      (make-call-instruction
+			:call-function (external-function instruction)
+			:call-n-args n-args
+			:call-destination call-destination
+			:call-inline-p 'cl:inline
+			:inst-source-locator inst-source-locator
+			:inst-level inst-level
+			:inst-pre-control-stack-state inst-pre-control-stack-state
+			:inst-post-control-stack-state inst-post-control-stack-state))
+	t))))
+
+(def-peep-hole (setq setq-to-pop-optimizer)
+  (when (and (eq (inst-opcode inst-next) 'pop)
+	     (variable-can-be-operand-p setq-variable))
+    (let* ((variable setq-variable)
+	   (pop-n (pop-n inst-next))
+	   (save-n (pop-save-n inst-next))
+	   (offset (variable-stack-offset
+		     variable
+		     (inst-pre-control-stack-state self)
+		     setq-level)))
+      (cond ((or (not (numberp offset)) (not (numberp pop-n)))
+	     (return-from setq-to-pop-optimizer nil))
+	    ((or (= offset 1)
+		 (and ( pop-n offset)
+		      (> offset save-n)))
+	     ;; SETQ unused
+	     (delete-inst self)
+	     (note-optimization unneeded-setq)
+	     t)
+	    ((= (+ pop-n 1) offset)
+	     (note-optimization setq-and-pop)
+	     (setf (pop-save-n inst-next) (max save-n 1))
+	     (delete-inst self)
+	     t)
+	    (t nil)))))
+
+(def-peep-hole (var return-tos-multiple)
+  (let ((offset (variable-stack-offset var-variable inst-pre-control-stack-state var-level)))
+    (when (and (fixp offset)
+	       (eql (control-stack-state-n-catch-blocks inst-pre-control-stack-state)
+		    (control-stack-state-n-catch-blocks
+		      (lexical-control-stack-state var-variable)))
+	       (eql (control-stack-state-n-bindings inst-pre-control-stack-state)
+		    (control-stack-state-n-bindings
+		      (lexical-control-stack-state var-variable))))
+      (let* ((n 1)
+	     (first-non-var
+	       (loop for inst first inst-next then (inst-next inst)
+		     doing
+		 (cond ((eq (inst-opcode inst) 'var)
+			(unless (eql (variable-stack-offset
+				       (var-variable inst)
+				       (inst-pre-control-stack-state inst)
+				       (var-level inst))
+				     offset)
+			  (return inst))
+			(incf n))
+		       (t (return inst)))))
+	     (n-other-pushes 0)
+	     (other-vars-pushed nil)
+	     (first-non-push
+	       (loop for inst first first-non-var then (inst-next inst)
+		     doing
+		 (selectq (inst-opcode inst)
+		   (const
+		    (incf n-other-pushes))
+		   (var
+		    (setq other-vars-pushed t)
+		    (incf n-other-pushes))
+		   (call
+		    (cond ((and (<= (call-n-args inst) n-other-pushes))
+			   (selectq (destination-n-values (call-destination inst))
+			     ((0)
+			      (setq n-other-pushes (- n-other-pushes (call-n-args inst))))
+			     ((1)
+			      (setq n-other-pushes (1+ (- n-other-pushes (call-n-args inst)))))
+			     (otherwise (return inst))))
+			  (t (return inst))))
+		   (otherwise
+		    (return inst)))))
+	     (last (if (eq (inst-opcode first-non-push) 'pop-vars)
+		       (inst-next first-non-push)
+		       first-non-push)))
+	(selectq (inst-opcode last)
+	  (return
+	   (when (and (eql (return-n last) (+ n n-other-pushes))	;returning pushed stuff
+		      ;; either no vars, or nothing is being popped
+		      ;; ----- could be more aggressive and test for no popped var being used
+		      (or (null other-vars-pushed)
+			  (= offset n)))
+	     ;; Everything is already on the stack in order, skip the pushes
+	     (note-optimization unneeded-push-tos)
+	     (delete-inst self (inst-prev first-non-var))
+	     (when other-vars-pushed
+	       ;; adjust levels of other vars pushed -- we didn't push n
+	       (loop for inst first first-non-var then (inst-next inst)
+		     until (eq inst first-non-push)
+		     do (selectq (inst-opcode inst)
+			  (var
+			   (decf (var-level inst) n)
+			   (decf (inst-level inst) n)))))
+	     (unless (= offset n)
+	       ;; pop to get to the right level
+	       (insert-inst first-non-var
+			    (make-pop-instruction :pop-n (- offset n) :pop-save-n 0)))
+	     t))
+	  (pop
+	   (let ((pop-n (pop-n last))
+		 (pop-save-n (pop-save-n last)))
+	     (when (and (eql pop-save-n (+ n n-other-pushes))
+			(fixp pop-n)
+			(>= pop-n offset)	;Popping at least what we pushed
+			;; either no vars, or nothing is being popped
+			;; ----- could be more aggressive and test for no popped var being used
+			(or (null other-vars-pushed)
+			    (= offset n pop-n)))
+	       (note-optimization unneeded-push-tos)
+	       (delete-inst self (inst-prev first-non-var))
+	       (when other-vars-pushed
+		 ;; adjust levels of other vars pushed -- we didn't push n
+		 (loop for inst first first-non-var then (inst-next inst)
+		       until (eq inst first-non-push)
+		       do (selectq (inst-opcode inst)
+			    (var
+			     (decf (var-level inst) n)
+			     (decf (inst-level inst) n)))))
+	       (unless (= offset n)
+		 ;; Need to pop off the junk on the top
+		 (insert-inst first-non-var
+			      (make-pop-instruction :pop-n (- offset n) :pop-save-n 0)))
+	       (cond ((= pop-n offset)
+		      (delete-inst last))
+		     (t
+		      ;; Already popped (- offset n), and we never pushed n
+		      (setf (pop-n last) (- pop-n offset))
+		      (when (> n-other-pushes 0)
+			;; Move the pop before pushing the other stuff
+			(delete-inst last)
+			(setf (pop-save-n last) (- pop-save-n n-other-pushes))
+			(insert-inst first-non-var last))))
+	       t))))))))
+
+(def-peep-hole (var var-unneeded-tos-optimizer)
+  (when (eql (variable-stack-offset var-variable inst-pre-control-stack-state var-level) 1)
+    (let ((next inst-next))
+      (selectq (inst-opcode next)
+	(jump
+	 (let ((successful (jump-pops-if-successful next))
+	       (not-successful (jump-pops-if-not-successful next)))
+	   (when (and ( successful 1)
+		      ( not-successful 1)
+		      (jump-pops-valid-p *compiler* (1- successful) (1- not-successful)))
+	     (note-optimization unneeded-push-tos)
+	     (delete-inst self)
+	     (decf (jump-pops-if-successful next))
+	     (decf (jump-pops-if-not-successful next))
+	     (decf (inst-level next))
+	     t)))
+	(setq
+	 (note-optimization unneeded-push-tos)
+	 (cond ((eq (setq-variable next) var-variable)
+		(delete-inst next))
+	       (t
+		(decf (setq-level next))
+		(decf (inst-level next))
+		(insert-inst
+		  (inst-next next)
+		  (make-var-instruction
+		    :var-variable var-variable
+		    :var-level var-level
+		    :inst-source-locator inst-source-locator
+		    :inst-level inst-level
+		    :inst-pre-control-stack-state inst-pre-control-stack-state
+		    :inst-post-control-stack-state inst-post-control-stack-state))
+		(delete-inst self)))
+	 t)
+	(tag 
+	 (let ((next (next-executable-inst self)))
+	   (selectq (inst-opcode next)
+	     (return
+	      (when (eql (return-n next) 1)
+		(note-optimization unneeded-push-tos)
+		(delete-inst self)
+		t)))))))))
+
+(def-peep-hole (pop-vars combine-pop-vars)
+  (when (eq (inst-opcode inst-next) 'pop-vars)
+    (note-optimization combine-adjacent-pop-vars)
+    (setf (pop-vars-list inst-next)
+	  (append pop-vars-list (pop-vars-list inst-next)))
+    (delete-inst self)
+    t))

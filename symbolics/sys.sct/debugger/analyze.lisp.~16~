@@ -1,0 +1,516 @@
+;;; -*- Mode: LISP; Package: DEBUGGER; Base: 8; Lowercase: Yes -*-
+
+;;; Debugger erring frame analyzer
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;--- This is a little too verbose
+;;--- Compiled code analyzer could use some work
+
+(cp:define-command (com-analyze-frame :command-table "Lisp-Debugger")
+		   ()
+  (send *error* :analyze))
+
+(cp:define-command-accelerator analyze "Lisp-Debugger" (#\c-m-Z) () ()
+  `(com-analyze-frame))
+
+
+(defstruct (level-description :named :conc-name)
+  form
+  kind
+  usage
+  variables
+  conditionals)
+
+(defstruct (variable-description :named :conc-name)
+  name
+  letting-form
+  setting-forms)
+
+(defun mapforms-print (form kind usage state)
+  (format t "~&~V@TForm: ~S, kind: ~S, usage: ~S.~%"
+    lt:*mapforms-level* form kind usage)
+  state)
+
+(defflavor lisp-code-fragment
+	((start-bp nil)
+	 (end-bp nil))
+	(dw:presentation)
+  :writable-instance-variables
+  :initable-instance-variables
+  (:conc-name fragment-)
+  (:init-keywords :locator))
+
+(defmethod (:init lisp-code-fragment) (plist)
+  (let ((locator (get plist :locator)))
+    (when locator
+      (setq start-bp locator
+	    end-bp   (cdr locator))))
+  (when (and (not (variable-boundp dw::form-or-location))
+	     (not (null start-bp)))
+    (setq dw::form-or-location (car start-bp))))
+
+(defmethod (fragment-visibly-equal lisp-code-fragment) (other-fragment)
+  (and (zwei:bp-= start-bp (fragment-start-bp other-fragment))
+       (zwei:bp-= end-bp   (fragment-end-bp other-fragment))))
+
+(defun make-code-fragment (&optional (type 'lisp-code-fragment) &rest options)
+  (lexpr-funcall #'make-instance type options))
+
+(defun mapforms-code-fragment (form)
+  (make-code-fragment 'lisp-code-fragment
+		      :form form :object form :type 'sys:code-fragment
+		      :start-bp lt:*mapforms-locator-start*
+		      :end-bp	lt:*mapforms-locator-end*))
+
+
+;; Run mapforms over FORM until get to SUBFORM, then return dynamic state: variables and
+;; conditions that were satisfied to get here
+(defun map-description-down-to (form subform &optional subform-super)
+  (block map-description-down-to
+    (lt:mapforms
+      #'(lambda (form kind usage array &aux (level lt:*mapforms-level*))
+	  (let* ((prev-level-desc (and (plusp level) (aref array (1- level))))
+		 (level-description (make-level-description
+				      form form kind kind usage usage
+				      variables
+				      (and prev-level-desc
+					   (level-description-variables prev-level-desc))
+				      conditionals
+				      (and prev-level-desc
+					   (level-description-conditionals
+					     prev-level-desc)))))
+	    (when (and (eq form subform)
+		       (or (null subform-super)
+			   (eq subform-super (level-description-form prev-level-desc))))
+	      (return-from map-description-down-to level-description))
+	    (when ( level (array-length array))
+	      (adjust-array-size array (+ level 100)))
+	    (aset level-description array level)
+	    (selectq kind
+	      (let
+	       ;; Binding
+	       (let ((var-desc (make-variable-description name form
+							  letting-form
+							  (mapforms-code-fragment
+							    (level-description-form
+							      prev-level-desc)))))
+		 (push var-desc (level-description-variables prev-level-desc))))
+	      (set
+	       ;; Setting
+	       (let ((var-desc (loop for x in (level-description-variables level-description)
+				     when (eq (variable-description-name x) form)
+				       return x)))
+		 (when var-desc
+		   (push (mapforms-code-fragment
+			   (level-description-form prev-level-desc))
+			 (variable-description-setting-forms var-desc))))))
+	    array))
+      form
+      :initial-state (make-array 100))
+    nil))
+
+;; Does the value of this form only depend on simple access to variables?
+;; (i.e., no calls to unknown or side-effecting functions)
+(defvar *free-variables*)
+(defun form-simple-motion-p (form)
+  (declare (values simple-p variables))
+  (block form-simple-motion
+    (let ((*free-variables* nil))
+      (lt:mapforms
+	#'(lambda (form kind usage state)
+	    usage
+	    (selectq kind
+	      (lt:symeval
+	       (unless (memq form lt::*mapforms-bound-variables*)
+		 (cl:pushnew form *free-variables*)))
+	      ((nil))				;Normal function combination
+	      ((quote))				;Harmless
+	      (otherwise
+	       (return-from form-simple-motion nil)))
+	    state)
+	form
+	:bound-variables nil
+	:apply-function #'(lambda (form kind usage state)
+			    usage
+			    (unless (and (null kind)
+					 (symbolp (car form))
+					 (memq (lt::function-annotation-class (car form))
+					       '(lt::reader lt::simple)))
+			      (return-from form-simple-motion nil))
+			    state)
+	:expand-substs t)
+      (values t *free-variables*))))
+
+
+(defun analyze-frame (frame function-supposedly-called interesting-argument-positions)
+  (declare (values function-supposedly-called interesting-argument-positions))
+  (block analyze-frame
+    (let ((function (frame-function frame)))
+      (unless (multiple-value-bind (sect corr)
+		  (si:function-correspondence-info function)
+		(and sect corr))
+	(return-from analyze-frame
+	  (analyze-compiled-frame frame function-supposedly-called
+				  interesting-argument-positions)))
+      (let ((function-name (function-name function))
+	    (definition (cadr (si:debugging-info-user-entry function ':interpreted-form)))
+	    (form (car (frame-exit-source-locator frame))))
+	(unless definition
+	  (format t "~&Could not find original definition of ~S~%" function-name))
+	(let ((form-queue nil)
+	      (all-simple-p t)
+	      forms-to-highlight arguments-of-interest)
+	  (unless (setq interesting-argument-positions
+			(and (listp form)
+			     (form-matches-function-p form function-supposedly-called
+						      interesting-argument-positions)))
+	    (format t "~&Cannot find calling form in previous frame~%")
+	    (return-from analyze-frame nil))
+	  (let ((arg-forms (loop for i from 0
+				 for arg-form in form
+				 when (memq i interesting-argument-positions)
+				   collect arg-form)))
+	    (setq form-queue (list (list* form nil arg-forms)))
+	    (format t "~2&~VProbably bad argument~P ~"
+	      *deemphasis-character-style* (length arg-forms))
+	    (loop for arg in arg-forms
+		  for arg-no from 0
+		  with called-fun = (let ((fun (car form)))
+				      (and fun (fdefinedp fun)
+					   (typep (fdefinition fun) :compiled-function)
+					   (fdefinition fun)))
+		  doing (format t "~:[, ~]~V~S~~@[ (~A)~]"
+			  (zerop arg-no) *emphasis-character-style* arg
+			  (and called-fun
+			       #+3600  (llc:disassemble-arg-name called-fun arg-no)
+			       D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB");;--- This takes a frame on the IMach
+0			       #+imach (ilc:disassemble-arg-name called-fun arg-no)))))
+	  (loop while form-queue
+		as (form super . subforms) = (pop form-queue)
+		doing
+	    (let ((level-description (map-description-down-to definition form super)))
+	      (if (null level-description)
+		  (setq all-simple-p nil)	;Couldn't even find it
+		(loop named subform
+		      for subform in subforms doing
+		  (multiple-value-bind (simple-p variables)
+		      (form-simple-motion-p subform)
+		    (if (null simple-p)
+			(return (setq all-simple-p nil))
+		      (loop for variable in variables doing
+			(let ((variable-desc (loop for variable-desc
+						       in (level-description-variables
+							    level-description)
+						   when (eq (variable-description-name
+							      variable-desc)
+							    variable)
+						     return variable-desc)))
+			  (when (null variable-desc)
+			    (setq all-simple-p nil)
+			    (return-from subform))
+			  (let ((letting-form (variable-description-letting-form
+						variable-desc)))
+			    (when (null letting-form)
+			      ;; Special variable
+			      (setq all-simple-p nil)
+			      (return-from subform))
+			    (unless (loop for form-desc in forms-to-highlight
+					  thereis (fragment-visibly-equal
+						    form-desc letting-form))
+			      (push letting-form forms-to-highlight)
+			      (let ((function (car (dw::presentation-form letting-form))))
+				(selectq function
+				  ((defun)
+				   (push (car (fragment-start-bp letting-form))
+					 arguments-of-interest))
+				  ((let)
+				   (let ((initialization-form
+					   (let ((tem (car (fragment-start-bp letting-form))))
+					     (and (listp tem) (cadr tem)))))
+				     (when initialization-form
+				       (let ((queue-entry
+					       (assq (dw::presentation-form letting-form)
+						     form-queue)))
+					 (when (null queue-entry)
+					   (push (setq queue-entry
+						       (list (dw::presentation-form
+							       letting-form)
+							     nil))
+						 form-queue))
+					 (cl:pushnew initialization-form
+						     (cddr queue-entry))))))
+				  ((let*)
+				   (let ((initialization-form
+					   (let ((tem (car (fragment-start-bp letting-form))))
+					     (and (listp tem) (cadr tem)))))
+				     ;; Sequential binding, stop when get to variable,
+				     ;; before noting its binding but after previous
+				     (when initialization-form
+				       (push (list (caar (fragment-start-bp letting-form))
+						   (dw::presentation-form letting-form)
+						   initialization-form)
+					     form-queue))))))))
+			  (dolist (setting-form (variable-description-setting-forms
+						  variable-desc))
+			    (unless (loop for form-desc in forms-to-highlight
+					  thereis (fragment-visibly-equal form-desc setting-form))
+			      (push setting-form forms-to-highlight)
+			      (push (list (car (fragment-start-bp setting-form))
+					  (dw::presentation-form setting-form)
+					  (cadr (fragment-start-bp setting-form)))
+				    form-queue)))))))))))
+	  (when forms-to-highlight
+	    (format t " ~Vfrom:~~%" *deemphasis-character-style* )
+	    ;; Make sure things point to what we really want highlighted, not a special form
+	    (dolist (form-desc forms-to-highlight)
+	      (setf (dw::presentation-form form-desc)
+		    (first (fragment-start-bp form-desc))))
+	    (multiple-value-bind (section correspondences)
+		(si:function-correspondence-info function)
+	      correspondences
+	      (zwei:output-interval-with-presentation-nodes-sensitivity
+		section nil t nil
+		:highlighted-presentations forms-to-highlight)))
+	  (when all-simple-p
+	    (values function-name (loop for i from 0
+					for arg in (third definition)
+					when (memq arg arguments-of-interest)
+					  collect i))))))))
+
+(defun form-matches-function-p (form function-supposedly-called positions)
+  (declare (values permuted-positions))
+  (let ((real-function (car form)))
+    (cond ((or (eq real-function function-supposedly-called)
+	       (loop for (from . to) in '((aref . ar-1) (aset . as-1)
+					  (aref . ar-2) (aset . as-2)
+					  (send . funcall))
+		     thereis (and (eq from real-function)
+				  (eq to function-supposedly-called)))
+	       (eq function-supposedly-called
+		   (get real-function 'compiler:internal-function))
+	       (loop for optimized-into in (get real-function 'compiler:optimized-into)
+		     thereis (or (eq function-supposedly-called optimized-into)
+				 (eq function-supposedly-called
+				     (get optimized-into 'compiler:internal-function)))))
+	   (mapcar #'1+ positions))
+	  ((and (memq real-function '(lexpr-funcall apply))
+		(listp (cadr form))
+		(memq (car (cadr form)) '(quote function))
+		(eq (cadr (cadr form)) function-supposedly-called))
+	   (loop for (arg . rest) on (cddr form)
+		 for i from 0
+		 when (or (memq i positions)
+			  (and (null rest)
+			       (loop for j in positions
+				     thereis (> j i))))
+		   collect (+ i 2)))
+	  ((let ((new-form (macroexpand form)))
+	     (when (neq form new-form)
+	       (let ((new-pos (look-for-function-in-expanded-form function-supposedly-called
+								  new-form form
+								  positions)))
+		 (loop for pos in new-pos
+		       when pos collect (1+ pos)))))))))
+
+(defun look-for-function-in-expanded-form (function in-form from-form positions)
+  (if (form-matches-function-p in-form function positions)
+      (loop for arg in (cdr in-form)
+	    for oarg in (cdr from-form)
+	    for i upfrom 0
+	    when (memq i positions)
+	      collect (if (eq arg oarg)
+			  i (find-position-in-list arg (cdr from-form))))
+    (loop for subform in (cdr in-form)
+	  unless (memq subform from-form)
+	    thereis (look-for-function-in-expanded-form
+		      function subform from-form positions))))
+
+(defun display-bad-argument-track (frame function arguments)
+  (loop as first-p first t then nil
+	do (format t "~2&~V~:[Called from~;Error occurred in~]~ ~V~S~:~%"
+	     *deemphasis-character-style* first-p
+	     *emphasis-character-style*  function)
+	   (show-lisp-frame-source frame nil nil nil)
+	   (multiple-value (function arguments)
+	     (analyze-frame frame function arguments))
+	while arguments
+	do (setq frame (frame-previous-active-frame frame))))
+
+
+#+3600				1;--- do this for IMach
+0(defun analyze-compiled-frame (frame function-supposedly-called
+			       interesting-argument-positions)
+  (declare (values function-supposedly-called interesting-argument-positions))
+  (block analyze-compiled-frame
+    (let* ((function (frame-function frame))
+	   (cca (compiled-function-cca function))
+	   (pc (frame-relative-exit-pc frame))
+	   (stack-level 0))
+      (when (frame-pc-incremented-p *error* frame)
+	(decf pc))
+      (multiple-value-bind (ok positions new-pc)
+	  (llc:instruction-calls-function-p cca pc function-supposedly-called)
+	(unless ok
+	  (return-from analyze-compiled-frame nil))
+	(setq pc new-pc
+	      interesting-argument-positions
+	      (loop for i from 0
+		    for (how pos) in positions
+		    when (and (memq i interesting-argument-positions) (eq how :stack))
+ 		      collect pos))
+	(when (eq (caar positions) :stack)
+	  (setq stack-level (1- (cadar positions)))))
+      (let ((positions nil)
+	    (nargs (frame-number-of-spread-args frame))
+	    (level 0))
+	(loop while (> level stack-level) doing
+	  (decf pc)
+	  (let* ((inst (cca-instruction cca pc))
+		 (uop (llc:get-universal-opcode inst)))
+	    (cond (( llc:*push-indirect-opcode* uop
+		      llc:*push-address-local-opcode*)
+		   (when (memq level interesting-argument-positions)
+		     (when (= uop llc:*push-local-opcode*)
+		       (let ((local-no (let ((operand (llc:get-operand inst)))
+					 (unless (ldb-test (byte 1 7) operand)
+					   (ldb (byte 7 0) operand)))))
+			 (when (and local-no (< local-no nargs))
+			   (push local-no positions)))))
+		   (decf level))
+		  (( llc:*pop-local-opcode* uop llc:*pop-indirect-opcode*)
+		   (incf level))
+		  (t
+		   (return-from analyze-compiled-frame nil)))))
+	(when positions
+	  (setq positions (sort positions #'<))
+	  (setq positions (loop for offset in positions
+				when (eq (frame-arg-value frame offset t)
+					 (frame-arg-value frame offset nil))
+				  ;; Not SETQ'ed yet
+				  collect offset)))
+	(when positions
+	  (format t "~2&~VProbably bad argument~P~ "
+	    *deemphasis-character-style* (length positions))
+	  (loop for offset in positions
+		as first-p first t then nil
+		do (format t "~:[, ~]~VFP|~D~~@[ (~A)~]"
+		     first-p *emphasis-character-style* offset
+		     (llc:disassemble-arg-name function offset))))
+	(values (function-name function)
+		positions)))))
+
+
+;;; Condition specific analysis routines
+
+(defmethod (:analyze condition) ()
+  (format t "~2&~VError occurred in:~~%" *deemphasis-character-style*)
+  (show-lisp-frame-source *innermost-interesting-frame* nil nil nil))
+
+(defmethod (:analyze break) ()
+  (format t "~2&~VThere is nothing to analyze in a breakpoint!~~%"
+    *deemphasis-character-style*))
+
+#+3600				1;--- do this for IMach
+0(defmethod (:analyze arg-type-trap) ()
+  (display-bad-argument-track
+    (frame-previous-frame error-handler-base-frame)
+    (instruction-function (pc-instruction macro-pc))
+    (loop with collect-p = nil
+	  for i upfrom 0
+	  for args on args-list
+	  until (eq args bad-args-end)
+	  as arg = (car args)
+	  ;; This was once "(eq arg (car bad-args-start))"
+	  when (equal args bad-args-start)
+	    do (setq collect-p t)
+	  when collect-p
+	    collect i)))
+
+(defmethod (:analyze invalid-function) ()
+  (analyze-bad-function-error function))
+
+(defmethod (:analyze undefined-function) ()
+  (analyze-bad-function-error function-name))
+
+(defun analyze-bad-function-error (function)
+  (let ((frame *innermost-interesting-frame*))
+    (if (and (eq (frame-function frame) function)
+	     (not (zerop (frame-funcalled frame))))
+	;; Funcalled a bad function, treat it like bad data
+	(display-bad-argument-track (frame-previous-active-frame frame) 'funcall '(0))
+      ;; The function must have been directly in the source
+      (format t "~2&~VError occurred in:~~%" *deemphasis-character-style*)
+      (show-lisp-frame-source *innermost-interesting-frame* nil nil nil))))
+
+(defmethod (:analyze unclaimed-message) ()
+  (display-bad-argument-track *innermost-interesting-frame* 'funcall '(0 1)))
+
+(defmethod (:analyze too-few-arguments) ()
+  (analyze-wrong-number-of-arguments function))
+
+(defmethod (:analyze too-many-arguments) ()
+  (analyze-wrong-number-of-arguments function))
+
+(defun analyze-wrong-number-of-arguments (function)
+  (format t "~2&~VBad call occurred in:~~%" *deemphasis-character-style*)
+  (let ((frame *innermost-interesting-frame*))
+    (when (eq (function-name (frame-function frame)) function)
+      (setq frame (frame-previous-active-frame frame)))
+    (show-lisp-frame-source frame nil nil nil))
+  (format t "~2&~VCorrect arguments to~ ~S ~Vare~ ~S~%"
+    *deemphasis-character-style* (function-name function)
+    *deemphasis-character-style* (arglist function)))
+
+(defmethod (:analyze check-arg) ()
+  (display-bad-argument-track *innermost-interesting-frame* 'check-arg-1 '(1)))

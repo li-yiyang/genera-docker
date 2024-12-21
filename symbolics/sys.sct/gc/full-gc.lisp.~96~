@@ -1,0 +1,1511 @@
+;;; -*- Mode: Lisp; Base: 8; Package: System-Internals -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;					+---------------------------------------+
+;;					|       SATISFACTION GUARANTEED		|
+;;;					|     OR DOUBLE YOUR GARBAGE BACK	|
+;;;; Symbolics Garbage Collector	|		       			|
+;;;;					|  	   Cape Cod Refuse Co.		|
+;;;;					|	Wellfleet, Massachusetts	|
+;;;; Remodularized March 1987 by DLA	|					|
+;;;					|	    Inventors of the		|
+;;					|	Copying Garbage Collector	|
+;					+---------------------------------------+
+
+;;; FULL-GC and SYSTEM-RELEASE-GC.
+
+;; This must be only used within USING-SYSTEM-TEMPORARY-AREA, which resets it on entry
+;; and exit.  It is primarily useful for large amounts of temporary storage.
+(DEFVAR SYSTEM-TEMPORARY-AREA (MAKE-AREA :NAME 'SYSTEM-TEMPORARY-AREA
+					 :GC :TEMPORARY))
+
+;; This is used internally by GC-SYMBOLS, and maybe other things someday.
+;; It is reset by GC.
+(DEFVAR SYSTEM-WEAKSPACE-AREA (MAKE-AREA :NAME 'SYSTEM-WEAKSPACE-AREA
+					 :GC :TEMPORARY
+					 '%%REGION-SPACE-TYPE %REGION-SPACE-WEAK))
+
+;; This is used for reordering lists and other structures of a temporary nature which
+;; must survive the GC flip, but can be reclaimed after reclaiming oldspace.
+;; GC optimizations can cons here freely, however they should make sure that objects
+;; created here don't point to garbage, since GC will scavenge this area.
+(DEFVAR REORDERING-LIST-AREA (MAKE-AREA :NAME 'REORDERING-LIST-AREA
+					:GC :TEMPORARY))
+
+(DEFVAR *SYSTEM-TEMPORARY-AREA-LOCK* (PROCESS:MAKE-LOCK "System Temporary Area Lock"))
+
+(ADD-INITIALIZATION "Forcibly reset *SYSTEM-TEMPORARY-AREA-LOCK*"
+		    '(PROCESS:RESET-LOCK *SYSTEM-TEMPORARY-AREA-LOCK*) '(:WARM))
+
+(DEFMACRO USING-SYSTEM-TEMPORARY-AREA (&BODY BODY)
+  `(PROCESS:WITH-LOCK (*SYSTEM-TEMPORARY-AREA-LOCK*)
+     (RESET-TEMPORARY-AREA SYSTEM-TEMPORARY-AREA)
+     (UNWIND-PROTECT
+	 (PROGN ,@BODY)
+       (RESET-TEMPORARY-AREA SYSTEM-TEMPORARY-AREA T))))
+
+(DEFVAR *ENABLE-GC-OPTIMIZATION-REPORTS*)	;NIL => don't say anything unless important
+
+(DEFUN GC-OPTIMIZATION-REPORT (&REST FORMAT-STRING-AND-ARGS)
+  (WHEN *ENABLE-GC-OPTIMIZATION-REPORTS*
+    (APPLY #'GC-OPTIMIZATION-REPORT-FORCE FORMAT-STRING-AND-ARGS)))
+
+(DEFUN GC-OPTIMIZATION-REPORT-FORCE (&REST FORMAT-STRING-AND-ARGS)
+  (LEXPR-FUNCALL #'FORMAT T FORMAT-STRING-AND-ARGS))
+
+
+;; This is the list of legal modes for IMMEDIATE-GC
+(DEFCONST *IMMEDIATE-GC-MODES*
+	  '(NIL
+	    :NORMAL
+	    :CLEANUP
+	    :LAYERED-IDS-RELEASE
+	    :LAYERED-SYSTEM-RELEASE
+	    SYMBOLICS-SYSTEM-RELEASE))
+
+;; *IMMEDIATE-GC-MODE-OPTIMIZATION-ALIST* is in LISPFN.
+;; *ALL-GC-OPTIMIZATIONS* is in LISPFN.
+
+(DEFUN IMMEDIATE-GC-DEFAULT-OPTIMIZATIONS (&OPTIONAL (MODE :NORMAL))
+  (CDR (CL:ASSOC MODE *IMMEDIATE-GC-MODE-OPTIMIZATION-ALIST*)))
+
+(DEFVAR *IMMEDIATE-GC-OPTIONS*)
+(DEFVAR *IMMEDIATE-GC-OPTIMIZATIONS*)
+(DEFVAR *IMMEDIATE-GC-FLIP-OPTIONS*)
+(DEFVAR *IMMEDIATE-GC-LEVEL-MASK*)
+(DEFVAR *IMMEDIATE-GC-AREA-MASK*)
+(DEFVAR *IMMEDIATE-GC-REGION-MASK*)
+(DEFVAR *IMMEDIATE-GC-LEVEL-MIGRATION-ARRAY*)
+(DEFVAR *IMMEDIATE-GC-AREA-MIGRATION-ARRAY*)
+(DEFVAR *IMMEDIATE-GC-REGION-MIGRATION-ARRAY*)
+
+(DEFVAR *INCREMENTAL-IMMEDIATE-GC*)
+
+(DEFVAR *FULL-GC-FOR-SYSTEM-RELEASE*)
+
+;; When REORDER-MEMORY flips, this is a list of REORDERINGs (above) which have been
+;; put there by the reordering 
+(DEFVAR *REORDERINGS*)
+
+;; The workhorse
+(DEFUN IMMEDIATE-GC (&REST OPTIONS
+		     &KEY (MODE :NORMAL)
+			  (GC-COMPILED-FUNCTIONS NIL GC-COMPILED-FUNCTIONS-P)
+			  (GC-STATIC-AREAS NIL GC-STATIC-AREAS-P)
+			  (OPTIMIZE NIL OPTIMIZE-P)
+			  (INCREMENTAL-OPTIMIZE NIL INCREMENTAL-OPTIMIZE-P)
+			  (INSUFFICIENT-ADDRESS-SPACE-ACTION :QUERY)
+			  (AREA-MASK NIL AREA-MASK-P)
+			  (REGION-MASK NIL REGION-MASK-P)
+			  (LEVEL-MASK NIL LEVEL-MASK-P)
+			  (VERBOSE NIL VERBOSE-P)
+		     &ALLOW-OTHER-KEYS)
+  (DECLARE (IGNORE GC-COMPILED-FUNCTIONS-P GC-COMPILED-FUNCTIONS
+		   GC-STATIC-AREAS-P GC-STATIC-AREAS))
+  ;; Set up defaults
+  (CHECK-ARG MODE (MEMQ MODE *IMMEDIATE-GC-MODES*) "a valid mode for IMMEDIATE-GC")
+  (WHEN (EQ MODE 'SYMBOLICS-SYSTEM-RELEASE)
+    (FORMAT ERROR-OUTPUT
+	    "~&Use of the ~S mode in ~S is reserved to Symbolics.~@
+	       Use by customers is not recommended or supported."
+            'SYMBOLICS-SYSTEM-RELEASE 'IMMEDIATE-GC))
+;  (UNLESS GC-COMPILED-FUNCTIONS-P
+;    (SETQ GC-COMPILED-FUNCTIONS (MEMQ MODE '(:LAYERED-IDS-RELEASE
+;					     :LAYERED-SYSTEM-RELEASE
+;					     SYMBOLICS-SYSTEM-RELEASE))))
+;  (UNLESS GC-STATIC-AREAS-P
+;    (SETQ GC-STATIC-AREAS (MEMQ MODE '(:LAYERED-SYSTEM-RELEASE SYMBOLICS-SYSTEM-RELEASE))))
+  (UNLESS OPTIMIZE-P
+    (SETQ OPTIMIZE (IMMEDIATE-GC-DEFAULT-OPTIMIZATIONS MODE)))
+  (WHEN OPTIMIZE
+    (UNLESS INCREMENTAL-OPTIMIZE-P
+      (SETQ INCREMENTAL-OPTIMIZE
+	    (NOT (MEMQ MODE '(:LAYERED-SYSTEM-RELEASE SYMBOLICS-SYSTEM-RELEASE)))))
+    (SETQ OPTIMIZE (ORDER-GC-OPTIMIZATIONS OPTIMIZE)))
+  (UNLESS VERBOSE-P
+    (SETQ VERBOSE (MEMQ MODE '(:LAYERED-IDS-RELEASE
+			       :LAYERED-SYSTEM-RELEASE
+			       SYMBOLICS-SYSTEM-RELEASE))))
+  ;; Some GC optimizations assume we're logged in.
+  (FS:WITH-AUTOMATIC-LOGIN-TO-SYS-HOST
+    ;; Do it.
+    (LET* (;; This is for communications with individual optimizations.
+	   (*IMMEDIATE-GC-OPTIONS* OPTIONS)
+	   ;; This is mainly for compatibility.
+	   (*FULL-GC-FOR-SYSTEM-RELEASE* (EQ MODE 'SYMBOLICS-SYSTEM-RELEASE))
+	   ;; This is for communication between the optimizations and the flipper.
+	   (*IMMEDIATE-GC-FLIP-OPTIONS* NIL)
+	   ;; This is so that an optimization can alter its behavior depending on whether
+	   ;; another optimization is running.
+	   (*IMMEDIATE-GC-OPTIMIZATIONS* OPTIMIZE)
+	   ;; This is the list of reorderings built by optimizations
+	   (*REORDERINGS* NIL)
+	   ;; This is another way to pass INCREMENTAL-OPTIMIZE to individual optimizations.
+	   ;; I don't feel like fixing the modularity here at the moment.
+	   (*INCREMENTAL-IMMEDIATE-GC* INCREMENTAL-OPTIMIZE)
+	   ;; Whether to clam up.
+	   (*ENABLE-GC-OPTIMIZATION-REPORTS* VERBOSE)
+	   ;; Optimizations control flipping and migration through these.
+	   (*IMMEDIATE-GC-LEVEL-MASK* NIL)
+	   (*IMMEDIATE-GC-AREA-MASK* NIL)
+	   (*IMMEDIATE-GC-REGION-MASK* NIL)
+	   (*IMMEDIATE-GC-LEVEL-MIGRATION-ARRAY* NIL)
+	   (*IMMEDIATE-GC-AREA-MIGRATION-ARRAY* NIL)
+	   (*IMMEDIATE-GC-REGION-MIGRATION-ARRAY* NIL))
+      (WITH-DATA-STACK
+	;; The default is to flip all dynamic and ephemeral levels.
+	;; Individual optimizations can add levels or exclude regions and areas as appropriate.
+	;; Migration is specified by setting the appropriate migration array element to
+	;; the appropriate level.
+	(IF LEVEL-MASK-P
+	    (SETQ *IMMEDIATE-GC-LEVEL-MASK* LEVEL-MASK)
+	  (SETQ *IMMEDIATE-GC-LEVEL-MASK* (MAKE-STACK-ARRAY %NUMBER-OF-LEVELS :TYPE ART-BOOLEAN))
+	  (LOOP FOR LEVEL BELOW %NUMBER-OF-LEVELS DO
+	    (SETF (AREF *IMMEDIATE-GC-LEVEL-MASK* LEVEL)
+		  ( (LEVEL-TYPE LEVEL) %LEVEL-TYPE-DYNAMIC))))
+	(SETQ *IMMEDIATE-GC-AREA-MASK*
+	      (IF AREA-MASK-P AREA-MASK
+		  (MAKE-STACK-ARRAY NUMBER-OF-AREAS :TYPE ART-BOOLEAN :INITIAL-ELEMENT T)))
+	(SETQ *IMMEDIATE-GC-REGION-MASK*
+	      (IF REGION-MASK-P REGION-MASK
+		  (MAKE-STACK-ARRAY NUMBER-OF-REGIONS :TYPE ART-BOOLEAN :INITIAL-ELEMENT T)))
+	(SETQ *IMMEDIATE-GC-LEVEL-MIGRATION-ARRAY* (MAKE-STACK-ARRAY %NUMBER-OF-LEVELS))
+	;; By default all ephemeral levels should migrate to dynamic space
+	(LOOP FOR LEVEL BELOW %NUMBER-OF-EPHEMERAL-LEVELS DO
+	  (SETF (AREF *IMMEDIATE-GC-LEVEL-MIGRATION-ARRAY* LEVEL) %DYNAMIC-LEVEL))
+	(SETQ *IMMEDIATE-GC-AREA-MIGRATION-ARRAY* (MAKE-STACK-ARRAY NUMBER-OF-AREAS))
+	(SETQ *IMMEDIATE-GC-REGION-MIGRATION-ARRAY* (MAKE-STACK-ARRAY NUMBER-OF-REGIONS))
+	(WITHOUT-ABORTS (IMMEDIATE-GC "An immediate garbage collection is in progress.~@
+				       Aborting at this time could cause the selected GC~@
+				       optimizations to leave the world in an inconsistent~@
+				       state.  This can result in serious damage to the running~@
+				       world, including irrecoverable crashes.")
+	  ;;--- This should really use an extra ephemeral level.  Fix MAKE-AREA.
+	  (WITH-EPHEMERAL-MIGRATION-MODE :COLLECT
+	    (MULTIPLE-VALUE-BIND (BIND-VARS BIND-VALS)
+		(IMMEDIATE-GC-VARIABLE-BINDINGS MODE OPTIMIZE INCREMENTAL-OPTIMIZE)
+	      (PROGV BIND-VARS BIND-VALS
+		(LET-GLOBALLY ((GC-IMMEDIATELY-IN-PROGRESS T))
+		  (RESET-TEMPORARY-AREA REORDERING-LIST-AREA)
+		  (LOOP FOR OPTIMIZATION IN OPTIMIZE DO
+		    (RUN-GC-OPTIMIZATION OPTIMIZATION :BEFORE-FLIP INCREMENTAL-OPTIMIZE))
+		  ;; Possibly temporary metering for system-release.
+		  (WHEN (EQ MODE 'SYMBOLICS-SYSTEM-RELEASE)
+		    (GC-OPTIMIZATION-REPORT "~%~\DATIME\ Resetting GC meters ...")
+		    (DOLIST (GC-METER *GC-METERS*)
+		      (SET GC-METER 0)))
+		  ;;--- Then flip, appropriately hacking areas
+		  (GC-OPTIMIZATION-REPORT "~%~\DATIME\ Flipping ...")
+		  (CL:APPLY #'DYNAMIC-GC-FLIP
+		    :INSUFFICIENT-ADDRESS-SPACE-ACTION INSUFFICIENT-ADDRESS-SPACE-ACTION
+		    :RECLAIM :IMMEDIATE
+		    :REORDERINGS *REORDERINGS*
+		    :INCREMENTAL-REORDERINGS INCREMENTAL-OPTIMIZE
+		    :LEVEL-MASK *IMMEDIATE-GC-LEVEL-MASK*
+		    :AREA-MASK *IMMEDIATE-GC-AREA-MASK*
+		    :REGION-MASK *IMMEDIATE-GC-REGION-MASK*
+		    :LEVEL-MIGRATION-ARRAY *IMMEDIATE-GC-LEVEL-MIGRATION-ARRAY*
+		    :AREA-MIGRATION-ARRAY *IMMEDIATE-GC-AREA-MIGRATION-ARRAY*
+		    :REGION-MIGRATION-ARRAY *IMMEDIATE-GC-REGION-MIGRATION-ARRAY*
+		    *IMMEDIATE-GC-FLIP-OPTIONS*)
+		  (LOOP FOR OPTIMIZATION IN OPTIMIZE DO
+		    (RUN-GC-OPTIMIZATION OPTIMIZATION :AFTER-FLIP INCREMENTAL-OPTIMIZE))
+		  (FLET ((FINISH ()
+			   (GC-OPTIMIZATION-REPORT "~%~\DATIME\ Scavenging ...")
+			   (%GC-SCAVENGE)
+			   (GC-OPTIMIZATION-REPORT "~%~\DATIME\ Reclaiming Oldspace ...")
+			   (GC-RECLAIM-OLDSPACE)
+			   (WHEN (EQ MODE 'SYMBOLICS-SYSTEM-RELEASE) (PRINT-GC-METERS))
+			   (LOOP FOR OPTIMIZATION IN OPTIMIZE DO
+			     (RUN-GC-OPTIMIZATION OPTIMIZATION :AFTER-RECLAIM-OLDSPACE
+						  INCREMENTAL-OPTIMIZE))
+			   (GC-OPTIMIZATION-REPORT "~%~\DATIME\ Resetting temporary areas ...")
+			   (RESET-TEMPORARY-AREA REORDERING-LIST-AREA T)
+			   (RESET-TEMPORARY-AREA SYSTEM-WEAKSPACE-AREA T)
+			   T))
+		    (IF (LOOP FOR OPTIMIZATION IN OPTIMIZE
+			      NEVER (RUN-GC-OPTIMIZATION-P
+				      OPTIMIZATION :AFTER-RECLAIM-OLDSPACE))
+			;; Allow aborting out if it won't hurt.
+			(WITH-ABORTS-ENABLED (IMMEDIATE-GC)
+			  (FINISH))
+			(FINISH))))))))))))
+
+;; This should be improved.
+(DEFUN IMMEDIATE-GC-VARIABLE-BINDINGS (MODE OPTIMIZE INCREMENTAL-OPTIMIZE)
+  (DECLARE (IGNORE OPTIMIZE INCREMENTAL-OPTIMIZE))
+  (COND ((MEMQ MODE '(:LAYERED-IDS-RELEASE
+		      :LAYERED-SYSTEM-RELEASE
+		      SYMBOLICS-SYSTEM-RELEASE))
+	 (VALUES '(GC-REPORT-STREAM
+		   GC-WARNINGS-ENABLE
+		   GC-REPORTS-ENABLE
+		   GC-AREA-RECLAIM-REPORT
+		   GC-RECLAIM-IMMEDIATELY
+		   NETI:*INHIBIT-VALIDITY-CHECKING*
+		   TV:MORE-PROCESSING-GLOBAL-ENABLE)
+		 (LIST STANDARD-OUTPUT T T T T T NIL)))
+	(T (VALUES '(GC-RECLAIM-IMMEDIATELY) '(T)))))
+
+;; This is slow, but seems to work.
+;; It would be nice if it were stable.
+;; It would also be nice if there was a way to specify that one optimization required another.
+(DEFUN ORDER-GC-OPTIMIZATIONS (OPTIMIZATIONS)
+  (LOOP FOR OPTIMIZATION IN OPTIMIZATIONS
+	AS ORDER = (GET OPTIMIZATION 'GC-OPTIMIZATION-ORDER)
+	WHEN (MEMQ :FIRST ORDER)
+	  COLLECT OPTIMIZATION INTO FIRST-OPTIMIZATIONS
+	ELSE WHEN (MEMQ :LATE ORDER)
+	  COLLECT OPTIMIZATION INTO LATE-OPTIMIZATIONS
+	ELSE WHEN (MEMQ :LAST ORDER)
+	  COLLECT OPTIMIZATION INTO LAST-OPTIMIZATIONS
+	ELSE
+	  COLLECT OPTIMIZATION INTO MIDDLE-OPTIMIZATIONS
+	FINALLY
+	  (FLET ((SORT-OPTS (OPTS)
+		   (TAGBODY RETRY
+		     (LOOP FOR S1 ON OPTS DO
+		       (LOOP FOR S2 ON (CDR S1) DO
+			 (WHEN (OR (LOOP FOR O IN (GET (CAR S1) 'GC-OPTIMIZATION-ORDER)
+					 THEREIS (AND (CL:CONSP O)
+						      (EQ (CAR O) :AFTER)
+						      (EQ (CADR O) (CAR S2))))
+				   (LOOP FOR O IN (GET (CAR S2) 'GC-OPTIMIZATION-ORDER)
+					 THEREIS (AND (CL:CONSP O)
+						      (EQ (CAR O) :BEFORE)
+						      (EQ (CADR O) (CAR S1)))))
+			   (SWAPF (CAR S1) (CAR S2))
+			   (GO RETRY)))))
+		   OPTS))
+	    (RETURN
+	      (NCONC (SORT-OPTS FIRST-OPTIMIZATIONS)
+		     (SORT-OPTS MIDDLE-OPTIMIZATIONS)
+		     (SORT-OPTS LATE-OPTIMIZATIONS)
+		     (SORT-OPTS LAST-OPTIMIZATIONS))))))
+
+;; These functions are for use by individual GC Optimizations
+(DEFSUBST IMMEDIATE-GC-OPTION (OPTION)
+  (GETF *IMMEDIATE-GC-OPTIONS* OPTION))
+
+(DEFSUBST IMMEDIATE-GC-FLIP-OPTION (OPTION)
+  (GETF *IMMEDIATE-GC-FLIP-OPTIONS* OPTION))
+
+(DEFPROP DEFINE-GC-OPTIMIZATION "GC Optimization" DEFINITION-TYPE-NAME)
+(DEFMACRO DEFINE-GC-OPTIMIZATION (NAME DEFAULT-MODES &BODY CLAUSES &ENVIRONMENT ENV
+				  &AUX (COMPILER:DEFAULT-WARNING-FUNCTION NAME)
+				       (COMPILER:DEFAULT-WARNING-DEFINITION-TYPE
+					 'DEFINE-GC-OPTIMIZATION))
+  (UNLESS (IF (CL:LISTP DEFAULT-MODES)
+	      (LOOP FOR MODE IN DEFAULT-MODES
+		    ALWAYS (MEMQ MODE *IMMEDIATE-GC-MODES*))
+	      (MEMQ DEFAULT-MODES *IMMEDIATE-GC-MODES*))
+    (WARN "Malformed DEFAULT-MODE specification:  ~S" DEFAULT-MODES))
+  (LET ((DEFAULT-MODES (IF (AND (SYMBOLP DEFAULT-MODES)
+				(NOT (NULL DEFAULT-MODES)))
+			   (MEMQ DEFAULT-MODES *IMMEDIATE-GC-MODES*)
+			   DEFAULT-MODES))
+	DOCUMENTATION ORDER BEFORE-FLIP AFTER-FLIP AFTER-RECLAIM-OLDSPACE)
+    (LOOP FOR CLAUSE IN CLAUSES DO
+      (CL:CASE (CAR CLAUSE)
+	(:DOCUMENTATION
+	  (UNLESS (AND (STRINGP (CADR CLAUSE))
+		       (NULL (CDDR CLAUSE)))
+	    (WARN "Malformed documentation specification:  ~S" CLAUSE))
+	  (SETQ DOCUMENTATION (CADR CLAUSE)))
+	(:ORDER
+	  (UNLESS (AND (LOOP FOR ELEMENT IN (CDR CLAUSE)
+			     ALWAYS (OR (MEMQ ELEMENT '(:FIRST :LATE :LAST))
+					(AND (CL:CONSP ELEMENT)
+					     (MEMQ (CAR ELEMENT) '(:BEFORE :AFTER))
+					     (CL:CONSP (CDR ELEMENT))
+					     (NULL (CDDR ELEMENT))
+					     (SYMBOLP (CADR ELEMENT)))))
+		       ;; No more than 1 of :FIRST, :LATE, and :LAST
+		       (NULL (CDR (INTERSECTION '(:FIRST :LATE :LAST) (CDR CLAUSE)))))
+	    (WARN "Malformed :ORDER specification:  ~S" CLAUSE))
+	  (SETQ ORDER (CDR CLAUSE)))
+	(:BEFORE-FLIP (SETQ BEFORE-FLIP (CDR CLAUSE)))
+	(:AFTER-FLIP (SETQ AFTER-FLIP (CDR CLAUSE)))
+	(:AFTER-RECLAIM-OLDSPACE (SETQ AFTER-RECLAIM-OLDSPACE (CDR CLAUSE)))
+	(OTHERWISE (WARN "Malformed clause:  ~S" CLAUSE))))
+    (FLET ((EXPAND (CLAUSE PROPERTY)
+	     (WHEN CLAUSE
+	       (MULTIPLE-VALUE-BIND (DECLS BODY)
+		   (FIND-BODY-DECLARATIONS (CDR CLAUSE) ENV)
+		 `((DEFUN (:PROPERTY ,NAME ,PROPERTY) ,(CAR CLAUSE)
+		     (DECLARE (FUNCTION-PARENT ,NAME DEFINE-GC-OPTIMIZATION))
+		     ,@DECLS
+		     (BLOCK ,NAME . ,BODY)))))))
+      `(MULTIPLE-DEFINITION ,NAME DEFINE-GC-OPTIMIZATION
+	 (REDEFINE-GC-OPTIMIZATION ',NAME ',DEFAULT-MODES ',ORDER ',DOCUMENTATION)
+	 ,@(EXPAND BEFORE-FLIP 'GC-OPTIMIZATION-BEFORE-FLIP)
+	 ,@(EXPAND AFTER-FLIP 'GC-OPTIMIZATION-AFTER-FLIP)
+	 ,@(EXPAND AFTER-RECLAIM-OLDSPACE 'GC-OPTIMIZATION-AFTER-RECLAIM-OLDSPACE)))))
+
+(DEFUN RUN-GC-OPTIMIZATION-P (OPTIMIZATION WHEN)
+  (GET OPTIMIZATION
+       (CL:ECASE WHEN
+	 (:BEFORE-FLIP 'GC-OPTIMIZATION-BEFORE-FLIP)
+	 (:AFTER-FLIP 'GC-OPTIMIZATION-AFTER-FLIP)
+	 (:AFTER-RECLAIM-OLDSPACE 'GC-OPTIMIZATION-AFTER-RECLAIM-OLDSPACE))))
+
+(DEFUN RUN-GC-OPTIMIZATION (OPTIMIZATION WHEN INCREMENTAL)
+  (FUNCALL (OR (RUN-GC-OPTIMIZATION-P OPTIMIZATION WHEN)
+	       (RETURN-FROM RUN-GC-OPTIMIZATION NIL))
+	   (PROGN (GC-OPTIMIZATION-REPORT
+		    "~%~\DATIME\ GC Optimization ~S ~S" WHEN OPTIMIZATION)
+		  INCREMENTAL)))
+
+;;; REDEFINE-GC-OPTIMIZATION is in LISPFN so it works in the cold load.
+
+(DEFPROP DEFINE-GC-OPTIMIZATION KILL-GC-OPTIMIZATION ZWEI:KILL-DEFINITION)
+(DEFUN KILL-GC-OPTIMIZATION (NAME)
+  (REDEFINE-GC-OPTIMIZATION NAME NIL NIL NIL)
+  (REMOVE-SOURCE-FILE-DEFINITION NAME 'DEFINE-GC-OPTIMIZATION)
+  (SETQ *ALL-GC-OPTIMIZATIONS* (DELQ NAME *ALL-GC-OPTIMIZATIONS*))
+  NAME)
+
+(DEFUN SHOW-GC-OPTIMIZATIONS (&OPTIONAL (STREAM STANDARD-OUTPUT))
+  (FORMAT STREAM "~&Modes   Optimization")
+  (LOOP FOR OPTIMIZATION IN (ORDER-GC-OPTIMIZATIONS *ALL-GC-OPTIMIZATIONS*) DO
+    (SEND STREAM :FRESH-LINE)
+    (LOOP FOR I FROM 0 FOR (NIL . OPTS) IN *IMMEDIATE-GC-MODE-OPTIMIZATION-ALIST*
+	  DO (SEND STREAM :TYO (IF (MEMQ OPTIMIZATION OPTS)
+				   (CODE-CHAR (+ (CHAR-CODE #/a) I))
+				   #\Space)))
+    (FORMAT STREAM "   ~48S " OPTIMIZATION)
+    (LOOP FOR COMMA = NIL THEN T
+	  FOR SPEC IN (GET OPTIMIZATION 'GC-OPTIMIZATION-ORDER) DO
+      (WHEN COMMA (FORMAT STREAM ", "))
+      (COND ((EQ SPEC :FIRST) (FORMAT STREAM "First"))
+	    ((EQ SPEC :LATE)  (FORMAT STREAM "Late"))
+	    ((EQ SPEC :LAST)  (FORMAT STREAM "Last"))
+	    (T (FORMAT STREAM "~:[Before~;After~] ~S" (EQ (CAR SPEC) :AFTER) (CADR SPEC))))))
+  (SEND STREAM :FRESH-LINE)
+  (SEND STREAM :TYO #\Return)
+  (CL:APPLY #'FORMAT STREAM
+	    "~2&~2Xa -- ~S mode~@
+		~2Xb -- ~S mode~@
+		~2Xc -- ~S mode~@
+		~2Xd -- ~S mode~@
+		~2Xe -- ~S mode"
+	  (CDR *IMMEDIATE-GC-MODES*)))
+
+;; Since FUNCTION-SAME-AS-FUNCTION-FROM-NAME is such a PIG, we introduce this cache
+;; so it is only called once on any function during FULL-GC.  For now, the cache uses
+;; COMPILED-FUNCTION-SPARE-BITS-1.  This will be changed when there's a real 
+;; function-reference database.  If COMPILED-FUNCTION-SPARE-BITS-1 is zero, then
+;; the function is considered current.  That way, newly created compiled functions
+;; will be considered current.
+(DEFVAR *FUNCTION-CURRENCY-CACHED* NIL)
+
+;; Stolen from NWho-Calls
+;; This is optimized for paging so you can scan compiled functions quickly and
+;; collect functions which are current.
+(DEFUN FUNCTION-SAME-AS-FUNCTION-FROM-NAME (FUNCTION)
+  (IF *FUNCTION-CURRENCY-CACHED*
+      (NOT (ZEROP (CCA-CURRENT-DEFINITION-P (COMPILED-FUNCTION-CCA FUNCTION))))
+    (LET* ((CCA (COMPILED-FUNCTION-CCA FUNCTION))
+	   (NAME (CAR (CCA-EXTRA-INFO CCA)))	;Take a page fault here
+	   #|| (CELL (LOCF (COMPILED-FUNCTION-FUNCTION-CELL CCA))) ||#
+	   DEFINITION)
+      (OR #| This optimization only works for a small number of cases.
+	     DCP found that it is not correct for macros definitions,
+	     combined methods, functions moved to safeguarded-objects-area
+	     and possibly a few others.  Before reinstalling the
+	     optimization, make sure it is correct. |
+	  (AND (OR (SYMBOLP NAME)		;:INTERNAL's don't win
+		   (MEMQ (CAR NAME) FLAVOR::*FDEFINABLE-METHOD-TYPES*))
+	       (= (%P-DATA-TYPE CELL) DTP-COMPILED-FUNCTION)	;bound and not forwarded
+	       (EQ (LOCATION-CONTENTS CELL) FUNCTION)) ||#
+	  ;; We have to condition-case here since the function spec may no longer be valid.
+	  (CONDITION-CASE (ERROR)
+	       (AND (LET ((NAME (UNINTERNALIZE-FUNCTION-NAME NAME)))
+		      (OR (NOT (INSTANCEP NAME))
+			  (CLOS-INTERNALS::FUNCTION-NAME-CURRENT-P NAME)))
+		    (PROGN (SETQ DEFINITION (FDEFINITION (UNENCAPSULATE-FUNCTION-SPEC NAME)))
+			   (OR (EQ FUNCTION DEFINITION)
+			       (EQ FUNCTION (MACRO-FUNCTION DEFINITION))
+			       (EQ FUNCTION (SPECIAL-FORM-P DEFINITION))
+			       (AND (LISTP NAME)
+				    (EQ (CAR NAME) 'DW::PRESENTATION-FUNCTION)
+				    (DW::PRESENTATION-FUNCTION-SAME-AS-FUNCTION-FROM-NAME
+				      FUNCTION NAME DEFINITION)))))
+	     (ERROR (VALUES NIL ERROR)))))))
+
+(DEFUN UNINTERNALIZE-FUNCTION-NAME (NAME)
+  (LOOP UNTIL (OR (ATOM NAME)
+		  (NOT (EQ (FIRST NAME) :INTERNAL)))
+	DO (SETQ NAME (SECOND NAME))
+	FINALLY (RETURN NAME)))
+
+(DEFINE-GC-OPTIMIZATION CACHE-FUNCTION-CURRENCY :LAYERED-SYSTEM-RELEASE
+  (:ORDER :FIRST)
+  (:BEFORE-FLIP (IGNORE)
+    (SETQ *FUNCTION-CURRENCY-CACHED* NIL)
+    (MAP-COMPILED-FUNCTIONS T NIL "Caching compiled-function currency"
+      (LAMBDA (FUNCTION CCA)
+	(SETF (CCA-CURRENT-DEFINITION-P CCA)
+	      (IF (FUNCTION-SAME-AS-FUNCTION-FROM-NAME FUNCTION) 1 0))))
+    (SETQ *FUNCTION-CURRENCY-CACHED* T)))
+
+(DEFINE-GC-OPTIMIZATION DECACHE-FUNCTION-CURRENCY :LAYERED-SYSTEM-RELEASE
+  (:ORDER :LAST)
+  (:AFTER-RECLAIM-OLDSPACE (IGNORE)
+    (SETQ *FUNCTION-CURRENCY-CACHED* NIL)))
+
+#+IGNORE ;; This is subsumed by REORDER-SYMBOLS now.
+(DEFINE-GC-OPTIMIZATION CDR-CODE-ALL-PLISTS :LAYERED-IDS-RELEASE
+  (:ORDER :LATE)
+  (:DOCUMENTATION "Localize all symbol property lists")
+  (:BEFORE-FLIP (INCREMENTAL-P)
+   (MAPATOMS-ALL
+     #'(LAMBDA (X)
+	 (WHEN (AND ;; Don't copy lists that are forwarded.
+		 (= (%P-DATA-TYPE (PROPERTY-CELL-LOCATION X)) DTP-LIST)
+		 (= (%AREA-NUMBER (CL:SYMBOL-PLIST X)) PROPERTY-LIST-AREA))
+	   (SETF (CL:SYMBOL-PLIST X)
+		 (IF INCREMENTAL-P
+		     (MAYBE-CDR-CODE-PLIST X (CL:SYMBOL-PLIST X)
+		       #'(LAMBDA (SUBLIST)
+			   (LET ((REGION (%REGION-NUMBER SUBLIST)))
+			     (WHEN REGION
+			       ( (LEVEL-TYPE (LDB %%REGION-LEVEL (REGION-BITS REGION)))
+				  %LEVEL-TYPE-DYNAMIC)))))
+		     (COPYLIST (CL:SYMBOL-PLIST X) PROPERTY-LIST-AREA))))))))
+
+#+3600
+;; Run this after GC completes now.
+(DEFINE-GC-OPTIMIZATION GC-PERMANENT-OBJECTS SYMBOLICS-SYSTEM-RELEASE
+  (:DOCUMENTATION "Run a special garbage-collector on wired and safeguarded objects")
+  (:ORDER :LAST)
+  (:BEFORE-FLIP (IGNORE)
+   (INHIBIT-GC-FLIPS
+     (GC-RECLAIM-OLDSPACE)
+     (REMOVE-POINTERS-TO-OBSOLETE-PERMANENT-FUNCTIONS *ENABLE-GC-OPTIMIZATION-REPORTS*)))
+  (:AFTER-RECLAIM-OLDSPACE (IGNORE)
+    (GC-PERMANENT-OBJECTS :VERBOSE *ENABLE-GC-OPTIMIZATION-REPORTS*
+			  :REMOVE-POINTERS NIL)))
+
+(DEFINE-GC-OPTIMIZATION REMOVE-POINTERS-TO-COMPILED-FUNCTIONS SYMBOLICS-SYSTEM-RELEASE
+  (:DOCUMENTATION "Remove some pointers to compiled functions which would otherwise
+inhibit their collection as garbage")
+  (:ORDER :FIRST)
+  (:BEFORE-FLIP (IGNORE) (REMOVE-POINTERS-TO-COMPILED-FUNCTIONS)))
+
+(DEFVAR *FULL-GC-COUNT* 0)
+(DEFVAR *SYSTEM-RELEASE-GC-COUNT* 0)
+(DEFVAR *RELEASED-SYSTEM-RELEASE-GC-COUNT* 0)
+
+(DEFINE-GC-OPTIMIZATION INCREMENT-FULL-GC-COUNT :LAYERED-SYSTEM-RELEASE
+  (:DOCUMENTATION "Increment *FULL-GC-COUNT*")
+  (:BEFORE-FLIP (IGNORE) (INCF *FULL-GC-COUNT*)))
+
+(DEFINE-GC-OPTIMIZATION INCREMENT-SYSTEM-GC-COUNT SYMBOLICS-SYSTEM-RELEASE
+  (:DOCUMENTATION "Increment *SYSTEM-RELEASE-GC-COUNT*")
+  (:BEFORE-FLIP (IGNORE) (INCF *SYSTEM-RELEASE-GC-COUNT*)))
+
+(DEFINE-GC-OPTIMIZATION RUN-FULL-GC-INITIALIZATIONS :LAYERED-SYSTEM-RELEASE
+  (:DOCUMENTATION "Run the BEFORE-FULL-GC, FULL-GC, and AFTER-FULL-GC initialization lists")
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (DECLARE (IGNORE INCREMENTAL-P))
+    (INITIALIZATIONS 'BEFORE-FULL-GC-INITIALIZATION-LIST T)
+    (INITIALIZATIONS 'FULL-GC-INITIALIZATION-LIST T))
+  (:AFTER-RECLAIM-OLDSPACE (INCREMENTAL-P)
+    (DECLARE (IGNORE INCREMENTAL-P))
+    (INITIALIZATIONS 'AFTER-FULL-GC-INITIALIZATION-LIST T)))
+
+(DEFINE-GC-OPTIMIZATION GC-STATIC-LEVEL :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "GC the default static level as well as more volatile levels")
+  (:BEFORE-FLIP (IGNORE)
+   (SETF (AREF *IMMEDIATE-GC-LEVEL-MASK* %STATIC-LEVEL) T)))
+
+;; This is the master list controlling object migration for
+;; immediage GC in :LAYERED-SYSTEM-RELEASE and SYMBOLICS-SYSTEM-RELEASE.
+;; The format is (area-name layered-system-release-mode symbolics-system-release-mode).
+;; Modes are lists of (from to), where from is * or a representation type, and to is a
+;; level name.
+;; By default, all nonpermanent regions are flipped, and migrate to the same level.
+(DEFVAR *IMMEDIATE-GC-AREA-MIGRATION*
+	'((WORKING-STORAGE-AREA ((* :STATIC))
+				((* :PERMANENT)))
+	  (FLAVOR::*FLAVOR-AREA* ((* :STATIC))
+				 ((* :PERMANENT)))
+	  (TV:SHEET-AREA ((:STRUCTURE :STATIC))
+			 ((:STRUCTURE :PERMANENT)))
+	  (TV:BLINKER-AREA ((* :STATIC))
+			   ((* :PERMANENT)))
+	  (TV:WHO-LINE-AREA ((:STRUCTURE :STATIC))
+			    ((:STRUCTURE :PERMANENT)))
+	  (PKG-AREA ((* :STATIC))
+		    ((* :PERMANENT)))
+	  (FS:PATHNAME-AREA ((* :STATIC))
+			    ((* :PERMANENT)))
+	  (NETI:*NAMESPACE-OBJECT-AREA* ((* :STATIC))
+					((* :STATIC)))	;Don't make this permanent.
+	  (TV:*FONT-AREA* ((* :PERMANENT))		;Always make this permanent.
+			  ((* :PERMANENT)))
+	  (PROPERTY-LIST-AREA ((* :STATIC))
+			      ((* :PERMANENT)))
+	  (PNAME-AREA ((* :STATIC))
+		      ((* :PERMANENT)))
+	  (SYMBOL-AREA ((* :STATIC))
+		       ((* :PERMANENT)))
+	  (PERMANENT-STORAGE-AREA ((* :STATIC))
+				  ((* :PERMANENT)))
+	  (SYMBOL-AREA ((* :STATIC)) ((* :PERMANENT)))
+	  (PERMANENT-STORAGE-AREA ((* :STATIC)) ((* :PERMANENT)))
+	  (DEBUG-INFO-AREA ((* :STATIC)) ((* :PERMANENT)))
+	  (SAGE:*SAGE-COMPLETION-AREA* ((* :STATIC)) ((* :STATIC)))))
+
+;;;--- This probably needs a better interface like
+;;; IMMEDIATE-GC-MAKE-AREA-PERMANENT or something.
+
+(DEFINE-GC-OPTIMIZATION MAKE-SURVIVING-REGIONS-STATIC :LAYERED-IDS-RELEASE
+  ;; This has to run after anything which can cons significantly.
+  (:ORDER :LAST (:BEFORE COLLAPSE-REORDERINGS))
+  (:BEFORE-FLIP (IGNORE)
+   (LET ((REGION-MIGRATION-ARRAY *IMMEDIATE-GC-REGION-MIGRATION-ARRAY*)
+	 (AREA-MIGRATION-ARRAY   *IMMEDIATE-GC-AREA-MIGRATION-ARRAY*))
+     (LOOP FOR (AREA SPEC1 SPEC2) IN *IMMEDIATE-GC-AREA-MIGRATION*
+	   AS SPEC = (IF *FULL-GC-FOR-SYSTEM-RELEASE* SPEC2 SPEC1)
+	   WHEN (BOUNDP AREA) DO
+       (SETQ AREA (SYMEVAL AREA))
+       (LOOP FOR (SOURCE DESTINATION) IN SPEC DO
+	 (SETQ DESTINATION (CL:ECASE DESTINATION
+			     (:STATIC %STATIC-LEVEL)
+			     (:PERMANENT %PERMANENT-LEVEL)))
+	 (IF (EQ SOURCE '*)
+	     (SETF (AREF AREA-MIGRATION-ARRAY AREA) DESTINATION)
+	   (LET ((REP-TYPE (CL:ECASE SOURCE
+			     (:STRUCTURE %REGION-REPRESENTATION-TYPE-STRUCTURE)
+			     (:LIST %REGION-REPRESENTATION-TYPE-LIST))))
+	     (DO-AREA-REGIONS (REGION AREA)
+	       (WHEN (= (LDB %%REGION-REPRESENTATION-TYPE (REGION-BITS REGION)) REP-TYPE)
+		 (SETF (AREF REGION-MIGRATION-ARRAY REGION) DESTINATION))))))))))
+
+;; New one-pass symbol GC.  Well, almost.
+
+;; This assumes that the GC-ability of a symbol does not change during the course of GC.
+
+(DEFUN WORTHLESS-SYMBOL-P (SYMBOL)
+  (LET ((PKG (SYMBOL-PACKAGE SYMBOL)))
+    (OR (NULL PKG)
+	(NOT (OR (AND (NEQ PKG PKG-KEYWORD-PACKAGE)
+		      (BOUNDP SYMBOL))
+		 (FBOUNDP SYMBOL)
+		 (CL:SYMBOL-PLIST SYMBOL))))))
+
+(DEFUN COLLECT-ALL-SHARED-SYMBOLS (&OPTIONAL (AREA DEFAULT-CONS-AREA))
+  (LET ((SHARED-SYMBOL-HASH-TABLE (CL:MAKE-HASH-TABLE
+				    :TEST #'EQ
+				    :MUTATING NIL
+				    :LOCKING NIL
+				    :NUMBER-OF-VALUES 0
+				    :SIZE (LOOP FOR PKG IN *ALL-PACKAGES*
+						SUM (PKG-NUMBER-OF-SYMBOLS PKG))
+				    :AREA AREA))
+	(SHARED-SYMBOLS (CL:MAKE-HASH-TABLE :SIZE 5500 :MUTATING NIL
+					    :TEST #'EQ :NUMBER-OF-VALUES 0
+					    :LOCKING NIL
+					    :AREA AREA)))
+    (DO-ALL-SYMBOLS (SYM)
+      (SCL:MODIFY-HASH SHARED-SYMBOL-HASH-TABLE SYM
+	(LAMBDA (KEY VALUE FOUND-P)
+	  (DECLARE (IGNORE VALUE))
+	  (WHEN FOUND-P
+	    (SETF (CL:GETHASH KEY SHARED-SYMBOLS) T))
+	  T)))
+    SHARED-SYMBOLS))
+
+;;; Returns true if this symbol can be safely uninterned as far as the package system
+;;; is concerned.  To safely unintern it, it must also be WORTHLESS-SYMBOL-P.
+(DEFUN SYMBOL-CAN-BE-SAFELY-UNINTERNED (SYMBOL SHARED-SYMBOLS)
+  ;; Don't unintern anything which is interned in more than one package.
+  (AND (NOT (CL:GETHASH SYMBOL SHARED-SYMBOLS))
+       ;; Don't unintern a symbol which is SAFEGUARDED or WIRED; it's there for a reason.
+       (= (%AREA-NUMBER SYMBOL) SYMBOL-AREA)
+       (LET ((PKG (SYMBOL-PACKAGE SYMBOL)))
+	 ;; Don't do anything if it's already uninterned.
+	 (AND PKG
+	      ;; Don't unintern anything in a locked package.
+	      (NOT (PKG-LOCKED PKG))
+	      (LET ((PNAME (CL:SYMBOL-NAME SYMBOL)))
+		(MULTIPLE-VALUE-BIND (PACKAGE-ENTRY TYPE)
+		    (INTERN-SOFT PNAME PKG)
+		  ;; Don't unintern anything external, except for keywords, which will
+		  ;; always reintern themselves externally so it doesn't matter.
+		  (AND (OR (EQ TYPE :INTERNAL)
+			   (EQ PKG-KEYWORD-PACKAGE PKG))
+		       ;; Make sure we're talking about the same guy the package is.
+		       (EQ PACKAGE-ENTRY SYMBOL)
+		       ;; Don't unintern anything which shadows something else 
+		       (LOOP FOR USED IN (CDR (PKG-SELF-AND-USE-LIST PKG))
+			     NEVER (MULTIPLE-VALUE-BIND (NIL FOUND)
+				       (INTERN-SOFT PNAME USED)
+				     FOUND)))))))))
+
+(DEFVAR *PROTECTED-SYMBOLS* NIL)
+(DEFVAR *SAVED-PACKAGE-SIZES* NIL)
+
+(DEFVAR *PACKAGES-NOT-TO-SHRINK* '("ZETALISP-USER" "COMMON-LISP-USER" "KEYWORD"))
+
+(DEFUN HANDLE-INTERN-OF-GARBAGE-COLLECTED-SYMBOL (CONDITION)
+  (WHEN (DBG:PROCEED-TYPE-P CONDITION :NO-ACTION)
+    (LET ((LOCATION (SEND CONDITION :ADDRESS))
+	  (DATA-TYPE (SEND CONDITION :DATA-TYPE)))
+      (WHEN (AND (= DATA-TYPE DTP-NULL)
+		 (= (%AREA-NUMBER LOCATION) SYSTEM-WEAKSPACE-AREA))
+	(LET ((PKG (%FIND-STRUCTURE-HEADER LOCATION)))
+	  (WHEN (AND (TYPEP PKG 'PACKAGE)
+		     (PLUSP (%POINTER-DIFFERENCE LOCATION (ALOC PKG 0))))
+	    ;; This is a DTP-NULL in the middle of a package.
+	    ;; Fix the package to look like the symbol was REMOB'd and retry
+	    ;; the trapping instruction.
+	    (WITHOUT-INTERRUPTS
+	      ;; Make sure this operation is atomic.
+	      (WHEN (NOT (LOCATION-BOUNDP LOCATION))
+		(SETF (LOCATION-CONTENTS LOCATION) NIL)
+		(SETF (LOCATION-CONTENTS (%MAKE-POINTER-OFFSET DTP-LOCATIVE LOCATION -1)) T)))
+	    (VALUES :NO-ACTION)))))))
+
+(DEFINE-GC-OPTIMIZATION GC-SYMBOLS :LAYERED-SYSTEM-RELEASE
+  (:DOCUMENTATION "GC interned symbols")
+  ;; Before flipping, copy all the packages into a weak area, and
+  ;; set up a condition handler which understands the weakspace trap.
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (GC-OPTIMIZATION-REPORT "~%Turning packages into weak tables ...")
+    (DBG:DEFINE-GLOBAL-HANDLER-1 'HANDLE-INTERN-OF-GARBAGE-COLLECTED-SYMBOL
+				 '(BAD-DATA-TYPE-IN-MEMORY))
+    ;; Copy the packages into the weak area.
+    (LOOP WITH PKG-REHASH-HISTORY = NIL		;Don't permanently record these rehashes
+	  FOR PKG IN *ALL-PACKAGES*
+	  AS COUNT = (PKG-NUMBER-OF-SYMBOLS PKG)
+	  WHEN (OR (NULL INCREMENTAL-P)
+		   (NOT (REORDERABLE PKG INCREMENTAL-P)))
+	    DO (PKG-REHASH PKG (+ COUNT 256.) SYSTEM-WEAKSPACE-AREA))
+    ;; Copy the forwarded keyword cells there too, so keywords can be reclaimed.
+    (UNLESS INCREMENTAL-P
+      (WITH-READ-ONLY-INHIBITED
+	(LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	      WHEN (= (%AREA-NUMBER TABLE) CONSTANTS-AREA)
+		DO (LET* ((SIZE (ARRAY-LENGTH TABLE))
+			  (NEW (MAKE-ARRAY SIZE
+				 :AREA SYSTEM-WEAKSPACE-AREA
+				 :LEADER-LENGTH 3
+				 :NAMED-STRUCTURE-SYMBOL 'FORWARDED-SYMBOL-CELL-TABLE)))
+		     (COPY-ARRAY-CONTENTS-AND-LEADER TABLE NEW)
+		     (STRUCTURE-FORWARD TABLE NEW)))))
+    ;; Ensure that symbols which can't be safely uninterned have pointers to them,
+    ;; so the GC won't blithely unintern them.
+    (GC-OPTIMIZATION-REPORT "~%Protecting symbols which cannot be safely uninterned ...")
+    (SETQ *PROTECTED-SYMBOLS* NIL)
+    (USING-SYSTEM-TEMPORARY-AREA
+      (LET ((SHARED-SYMBOLS (COLLECT-ALL-SHARED-SYMBOLS SYSTEM-TEMPORARY-AREA))
+	    (SYMBOL-COUNT 0))
+	(DO-OBJECTS ((SYMBOL) :AREA SYMBOL-AREA
+			      :REGION-PREDICATE #'REGION-PREDICATE-STRUCTURE)
+	  (WHEN (SYMBOLP SYMBOL)
+	    (INCF SYMBOL-COUNT)
+	    (UNLESS (AND (WORTHLESS-SYMBOL-P SYMBOL)
+			 (SYMBOL-CAN-BE-SAFELY-UNINTERNED SYMBOL SHARED-SYMBOLS))
+	      (PUSH-IN-AREA SYMBOL *PROTECTED-SYMBOLS* SYSTEM-TEMPORARY-AREA))))
+	(SETQ *PROTECTED-SYMBOLS* (COPYLIST *PROTECTED-SYMBOLS* REORDERING-LIST-AREA))
+	(GC-OPTIMIZATION-REPORT "~% ... protected ~D out of ~D symbols"
+				(LENGTH *PROTECTED-SYMBOLS*) SYMBOL-COUNT)
+	;; Set this to NIL now, so as not to confuse the Who-Calls database.
+	;; Since REORDERING-LIST-AREA doesn't get flipped, this works.
+	(SETQ *PROTECTED-SYMBOLS* NIL)))
+    ;; Remember how many symbols we have so we can tell how good we did.
+    (WHEN *ENABLE-GC-OPTIMIZATION-REPORTS*
+      (SETQ *SAVED-PACKAGE-SIZES*
+	    (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+	      (LOOP FOR PKG IN *ALL-PACKAGES*
+		    WHEN (REORDERABLE PKG INCREMENTAL-P)
+		      COLLECT (CONS PKG (PKG-NUMBER-OF-SYMBOLS PKG))))))
+    )
+  ;; After flipping, make sure internal package data structures are transported.
+  ;; Such are the trappings of using GC innards.
+  (:AFTER-FLIP (IGNORE)
+    (DOLIST (PKG *ALL-PACKAGES*)
+      (WHEN (EQL (%AREA-NUMBER PKG) SYSTEM-WEAKSPACE-AREA)
+	(DOTIMES (I (ARRAY-LEADER-LENGTH PKG))
+	  (COMPILER:FOR-EFFECT (ARRAY-LEADER PKG I))))))
+  ;; After GC is complete, copy back the surviving package structure into PKG-AREA,
+  ;; optimizing their sizes.  Then scan through all memory and snap out the pointers
+  ;; to the temporary packages.
+  (:AFTER-RECLAIM-OLDSPACE (INCREMENTAL-P)
+    (WITH-PROGRESS-REPORT ("reconstructing packages")
+      ;; Make sure the structures we copy out of the weak area are permanent.
+      (WHEN *FULL-GC-FOR-SYSTEM-RELEASE*
+	;; Have to disable scavenging since we're changing copyspace to newspace.
+	(INHIBIT-GC-FLIPS
+	  (GC-RECLAIM-OLDSPACE)
+	  ;; Put packages in the existing region.
+	  (FLET ((FIX-AREA (AREA)
+		   (SETF (LDB %%REGION-LEVEL (AREA-REGION-BITS AREA)) %PERMANENT-LEVEL)
+		   (DO-AREA-REGIONS (REGION AREA)
+		     (LET ((BITS (REGION-BITS REGION)))
+		       (WHEN (= (LDB %%REGION-LEVEL BITS) %PERMANENT-LEVEL)
+			 (SETF (REGION-BITS REGION)
+			       (DPBS 0 %%REGION-NO-CONS
+				     %REGION-SPACE-NEW %%REGION-SPACE-TYPE BITS)))))))
+	    (FIX-AREA PKG-AREA)
+	    (FIX-AREA CONSTANTS-AREA))
+	  (CLEAR-CONS-CACHES)))
+      ;; Reconstruct read-only forwarded symbol cell tables.
+      (UNLESS INCREMENTAL-P
+	(GC-OPTIMIZATION-REPORT "~%Reconstructing read-only forwarded symbol-cell table ...")
+	(PROCESS:WITH-LOCK (*FORWARDED-SYMBOL-CELL-TABLE-LOCK*)
+	  (WITH-READ-ONLY-INHIBITED
+	    (LET ((SIZE (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+			      WHEN (= (%AREA-NUMBER TABLE) SYSTEM-WEAKSPACE-AREA)
+				SUM (LOOP FOR I BELOW (FILL-POINTER TABLE)
+					  COUNT (LOCATION-BOUNDP (LOCF (AREF TABLE I)))))))
+	      (LET ((NEW (MAKE-FORWARDED-SYMBOL-CELL-TABLE (+ SIZE 2000.) :SELF-EVALUATING))
+		    (INDEX 0))
+		(LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+		      WHEN (= (%AREA-NUMBER TABLE) SYSTEM-WEAKSPACE-AREA)
+			DO (LOOP WITH TO FOR I BELOW (FILL-POINTER TABLE)
+				 AS FROM = (LOCF (AREF TABLE I))
+				 WHEN (LOCATION-BOUNDP FROM)
+				   DO (SETQ TO (LOCF (AREF NEW INDEX)))
+				      (%P-COPY-Q FROM TO)
+				      (%P-STORE-TAG-AND-POINTER FROM DTP-ONE-Q-FORWARD TO)
+				      (INCF INDEX)))
+		(SETF (FILL-POINTER NEW) INDEX)
+		(SETQ *CURRENT-SELF-EVALUATING-SYMBOL-TABLE* NEW)
+		(LOOP FOR L ON *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+		      WHEN (= (%AREA-NUMBER (CAR L)) SYSTEM-WEAKSPACE-AREA)
+		      DO (SETF (CAR L) NIL))
+		(SETQ *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+		      (DELQ NIL *ALL-FORWARDED-SYMBOL-CELL-TABLES*)))))))
+      ;; Reconstruct all the packages.
+      (GC-OPTIMIZATION-REPORT "~%Reconstructing packages ...")
+      (LET ((PKG-REHASH-HISTORY NIL))		;Don't record these rehashes.
+	(DOLIST (PKG *ALL-PACKAGES*)
+	  (WHEN (EQL (%AREA-NUMBER PKG) SYSTEM-WEAKSPACE-AREA)
+	    ;; Fix the DTP-NULLs in the package directly rather than trapping on all of them.
+	    (LOOP FOR LOC = (ALOC PKG 1) THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE LOC 2)
+		  REPEAT (PKG-HASH-MODULUS PKG)
+		  UNLESS (LOCATION-BOUNDP LOC)
+		    DO (WITHOUT-INTERRUPTS
+			 (UNLESS (LOCATION-BOUNDP LOC)
+			   (SETF (LOCATION-CONTENTS LOC) NIL)
+			   (SETF (LOCATION-CONTENTS (%MAKE-POINTER-OFFSET DTP-LOCATIVE LOC -1))
+				 T))))
+	    ;; Build a new package back in PKG-AREA
+	    (LET* ((COUNT (PKG-COUNT-NUMBER-OF-SYMBOLS PKG))
+		   (NEW-SIZE NIL))
+	      (IF (CL:MEMBER (PKG-NAME PKG) *PACKAGES-NOT-TO-SHRINK* :TEST #'STRING=)
+		  (SETQ NEW-SIZE (PKG-MAX-NUMBER-OF-SYMBOLS PKG))
+		(SETQ NEW-SIZE (+ COUNT (MAX 256. (CEILING COUNT 20.))))
+		(MULTIPLE-VALUE (NIL NEW-SIZE) (PKG-GOOD-SIZE NEW-SIZE)))
+	      (PKG-REHASH PKG NEW-SIZE)))))
+      (WHEN *FULL-GC-FOR-SYSTEM-RELEASE*
+	(FLET ((FIX-AREA (AREA)
+		 (SETF (LDB %%REGION-LEVEL (AREA-REGION-BITS AREA)) %STATIC-LEVEL)
+		 ;; Turn the regions back into copyspace so the next GC can append.
+		 (DO-AREA-REGIONS (REGION AREA)
+		   (LET ((BITS (REGION-BITS REGION)))
+		     (WHEN (= (LDB %%REGION-LEVEL BITS) %PERMANENT-LEVEL)
+		       (SETF (REGION-BITS REGION)
+			     (DPBS 1 %%REGION-NO-CONS
+				   %REGION-SPACE-COPY %%REGION-SPACE-TYPE BITS)))))))
+	  (FIX-AREA CONSTANTS-AREA)
+	  (FIX-AREA PKG-AREA))
+	(CLEAR-CONS-CACHES))
+      ;; Get rid of the global handler; INTERN should work normally now.
+      (DBG:REMOVE-GLOBAL-HANDLER 'HANDLE-INTERN-OF-GARBAGE-COLLECTED-SYMBOL)
+      ;; Map over everything snapping pointers into SYSTEM-WEAKSPACE-AREA with PKG-AREA.
+      ;; Unfortunately, this has to be WITHOUT-INTERRUPTS; I see no way around this phase
+      ;; and no way around the WITHOUT-INTERRUPTS.
+      (WITH-PROGRESS-REPORT ("redirecting weakspace pointers")
+	(WITHOUT-INTERRUPTS
+	  (DO-VIRTUAL-MEMORY
+	       ((ADDRESS TAG POINTER)
+		:OLDSPACE-ACTION :COLLECT
+		:LOOP-WRAPPER '(LET ((POINTER-TYPE-P *POINTER-TYPE-P*)
+				     #+3600 (ASM *ADDRESS-SPACE-MAP*)
+				     (SWA SYSTEM-WEAKSPACE-AREA))
+				 (DECLARE (ARRAY-REGISTER POINTER-TYPE-P #+3600 ASM))
+				 (WITH-FAST-STORAGE-ACCESSORS (REGION-AREA)
+				   . BODY)))
+	    (WHEN (AREF POINTER-TYPE-P (LDB %%Q-TYPE-WITHIN-TAG TAG))
+	      (LET ((REGION #+3600 (AREF ASM (LDB %%VMA-QUANTUM-NUM POINTER))
+			    #+imach (%REGION-NUMBER POINTER)))
+		(WHEN (AND #+3600 (REGION-VALID-P REGION)
+			   #+imach REGION
+			   (= (REGION-AREA REGION) SWA))
+		  ;; There doesn't seem to be a cycle type which does the right thing here.
+		  #+3600
+		  (LOOP AS DTP = (%P-DATA-TYPE POINTER)
+			WHILE (OR (= DTP DTP-HEADER-FORWARD)
+				  (= DTP DTP-ELEMENT-FORWARD)
+				  (= DTP DTP-ONE-Q-FORWARD)
+				  (= DTP DTP-EXTERNAL-VALUE-CELL-POINTER))
+			DO (SETQ POINTER (%P-POINTER POINTER)))
+		  #+IMach
+		  (LOOP AS WORD = (%MEMORY-READ POINTER :CYCLE-TYPE %MEMORY-GC-COPY)
+			WHILE (TYPE-MEMBER WORD DTP-HEADER-FORWARD
+						DTP-ELEMENT-FORWARD
+						DTP-ONE-Q-FORWARD
+						DTP-EXTERNAL-VALUE-CELL-POINTER)
+			DO (SETQ POINTER (%POINTER WORD)))
+		  (SELECTOR (%AREA-NUMBER POINTER) EQL
+		    ((PKG-AREA CONSTANTS-AREA)
+		     (%P-DPB POINTER %%Q-POINTER ADDRESS))
+		    (OTHERWISE
+		      (GC-OPTIMIZATION-REPORT-FORCE
+			"~%Warning:  Can't forward weakspace reference from ~\SI:ADDRESS\"
+			ADDRESS)))))))))
+      ;; Report on how we did.
+      (WHEN *ENABLE-GC-OPTIMIZATION-REPORTS*
+	(LOOP WITH WIDTH = (1+ (LOOP FOR (PKG) IN *SAVED-PACKAGE-SIZES*
+				     MAXIMIZE (STRING-LENGTH (PKG-NAME PKG))))
+	      FOR (PKG . ORIGINAL-SIZE) IN (CL:SORT *SAVED-PACKAGE-SIZES* #'STRING-LESSP
+						    :KEY #'(LAMBDA (X) (PKG-NAME (CAR X))))
+	      AS CURRENT-SIZE = (PKG-NUMBER-OF-SYMBOLS PKG)
+	      SUM ORIGINAL-SIZE INTO TOTAL-ORIGINAL-SIZE
+	      SUM CURRENT-SIZE INTO TOTAL-CURRENT-SIZE
+	      DO (FORMAT T
+		   "~%Package ~V@<~A:~>  ~5D symbols before GC, ~5D symbols after GC (~3D%)"
+		   WIDTH (PKG-NAME PKG) ORIGINAL-SIZE CURRENT-SIZE
+		   (IF (PLUSP ORIGINAL-SIZE)
+		       (ROUND (* 100. CURRENT-SIZE) ORIGINAL-SIZE)
+		       0))
+	      FINALLY (FORMAT T "~%Total of ~D symbols before GC, ~D symbols after GC (~3D%),~@
+				   or ~D symbols reclaimed."
+			      TOTAL-ORIGINAL-SIZE TOTAL-CURRENT-SIZE
+			      (ROUND (* 100. CURRENT-SIZE) ORIGINAL-SIZE)
+			      (- TOTAL-ORIGINAL-SIZE TOTAL-CURRENT-SIZE)))
+	(SETQ *SAVED-PACKAGE-SIZES* NIL)))))
+
+#+IGNORE
+(DEFUN GC-SYMBOLS-IN-PACKAGE (PKG)
+  (STACK-LET ((REGIONS (MAKE-ARRAY (+ (N-REGIONS) 4) :TYPE ART-BOOLEAN))
+	      (LEVELS (MAKE-ARRAY %NUMBER-OF-LEVELS :TYPE ART-BOOLEAN)))
+   (LET-GLOBALLY ((GC-IMMEDIATELY-IN-PROGRESS T))
+    (LET ((REGION (%REGION-NUMBER PKG)))
+      (SETF (AREF REGIONS REGION) T)
+      (SETF (AREF LEVELS (LDB %%REGION-LEVEL (REGION-BITS REGION))) T))
+    (DO-LOCAL-SYMBOLS (SYMBOL PKG)
+      (LET ((REGION (%REGION-NUMBER SYMBOL)))
+	(SETF (AREF REGIONS REGION) T)
+	(SETF (AREF LEVELS (LDB %%REGION-LEVEL (REGION-BITS REGION))) T)))
+    (DBG:DEFINE-GLOBAL-HANDLER-1 'HANDLE-INTERN-OF-GARBAGE-COLLECTED-SYMBOL
+				 '(BAD-DATA-TYPE-IN-MEMORY))
+    (PKG-REHASH PKG (+ (PKG-NUMBER-OF-SYMBOLS PKG) 256.) SYSTEM-WEAKSPACE-AREA)
+    (DYNAMIC-GC-FLIP :REGION-MASK REGIONS :LEVEL-MASK LEVELS)
+    (DOTIMES (I (ARRAY-LEADER-LENGTH PKG))
+      (ARRAY-LEADER PKG I))
+    (GC-RECLAIM-OLDSPACE)
+    ;; Fix the DTP-NULLs in the package directly rather than trapping on all of them.
+    (LOOP FOR LOC = (ALOC PKG 1) THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE LOC 2)
+	  REPEAT (PKG-HASH-MODULUS PKG)
+	  UNLESS (LOCATION-BOUNDP LOC)
+	    DO (WITHOUT-INTERRUPTS
+		 (UNLESS (LOCATION-BOUNDP LOC)
+		   (SETF (LOCATION-CONTENTS LOC) NIL)
+		   (SETF (LOCATION-CONTENTS (%MAKE-POINTER-OFFSET DTP-LOCATIVE LOC -1))
+			 T))))
+    ;; Build a new package back in PKG-AREA
+    (LET* ((COUNT (PKG-NUMBER-OF-SYMBOLS PKG))
+	   (NEW-SIZE (+ COUNT (MAX 256. (CEILING COUNT 20.)))))
+      (MULTIPLE-VALUE (NIL NEW-SIZE) (PKG-GOOD-SIZE NEW-SIZE))
+      (PKG-REHASH PKG NEW-SIZE))
+    ;; Get rid of the global handler; INTERN should work normally now.
+    (DBG:REMOVE-GLOBAL-HANDLER 'HANDLE-INTERN-OF-GARBAGE-COLLECTED-SYMBOL)
+    ;; Map over everything replacing pointers to SYSTEM-WEAKSPACE-AREA with PKG-AREA.
+    ;; Unfortunately, this has to be WITHOUT-INTERRUPTS; I see no way around this phase
+    ;; and no way around the WITHOUT-INTERRUPTS.
+    (WITH-PROGRESS-REPORT ("redirecting weakspace pointers")
+      (WITHOUT-INTERRUPTS
+	(DO-VIRTUAL-MEMORY
+	  ((ADDRESS TAG POINTER)
+	   :OLDSPACE-ACTION :COLLECT
+	   :LOOP-WRAPPER '(LET ((POINTER-TYPE-P *POINTER-TYPE-P*)
+				#+3600 (ASM *ADDRESS-SPACE-MAP*)
+				(SWA SYSTEM-WEAKSPACE-AREA))
+			    (DECLARE (ARRAY-REGISTER POINTER-TYPE-P #+3600 ASM))
+			    (WITH-FAST-STORAGE-ACCESSORS (REGION-AREA)
+			      . BODY)))
+	  (WHEN (AREF POINTER-TYPE-P (LDB %%Q-TYPE-WITHIN-TAG TAG))
+	    (LET ((REGION #+3600 (AREF ASM (LDB %%VMA-QUANTUM-NUM POINTER))
+			  #+imach (%REGION-NUMBER POINTER)))
+	      (WHEN (AND #+3600 (REGION-VALID-P REGION)
+			 #+imach REGION
+			 (= (REGION-AREA REGION) SWA))
+		#+3600
+		(LOOP AS DTP = (%P-DATA-TYPE POINTER)
+		      WHILE (OR (= DTP DTP-HEADER-FORWARD) (= DTP DTP-ELEMENT-FORWARD))
+		      DO (SETQ POINTER (%P-POINTER POINTER)))
+		#+IMach
+		(LOOP AS WORD = (%MEMORY-READ POINTER :CYCLE-TYPE %MEMORY-GC-COPY)
+		      WHILE (TYPE-MEMBER WORD DTP-HEADER-FORWARD DTP-ELEMENT-FORWARD)
+		      DO (SETQ POINTER (%POINTER WORD)))
+		(WHEN (EQL (%AREA-NUMBER POINTER) PKG-AREA)
+		  (%P-DPB POINTER %%Q-POINTER ADDRESS)))))))))))
+
+;;;; Source files
+
+(defconst *stand-in-source-file* (send (fs:merge-pathnames "SYS:SYS;SOME-SYSTEM-FILE")
+				       :generic-pathname))
+
+(defmacro definitions-property-source-file-name-substitute (plist new old &environment env)
+  (once-only (new old &environment env)
+    `(loop for (type . fspecs) in (cl:getf ,plist 'definitions) do
+       (dolist (fspec fspecs)
+	 (let ((prop (function-spec-get fspec ':source-file-name)))
+	   (if (atom prop)
+	       (when (eq prop ,old)
+		 (function-spec-putprop fspec ,new ':source-file-name))
+	       (let ((elem (cl:assoc type prop)))
+		 (when elem
+		   (cl:nsubstitute ,new ,old (cdr elem))))))))))
+
+(define-gc-optimization remove-source-files :layered-system-release
+  (:documentation
+    "Remove or compress source file names, under control of the :SOURCE-FILE-NAMES option.")
+  (:order (:before fs:gc-pathnames))
+  (:before-flip (ignore)
+    (let ((action (or (immediate-gc-option :source-file-names)
+		      (return-from remove-source-files nil))))
+      #+NIY
+      (when *reload-source-files-file*
+	(reload-source-files))
+      (let ((stand-in nil)
+	    (non-patch-files t))
+	(cl:ecase action
+	  (:remove )
+	  (:remove-patches (setq non-patch-files nil))
+	  (:replace-with-stand-in (setq stand-in *stand-in-source-file*)))
+	(with-progress-report ((cond ((not non-patch-files) "forgetting patch files")
+				     (stand-in "forgetting detailed source information")
+				     (t "forgetting source information")))
+	  (let ((pathnames-cleared 0))
+	    (dolist (host fs:*logical-pathname-host-list*)
+	      (maphash #'(lambda (ignore pathname)
+			   (let ((plist (send pathname :property-list-no-translation)))
+			     (when (and plist
+					(or non-patch-files
+					    (cl:getf plist 'sct:patch-file-version-info)))
+			       #| No dumping yet. |
+			       ;; This is part of our internal state,
+			       ;; not the actual pathname's, right?
+			       (cl:remf plist 'fs:back-translation-alist)
+			       ;; Cannot dump packages.
+			       (dolist (elem (cl:getf plist ':file-id-package-alist))
+				 (setf (first elem) (pkg-name (first elem))))
+			       (let ((tem (getl (locf plist) '(sct:system))))
+				 (when tem
+				   (setf (second tem) (sct:system-name (second tem)))))
+			       (when plist
+				 (push `(reload-pathname-property-list ,pathname ',plist)
+				       forms-to-dump))
+			       ||#
+			       (when stand-in
+				 (definitions-property-source-file-name-substitute plist
+										   stand-in
+										   pathname))
+			       (incf pathnames-cleared)
+			       ;; Might be worth having another intermediate version that
+			       ;; just removed properties that customers aren't likely to be
+			       ;; interested in.
+			       (send pathname :set-property-list-no-translation nil nil))))
+		       (send host :pathname-hash-table)))
+	    (do-all-symbols (symbol)
+	      (when (get symbol 'initialization-list)
+		(let ((names-and-source-files
+			(loop for elem in (symeval symbol)
+			      as source-file = (init-source-file elem)
+			      when (and source-file
+					(or non-patch-files
+					    ;; Cannot contribute anything.
+					    (null (send source-file
+							:property-list-no-translation))))
+				;; collect (list (init-name elem) source-file) and
+			      do (setf (init-source-file elem) stand-in))))
+		  (when names-and-source-files
+		    #+NIY
+		    (push `(reload-initialization-list-definitions ',symbol
+								   ',names-and-source-files)
+			  forms-to-dump)))))
+	    #+NIY
+	    (setq *reload-source-files-file*
+		  (dump-source-files (nreverse forms-to-dump)
+				     (fs:make-pathname :host "local" :directory "MMcM"
+						       :name (format nil
+								     "SYSTEM-~D-SOURCE-FILES"
+								     (sct:get-system-version))
+						       :type *default-binary-file-type*
+						       :version :newest)))
+	    (gc-optimization-report "~&~D ~:[patch file ~]pathnames cleared.~%"
+				    pathnames-cleared non-patch-files))
+	  (let ((fspecs-handled 0)
+		(sharing-table (and stand-in
+				    (cl:make-hash-table
+				      :test #'cl:equal :number-of-values 0
+				      :area system-temporary-area :size 700
+				      :mutating nil :ignore-gc t :locking nil))))
+	    (labels ((missing-link (fspec type files)
+		       (ignore fspec type files)
+		       #+cold-load-generator-fixed
+		       (gc-optimization-report-force
+			 "~&Warning: ~A ~S has source file~P ~{~A~^, ~}, ~
+	but was not pointed to by the pathname.~%"
+			       (definition-type-name type) fspec (length files) files))
+		     (do-one-fspec (fspec source-file-property)
+		       (cond ((not non-patch-files)
+			      (let ((handled nil))
+				(if (atom source-file-property)
+				    (when (null (send source-file-property
+						      :property-list-no-translation))
+				      (setq source-file-property nil
+					    handled t))
+				    (dolist (elem source-file-property)
+				      (setf (cdr elem) 
+					    (del-if 
+					      #'(lambda (pathname)
+						  (unless (send pathname
+								:property-list-no-translation)
+						    (setq handled t)
+						    t))
+					      (cdr elem)))))
+				(when handled
+				  (when (listp source-file-property)
+				    (setq source-file-property (del-if #'(lambda (elem)
+									   (null (cdr elem)))
+								       source-file-property))
+				    (when (and (null (cdr source-file-property))
+					       (eq (caar source-file-property) 'defun)
+					       (null (cddar source-file-property)))
+				     (setq source-file-property (cadar source-file-property))))
+				  (incf fspecs-handled)))
+			      (if (null source-file-property)
+				  (function-spec-remprop fspec ':source-file-name)
+				  (function-spec-putprop fspec (copytree source-file-property)
+							 ':source-file-name)))
+			     (stand-in
+			      (if (atom source-file-property)
+				  (unless (eq source-file-property stand-in)
+				    (missing-link fspec 'defun (list source-file-property))
+				    (setq source-file-property stand-in))
+				(dolist (elem source-file-property)
+				  (destructuring-bind (type . pathnames) elem
+				    (let ((no-good (delq stand-in pathnames)))
+				      (when no-good
+					(missing-link fspec type no-good))
+				      (when (or no-good (> (length elem) 2))
+					(setf (cdr elem) (list stand-in))))))
+				(when (and (null (cdr source-file-property))
+					   (eq (caar source-file-property) 'defun))
+				  (setq source-file-property stand-in)))
+			      (function-spec-putprop fspec (copytree-share source-file-property
+									   nil sharing-table)
+						     ':source-file-name)
+			      (when (and (symbolp fspec)
+					 (loop for (ind) on (plist fspec) by 'cddr
+					       always (memq ind '(:source-file-name special))))
+				(setplist fspec (copytree-share (plist fspec)
+								nil sharing-table)))
+			      (incf fspecs-handled))
+			     (t
+			      (function-spec-remprop fspec ':source-file-name)
+			      (incf fspecs-handled)))))
+	      (do-all-symbols (symbol)
+		(let ((prop (get symbol ':source-file-name)))
+		  (when prop
+		    (do-one-fspec symbol prop))))
+	      ;; Is this the only other place function-spec-putprop ends up storing things?
+	      (if (eq action :remove)
+		  (remhash ':source-file-name *function-spec-hash-tables*)
+		  (maphash #'do-one-fspec
+			   (gethash ':source-file-name *function-spec-hash-tables*))))
+	    (gc-optimization-report "~D function specs altered.~%" fspecs-handled)))))))
+
+;;; Share handlers in compiled function objects.  This only saves about 16 pages,
+;;; but it is fast and increases signalling locality significantly.
+
+(define-gc-optimization share-handlers :layered-system-release
+  (:documentation "Share identical condition handlers used in different functions")
+  (:before-flip (ignore)
+    (share-handlers nil *enable-gc-optimization-reports*)))
+
+(defun share-handlers (&optional meter-only (verbose t))
+  (with-progress-report-if verbose ("sharing condition handlers")
+    (let ((instance-alist nil)
+	  (hash (cl:make-hash-table :test #'cl:equal :locking nil :number-of-values 0)))
+      ;; Map over functions in their original order, so that when this is run
+      ;; subsequent times it is fast.
+      (map-compiled-functions t nil "sharing compiled-function condition handlers"
+	(lambda (function ignore)
+	  (do-function-constants (instance loc) function
+	    (when (and (instancep instance)
+		       (typep instance 'dbg:basic-handler))
+	      (loop with flavor = (%instance-flavor instance)
+		    for elem in instance-alist
+		    when (and (eq (%instance-flavor (car elem)) flavor)
+			      (dbg:handler-equal (car elem) instance))
+		      do (if meter-only
+			     (incf (cadr elem))
+			     (unless (eq instance (car elem))
+			       (setf (location-contents loc) (car elem))))
+			 (return nil)
+		    finally
+		      (push (list instance 1) instance-alist)
+		      (loop for i from 1 below (%structure-total-size instance)
+			    as original = (%instance-ref instance i)
+			    as shared = (copytree-share original permanent-storage-area hash t)
+			    when (and (not meter-only) (neq original shared))
+			      do (setf (%instance-ref instance i) shared)))))))
+      (when meter-only
+	instance-alist))))
+
+#||
+;; Assumes no previous sharing.
+;; Returns the number of words saved by sharing handlers.
+;; Do (sum-meter-handling (share-handlers t)).
+(defun sum-handler-sharing (instance-alist)
+  (loop for (instance n) in instance-alist
+	as size = (%structure-total-size instance)
+	sum (* (+ size 
+		  (loop for i from 1 below size
+			as elem = (%instance-ref instance i)
+			when (cl:consp elem)
+			  sum (length elem)))
+	       (1- n))))
+
+||#
+
+#||
+;; Compiled Function Sharing
+;; This is currently broken.
+;; In particular, the %p-store-contents crap in share-equal-compiled-functions
+;; leaves the forwarded function cells pointing to the old functions, so they
+;; never get GC'd.  In any case, the benefit of this optimization is currently
+;; low, so it's not worth fixing.
+
+(defsubst compiled-function-hash-operator (a b)
+  (%32-bit-plus (logxor (rot a 7) b) #o52525))
+
+#+3600
+(defun compiled-function-hash (fun)
+  (let* ((cca (compiled-function-cca fun))
+	 (n-objects (cca-n-objects cca))
+	 (n-instructions (cca-n-instructions cca))
+	 (hash (compiled-function-hash-operator n-objects n-instructions)))
+    (loop for i below n-instructions do
+      (setq hash (compiled-function-hash-operator hash (cca-instruction cca i nil))))
+    (loop for i below n-objects do
+      (setq hash (compiled-function-hash-operator hash
+		   (cli::xequal-hash (cca-object cca i)))))
+    ;; Superstition -- make the hash nonnegative.
+    (logxor (%logldb (byte 31 0) hash)
+	    (%logldb (byte 31 1) hash))))
+
+#+3600
+(defun compiled-function-equal (fun1 fun2)
+  (or (eq fun1 fun2)
+      (let* ((cca1 (compiled-function-cca fun1))
+	     (cca2 (compiled-function-cca fun2))
+	     (cca1-n-objects (cca-n-objects cca1))
+	     (cca2-n-objects (cca-n-objects cca2))
+	     (cca1-n-instructions (cca-n-instructions cca1))
+	     (cca2-n-instructions (cca-n-instructions cca2)))
+	(and (= cca1-n-objects cca2-n-objects)
+	     (= cca1-n-instructions cca2-n-instructions)
+	     (loop for i below cca2-n-instructions
+		   always (eql (cca-instruction cca1 i nil) (cca-instruction cca2 i nil)))
+	     (loop for i below cca1-n-objects
+		   always (cl:equal (cca-object cca1 i) (cca-object cca2 i)))
+	     ))))
+
+;; Note that on Ivory, suffixes are not compared.
+
+#+IMach
+(defun compiled-function-hash (fun)
+  (let* ((cca (compiled-function-cca fun))
+	 (header (%p-pointer cca))
+	 (total-size (ldb cca-total-size header))
+	 (suffix-size (ldb cca-suffix-size header))
+	 (hash (compiled-function-hash-operator total-size suffix-size)))
+    (with-block-registers (2)
+      (setf (%block-register 2) fun)
+      (loop repeat (- total-size suffix-size (defstorage-size compiled-function))
+	    as word = (%block-read 2 :cycle-type %memory-scavenge
+				     :set-cdr-next nil
+				     :prefetch nil)
+	    do (setq hash (compiled-function-hash-operator hash (%tag word)))
+	       (setq hash (compiled-function-hash-operator hash
+			    (if ( (%data-type word) dtp-packed-instruction-60)
+				(%pointer word)
+				(cli::xequal-hash
+				  (if (type-member word dtp-external-value-cell-pointer)
+				      (%set-tag word dtp-locative)
+				      word)))))
+	    finally (return
+		      ;; Superstition -- make the hash nonnegative.
+		      (logxor (%logldb (byte 31 0) hash)
+			      (%logldb (byte 31 1) hash)))))))
+
+#+IMach
+(defun compiled-function-equal (fun1 fun2)
+  (or (eq fun1 fun2)
+      (let* ((cca1 (compiled-function-cca fun1))
+	     (cca2 (compiled-function-cca fun2))
+	     (header1 (%p-pointer cca1)))
+	(and (= header1 (%p-pointer cca2))	;total-size and suffix-sizes equal
+	     (with-block-registers (2 3)
+	       (setf (%block-register 2) fun1)
+	       (setf (%block-register 3) fun2)
+	       (loop repeat (- (ldb cca-total-size header1)
+			       (ldb cca-suffix-size header1)
+			       (defstorage-size compiled-function))
+		     as word1 = (%block-read 2 :cycle-type %memory-scavenge
+					       :set-cdr-next nil
+					       :prefetch nil)
+		     as word2 = (%block-read 3 :cycle-type %memory-scavenge
+					       :set-cdr-next nil
+					       :prefetch nil)
+		     always (and (= (%tag word1) (%tag word2))	;Check cdr-codes!
+				 (progn (if (type-member word1 dtp-external-value-cell-pointer)
+					    (setf word1 (%set-tag word1 dtp-locative)))
+					(if (type-member word2 dtp-external-value-cell-pointer)
+					    (setf word2 (%set-tag word2 dtp-locative)))
+					(cl:equal word1 word2)))))))))
+
+(defun compiled-function-debug-info-equal (fun-1 fun-2 make-1-better)
+  (let ((debug-1 (cdr (cca-extra-info (compiled-function-cca fun-1))))
+	(debug-2 (cdr (cca-extra-info (compiled-function-cca fun-2)))))
+    (or (and (cl:equal debug-1 debug-2)
+	     (loop for entry in debug-1
+		   always (or (not (listp entry))
+			      (not (memq (first entry) *debug-info-types-not-to-copy*)))))
+	(and (= (length debug-1) (length debug-2))
+	     (loop for sublist-1 on debug-1 and sublist-2 on debug-2
+		   as elem-1 = (first sublist-1) and elem-2 = (first sublist-2)
+		   always (cond ((cl:equal elem-1 elem-2)
+				 (or (not (listp elem-1))
+				     (not (memq (first elem-1) *debug-info-types-not-to-copy*))
+				     (cl:every #'eq elem-1 elem-2)))
+				;; Most inlines are shared by the non-essential discarder
+				;; above.  However, there may be subtle differences, such as
+				;; (aref ## 7) vs. (aref ## '7).  Assume that if the compiled
+				;; code produced for the single copy is the same, the inline
+				;; code will also be.
+				((and (listp elem-1) (eq (car elem-1) 'lt:inline-form)
+				      (listp elem-2) (eq (car elem-2) 'lt:inline-form))
+				 (let* ((il-1 (cadr elem-1))
+					(form-1 (lt::inline-form-form il-1))
+					(il-2 (cadr elem-2))
+					(form-2 (lt::inline-form-form il-2)))
+				   ;; Make the one that is getting saved be the simpler one.
+				   ;; This also eliminates recursions in the expansions, which
+				   ;; might arise if the definition of one subst uses another
+				   ;; which is identical.
+				   (when (and make-1-better
+					      (listp form-1)
+					      (or (atom form-2)
+						  (member (compiled-function-name fun-2)
+							  (lt::inline-form-free-functions
+							    il-1))
+						  (let ((simple '(aref array-leader nth
+								  %p-ldb-offset
+								  %p-contents-offset)))
+						    (and (member (car form-2) simple)
+							 (or (not (member (car form-1) simple))
+							     (and (loop for subform in form-2
+									always (atom subform))
+								  (not
+								    (loop for subform in form-1
+									  always
+									    (atom
+									      subform))))))))
+					      (not (member (compiled-function-name fun-1)
+							   (lt::inline-form-free-functions
+							     il-2))))
+				     (setf (cadr elem-1) il-2)))
+				 t)
+				((and (listp elem-1) (eq (car elem-1) 'lt:side-effects)
+				      (listp elem-2) (eq (car elem-2) 'lt:side-effects))
+				 (when make-1-better
+				   (let* ((types 'lt:(simple reducible reader))
+					  (type-1 (loop for i from 0
+							for type in types
+							when (memq type (cdr elem-1))
+							  return i
+							finally (return i))) 
+					  (type-2 (loop for i from 0
+							for type in types
+							when (memq type (cdr elem-2))
+							  return i
+							finally (return i))))
+				     (when (< type-2 type-1)
+				       ;; debug-2 has a stronger side-effects declaration.
+				       (setf (car sublist-1) elem-2))))
+				 t)))))))
+
+(defun share-equal-compiled-functions ()
+  (with-progress-report ("sharing identical compiled functions")
+    (let ((n-funs 0)
+	  (comparison-hash-table (cl:make-hash-table :test #'compiled-function-equal
+						     :hash-function #'compiled-function-hash
+						     :size 40000 :number-of-values 0
+						     :mutating nil :ignore-gc t :locking nil))
+	  (bucket-hash-table (cl:make-hash-table :size 1800
+						 :mutating nil :ignore-gc t :locking nil)))
+
+      ;; Map in the original order, so that the earliest function stays, aliis aequis.
+      (map-compiled-functions t nil "sharing equal compiled functions"
+	#'(lambda (function cca)
+	    (ignore cca)
+	    (incf n-funs)
+	    (unless ;; Cannot redefine an internal function or a CLOS method function yet.
+	      (let ((name (compiled-function-name function)))
+		(and (listp name)
+		     (selectq (first name)
+		       ((#+Imach :internal clos:method) t))))
+	      (scl:modify-hash comparison-hash-table function
+			       #'(lambda (key value found-p)
+				   (ignore value)
+				   (when found-p
+				     (push function (gethash key bucket-hash-table)))
+				   ;; We rely on the key staying the same as for the first
+				   ;; insert.
+				   t)))))
+
+      (let ((n-dups 0)
+	    (n-dups-except-debug 0))
+	(maphash #'(lambda (key bucket)
+		     ;; All the identical functions that aren't obsolete, oldest first.
+		     (setq bucket (del-if-not #'function-same-as-function-from-name
+					      (cons key (nreverse bucket))))
+		     (loop while bucket
+			   do (let ((function (first bucket)))
+				(loop for sublist on (cdr bucket)
+				      as other-function = (first sublist)
+				      do
+				  (when (compiled-function-debug-info-equal function
+									    other-function
+									    t)
+				    (incf n-dups)
+				    ;; Cannot always use fdefine, because the flavor system
+				    ;; will trash its method tables if you do.  Also, don't
+				    ;; setf location-contents, since we don't want to chase
+				    ;; into the shared function cell of the old function.  But
+				    ;; is this right for safeguarded symbol cells?
+				    ;;---- This is broken
+				    (let* ((other-name (function-name other-function))
+					   (other-def (fdefinition other-name))
+					   (new-def (subst function other-function other-def)))
+				      (if (definition-has-location-p other-name)
+					  (%p-store-contents
+					    (fdefinition-location other-name)
+					    new-def)
+					  (fdefine other-name new-def)))
+				    (setf (first sublist) function)))
+				(setq bucket (delq function bucket))
+				(when bucket
+				  (incf n-dups-except-debug)))))
+		 bucket-hash-table)
+	(gc-optimization-report "~D functions checked.  ~D were duplicates.  
+~D were duplicates except for differing debugging info."
+		n-funs n-dups n-dups-except-debug)))))
+||#
+
+;; Compatibility
+
+(DEFVAR *FULL-GC-PROHIBITED-OPTIMIZATIONS*
+	'(GC-SYMBOLS				;Uses weakspace, which I don't trus
+	  NETI:GC-NAMESPACE			;Doesn't seem to work
+	  REORDER-FLAVORS			;Leave out all reordering for now.
+	  REORDER-COMPILED-FUNCTIONS
+	  REORDER-PACKAGES
+	  REORDER-SYMBOLS
+	  REORDER-SYSTEMS
+	  REORDER-PRINT-OBJECT-PRESENTATION-TYPES
+	  REORDER-CHARACTER-STYLES
+	  REORDER-SHEETS
+	  REORDER-GENERIC-FUNCTIONS
+	  COLLAPSE-REORDERINGS))
+
+(DEFINE-GC-OPTIMIZATION FULL-GC-COMPATIBILITY-OPTIMIZATION ()
+  (:ORDER :LAST (:AFTER MAKE-SURVIVING-REGIONS-STATIC))
+  (:BEFORE-FLIP (IGNORE)
+    ;; Don't GC compiled functions, since we disable the reordering substrate.
+    (SETF (AREF *IMMEDIATE-GC-AREA-MASK* COMPILED-FUNCTION-AREA) NIL)
+    ;; For compatibility, don't flip any static areas which aren't system areas.
+    (LOOP WITH NAME FOR AREA FROM (1+ DISK-SAVE-AREA) BELOW (N-AREAS)
+	  WHEN (AND (= (LEVEL-TYPE (LDB %%REGION-LEVEL (AREA-REGION-BITS AREA)))
+		       %LEVEL-TYPE-STATIC)
+		    (NOT (MEMQ (SETQ NAME (AREA-NAME AREA))
+			       '(ZWEI:ZWEI-COMMAND-AREA
+				 *WHO-CALLS-DATABASE-AREA*
+				 METER:PC-ARRAY-AREA
+				 METERING:WIRED-METERING-AREA
+				 METERING:METERING-AREA))))
+	    DO (FORMAT T "~%  Disabling GC for ~S" NAME)
+	       (SETF (AREF *IMMEDIATE-GC-AREA-MASK* AREA) NIL))))
+
+;; No arguments are supported, since they were only used in conjunction with
+;; :SYSTEM-RELEASE
+
+(DEFUN FULL-GC ()
+  (IMMEDIATE-GC :MODE :LAYERED-SYSTEM-RELEASE
+    :INCREMENTAL-OPTIMIZE NIL
+    :OPTIMIZE (CONS 'FULL-GC-COMPATIBILITY-OPTIMIZATION
+		    (CL:SET-DIFFERENCE
+		      (IMMEDIATE-GC-DEFAULT-OPTIMIZATIONS :LAYERED-SYSTEM-RELEASE)
+		      *FULL-GC-PROHIBITED-OPTIMIZATIONS*))))

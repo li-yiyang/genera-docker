@@ -1,0 +1,128 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Package: SYSTEM-INTERNALS; Base: 8; Patch-File: T -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+(defwiredvar *saved-trap-vector-base*)
+
+(defconstant %exception-vector-length  (+ #o4000 #o400))
+
+;;; Actually we start past this guys entry instruction so that it will
+;;; work with any number of arguments
+(defun trace-trap-exception-handler (trap-vector-index)
+  (si:%funcall-in-aux-stack #'call-real-exception-handler
+			    (si:%microsecond-clock)
+			    (ldb %%cr.call-trace (sys:%saved-control-register))
+			    trap-vector-index)
+  (sys:%halt))
+
+(defun call-real-exception-handler (start-time old-call-trace trap-vector-index)
+  (%write-internal-register
+    (%memory-read (%pointer-plus *saved-trap-vector-base* trap-vector-index))
+    sys:%register-continuation)
+  (compiler:%error-when (and (not (zerop old-call-trace))
+			     metering:*metering-enabled*
+			     (= trap-mode-emulator
+				(%logldb %%cr.trap-mode (%saved-control-register))))
+    (%p-dpb old-call-trace %%cr.call-trace
+	    (cli::%saved-control-register-address))
+    (si:%revert-to-emulator-mode)
+    (si:saving-registers-for-trap-for-effect
+      (let ((flag si:inhibit-scheduling-flag))
+	(unwind-protect
+	    (progn
+	      (setf si:inhibit-scheduling-flag t)
+	      (let ((overhead (dbg:meter-function-entry flag start-time)))
+		(si:%set-trap-mode si:trap-mode-extra-stack)
+		(when overhead
+		  (si:incf* process::*current-process-metering-overhead*
+			    (sys:%32-bit-difference (si:%microsecond-clock) overhead)))))
+	  (setf si:inhibit-scheduling-flag flag)
+	  (unless flag 
+	    (si:%check-preempt-pending))))))
+  (values))
+
+(defvar *saved-trap-vector* (make-array %exception-vector-length))
+(defun init-saved-trap-vector ()
+  (setq *saved-trap-vector-base* (aloc *saved-trap-vector* 0))
+  (when (null (aref *saved-trap-vector* 0))
+    (loop for index from 0 below %exception-vector-length
+	  for tv-pointer from %trap-vector-base
+	  for sv-pointer = *saved-trap-vector-base* then (%pointer-plus sv-pointer 1)
+	  do (%memory-write sv-pointer (%memory-read tv-pointer)))))
+
+(defvar %*exceptions-that-raise-the-trap-mode-of-their-caller*
+	(list (+ (ilc:opcode-for-instruction 'si:%allocate-list-block)
+		 %instruction-exception-vector)
+	      (+ (ilc:opcode-for-instruction 'si:%allocate-structure-block)
+		 %instruction-exception-vector)))
+
+(defun install-exception-trace-handlers ()
+  (loop with new-handler = (%make-pointer-offset dtp-even-pc
+						 #'trace-trap-exception-handler
+						 1)
+	for index from 0 below %exception-vector-length
+	for tv-pointer = (%make-pointer dtp-locative %trap-vector-base)
+		       then (%pointer-plus tv-pointer 1)
+	when (not (loop for exception in %*exceptions-that-raise-the-trap-mode-of-their-caller*
+			thereis (= exception index)))
+	  do (setf (location-contents tv-pointer) new-handler)))
+
+(defun remove-exception-trace-handlers ()
+  (loop for index from 0 below %exception-vector-length
+	for tv-pointer = (%make-pointer dtp-locative %trap-vector-base)
+		       then (%pointer-plus tv-pointer 1)
+	for sv-pointer = *saved-trap-vector-base* then (%pointer-plus sv-pointer 1)
+	do (setf (location-contents tv-pointer) (location-contents sv-pointer))))
+
+
+

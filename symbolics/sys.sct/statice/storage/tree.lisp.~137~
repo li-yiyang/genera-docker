@@ -1,0 +1,1617 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: STATICE-INDEX; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;
+;;; Main module for Kernel Statice Index system.  
+;;; This file contains definitions for the various objects
+;;; which represent parts of the B*-tree indexing scheme.
+;;; For definition of the pagination object, see SYS:STATICE;STORAGE;SCROLL.LISP
+;;; For internal design documentation, see SYS:STATICE;STORAGE;INDEX-DESIGN.MSS
+;;; and .PR2
+
+;;  Things to do:
+;;  1.1) Metering and performance analysis.  Tuning.
+;;  4.1) Rewrite of UPDATE-PARENT code.  Avoid multiple repagination of parents
+;;       due to replace operations, DELETE-CHILD-POINTERs (flushes) from scroll.
+;;    5) Need to eliminate duplicate branch/leaf code via clever macrology.
+;;  5.1) Apply macrology to other duplicate code.
+;;    6) Maybe optimize sequential insert case
+;;    7) Maybe allow block inserts/deletes
+;;    8) Maybe introduce space requirements computations which figure out the total
+;;       amount of space needed in children and parents before any data is moved.
+;;       Maybe this is impossible? Maybe it is just as much work?
+;;    9) Maybe implement the PLAN algorithm, where things are planned, and then
+;;       executed without copying any more data than necessary.
+;;   10) Maybe remove generalities for clarity and speed improvement.
+;;   11) Repagination after deletes occur too often.  Provide a way to queue 
+;;       the repaginations until after the parental updates are finished, and 
+;;       combine some of the repaginations.  This needs some thought.
+;;   12) Make sure the function-parent stuff works
+;;   13) Add comments
+;;   14) Consider tweeking some parameters.  Consider that inserting/deleting 
+;;       at just the right point can cause repaginations every time.  Maybe raise
+;;       repagination density, and/or lower repaginate after delete density cutoff.
+;;   15) Redesign fill pointers (at least in overflow record) to not include header words.
+
+
+;;This variable holds an object which represents the current index being operated on.
+;;This is where the index type and the address of the root is stored.
+(defvar *current-index* nil)
+
+;;This variable contains the opening returned by file level for the current index.
+(defvar *current-segment* nil)
+
+;;This array is used for a zero length key, mostly for error checking.
+(defparameter *zero-length-array* (make-array 0))
+
+;; Any disk page involved in an index is represented in virtual memory by an
+;; object of type INDEX-RECORD.  
+(defflavor index-record ((disk-page nil)		;Copy of the words on disk
+			 disk-page-address)		;Address of this record
+	   ()
+  :readable-instance-variables 
+  :writable-instance-variables
+  (:initable-instance-variables disk-page-address))
+
+;; Initializes the disk-page and disk-page-address variables of an index record.
+(defmethod (set-disk-page index-record) (new-disk-page new-address)
+  (setf disk-page new-disk-page)
+  (setf disk-page-address new-address))
+
+;; Set the password for the page depending on the type of index record.  Also
+;; initialize the neighbor and parent pointers of the node.
+(defmethod (initialize-disk-page index-record)  (&key (next 0) (previous 0) (parent 0))
+  (setf (node-next disk-page) next)
+  (setf (node-previous disk-page) previous)
+  (setf (node-parent disk-page) parent))
+
+;;If we have to free disk buffers for the real file level, we will need
+;;to put an unwind-protect in here.  At the moment this macro simply
+;;insures that reads to page zero return NIL, since the index
+;;system uses zero as the null pointer.   It might be used to
+;;free disk pages for the file level in future, although at the moment
+;;the number of pages outstanding in a typical transaction is typically
+;;small.  Note: other code calls read-page directly.
+;;This macro is mainly used by other macros.
+(defmacro with-disk-page-at-address ((var address mode) &body body)
+  `(let ((,var (if (zerop ,address)
+		   nil
+		   (funcall (ecase ,mode
+			      (:read #'read-page)
+			      (:write #'write-page))
+			    *current-segment* ,address))))
+     . ,body))
+
+;;Use this when we know we are going to write the page.  At the moment
+;;this macro simply insures that reads to page zero return NIL, since
+;;the index system uses zero as the null pointer.  It might be used to
+;;free disk pages for the file level in future, although at the moment
+;;the number of pages outstanding in a typical transaction is typically
+;;small.
+;;This macro is mainly used by other macros.
+(defmacro writing-disk-page-at ((var address) &body body)
+  (warn "WRITING-DISK-PAGE-AT is obsolete.~@
+         Use WITH-DISK-PAGE-AT-ADDRESS with mode :WRITE instead.")
+  `(with-disk-page-at-address (,var ,address :write)
+     . ,body))
+
+;; Basic index record access mechanism.  In its fullblown form, it binds
+;; a record variable to a flavor instance representing the disk-resident
+;; index record at the specified address, and it binds a disk page
+;; variable to the actual disk page.  If NIL is specified for the record
+;; variable, the effect is similar to with-disk-page-at-address, except
+;; you get a better error message if you try to read location zero.
+(defmacro with-record-at ((record-var address mode &optional (disk-page-var '.disk-page.))
+			  &environment env &body body)
+  (once-only (address &environment env)
+    `(with-disk-page-at-address (,disk-page-var ,address ,mode)
+       (if (null ,disk-page-var)
+	   (cond ((zerop ,address)
+		  . ,(if record-var
+			 `((let ((,record-var nil))
+			     . ,body))
+		       body))
+		 (t
+		  (error "Reference to unallocated disk page ~D" ,address)))
+	 . ,(if record-var
+		`((with-resource (,record-var (index-record-type ,disk-page-var)
+				  ,disk-page-var ,address)
+		   . ,body))
+	      body)))))
+
+;; Same idea as with-record-at, except that the record is write locked.
+(defmacro with-record-written-at ((record-var address &optional (disk-page-var '.disk-page.))
+			  &body body)
+  (warn "WITH-RECORD-WRITTEN-AT is obsolete.~@
+         Use WITH-RECORD-AT with a mode of :WRITE instead.")
+  `(with-record-at (,record-var ,address :write ,disk-page-var)
+     . ,body))
+
+;; Similar to with-record-at, except the node must be manually
+;; deallocated.  Used by the GET-NODE-xxx operators which are
+;; automatically generated by the def-node-pointer-accessors macro.
+;; We probably just want to permanently allocate nodes for scrolls, thus
+;; we could purge this code.
+(defmacro get-record-at ((record-var address &optional (disk-page-var '.disk-page.))
+			 &environment env &body body)
+  (once-only (address &environment env)
+    `(with-disk-page-at-address (,disk-page-var ,address :read)
+       (if (null ,disk-page-var)
+	   (cond ((zerop ,address)
+		  . ,(if record-var
+			 `((let ((,record-var nil))
+			     . ,body))
+		       body))
+		 (t
+		  (error "Reference to unallocated disk page ~D" ,address)))
+	 . ,(if record-var
+		`((let ((,record-var (allocate-resource (index-record-type ,disk-page-var)
+						     ,disk-page-var ,address)))
+		   . ,body))
+	      body)))))
+
+(defprop def-node-pointer-accessors "Node Pointer Accessors" si:definition-type-name)
+
+;; Defines accessors for the various index record slots (currently next,
+;; previous, and parent).  The NODE-xxx accessors just get you the
+;; address.  The WITH-xxx-INDEX-RECORD and
+;; WITH-xxx-INDEX-RECORD-FOR-WRITING are similar to WITH-RECORD-AT
+;; combined with NODE-xxx.  The address is some neighbor (or parent) of
+;; the specified node. 
+(defmacro def-node-pointer-accessors (node-pointers)
+  `(progn . ,(loop for node-pointer in node-pointers
+		   as struct-accessor-name = (intern (string-append "NODE-"
+							      node-pointer))
+		   as with-macro-name = (intern (string-append "WITH-"
+							      node-pointer
+							      "-INDEX-RECORD"))
+		   as get-macro-name =  (intern (string-append "GET-NODE-"
+							      node-pointer))
+		   collect
+		     `(defmacro ,with-macro-name ((var source-disk-page mode
+						      &optional (dest-disk-page-var
+								  '.disk-page.))
+						 &body body)
+		       `(with-record-at (,var (,',struct-accessor-name ,source-disk-page) ,mode
+					  ,dest-disk-page-var)
+			   . ,body))
+		   collect
+		     `(defmacro ,get-macro-name ((var source-disk-page
+						     &optional (dest-disk-page-var
+								 '.disk-page.))
+						&body body)
+		       `(get-record-at (,var (,',struct-accessor-name ,source-disk-page)
+					,dest-disk-page-var)
+			  . ,body)))))
+
+;; Define NEXT, PREVIOUS, and PARENT versions of the accessors described
+;; above.
+(def-node-pointer-accessors (parent previous next))
+
+;; Given a main node and a disk page and address of a node to the right
+;; of the main node, find the common parent these two nodes share.  When
+;; the parent is found, bind the parent-node-var to the flavor instance
+;; representing the parent, bind the part-disk-page-var to the actual
+;; disk page of the common parent, and bind the child address var to the
+;; child address of the node immediately below the parent which is an
+;; ancestor of the the main node.
+(defmacro with-node-common-parent ((parent-node-var parent-disk-page-var child-address-var
+				    main-node right-disk-page right-page-address mode)
+				   &body body)
+  (unless parent-node-var (setf parent-node-var '.parent-node-var.))
+  `(multiple-value-bind (.parent-address. ,child-address-var)
+       (find-common-parent-address ,main-node ,right-disk-page ,right-page-address)
+     (with-record-at (,parent-node-var .parent-address. ,mode
+		      . ,(and parent-disk-page-var (ncons parent-disk-page-var)))
+       . ,body)))
+
+;; Same as above, except a write lock is taken.
+(defmacro with-node-common-parent-for-writing
+	  ((parent-node-var parent-disk-page-var child-address-var
+	    main-node right-disk-page right-page-address) &body body)
+  (warn "WITH-NODE-COMMON-PARENT-FOR-WRITING is obsolete.~@
+         Use WITH-NODE-COMMON-PARENT with a mode of :WRITE instead.")
+  `(with-node-common-parent (,parent-node-var ,parent-disk-page-var ,child-address-var
+			     ,main-node ,right-disk-page ,right-page-address :write)
+     . ,body))
+
+;; INDEX objects represent the entire B-tree index.
+
+(defflavor index (root) ()
+  :readable-instance-variables
+  :writable-instance-variables)
+
+;; Allocate the root node, and set up the instance to point to it.
+(defmethod (initialize-index index) ()
+  (multiple-value-bind (root-instance root-address) (create-new-node nil nil nil 'leaf-node)
+    (setq root root-address)
+    (deallocate-resource 'leaf-node root-instance)))
+
+;; Sets the disk address of the root of a given index.  Used when the
+;; tree grows or shrinks a level.
+(defmethod (set-index-root index) (address)
+  (setq root address))
+
+;; Resource of these instances.
+(defresource index-instance ()
+  :constructor (make-instance 'index))
+
+;; Objects of type NODE are elements of the B*-tree proper.  In
+;; particular, there are basically leaf nodes and branch nodes (q.v.).
+;; NODEs share a similar storage allocation scheme, where the fixed
+;; sized header words are allocated from the front of the node, and the
+;; variable length key and data words are allocated from the end of the
+;; node.
+
+(defflavor node ()
+	   (index-record)			
+  :readable-instance-variables
+  :writable-instance-variables
+  (:method-combination check-consistency (:and :most-specific-last)))
+
+;; Forces the node to be empty.
+(defmethod (reset-fill-pointers node) ()
+  (setf (node-header-fill-pointer disk-page) *index-record-header-size*)
+  (setf (node-data-fill-pointer disk-page) *words-per-page*))
+
+;; When we initialize a node, we want to start out with an empty node.
+(defmethod (initialize-disk-page node :after) (&rest ignore)
+  (reset-fill-pointers self))
+						
+;; Objects of type BRANCH-NODE are used in the B*-tree to find the
+;; leaf-node where the actual key and data are stored.  Due to various
+;; optimizations, full length keys are not typically stored in the
+;; branches.  Branches are also special as for every n keys, n+1
+;; pointers must be stored.
+
+(defflavor branch-node () (node)
+  :readable-instance-variables
+  :writable-instance-variables
+  (:method-combination check-consistency (:and :most-specific-last)))
+
+
+;; Given an actual disk page and a header, return the value for the
+;; entry the header points to.  This is only valid on branch disk pages. 
+;; This should become a defsubst-in-flavor when someone unbreaks them.
+(defmacro child-at-header (disk-array header)
+  `(aref ,disk-array
+	 (- (entry-key-start ,header) 1)))
+
+;; This is similar to CHILD-AT-HEADER except that the header specified
+;; by entry-index is fetched for the caller.
+;; for you from the disk page
+(defmacro child-at-entry (disk-array entry-index &environment env)
+  (once-only (disk-array &environment env)
+    `(child-at-header ,disk-array (aref ,disk-array ,entry-index))))
+
+;; Objects of type LEAF-NODE are used to store the actual data the
+;; client has entrusted to the B*-tree.  There is one entry per key.
+
+(defflavor leaf-node () (node)
+  :readable-instance-variables
+  :writable-instance-variables
+  (:method-combination check-consistency (:and :most-specific-last)))
+
+;; Objects of type OVERFLOW-RECORD are used to store keys and values
+;; which are too large to store directly in the node.  In the current
+;; design, when the total size of an entry is greater than 1/2 *
+;; (page size - node overhead words), an overflow key or a set of
+;; overflow values is necessary.
+
+(defflavor overflow-record () (index-record)
+  :readable-instance-variables
+  :writable-instance-variables)
+
+;;; Utility macro for defining resources for the various index records.
+
+(defmacro make-record-resource-definition (type)
+  `(defresource ,type (disk-page address)
+     :constructor
+     (make-instance ',type)
+     :initializer
+;;This is acutally slower than SET-DISK-PAGE below
+;     (setf (index-record-disk-page object) disk-page
+;	   (index-record-disk-page-address object) address)
+     (set-disk-page object disk-page address)
+     :matcher (true object)
+     :deinitializer
+     (setf (index-record-disk-page object) nil)))
+
+;; Define the various resources now.
+(make-record-resource-definition branch-node)
+(make-record-resource-definition leaf-node)
+(make-record-resource-definition overflow-record)
+
+;;This function returns the type of scroll required to paginate a given
+;;node.  These guys might become more fancy when we have more than one
+;;kind of index.
+(defmethod (scroll-type leaf-node) () 'leaf-scroll)
+(defmethod (scroll-type branch-node) () 'branch-scroll)
+
+(defmethod (free-space node) () (node-free-space disk-page))
+
+
+;;; Lookup
+
+;; Keys are art-32b arrays (e.g. art-fixnum).
+
+;; -1 means ARRAY1 is less than ARRAY2, 0 means they are equal, 1 means 
+;; ARRAY1 is greater than ARRAY2.  The key should already be encoded.
+(defsubst array-compare (array1 array1-start array1-length
+		      array2 array2-start array2-length)
+  (loop with i = array1-start and 
+	     j = array2-start
+	with array1-end = (+ i array1-length) and
+	     array2-end = (+ j array2-length)
+	as result = (- (aref array1 i) (aref array2 j)) do
+	(cond ((not (zerop result)) 
+	       (return (signum result)))
+	      (t
+	       (incf i)
+	       (incf j)
+	       (if (>= i array1-end)
+		   (if (>= j array2-end)
+		       (return 0)
+		     (return -1))
+		 (if (>= j array2-end)
+		     (return 1)))))))
+
+;; -1 means key is less than indexed key, 0 means they are equal, 1 means 
+;; the key is greater than the indexed key.  The key should already be encoded.
+(defun key-compare (key-array key-start key-length disk-array header)
+  (if (zerop (entry-key-overflow header))
+      (array-compare key-array key-start key-length
+		     disk-array (entry-key-start header) (entry-key-length header))
+    (with-record-at (overflow-record (aref disk-array (entry-key-start header)) :read)
+      (overflow-key-compare overflow-record key-array key-start key-length))))
+
+;; -1 means dp/h-1 is less than entry indexed by index-2, 0 means they
+;; are equal, 1 means dp/h-1 is greater than entry indexed by index-2
+;; This all badly needs to be merged with the optimized-key-length code.
+(defmethod (general-key-compare node) (disk-page-1 header-1 disk-page-2 header-2)
+  (cond ((not (overflow-key-p header-1))
+	 ;;If the first key is not an overflow key, then key-compare can handle
+	 ;;the situation.
+	 (key-compare disk-page-1 (entry-key-start header-1) (entry-key-length header-1)
+		      disk-page-2 header-2))
+	;;If the first key is an overflow key, but the second one is not, we
+	;;just reverse the args to key-compare, and invert the result
+	((not (overflow-key-p header-2))
+	 (* -1 (key-compare disk-page-2 (entry-key-start header-2)
+			    (entry-key-length header-2)
+			    disk-page-1 header-1)))
+	;;Otherwise we have been given two overflow keys.  Yank one into a temporary
+	;;array (sigh).  No one said overflow records were very efficient.  Hope you have
+	;;plenty of paging.
+	(t
+	 (sys:with-data-stack
+	   (with-record-at (overflow-record-1 (aref disk-page-1 (entry-key-start header-1))
+					      :read)
+	     (let ((array-1 (overflow-value-collect overflow-record-1)))
+	       (key-compare array-1 0 (length array-1)
+			    disk-page-2 header-2)))))))
+
+(defmethod (overflow-key-compare overflow-record) (key-array key-start key-length)
+  (loop with i = key-start and
+	  key-length-remaining = key-length and
+	  current-disk-array = disk-page 
+	as words-this-page = (- (overflow-record-data-fill-pointer current-disk-array)
+				*overflow-record-header-size*)
+	as result = (array-compare key-array i (min words-this-page key-length-remaining)
+				   current-disk-array *overflow-record-header-size*
+				   words-this-page)
+	while (zerop result) do
+    ;;If the last check was for less than a page, we have found the answer.  The
+    ;;answer depends upon the relative length of the key and the overflow record.
+    (if (<= key-length-remaining words-this-page)
+	(cond ((zerop (overflow-record-next current-disk-array))
+	       ;;If this last comparison uses up all of the key, and
+	       ;;this is the last page of the overflow record, we now
+	       ;;know the answer.  If the length of the last bit of key
+	       ;;is smaller than the number of words in the overflow record,
+	       ;;the key is less than the record, so return -1.  Otherwise,
+	       ;;if the key and record are both of the same length, return 0
+	       ;;as they are identical.
+	       (record-test-point overflow-compare-1)
+	       (return (- key-length-remaining words-this-page)))
+	      (t
+	       (record-test-point overflow-compare-2)
+	       ;;Otherwise, if this is not the last overflow page, there is more
+	       ;;record but we have run out of key.  Return -1 to indicate that the
+	       ;;key is less than the record.
+	       (return -1)))
+      ;;Otherwise, we have more key than this record currently contains.
+      (when (zerop (overflow-record-next current-disk-array))
+	;;If there is no more record (but there is more key), the key is
+	;;greater than the record, which is indicated by a result of 1.
+	(record-test-point overflow-compare-3)
+	(return 1)))
+    ;;Otherwise, there is more key and overflow record, so keep going.
+    (record-test-point overflow-compare-4)
+    (decf key-length-remaining words-this-page)
+    (incf i words-this-page)
+    (when-debugging-and (zerop (overflow-record-next current-disk-array))
+      (error "B* Index system bug: overflow length information incorrect."))
+    ;;When we start returning disk-pages to file level, we may want
+    ;;to recurse here.
+    (setq current-disk-array (read-page *current-segment*
+					(overflow-record-next current-disk-array)))
+	finally
+	  (record-test-point overflow-compare-5)
+	  (return result)))
+
+;; Takes an encoded key.  Returns the header index which points to the
+;; smallest key which is greater or equal to the specified key.  Second
+;; value indicates if an exact match occured.
+
+(defmethod (search-node leaf-node) (key-array)
+  (loop with lower-bound = *index-record-header-size* and
+	     upper-bound = (- (node-header-fill-pointer disk-page) 1)	
+	   		    ;; Fast (truncate (+ lb ub) 2) for small lb and ub
+	as current-index = (ldb (byte 31 1) (+ lower-bound upper-bound))
+	with current-header do
+    (if (> lower-bound upper-bound)
+	(return (values lower-bound nil))
+      (setq current-header (aref disk-page current-index))
+      (case (key-compare key-array 0 (length key-array) disk-page current-header)
+	(0  (return (values current-index t)))
+	(1  (setq lower-bound (+ current-index 1)))
+	(-1 (setq upper-bound (- current-index 1)))))))
+
+;; Takes an encoded key, its start, and its length.  Returns the header
+;; index which points to the smallest key which is greater or equal to
+;; the specified key.  Second value indicates if an exact match occured.
+;; We subtract two from the header fill pointer because subtracting one
+;; converts the fill pointer to the last zero origin index, and
+;; subtracting another one makes the upper bound index one less than the
+;; last entry.
+(defmethod (search-node-subseq branch-node) (key-array key-start key-length)
+  (loop with lower-bound = *index-record-header-size* and
+	     upper-bound = (- (node-header-fill-pointer disk-page) 2)
+	   		    ;; Fast (truncate (+ lb ub) 2) for small lb and ub
+	as current-index = (ldb (byte 31 1) (+ lower-bound upper-bound))
+	with current-header do
+    (if (> lower-bound upper-bound)
+	(return (values lower-bound nil))
+      (setq current-header (aref disk-page current-index))
+      (case (key-compare key-array key-start key-length disk-page current-header)
+	(0  (return (values (+ current-index 1) t)))
+	(1  (setq lower-bound (+ current-index 1)))
+	(-1 (setq upper-bound (- current-index 1)))))))
+
+(defmacro with-child-matching-key ((child key mode) &body body)
+  `(with-record-at (,child (child-at-entry disk-page
+						  (search-node-subseq self ,key 0
+						   (length (the array ,key))))
+		    ,mode)
+	    . ,body))
+
+(defmethod (lookup-value leaf-node) (key)
+  (multiple-value-bind (index found-p) (search-node self key)
+    (let* ((header (aref disk-page index)))
+      (if found-p
+	  (if (and (zerop (entry-value-overflow header))
+		   (= (entry-number-of-values header) 1))
+	      (aref disk-page (- (entry-key-start header) 1))
+	    (signal 'too-many-values-for-single-lookup :key key)
+	    nil)
+	nil))))
+
+(defmethod (lookup-value branch-node) (key)
+  (with-child-matching-key (child-node key :read)
+    (lookup-value child-node key)))
+
+;; This is actually slower for some reason
+;(defmethod (lookup-value branch-node) (key)
+;  (loop with disk-array = disk-page
+;	until (= (aref disk-array 0) *leaf-node-code*)
+;	for address = (child-at-entry disk-array (search-branch-node-subseq key 0
+;								 (length (the array key))
+;								 disk-array))
+;	do (setf disk-array (read-page *current-segment* address))
+;	finally
+;	  (with-record-at (leaf-node address)
+;	    (lookup-value leaf-node key))))
+(defmethod (collect-entry-values leaf-node) (index exists-p)
+  (values
+    (if exists-p
+	(let* ((header (aref disk-page index))
+	       (number-of-values (entry-number-of-values header)))
+	  (if (zerop (entry-value-overflow header))
+	      (let ((result (sys:make-stack-array number-of-values
+						  :element-type 'fixnum)))
+		(forward-copy-part-of-array disk-page (- (entry-key-start header)
+							 number-of-values)
+					    result 0 number-of-values)
+		result)
+	    (with-record-at (overflow-record (child-at-header disk-page header) :read)
+	      (overflow-value-collect overflow-record))))
+      (sys:make-stack-array 0 :element-type 'fixnum))
+    disk-page-address))
+
+(defmethod (lookup-values leaf-node) (key)
+  (multiple-value-bind (index exists-p) (search-node self key)
+    (collect-entry-values self index exists-p)))
+
+(defmethod (lookup-values branch-node) (key)
+  (with-child-matching-key (child-node key :read)
+    (lookup-values child-node key)))
+  
+(defmethod (compute-depth branch-node) ()
+  (1+ (with-record-at (child (child-at-entry disk-page *index-record-header-size*) :read)
+	(compute-depth child))))
+
+(defmethod (compute-depth leaf-node) () 1)  
+
+(defmethod (overflow-value-collect overflow-record) (&optional (result-array nil)
+							       (result-start 0)
+							       &key count-only)
+  (record-test-point overflow-value-collect-main)
+  (loop with space-required = 0
+	with result = (or result-array
+			  (sys:make-stack-array (overflow-record-total-length disk-page)
+						:element-type 'fixnum
+						:fill-pointer 0)) and
+	  current-disk-page = disk-page
+	with result-size = (when (not count-only)			       
+			       (array-total-size result))
+	as words-this-page = (- (overflow-record-data-fill-pointer current-disk-page)
+				*overflow-record-header-size*) and
+	   next-address = (overflow-record-next current-disk-page) do
+    (cond (count-only
+	   (incf result words-this-page))
+	  (t
+	   (unless (< (+ result-start words-this-page) result-size)
+	     (adjust-array result (+ result-start words-this-page))
+	     (incf result-size words-this-page))
+	   (forward-copy-part-of-array current-disk-page *overflow-record-header-size*
+				       result result-start words-this-page)
+	   (incf space-required words-this-page)))
+    until (zerop next-address) do
+    (record-test-point overflow-value-collect-multi-page)
+    (setf current-disk-page (read-page *current-segment* next-address))
+    (incf result-start words-this-page)
+    finally
+      (unless count-only
+	(incf (fill-pointer result) space-required))
+      (return result)))
+
+(defmethod (greatest-leaf-address leaf-node) ()
+  (record-test-point greatest-leaf-address)
+  disk-page-address)
+
+(defmethod (greatest-leaf-address branch-node) ()
+  (with-record-at (child-node (child-at-entry disk-page
+					      (- (node-header-fill-pointer disk-page) 1))
+			      :read)
+    (greatest-leaf-address child-node)))
+
+(defmethod (least-leaf-address leaf-node) ()
+  (record-test-point least-leaf-address)
+  disk-page-address)
+
+(defmethod (least-leaf-address branch-node) ()
+  (with-record-at (child-node (child-at-entry disk-page *index-record-header-size*) :read)
+    (least-leaf-address child-node)))
+
+(defmethod (greatest-leaf-values leaf-node) ()
+  (record-test-point greatest-leaf-values)
+  (collect-entry-values self (- (node-header-fill-pointer disk-page) 1)
+			     ;;If the node is not empty, collect the values
+			     (not (node-empty-p disk-page))))
+
+
+(defmethod (least-leaf-values leaf-node) ()
+  (record-test-point least-leaf-values)
+  (collect-entry-values self *index-record-header-size*
+			     ;;If the node is not empty, collect the values
+			     (not (node-empty-p disk-page))))
+  
+(defmethod (locate-key-less-than branch-node) (key or-equal-p)
+  (with-child-matching-key (child-node key :read)
+    (locate-key-less-than child-node key or-equal-p)))
+
+(defmethod (locate-key-less-than leaf-node) (key or-equal-p)
+  (record-test-point locate-key-less-than)
+  (multiple-value-bind (index found-p) (search-node self key)
+    ;;If this is less-than-or-equal-to (e.g. not-greaterp), and there
+    ;;is an exact match on the specified key, just return it, else
+    ;;return the entry to the left, if it exists, otherwise return
+    ;;NIL.
+    (if (and found-p or-equal-p) (values disk-page-address index)
+      (if (> index *index-record-header-size*)
+	  (values disk-page-address (- index 1))
+	(with-previous-index-record (previous-node disk-page :read previous-disk-page)
+	  (if (null previous-node)
+	      nil
+	    (values (index-record-disk-page-address previous-node)
+		    (- (node-header-fill-pointer previous-disk-page) 1))))))))
+
+(defmethod (locate-key-greater-than branch-node) (key or-equal-p)
+  (with-child-matching-key (child-node key :read)
+    (locate-key-greater-than child-node key or-equal-p)))
+
+;;Rewrite slightly contorted control structure someday.
+(defmethod (locate-key-greater-than leaf-node) (key or-equal-p)
+  (record-test-point locate-key-greater-than)
+  (multiple-value-bind (index found-p) (search-node self key)
+    ;;If this is strictly greater-than, and we have an exact match on
+    ;;the specified key, or the index from the search is past the end
+    ;;of the node, attempt to find the next entry, else return what
+    ;;was found.
+    (if (or (and found-p (not or-equal-p))
+	    (not (< index (node-header-fill-pointer disk-page))))
+	(if (< index (- (node-header-fill-pointer disk-page) 1))
+	    (values disk-page-address (+ index 1))
+	  (with-next-index-record (next-node disk-page :read next-disk-page)
+	    (if (null next-node)
+		nil
+	      (values (index-record-disk-page-address next-node)
+		      *index-record-header-size*))))
+      (values disk-page-address index))))
+	
+;; Scanning a range (complex lookup)
+
+(defconstant *initial-scan-result-size* 1000.)
+
+(defmethod (scan-range index) (root-node lessp greaterp not-lessp not-greaterp
+					 &key count-only)
+  (multiple-value-bind (left-address left-index)
+      (if (null greaterp)
+	  (cond ((null not-lessp)
+		 (record-test-point scan-range-1)
+		 (values (least-leaf-address root-node) *index-record-header-size*))
+		(t
+		 (record-test-point scan-range-2)
+		 (locate-key-greater-than root-node not-lessp t)))
+	(cond ((null not-lessp)
+	       (record-test-point scan-range-3)
+	       (locate-key-greater-than root-node greaterp nil))
+	      (t
+	       (error "You must specify :GREATERP, :NOT-LESSP, or neither, but not both."))))
+    (multiple-value-bind (right-address right-index)
+	(if (null lessp)
+	    (cond ((null not-greaterp)
+		   (record-test-point scan-range-4)
+		   (with-record-at (greatest-node (greatest-leaf-address root-node) :read
+						  greatest-disk-page)
+		     (values (index-record-disk-page-address greatest-node)
+			     (- (node-header-fill-pointer greatest-disk-page) 1))))
+		  (t
+		   (record-test-point scan-range-5)
+		   (locate-key-less-than root-node not-greaterp t)))
+	  (cond ((null not-greaterp)
+		 (record-test-point scan-range-6)
+		 (locate-key-less-than root-node lessp nil))
+		(t
+		 (error
+		   "You must specify :LESSP, :NOT-GREATERP, or neither, but not both."))))
+      (scan-range-collect self left-address left-index right-address right-index
+			  :count-only count-only))))
+
+(defmethod (keys-crossed-p index) (start-address start-index end-address end-index)
+  (or ;;Catch the null index case, and simple cases.
+      (and (= start-address end-address) (< end-index start-index))
+      (with-record-at (start-node start-address :read start-disk-page)
+	(with-record-at (nil end-address :read end-disk-page)
+	  (> (general-key-compare start-node
+				  start-disk-page (aref start-disk-page start-index)
+				  end-disk-page (aref end-disk-page end-index))
+	     0)))))
+
+(defmethod (scan-range-collect index)
+ 	   (start-address start-index end-address end-index &key count-only)
+  ;;This is a macrolet instead of an flet because (declare (inline foo)) doesn't work,
+  ;;yet.
+  (macrolet ((collect-values (end)
+	       `(loop for i from start-index to ,end
+		      as header = (aref current-disk-page i) do
+		  (if (zerop (entry-value-overflow header))
+		      (if count-only
+			  (incf result (entry-number-of-values header))
+			  (loop for j from (- (entry-key-start header)
+					      (entry-number-of-values header))
+				      below (entry-key-start header) do
+			    (array-push-extend result (aref current-disk-page j))
+			    ;;Separate results from different keys by a zero
+			    ;;element.  Added by request of DLW on 7/22/86 to
+			    ;;make sorting easier for model level.
+				finally (array-push-extend result 0)))
+		      (with-record-at (overflow-record (child-at-header current-disk-page
+									header) :read)
+			(if count-only
+			    (setf result
+				  (overflow-value-scan-range-collect overflow-record result
+								     :count-only count-only))
+			    (overflow-value-scan-range-collect overflow-record result)))))))
+    (cond ((or (null start-address)
+	       (null end-address)
+	       (keys-crossed-p self start-address start-index end-address end-index))
+	   (record-test-point scan-range-collect-1)
+	   (if count-only
+	       0
+	       (sys:make-stack-array 0 :fill-pointer 0)))
+	  (t
+	   (loop with result = (if count-only
+				   0
+				   (sys:make-stack-array *initial-scan-result-size*
+						     :fill-pointer 0))
+		 until (zerop start-address) do
+	     (with-record-at (nil start-address :read current-disk-page)
+	       (cond ((= start-address end-address)
+		      (record-test-point scan-range-collect-2)
+		      (collect-values end-index)
+		      (return result))
+		     (t
+		      (record-test-point scan-range-collect-3)
+		      (collect-values (- (node-header-fill-pointer current-disk-page) 1))
+		      (setf start-address (node-next current-disk-page))
+		      (setf start-index *index-record-header-size*))))
+	     finally (return result))))))
+
+(defmacro ensure-room-in-array (space-required array &environment env)
+  (once-only (space-required array &environment env)
+    `(let ((space-remaining (- (zl:array-length ,array) (fill-pointer ,array))))
+       (when (< space-remaining ,space-required)
+	 ;;It would be more accurate to use (- space-required space-remaining) instead
+	 ;;of simply space-remaining, but a little extra space never hurt.
+	 ;;Actually, we should probably grow this by some multiple a of suitable quanta,
+	 ;;but it currently is not worth it.
+	 (adjust-array ,array (+ ,space-required (zl:array-length ,array)))))))
+
+(defmethod (overflow-value-scan-range-collect overflow-record) (result &key count-only)
+  (record-test-point overflow-value-scan-range-collect)
+  ;;Separate results from different keys by a zero
+  ;;element.  Added by request of DLW on 7/22/86 to
+  ;;make sorting easier for model level.
+  (cond (count-only
+	 (overflow-value-collect self result 0 :count-only count-only))
+	(t
+	 (ensure-room-in-array (1+ (overflow-record-total-length disk-page)) result)
+	 (overflow-value-collect self result (fill-pointer result))
+	 ;;Separate results from different keys by a zero
+	 ;;element.  Added by request of DLW on 7/22/86 to
+	 ;;make sorting easier for model level.
+	 (array-push-extend result 0))))
+
+
+;;; Insertion
+
+;;;Maybe optimize to iteration later (but this looks so nice!)
+;;;Sigh, it would be nice if we had tail recursion.
+(defmethod (insert branch-node) (key value single-value-p depth)
+  (with-child-matching-key (child-node key (if (= depth 2) :write :read))
+    (insert child-node key value single-value-p (1- depth))))
+
+;; Given an encoded key and a value, associate the value with the key
+(defmethod (insert leaf-node) (key value single-value-p depth)
+  (unless (= depth 1) (error "Depth not 1 at leaf-node"))
+  (multiple-value-bind (index found-p) (search-node self key)
+    (cond (found-p
+	   (cond (single-value-p
+		  (signal 'too-many-values-for-insert :key key :value value))
+		 (t
+		  (write-page *current-segment* disk-page-address)
+		  (insert-value-into-entry self index value))))
+	  (t
+	   (write-page *current-segment* disk-page-address)
+	   (insert-key-subseq self index key 0 (length key) value)
+	   index))))
+
+;; Sort of like COPY-ARRAY-PORTION, except it assumes that BITBLT is not
+;; worthwhile, and it takes two starting indices and a length.  It also
+;; handles the overflap case correctly when data is moving forward (e.g.
+;; TO-START > FROM-START).  For small LENGTHs, this appears to be
+;; faster than COPY-ARRAY-PORTION.
+;; It would be nice to have a block move instruction.
+
+(defun reverse-copy-part-of-array (from-array from-start to-array to-start length)
+  (let ((from-array from-array)
+	(to-array to-array))
+    (declare (compiler:array-register-1d from-array to-array))
+    (setq from-start (+ from-start length)
+	  to-start   (+ to-start length))
+    (loop repeat length
+	  do (decf from-start)
+	     (decf to-start)
+	     (setf (aref to-array to-start) (aref from-array from-start)))))
+
+;; Similar to above, except it handles the overlap case correctly when
+;; data is moving backward (e.g. TO-START < FROM-START).  This does
+;; better than COPY-ARRAY-PORTION even for LENGTHs of 150.
+
+;; Investigate changing this to dbfs::fast-copy-fixnum-array some day.
+
+(defun forward-copy-part-of-array (from-array from-start to-array to-start length)
+  (let ((from-array from-array)
+	(to-array to-array))
+    (declare (compiler:array-register-1d from-array to-array))
+    (loop repeat length
+	  do (setf (aref to-array to-start) (aref from-array from-start))
+	     (incf from-start)
+	     (incf to-start))))
+
+
+(defsubst copy-part-of-array (from-array from-start to-array to-start length)
+  (if (> to-start from-start)
+      (reverse-copy-part-of-array from-array from-start to-array to-start length)
+    (forward-copy-part-of-array from-array from-start to-array to-start length)))
+
+;; Moves the variable length data pointed to by INDEX in DISK-PAGE to the top 
+;; of the variable length data heap in DISK-PAGE, in preparation for 
+;; inserting a value into the variable length data entry.  Returns the modified
+;; header of the entry which has been moved to the top.
+(defmethod (move-entry-to-top-of-heap node) (header-index header)
+  (let* ((number-of-values (entry-number-of-values header))
+	 (entry-size  (+ number-of-values (entry-key-length header)))
+	 (entry-index (- (entry-key-start header)
+			 number-of-values))
+	 (fill-pointer (node-data-fill-pointer disk-page)))
+    ;; If entry is on top, return unchanged header, else move
+    ;; entry to the top of the heap
+    (cond ((= fill-pointer entry-index)
+	   (record-test-point move-entry-to-top-of-heap-no-move)
+	   header)
+	  (t
+	   (using-resource (temp-page temp-page)
+	     (record-test-point move-entry-to-top-of-heap-with-move)
+	     ;; Save entry into temp page
+	     (forward-copy-part-of-array disk-page entry-index
+					 temp-page 0
+					 entry-size)
+	     ;; Push the data before ENTRY-INDEX down
+	     (reverse-copy-part-of-array disk-page fill-pointer
+					 disk-page (+ fill-pointer entry-size)
+					 (- entry-index fill-pointer))
+	     ;; Restore values from temp page to top of heap
+	     (forward-copy-part-of-array temp-page 0
+					 disk-page fill-pointer
+					 entry-size))
+	   ;;Now adjust pointers into the variable length data area
+	   ;;If we make SET-ENTRY-xx forms, this should be changed
+	   (loop for i from *index-record-header-size*
+		       below (node-header-fill-pointer disk-page)
+		 as key-start = (entry-key-start (aref disk-page i)) do
+	     (when (< key-start entry-index)
+	       (setf (aref disk-page i)
+		     (set-entry-key-start (aref disk-page i)
+					  (+ key-start entry-size)))))
+	   ;;Update the header for the moved entry in DISK-PAGE, and return the 
+	   ;;new header value.
+	   ;;If we make SET-ENTRY-xx forms, this should be changed
+	   (setf (aref disk-page header-index)
+		 (set-entry-key-start (aref disk-page header-index)
+				      (+ fill-pointer number-of-values)))))))
+
+(defmethod (insert-value-into-entry leaf-node) (index value)
+  (let ((header (aref disk-page index)))
+    (if (zerop (entry-value-overflow header))
+	(if (and (< (size-of-existing-entry header) *50%-point-of-page*)
+		 ;; also go to an overflow record if you would exceed the field!
+		 (< (entry-number-of-values header) (entry-number-of-values -1)))
+	    (cond ((> (node-free-space disk-page) 0)
+				;;Rearranges node, then returns altered header
+		   		;;at INDEX.
+		   (move-entry-to-top-of-heap self index header)
+		   (let ((new-data-fill-pointer (decf (node-data-fill-pointer disk-page))))
+		     (setf (aref disk-page new-data-fill-pointer)
+			   value))
+		   ;;If we make SET-ENTRY-xx forms, this should be changed
+		   (incf (entry-number-of-values (aref disk-page index))))
+		  (t
+		   ;;There is not enough room in this node to add this
+		   ;;value.  Load a scroll up, append the specified
+		   ;;value to the entry at the specified index, and
+		   ;;repaginate.
+		   (split-and-insert self nil 0 0 value index)))
+	  (with-record-at (overflow-record (create-overflow-record disk-page-address) :write
+					   overflow-disk-page)
+	    (convert-immediate-values-to-overflow self index header
+						  overflow-record overflow-disk-page)
+	    (insert-value-into-overflow-record overflow-record value)))
+      (with-record-at (overflow-record (child-at-header disk-page header) :write)
+	(insert-value-into-overflow-record overflow-record value)))))
+
+;;Returns the disk address of the new overflow record
+(defun create-overflow-record (parent-address &key (next 0) (previous 0) (total-length 0))
+  (multiple-value-bind (disk-array address)
+      (allocate-whole-page *current-segment* *b-tree-overflow-page-code*)
+    (with-resource (overflow-record 'overflow-record disk-array address)
+      (initialize-disk-page overflow-record :next next :previous previous
+			    :parent parent-address)
+      (setf (overflow-record-total-length disk-array) total-length)
+      (setf (overflow-record-data-fill-pointer disk-array) *overflow-record-header-size*)
+      address)))
+
+(defmethod (convert-immediate-values-to-overflow node) (index header overflow-record
+							      overflow-disk-page)
+  (record-test-point convert-immediate-values-to-overflow-main)
+  (let ((key-start (entry-key-start header))
+	(key-length (entry-key-length header))
+	(number-of-values (entry-number-of-values header)))
+    ;;Copy the immediate values from the node to the overflow record
+    (forward-copy-part-of-array disk-page (- key-start number-of-values)
+				overflow-disk-page *overflow-record-header-size*
+				number-of-values)
+    (setf (overflow-record-total-length overflow-disk-page) number-of-values)
+    (setf (overflow-record-data-fill-pointer overflow-disk-page)
+	  (+ *overflow-record-header-size* number-of-values))
+    (with-resource (temp-page 'temp-page)
+      (forward-copy-part-of-array disk-page key-start
+				  temp-page 0
+				  key-length)
+      (delete-entry self index nil)
+      (insert-key-subseq self index temp-page 0 key-length
+			 (index-record-disk-page-address overflow-record)
+			 (entry-key-overflow header))
+      (setf (entry-value-overflow (aref disk-page index)) 1)
+      (repaginate-after-delete-if-necessary self))))
+
+
+(defmethod (insert-value-into-overflow-record overflow-record) (value)
+  (record-test-point insert-value-into-overflow-record)
+  (loop with current-address = disk-page-address
+	as current-disk-page = (write-page *current-segment* current-address)
+	as data-fill-pointer = (overflow-record-data-fill-pointer current-disk-page) and
+	   next-address = (overflow-record-next current-disk-page) do
+    ;;Perhaps only maintain total in first overflow record?
+    (incf (overflow-record-total-length current-disk-page))
+    (cond ((< data-fill-pointer *words-per-page*)
+	   (setf (aref current-disk-page data-fill-pointer) value)
+	   (setf (overflow-record-data-fill-pointer current-disk-page)
+		 (+ data-fill-pointer 1))
+	   ;;Return the current address for no particularly good reason (need to exit loop).
+	   (return current-address))
+	  ((not (zerop next-address))
+	   (setf current-address next-address))
+	  (t
+	   (setf current-address
+		 (create-overflow-record (overflow-record-parent disk-page)
+					 :previous current-address
+					 :total-length
+					 (overflow-record-total-length current-disk-page)))
+	   (setf (overflow-record-next current-disk-page) current-address)))))
+
+
+;; Callers should have already done a DBFS:WRITE-PAGE on self
+
+(defmethod (insert-key-subseq node) (header-index key-array key-start key-length value
+				     &optional (key-overflow 0))
+  (let* ((data-fill-pointer (node-data-fill-pointer disk-page))
+	 (header-fill-pointer (node-header-fill-pointer disk-page))
+	 (free-space (- data-fill-pointer header-fill-pointer))
+	 (entry-size (compute-size-of-entry key-length 1)))
+    (when-debugging-and *debug* (dbg:dbg))
+    (if (and (<= entry-size *50%-point-of-page*)
+	     ;; also go to an overflow record if you would exceed the field!
+	     (<= key-length (entry-key-length -1)))
+	(cond ((>= free-space entry-size)
+	       (let* ((destination-key-start (- data-fill-pointer key-length))
+		      (new-data-fill-pointer (- destination-key-start 1)))
+		 ;;Insert key
+		 (forward-copy-part-of-array key-array key-start
+					     disk-page destination-key-start key-length)
+		 ;;Insert value
+		 (setf (aref disk-page new-data-fill-pointer) value)
+		 ;;Adjust data fill pointer in DISK-PAGE
+		 (setf (node-data-fill-pointer disk-page) new-data-fill-pointer)
+		 ;;Make room for the header at HEADER-INDEX
+		 (reverse-copy-part-of-array disk-page header-index
+					     disk-page (1+ header-index)
+					     (- header-fill-pointer header-index))
+		 ;;Adjust header fill pointer in DISK-PAGE
+		 (setf (node-header-fill-pointer disk-page) (1+ header-fill-pointer))
+		 ;;Insert header
+		 (setf (aref disk-page header-index)
+		       (extended-make-entry :key-start destination-key-start
+					    :key-length key-length
+					    :number-of-values 1
+					    :key-overflow key-overflow))))
+	      (t (split-and-insert self key-array key-start key-length value
+				   header-index key-overflow)))
+      (insert-key-into-overflow-record self header-index key-array value))))
+
+(defmethod (insert-key-into-overflow-record node) (header-index key value)
+  (record-test-point insert-key-into-overflow-record)
+  (let ((overflow-record-address
+	  (create-overflow-record disk-page-address :total-length (length (the array key)))))
+    (with-record-at (overflow-record overflow-record-address :read)
+      (insert-overflow-key overflow-record key))
+    (with-resource (temp-page 'temp-page)
+      (setf (aref temp-page 0) overflow-record-address)
+      ;;This may split and cause repagination, making header-index
+      ;;invalid, so we must pass key-overflow bit down to the normal
+      ;;key insertion code, which may have to pass it across modules to
+      ;;the scroll insertion code.  Rethink the modularity here some day.
+      (insert-key-subseq self header-index temp-page 0 1 value 1))))
+
+(defmethod (insert-overflow-key overflow-record) (key)
+  (loop with current-disk-page = disk-page and
+	  current-address = disk-page-address and
+	  available-data-space = (- *words-per-page* *overflow-record-header-size*) and
+	  total-key-length  = (length (the array key)) and
+	  i = 0
+	as words-this-page = (min available-data-space (- total-key-length i)) do
+    (setf (overflow-record-data-fill-pointer current-disk-page)
+	  (+ words-this-page *overflow-record-header-size*))
+    (setf (overflow-record-total-length current-disk-page) total-key-length)
+    (forward-copy-part-of-array key i
+				current-disk-page *overflow-record-header-size*
+				words-this-page)
+    (incf i words-this-page)
+    	until (= i total-key-length) do
+    (record-test-point insert-overflow-key-multi-page)
+    (setf current-address (create-overflow-record disk-page-address
+						  :previous current-address))
+    (setf (overflow-record-next current-disk-page) current-address)
+    (setf current-disk-page (write-page *current-segment* current-address))))
+
+(defmethod (insert-last-entry branch-node) (value)
+  (when-debugging-and *debug* (dbg:dbg))
+  (if (and (> (number-of-entries-in-disk-page disk-page) 0)
+	   (zerop (entry-key-length (aref disk-page
+					  (1- (node-header-fill-pointer disk-page))))))
+      (error "B* Index system bug: Inserting a zero length key entry into
+              a branch which already has one.")
+    (insert-key-subseq self (node-header-fill-pointer disk-page)
+	  *zero-length-array* 0 0 value)))
+
+;; Assumes the disk page you are passing in is from a branch node.
+;; Use array registers, make defsubst-in-flavor when we believe that works.
+(defsubst find-header-index-for-address (disk-array address)
+  (loop for i from *index-record-header-size* below (node-header-fill-pointer disk-array)
+	when (= (child-at-entry disk-array i)
+		address) do
+	  (return i)
+	finally
+	 nil))
+
+;;Make this more efficient by doing less deleting and inserting some time.
+(defmethod (replace-key branch-node)
+	   (child-address boundry-disk-page boundry-key-start boundry-key-length
+	    repagination-prohibited-p &optional (overflow-key 0))
+  (record-test-point replace-key-main)
+  (when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+  (let ((header-index (find-header-index-for-address disk-page child-address)))
+    (cond (header-index
+	   (delete-entry self header-index nil)
+	   (insert-key-subseq self header-index boundry-disk-page boundry-key-start
+		 boundry-key-length child-address overflow-key))
+	  (t (error "B* Index system bug: Replacing entry which is not present."))))
+  (when (not repagination-prohibited-p)
+    (record-test-point replace-key-repaginate-after)
+    (repaginate-after-delete-if-necessary self)))
+
+
+;;Loads the node into a scroll with its left and right neighbors (if
+;;available), inserting the specified key and value.  (If the key is
+;;null, just the value is inserted.  The nodes are then repaginated and
+;;stored back in the nodes they came from, possibly creating, inserting
+;;and using an empty node if there is not enough free space obtained
+;;from the neighbors.  If the key is null, the value is appended to the 
+;;existing entry at INDEX.
+(defmethod (split-and-insert node) (key-array key-start key-length value index
+				    &optional (key-overflow 0))
+  (flet ((split (always-create-new-page-p)
+	   (with-resource (scroll (scroll-type self) *words-per-page*)
+	     (let ((new-page-p (load-scroll scroll self disk-page key-array
+				   key-start key-length value index
+				   always-create-new-page-p key-overflow)))
+	       (multiple-value-bind (left-boundry right-boundry result)
+		   (find-boundry-records scroll)
+		 (when (eq result :success)
+		   (move-entries-from-scroll-to-nodes scroll left-boundry right-boundry))
+		 (values result new-page-p))))))
+    (multiple-value-bind (result new-page-p) (split nil)
+      ;;If we failed to find the appropriate number of boundry
+      ;;records, try again forcing the pagination algorithm to
+      ;;allocated a new node as one of the neighbors.
+      (when (eq result :failure)
+	(cond (new-page-p
+	       (error "B* Index system bug: Cannot paginate current scroll."))
+	      (t
+	       (record-test-point split-and-insert-second-pass)
+	       (multiple-value-bind (result) (split t)
+		 ;;If we failed with the addition of a empty page, there is a
+		 ;;bug in pagination code.
+		 (if (eq result :failure)
+		     (error "B* Index system bug: Cannot paginate current scroll.")))))))))
+
+
+
+;; If the usual case is true (this node and the next share the same parent),
+;; no search is needed, and the parent address and the child address are returned.
+;; Otherwise search up the tree on the right side of the split until the point
+;; where there are entries to the left.  The entry to the left is the child, and
+;; the node where such an entry exists in the common parent.
+(defmethod (find-common-parent-address node) (other-disk-page other-page-address)
+  (flet ((find-common-parent (right-disk-page right-address)
+	   (cond ((= (node-parent disk-page) (node-parent right-disk-page))
+		  (values (node-parent disk-page) disk-page-address))
+		 (t
+		  (loop	for previous-address first right-address then address and
+			for address first (node-parent right-disk-page)
+				    then (node-parent next-disk-page)
+			as next-disk-page = (read-page *current-segment* address)
+			when (not (= (child-at-entry next-disk-page
+						      *index-record-header-size*)
+				      previous-address)) do
+			  (return
+			    (values address
+				    (child-at-entry next-disk-page
+				      (- (find-header-index-for-address next-disk-page
+									previous-address)
+					 1)))))))))
+    (cond ((new-destination-p other-disk-page)
+	   (record-test-point find-common-parent-address-with-new-destination)
+	   (with-next-index-record (after-other-node other-disk-page :read
+						     after-other-disk-page)
+	     ;;Maybe remove check for speed later
+	     (if (or (null after-other-disk-page)
+		     (new-destination-p after-other-disk-page))
+		 (error "B* Index system bug: Can't find next parent")
+	       (find-common-parent after-other-disk-page
+				   (index-record-disk-page-address after-other-node)))))
+	  (t (record-test-point find-common-parent-address-without-new-destination)
+	     (find-common-parent other-disk-page other-page-address)))))
+
+
+
+;;Deletion
+(defmethod (delete-entry node) (index &optional (gc-overflow-records-p t))
+  (let* ((header (aref disk-page index))
+	 (entry-size (data-space-used-by-existing-entry header))	
+	 (new-header-fill-pointer (1- (node-header-fill-pointer disk-page)))
+	 (data-fill-pointer (node-data-fill-pointer disk-page))
+	 (number-of-data-words-to-move (- (entry-start header)
+					  data-fill-pointer))
+	 (number-of-header-words-to-move (- new-header-fill-pointer index)))
+    (when gc-overflow-records-p
+      (when (overflow-key-p header)
+	(with-record-at (overflow-record (aref disk-page (entry-key-start header)) :write)
+	  (free-overflow-records overflow-record)))
+      (when (overflow-values-p header)
+	(with-record-at (overflow-record (child-at-header disk-page header) :write)
+	  (free-overflow-records overflow-record))))
+    ;;Reclaim the data space by pushing all the data above the entry's data down over it,
+    ;;unless we're at the top of the heap already.
+    (reverse-copy-part-of-array disk-page data-fill-pointer	
+				disk-page (+ data-fill-pointer entry-size)
+				number-of-data-words-to-move)
+    (setf (node-data-fill-pointer disk-page) (+ data-fill-pointer entry-size))
+    ;;Reclaim header slot by pulling up all the headers below the entry header index,
+    ;;unless this is the last entry.
+    (forward-copy-part-of-array disk-page (+ index *number-of-header-words*)
+				disk-page index
+				number-of-header-words-to-move)
+    (setf (node-header-fill-pointer disk-page) new-header-fill-pointer)
+    ;;Update the headers of any entry who's data has been moved.
+    ;;We can make this loop shorter, as once we're past the range of data movement,
+    ;;we can stop.  Also, if indices were relative to the end of the node (or maybe
+    ;;the fill pointer), we might not need to do this at all.  Remember that
+    ;;insert doesn't keep data space ordered, though.
+    (loop for i from *index-record-header-size* below (node-header-fill-pointer disk-page)
+	  as header = (aref disk-page i)
+	  when (and (>= (entry-start header) data-fill-pointer)
+		    (<= (entry-end header)
+			(+ data-fill-pointer number-of-data-words-to-move))) do
+	    (setf (aref disk-page i)
+		  (set-entry-key-start header (+ (entry-key-start header) entry-size))))
+    (when-debugging-and (eq *debug* :de) (dbg:dbg))))
+
+(defmethod (free-overflow-records overflow-record) ()
+  (record-test-point free-overflow-records)
+  (when-debugging-and (eq *debug* :FOR) (dbg:dbg))
+  (loop for current-address first disk-page-address
+			    then (overflow-record-next current-disk-page)
+	until (zerop current-address) 
+	for current-disk-page first disk-page
+			      then (read-page *current-segment* current-address) do
+    (deallocate-whole-page *current-segment* current-address)))
+
+
+;;To maintain consistency in the branch nodes, when the child of entry n
+;;is deleted, entry n-1 must have its key replaced with entry n's key,
+;;as all the children associated with entry n have been moved into entry
+;;n-1.  We accoplish this replace operation by remembering entry n-1's
+;;child address, deleting entry n-1, then clobbering entry n's (now
+;;really n-1's) child pointer to be that saved value.  If deletion of
+;;the first entry occurs (and this node is not on the left edge),
+;;the common parental key will need to be updated.  If we happen to
+;;be deleting the last node in the branch, just delete the branch.
+(defmethod (delete-child-pointer branch-node) (child-address child-disk-page)
+  (when-debugging-and *debug* (dbg:dbg))
+  (block delete-child-pointer
+    (let ((index (find-header-index-for-address disk-page child-address)))
+      (cond ((= (number-of-entries-in-disk-page disk-page) 1)
+	     ;;It is unclear exactly how to activate this code right now, since
+	     ;;the repaginate-after-delete-if-necessary branch code seems
+	     ;;to handle this right now.  Try again when we can allocate more than 200
+	     ;;pages.
+	     (record-test-point delete-child-pointer-1)
+	     (delete-entry self index)
+	     (delete-node self)
+	     (return-from delete-child-pointer t))
+	    (t
+	     (cond ((and (= index (1- (node-header-fill-pointer disk-page)))
+			 (or (not (= index *index-record-header-size*))
+			     (not (zerop (node-previous disk-page)))))
+		    (record-test-point delete-child-pointer-2)
+		    ;; When we are deleting the last element of this branch node,
+		    ;; be sure to zero out the key of the element which will be
+		    ;; the last one, once this element is gone.
+		    ;; Update-parent expects us only to deal with the immediate parent.
+		    ;; It will handle the internode case.
+		    (with-previous-index-record (previous-node child-disk-page :read
+							       previous-disk-page)
+		      (with-parent-index-record
+			(previous-parent-node previous-disk-page
+			 :write previous-parent-disk-page)
+			(replace-key previous-parent-node 
+				     (index-record-disk-page-address previous-node)	
+				     *zero-length-array*
+				     0 0
+				     T)
+			(when-debugging-and *debug* (dbg:dbg))
+			(delete-entry self index)
+			(repaginate-after-delete-if-necessary self))))
+		   (t
+		    (record-test-point delete-child-pointer-3)
+		    (delete-entry self index)
+		    ;;When the node is more than %50 free, compact the nodes
+		    ;;and remove any not used from the B* tree.
+		    (repaginate-after-delete-if-necessary self))))))))
+
+      
+(defmethod (replace-child-pointer branch-node) (child-address new-disk-page-address)
+  (record-test-point replace-child-pointer)
+  (let ((index (find-header-index-for-address disk-page child-address)))
+    (when-debugging-and *debug* (dbg:dbg))
+    (setf (child-at-entry disk-page index) new-disk-page-address)))
+
+;;Don't repaginate leaf nodes if they do not have any neighbors (e.g.
+;;this is the root of the tree), or the node has been killed, or 
+;;less then 50% of the node is free.
+(defwhopper (repaginate-after-delete-if-necessary leaf-node) ()
+  (unless (or (killed-p self)
+	      (and (zerop (node-next disk-page))
+		   (zerop (node-previous disk-page)))
+	      (<= (node-free-space disk-page) *50%-point-of-page*))
+    (continue-whopper)))
+
+(defwhopper (repaginate-after-delete-if-necessary branch-node) ()
+  (cond ((or (killed-p self)
+	     (<= (node-free-space disk-page) *50%-point-of-page*))
+	 ;;If the node is killed, or is less than 50% free, do nothing.
+	 nil)
+	((and (zerop (node-next disk-page))
+	      (zerop (node-previous disk-page)))
+	 ;;When this is the root, and there is only one entry in it,
+	 ;;collapse the tree by one level.
+	 (when (= (number-of-entries-in-disk-page disk-page) 1)
+	   (record-test-point compress-tree-one-level)
+	   (let ((child-address (child-at-entry disk-page *index-record-header-size*)))
+	     (with-record-at (child-node child-address :write child-disk-page)
+	       (setf (node-parent child-disk-page) 0)
+	       (set-index-root *current-index*
+			       (index-record-disk-page-address child-node))))
+	   (kill-node self)))
+	(t
+	 (continue-whopper))))
+
+;; Make this inline some day.
+;; Combine with FLET in split-and-insert, since these are the same.
+(defmethod (repaginate-after-delete-if-necessary node) ()
+  (when-debugging-and (eq *debug* :RAD) (dbg:dbg))
+  ;;If this node has no neighbors, there is no point in repaginating it.
+  (with-resource (scroll (scroll-type self) *words-per-page*)
+    ;;Load the scroll, but don't insert any key, and don't force allocation
+    ;;of an empty page (we should not need it.)
+    (load-scroll scroll self disk-page nil 0 0 nil
+		 (node-header-fill-pointer disk-page) nil)
+    (multiple-value-bind (left-boundry right-boundry result)
+	(find-boundry-records scroll)
+      ;;If we failed, there is a bug in pagination code.  This should
+      ;;never happen.  Maybe remove for speed later.
+      (if (eq result :failure)
+	  (error "B* Index system bug: Cannot paginate current scroll during delete.")
+	(move-entries-from-scroll-to-nodes scroll left-boundry right-boundry)))))
+
+
+(defvar *delete-of-new-node* 0)
+
+;; Don't allow the root to be deleted.
+;; ADJUST-LEFT-NEIGHBOR-KEY-P is an interim kludge until this can be thought out
+;; better.  The order of deleting empty nodes vs inserting new ones needs to be
+;; figured out better. 
+(defmethod (delete-node node) ()
+  (when-debugging-and *debug* (dbg:dbg))
+  (unless (zerop (node-parent disk-page))	
+    (when (not (node-empty-p disk-page))
+      (error "B* Index system bug: Attempt to delete a non-empty node"))
+    ;;Splice together left and right nodes, if they exist
+    (with-previous-index-record (nil disk-page :write left-disk-page)
+      (with-next-index-record (nil disk-page :write right-disk-page)
+	(when (not (null left-disk-page))
+	  (setf (node-next left-disk-page)
+		(node-next disk-page)))
+	(when (not (null right-disk-page))
+	  (setf (node-previous right-disk-page)
+		(node-previous disk-page)))))
+    ;;Remove node from tree
+    (if (new-destination-p disk-page)
+	(incf *delete-of-new-node*)
+      (with-parent-index-record (parent disk-page :write)
+	(delete-child-pointer parent disk-page-address disk-page)))
+    (kill-node self)))
+
+;;Merge with above someday (with proper macrology)
+(defmethod (replace-node node) (new-page-address)
+  (unless (zerop (node-parent disk-page))
+    (when (not (node-empty-p disk-page))
+      (error "B* Index system bug: Attempt to replace a non-empty node"))
+    ;;Splice together left and right nodes, if they exist
+    (with-previous-index-record (nil disk-page :write left-disk-page)
+      (with-next-index-record (nil disk-page :write right-disk-page)
+	(when (not (null left-disk-page))
+	  (setf (node-next left-disk-page)
+		(node-next disk-page)))
+	(when (not (null right-disk-page))
+	  (setf (node-previous right-disk-page)
+		(node-previous disk-page)))))
+    (with-parent-index-record (parent disk-page :write)
+      (replace-child-pointer parent disk-page-address new-page-address))
+    (kill-node self)))
+
+;; Make inline someday.
+;; Signify that the node is deleted by replacing the disk page with it's
+;; address.
+(defmethod (kill-node node) ()
+  (setf disk-page disk-page-address)
+  (deallocate-whole-page *current-segment* disk-page-address))
+
+;; Make inline someday
+(defmethod (killed-p index-record) ()
+  (typep disk-page 'fixnum))
+
+;;Make this a defmacro-in-flavor some day, when the bugs go away.
+;;Needs to be a macro because it uses lexical variables in a non-lexical way.
+;;Figure out better modularity some day.
+(defmacro find-value-index ()
+  '(loop for i from entry-start below (entry-key-start header)
+	 when (= (aref disk-page i) value)
+	   do (return i)
+	 finally (signal 'value-not-found-for-delete :key key :value value)))
+
+
+;; Share some code with delete-entry some day.  In the mean time, use a copy.
+(defmethod (delete-value leaf-node) (key value depth)
+  (unless (= depth 1) (error "Depth was not 1 at leaf"))
+  (multiple-value-bind (index found-p)
+      (search-node self key)
+    (if (not found-p)
+	(signal 'key-not-found-for-delete :key key :value value)
+      (let* ((header (aref disk-page index))
+	     (number-of-values (entry-number-of-values header)))
+	(write-page *current-segment* disk-page-address)
+	;;If we are dealing with overflow values, use the overflow routine
+	(cond ((not (zerop (entry-value-overflow header)))
+	       (record-test-point delete-value-overflow)
+	       (with-record-at (overflow-record (child-at-header disk-page header) :read)
+		 (delete-overflow-value overflow-record key value disk-page-address)))
+	      ;;If there is one (or fewer?) value here, delete
+	      ;;the whole entry from the tree, otherwise just
+	      ;;delete one of the values.
+	      ((and (< number-of-values 2)
+		    (= (child-at-header disk-page header) value))
+	       (record-test-point delete-value-purge-entry)
+	       (delete-entry self index))
+	      (t
+	       (record-test-point delete-value-main)
+	       (let* ((entry-start (entry-start header))
+		      (value-index (find-value-index))
+		      (data-fill-pointer (node-data-fill-pointer disk-page))
+		      (number-of-data-words-to-move (- entry-start data-fill-pointer)))
+		 ;;Compress the values for this entry over the value to be deleted.
+		 (reverse-copy-part-of-array disk-page entry-start
+					     disk-page (1+ entry-start)
+					     (- value-index entry-start))
+		 ;;Maybe optimized this with MAKE-ENTRY
+		 (setf (aref disk-page index)
+		       (extended-make-entry :start-value header
+					    :number-of-values (- number-of-values 1)))
+		 ;;Reclaim the data space by pushing all the data above
+		 ;;the entry's data down over the word freed with the
+		 ;;above copy, unless're at the top of the heap already.
+		 (reverse-copy-part-of-array disk-page data-fill-pointer	
+					     disk-page (+ data-fill-pointer 1)
+					     number-of-data-words-to-move)
+		 (setf (node-data-fill-pointer disk-page) (+ data-fill-pointer 1))
+		 ;;Update the headers of any entry who's data has been
+		 ;;moved.  We can make this loop shorter, as once we're
+		 ;;past the range of data movement, we can stop.  Also,
+		 ;;if indices were relative to the end of the node (or
+		 ;;maybe the fill pointer), we might not need to do this
+		 ;;at all.  Remember that insert doesn't keep data space
+		 ;;ordered, though.
+		 (loop for i from *index-record-header-size*
+			     below (node-header-fill-pointer disk-page)
+		       as header = (aref disk-page i)
+		       when (and (>= (entry-start header) data-fill-pointer)
+				 (<= (entry-end header)
+				     (+ data-fill-pointer number-of-data-words-to-move)))
+			 do
+			   (setf (aref disk-page i)
+				 (set-entry-key-start
+				   header (+ (entry-key-start header) 1)))))))
+	;;When the node is more than %50 free, compact the nodes
+	;;and remove any not used from the B* tree.
+	(repaginate-after-delete-if-necessary self)))))
+
+
+;;Branch nodes just pass the buck
+(defmethod (delete-value branch-node) (key value depth)
+  (with-child-matching-key (child-node key (if (= depth 2) :write :read))
+    (delete-value child-node key value (1- depth))))
+
+(defmethod (delete-overflow-value overflow-record) (key value parent-address)
+  (loop for current-address first disk-page-address
+			    then next-address
+	as current-disk-page = (read-page *current-segment* current-address)
+	as next-address = (overflow-record-next current-disk-page) and
+	   data-fill-pointer = (overflow-record-data-fill-pointer current-disk-page) and
+	   position = (position value (the array current-disk-page)
+				:start *overflow-record-header-size*
+				:end (overflow-record-data-fill-pointer current-disk-page)) do
+    (cond ((null position)
+	   (if (zerop next-address)
+	       (signal 'value-not-found-for-delete :key key :value value)))
+	  ;;If the words in this page is one (or less?), and we have a position, the
+	  ;;value must be this word.  Delete the whole page, since there will be nothing
+	  ;;left.  If this is the last entry in the whole overflow record, kill
+	  ;;the entry in our parent too.
+	  ((< (- data-fill-pointer *overflow-record-header-size*) 2)
+	   (record-test-point delete-overflow-value-1)
+	   (with-record-at (current-record current-address :read)
+	     (delete-overflow-record current-record parent-address)
+	     (when (not (= current-address disk-page-address))
+	       (decrease-overflow-total-length self))
+	     (return t)))
+	  ;;Otherwise, just reduce the number of entries in this particular overflow record
+	  ;;and then reduce the total in all overflow records.  Maybe someday we should
+	  ;;only keep track of the total in the first overflow record.
+	  (t
+	   (record-test-point delete-overflow-value-2)
+	   ;;Compact record over the value to be deleted.
+	   (write-page *current-segment* current-address)
+	   (forward-copy-part-of-array current-disk-page (1+ position)
+				       current-disk-page position
+				       (- data-fill-pointer position 1))
+	   (decf (overflow-record-data-fill-pointer current-disk-page))
+	   (decrease-overflow-total-length self)
+	   (return t)))))
+
+;;Generalize to standard overflow record mapping function some day.
+(defmethod (decrease-overflow-total-length overflow-record) ()
+  (loop as current-address first disk-page-address
+			   then next-address
+		until (zerop current-address)
+	as current-disk-page = (write-page *current-segment* current-address)
+	as next-address = (overflow-record-next current-disk-page) do
+	(decf (overflow-record-total-length current-disk-page))))
+
+(defmethod (delete-overflow-record overflow-record) (parent-address)
+  (with-next-index-record (next-record disk-page :write next-page)
+    (with-previous-index-record (previous-record disk-page :write previous-page)
+      (cond ((and (null next-record)
+		  (null previous-record))
+	     (record-test-point delete-overflow-record-1)
+	     ;;If this is the "root" of the overflow record chain, flush the entry
+	     ;;from the parent node
+	     (with-record-at (parent-record parent-address :write parent-page)
+	       (let ((index (find-header-index-for-address parent-page disk-page-address)))
+		 (when-debugging-and (null index)
+		   (error "B* Index system bug: overflow root not found in parent."))
+		 (delete-entry parent-record index)
+		 (repaginate-after-delete-if-necessary parent-record))))
+	    (t
+	     ;;Otherwise splice out this record
+	     (cond ((not (null previous-record))
+		    (record-test-point delete-overflow-record-2)
+		    (setf (overflow-record-next previous-page)
+			  (overflow-record-next disk-page)))
+		   (t
+		    (record-test-point delete-overflow-record-3)
+		    ;;If the previous record is null, we are deleting the overflow root.
+		    ;;We know that there is a next record, because we know both
+		    ;;previous and next records cannot be null, and the previous
+		    ;;one is null.  We must inform the parent node of the new root.
+		    (with-record-at (nil parent-address :write parent-page)
+		      (let* ((index (find-header-index-for-address parent-page
+								   disk-page-address)))
+			(setf (child-at-entry parent-page index)
+			      (overflow-record-next disk-page))))))
+	     (unless (null next-record)
+	       (setf (overflow-record-previous next-page)
+		     (overflow-record-previous disk-page)))
+	     ;;In any case, this page bites the dust.
+	     (deallocate-whole-page *current-segment* disk-page-address))))))
+
+
+;;; Whole tree deallocation 
+;;; Prefix tree walk, performing deallocation.  We should probably provide
+;;; general tree walking tool, and use that.
+(defmethod (deallocate-tree leaf-node) ()
+  (record-test-point deallocate-tree) 
+  ;;Deallocate any overflow keys or values
+  (loop for i from *index-record-header-size* below (node-header-fill-pointer disk-page)
+	as header = (aref disk-page i) do
+    (when (overflow-key-p header)
+      (with-record-at (overflow-record (aref disk-page (entry-key-start header)) :write)
+	(free-overflow-records overflow-record)))
+    (when (overflow-values-p header)
+      (with-record-at (overflow-record (child-at-header disk-page header) :write)
+	(free-overflow-records overflow-record))))
+  (deallocate-whole-page *current-segment* disk-page-address))
+
+(defmethod (deallocate-tree branch-node) ()
+  (loop for i from *index-record-header-size* below (node-header-fill-pointer disk-page)
+	as header = (aref disk-page i) do
+    (with-record-at (child-node (child-at-header disk-page header) :write)
+      (deallocate-tree child-node))
+    ;;Deallocate any overflow keys
+    (when (overflow-key-p header)
+      (with-record-at (overflow-record (aref disk-page (entry-key-start header)) :write)
+	(free-overflow-records overflow-record))))
+  (deallocate-whole-page *current-segment* disk-page-address))

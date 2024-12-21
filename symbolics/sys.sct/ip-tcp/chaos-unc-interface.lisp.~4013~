@@ -1,0 +1,258 @@
+;; -*- Mode: Lisp; Syntax: Zetalisp; Package: Network-Internals; Base: 10; Lowercase: Yes -*-
+;; Network Interface encapsulated in Chaos UNC packets.
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Here is the low-level CHAOS part of this
+
+chaos:
+(defun send-encapsulated-pkt (pkt source destination protocol-number free-flag)
+  (cond (*enable*
+	 (alter-pkt-leader pkt
+			   pkt-time-transmitted 0
+			   pkt-times-transmitted 0
+			   pkt-link free-flag)
+	 (setf (pkt-mbz pkt) 0)
+	 (setf (pkt-opcode pkt) unc-op)
+	 (setf (pkt-source-address pkt) source)
+	 (setf (pkt-source-index-num pkt) 0)
+	 (setf (pkt-dest-address pkt) destination)
+	 (setf (pkt-dest-index-num pkt) 0)
+	 (setf (pkt-num pkt) 0)
+	 (setf (pkt-ack-num pkt) protocol-number)
+	 (incf *encapsulated-pkts-out*)
+	 (transmit-pkt pkt))
+	(free-flag
+	 (return-pkt pkt))))
+
+;;;
+
+(cl:defconstant chaos-header-bytes (* 2 chaos:first-data-word-in-pkt))
+(cl:defconstant chaos-unc-max-packet-size 478)
+
+(defflavor chaos-unc-interface
+	((listen-conn)
+	 (brds-in 0)
+	 (brds-out 0)
+	 (networks))
+	(network-interface)
+  (:gettable-instance-variables brds-in brds-out))
+
+(defmethod (:max-packet-size chaos-unc-interface) () chaos-unc-max-packet-size)
+
+(defmethod (:network-supported chaos-unc-interface :or) (network)
+  (typecase network
+    (tcp:internet-network
+      (let ((acceptable-addresses
+	      (loop with chaos-addresses = (send *local-host* :chaos-addresses)
+		    for (net addr) in (send *local-host* :network-addresses)
+		    when (and (eq net network)
+			      (multiple-value-bind (b1 ignore b3 b4)
+				  (tcp:explode-internet-address addr)
+				(and (< b1 192)
+				     (memq (+ (lsh b3 8) b4) chaos-addresses))))
+		    collect addr)))
+	(cond ((null acceptable-addresses) nil)
+	      ((null (rest1 acceptable-addresses)) (first acceptable-addresses))
+	      (t t))))
+    (otherwise :unsupported)))
+
+(defmethod (:add-network chaos-unc-interface) (network address)
+  (unless overseer
+    (setq overseer (make-process "Chaos UNC Interface" :simple-p t))
+    (send overseer :preset #'send self :check-for-brds)
+    (process-enable overseer))  
+  (setf (get (locf networks) network) address))
+
+(defmethod (:protocol-address chaos-unc-interface) (network)
+  (get (locf networks) network))
+
+(defmethod (:reset chaos-unc-interface) ())
+
+;;; Transmit side
+
+(defmethod (:allocate-packet chaos-unc-interface) (&optional (wait-p t))
+  (let ((cpkt (chaos:get-pkt wait-p)))
+    (when cpkt
+      (chaos:mark-chaos-packet-returned cpkt)
+      (get-sub-packet cpkt 'art-8b chaos-header-bytes))))
+
+(defmethod (:transmit-packet chaos-unc-interface)
+	   (packet free-flag network address nbytes)
+  (when (> nbytes chaos-unc-max-packet-size) (error "Packet is too long to encapsulate."))
+  (when enabled
+    (let ((protocol-number (send network :address-resolution-parameters))
+	  (other-chaos-address (typecase network
+			   (tcp:internet-network
+			     (multiple-value-bind (ignore ignore b3 b4)
+				 (tcp:explode-internet-address address)
+			       (+ (lsh b3 8) b4)))
+			   (t (error "Unknown network type.")))))
+      (incf transmit-count)
+      (cond ((zerop other-chaos-address)
+	     ;; Broadcast
+	     (let ((contact-name (make-array (+ 10 nbytes) :element-type 'string-char)))
+	       (copy-array-portion "FOREIGN " 0 8 contact-name 0 8)
+	       (setf (aref contact-name 8) (ldb (byte 8 0) protocol-number))
+	       (setf (aref contact-name 9) (ldb (byte 8 8) protocol-number))
+	       (copy-array-portion packet 0 nbytes contact-name 10 (+ 10 nbytes))
+	       (chaos:remove-conn (chaos:broadcast contact-name)))
+	     (incf brds-out))
+	    ;; UNC
+	    (t
+	     (cl:multiple-value-setq (packet free-flag)
+	       (get-sub-packet-maybe-copying
+		 free-flag nbytes packet 'art-16b (- chaos-header-bytes)
+		 chaos:pkt-leader-size 'chaos:pkt))
+	     (when packet
+	       (when free-flag (chaos:mark-chaos-packet-allocated packet))
+	       (setf (chaos:pkt-nbytes packet) nbytes)
+	       (multiple-value-bind (nil nil b3 b4)
+		   (tcp:explode-internet-address (get (locf networks) network))
+		 (chaos:send-encapsulated-pkt packet
+					      (dpb b3 (byte 8 8) b4) other-chaos-address
+					      protocol-number free-flag))
+	       (setf packet nil))))))
+  (when (and packet free-flag) (deallocate-packet-buffer packet)))
+
+;;; Receive side
+
+(defmethod (:receive-unc-packet chaos-unc-interface) (chaos-packet)
+  (if enabled
+      (let ((pkt (neti:get-sub-packet chaos-packet 'art-8b chaos-header-bytes)))
+	(chaos:mark-chaos-packet-returned chaos-packet)
+	(send self :receive-protocol-packet pkt (chaos:pkt-ack-num chaos-packet)))
+      (chaos:return-pkt chaos-packet)))
+
+(defmethod (:packet-protocol-source-address chaos-unc-interface) (network pkt)
+  (let ((cpkt (get-sub-packet pkt 'art-16b (- chaos-header-bytes)
+			      chaos:pkt-leader-size 'chaos:pkt)))
+    (unless (zerop (chaos:pkt-source-address cpkt))
+      (typecase network
+	(tcp:internet-network
+	  (multiple-value-bind (b1 b2)
+	      (tcp:explode-internet-address (send self :protocol-address network))
+	    (tcp:build-internet-address b1
+					b2
+					(ldb (byte 8 8) (chaos:pkt-source-address cpkt))
+					(ldb (byte 8 0) (chaos:pkt-source-address cpkt)))))
+	))))
+
+(defmethod (:check-for-brds chaos-unc-interface) ()
+  (when listen-conn
+    (cl:case (chaos:state listen-conn)
+      (chaos:listening-state)
+      (chaos:brd-received-state
+       (let ((chaos-packet (when enabled (chaos:get-next-pkt listen-conn))))
+	 (chaos:remove-conn listen-conn)
+	 (setq listen-conn nil)
+	 (when chaos-packet
+	   (let ((pkt (neti:get-sub-packet chaos-packet 'art-8b (+ chaos-header-bytes 10))))
+	     (chaos:mark-chaos-packet-returned chaos-packet)
+	     (incf brds-in)
+	     (send self :receive-protocol-packet pkt
+		   (aref chaos-packet (+ chaos:first-data-word-in-pkt 4)))))))
+      (otherwise
+       (chaos:close-conn listen-conn)
+       (setq listen-conn nil))))
+  (unless listen-conn
+    (setq listen-conn (chaos:listen "FOREIGN" 1 nil)))
+  (si:set-process-wait current-process
+		       #'(lambda (conn) (neq (chaos:state conn) 'chaos:listening-state))
+		       (list listen-conn))
+  (setf (si:process-whostate current-process) "Chaos Foreign"))
+
+(defmethod (:receive-protocol-packet chaos-unc-interface) (pkt protocol-number)
+  (incf receive-count)
+  (loop for (network) on networks by #'cddr
+	until (= protocol-number (send network :address-resolution-parameters))
+	finally (if network
+		    (send network :receive-packet pkt self (get (locf networks) network))
+		    (neti:deallocate-packet-buffer pkt))))
+
+;;; Miscellaneous
+
+(define-server :chaos-foreign-index (:medium :chaos :conn conn)
+  (let ((pkt (chaos:get-pkt)))
+    (setf (aref pkt chaos:first-data-word-in-pkt) 0)
+    (setf (chaos:pkt-nbytes pkt) 2)
+    (chaos:answer conn pkt)))
+
+(chaos:add-contact-name-for-protocol :chaos-foreign-index "FOREIGN-INDEX")
+
+;;; Debugging
+
+(defmethod (:peek chaos-unc-interface) ()
+  (append (tv:peek-network-interface self)
+	  (list
+	    (tv:scroll-parse-item
+	      `(:function ,#'send (,self :brds-in) nil ("  BRD's in: ~D"))
+	      `(:function ,#'send (,self :brds-out) nil ("  BRD's out: ~D"))))))
+
+(compile-flavor-methods chaos-unc-interface)
+
+;(export 'tcp::*enable-chaos-unc-interface* "TCP")
+(defvar tcp:*enable-chaos-unc-interface* nil "T to enable Chaos UNC encapsulation.")
+
+(defun add-chaos-unc-interface ()
+  (when tcp:*enable-chaos-unc-interface*
+    (unless chaos:*unc-interface*
+      (setf chaos:*unc-interface*
+	    (with-network-cons-area (make-instance 'chaos-unc-interface))))
+    (unless (memq chaos:*unc-interface* *interfaces*)
+      (push chaos:*unc-interface* *interfaces*))))
+
+(add-initialization "Chaos Foreign Interface" '(add-chaos-unc-interface) nil
+		    'add-interfaces-initialization-list)
+
+(add-chaos-unc-interface)

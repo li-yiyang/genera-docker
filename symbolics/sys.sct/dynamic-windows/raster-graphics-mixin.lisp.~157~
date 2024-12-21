@@ -1,0 +1,2827 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: GRAPHICS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Pixel slice implementation of graphics protocol.  Used by window system.
+
+(defmethod (make-new-drawing-state raster-graphics-mixin) ()
+  (make-raster-drawing-state))
+
+(defmethod (current-position raster-graphics-mixin) ()
+  (current-position-1 (get-drawing-state self) self))
+
+(defmethod (current-position-1 raster-drawing-state) (stream)
+  (stream-untransform-point position-x position-y stream))
+
+(defmethod (set-current-position raster-graphics-mixin) (new-x new-y &key (explicit t))
+   (transform-and-fix-points new-x new-y)
+   (set-current-position-1 (get-drawing-state self) new-x new-y explicit))
+
+(defmethod (set-current-position-1 raster-drawing-state) (new-x new-y explicit)
+   (setq position-dx (and position-x (- new-x position-x))
+	 position-dy (and position-y (- new-y position-y))
+	 position-x new-x
+	 position-y new-y)
+   (when explicit
+     (setq path-initial-x new-x
+	   path-initial-y new-y
+	   path-initial-dx nil
+	   path-initial-dy nil)))
+
+(defmethod (raster-drawing-state-path-position raster-drawing-state) ()
+  (values position-x position-y path-initial-x path-initial-y
+	  position-dx position-dy path-initial-dx path-initial-dy))
+
+(defmethod (raster-drawing-state-set-path-position raster-drawing-state) (x y)
+  (setq position-x x position-y y))
+
+(defmethod (raster-drawing-state-set-path-initial-position raster-drawing-state)
+	   (initial-x initial-y)
+  (setq path-initial-x initial-x path-initial-y initial-y))
+
+(defmethod (raster-drawing-state-set-path-position-and-initial raster-drawing-state)
+	   (x y initial-x initial-y)
+  (setq position-x x position-y y
+	path-initial-x initial-x path-initial-y initial-y))
+
+(defmethod (raster-drawing-state-set-path-position-and-slope raster-drawing-state)
+	   (x y initial-x initial-y dx dy initial-dx initial-dy)
+  (setq position-x x position-y y
+	path-initial-x initial-x path-initial-y initial-y
+	position-dx dx position-dy dy
+	path-initial-dx initial-dx path-initial-dy initial-dy))
+
+;;; Convert a mixture of D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB"):alu0,1 :pattern0,1 :gray-level0,1 :color0,1 0etc. into
+;;; a device specific bitblt source and (possible extended) alu.
+(defmacro with-standardized-source-and-alu ((pattern ones-alu zeros-alu)
+					    &body body)
+  `(multiple-value-bind (,pattern ,ones-alu ,zeros-alu)
+       (standardize-source-and-alu)
+     . ,body))
+
+(defun-in-flavor (standardize-source-and-alu raster-graphics-mixin) ()
+  (drawing-state-source-and-alu (get-drawing-state self) self))
+
+(defvar *alloc-errors* nil)
+
+(defmethod (drawing-state-source-and-alu raster-drawing-state) (stream)
+  (declare (values pattern niy ones-alu zeros-alu))
+  (when (ldb-test %%drawing-state-parameters-unwritten flags)
+    ;; If we made a bitmap last time, we're done with it now.
+    (when (ldb-test %%drawing-state-temporary-source flags)
+      (setf (ldb %%drawing-state-temporary-source flags) 0)
+      (tv:deallocate-temp-sheet-raster-and-header
+	(prog1 source-pattern (setq source-pattern nil))))
+    ;; Pick a stipple pattern that will approximate the desired gray level.
+    (let ((alu alu)
+	  (source nil)
+	  (temporary-p nil) (tile-p nil)
+	  (gray-stipple t))
+      (condition-case (e)
+	   (cond (color
+		  (if (and (color:color-stream-p stream)  
+			   (not (member stream *alloc-errors*)))
+		      ;; If there is a color and this is a color screen, compute the alu for it,
+		      ;; possibly decreasing the intensity per gray-level.
+		      (setq alu (color:color-alu-for-window
+				  (if ( gray-level 1)
+				      (multiple-value-bind (i h s)
+					  (color:color-ihs color)
+					(with-stack-list (ihs (* i gray-level) h s)
+					  (color:make-color :ihs ihs)))
+				      color)
+				  stream (if opaque tv:alu-seta alu)))
+		      ;; A color on the b&w screen turns into the corresponding gray level from
+		      ;; its intensity, and thence into a stipple.
+		      (setq gray-stipple (gray-level-stipple
+					   (* gray-level
+					      (/ (expt (color:color-intensity color) 2) 3))))))
+		 ((and (not (or (= gray-level 1) (= gray-level 0)))
+		       (color:color-stream-p stream)
+		       (not (member stream *alloc-errors*)))
+		  ;; A gray other than black or white on a color screen turns into that color
+		  ;; of no hue, and thence into an alu.
+		  (let ((intensity gray-level))
+		    (when (let ((screen-bow (let ((screen (send-if-handles stream :screen)))
+					      (and screen (send screen :bow-mode))))
+				(window-reverse (send-if-handles stream :reverse-video-p)))
+			    (neq screen-bow window-reverse))
+		      (setq intensity (- 1 intensity)))
+		    (setq intensity (sqrt (* intensity 3)))
+		    (setq alu (multiple-value-bind (r g b)
+				  (color:ihs->rgb intensity 0 0)
+				(with-stack-list (rgb r g b)
+				  (color:color-alu-for-window rgb stream
+							      (if opaque tv:alu-seta alu)))))))
+		 (t
+		  ;; No color involved, compute the base stipple for the gray.
+		  (setq gray-stipple (gray-level-stipple gray-level))))
+	 (xlib::alloc-error (pushnew stream *alloc-errors*)
+			    (setq gray-stipple (gray-level-stipple gray-level))))
+      (if (null gray-stipple)
+	  ;; :gray-level 0 means draw with white ink, which is either transparent, or
+	  ;; means erasing.
+	  (setq alu (if opaque :erase :noop))
+	;; If there is a tile, start the source with that.
+	(when tile
+	  (setq source tile
+		tile-p t))
+	(when stipple
+	  (if (null source)
+	      ;; If there is a stipple, and no tile, use the stipple as the source.
+	      (setq source stipple)
+	      ;; Else make a temporary array and and the stipple and tile into it.
+	      (multiple-value-bind (width height)
+		  (decode-raster-array source)
+		(multiple-value-bind (awidth aheight)
+		    (decode-raster-array stipple)
+		  (setq width (lcm width awidth)
+			height (lcm height aheight)))
+		;; Arrange for it to be large enough later.
+		(unless (eq gray-stipple t)
+		  (multiple-value-bind (awidth aheight)
+		      (decode-raster-array gray-stipple)
+		    (setq width (lcm width awidth)
+			  height (lcm height aheight))))
+		(let ((new-source (with-stack-list (dims height width)
+				    ;; Despite the -raster- in its, name, this takes row-minor
+				    ;; dimensions.
+				    (tv:allocate-temp-sheet-raster-and-header
+				      dims :type (array-type source)))))
+		  (tv:bitblt tv:alu-seta width height source 0 0 new-source 0 0)
+		  (setq source new-source
+			temporary-p t))
+		(tv:bitblt tv:alu-and width height stipple 0 0 source 0 0))))
+	;; If there is a stipple approximating gray, either use it as the source or and it
+	;; into an existing source.
+	(when (neq gray-stipple t)
+	  (if (null source)
+	      (setq source gray-stipple)
+	      (multiple-value-bind (width height)
+		  (decode-raster-array source)
+		(unless temporary-p
+		  (multiple-value-bind (awidth aheight)
+		      (decode-raster-array gray-stipple)
+		    (setq width (lcm width awidth)
+			  height (lcm height aheight)))
+		  (let ((new-source (with-stack-list (dims height width)
+				      (tv:allocate-temp-sheet-raster-and-header
+					dims :type (array-type source)))))
+		    (tv:bitblt tv:alu-seta width height source 0 0 new-source 0 0)
+		    (setq source new-source
+			  temporary-p t)))
+		(tv:bitblt tv:alu-and width height gray-stipple 0 0 source 0 0)))))
+      ;; Store this source in state.
+      (setq source-pattern source)
+      ;; If tiling, set special zeros-alu which tells drawer to use bitblt instead of
+      ;; 1-bit-raster drawing.
+      (if tile-p
+	  (setq ones-alu tv:alu-seta
+		zeros-alu :tile)
+	  (setq ones-alu (standardize-alu stream alu)
+		zeros-alu (standardize-alu stream (if opaque :erase :noop))))
+      (when (instancep pattern)
+	(multiple-value-setq (source-pattern ones-alu zeros-alu temporary-p)
+	  (pattern-compute-raster-source-pattern pattern
+						 source-pattern ones-alu zeros-alu temporary-p
+						 stream self)))
+      ;; Remember if will need to deallocate raster.
+      (when temporary-p
+	(setf (ldb %%drawing-state-temporary-source flags) 1)))
+    (setf (ldb %%drawing-state-parameters-unwritten flags) 0))
+  (values source-pattern ones-alu zeros-alu))
+
+(defwhopper-subst (with-drawing-state-internal raster-drawing-state) (&rest args)
+  (letf ((source-pattern source-pattern)
+	 (ones-alu ones-alu)
+	 (zeros-alu zeros-alu))
+    (lexpr-continue-whopper args)))
+
+;;; Convert 1:alu0 argument into 1boole0 argument or extended alu.
+;;; This is here just so that windows can shadow it.
+(defmethod (standardize-alu raster-graphics-mixin) (alu)
+  (case alu
+    (:draw tv:alu-ior)
+    (:erase tv:alu-andca)
+    (:flip tv:alu-xor)
+    (:noop color:alu-noop)
+    (otherwise alu)))
+
+(defmethod (drawing-state-untouched-p drawing-state) () (zerop flags))
+
+(defmacro integer-coordinates-p (&rest points)
+  `(and . ,(loop for point in points collect `(integerp ,point))))
+
+;;; I can never seem to get defmacro-in-flavor to work for me.
+;;; Inline code that returns true if the drawing state doesn't have any funny parameters,
+;;; after possibly coercing the points to integers.  Not for use with things that require
+;;; fractional coordinates to work right.
+(defmacro optimized-state-okay-for-integers (&rest points)
+  `(let ((flags (drawing-state-flags (get-drawing-state self))))
+     (cond ((zerop flags)
+	    (fix-points . ,points)
+	    t)
+	   ((zerop (ldb %%drawing-state-new-parameters flags))
+	    (if (zerop (ldb %%drawing-state-new-transform flags))
+		(fix-points . ,points)
+		(transform-and-fix-points . ,points))
+	    t))))
+
+(defmethod (default-draw-point raster-graphics-mixin) (x y &key)
+  (transform-and-fix-points x y)
+  (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+    (if (null pattern)
+	(send self :draw-point x y ones-alu)
+	(draw-patterned-rectangle 1 1 x y pattern ones-alu zeros-alu))))
+
+(defmethod (optimized-draw-point raster-graphics-mixin) (x y alu)
+  (declare (notinline draw-point))
+  (if (optimized-state-okay-for-integers x y)
+      (send self :draw-point x y alu)
+      (draw-point x y :stream self :alu alu)))
+
+(defmacro with-dash-pattern (arglist &body body)
+  `(with-data-stack
+     (multiple-value-bind ,arglist
+	 (decode-dash-pattern)
+       . ,body)))
+
+(defun-in-flavor (decode-dash-pattern raster-graphics-mixin) ()
+  (drawing-state-scaled-dash-pattern (get-drawing-state self)))
+
+(defmethod (default-draw-line raster-graphics-mixin) (start-x start-y end-x end-y &rest args)
+  (transform-and-fix-points start-x start-y end-x end-y)
+  (multiple-value-bind (x-thickness/2 y-thickness/2)
+      (standardize-thickness)
+    (block thin
+      (unless (= 0 x-thickness/2 y-thickness/2)
+	(return-from thin))
+      (with-standardized-source-and-alu (pattern ones-alu ignore)
+	(unless (null pattern)
+	  (return-from thin))
+	(let ((draw-end-point (neq (drawing-state-line-shapes drawing-state) :no-end-point)))
+	  (with-dash-pattern (dashed dash-pattern dash-phase literal-p)
+	    (if (not dashed)
+		(draw-scaled-line self start-x start-y end-x end-y ones-alu draw-end-point)
+		(draw-dashed-line-scaled start-x start-y end-x end-y
+					 dash-pattern dash-phase literal-p
+					 ones-alu draw-end-point)))
+	  (return-from default-draw-line nil))))
+    (with-stack-list (points start-x start-y end-x end-y)
+      (apply #'draw-thick-lines-scaled self points x-thickness/2 y-thickness/2 args))))
+
+(defmethod (optimized-draw-line raster-graphics-mixin)
+	   (start-x start-y end-x end-y alu)
+  (declare (notinline draw-line))
+  (if (optimized-state-okay-for-integers start-x start-y end-x end-y)
+      (draw-scaled-line self start-x start-y end-x end-y alu t)
+      (draw-line start-x start-y end-x end-y :stream self :alu alu)))
+
+(defmethod (draw-scaled-line raster-graphics-mixin :default)
+	   (start-x start-y end-x end-y &optional (alu :draw) (draw-end-point t))
+  (setq alu (standardize-alu self alu))
+  (draw-line-driver start-x start-y end-x end-y draw-end-point
+    #'(lambda (width height x y) (send self :draw-rectangle width height x y alu))))
+
+(defmethod (default-draw-lines raster-graphics-mixin) (points &rest args)
+  (with-data-stack
+    (multiple-value-bind (x-thickness/2 y-thickness/2)
+	(standardize-thickness)
+      (apply #'draw-lines-scaled self (transform-and-fix-point-set points)
+	     x-thickness/2 y-thickness/2 args))))
+
+(defmethod (draw-lines-scaled raster-graphics-mixin)
+	   (points x-thickness/2 y-thickness/2
+	    &rest args
+	    &key (closed nil) (join-to-path nil)
+	    &allow-other-keys)
+  (if (not (= 0 x-thickness/2 y-thickness/2))
+      (apply #'draw-thick-lines-scaled self points x-thickness/2 y-thickness/2 args)
+      (with-standardized-source-and-alu (ignore alu ignore)
+	(let ((position-x nil) (position-y nil)
+	      (path-initial-x nil) (path-initial-y nil))
+	  (when join-to-path
+	    (multiple-value-setq (position-x position-y path-initial-x path-initial-y)
+	      (raster-drawing-state-path-position drawing-state)))
+	  (with-dash-pattern (dashed dash-pattern dash-phase literal-p)
+	    (flet ((line (x1 y1 x2 y2 draw-end)
+		     (if (not dashed)
+			 (draw-scaled-line self x1 y1 x2 y2 alu draw-end)
+			 (setq dash-phase (draw-dashed-line-scaled x1 y1 x2 y2
+								   dash-pattern dash-phase
+								   literal-p
+								   alu draw-end)))))
+	      (map-points #'(lambda (x y last-p)
+			      (when position-x
+				(line position-x position-y x y (and last-p (not closed))))
+			      (when (null path-initial-x)
+				(setq path-initial-x x path-initial-y y))
+			      (setq position-x x position-y y))
+			  points)
+	      (when (and closed position-x path-initial-x)
+		(line position-x position-y
+		      path-initial-x path-initial-y
+		      nil)
+		(setq position-x nil position-y nil
+		      path-initial-x nil path-initial-y nil))
+	      (when join-to-path
+		(raster-drawing-state-set-path-position-and-initial
+		  drawing-state position-x position-y
+		  path-initial-x path-initial-y)
+		(when dashed
+		  (setf (drawing-state-initial-dash-phase drawing-state) dash-phase)))))))))
+
+(defun slanted-thickness (x-thickness/2 y-thickness/2 dx dy)
+  (let ((l (sqrt (+ (expt dx 2) (expt dy 2)))))
+    (values (/ (* x-thickness/2 dx) l)
+	    (/ (* y-thickness/2 dy) l)
+	    l)))
+
+(defun-in-flavor (draw-patterned-sector raster-graphics-mixin)
+		 (x y radius theta-1 theta-2 pattern ones-alu zeros-alu)
+  (draw-scaled-filled-in-sector self x y radius theta-1 theta-2
+				ones-alu pattern zeros-alu x y))
+
+(defsubst-in-flavor (draw-patterned-quadrilateral raster-graphics-mixin)
+		 (x1 y1 x2 y2 x3 y3 x4 y4 pattern ones-alu zeros-alu)
+  (draw-patterned-triangle x1 y1 x2 y2 x3 y3 pattern ones-alu zeros-alu)
+  (draw-patterned-triangle x1 y1 x2 y2 x4 y4 pattern ones-alu zeros-alu))
+
+(defun-in-flavor (draw-rectangle-internal raster-graphics-mixin)
+		 (left top right bottom pattern ones-alu zeros-alu)
+  (flet ((min-max (x1 x2 min-p pred)
+	   (multiple-value-bind (rx rem)
+	       (floor (if min-p (min x1 x2) (max x1 x2)))
+	     ;; pred should actually always be >, but we are compatible with draw-triangle
+	     ;; which is compatible with the microcode.
+	     (if (funcall pred rem .5) (1+ rx) rx))))
+    (let ((left (min-max left right t #'))
+	  (top (min-max top bottom t #'>))
+	  (right (min-max left right nil #'))
+	  (bottom (min-max top bottom nil #'>)))
+      (draw-patterned-rectangle (- right left) (- bottom top) left top
+				pattern ones-alu zeros-alu))))
+
+;;; Draw the butt of a thick line as a square or semi-circle or something.
+(defun-in-flavor (draw-line-cap raster-graphics-mixin)
+		 (x y dx dy x-thickness/2 y-thickness/2 line-end-shape
+		  pattern ones-alu zeros-alu)
+  (unless (and (zerop dx) (zerop dy))
+    ;; Angle points out from point to where cap should go.
+    (ecase line-end-shape
+      ((:butt :no-end-point) )
+      (:square
+	(multiple-value-bind (dxt dyt)
+	    (slanted-thickness x-thickness/2 y-thickness/2 dx dy)
+	  (let* ((xa (+ x dyt))
+		 (ya (- y dxt))
+		 (xb (- x dyt))
+		 (yb (+ y dxt))
+		 (xat (+ xa dxt))
+		 (yat (+ ya dyt))
+		 (xbt (+ xb dxt))
+		 (ybt (+ yb dyt)))
+	    (draw-patterned-quadrilateral xa ya xbt ybt xb yb xat yat
+					  pattern ones-alu zeros-alu))))
+      (:round
+	(draw-patterned-sector x y x-thickness/2
+			       (atan (- dx) dy) (atan dx (- dy))
+			       pattern ones-alu zeros-alu)))))
+
+;;; Draw a miter or bevel or circular wedge between thick lines.
+(defun-in-flavor (draw-line-joint raster-graphics-mixin)
+		 (x y dx1 dy1 dx2 dy2 x-thickness/2 y-thickness/2 line-joint-shape
+		  pattern ones-alu zeros-alu)
+  (let ((p1 (* dx1 dy2))
+	(p2 (* dx2 dy1)))
+    (when (= p1 p2)
+      (return-from draw-line-joint nil))	;Colinear, so joined already
+    (when (< p1 p2)				;Make 1 be the smaller angle
+      (rotatef dx1 dx2)
+      (rotatef dy1 dy2)))
+  (flet ((joint-thickness (x-thickness/2 y-thickness/2 dx1 dy1 l1 dx2 dy2 l2)
+	   (if (= x-thickness/2 y-thickness/2)
+	       ;; Easy symmetrical case, the lines are drawn the thickness given.
+	       (let ((q (/ (- (* dx1 dy2) (* dx2 dy1)) x-thickness/2)))
+		 (values (/ (+ (* dx1 l2) (* dx2 l1)) q)
+			 (/ (+ (* dy1 l2) (* dy2 l1)) q)))
+	       ;; Need to actually compute the thickness drawn.
+	       (let* ((t1 (sqrt (+ (expt (* dy1 x-thickness/2) 2)
+				   (expt (* dx1 y-thickness/2) 2))))
+		      (t2 (sqrt (+ (expt (* dy2 x-thickness/2) 2)
+				   (expt (* dx2 y-thickness/2) 2))))
+		      (dt (+ t1 t2))
+		      (ddx (- dx1 dx2))
+		      (ddy (- dy1 dy2))
+		      (q (- (* dx1 ddy) (* dy1 ddx))))
+		 (values (/ (- (* t1 ddx) (* dx1 dt)) q)
+			 (/ (- (* t1 ddy) (* dy1 dt)) q))))))
+    (ecase line-joint-shape
+      (:miter
+	(cond ((and (zerop dx1) (zerop dy2))
+	       (draw-rectangle-internal x y
+					(+ x (* x-thickness/2 (signum dx2)))
+					(+ y (* y-thickness/2 (signum dy1)))
+					pattern ones-alu zeros-alu)
+	       (when (eql ones-alu tv:alu-xor)
+		 (draw-rectangle-internal x y
+					  (+ x (* x-thickness/2 (- (signum dx2))))
+					  (+ y (* y-thickness/2 (- (signum dy1))))
+					  pattern ones-alu zeros-alu)))
+	      ((and (zerop dx2) (zerop dy1))
+	       (draw-rectangle-internal x y
+					(+ x (* x-thickness/2 (signum dx1)))
+					(+ y (* y-thickness/2 (signum dy2)))
+					pattern ones-alu zeros-alu)
+	       (when (eql ones-alu tv:alu-xor)
+		 (draw-rectangle-internal x y
+					  (+ x (* x-thickness/2 (- (signum dx1))))
+					  (+ y (* y-thickness/2 (- (signum dy2))))
+					  pattern ones-alu zeros-alu)))
+	      (t
+	       (multiple-value-bind (dxt1 dyt1 l1)
+		   (slanted-thickness x-thickness/2 y-thickness/2 dy1 dx1)
+		 (multiple-value-bind (dxt2 dyt2 l2)
+		     (slanted-thickness x-thickness/2 y-thickness/2 dy2 dx2)
+		   (multiple-value-bind (dxb dyb)
+		       (joint-thickness x-thickness/2 y-thickness/2 dx1 dy1 l1 dx2 dy2 l2)
+		     (let ((xb (+ x dxb))
+			   (yb (+ y dyb)))
+		       (draw-patterned-quadrilateral x y xb yb
+						     (- x dxt1) (+ y dyt1)
+						     (+ x dxt2) (- y dyt2)
+						     pattern ones-alu zeros-alu))
+		     (when (eql ones-alu tv:alu-xor)
+		       ;; A bit of a kludge, but it's hard to do otherwise, since damage
+		       ;; was done before.
+		       (let ((xb (- x dxb))
+			     (yb (- y dyb)))
+			 (draw-patterned-quadrilateral x y xb yb
+						       (+ x dxt1) (- y dyt1)
+						       (- x dxt2) (+ y dyt2)
+						       pattern ones-alu zeros-alu)))))))))
+	  (:bevel
+	    (multiple-value-bind (dxt1 dyt1 l1)
+		(slanted-thickness x-thickness/2 y-thickness/2 dy1 dx1)
+	      (multiple-value-bind (dxt2 dyt2 l2)
+		  (slanted-thickness x-thickness/2 y-thickness/2 dy2 dx2)
+		(draw-patterned-triangle x y (- x dxt1) (+ y dyt1) (+ x dxt2) (- y dyt2)
+					 pattern ones-alu zeros-alu)
+		(when (eql ones-alu tv:alu-xor)
+		  (multiple-value-bind (dxb dyb)
+		      (joint-thickness x-thickness/2 y-thickness/2 dx1 dy1 l1 dx2 dy2 l2)
+		    (let ((xb (- x dxb))
+			  (yb (- y dyb)))
+		      (draw-patterned-quadrilateral x y xb yb
+						    (+ x dxt1) (- y dyt1) (- x dxt2) (+ y dyt2)
+						    pattern ones-alu zeros-alu)))))))
+	  (:round
+	    (draw-patterned-sector x y x-thickness/2
+				   (atan (- dx2) dy2) (atan dx1 (- dy1))
+				   pattern ones-alu zeros-alu)
+	    (multiple-value-bind (dxt1 dyt1 l1)
+		(slanted-thickness x-thickness/2 y-thickness/2 dy1 dx1)
+	      (multiple-value-bind (dxt2 dyt2 l2)
+		  (slanted-thickness x-thickness/2 y-thickness/2 dy2 dx2)
+		(when (eql ones-alu tv:alu-xor)
+		  (multiple-value-bind (dxb dyb)
+		      (joint-thickness x-thickness/2 y-thickness/2 dx1 dy1 l1 dx2 dy2 l2)
+		    (let ((xb (- x dxb))
+			  (yb (- y dyb)))
+		      (draw-patterned-quadrilateral x y xb yb
+						    (+ x dxt1) (- y dyt1) (- x dxt2) (+ y dyt2)
+						    pattern ones-alu zeros-alu)))))))
+	  (:none ))))
+
+(defun-in-flavor (draw-thick-line-scaled raster-graphics-mixin) (x1 y1 x2 y2
+								 x-thickness/2 y-thickness/2
+								 pattern ones-alu zeros-alu)
+  (let ((dx (- x2 x1))
+	(dy (- y2 y1)))
+    (cond ((zerop dx)
+	   (draw-rectangle-internal (- x1 x-thickness/2) y1
+				    (+ x2 x-thickness/2) y2
+				    pattern ones-alu zeros-alu))
+	  ((zerop dy)
+	   (draw-rectangle-internal x1 (- y1 y-thickness/2) x2 (+ y2 y-thickness/2)
+				     pattern ones-alu zeros-alu))
+	  (t
+	   (multiple-value-bind (dxt dyt)
+	       (slanted-thickness x-thickness/2 y-thickness/2 dy dx)
+	     (let ((x1a (+ x1 dxt))
+		   (y1a (- y1 dyt))
+		   (x1b (- x1 dxt))
+		   (y1b (+ y1 dyt))
+		   (x2a (+ x2 dxt))
+		   (y2a (- y2 dyt))
+		   (x2b (- x2 dxt))
+		   (y2b (+ y2 dyt)))
+	       (draw-patterned-quadrilateral x1a y1a x2b y2b x2a y2a x1b y1b
+					     pattern ones-alu zeros-alu)))))
+    (values dx dy)))
+
+(defmethod (draw-thick-lines-scaled raster-graphics-mixin)
+	   (points x-thickness/2 y-thickness/2
+	    &rest args
+	    &key (closed nil) (join-to-path nil)
+	    &allow-other-keys)
+  (declare (ignore args))
+  (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+    (with-dash-pattern (dashed dash-pattern dash-phase literal-p)
+      (multiple-value-bind (line-end-shape line-joint-shape)
+	  (drawing-state-line-shapes drawing-state)
+	(flet ((line (x1 y1 x2 y2)
+		 (if (not dashed)
+		     (draw-thick-line-scaled x1 y1 x2 y2 x-thickness/2 y-thickness/2
+					     pattern ones-alu zeros-alu)
+		     (setq dash-phase (draw-thick-dashed-line-scaled
+					x1 y1 x2 y2
+					dash-pattern dash-phase literal-p
+					x-thickness/2 y-thickness/2
+					line-end-shape pattern ones-alu zeros-alu))
+		     (values (- x2 x1) (- y2 y1)))))
+	  (let ((position-x nil) (position-y nil)
+		(position-dx nil) (position-dy nil)
+		(path-initial-x nil) (path-initial-y nil)
+		(path-initial-dx nil) (path-initial-dy nil))
+	    (when join-to-path
+	      (multiple-value-setq (position-x position-y path-initial-x path-initial-y
+				    position-dx position-dy path-initial-dx path-initial-dy)
+		(raster-drawing-state-path-position drawing-state)))
+	    (map-points #'(lambda (x y ignore)
+			    (if position-x
+				(multiple-value-bind (dx dy)
+				    (line position-x position-y x y)
+				  (if position-dx
+				      (draw-line-joint position-x position-y
+						       position-dx position-dy
+						       (- dx) (- dy)
+						       x-thickness/2 y-thickness/2
+						       line-joint-shape
+						       pattern ones-alu zeros-alu)
+				      (if (or closed join-to-path)
+					  (setq path-initial-dx dx
+						path-initial-dy dy)
+					  (draw-line-cap position-x position-y
+							 (- dx) (- dy)
+							 x-thickness/2 y-thickness/2
+							 line-end-shape
+							 pattern ones-alu zeros-alu)))
+				  (setq position-dx dx position-dy dy))
+				(setq path-initial-x x path-initial-y y))
+			    (setq position-x x position-y y))
+			points)
+	    (when position-x
+	      (if (not closed)
+		  (unless join-to-path
+		    (draw-line-cap position-x position-y position-dx position-dy
+				   x-thickness/2 y-thickness/2 line-end-shape
+				   pattern ones-alu zeros-alu))
+		(multiple-value-bind (dx dy)
+		    (line position-x position-y
+			  path-initial-x path-initial-y)
+		  (when position-dx
+		    (draw-line-joint position-x position-y position-dx position-dy
+				     (- dx) (- dy)
+				     x-thickness/2 y-thickness/2 line-joint-shape
+				     pattern ones-alu zeros-alu))
+		  (when (and path-initial-x path-initial-dx)
+		    (draw-line-joint path-initial-x path-initial-y
+				     (- path-initial-dx) (- path-initial-dy)
+				     dx dy
+				     x-thickness/2 y-thickness/2 line-joint-shape
+				     pattern ones-alu zeros-alu)))
+		(setq position-x nil position-y nil
+		      position-dx nil position-dy nil
+		      path-initial-x nil path-initial-y nil
+		      path-initial-dx nil path-initial-dy nil)))
+	    (when join-to-path
+	      (raster-drawing-state-set-path-position-and-slope drawing-state
+		position-x position-y path-initial-x path-initial-y
+		position-dx position-dy path-initial-dx path-initial-dy))))))))
+
+(defun map-over-dash-segments (dash-pattern dash-phase line-length function)
+  (declare (downward-funarg function)
+	   (values dash-phase))
+  (let ((length (length dash-pattern))
+	(position 0))
+    (loop
+      (let ((phase-position 0))
+	(dotimes (i length)
+	  (let* ((on-p (evenp i))
+		 (segment-length (elt dash-pattern i))
+		 (new-position (+ position segment-length)))
+	    (when ( new-position line-length)
+	      (let ((dl (- line-length (max position dash-phase))))
+		(when (plusp dl)
+		  (funcall function dl on-p t))
+		(return-from map-over-dash-segments
+		  (floor (+ phase-position dl)))))
+	    (if (plusp dash-phase)
+		(when (> new-position dash-phase)
+		  (funcall function (- new-position dash-phase) on-p nil)
+		  (setq dash-phase 0))
+		(funcall function segment-length on-p nil))
+	    (setq position new-position)
+	    (incf phase-position segment-length)))))))
+
+;;; Function is called with x1,y1 x2,y2 final-segment-p
+(defun map-over-dash-line-segments (start-x start-y end-x end-y
+				    dash-pattern dash-phase literal-p
+				    function)
+  (declare (downward-funarg function)
+	   (values dash-phase))
+  (let* ((dx (- end-x start-x))
+	 (dy (- end-y start-y))
+	 (length (sqrt (+ (expt dx 2) (expt dy 2)))))
+    (when (plusp length)
+      (let ((x-slant (/ dx length))
+	    (y-slant (/ dy length))
+	    (x start-x)
+	    (y start-y))
+	(flet ((segment (dl on-p last-p)
+		 (let ((new-x (if last-p end-x (+ x (* dl x-slant))))
+		       (new-y (if last-p end-y (+ y (* dl y-slant)))))
+		   (when on-p
+		     (funcall function x y new-x new-y last-p))
+		   (setq x new-x
+			 y new-y))))
+	  (if literal-p
+	      (setq dash-phase (map-over-dash-segments dash-pattern dash-phase
+						       length #'segment))
+	      ;; Arrange for the final drawn segment to end up at the final point so that it
+	      ;; is guaranteed to be drawn.
+	      (let* ((nsegs (length dash-pattern))
+		     (total-length (reduce #'+ dash-pattern))
+		     (scale (/ length (+ (* total-length (1- (floor length total-length)))
+					 (- total-length (elt dash-pattern (1- nsegs)))))))
+		(when (plusp scale)
+		  (with-stack-array (scaled nsegs)
+		    (dotimes (i nsegs)
+		      (setf (aref scaled i) (ceiling (* scale (elt dash-pattern i)))))
+		    (setq dash-phase (floor (map-over-dash-segments scaled dash-phase
+								    length #'segment)
+					    scale))))))))))
+  dash-phase)
+
+;;; This has without-interrupts locking because some programs draw dashed lines in the
+;;; mouse process inside a prepare-sheet, which relies on without-interrupts.
+(defvar *dash-pattern-to-bitblt-pattern-table*
+	(make-hash-table :test 'equal :locking :without-interrupts))
+
+(defun dash-pattern-to-bitblt-pattern (dash-pattern vertical-p)
+  (let ((length (length dash-pattern)))
+    (with-stack-array (copy length :type 'art-q-list)
+      (dotimes (i length)
+	(setf (aref copy i) (round (elt dash-pattern i))))
+      (with-stack-list (key vertical-p (g-l-p copy))
+	(multiple-value-bind (array found-p)
+	    (gethash key *dash-pattern-to-bitblt-pattern-table*)
+	  (when found-p
+	    (return-from dash-pattern-to-bitblt-pattern array)))
+	(let ((line-length 0))
+	  (dotimes (i length)
+	    (incf line-length (aref copy i)))
+	  (if vertical-p
+	      (let ((array (make-raster-array 32 line-length :element-type 'bit))
+		    (y 0))
+		(loop for i from 0 below length by 2 do
+		  (dotimes (i (aref copy i))
+		    (setf (raster-aref array 0 (+ y i)) 1))
+		  (incf y (+ (aref copy i) (aref copy (1+ i)))))
+		(setf (gethash (copy-tree key) *dash-pattern-to-bitblt-pattern-table*) array)
+		array)
+	      (let* ((array-width (lcm line-length 32))
+		     (repeat (/ array-width line-length))
+		     (array (make-raster-array array-width 1 :element-type 'bit))
+		     (x 0))
+		(loop for i from 0 below length by 2 do
+		  (dotimes (i (aref copy i))
+		    (loop for j from 0 by line-length repeat repeat do
+		      (setf (raster-aref array (+ x i j) 0) 1)))
+		  (incf x (+ (aref copy i) (aref copy (1+ i)))))
+		(setf (gethash (copy-tree key) *dash-pattern-to-bitblt-pattern-table*) array)
+		array)))))))
+
+(defun-in-flavor (draw-dashed-line-scaled raster-graphics-mixin)
+		 (start-x start-y end-x end-y
+		  dash-pattern dash-phase literal-p
+		  alu draw-end-point)
+  (block used-bitblt
+    (when (= start-y end-y)
+      (let* ((width (abs (- end-x start-x)))
+	     (added-phase (mod width (round (reduce #'+ dash-pattern)))))
+	(when (or literal-p (zerop added-phase))
+	  (when draw-end-point
+	    (incf width))
+	  (send self :draw-1-bit-raster width 1
+		(dash-pattern-to-bitblt-pattern dash-pattern nil) dash-phase 0
+		(min start-x end-x) start-y
+		alu color:alu-noop)
+	  (return-from used-bitblt (+ dash-phase added-phase)))))
+    (when (= start-x end-x)
+      (let* ((height (abs (- end-y start-y)))
+	     (added-phase (mod height (round (reduce #'+ dash-pattern)))))
+	(when (or literal-p (zerop added-phase))
+	  (when draw-end-point
+	    (incf height))
+	  (send self :draw-1-bit-raster 1 height
+	       (dash-pattern-to-bitblt-pattern dash-pattern t) 0 dash-phase
+	       start-x (min start-y end-y)
+	       alu color:alu-noop)
+	  (return-from used-bitblt (+ dash-phase added-phase)))))
+    (map-over-dash-line-segments start-x start-y end-x end-y
+				 dash-pattern dash-phase literal-p
+      #'(lambda (x1 y1 x2 y2 last-p)
+	  (draw-scaled-line self (round x1) (round y1) (round x2) (round y2)
+			    alu (and last-p draw-end-point))))))
+
+(defun-in-flavor (draw-thick-dashed-line-scaled raster-graphics-mixin)
+		 (start-x start-y end-x end-y
+		  dash-pattern dash-phase literal-p
+		  x-thickness/2 y-thickness/2 line-end-shape pattern ones-alu zeros-alu)
+  (let ((first-p nil))
+    (map-over-dash-line-segments start-x start-y end-x end-y
+				 dash-pattern dash-phase literal-p
+      #'(lambda (x1 y1 x2 y2 last-p)
+	  (draw-thick-line-scaled x1 y1 x2 y2 x-thickness/2 y-thickness/2
+				  pattern ones-alu zeros-alu)
+	  (unless first-p
+	    (draw-line-cap x1 y1 (- x1 x2) (- y1 y2) x-thickness/2 y-thickness/2 line-end-shape
+			   pattern ones-alu zeros-alu))
+	  (unless last-p
+	    (draw-line-cap x2 y2 (- x2 x1) (- y2 y1) x-thickness/2 y-thickness/2 line-end-shape
+			   pattern ones-alu zeros-alu))))))
+
+;;; Useful for drawing shapes with an arbitrary pattern argument.  If pattern is all ones, can
+;;; use faster output microcode.
+(defun-in-flavor (draw-patterned-rectangle raster-graphics-mixin)
+		 (width height x y pattern ones-alu zeros-alu
+			&optional (pattern-x x) (pattern-y y))
+  (etypecase pattern
+    (null
+      (send self :draw-rectangle width height x y ones-alu))
+    (array
+      (if (eq zeros-alu :tile)
+	  (send self :draw-tiled-rectangle width height x y pattern ones-alu
+		pattern-x pattern-y)
+	  (send self :draw-patterned-rectangle width height x y
+					       pattern ones-alu zeros-alu
+					       pattern-x pattern-y)))
+    (instance
+      (pattern-draw-raster-slice pattern width height x y ones-alu zeros-alu
+				 self drawing-state))))
+
+(defun-in-flavor (draw-patterned-triangle raster-graphics-mixin)
+		 (x1 y1 x2 y2 x3 y3 pattern ones-alu zeros-alu)
+  (etypecase pattern
+    (null
+      (if (if (not (ldb-test %%scan-conversion-round-coordinates
+			     (get-drawing-state-scan-conversion-flags drawing-state)))
+	      (check-nearly-integer-p x1 y1 x2 y2 x3 y3)
+	    (fix-points x1 y1 x2 y2 x3 y3)
+	    t)
+	  ;; Microcode can only deal with integers.
+	  (send self :draw-triangle x1 y1 x2 y2 x3 y3 ones-alu)
+	  (send self :draw-fractional-triangle x1 y1 x2 y2 x3 y3 ones-alu)))
+    (array
+      (if (eq zeros-alu :tile)
+	  (send self :draw-tiled-triangle x1 y1 x2 y2 x3 y3
+					  pattern ones-alu
+					  (round x1) (round y1))
+	  (send self :draw-patterned-triangle x1 y1 x2 y2 x3 y3
+					      pattern ones-alu zeros-alu
+					      (round x1) (round y1))))
+    (instance
+      (draw-triangle-driver x1 y1 x2 y2 x3 y3
+	#'(lambda (width height x y)
+	    (pattern-draw-raster-slice pattern width height x y ones-alu zeros-alu
+				       self drawing-state))))))
+
+(defmethod (default-draw-rectangle raster-graphics-mixin)
+	   (left top right bottom
+	    &rest args &key (filled t) &allow-other-keys)
+  (when (not filled)
+    (return-from default-draw-rectangle
+      (with-stack-list (points left top right top right bottom left bottom)
+	(apply #'draw-polygon points :points-are-convex-p t :stream self args))))
+  (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+    (let ((upper-left-x left)
+	  (upper-left-y top)
+	  (upper-right-x right)
+	  (upper-right-y top)
+	  (lower-right-x right)
+	  (lower-right-y bottom)
+	  (lower-left-x left)
+	  (lower-left-y bottom))
+      (transform-points upper-left-x upper-left-y
+			upper-right-x upper-right-y
+			lower-right-x lower-right-y
+			lower-left-x lower-left-y)
+      (if (and (= upper-left-x lower-left-x)
+	       (= upper-right-x lower-right-x)
+	       (= upper-left-y upper-right-y)
+	       (= lower-right-y lower-left-y))
+	  (draw-rectangle-internal lower-left-x upper-left-y
+				   lower-right-x lower-left-y
+				   pattern ones-alu zeros-alu)
+	  (draw-patterned-quadrilateral upper-left-x upper-left-y lower-right-x lower-right-y
+					upper-right-x upper-right-y lower-left-x lower-left-y
+					pattern ones-alu zeros-alu)))))
+
+(defmethod (optimized-draw-rectangle raster-graphics-mixin)
+	   (left top right bottom alu)
+  (declare (notinline draw-rectangle))
+  (if (and (drawing-state-untouched-p (get-drawing-state self))
+	   (integer-coordinates-p left top right bottom)
+	   ( right left) ( bottom top))
+      (send self :draw-rectangle (- right left) (- bottom top) left top alu)
+      (draw-rectangle left top right bottom :stream self :alu alu)))
+
+(defmethod (default-draw-triangle raster-graphics-mixin)
+	   (x1 y1 x2 y2 x3 y3
+	    &rest args
+	    &key (filled t)
+	    &allow-other-keys)
+  (if (not filled)
+      (multiple-value-bind (x-thickness/2 y-thickness/2)
+	  (standardize-thickness)
+	(transform-and-fix-points x1 y1 x2 y2 x3 y3)
+	(with-stack-list (points x1 y1 x2 y2 x3 y3)
+	  (apply #'draw-lines-scaled self points x-thickness/2 y-thickness/2 :closed t args)))
+      (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+	(transform-points x1 y1 x2 y2 x3 y3)
+	(draw-patterned-triangle x1 y1 x2 y2 x3 y3 pattern ones-alu zeros-alu))))
+
+(defmethod (:draw-triangle raster-graphics-mixin :default)
+	   (x1 y1 x2 y2 x3 y3 &optional (alu :draw))
+  (setq alu (standardize-alu self alu))
+  (draw-triangle-driver x1 y1 x2 y2 x3 y3
+    #'(lambda (width height x y) (send self :draw-rectangle width height x y alu))))
+
+(defmethod (optimized-draw-triangle raster-graphics-mixin) (x1 y1 x2 y2 x3 y3 alu)
+  (declare (notinline draw-triangle))
+  (if (and (drawing-state-untouched-p (get-drawing-state self))
+	   (integer-coordinates-p x1 y1 x2 y2 x3 y3))
+      (send self :draw-triangle x1 y1 x2 y2 x3 y3 alu)
+      (draw-triangle x1 y1 x2 y2 x3 y3 :stream self :alu alu)))
+
+(defmethod (default-draw-polygon raster-graphics-mixin)
+	   (points &rest args
+		   &key (points-are-convex-p nil) (filled t)
+		   &allow-other-keys)
+  (with-data-stack
+    (setq points (transform-and-fix-point-set points))
+    (if (not points-are-convex-p)
+	(if (not filled)
+	    (with-stack-array (triangles (* (length points) 4) :fill-pointer 0)
+	      (triangulate-polygon
+		#'(lambda (x1 y1 x2 y2 x3 y3)
+		    ;; triangulate-polygon sometimes returns flat triangles.
+		    (unless (zerop #(x2-x1)*(y3-y1)-(y2-y1)*(x3-x1))
+		      (vector-push-extend nil triangles)
+		      (vector-push-extend x1 triangles) (vector-push-extend y1 triangles)
+		      (vector-push-extend x2 triangles) (vector-push-extend y2 triangles)
+		      (vector-push-extend x3 triangles) (vector-push-extend y3 triangles)))
+		points)
+	      (multiple-value-bind (x-thickness/2 y-thickness/2)
+		  (standardize-thickness)
+		(loop
+		  (let ((polygon (triangle-next-polygon triangles)))
+		    (when (null polygon)
+		      (return nil))
+		    (apply #'draw-lines-scaled self polygon x-thickness/2 y-thickness/2
+			   :closed t args)))))
+	    (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+	      (triangulate-polygon
+		#'(lambda (x1 y1 x2 y2 x3 y3)
+		    (draw-patterned-triangle x1 y1 x2 y2 x3 y3 pattern ones-alu zeros-alu))
+		points)))
+	(if (not filled)
+	    (multiple-value-bind (x-thickness/2 y-thickness/2)
+		(standardize-thickness)
+	      (apply #'draw-lines-scaled self points x-thickness/2 y-thickness/2 :closed t args))
+	    (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+	      (let ((x1 nil) (y1 nil)
+		    (x2 nil) (y2 nil))
+		(map-points #'(lambda (x3 y3 ignore)
+				(if (null x1)
+				    (setq x1 x3 y1 y3)
+				    (when x2
+				      (draw-patterned-triangle x1 y1 x2 y2 x3 y3
+							       pattern ones-alu zeros-alu))
+				    (setq x2 x3 y2 y3)))
+			    points)))))))
+
+;;; This is more efficient than the default, because it doesn't have to
+;;; do the transcendentals all the time (or intersect the lines a lot, although
+;;; a smarter scan converter would make that negligible.)
+(defmethod (draw-regular-polygon raster-graphics-mixin)
+	   (start-x start-y end-x end-y number-of-sides
+	    &rest args
+	    &key (handedness :left)
+	    &allow-other-keys)
+  (let* ((2n (* number-of-sides 2))
+	 (theta (* pi (1- (/ 2.0 (* number-of-sides
+				    (ecase handedness
+				      (:left +1)
+				      (:right -1)))))))
+	 (sin-theta (sin theta))
+	 (cos-theta (cos theta))
+	 (x1 start-x)
+	 (y1 start-y)
+	 (x2 end-x)
+	 (y2 end-y))
+    (with-stack-array (points 2n)
+      (setf (aref points 0) x1)
+      (setf (aref points 1) y1)
+      (setf (aref points 2) x2)
+      (setf (aref points 3) y2)
+      (loop for i from 4 below 2n by 2 do
+	(psetq x1 x2
+	       y1 y2
+	       x2 (+ (- (- (* x1 cos-theta)
+			   (* y1 sin-theta))
+			(* x2 (1- cos-theta)))
+		     (* y2 sin-theta))
+	       y2 (- (- (+ (* x1 sin-theta)
+			   (* y1 cos-theta))
+			(* x2 sin-theta))
+		     (* y2 (1- cos-theta))))
+	(setf (aref points i) x2)
+	(setf (aref points (1+ i)) y2))
+      (si:with-rem-keywords (some-args args '(:handedness))
+	(apply #'draw-polygon points
+	       :points-are-convex-p t :stream self some-args)))))
+
+(defmethod (default-draw-ellipse raster-graphics-mixin)
+	   (center-x center-y x-radius y-radius
+	    &rest args
+	    &key (inner-x-radius 0) (inner-y-radius inner-x-radius)
+		 (start-angle 0) (end-angle 2pi) (clockwise nil)
+		 (filled t) (join-to-path nil)
+	    &allow-other-keys)
+  (setq x-radius (abs x-radius)
+	y-radius (abs y-radius)
+	inner-x-radius (abs inner-x-radius)
+	inner-y-radius (abs inner-y-radius))
+  (when (> inner-x-radius x-radius)
+    (rotatef inner-x-radius x-radius))
+  (when (> inner-y-radius y-radius)
+    (rotatef inner-y-radius y-radius))
+  (when (not filled)
+    (when (not (and (zerop inner-x-radius)(zerop inner-y-radius)))
+      ;; Really just asking to draw two separate ellipses.
+      (return-from default-draw-ellipse
+	(si:with-rem-keywords (some-args args
+					 '(:inner-x-radius :inner-y-radius
+					   :start-angle :end-angle :clockwise))
+	  (apply (flavor:generic draw-ellipse) self
+		 center-x center-y x-radius y-radius
+		 :start-angle start-angle :end-angle end-angle :clockwise clockwise
+		 some-args)
+	  (apply (flavor:generic draw-ellipse) self
+		 center-x center-y inner-x-radius inner-y-radius
+		 :start-angle end-angle :end-angle start-angle :clockwise (not clockwise)
+		 some-args))))
+    (let ((thickness (or (drawing-state-thickness drawing-state) 0)))
+      (when (and (plusp thickness) (drawing-state-scale-thickness drawing-state)
+		 (not (drawing-state-dashed drawing-state)))	;Handled below.
+	(multiple-value-bind (x y) (untransform-distance 1 1 (stream-transform self))
+	  ;; This implements the policy that the thickness can never be
+	  ;; thin enough to draw nothing.
+	  (maxf thickness (abs x) (abs y)))
+	(let ((half-thickness (/ (if (and (integerp thickness) (evenp thickness))
+				     thickness
+				     (float thickness 0.0))
+				 2)))
+	  ;; This is not really correct.  An ellipse is not the outline
+	  ;; of another ellipse, taking the distances perpendicular to
+	  ;; the curve.
+	  ;; For an ellipse
+	  ;;  x = a cos(theta), y = b sin(theta)
+	  ;; The slope of the normal is
+	  ;;  s = (a/b)tan(theta)
+	  ;; So, the outline with thickness 2l is
+	  ;;  x' = x + l sqrt(1/(1+s^2)), y = y + l s sqrt(1/(1+s^2))
+	  ;; When a>>b, the tangent term dominates much longer.
+	  ;; So, an 100x1 ellipse with thickness 100 resembles a rectangle 300x102 more than
+	  ;; an ellipse 150x51.
+	  (setq inner-x-radius (max 0 (- x-radius half-thickness))
+		inner-y-radius (max 0 (- y-radius half-thickness))
+		x-radius (+ inner-x-radius thickness)
+		y-radius (+ inner-y-radius thickness)
+		filled t)))))
+  (transform-points center-x center-y)
+  (let ((full-circle-p (full-circle-p start-angle end-angle))
+	rotation shear-x
+	(rotated-start-angle start-angle)
+	(rotated-end-angle end-angle)
+	original-x-radius original-y-radius)
+    (multiple-value-bind (composed-rotation scale-x scale-y nil nil before-scale-x)
+	(decompose-transform (stream-transform self))
+      (setq rotation composed-rotation
+	    shear-x before-scale-x
+	    x-radius (abs (* x-radius scale-x))
+	    y-radius (abs (* y-radius scale-y))
+	    inner-x-radius (abs (* inner-x-radius scale-x))
+	    inner-y-radius (abs (* inner-y-radius scale-y)))    
+      (setq original-x-radius x-radius
+	    original-y-radius y-radius)
+      (when (minusp scale-x)
+	(setq scale-x (- scale-x))
+	(setq rotated-start-angle (- pi rotated-start-angle)
+	      rotated-end-angle (- pi rotated-end-angle))
+	;; Clockwise  counterclockwise
+	(setq clockwise (not clockwise)))
+      (when (minusp scale-y)
+	(setq scale-y (- scale-y))
+	(setq rotated-start-angle (- rotated-start-angle)
+	      rotated-end-angle (- rotated-end-angle))
+	(setq clockwise (not clockwise)))
+      (when clockwise
+	;; Most operations don't care which way they draw, so we draw counterclockwise
+	;; between the angles the other way.  The methods that do care understand the way
+	;; in which to interpret start-angle and end-angle.
+	(rotatef rotated-start-angle rotated-end-angle))
+      ;; Translate sector rays from user coordinate system too.  Any vector with both x and
+      ;; y components is distorted by non uniform scaling.
+      (unless (or full-circle-p
+		  (= scale-x scale-y))		;No distortion
+	(unless (zerop (mod rotated-start-angle (/ pi 2)))
+	  (let ((sin (sin rotated-start-angle))
+		(cos (cos rotated-start-angle)))
+	    (unless (or (< (abs sin) 1e-5) (< (abs cos) 1e-5))	;...
+	      (setq rotated-start-angle (atan (* sin scale-y) (* cos scale-x))))))
+	(unless (zerop (mod rotated-end-angle (/ pi 2)))
+	  (let ((sin (sin rotated-end-angle))
+		(cos (cos rotated-end-angle)))
+	    (unless (or (< (abs sin) 1e-5) (< (abs cos) 1e-5))	;...
+	      (setq rotated-end-angle (atan (* sin scale-y) (* cos scale-x)))))))
+      (unless (zerop rotation)
+	(incf rotated-start-angle rotation)
+	(incf rotated-end-angle rotation)))
+    (let ((flags (get-drawing-state-scan-conversion-flags drawing-state)))
+      (when (ldb-test %%scan-conversion-round-coordinates flags)
+	(fix-points center-x center-y x-radius y-radius inner-x-radius inner-y-radius)
+	;; Don't let this reduce thickness past limit.
+	(when (or (eql x-radius inner-x-radius) (eql y-radius inner-y-radius))
+	  (setq inner-x-radius 0
+		inner-y-radius 0
+		filled nil)))
+      (when (ldb-test %%scan-conversion-center-circles flags)
+	(incf center-x .5) (incf center-y .5)
+	(when filled
+	  (incf x-radius .5) (incf y-radius .5)
+	  (unless (zerop inner-x-radius)
+	    (incf inner-x-radius .5))
+	  (unless (zerop inner-y-radius)
+	    (incf inner-y-radius .5)))))
+    (with-standardized-source-and-alu (pattern alu zeros-alu)
+      (when (not filled)
+	(multiple-value-bind (x-thickness/2 y-thickness/2)
+	    (standardize-thickness)
+	  (with-dash-pattern (dashed)
+	    (when dashed
+	      ;; Not the fastest way of doing this, but better than nothing.
+	      (using-resource (path-stream line-path-stream)
+		(send path-stream :initialize :filled-allowed t)
+		(cond ((< y-radius 1)
+		       (let ((dx (* x-radius (cos rotation)))
+			     (dy (* x-radius (sin rotation))))
+			 (draw-scaled-line path-stream
+					   (floor (- center-x dx)) (floor (- center-y dy))
+					   (ceiling (+ center-x dx)) (ceiling (+ center-y dy))
+					   )))
+		      ((< x-radius 1)
+		       (let ((dy (* y-radius (cos rotation)))
+			     (dx (* y-radius (sin rotation))))
+			 (draw-scaled-line path-stream
+					   (floor (- center-x dx)) (floor (- center-y dy))
+					   (ceiling (+ center-x dx)) (ceiling (+ center-y dy))
+					   )))
+		      (t
+		       (draw-general-ellipse path-stream center-x center-y x-radius y-radius
+					     rotation shear-x inner-x-radius inner-y-radius
+					     rotated-start-angle rotated-end-angle
+					     clockwise nil nil t tv:alu-ior color:alu-noop
+					     center-x center-y)))
+		(draw-lines-scaled self (send path-stream :lines) x-thickness/2 y-thickness/2 
+				   :closed full-circle-p :join-to-path join-to-path))
+	      (return-from default-draw-ellipse nil)))
+	  (when (or (not (= 0 x-thickness/2 y-thickness/2)) (not (null pattern)))
+	    (setq inner-x-radius (- x-radius x-thickness/2)
+		  inner-y-radius (- y-radius y-thickness/2)
+		  x-radius (+ x-radius x-thickness/2)
+		  y-radius (+ y-radius y-thickness/2)
+		  filled t))))
+      (cond ((< y-radius 1)
+	     (let ((dx (* x-radius (cos rotation)))
+		   (dy (* x-radius (sin rotation))))
+	       (draw-scaled-line self (floor (- center-x dx)) (floor (- center-y dy))
+				 (ceiling (+ center-x dx)) (ceiling (+ center-y dy))
+				 alu)))
+	    ((< x-radius 1)
+	     (let ((dy (* y-radius (cos rotation)))
+		   (dx (* y-radius (sin rotation))))
+	       (draw-scaled-line self (floor (- center-x dx)) (floor (- center-y dy))
+				 (ceiling (+ center-x dx)) (ceiling (+ center-y dy))
+				 alu)))
+	    ((and (= x-radius y-radius)
+		  (= inner-x-radius inner-y-radius)
+		  (null pattern))
+	     (flet ((join-to-path (x-thickness/2 y-thickness/2)
+		      ;; Compatibility kludge for tv:graphics-mixin, which doesn't honor it.
+		      ;; Draw the initial line segment and move the final position.
+		      ;; We cannot do this for path filling here as well, since that
+		      ;; required exact matchup in the intersection and cos and sin introduce
+		      ;; error.  However, this error doesn't matter for visible lines.
+		       (when join-to-path
+			 (when clockwise
+			   (rotatef rotated-start-angle rotated-end-angle))
+			 (multiple-value-bind (position-x position-y
+					       path-initial-x path-initial-y)
+			     (raster-drawing-state-path-position drawing-state)
+			   (if position-x
+			       (if (= 0 x-thickness/2 y-thickness/2)
+				   (draw-scaled-line self position-x position-y
+						     (round (+ center-x
+							       (* original-x-radius
+								  (cos rotated-start-angle))))
+						     (round (+ center-y
+							       (* original-y-radius
+								  (sin rotated-start-angle))))
+						     alu)			       
+				   (draw-thick-line-scaled
+				     position-x position-y
+				     (round (+ center-x
+					       (* (- original-x-radius x-thickness/2)
+						  (cos rotated-start-angle))))
+				     (round (+ center-y
+					       (* (- original-y-radius y-thickness/2)
+						  (sin rotated-start-angle))))
+				     x-thickness/2 y-thickness/2 pattern alu zeros-alu))
+			       (setq path-initial-x (round (+ center-x
+							      (* (- original-x-radius x-thickness/2)
+								 (cos rotated-start-angle))))
+				     path-initial-y (round (+ center-y
+							      (* (- original-y-radius y-thickness/2)
+								 (sin rotated-start-angle))))
+				     ))
+			   (setq position-x (round (+ center-x
+						      (* (- original-x-radius x-thickness/2)
+							 (cos rotated-end-angle))))
+				 position-y (round (+ center-y
+						      (* (- original-y-radius y-thickness/2)
+							 (sin rotated-end-angle)))))
+			   (raster-drawing-state-set-path-position-and-initial
+			     drawing-state
+			     position-x position-y path-initial-x path-initial-y)))))
+	       (if (not filled)
+		   (if full-circle-p
+		       (draw-scaled-circle self center-x center-y x-radius alu clockwise)
+		       (unless
+			   (draw-scaled-circular-arc self center-x center-y x-radius
+						     rotated-start-angle rotated-end-angle
+						     alu clockwise join-to-path)
+			 (join-to-path 0 0)))
+		   (if (zerop inner-x-radius)
+		       (if full-circle-p
+			   (draw-scaled-filled-in-circle self center-x center-y x-radius alu)
+			   (draw-scaled-filled-in-sector self center-x center-y x-radius
+							 rotated-start-angle rotated-end-angle
+							 alu pattern zeros-alu
+							 center-x center-y))
+		       (if full-circle-p
+			   (draw-scaled-ring self center-x center-y
+					     inner-x-radius x-radius alu)
+			   (draw-scaled-sector-ring self center-x center-y
+						    inner-x-radius x-radius
+						    rotated-start-angle rotated-end-angle
+						    alu pattern zeros-alu
+						    center-x center-y)
+			   (join-to-path (/ (- x-radius inner-x-radius) 2)
+					 (/ (- y-radius inner-y-radius) 2)))))))
+	    ((and (null pattern)
+		  (or (zerop rotation)
+		      (zerop (cos rotation)) (zerop (sin rotation)))
+		  full-circle-p
+		  (zerop inner-x-radius) (zerop inner-y-radius))
+	     (when (zerop (cos rotation))
+	       (rotatef x-radius y-radius))
+	     (if (not filled)
+		 (draw-scaled-simple-ellipse self center-x center-y
+					     x-radius y-radius alu clockwise)
+		 (draw-scaled-filled-in-simple-ellipse self center-x center-y
+						       x-radius y-radius alu)))
+	    (t
+	     (draw-general-ellipse self center-x center-y x-radius y-radius
+				   rotation shear-x inner-x-radius inner-y-radius
+				   rotated-start-angle rotated-end-angle
+				   clockwise join-to-path filled pattern alu zeros-alu
+				   center-x center-y)))))) 
+
+;;; Draw a slice of a circle, applying sector clipping as necessary.
+;;; Sometimes draws a thinner slice, sometime two thinner slices around the missing piece
+;;; of pie.
+(defun-in-flavor (draw-sector-slice raster-graphics-mixin)
+		 (start-x end-x y clipping-x-1 clipping-y-1 clipping-x-2 clipping-y-2 wide-p
+		  center-x center-y pattern ones-alu zeros-alu pattern-x pattern-y)
+  (setq start-x (floor start-x)
+	end-x (ceiling end-x)
+	y (floor y)
+	center-x (round center-x)
+	center-y (round center-y)
+	pattern-x (round pattern-x)
+	pattern-y (round pattern-y))
+  (let ((slice-1-x1 (clip-with-start-angle start-x y clipping-x-1 clipping-y-1))
+	(slice-1-x2 (clip-with-start-angle end-x y clipping-x-1 clipping-y-1))
+	(slice-2-x1 (clip-with-end-angle start-x y clipping-x-2 clipping-y-2))
+	(slice-2-x2 (clip-with-end-angle end-x y clipping-x-2 clipping-y-2)))
+    (if (not wide-p)
+	;; Draw intersection
+	(let ((left (max slice-1-x1 slice-2-x1))
+	      (right (min slice-1-x2 slice-2-x2)))
+	  (when (> right left)
+	    (draw-patterned-rectangle (- right left) 1
+				      (+ center-x left) (+ center-y y)
+				      pattern ones-alu zeros-alu
+				      (+ pattern-x left) (+ pattern-y y))))
+	;; Draw two pieces
+	(unless (< slice-1-x1 slice-2-x1)
+	  (rotatef slice-1-x1 slice-2-x1)
+	  (rotatef slice-1-x2 slice-2-x2))
+	(when (> slice-1-x2 slice-1-x1)
+	  (draw-patterned-rectangle (- slice-1-x2 slice-1-x1) 1
+				    (+ center-x slice-1-x1) (+ center-y y)
+				    pattern ones-alu zeros-alu
+				    (+ pattern-x slice-1-x1) (+ pattern-y y))
+	  (setq slice-2-x1 (max slice-2-x1 slice-1-x2)))
+	(when (> slice-2-x2 slice-2-x1)
+	  (draw-patterned-rectangle (- slice-2-x2 slice-2-x1) 1
+				    (+ center-x slice-2-x1) (+ center-y y)
+				    pattern ones-alu zeros-alu
+				    (+ pattern-x slice-2-x1) (+ pattern-y y))))))
+
+;;; (This has the same footprint as the relevant portion of a filled circle, unlike the
+;;;  version that also called isqrt in the inner loop.)
+(defmethod (draw-scaled-filled-in-sector raster-graphics-mixin)
+	   (center-x center-y radius theta-1 theta-2
+		     &optional (alu :draw) (pattern nil) (zeros-alu :noop)
+			       (pattern-left center-x) (pattern-top center-y))
+  (setq alu (standardize-alu self alu)
+	zeros-alu (standardize-alu self zeros-alu))
+  (multiple-value-bind (clipping-x-1 clipping-y-1)
+      (angle-clipping-line theta-1 (* radius 3))
+    (multiple-value-bind (clipping-x-2 clipping-y-2)
+	(angle-clipping-line theta-2 (* radius 3))
+      (let ((wide-p (sector-wide-p theta-1 theta-2)))
+	(draw-circle-driver center-x center-y radius
+	  #'(lambda (width height x y)
+	      (loop repeat height
+		    for y from y
+		    do (draw-sector-slice (- x center-x) (- (+ x width) center-x)
+					  (- y center-y)
+					  clipping-x-1 clipping-y-1 clipping-x-2 clipping-y-2
+					  wide-p center-x center-y
+					  pattern alu zeros-alu
+					  pattern-left pattern-top))))))))
+
+(defmethod (draw-scaled-sector-ring raster-graphics-mixin)
+	   (center-x center-y radius-1 radius-2 theta-1 theta-2
+	    &optional (alu :draw) (pattern nil) (zeros-alu :noop)
+		      (pattern-left center-x) (pattern-top center-y))
+  (setq alu (standardize-alu self alu)
+	zeros-alu (standardize-alu self zeros-alu))
+  (multiple-value-bind (clipping-x-1 clipping-y-1)
+      (angle-clipping-line theta-1 (* (max radius-1 radius-2) 3))
+    (multiple-value-bind (clipping-x-2 clipping-y-2)
+	(angle-clipping-line theta-2 (* (max radius-1 radius-2) 3))
+      (let ((wide-p (sector-wide-p theta-1 theta-2)))
+	(draw-circular-ring-driver center-x center-y radius-1 radius-2
+	  #'(lambda (width height x y)
+	      (loop repeat height
+		    for y from y
+		    do (draw-sector-slice (- x center-x) (- (+ x width) center-x)
+					  (- y center-y)
+					  clipping-x-1 clipping-y-1 clipping-x-2 clipping-y-2
+					  wide-p center-x center-y 
+					  pattern alu zeros-alu
+					  pattern-left pattern-top))))))))
+
+;;; Output a series of points on a curve, composing them into small line segments which
+;;; are then drawn on stream.  This makes path drawing work on the curve, and presumably
+;;; cuts down the overhead of drawing smoothly on devices with only a line drawing
+;;; protocol, like the LGP1 (RIP).
+;;; If join-to-path, arrange to their to be a line segment from the first point drawn
+;;; to the old current point, and leave the final point as the new current point.
+(defmacro drawing-points-as-lines ((stream point-function
+				    &key alu reflect-y join-to-path
+					 (x-offset '0) (y-offset '0))
+				   &body body
+				   &environment env)
+  (once-only (alu reflect-y join-to-path x-offset y-offset &environment env)
+    `(let ((lx nil) (ly nil)
+	   (ox nil) (oy nil)
+	   (odx nil) (ody nil)
+	   (tdx 0) (tdy 0))
+       (when ,join-to-path
+	 ;; Since this will get drawn after the coordinates have been translated by
+	 ;; a dynamic window, we need to compute the offset according to planar coordinates.
+	 (when (operation-handled-p ,stream :visible-cursorpos-limits)
+	   (multiple-value-setq (tdx tdy)
+	     (send ,stream :visible-cursorpos-limits)))
+	 (multiple-value-bind (position-x position-y)
+	     (raster-drawing-state-path-position drawing-state)
+	   (when position-x
+	     (setq ox (- position-x ,x-offset tdx)
+		   oy (if ,reflect-y
+			  (- (+ ,y-offset tdy) position-y)
+			  (- position-y (+ ,y-offset tdy)))))))
+       (labels ((.line. (x1 y1 x2 y2 draw-end-point)
+		  (when ,reflect-y
+		    (setq y1 (- y1) y2 (- y2)))
+		  (draw-scaled-line ,stream (+ ,x-offset x1) (+ ,y-offset y1)
+				    (+ ,x-offset x2) (+ ,y-offset y2)
+				    ,alu draw-end-point))
+		(,point-function (x y)
+		  (if ox
+		      (let ((dx (- x ox))
+			    (dy (- y oy)))
+			(cond ((null odx)
+			       (setq odx dx ody dy
+				     lx ox ly oy))
+			      ((or ( dx odx) ( dy ody))
+			       (.line. lx ly ox oy nil)
+			       (setq odx dx ody dy
+				     lx ox ly oy))))
+		      (when ,join-to-path
+			(raster-drawing-state-set-path-initial-position
+			  drawing-state
+			  (+ x ,x-offset tdx)
+			  (+ (if ,reflect-y (- y) y) ,y-offset tdy))))
+		  (setq ox x oy y)))
+	 (multiple-value-prog1
+	     (progn . ,body)
+	   (when lx
+	     (.line. lx ly ox oy t))
+	   (when ,join-to-path
+	     (raster-drawing-state-set-path-position
+	       drawing-state
+	       (+ ox ,x-offset tdx)
+	       (+ (if ,reflect-y (- oy) oy) ,y-offset tdy))))))))
+
+;;; Draw a portion of a circle between two sector lines, given as their tangents.
+;;; Note that clockwise should not affect the interpretation of start and end, just
+;;; which way the lines are going when drawn.  We accomplish by drawing backwards
+;;; (from end to start) reflected by y=0.
+(defun-in-flavor (draw-circular-arc-internal raster-graphics-mixin)
+		 (center-x center-y radius
+		  cos-start-theta sin-start-theta cos-end-theta sin-end-theta
+		  clockwise join-to-path alu)
+  (when clockwise
+    (setq sin-start-theta (- sin-start-theta)
+	  sin-end-theta (- sin-end-theta))
+    (rotatef cos-start-theta cos-end-theta)
+    (rotatef sin-start-theta sin-end-theta))
+  (labels ((angle-quadrant (cos sin)
+	     (if (minusp cos) (if (minusp sin) 2 1) (if (minusp sin) 3 0)))
+	   (angle-boundary (quadrant cos sin)
+	     (round (if (evenp quadrant) (* radius sin) (* radius cos))))
+	   (point-boundary-p (x y mod-quadrant boundary)
+	     (case mod-quadrant
+	       ((0) ( y boundary))
+	       ((1) ( x boundary))
+	       ((2) ( y boundary))
+	       ((3) ( x boundary))))
+	   (draw-quadrant (rcx rcy quadrant-function)
+	     (draw-unfilled-circle-driver (- center-x rcx) (- center-y rcy) radius
+	       #'(lambda (x y)
+		   (funcall quadrant-function (angle-quadrant x y) x y))
+	       t)))
+    (let* ((start-quadrant (angle-quadrant cos-start-theta sin-start-theta))
+	   (start-boundary (angle-boundary start-quadrant cos-start-theta sin-start-theta))
+	   (end-quadrant (angle-quadrant cos-end-theta sin-end-theta))
+	   (end-boundary (angle-boundary end-quadrant cos-end-theta sin-end-theta))
+	   (rcx (round center-x))
+	   (rcy (round center-y))
+	   (drawing-p nil))
+      (drawing-points-as-lines (self next-point :alu alu
+				     :reflect-y clockwise :join-to-path join-to-path
+				     :x-offset rcx :y-offset rcy)
+	(when (or (> start-quadrant end-quadrant)
+		  (and (= start-quadrant end-quadrant)
+		       (point-boundary-p start-boundary start-boundary start-quadrant
+					 end-boundary)))
+	  (incf end-quadrant 4))
+	(loop for quadrant from start-quadrant to end-quadrant do
+	  (let ((mod-quadrant (mod quadrant 4)))
+	    (draw-quadrant rcx rcy
+			   #'(lambda (drawing-quadrant x y)
+			       (when (= drawing-quadrant mod-quadrant)
+				 (if (not drawing-p)
+				     (when (point-boundary-p x y mod-quadrant start-boundary)
+				       (setq drawing-p t))	;Reached the start angle
+				     (when (and (= quadrant end-quadrant)
+						(point-boundary-p x y
+								  mod-quadrant end-boundary))
+				       (return)))
+				 (when drawing-p
+				   (next-point x y)))))))
+	(next-point (round (* cos-end-theta radius)) (round (* sin-end-theta radius)))))))
+
+;;; Draw a circle as a bunch of king's moves, which can then be used for path filling.
+(defmethod (draw-scaled-circle raster-graphics-mixin)
+	   (center-x center-y radius &optional alu clockwise)
+  (draw-circular-arc-internal center-x center-y radius 1 0 1 0 clockwise nil alu))
+
+(defmethod (draw-scaled-circular-arc raster-graphics-mixin)
+	   (center-x center-y radius start-theta end-theta
+	    &optional alu clockwise join-to-path)
+  (draw-circular-arc-internal center-x center-y radius
+			      (cos start-theta) (sin start-theta)
+			      (cos end-theta) (sin end-theta)
+			      clockwise join-to-path alu)
+  t)
+
+;;; Draw an ellipse as a sequence of king's moves.
+(defmethod (draw-scaled-simple-ellipse raster-graphics-mixin)
+	   (center-x center-y x-radius y-radius &optional alu clockwise)
+  (let ((rcx (round center-x))
+	(rcy (round center-y)))
+    (drawing-points-as-lines (self next-point :alu alu :reflect-y clockwise
+					      :x-offset rcx :y-offset rcy)
+      (let ((start-x nil)
+	    (start-y nil))
+	(draw-unfilled-ellipse-driver (- center-x rcx) (- center-y rcy) x-radius y-radius
+				      #'(lambda (x y)
+					  (unless start-x
+					    (setq start-x x start-y y))
+					  (next-point x y))
+				      t)
+	;; Close it off back around.
+	(next-point start-x start-y)))))
+
+(defun-in-flavor (draw-elliptical-arc raster-graphics-mixin)
+		 (center-x center-y x-radius y-radius rotation shear-x start-angle end-angle
+		  alu clockwise join-to-path)
+  (when clockwise
+    ;; If drawing clockwise, draw reflected about y=0 twice.
+    (psetq start-angle (- end-angle)
+	   end-angle (- start-angle))
+    (setq rotation (- rotation)))
+  (drawing-points-as-lines (self next-point-shifted :alu alu
+				 :reflect-y clockwise :join-to-path join-to-path
+				 :x-offset (round center-x) :y-offset (round center-y))
+    (multiple-value-bind (max-x nil max-y-x max-y untilted-x)
+	(ellipse-limits x-radius y-radius rotation shear-x)
+      (let* ((translation-slope (/ max-y-x max-y))
+	     (big-denominator (* (max max-x max-y) 3))
+	     (start-sin (round (* (sin start-angle) big-denominator)))
+	     (start-cos (round (* (cos start-angle) big-denominator)))
+	     (end-sin (round (* (sin end-angle) big-denominator)))
+	     (end-cos (round (* (cos end-angle) big-denominator)))
+	     (first-x nil) (first-y nil)
+	     (state :before-start)
+	     (drawing-p nil))
+	(loop
+	  (labels ((in-right-quadrant (x y sin cos)
+		     (when (and (eq (minusp x) (minusp cos))
+				(eq (minusp y) (minusp sin)))
+		       (values t (- (* y cos) (* x sin)))))
+		   (start-drawing ()
+		     (setq drawing-p t
+			   ;; If we are drawing the improper side of the angle, we
+			   ;; must wait until we see a quadrant boundary until checking
+			   ;; for the end transition.  This is because the start and end
+			   ;; might be in the same quadrant and points after the start are
+			   ;; also after the end.  We want to wait until next go round.
+			   state (if (sector-wide-p start-angle end-angle)
+				     :in-start-quadrant :after-start)))
+		   (next-point (x y)
+		     (incf x (+ max-y-x (* (- y max-y) translation-slope)))
+		     (ecase state
+		       ;; Initial state.  If this is the correct quadrant for starting,
+		       ;; if it's already past the start angle, start drawing.  Otherwise,
+		       ;; check for passing out.
+		       ((:before-start)
+			(multiple-value-bind (in-quadrant past-angle)
+			    (in-right-quadrant x y start-sin start-cos)
+			  (when in-quadrant
+			    (if (< past-angle 0)
+				(setq state :in-start-quadrant)
+				(start-drawing)))))
+		       ;; We were previously in the start quadrant.  If we pass the angle,
+		       ;; start drawing.  If we pass out, we must have just missed (the
+		       ;; angle was very close to an axis because of roundoff error).  So,
+		       ;; start drawing anyway.  If we are in here and drawing, wait to
+		       ;; pass out so that then we can start looking for the end angle.
+		       ;; This is for the case where the end angle is the same as the
+		       ;; start angle or very close to it.
+		       ((:in-start-quadrant)
+			(multiple-value-bind (in-quadrant past-angle)
+			    (in-right-quadrant x y start-sin start-cos)
+			  (if drawing-p
+			      (unless in-quadrant
+				(setq state :after-start))
+			      (when (if in-quadrant ( past-angle 0) t)
+				(start-drawing)))))
+		       ;; Waiting to pass into the end quadrant.  If we do so, and pass
+		       ;; the end angle, we're all done.  In any case, note when we move
+		       ;; into the correct quadrant.
+		       ((:after-start)
+			(multiple-value-bind (in-quadrant past-angle)
+			    (in-right-quadrant x y end-sin end-cos)
+			  (when in-quadrant
+			    (when (> past-angle 0)
+			      (return nil))
+			    (setq state :in-end-quadrant))))
+		       ;; Looking for the end angle.  If we pass out of this one, we just
+		       ;; missed the end angle (it was very close to an axis), so exit.
+		       ((:in-end-quadrant)
+			(multiple-value-bind (in-quadrant past-angle)
+			    (in-right-quadrant x y end-sin end-cos)
+			  (when (if in-quadrant (> past-angle 0) t)
+			    (return nil)))))
+		     (when drawing-p
+		       (setq x (round x) y (round y))
+		       (unless first-x
+			 (setq first-x x first-y y))
+		       (next-point-shifted x y))))
+	    (draw-unfilled-ellipse-driver 0 0 untilted-x max-y #'next-point t)))
+	;; If we are drawing a complete ellipse, return to the first
+	;; point for the sake of path filling.
+	(when (and (zerop (mod (- end-angle start-angle) 2pi)) first-x)
+	  (next-point-shifted first-x first-y))))))
+
+;;; This is the most general ellipse function here.  Drawing a titled elliptical sector ring.
+(defun-in-flavor (draw-elliptical-ring raster-graphics-mixin)
+		 (center-x center-y x-radius y-radius rotation shear-x
+		  inner-x-radius inner-y-radius start-angle end-angle
+		  pattern ones-alu zeros-alu pattern-x pattern-y)
+  (let ((sector-kind (cond ((full-circle-p start-angle end-angle) nil)
+			   ((sector-wide-p start-angle end-angle) :wide)
+			   (t :thin)))
+	clipping-x-1 clipping-y-1 clipping-x-2 clipping-y-2)
+    (when sector-kind
+      (multiple-value-setq (clipping-x-1 clipping-y-1)
+	(angle-clipping-line start-angle (* (max x-radius y-radius) 3)))
+      (multiple-value-setq (clipping-x-2 clipping-y-2)
+	(angle-clipping-line end-angle (* (max x-radius y-radius) 3))))
+    (if (or (zerop inner-x-radius) (zerop inner-y-radius))
+	(multiple-value-bind (nil nil max-y-x max-y untilted-x)
+	    (ellipse-limits x-radius y-radius rotation shear-x)
+	  (let ((translation-slope (/ max-y-x max-y)))
+	    (flet ((draw-bare-slice (width height x y)
+		     (assert (= height 1))
+		     (let* ((dx (+ max-y-x (* (- y max-y) translation-slope)))
+			    (x (floor (+ x dx))))
+		       (draw-sector-slice x (+ x width) y
+					  clipping-x-1 clipping-y-1
+					  clipping-x-2 clipping-y-2
+					  (eq sector-kind :wide)
+					  center-x center-y
+					  pattern ones-alu zeros-alu
+					  pattern-x pattern-y))))
+	      (draw-ellipse-driver 0 0 untilted-x max-y #'draw-bare-slice))))
+	(with-data-stack 
+	  (let (y-offset outer-start-x inner-start-x inner-widths outer-widths)
+	    (flet ((do-an-ellipse (untilted-x max-y max-y-x start-x widths)
+		     (let ((translation-slope (/ max-y-x max-y)))
+		       (flet ((draw-bare-slice (width height x y)
+				(assert (= height 1))
+				(let* ((dx (+ max-y-x (* (- y max-y) translation-slope)))
+				       (x (+ x dx))
+				       (y (round (+ y y-offset))))
+				  (setf (aref start-x y) x)
+				  (setf (aref widths y) width))))
+			 (draw-ellipse-driver 0 0 untilted-x max-y #'draw-bare-slice)))))
+	      (multiple-value-bind (nil nil max-y-x max-y untilted-x)
+		  (ellipse-limits x-radius y-radius rotation shear-x)
+		(setq y-offset (round max-y))
+		(let ((dim (1+ (* y-offset 2))))
+		  (setq outer-start-x (make-stack-array dim)
+			inner-start-x (make-stack-array dim)
+			inner-widths (make-stack-array dim)
+			outer-widths (make-stack-array dim)))
+		(do-an-ellipse untilted-x max-y max-y-x outer-start-x outer-widths))
+	      (multiple-value-bind (nil nil max-y-x max-y untilted-x)
+		  (ellipse-limits inner-x-radius inner-y-radius rotation shear-x)
+		(do-an-ellipse untilted-x max-y max-y-x inner-start-x inner-widths)))
+	    (loop for index to (* y-offset 2)
+		  for y from (- y-offset)
+		  do
+	      (let ((rounded-center-y (round center-y))
+		    (rounded-pattern-y (round pattern-y))
+		    (outer-start (aref outer-start-x index))
+		    (inner-start (aref inner-start-x index))
+		    (inner-width (aref inner-widths index))
+		    (outer-width (aref outer-widths index)))
+		(flet ((slice (start width)
+			 (if sector-kind
+			     (draw-sector-slice start (+ start width) y
+						clipping-x-1 clipping-y-1
+						clipping-x-2 clipping-y-2
+						(eq sector-kind :wide)
+						center-x center-y
+						pattern ones-alu zeros-alu
+						pattern-x pattern-y)
+			     (draw-patterned-rectangle width 1
+						       (floor (+ center-x start))
+						       (+ y rounded-center-y)
+						       pattern ones-alu zeros-alu
+						       (floor (+ pattern-x start))
+						       (+ y rounded-pattern-y)))))
+		  (when outer-start
+		    (if (not inner-start)
+			(slice outer-start outer-width)
+			(let ((left-width (- (floor (+ center-x inner-start))
+					     (floor (+ center-x outer-start)))))
+			  (slice outer-start left-width)
+			  (slice (+ inner-start inner-width)
+				 (- outer-width inner-width left-width)))))))))))))
+
+;;; This is a method, so that dynamic windows can introduce the history here and save
+;;; the overhead of all the slices.
+(defmethod (draw-general-ellipse raster-graphics-mixin)
+	   (center-x center-y x-radius y-radius rotation shear-x
+	    inner-x-radius inner-y-radius start-angle end-angle
+	    clockwise join-to-path filled pattern ones-alu zeros-alu
+	    pattern-left pattern-top)
+  (cond ((not filled)
+	 (draw-elliptical-arc center-x center-y x-radius y-radius rotation shear-x
+			      start-angle end-angle ones-alu clockwise join-to-path))
+	((and (or (zerop inner-x-radius) (zerop inner-y-radius))
+	      (full-circle-p start-angle end-angle))
+	 (multiple-value-bind (nil nil max-y-x max-y untilted-x)
+	     (ellipse-limits x-radius y-radius rotation shear-x)
+	   (let ((translation-slope (/ max-y-x max-y)))
+	     (flet ((draw-bare-slice (width height x y)
+		      (let* ((dx (+ max-y-x (* (- y max-y) translation-slope)))
+			     (px (floor (+ pattern-left x dx)))
+			     (py (round (+ pattern-top y)))
+			     (x (floor (+ center-x x dx)))
+			     (y (round (+ center-y y))))
+			(draw-patterned-rectangle width height x y
+						  pattern ones-alu zeros-alu
+						  px py))))
+	       (draw-ellipse-driver 0 0 untilted-x max-y #'draw-bare-slice)))))
+	(t
+	 (draw-elliptical-ring center-x center-y x-radius y-radius rotation shear-x
+			       inner-x-radius inner-y-radius start-angle end-angle
+			       pattern ones-alu zeros-alu pattern-left pattern-top))))
+
+(defmethod (default-draw-bezier-curve raster-graphics-mixin)
+	   (px1 py1 px4 py4 px2 py2 px3 py3
+	    &rest args
+	    &key number-of-samples
+	    &allow-other-keys)
+  (declare (ignore args))
+  (transform-points px1 py1 px2 py2 px3 py3 px4 py4)
+  (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+    (let ((eps (/ (float (or number-of-samples
+			     (/ (max (- (max px4 px1 px2 px3) (min px4 px1 px2 px3))
+				     (- (max py4 py1 py2 py3) (min py4 py1 py2 py3))
+				     2)
+				2))))))
+      (multiple-value-bind (x-thickness/2 y-thickness/2)
+	  (standardize-thickness)
+	(with-dash-pattern (dashed)
+	  (when dashed
+	    ;; Not the fastest way of doing this, but better than nothing.
+	    (using-resource (path-stream line-path-stream)
+	      (send path-stream :initialize)
+	      (funcall (flavor:generic draw-bezier-curve) path-stream
+		       px1 py1 px4 py4 px2 py2 px3 py3 :number-of-samples number-of-samples)
+	      (draw-lines-scaled self (send path-stream :lines) x-thickness/2 y-thickness/2))
+	    (return-from default-draw-bezier-curve nil)))
+
+	 (let ((tt 0) (1-tt 1))
+	   (labels ((line (x1 y1 x2 y2 draw-end-point)
+		      (if (not (= 0 x-thickness/2 y-thickness/2))
+			  (draw-thick-line-scaled x1 y1 x2 y2 x-thickness/2 y-thickness/2
+						  pattern ones-alu zeros-alu)
+			  (draw-scaled-line self x1 y1 x2 y2 ones-alu draw-end-point)))
+		    (convex (a b) (+ (* a 1-tt) (* b tt)))
+		    (bezier (a b c d)
+		      (let ((convex-b-c (convex b c)))
+			(convex (convex (convex a b) convex-b-c)
+				(convex convex-b-c (convex c d))))))
+	     (let (xr yr (pxr (round px1)) (pyr (round py1)))
+	       (loop
+		 (incf tt eps)
+		 (setq 1-tt (- 1 tt))
+		 (when ( tt 1)
+		   (line pxr pyr (round px4) (round py4) t)
+		   (return))
+		 (setq xr (round (bezier px1 px2 px3 px4))
+		       yr (round (bezier py1 py2 py3 py4)))
+		 (unless (and (= xr pxr) (= yr pyr))
+		   (line pxr pyr (setq pxr xr) (setq pyr yr) nil)))))))))
+  nil)
+
+;;; More efficient would be to use the algebraic form, like draw-circle-driver.  The shape
+;;; would have to be rationalized.
+(defmethod (default-draw-conic-section raster-graphics-mixin)
+	   (px1 py1 px3 py3 px2 py2
+	    &rest args
+	    &key number-of-samples shape
+	    &allow-other-keys)
+  (declare (ignore args))
+  (when (null shape)
+    (let ((a2 (+ (expt (- px3 px2) 2)
+		 (expt (- py3 py2) 2)))
+	  (c2 (+ (expt (- px1 px2) 2)
+		 (expt (- py1 py2) 2)))
+	  (b2 (+ (expt (- px1 px3) 2)
+		 (expt (- py1 py3) 2))))
+      (setq shape (/ (sqrt b2) (sqrt (* 2 (+ a2 c2)))))))
+  (transform-points px1 py1 px2 py2 px3 py3)
+  (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+    (let* ((eps (/ (or number-of-samples (float (abs (max (- px3 px1) (- py3 py1))) 0.0))))
+	   (eps2 (* eps eps)))
+      (multiple-value-bind (x-thickness/2 y-thickness/2)
+	  (standardize-thickness)
+	(with-dash-pattern (dashed)
+	  (when dashed
+	    ;; Not the fastest way of doing this, but better than nothing.
+	    (using-resource (path-stream line-path-stream)
+	      (send path-stream :initialize)
+	      (funcall (flavor:generic draw-conic-section) path-stream
+		       px1 py1 px3 py3 px2 py2 :shape shape
+					       :number-of-samples number-of-samples)
+	      (draw-lines-scaled self (send path-stream :lines) x-thickness/2 y-thickness/2))
+	    (return-from default-draw-conic-section nil)))
+  
+	(flet ((line (x1 y1 x2 y2 draw-end-point)
+		 (if (not (= 0 x-thickness/2 y-thickness/2))
+		     (draw-thick-line-scaled x1 y1 x2 y2 x-thickness/2 y-thickness/2
+					     pattern ones-alu zeros-alu)
+		     (draw-scaled-line self x1 y1 x2 y2 ones-alu draw-end-point)))
+	       (ds (p1 p2 p3)
+		 (let ((dt1 (+ (* (- p3 p1) 2 eps)
+			       (- (* (- p2 p1) 4 shape eps))))
+		       (dt0 (+ (* (- p3 p1) eps2)
+			       (* (- p2 p1) 2 shape (- eps eps2)))))
+		   (values (* dt1 eps)
+			   dt0))))
+	  (multiple-value-bind (dxt1 dx)
+	      (ds px1 px2 px3)
+	    (multiple-value-bind (dyt1 dy)
+		(ds py1 py2 py3)
+	      (let ((px px1)
+		    (py py1)
+		    (pxr (round px1))
+		    (pyr (round py1))
+		    (tt 0))
+		(loop
+		  (incf dx dxt1)
+		  (incf dy dyt1)
+		  (incf tt eps)
+		  (when ( tt 1)
+		    (line pxr pyr (round px3) (round py3) t)
+		    (return))
+		  (unless (and (zerop dx)
+			       (zerop dy))
+		    (incf px dx)
+		    (incf py dy)
+		    (line pxr pyr (setq pxr (round px)) (setq pyr (round py)) nil))))))))))
+  nil)
+
+(defun-in-flavor (draw-string-bounding-box raster-graphics-mixin)
+		 (string x y
+			 &key (attachment-x :left) (attachment-y :baseline)
+			      (toward-x (1+ x)) (toward-y y) (stretch-p nil)
+			      (character-style nil) (character-size nil) (string-width nil)
+			 &allow-other-keys)
+  (declare (values left top right bottom baseline-y toward-x toward-y computed-string-width))
+  (multiple-value-bind (computed-string-width max-char-width total-height line-height baseline)
+      (send self :draw-string-size string character-style character-size)
+    (when stretch-p
+      (setq computed-string-width (abs (- toward-x x))
+	    total-height (abs (- toward-y y))))
+    (unless string-width
+      (setq string-width computed-string-width))
+    (macrolet ((floor-for-scale (x y)
+		 ;; If dealing with character-size, use fractions.  Else stick to integers.
+		 `(if character-size (/ ,x ,y) (floor ,x ,y)))
+	       (ceiling-for-scale (x y)
+		 `(if character-size (/ ,x ,y) (ceiling ,x ,y))))
+      (cl:ecase attachment-x
+	((:left) )
+	((:right)
+	 (let ((width (cond ((= toward-y y) string-width)
+			    (( toward-x x)
+			     (abs (floor-for-scale (* (- toward-x x) string-width)
+						   (- toward-y y))))
+			    ((< toward-y y) (- max-char-width))
+			    (t max-char-width))))
+	   (when (< toward-x x)
+	     (decf width string-width))
+	   (decf x width)
+	   (decf toward-x width)))
+	((:center)
+	 (let ((width (cond ((= toward-y y) (floor-for-scale string-width 2))
+			    (( toward-x x) (floor-for-scale (* (- toward-x x) string-width)
+							     (* (- toward-y y) 2)))
+			    ((< toward-y y) (- (ceiling-for-scale max-char-width 2)))
+			    (t (floor-for-scale max-char-width 2)))))
+	   (decf x width)
+	   (decf toward-x width))))
+      (cl:ecase attachment-y
+	((:baseline) )
+	((:top)
+	 (incf y baseline)
+	 (incf toward-y baseline))
+	((:bottom)
+	 (let ((height (- line-height baseline)))
+	   (decf y height)
+	   (decf toward-y height)))
+	((:center)
+	 (let ((height (- (floor-for-scale line-height 2) baseline)))
+	   (unless (= toward-y y)
+	     (incf height (if (= toward-x x)
+			      (- (floor-for-scale total-height 2))
+			      (floor-for-scale (* (- toward-y y) string-width)
+					       (* (- toward-x x) 2)))))
+	   (decf y height)
+	   (decf toward-y height)))))
+    (values x (- y baseline) (+ x string-width) (+ (- y baseline) line-height)
+	    y toward-x toward-y computed-string-width)))
+
+(defmethod (draw-image dw::pixel-width-stream)
+	   (image left top &rest args
+			   &key (image-left 0) (image-top 0)
+				(image-right nil) (image-bottom nil)
+			   &allow-other-keys)
+  (declare (ignore args))
+  (multiple-value-bind (raster-width raster-height)
+      (decode-raster-array image)
+    (unless image-right
+      (setq image-right raster-width))
+    (unless image-bottom
+      (setq image-bottom raster-height)))
+  (let ((right (+ left (- image-right image-left)))
+	(bottom (+ top (- image-bottom image-top))))
+    (transform-and-fix-points left top right bottom)
+    ;;--- Should call DW::PIXEL-WIDTH-STREAM-GRAPHICS-BOX, but it's not there yet
+    (dw::minf-or dw::min-x-position left right)
+    (dw::minf-or dw::min-y-position top bottom)
+    (maxf dw::max-width left right)
+    (maxf dw::max-height top bottom)
+    nil))
+
+(defun-in-flavor (draw-string-image-transformed-bounding-box raster-graphics-mixin)
+		 (string x y &rest args)
+  (multiple-value-bind (left top right bottom nil nil nil computed-width)
+      (apply #'draw-string-bounding-box string x y args)
+    (setq top (- y (- top y))			;draw-string-bounding-box thinks upside down.
+	  bottom (- y (- bottom y)))
+    (transform-and-fix-points left top right bottom)
+    (values (min left right) (min top bottom)
+	    (max left right) (max top bottom)
+	    computed-width)))
+
+(defmethod (draw-string-image dw::pixel-width-stream) (&rest args)
+  (multiple-value-bind (left top right bottom)
+      (apply #'draw-string-image-transformed-bounding-box args)
+    ;;--- Should call DW::PIXEL-WIDTH-STREAM-GRAPHICS-BOX, but it's not there yet
+    (dw::minf-or dw::min-x-position left)
+    (dw::minf-or dw::min-y-position top)
+    (maxf dw::max-width right)
+    (maxf dw::max-height bottom)
+    nil))
+
+(defmethod (draw-string-image dw::redisplay-helper-stream) (&rest args)
+  (if (eq dw::state :displaying)
+      (apply (flavor:generic draw-string-image) (si:follow-syn-stream dw::stream) args)
+      (multiple-value-bind (left top right bottom)
+	  (apply #'draw-string-image-transformed-bounding-box args)
+	(dw::redisplay-helper-stream-graphics-box left top right bottom))))
+
+;;;+++ Horribly brute force.
+(defmethod (default-draw-image raster-graphics-mixin)
+	   (image left top &rest args
+			   &key (image-left 0) (image-top 0)
+				(image-right nil) (image-bottom nil)
+				(copy-image nil)
+			   &allow-other-keys)
+  (multiple-value-bind (raster-width raster-height)
+      (decode-raster-array image)
+    (unless image-right
+      (setq image-right raster-width))
+    (unless image-bottom
+      (setq image-bottom raster-height)))
+  (assert (<= image-left image-right)
+	  () "image-left, ~S, must be less than or equal to image-right, ~S"
+	  image-left image-right)
+  (assert (<= image-top image-bottom)
+	  () "image-top, ~S, must be less than or equal to image-bottom, ~S"
+	  image-top image-bottom)	  
+  (with-standardized-source-and-alu (drawing-pattern ones-alu zeros-alu)
+    (let ((opaque (drawing-state-opaque drawing-state))
+	  (transform (stream-transform self)))
+      (multiple-value-bind (composed-rotation scale-x scale-y translate-x translate-y)
+	  (decompose-transform transform)
+	(multiple-value-bind (tleft ttop)
+	    (transform-point left top transform)
+	  (if (zerop composed-rotation)
+	      ;; Image is not to be rotated, horizontal slices remain horizontal.
+	      (cond ((and (typep image '(array bit))
+			  (typep drawing-pattern '(or null (array bit))))
+		     ;; the bit case can use copy-bit-raster-scaling to get a big speedup
+		     (let ((width (- image-right image-left))
+			   (height (- image-bottom image-top)))
+		       (setq tleft (round tleft)
+			     ttop (round ttop))
+		       (if (and (= scale-x 1) (= scale-y 1) (null drawing-pattern))
+			   ;; perfect alignment, no pattern, just draw
+			   (draw-raster-internal width height image image-left image-top
+						 tleft ttop
+						 ones-alu zeros-alu copy-image)
+			   ;; non-+1 scaling in some direction and/or a pattern
+			   (sys:with-data-stack
+			     (let* ((swidth (abs (round (* width scale-x))))
+				    (sheight (abs (round (* height scale-y))))
+				    (element-type (array-element-type image))
+				    (cswidth (raster-array-correct-width swidth element-type))
+				    (scaled-image (if (and copy-image
+							   (patterns-are-remembered-p self))
+						      (make-raster-array
+							cswidth sheight
+							:element-type element-type)
+						      (make-raster-stack-array
+							cswidth sheight
+							:element-type element-type))))
+			       ;; zero (scaled) width or height is a no-op
+			       (unless (or (zerop swidth) (zerop sheight))
+				 ;; compute args for copy-bit-raster-scaling,
+				 ;; remembering that -from- is inclusive and -to-
+				 ;; is exclusive.  copy-bit-raster-scaling will do
+				 ;; the negative scaling for us (if necessary) by
+				 ;; pasing in indices in the "wrong" order.
+				 (multiple-value-bind (scaled-from-x scaled-to-x)
+				     (if (minusp scale-x)
+					 (values (1- swidth) -1)
+					 (values 0 swidth))
+				   (multiple-value-bind (scaled-from-y scaled-to-y)
+				       (if (minusp scale-y)
+					   (values (1- sheight) -1)
+					   (values 0 sheight))
+				     (copy-bit-raster-scaling
+				       image image-left image-top image-right image-bottom
+				       scaled-image
+				       scaled-from-x scaled-from-y
+				       scaled-to-x scaled-to-y)))
+				 ;; if a drawing pattern, mask the scaled image with it.
+				 (when drawing-pattern
+				   (bitblt boole-and swidth sheight
+					   drawing-pattern 0 0
+					   scaled-image 0 0))
+				 ;; 0,0 of the original image should appear at
+				 ;; tleft,ttop.  Negative scaling may have moved
+				 ;; where the origianl 0,0 are, so adjust tleft
+				 ;; and/or ttop so that when they are at the new
+				 ;; 0,0, the original 0,0 is at the old tleft,ttop.
+				 (let ((tleft (if (plusp scale-x)
+						  tleft
+						  (- tleft (1- swidth))))
+				       (ttop (if (plusp scale-y)
+						 ttop
+						 (- ttop (1- sheight)))))
+				   (draw-raster-internal swidth sheight scaled-image 0 0
+							 tleft ttop
+							 ones-alu zeros-alu copy-image))))))))
+		    ;; previous versions of code, which are still valid for non-bit images.
+		    ((and ( (abs scale-x) .95) ( (abs scale-y) .95))
+		     ;; Image properly aligned and being scaled up.
+		     (let ((width (- image-right image-left))
+			   (height (- image-bottom image-top)))
+		       (setq tleft (round tleft)
+			     ttop (round ttop)
+			     scale-x (round scale-x)
+			     scale-y (round scale-y))
+		       (if (and (null drawing-pattern) (= scale-x 1))
+			   ;; Horizonal slices are the same size.  We can just replicate
+			   ;; the image for each scan line.
+			   (if (= scale-y 1)
+			       ;; Perfect alignment, just bitblt it in.
+			       (draw-raster-internal width height image image-left image-top
+						     tleft ttop
+						     ones-alu zeros-alu copy-image)
+			       ;; Draw vertical slices for as many lines as necessary.
+			       (let* ((sh (abs scale-y))
+				      (dir (signum scale-y)))
+				 (loop for j from image-top below image-bottom
+				       for y from ttop by scale-y
+				       do
+				   (loop repeat sh for y from y by dir do
+				     (draw-raster-internal width 1 image image-left j
+							   tleft y
+							   ones-alu zeros-alu copy-image)))))
+			   ;; Being scaled horizontally.  Draw a rectangle for each pixel
+			   ;; in the source of the scaled size.
+			   (when (and copy-image (patterns-are-remembered-p self))
+			     (let* ((new-image (make-raster-array-with-correct-width
+						 width height
+						 :element-type (array-element-type image))))
+			       (bitblt tv:alu-seta width height
+				       image image-left image-top
+				       new-image 0 0)
+			       (setq image new-image
+				     image-left 0
+				     image-top 0
+				     image-right width
+				     image-bottom height)))
+			   (draw-simply-scaled-image self image tleft ttop
+						     scale-x scale-y
+						     drawing-pattern ones-alu zeros-alu opaque
+						     image-left image-top
+						     image-right image-bottom))))
+		    (t
+		     ;; Properly aligned, but being sampled.  Walk over the pixels in the image,
+		     ;; totally up until exceed threshold for smaller destination pixel, then
+		     ;; draw it with possible scaling up is one direction or the other.
+		     (let* ((x-cells-to-scan (max 1 (abs (round (/ scale-x)))))
+			    (x-pixels-to-write (* (if (minusp scale-x) -1 +1)
+						  (max 1 (abs (round scale-x)))))
+			    (y-cells-to-scan (max 1 (abs (round (/ scale-y)))))
+			    (y-pixels-to-write (* (if (minusp scale-y) -1 +1)
+						  (max 1 (abs (round scale-y)))))
+			    (threshold (floor (* x-cells-to-scan y-cells-to-scan) 2))
+			    (color-alu (and (not (typep image '(array bit)))
+					    (color:sc-fill-alu -1 -1))))
+		       (loop for j = image-top then nj
+			     as nj = (+ j y-cells-to-scan)
+			     for y = (round ttop) then ny
+			     as ny = (+ y y-pixels-to-write)
+			     do
+			 (loop for i = image-left then ni
+			       as ni = (+ i x-cells-to-scan)
+			       for x = (round tleft) then nx
+			       as nx = (+ x x-pixels-to-write)
+			       do
+			   (let ((on-p (block over
+					 (let ((sum 0))
+					   (loop for j from j below (min nj image-bottom)
+						 do (loop for i from i below (min ni image-right)
+							  do
+						      (incf sum (raster-aref image i j))
+						      (when (> sum threshold)
+							(return-from over t)))))))
+				 (alu1 ones-alu)
+				 (alu2 zeros-alu))
+			     (when (if on-p t
+				       (when opaque
+					 (setq alu1 alu2)
+					 t))
+			       (when (and on-p color-alu)
+				 (send color-alu :set-fill-data (raster-aref image i j))
+				 (setq alu1 color-alu))
+			       (draw-patterned-rectangle (abs x-pixels-to-write)
+							 (abs y-pixels-to-write)
+							 (min x nx) (min y ny)
+							 drawing-pattern alu1 alu2)))
+			   (when ( ni image-right)
+			     (return nil)))
+			 (when ( nj image-bottom)
+			   (return nil))))))
+	      (if (and ( (abs scale-x) 1) ( (abs scale-y) 1))
+		  ;; Scaled up, being tilted.  Draw parallelograms that represent the rotated
+		  ;; big rectangles.
+		  (multiple-value-bind (x-dx x-dy)
+		      (transform-distance +1 0 transform)
+		    (multiple-value-bind (y-dx y-dy)
+			(transform-distance 0 +1 transform)
+		      (loop for j from image-top below image-bottom
+			    as y-x = tleft then ny-x
+			    and y-y = ttop then ny-y
+			    as ny-x = (+ y-x y-dx)
+			    and ny-y = (+ y-y y-dy)
+			    do
+			(loop for i from image-left below image-right
+			      as x-y-x = y-x then nx-y-x
+			      and x-y-y = y-y then nx-y-y
+			      as nx-y-x = (+ x-y-x x-dx)
+			      and nx-y-y = (+ x-y-y x-dy)
+			      as x-ny-x = ny-x then nx-ny-x
+			      and x-ny-y = ny-y then nx-ny-y
+			      as nx-ny-x = (+ x-ny-x x-dx)
+			      and nx-ny-y = (+ x-ny-y x-dy)
+			      do
+			  (let ((alu1 ones-alu)
+				(alu2 zeros-alu))
+			    (when (if (zerop (raster-aref image i j))
+				      (when opaque
+					(setq alu1 alu2)
+					t)
+				      t)
+			      (draw-patterned-triangle x-y-x x-y-y nx-ny-x nx-ny-y
+						       nx-y-x nx-y-y drawing-pattern alu1 alu2)
+			      (draw-patterned-triangle x-y-x x-y-y nx-ny-x nx-ny-y
+						       x-ny-x x-ny-y drawing-pattern alu1 alu2)
+			      ))))))
+		  ;; Hardest case.  Being sampled and tilted.  Sample source rectilinearly,
+		  ;; then draw rectangles using the current transform matrix, which will make
+		  ;; them come out the right size and shape in the end.
+		  (let* ((x-cells-to-scan (max 1 (abs (round (/ scale-x)))))
+			 (x-pixels-to-write (* (if (minusp scale-x) -1 +1)
+					       (max 1 (abs (round scale-x)))))
+			 (y-cells-to-scan (max 1 (abs (round (/ scale-y)))))
+			 (y-pixels-to-write (* (if (minusp scale-y) -1 +1)
+					       (max 1 (abs (round scale-y)))))
+			 (threshold (floor (* x-cells-to-scan y-cells-to-scan) 2)))
+		    (with-graphics-identity-transform (self)
+		      (with-graphics-translation (self translate-x translate-y)
+			(with-graphics-rotation (self composed-rotation)
+			  (loop for j = image-top then nj
+				as nj = (+ j y-cells-to-scan)
+				for y from top by y-pixels-to-write
+				do
+			    (loop for i = image-left then ni
+				  as ni = (+ i x-cells-to-scan)
+				  for x from left by x-pixels-to-write
+				  do
+			      (let ((on-p (block over
+					    (let ((sum 0))
+					      (loop for j from j below (min nj image-bottom)
+						    do (loop for i from i
+								   below (min ni image-right)
+							     do
+							 (incf sum (raster-aref image i j))
+							 (when (> sum threshold)
+							   (return-from over t)))))))
+				    (alu1 ones-alu)
+				    (alu2 zeros-alu))
+				(when (if on-p t
+					  (when opaque
+					    (setq alu1 alu2)
+					    t))
+				  (apply #'draw-rectangle x y (1+ x) (1+ y)
+					 :alu alu1 :stream self
+					 :allow-other-keys t args)))
+			      (when ( ni image-right)
+				(return nil)))
+			    (when ( nj image-bottom)
+			      (return nil))))))))))))))
+
+(defmethod (draw-simply-scaled-image raster-graphics-mixin)
+	   (image x y scale-x scale-y
+	    pattern ones-alu zeros-alu opaque
+	    image-left image-top image-right image-bottom)
+  (let ((deep-p nil)
+	(sx (abs scale-x))
+	(sy (abs scale-y)))
+    (when (not (typep image '(array bit)))
+      (setq ones-alu (color:sc-fill-alu -1 -1)
+	    deep-p t))
+    (loop for j from image-top below image-bottom
+	  for y = y then ny
+	  as ny = (+ y scale-y)
+	  do
+      (loop for i from image-left below image-right
+	    for x = x then nx
+	    as nx = (+ x scale-x)
+	    do
+	(let ((data (raster-aref image i j)))
+	  (if deep-p
+	      (when (or opaque (not (zerop data)))
+		(send ones-alu :set-fill-data data)
+		(draw-patterned-rectangle sx sy
+					  (if (minusp scale-x) nx x)
+					  (if (minusp scale-y) ny y)
+					  pattern ones-alu zeros-alu))
+	      (if (zerop data)
+		  (when opaque
+		    (draw-patterned-rectangle sx sy
+					      (if (minusp scale-x) nx x)
+					      (if (minusp scale-y) ny y)
+					      pattern zeros-alu zeros-alu))
+		  (draw-patterned-rectangle sx sy
+					    (if (minusp scale-x) nx x)
+					    (if (minusp scale-y) ny y)
+					    pattern ones-alu zeros-alu))))))))
+
+;;; Should have been a method in the first place
+(defmethod (draw-string-bounding-box-internal raster-graphics-mixin) (&rest args)
+  (apply #'draw-string-bounding-box args))
+
+(defmethod (default-draw-string raster-graphics-mixin)
+	   (string x y
+	    &rest args
+	    &key (attachment-x :left) (attachment-y :baseline)
+		 (toward-x (1+ x)) (toward-y y) (stretch-p nil) (character-style nil)
+		 (record-as-text nil))
+  (transform-and-fix-points x y toward-x toward-y)
+  (unless (and (eq attachment-x :left) (eq attachment-y :baseline))
+    (multiple-value-setq (x nil nil nil y toward-x toward-y)
+      (apply #'draw-string-bounding-box string x y
+	     :toward-x toward-x :toward-y toward-y
+	     args)))
+  (when (and record-as-text (send-if-handles self :output-recording-enabled)
+	     (= toward-y y) ( toward-x x) (not stretch-p))
+    (multiple-value-bind (ox oy)
+	(send self :read-cursorpos)
+      (with-character-style (character-style self :bind-line-height t)
+	(send self :set-cursorpos x (- y (send self :baseline)))
+	(send self :string-out string))
+      (send self :set-cursorpos ox oy)
+      (return-from default-draw-string nil)))
+  (with-standardized-source-and-alu (pattern alu ignore)
+    (if (null pattern)
+	(send self :draw-string string x y toward-x toward-y
+	      stretch-p character-style (standardize-alu self alu))
+	(with-graphics-identity-transform (self)
+	  (graphics-translate x y :stream self)
+	  (graphics-rotate (atan (- toward-y y) (- toward-x x)) :stream self)
+	  (graphics-scale 1 -1 :stream self)
+	  (si:with-rem-keywords (some-args args '(:attachment-x :attachment-y
+						  :toward-x :toward-y :stretch-p))
+	    (apply (flavor:generic draw-string-image) self string 0 0 some-args))))))
+
+(defun-in-flavor (draw-glyph-image standard-graphics-mixin) (index font x y &rest args)
+  (multiple-value-setq (x y)
+    (stream-transform-point x y self))
+  (with-graphics-identity-transform (self)
+    (multiple-value-bind (image-left image-right)
+	(let ((fit (sys:font-indexing-table font)))
+	  (if fit
+	      (values (aref fit index) (aref fit (1+ index)))
+	      (let ((rw (sys:font-raster-width font)))
+		(values (* rw index) (* rw (1+ index))))))
+      (let ((lkt (sys:font-left-kern-table font)))
+	(if lkt (decf x (aref lkt index))))
+      (apply (flavor:generic draw-image) self font x y
+	     :image-left image-left :image-right image-right
+	     args))))
+
+(defmethod (default-draw-glyph raster-graphics-mixin) (index font x y &rest args)
+  (transform-and-fix-points x y)
+  (with-standardized-source-and-alu (pattern alu ignore)
+    (if (null pattern)
+	(send self :draw-glyph index font x y alu)
+	(with-graphics-identity-transform (self)
+	  (apply #'draw-glyph-image index font x y args)))))
+
+(defun-in-flavor (draw-raster-internal raster-graphics-mixin)
+		 (width height pattern pattern-left pattern-top left top
+		  ones-alu &optional (zeros-alu color:alu-noop) (copy-pattern t))
+  (when (and copy-pattern (patterns-are-remembered-p self))
+    (let ((new-pattern (make-raster-array-with-correct-width
+			 width height :element-type (array-element-type pattern))))
+      (bitblt tv:alu-seta width height
+	      pattern pattern-left pattern-top
+	      new-pattern 0 0)
+      (setq pattern new-pattern
+	    pattern-left 0
+	    pattern-top 0)))
+  (if (= (array-element-size pattern) 1)
+      (send self :draw-1-bit-raster width height
+				    pattern pattern-left pattern-top left top
+				    ones-alu zeros-alu)
+      (send self :draw-raster width height
+			      pattern left top pattern-left pattern-top
+			      ones-alu)))
+
+(defmethod (patterns-are-remembered-p raster-graphics-mixin :default) () nil)
+(defmethod (patterns-are-remembered-p dw::dynamic-window) () dw::output-recording-enabled)
+
+;;; Usual strategy is to generate a mask from the clipping specification,
+;;; output the graphics to a bit array, 1and0 the two and output the result.
+(defun-in-flavor (with-clipping-mask-internal-1 raster-graphics-mixin)
+		 (continuation xstream mask left top right bottom)
+  (with-output-to-bitmap-stream (raster-stream :for-stream xstream
+					       :graphics-transform (stream-transform self))
+    (funcall continuation raster-stream)
+    (multiple-value-bind (raster r-origin-x r-origin-y r-left r-top r-right r-bottom)
+	(send raster-stream :bitmap-and-edges)
+      (let* ((stream-left (max left r-left))
+	     (stream-top (max top r-top))
+	     (stream-right (min right r-right))
+	     (stream-bottom (min bottom r-bottom))
+	     (width (- stream-right stream-left))
+	     (height (- stream-bottom stream-top)))
+	(when (and (plusp width) (plusp height))
+	  (bitblt tv:alu-and width height mask (- stream-left left) (- stream-top top)
+		  raster (- stream-left r-origin-x) (- stream-top r-origin-y))
+	  (draw-raster-internal width height
+				raster (- stream-left r-origin-x) (- stream-top r-origin-y)
+				stream-left stream-top
+				(standardize-alu self :draw)))))))
+
+(defmethod (with-clipping-path-internal raster-graphics-mixin)
+	   (continuation xstream path-function &key (winding-rule :non-zero))
+  (with-fill-path-into-raster (raster min-x min-y max-x max-y)
+			      (path-function :transform (stream-transform self)
+					     :winding-rule winding-rule)
+    (with-clipping-mask-internal-1 continuation xstream raster min-x min-y max-x max-y)))
+
+(defmethod (with-clipping-from-output-internal raster-graphics-mixin)
+	   (output-continuation clipping-continuation xstream)
+  (with-output-to-bitmap-stream (raster-stream :for-stream xstream
+					       :graphics-transform (stream-transform self))
+    (funcall clipping-continuation raster-stream)
+    (multiple-value-bind (raster origin-x origin-y left top right bottom)
+	(send raster-stream :bitmap-and-edges)
+      (ignore left top)
+      (with-clipping-mask-internal-1 output-continuation xstream raster
+				     origin-x origin-y right bottom))))
+
+(defmethod (with-clipping-mask-internal raster-graphics-mixin)
+	   (continuation xstream mask &key (left 0) (top 0) right bottom)
+  (transform-and-fix-points left top)
+  (let ((r (or right left))
+	(b (or bottom top)))
+    (transform-and-fix-points r b)
+    (multiple-value-bind (width height)
+	(decode-raster-array mask)
+      (unless right (setq r (+ left width)))
+      (unless bottom (setq b (+ top height))))
+    (setq right r bottom b))
+  (with-clipping-mask-internal-1 continuation xstream mask
+				 (min left right) (min top bottom)
+				 (max left right) (max top bottom)))
+
+(defmethod (raster-drawing-state-call-path-function raster-drawing-state)
+	   (continuation xstream)
+  (letf ((position-x nil) (position-y nil)
+	 (position-dx nil) (position-dy nil)
+	 (path-initial-x nil) (path-initial-y nil)
+	 (path-initial-dx nil) (path-initial-dy nil))
+    (funcall continuation xstream)
+    (values position-x position-y
+	    path-initial-x path-initial-y
+	    position-dx position-dy
+	    path-initial-dx path-initial-dy)))
+
+(defmethod (draw-path raster-graphics-mixin)
+	   (path-function &rest args
+			  &key (filled t) (winding-rule :non-zero)
+			  &allow-other-keys)
+  (declare (ignore args))
+  (with-standardized-source-and-alu (pattern ones-alu zeros-alu)
+    (if (not filled)
+	;; Can just output with adjusted line parameters
+	(saving-graphics-transform (self)
+	  (multiple-value-bind (position-x position-y
+				path-initial-x path-initial-y
+				position-dx position-dy
+				path-initial-dx path-initial-dy)
+	      (raster-drawing-state-call-path-function drawing-state path-function self)
+	    ;; If the path was left open, cap it.
+	    (multiple-value-bind (x-thickness/2 y-thickness/2)
+		(standardize-thickness)
+	      (let ((line-end-shape (drawing-state-line-shapes drawing-state)))
+		(when (and position-x position-dx)
+		  (draw-line-cap position-x position-y
+				 position-dx position-dy
+				 x-thickness/2 y-thickness/2 line-end-shape
+				 pattern ones-alu zeros-alu))
+		(when (and path-initial-x path-initial-dx)
+		  (draw-line-cap path-initial-x path-initial-y
+				 (- path-initial-dx) (- path-initial-dy)
+				 x-thickness/2 y-thickness/2 line-end-shape
+				 pattern ones-alu zeros-alu))))))
+	(if (eql zeros-alu color:alu-noop)
+	    ;; Collect line segments that make up the shape and fill between them.
+	    ;; Can draw as one big lump, which helps keep the history smaller/faster.
+	    (multiple-value-bind (raster min-x min-y max-x max-y)
+		(fill-path-into-raster path-function
+				       :transform (stream-transform self)
+				       :winding-rule winding-rule
+				       :pattern pattern)
+	      (send self :draw-1-bit-raster (- max-x min-x) (- max-y min-y)
+		    raster 0 0 min-x min-y ones-alu zeros-alu))
+	    ;; Must draw as individual slices to get background correct.
+	    (using-resource (path-stream line-path-stream)
+	      (send path-stream :initialize :transform (stream-transform self))
+	      (funcall path-function path-stream)
+	      (multiple-value-bind (nil min-y nil max-y)
+		  (send path-stream :point-limits)
+		(fill-from-lines (send path-stream :lines) min-y max-y winding-rule
+		  #'(lambda (start-x end-x line-y)
+		      (draw-patterned-rectangle (- end-x start-x) 1
+						start-x line-y
+						pattern ones-alu zeros-alu)))))))))
+
+;;; Helper stream for accumulating 1draw-line0 segments that make up the outline that has to
+;;; be filled.
+(defflavor line-path-stream
+	((lines (make-array 100 :fill-pointer 0))
+	 (rectangles (make-array 100 :fill-pointer 0))
+	 (rectangles-allowed nil)
+	 (min-x nil)
+	 (min-y nil)
+	 (max-x 0)
+	 (max-y 0))
+	(raster-graphics-mixin)
+  (:gettable-instance-variables lines rectangles))
+
+(defmethod (:initialize line-path-stream) (&key (transform *identity-transform*)
+						(filled-allowed nil))
+  (setf (fill-pointer lines) 0
+	(fill-pointer rectangles) 0)
+  (setq max-x 0 max-y 0)
+  (setq min-x nil min-y nil)
+  (setq rectangles-allowed filled-allowed)
+  (raster-drawing-state-initialize (get-drawing-state self) transform))
+
+(defmethod (raster-drawing-state-initialize raster-drawing-state) (transform)
+  (setq position-x nil
+	position-y nil
+	position-dx nil
+	position-dy nil
+	path-initial-x nil
+	path-initial-y nil
+	path-initial-dx nil
+	path-initial-dy nil)
+  (drawing-state-initialize self transform))
+
+(defmethod (:point-limits line-path-stream) ()
+  (values min-x min-y max-x max-y))
+
+(defun-in-flavor (update-point-range line-path-stream) (&rest points)
+  (loop for (x y) on points by 'cddr do
+    (if min-x
+	(minf min-x x)
+	(setq min-x x))
+    (if min-y
+	(minf min-y y)
+	(setq min-y y))
+    (maxf max-x (1+ x))
+    (maxf max-y (1+ y))))
+
+(defun add-line-entry (lines x1 y1 x2 y2)
+  (let ((length (fill-pointer lines)))
+    (when (> (+ length 4) (array-total-size lines))
+      (sys:adjust-array-size lines (floor (* length 3) 2)))
+    (setf (line-entry-x1 length lines) x1)
+    (setf (line-entry-y1 length lines) y1)
+    (setf (line-entry-x2 length lines) x2)
+    (setf (line-entry-y2 length lines) y2)
+    (setf (fill-pointer lines) (+ length 4))))
+
+(defmethod (draw-scaled-line line-path-stream) (from-x from-y to-x to-y &rest ignore)
+  (update-point-range from-x from-y to-x to-y)
+  (add-line-entry lines from-x from-y to-x to-y))
+
+(defmethod (:draw-rectangle line-path-stream) (width height from-x from-y &rest ignore)
+  (unless (or (zerop width) (zerop height)) 	;vertical or horizontal line
+    (unless rectangles-allowed
+      (error "Cannot draw :filled shapes"))
+    (let ((to-x (+ from-x width))
+	  (to-y (+ from-y height)))
+      (update-point-range from-x from-y to-x to-y)
+      (add-line-entry rectangles from-x from-y to-x to-y))))
+
+(defmethod (:draw-patterned-rectangle line-path-stream) (width height x y &rest ignore)
+  (send self :draw-rectangle width height x y))
+
+(defmethod (color:color-stream-p line-path-stream) () nil)
+
+(compile-flavor-methods line-path-stream)
+
+(defresource line-path-stream ()
+  :constructor (make-instance 'line-path-stream))
+
+
+;; Hair.  The basic idea is to read 32 references into local variables,
+;; rotate the 32x32 bit raster represented, and write them out to 32
+;; (possibly) other references.  It can rotate, under compile-time
+;; control, clockwise or counterclockwise.  
+;; 
+;; Rotation is done roughly like it is in the HACKS: algorithm.  Start
+;; by rotating the four bits in each 2x2 cell.  Then rotate the four 2x2
+;; cells in each 4x4 cell.  Etc up until rotating the 4 16x16 cells in
+;; the single 32x32 cell.
+;;
+;; --- DCP should describe how the above is actually done.
+(defmacro bit-rotate-32-32-macro (32-gets 32-sets &optional (direction :clockwise))
+  (assert (and (listp 32-gets) (= (length 32-gets) 32))
+	  () "32-gets must be a list of 32 references.")
+  (assert (and (listp 32-sets) (= (length 32-sets) 32))
+	  () "32-sets must be a list of 32 references.")
+  (let* ((cw (ecase direction (:clockwise t) (:counterclockwise nil)))
+	 (vars (loop for counter below 32 collect (sys:gensymbol "rotate-" counter))))
+    ;; encache everything into local variables
+    `(let* ,(loop for var in vars
+		  for get in 32-gets
+		  collect `(,var ,get))
+       ,@(loop for mask in
+		   `#.(loop for n-bits = 2 then (lsh n-bits 1) until (> n-bits 32.)
+			    collect (floor (1- 1_32.) (1+ (ash 1 (floor n-bits 2)))))
+	       for delta = 1 then 2delta
+	       as 2delta = (rot delta 1)
+	       as -mask = (lognot mask)
+	       as -delta = (- delta)
+	       collect
+	       ;; cache mask and -mask in locals, since the constant
+	       ;; value is too large to fit in the 3600 immediate field.
+		 `(let ((mask ,mask)
+			(-mask ,-mask))
+		    ,@(loop for i from 0 below 32. by 2delta
+			    append
+			      (loop repeat delta
+				    for j upfrom i
+				    for k upfrom (+ i delta)
+				    as jvar = (elt vars j)
+				    as kvar = (elt vars k)
+				    collect
+				      (multiple-value-bind (mask -mask delta -delta)
+					  (if cw
+					      (values 'mask '-mask delta -delta)
+					      (values '-mask 'mask -delta delta))
+					`(psetq
+					   ,jvar (logior (logand (rot ,jvar ,delta) ,-mask)
+							 (logand ,kvar ,mask))
+					   ,kvar (logior (logand ,jvar ,-mask)
+							 (logand (rot ,kvar ,-delta) ,mask))))))))
+       	    (progn
+	      ,@(loop for var in vars
+		      for set in 32-sets
+		      collect `(setf ,set ,var))))))
+
+
+;; The subrectangle of SRC is copied to the subrectangle of DST, scaling
+;; in either or both direction, larger or smaller independently.  The
+;; -to- parts of the rectangles must be greater than the -from-
+;; portions.  Therefore, negative scaling is not allowed here.  This
+;; only works on bit arrays.  If somebody later extends it to work on
+;; larger element types, call the new function something else and make
+;; this function call it.  SRC and DST must be of the same element type
+;; so that BITBLT and compression/expansion has any meaning at all.
+;;
+;; The semantics are that bits get IORed together when being compressed
+;; and duplicated when being expanded.  It does not work by selection
+;; criteria, threshold or averaging.  This functions allows arbitrary
+;; rational scaling.  The lines which are duplicated or expanded are
+;; evenly distributed and otherwise cannot be controlled.
+;;
+;; The idea is to use bitblt to do compression and expansion.  This
+;; results in good memory utilization.  In the Y direction this is easy
+;; and efficient, since entire rows (which is how memory is organized)
+;; are operated on at once.  In the X direction this is very inefficient
+;; because of poor memory utilization and requiring BITBLT to do
+;; shifting as well.  In order to do X, the image is rotated, thus
+;; turning Xs into Ys, the rotated image is compressed or expanded in
+;; the y (= rotated-x) direction, and then unrotated.
+;;
+;; Efficiency #1: If Y is being compressed, it is done before the
+;; rotate/x-compress/unrotate, and if Y is being expanded, it is done
+;; after.  Because of the compression/expansion semantics, scaling X and
+;; scaling Y are independent.  Compressing Y first results in a smaller
+;; subrectangle that needs rotating and unrotating.  (Expanding first
+;; would result in more work for the rotator.)
+;;
+;; Efficiency #2: The rotator is highly bummed.  The problem with most
+;; rotate algorithms (the naive one using AREF as well as the one in the
+;; HACKS: package) is that they make several passes over the data.  This
+;; rotator reads each source Q once and writes each target Q once.  To
+;; accomplish this, it reads a 32x32 pixel chunk (which is 32 Qs),
+;; rotates the 32x32 chunk on the stack, and writes the rotated version
+;; to the destination to the appropriate 32x32 block.  To accomplish all
+;; of this, all temporary arrays (WRK and ROT) are padded to a multiple
+;; of 32 array elements in both width and height.  (It needn't be 32 for
+;; larger than bit arrays, but 32 is easy and not too inefficient.)
+;; Then fixnum arrays are indirected to them to allow reading the Qs.
+;;
+;; Efficiency #3: To get good memory access and not worry about the
+;; BITBLT shifter possibly causing inefficiency and allow BITBLT to use
+;; fast word-aligned cases, the SRC subrectangle is copied to WRK and
+;; being word aligned in the process.  Y-compression/expansion is done
+;; using WRK.  X-compression/expansion is done on ROT.
+;;
+;; --- the rotator here should be abstracted out so screen hardcopy,
+;; etc, can use it.
+(defun copy-bit-raster-scaling (src src-from-x src-from-y src-to-x src-to-y
+				dst dst-from-x dst-from-y dst-to-x dst-to-y)
+  ;; -from- is always inclusive, -to- is always exclusive
+  (assert (and (typep src-from-x '(integer 0))
+	       (typep src-from-y '(integer 0))
+	       (typep src-to-x	 '(integer -1))	;exclusive
+	       (typep src-to-y	 '(integer -1))
+	       (typep dst-from-x '(integer 0))
+	       (typep dst-from-y '(integer 0))
+	       (typep dst-to-x	 '(integer -1))
+	       (typep dst-to-y	 '(integer -1)))
+	  () "All -from- and -to- arguments must be non-negative integers.")
+  (assert (and (= (sys:array-type-field src) sys:art-1b)
+	       (= (sys:array-type-field dst) sys:art-1b))
+	  () "Both source and destination rasters must be bit arrays")
+  (assert (= (sys:array-type-field src) (sys:array-type-field dst))
+	  () "Source and destination rasters must be of the same type.")
+  ;; special case zero-sized source and/or destination
+  (cond ((or (= dst-from-x dst-to-x)
+	     (= dst-from-y dst-to-y))
+	 ;; no space to copy into the destination, so just return
+	 (return-from copy-bit-raster-scaling nil))
+	((or (= src-from-x src-to-x)
+	     (= src-from-y src-to-y))
+	 ;; No source space to copy from, so clear destination portion
+	 ;; get bitblt args, converting inclusive/exclusives if necessary
+	 (multiple-value-bind (width x)
+	     (if (> dst-to-x dst-from-x)
+		 (values (- dst-to-x dst-from-x) dst-from-x)
+		 (values (- dst-from-x dst-to-x) (1+ dst-to-x)))
+	   (multiple-value-bind (height y)
+	       (if (> dst-to-y dst-from-y)
+		   (values (- dst-to-y dst-from-y) dst-from-y)
+		   (values (- dst-from-y dst-to-y) (1+ dst-to-y)))
+	     (bitblt boole-clr width height dst x y dst x y)
+	     (return-from copy-bit-raster-scaling nil)))))
+  (sys:with-data-stack
+    (let* (;; determine x and/or y flipping and (destructively) adjust parameters to
+	   ;; inclusive/exclusive if necessary
+	   (flip-src-x (when (> src-from-x src-to-x)
+			 (psetq src-from-x (1+ src-to-x)
+				src-to-x (1+ src-from-x))
+			 t))
+	   (flip-src-y (when (> src-from-y src-to-y)
+			 (psetq src-from-y (1+ src-to-y)
+				src-to-y (1+ src-from-y))
+			 t))
+	   (flip-dst-x (when (> dst-from-x dst-to-x)
+			 (psetq dst-from-x (1+ dst-to-x)
+				dst-to-x (1+ dst-from-x))
+			 t))
+	   (flip-dst-y (when (> dst-from-y dst-to-y)
+			 (psetq dst-from-y (1+ dst-to-y)
+				dst-to-y (1+ dst-from-y))
+			 t))
+	   (flip-x (not (eq flip-src-x flip-dst-x)))
+	   (flip-y (not (eq flip-src-y flip-dst-y)))
+	   ;; compute widths, heights and source element type and elements per q
+	   (src-wid (- src-to-x src-from-x))
+	   (src-hei (- src-to-y src-from-y))
+	   (dst-wid (- dst-to-x dst-from-x))
+	   (dst-hei (- dst-to-y dst-from-y))
+	   (src-elt (array-element-type src))	;hints of genericness
+	   (src-epq (sys:array-elements-per-q (sys:array-type-field src)))
+	   ;; compute versions rounded up to 32 (works for all array types)
+	   (src-wid32 (* (ceiling src-wid 32) 32))
+	   (src-hei32 (* (ceiling src-hei 32) 32))
+	   (dst-wid32 (* (ceiling dst-wid 32) 32))
+	   #+not-needed (dst-hei32 (* (ceiling dst-hei 32) 32))
+	   ;; compute parameters of wrk array
+	   (wrk-wid32 (max src-wid32 dst-wid32))
+	   (wrk-hei32 src-hei32)
+	   (wrk-elt src-elt)
+	   (wrk-epq src-epq)
+	   ;; and make the wrk array
+	   (wrk (sys:make-raster-stack-array wrk-wid32 wrk-hei32 :element-type wrk-elt)))
+      ;; copy src into wrk, doing y-compression at the same time if feasible
+      (cond ((< dst-hei src-hei)
+	     ;; compress Y now, since that will make less work for the rotator
+	     (loop with numer = (1- dst-hei)
+		   with denom = (max (1- src-hei) 1)	;avoid divide by 0
+		   for last-wrk-y = nil then wrk-y
+		   for y upfrom 0 below src-hei
+		   as unscaled-wrk-y = (if flip-y (- denom y) y)
+		   as wrk-y = (round (* unscaled-wrk-y numer) denom)
+		   do (bitblt (if (eql last-wrk-y wrk-y) boole-ior boole-1) src-wid 1
+			      src src-from-x (+ src-from-y y)
+			      wrk 0 wrk-y)))
+	    (t (bitblt boole-1 src-wid src-hei
+		       src src-from-x src-from-y
+		       wrk 0 0)))
+      ;; expand or compress wrk if needed.
+      (when (or ( src-wid dst-wid) flip-x)
+	;; Rotate so we can use bitblt for x scaling
+	(sys:with-data-stack
+	  (let* (;; compute parameters for the rotated bit raster.  We
+		 ;; don't need the bit raster, only the fixnum version
+		 ;; for the work here, so don't actually create the
+		 ;; rotated raster.
+		 (rot-wid32 wrk-hei32)
+		 (rot-hei32 (max wrk-wid32 dst-wid32))
+		 (rot-epq wrk-epq)
+		 #+not-needed (rot-elt wrk-elt)
+		 #+not-needed (rot (sys:make-raster-stack-array rot-wid32 rot-hei32
+								:element-type rot-elt))
+		 ;; compute dimensions for the fixnum versions
+		 (fwrk-wid (ceiling wrk-wid32 wrk-epq))
+		 (fwrk-hei wrk-hei32)
+		 (frot-wid (ceiling rot-wid32 rot-epq))
+		 (frot-hei rot-hei32)
+		 ;; make the fixnum versions of the wrk and rot arrays and get their spans
+		 (fwrk (sys:make-raster-stack-array fwrk-wid fwrk-hei :element-type 'fixnum
+						    :displaced-to wrk))
+		 (frot (sys:make-raster-stack-array frot-wid frot-hei :element-type 'fixnum))
+		 (fwrk-span (sys:array-row-span fwrk))
+		 (frot-span (sys:array-row-span frot)))
+	    (declare (sys:array-register-1d fwrk frot))
+	    (macrolet ((rotate (from-or-to)
+			 (let ((from-p (ecase from-or-to (:from t) (:to nil))))
+			   `(loop repeat frot-wid	;rot wid == wrk hei
+				  for frot-x downfrom (1- frot-wid)
+				  for fwrk-y upfrom 0 by (* 32 fwrk-span)
+				  do
+			      (loop repeat fwrk-wid	;wrk wid == rot hei ; --- optimize
+				    for fwrk-i upfrom fwrk-y
+				    for frot-i upfrom frot-x by (* 32 frot-span)
+				    do
+				,(let ((fwrk-refs
+					 (loop for i below 32
+					       collect `(aref fwrk (+ fwrk-i
+								      (* fwrk-span ,i)))))
+				       (frot-refs
+					 (loop for i below 32
+					       collect `(aref frot (+ frot-i
+								      (* frot-span ,i))))))
+				   (if from-p
+				       `(bit-rotate-32-32-macro
+					  ,fwrk-refs ,frot-refs :clockwise)
+				       `(bit-rotate-32-32-macro
+					  ,frot-refs ,fwrk-refs :counterclockwise))))))))
+	      (rotate :from)
+	      (cond ((< dst-wid src-wid)
+		     (loop for last-to-y = nil then to-y
+			   for from-y upfrom 0 below src-wid
+			   as to-y = (round (* from-y (1- dst-wid)) (1- src-wid))
+			   do (bitblt (if (eql last-to-y to-y) boole-ior boole-1) frot-wid 1
+				      frot 0 from-y
+				      frot 0 to-y)))
+		    ((> dst-wid src-wid)
+		     (loop for to-y downfrom (1- dst-wid) to 0
+			   as from-y = (round (* to-y (1- src-wid)) (1- dst-wid))
+			   do (bitblt boole-1 frot-wid 1
+				      frot 0 from-y
+				      frot 0 to-y))))
+	      ;; flip x now, using many BITBLT XOR operations
+	      (when flip-x
+		(loop for y1 upfrom 0
+		      for y2 downfrom (1- dst-wid)
+		      until (>= y1 y2)
+		      do (bitblt boole-xor frot-wid 1 frot 0 y1 frot 0 y2)
+			 (bitblt boole-xor frot-wid 1 frot 0 y2 frot 0 y1)
+			 (bitblt boole-xor frot-wid 1 frot 0 y1 frot 0 y2)))
+	      (rotate :to)))))
+      ;; copy the work raster to the destination raster.  If y is being
+      ;; compressed, it has already been compressed above, so just copy.
+      ;; If y needs expanding or simple flipping, do it here while
+      ;; copying to dst.
+      (cond ((or (> dst-hei src-hei)		;expanding y
+		 (and (= dst-hei src-hei) flip-y))	;same but needs flipping
+	     (loop with numer = (1- src-hei)
+		   with denom = (max (1- dst-hei) 1)
+		   for dst-y upfrom 0 below dst-hei
+		   as unscaled-wrk-y = (if flip-y (- denom dst-y) dst-y)
+		   as wrk-y = (round (* unscaled-wrk-y numer) denom)
+		   do (bitblt boole-1 dst-wid 1
+			      wrk 0 wrk-y
+			      dst dst-from-x (+ dst-from-y dst-y))))
+	    (t					;already compressed or same noflip
+	     (bitblt boole-1 dst-wid dst-hei
+		     wrk 0 0
+		     dst dst-from-x dst-from-y))))))
+

@@ -1,0 +1,299 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: PROCESS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Processes that have run recently, which need attention from update-scheduler-stats
+(defvar *recent-processes* (make-array 30 :fill-pointer 0))
+
+;;; Processes that have run recently, which need attention from update-scheduler-stats-2 
+(defvar *contemporary-processes* (make-array 50 :fill-pointer 0))
+
+(defparameter *scheduler-wakeup-interval* .2)
+(defparameter *scheduler-record-interval* 1)
+(defparameter *scheduler-sleep-interval*
+	      (floor (/ (min *scheduler-wakeup-interval* *scheduler-record-interval*)
+			*timer-units*)))
+(defparameter *scheduler-hysteresis-interval* 1)
+(defparameter *scheduler-peek-interval* 10)
+(defvar *scheduler-record-interval-usecs* (floor (* 1000000. *scheduler-record-interval*)))
+(defvar *scheduler-wakeup-interval-usecs* (floor (* 1000000. *scheduler-wakeup-interval*)))
+(defvar *scheduler-peek-interval-usecs* (floor (* 1000000. *scheduler-peek-interval*)))
+
+;; Ignore differences machine percentage less than this resolution: 
+;; For example, if *SCHEDULER-RESOLUTION* is 5, then a process taking 16% of the machine, 
+;; and a process taking 19% of the machine are penalized the same amount.
+(defparameter *scheduler-resolution* 5)
+;; priority levels demoted for running with 100% of the machine
+(defparameter *scheduler-spread* 1)
+;; priority-levels per second of (enforced) idle time.
+(defparameter *scheduler-boost* .2)
+
+;; Multiply priority level by this to get scheduler priority
+;; The low order 21 bits are to express priority adjustments within a level
+(defvar *low-order-priority-bits* (expt 2 21))
+
+;; Multiply this by the number of seconds of (enforced) idle time to get priority boost
+(defvar *scheduler-boost-factor* (floor (* *scheduler-boost* *low-order-priority-bits*)))
+
+;; Number of distinct bins of fractional machine utilization between 0% and 100%
+(defvar *scheduler-priority-factor-1* (floor 100 *scheduler-resolution*))
+
+;; Amount of priority decrease per bin of fractional machine utilization
+(defvar *scheduler-priority-factor-2* (floor (* *scheduler-spread* *low-order-priority-bits*)
+					     *scheduler-priority-factor-1*))
+
+;; make this work as a patch file, too.
+(defvar *scheduler-process* nil)
+(defvar *scheduler-timer* nil)
+(defvar *scheduler-priority* (make-process-priority :deadline 100000. :preemptive t))
+(si:defvar-resettable *scheduler-process-initialized* nil)
+
+
+;; this function is called every-time we boot, by PROCESS-INITIALIZE 
+;; It is a known entrypoint
+(defun initialize-process-scheduler ()
+  (setq *scheduler-process-initialized* nil)
+  (with-scheduler-locked
+    (loop for p in *all-processes* do
+      (reset-scheduler-info p)
+      (setf (ldb %%process-debug-funcall-policy-hook-on-process-switch
+		 (process-debug-flag p))
+	    1)))
+  (process-reset *scheduler-process* nil nil ':force)
+  (process:force-wakeup *scheduler-process*)
+  (process:enable *scheduler-process*)
+  (setq *scheduler-process-initialized* t))
+
+(defun set-scheduler-parameters (&key (wakeup *scheduler-wakeup-interval*)
+				      (record *scheduler-record-interval*)
+				      (hysteresis *scheduler-hysteresis-interval*)
+				      (peek *scheduler-peek-interval*)
+				      (resolution *scheduler-resolution*)
+				      (spread *scheduler-spread*)
+				      (boost *scheduler-boost*)
+				      (timer-resolution *timer-resolution*))
+
+  (setq *scheduler-spread* spread)
+  (setq *scheduler-boost* boost)
+  (setq *scheduler-resolution* resolution)
+  (setf *scheduler-boost-factor* (floor (* *scheduler-boost* *low-order-priority-bits*)))
+  (setf *scheduler-priority-factor-1* (floor 100 *scheduler-resolution*))
+  (setf *scheduler-priority-factor-2* (floor (* *scheduler-spread* *low-order-priority-bits*)
+					     *scheduler-priority-factor-1*))
+  (let ((wakeup (or wakeup *scheduler-wakeup-interval*))
+	(hysteresis (or hysteresis *scheduler-hysteresis-interval*))
+	(record (or record *scheduler-record-interval*))
+	(peek (or peek *scheduler-peek-interval*)))
+    (unless (> peek hysteresis)
+      (cerror "Use twice the hysteresis"
+	      "The interval over which we remember process statistics for Peek (~D seconds) must be greater than the hysteresis for scheduling (~D seconds)."
+	      peek hysteresis)
+      (setf peek (* hysteresis 2)))
+    (unless ( hysteresis record)
+      (cerror "Use half the hysteresis"
+	      "The scheduler recording interval (~D seconds) must be less than the hysteresis time (~D seconds)"
+	      record
+	      hysteresis)
+      (setf record (/ hysteresis 2)))
+    (with-scheduler-locked
+      (setf *scheduler-wakeup-interval* wakeup)
+      (setf *scheduler-record-interval* record)
+      (setf *scheduler-sleep-interval*
+	    (floor (/ (min *scheduler-wakeup-interval* *scheduler-record-interval*)
+		      *timer-units*)))
+      (setf *scheduler-hysteresis-interval* hysteresis)
+      (setf *scheduler-peek-interval* peek)
+      (setf *scheduler-record-interval-usecs*
+	    (floor (* 1000000. *scheduler-record-interval*)))
+      (setf *scheduler-wakeup-interval-usecs*
+	    (floor (* 1000000. *scheduler-wakeup-interval*)))
+      (setf *scheduler-peek-interval-usecs* (floor (* 1000000. *scheduler-peek-interval*)))))
+  (unless (= timer-resolution *timer-resolution*)
+    (set-timer-resolution timer-resolution))
+  t)
+
+(defun show-scheduler-parameters (&optional (stream *standard-output*))
+  (format stream
+	  "~&Wakeup: ~D (seconds between forcibly recomputing the priorities of runnable processes"
+	  *scheduler-wakeup-interval*)
+  (format stream
+	  "~&Record: ~D (seconds between snapshotting usage counts for each process)"
+	 *scheduler-record-interval*)
+  (format stream
+	  "~&Hysteresis: ~D (number of RECORDs looked at by the scheduler to compute process utilization)"
+	  *scheduler-hysteresis-interval*)
+  (format stream
+	  "~&Peek: ~D (seconds of history that PEEK and :Show Processes use to compute process utilization)" 
+	  *scheduler-peek-interval*)
+  (format stream "~&Control conversion of process priorities to instantaneous priorities.")
+  (format stream
+	  "~&  Resolution: ~D (quantize percent utilization to the nearest ~D percent when trying to"
+	  *scheduler-resolution* *scheduler-resolution*)
+  (format stream
+	  "~&                  equalize the usage of the processor by processes of equal priority")
+  (format stream
+	  "~&  Spread: ~D (a process using N% of the machine has its priority reduced by N% of SPREAD)"
+	  *scheduler-spread*)
+  (format stream
+	  "~&  Boost: ~D (a runnable process that hasn't run yet gets its priority boosted by BOOST"
+	  *scheduler-boost*)
+  (format stream
+	  "~&             per second of not running)")
+  (format stream
+	  "~&  Timer resolution: ~D (Timers are only accurate to ~D timer-units)"
+	  *timer-resolution* *timer-resolution*))
+
+(defun record-process-switch (proc)
+  (vector-push-extend proc *recent-processes*)
+  (setf (ldb %%process-debug-funcall-policy-hook-on-process-switch
+	     (process-debug-flag proc))
+	0))
+
+(defun update-scheduler-stats ()
+  (declare (inline process-debug-flag process-run-time-low))
+  (with-scheduler-locked
+    (loop for p being the array-elements of *recent-processes* do
+      (setf (ldb %%process-debug-funcall-policy-hook-on-process-switch
+		 (process-debug-flag p))
+	    1)
+      (setf (process-recent-run-time p) (process-run-time-low p))
+      (setf (process-recent-microsecond-clock p) (sys:%microsecond-clock))
+      (unless (find p *contemporary-processes*)
+	(vector-push-extend p *contemporary-processes*)))
+    (setf (fill-pointer *recent-processes*) 0)))
+
+(defun update-scheduler-stats-2 ()
+  (declare (inline process-run-time-low process-disk-wait-time-milliseconds))
+  (with-scheduler-locked
+    (multiple-value-bind (lnow hnow) (time:full-microsecond-time)
+      (setq *contemporary-processes* (follow-structure-forwarding *contemporary-processes*))
+      (loop for take from 0 below (fill-pointer *contemporary-processes*)
+	    with put = 0
+	    as p = (aref *contemporary-processes* take)
+	    do (when ;; Process has run recently
+		     (< (sys:%32-bit-difference lnow (process-recent-microsecond-clock p))
+			(* *scheduler-peek-interval-usecs* 2))
+		 ;; Shift history elements
+		 (setf (process-earlier-snapshot-run-time p)
+				(process-snapshot-run-time p) 
+		       (process-earlier-snapshot-paging-time p)
+				(process-snapshot-paging-time p)
+		       (process-earlier-snapshot-runnable-time p)
+				(process-snapshot-runnable-time p)
+		       (process-earlier-snapshot-microsecond-clock-low p)
+				(process-snapshot-microsecond-clock-low p)
+		       (process-earlier-snapshot-microsecond-clock-high p)
+				(process-snapshot-microsecond-clock-high p))
+		 ;; Take a snapshot
+		 (setf (process-snapshot-run-time p)
+				(process-run-time-low p)
+		       (process-snapshot-paging-time p)
+				(process-disk-wait-time-milliseconds p)
+		       (process-snapshot-runnable-time p)
+				(process-runnable-time p)
+		       (process-snapshot-microsecond-clock-low p)
+				lnow
+		       (process-snapshot-microsecond-clock-high p)
+				hnow)
+		 ;; Keep this process in the array of active processes
+		 (setf (aref *contemporary-processes* put) p)
+		 (incf put))
+	    finally (setf (fill-pointer *contemporary-processes*) put)))))
+
+(defun recalculate-runnable-priorities ()
+  (declare (inline process-next-process))
+  (with-scheduler-locked
+    (let ((q (aref *runnable-processes* *process-priority-class-foreground*))
+	  (i 0))
+      ;; The 1+ is because inside si:make-simple-stack-array we might call si:%make-stack
+      ;; to make a data stack for this simple-process stack-group, which might wake up
+      ;; the GC process, which will add one more element to the queue.  So leave room.
+      (stack-let ((processes (make-array (1+ (scheduler-queue-length q)))))
+	(loop for p = (scheduler-queue-head q) then (process-next-process p)
+	      while p do (setf (aref processes i) p) (incf i))
+	(loop until (zerop i)
+	      do (decf i) (recalculate-priority (aref processes i)))))))
+
+(defvar *process-scheduler-record-time* (sys:%microsecond-clock))
+(defvar *process-scheduler-last-wakeup* (sys:%microsecond-clock))
+(defvar *process-scheduler-last-peek* (sys:%microsecond-clock))
+
+(defun run-process-scheduler ()
+  (macrolet ((microsecond-time-elapsed-p
+		(increment initial-time &optional (final-time '(si:%microsecond-clock)))
+	       #+imach
+	       `(not (sys:%unsigned-lessp (sys:%32-bit-difference ,final-time ,initial-time)
+					  ,increment))
+	       #-imach
+	       `(let ((difference (sys:%32-bit-difference ,final-time ,initial-time)))
+		  (or (minusp difference) ( difference ,increment)))))
+    (unwind-protect
+	(let ((current-time (sys:%microsecond-clock)))
+	  (set-process-priority *current-process* *scheduler-priority*)
+	  (when (microsecond-time-elapsed-p *scheduler-record-interval-usecs*
+					    *process-scheduler-record-time*
+					    current-time)
+	    (update-scheduler-stats)
+	    (setq *process-scheduler-record-time* current-time))
+	  (with-scheduler-locked
+	    (when (microsecond-time-elapsed-p *scheduler-wakeup-interval-usecs*
+					      *process-scheduler-last-wakeup*
+					      current-time)
+	      (recalculate-runnable-priorities)
+	      (setq *process-scheduler-last-wakeup* current-time)))
+	  (when (microsecond-time-elapsed-p *scheduler-peek-interval-usecs*
+					    *process-scheduler-last-peek*
+					    current-time)
+	    (update-scheduler-stats-2)
+	    (setq *process-scheduler-last-peek* current-time)))
+      (reset-timer-relative-timer-units *scheduler-timer* *scheduler-sleep-interval*))))

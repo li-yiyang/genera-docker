@@ -1,0 +1,887 @@
+;;; -*- Mode: Lisp; Syntax: Common-lisp; Package: (DBFS SCL); Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+#|
+
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")COMMENTS:
+
+0+++ Fix this comment to use new objects
+
+With the token-list-stream interface, a separate connection is required per-transaction,
+not just per-machine.  Unfortunately, this really boils down to a connection being
+required per-file since transactions involve multiple files which might live in
+different file systems on potentially different servers.  If the connection resided
+in the file-system object instead of in the remote-file object, different processes
+could not refer to the same file concurrently, and would get arbitrarily synchronized.
+
+This can be solved by not waiting for disk completion; instead a reply could be
+sent saying the request was queued, and then the local process itself could block
+until an acknowledgement was received.  Meanwhile, the file-system would be free
+to process another request.  When this change occurs, it makes sense to use a
+datagram protocol instead of a stream protocol, and perhaps change the actual
+server to not use separate processes.
+
+|#
+
+;;;; 1Remote file systems and servers
+
+0;; The following three words form a unique-id "timestamp" for a given initialization
+;; of the client.  These are used by the server to determine if the client has
+;; been initialized (crashed), requiring the server to updated its client caching info.
+(defvar *client-unique-id-1*)
+(defvar *client-unique-id-2*)
+(defvar *client-unique-id-3*)
+
+(defflavor remote-file-system (server)
+	   (basic-file-system)
+  (:readable-instance-variables server)
+  (:initable-instance-variables server)
+  (:constructor make-remote-file-system (name server)))
+
+(defmethod (allocate-file remote-file-system) (file-id)
+  (make-remote-file self file-id))
+
+(defmethod (shutdown-file-system-server remote-file-system) ()
+  (shutdown-remote-server server))
+
+;;; This is sort of strange.  Since opening a connection is so slow with the
+;;; generic network system, and since DBFS wants to be able to open files
+;;; quickly, a pool of open connections is kept.  The idea is that
+;;; (excluding a shutdown, scavenge operation, or network error) a connection
+;;; is opened once and kept around forever, reused by multiple processes.
+;;; However, concurrent transactions each need their own connection, which
+;;; is why a hash table of connections indexed by process is maintained.
+;;; This means that (again, excepting a salvage etc.) there will be as
+;;; many connections kept open as there have ever been concurrent transactions.
+;;; This is ok, but is reason for a salvager to close old connections.
+
+;;; This UID-n instance variables are used to store the WORD-n fields of
+;;; the open-connection-reply.  Whenever the remote server is initialized,
+;;; it gets a uid:unique-id to identify its boot generation.  The first time
+;;; the server is accessed, this boot id is stored in the local server object.
+;;; Subsequent new connections to the server verify that the boot id has not
+;;; changed (that is, the remote server has not been reinitialized).  If the
+;;; boot id is different, all the local caches for that server must be flushed
+;;; (especially the states of all the copies of pages from that server must
+;;; be discarded).
+
+(defvar *remote-server-table* (make-hash-table :locking nil) "Maps host to remote server.")
+(defvar *remote-server-table-lock* (make-ordered-lock "Remote Server Table Lock"
+						      %remote-server-table-lock))
+
+(defun lookup-remote-server (host)
+  ;; I don't think this needs a cache since it is infrequently called since this
+  ;; lookup only occurs if the file system cache misses.
+  (with-lock (*remote-server-table-lock*)
+    (or (fast-gethash host *remote-server-table*)
+	(setf (gethash host *remote-server-table*)
+	      (make-remote-server host)))))
+
+(defflavor remote-server
+	(host
+	 (lock (make-ordered-lock "Remote Server Lock" %server-lock))
+	 (uid-1 nil)				; Server timestamp word 1
+	 (uid-2 nil)				; " " word 2
+	 (uid-3 nil)				; " " word 3
+	 (free-connections (make-array 10 :adjustable t :fill-pointer 0))
+	 ;;;(busy-connections (make-hash-table :locking nil :size 15))	; Idx by process
+	 (remote-ids (make-hash-table :locking nil :ignore-gc t)))	; ID to file obj.
+	()
+  (:readable-instance-variables host)
+  (:initable-instance-variables host)
+  (:constructor make-remote-server (host)))
+
+(defmethod (:print-self remote-server) (stream print-depth slashify-p)
+  (declare (ignore print-depth))
+  (if slashify-p
+      (sys:printing-random-object (self stream)
+	(format stream "Server ~A" host))
+      (format stream "Server for host ~A" host)))
+
+(defmethod (allocate-transaction-element remote-server) (transaction)
+  (let ((element (allocate-resource 'remote-transaction-element)))
+    (initialize-transaction-element element transaction self)
+    element))
+
+(defmethod (deallocate-transaction-element remote-server) (element)
+  (deallocate-resource 'remote-transaction-element element))
+
+(defmethod (insert-remote-id remote-server) (remote-id file)
+  (with-lock (lock)
+    (setf (gethash remote-id remote-ids) file)))
+
+(defmethod (lookup-remote-id remote-server) (remote-id)
+  (with-lock (lock)
+    (fast-gethash remote-id remote-ids)))
+
+(defmethod (validate-open-connection remote-server) (conn)
+  (using-resource (net-block net-block)
+    ;; Open the connection and read the reply
+    (setf (net-block-command net-block) %open-connection-cmd
+	  (connection-header-version net-block) %dbfs-page-protocol-version
+	  (connection-header-word1 net-block) *client-unique-id-1*
+	  (connection-header-word2 net-block) *client-unique-id-2*
+	  (connection-header-word3 net-block) *client-unique-id-3*
+	  (fill-pointer net-block) %open-connection-cmd-fixed-size)
+    (send-net-command-and-read-reply conn nil net-block nil t)
+    (select (net-block-command net-block)
+      (%dbfs-disabled-reply
+       (error 'dbfs-disabled
+	      :reason (dbfs-disabled-reply-reason net-block)))
+      (%open-connection-reply
+       (setf (dbfs-connection-server-id conn)
+	     (open-connection-reply-remote-transaction-id net-block))
+       (setf (dbfs-connection-marks-received conn) 0)
+       (setf (dbfs-connection-marks-sent conn) 0))
+      (otherwise
+       (unexpected-reply net-block)))
+    ;; Compare the protocol version
+    (let ((ptcl-version (connection-header-version net-block)))
+      (unless (= ptcl-version %dbfs-page-protocol-version)
+	(error "~A is running ~:[an older~;a newer~] version of the DBFS-PAGE protocol."
+	       self (> ptcl-version %dbfs-page-protocol-version))))
+    (let ((word1 (connection-header-word1 net-block))
+	  (word2 (connection-header-word2 net-block))
+	  (word3 (connection-header-word3 net-block)))
+      (unless (and (eql uid-1 word1) (eql uid-2 word2) (eql uid-3 word3))
+	(if (null uid-1)
+	    ;; This is the first time we've connected to this server.
+	    ;; Save its unique-id to compare next time we validate.
+	    (setq uid-1 word1 uid-2 word2 uid-3 word3)
+	    ;; There has been a previous connection to this server.
+	    ;; Make sure that the server has not been booted since the
+	    ;; last contact since that would mean that all the caches
+	    ;; for that server are invalid.
+	    (return-to-top-level 'server-booted self word1 word2 word3))))))
+
+(defmethod (open-net-connection remote-server) ()
+  (loop for conn = (vector-pop free-connections nil)
+	while conn do
+    ;; Check existing connection to make sure it's still open.  For
+    ;; example, the user might have done a Reset Network.
+    (when (connection-valid-p conn)
+      (return conn))
+    finally (return (make-dbfs-client-connection self))))
+
+#||
+
+;;+++ There is a problem here.  Opening the new net connection can end up noticing that
+;; the server has been booted, calling invalidate, which ends up flushing all pages,
+;; which can end up trying to abort another transaction holding one of the pages
+;; for that server, which ends up in its calling end-net-transaction, and thus
+;; screwing up the locking modularity.
+(defmethod (start-net-transaction remote-server) ()
+  (with-lock (lock)
+    (or (fast-gethash *current-process* busy-connections)
+	(setf (gethash *current-process* busy-connections) (open-net-connection self)))))
+
+(defmethod (end-net-transaction remote-server) ()
+  (with-lock (lock)
+    (let ((conn (fast-gethash *current-process* busy-connections)))
+      (when conn
+	(remhash *current-process* busy-connections)
+	(vector-push-extend conn free-connections)))))
+
+||#
+
+(defmethod (free-connection remote-server) (conn)
+  (with-lock (lock)
+    (vector-push-extend conn free-connections)))
+
+;;; It can't hurt to use a global lock, since this hardly ever happens.
+(defvar *invalidate-server-lock* (make-ordered-lock "Invalidate Server Lock"
+						    %invalidate-server-lock))
+
+;;; The caller must not be holding any transaction lock when this is
+;;; called.
+(defmethod (invalidate-server remote-server) (word1 word2 word3)
+  (with-lock (*invalidate-server-lock*)
+    ;; Check to see whether someone else has already invalidated the server.
+   (unless (and (eql uid-1 word1) (eql uid-2 word2) (eql uid-3 word3))
+     ;; Nope, it's still in need of invalidataion.
+     (incf *count-server-invalidations*)
+     ;; Forget the remote-id for all files
+     (maphash #'(lambda (ignore file)
+		  (flush-cache file))
+	      remote-ids)
+     (clrhash remote-ids)
+     ;; All clear.
+     (setq uid-1 word1 uid-2 word2 uid-3 word3))))
+
+;;; Called from shutdown-dbfs and shutdown-dbfs-file-system.
+(defmethod (shutdown-remote-server remote-server) ()
+  ;; This used to operate with the lock held.  However, that could cause
+  ;; indefinitely delays when you tried to disk-save, because some
+  ;; background client process might be waiting arbitrarily long for
+  ;; network input, with the lock held.  Our way of blowing away those
+  ;; processes is to close their network connection, so they'll get an
+  ;; error and wake up and decide to abort themselves.
+  ;; shutdown-dbfs-client has already passively aborted them.  So we
+  ;; can't afford to wait for the lock.  Instead, we'll just keep
+  ;; removing connections from the list until they're all gone.
+  (clrhash remote-ids)
+  ;; At this point there should be no busy connections.
+  (loop for conn = (atomically (vector-pop free-connections nil))
+	while conn do
+    (ignore-errors
+      (using-resource (net-block net-block)
+	(setf (net-block-command net-block) %close-connection-cmd)
+	(setf (fill-pointer net-block) %close-connection-cmd-fixed-size)
+	(send-net-command conn nil t net-block nil)))
+    (ignore-errors
+      ;; Should read a reply
+      (close-connection conn t))))
+
+;;; Called from reinitialize-dbfs, that is, from the warm initialization
+;;; list, so this is run at warm-boot and cold-boot time.
+(defmethod (reinitialize-server remote-server) ()
+  (reset-lock lock)
+  ;; Close all connections.
+  (loop for conn = (vector-pop free-connections nil)
+	while conn do (ignore-errors (close-connection conn t))))
+
+(compile-flavor-methods remote-file-system remote-server)
+
+;;;; 1Remote pages
+
+0(defflavor remote-page
+	(remote-lock-state			; Cache used to minimize lock-page requests
+	 remote-transactions			; Part of the same.
+	 pessimistic-state
+	 next-pessimistic-state)
+	(basic-page)
+  (:writable-instance-variables
+   remote-lock-state remote-transactions pessimistic-state next-pessimistic-state)
+  (:constructor make-remote-page ()))
+
+(defmethod (initialize-page remote-page :after) (&rest ignore)
+  (setq remote-lock-state %unlocked
+	remote-transactions nil
+	pessimistic-state nil
+	next-pessimistic-state nil))
+
+(defmethod (lock-page remote-page :after) (element lock-type)
+  (atomically
+    (when (> lock-type remote-lock-state)
+      (setq remote-lock-state lock-type))
+    (let ((transaction (transaction-element-transaction element)))
+      (unless (member-or-eql transaction remote-transactions)
+	(push-or-setq transaction remote-transactions)))))
+
+(defmethod (unlock-page-1 remote-page :after) (transaction abort-p)
+  (atomically
+    (setq remote-lock-state %unlocked)
+    (delete-or-setq transaction remote-transactions))
+  (unless abort-p
+    ;; The transaction is committing.  Set the pessimistic state
+    ;; to the next level, and invalidate the page when commiting
+    ;; a pessimistic page.
+    (when (eq 'pessimistic pessimistic-state)
+      (if *selective-pessimism*			; Just in case it has been recently disabled
+	  (setf (data-state) %invalid)
+	  (setq next-pessimistic-state 'read)))
+    (setq pessimistic-state next-pessimistic-state))
+  ;; Reset the temporary state for the next transaction.
+  (setq next-pessimistic-state pessimistic-state))
+
+(defmethod (allocate-data-array remote-page) ()
+  (unless data-array
+    (setf data-array (get-page-buffer file)))
+  (unless (and byte-array
+	       (eq data-array (si:array-indirect-pointer byte-array)))
+    (setq byte-array (make-array (* 4 (length data-array))
+				 :element-type '(unsigned-byte 8)
+				 :displaced-to data-array))))
+
+(defmethod (allocate-extra-data-array remote-page) (ignore)
+  (make-array (file-page-size-in-words file) :element-type 'fixnum
+	      :area *dbfs-page-area*))
+
+#||
+(defmethod (return-extra-data-array remote-page) (array resource-descriptor)
+  (deallocate-resource 'remote-data-array array resource-descriptor))
+||#
+
+(defmethod (cache-invalid-error remote-page) ()
+  (when ( %uninitialized (data-state)))
+    (setf (data-state) %invalid)
+  (when (eq 'read pessimistic-state)
+    (setq pessimistic-state (when *selective-pessimism* 'pessimistic))))
+
+(defmethod (show-status remote-page :after) (&key stream)
+  (when ( %unlocked remote-lock-state)
+    (format stream "~%  (Remote lock state: ~A)" (nth remote-lock-state *lock-states*)))
+  (when pessimistic-state
+    (format stream "~%  (Pessimistic state: ~A)" pessimistic-state)))
+
+(compile-flavor-methods remote-page)
+
+(defresource remote-page () :constructor (make-remote-page))
+
+;;;; 1Remote file
+
+0(defflavor remote-file (server) (basic-file)
+  (:constructor make-remote-file (file-system file-id)))
+
+(defmethod (make-instance remote-file) (&rest ignore)
+  (setq page-size-in-words nil
+	server (remote-file-system-server file-system)))
+
+(defmethod (allocate-page remote-file) ()
+  (let ((sys:default-cons-area *dbfs-page-area*))
+    (make-remote-page)))
+
+
+;; Commit is atomic for all files on a remote server, not just per remote file-system,
+;; since the remote server will use two-phase commit locally for all file systems
+;; in use by the transaction for the given server.
+(defmethod (atomic-commit-unit remote-file) () server)
+
+(defmethod (show-status remote-file) (&key ((:stream output-stream) *standard-output*))
+  (format output-stream "~&~A~%  page-size-in-words ~D" self page-size-in-words)
+  (format output-stream "~%  Has the following pages buffered locally:")
+  (tv:with-indentation (output-stream 4)
+    (loop for page being the hash-elements of pages doing
+      (show-status page :stream output-stream))))
+
+(compile-flavor-methods remote-file)
+
+;;;; 1Remote transaction-elements
+
+0;;; The net-block is stored in the transaction-element since it can be shared
+;;; within a transaction (process).
+;;;++ could really move this up to the transaction object, but who cares.
+;;;++ this has to be changed if transactions are shared across processes
+(defflavor remote-transaction-element
+	((connection nil)
+	 (net-block nil)
+	 optimistic-p)
+	(basic-transaction-element)
+  (:constructor make-remote-transaction-element ())
+  (:readable-instance-variables net-block connection))
+
+
+(defmethod (initialize-transaction-element remote-transaction-element :after) (&rest ignore)
+  ;; ATOMIC-COMMIT-UNIT contains a server
+  (setq connection (open-net-connection atomic-commit-unit))
+  (unless net-block
+    (setq net-block (allocate-resource 'net-block)))
+  (setf optimistic-p nil))
+
+(defmethod (process-net-block remote-transaction-element) (net-block asynch-p)
+  (flet ((decode-net-block (net-block)
+	   ;; Provide a function since the block accessors can expand into a bit of code.
+	   (values (net-block-remote-id net-block)
+		   (net-block-page-n net-block))))
+    (select (net-block-command net-block)
+      (%page-lock-wait-reply
+       ;; Have to throw out to release the latch on the page.
+       (multiple-value-bind (remote-id page-n) (decode-net-block net-block)
+	 (return-to-top-level 'page-locked-remotely remote-id page-n self)))
+      (%cache-invalid-reply
+       ;; Locked a page which had been modified by another client before
+       ;; the local copy of the page was invalidated.  Have to do a
+       ;; restartable transaction abort.
+       (multiple-value-bind (remote-id page-n) (decode-net-block net-block)
+	 (let ((n-pages (cache-invalid-reply-n-invalidates net-block))
+	       (invalid-array nil))
+	   (when (plusp n-pages)
+	     (setq invalid-array (make-array (* 2 n-pages)))
+	     (loop for i below (* 2 n-pages) by 2 doing
+	       (read-net-block connection net-block)
+	       (when ( %invalidate-page-cmd (net-block-command net-block))
+		 (unexpected-reply net-block))
+	       (multiple-value-bind (rid pagen) (decode-net-block net-block)
+		 (setf (aref invalid-array i) rid
+		       (aref invalid-array (1+ i)) pagen))))
+	   (return-to-top-level 'cache-invalid remote-id page-n self invalid-array))))
+      (%transaction-abort-reply
+       ;;Indicate an abort is in progress to avoid deadlock between client and
+       ;;background invalidation.
+       (setf (transaction-error transaction)
+	     'two-transaction-deadlock-restartable-transaction-abort)
+       (return-to-top-level 'remote-deadlock transaction))
+      (%nonextant-file-reply
+       (let ((remote-id (net-block-remote-id net-block)))
+	 (return-to-top-level 'nonextant-file remote-id self)))
+      (t
+       (when asynch-p
+	 (unexpected-reply net-block))))))
+
+(defmethod (finish-commit remote-transaction-element) ()
+  ;; ATOMIC-COMMIT-UNIT contains a server.
+  (setf (net-block-command net-block) %commit-cmd
+	(fill-pointer net-block) %commit-cmd-fixed-size)
+  (send-net-command-and-read-reply connection self net-block)
+  (unless (= %done-reply (net-block-command net-block))
+    (unexpected-reply net-block))
+  (doing-over-set (page pages)
+    (unlock-page page transaction nil))
+  (free-connection atomic-commit-unit connection)
+  (setq connection nil))
+
+(defmethod (finish-abort remote-transaction-element) (asynch-p)
+  ;; atomic-commit-unit contains a server.
+  (when connection
+    (if (or asynch-p optimistic-p)
+	(close-connection connection t)
+	(synch-connection connection))
+    (free-connection atomic-commit-unit connection)
+    (setq connection nil)))
+
+(defmethod (validate remote-transaction-element) ()
+  (when connection
+    (setf (net-block-command net-block) %validate-transaction-cmd
+	  (fill-pointer net-block) %net-header-fixed-size)
+    (send-net-command-and-read-reply connection self net-block)
+    (unless (= %done-reply (net-block-command net-block))
+      (unexpected-reply net-block))))
+
+(defmethod (abort-dbfs-page remote-transaction-element) (page)
+  ;; Don't have to do anything.
+  page)
+
+(defmethod (open-dbfs-file remote-transaction-element) (file &optional create-p)
+  (declare (values extant-p))
+  ;; Don't have to lock the file, since it doesn't really matter if two
+  ;; processes both think there is no remote id and ask the server for it
+  ;; since they will both get the same answer.
+  (let ((file-system-name (file-system-name (file-file-system file))))
+    (multiple-value-bind (id0 id1 id2) (file-id-words (file-file-id file))
+      (setf (net-block-command net-block) %open-file-cmd
+	    (open-file-cmd-file-id0 net-block) id0
+	    (open-file-cmd-file-id1 net-block) id1
+	    (open-file-cmd-file-id2 net-block) id2
+	    (open-file-cmd-create-p net-block) create-p
+	    (open-file-cmd-file-system-name net-block) file-system-name
+	    (fill-pointer net-block) (+ %open-file-cmd-fixed-size
+					(string-length file-system-name))))
+    (send-net-command-and-read-reply connection self net-block `(,%nonextant-file-reply))
+    (select (net-block-command net-block)
+      (%open-file-reply
+       (let ((remote-id (setf (file-remote-id file) (net-block-remote-id net-block)))
+	     (page-size (open-file-reply-page-size net-block)))
+	 (setf (file-page-size-in-words file) page-size)
+	 (setf (file-page-pool file) (get-remote-page-pool *page-pool* page-size))
+	 (insert-remote-id atomic-commit-unit remote-id file)
+	 t))
+      (%nonextant-file-reply
+       nil)
+      (%file-system-disabled-reply
+       (error 'file-system-disabled
+	      :name file-system-name
+	      :reason (file-system-disabled-reply-reason net-block)))
+      (%nonextant-file-system-reply
+       (error 'nonextant-file-system :name file-system-name))
+      (%invalid-file-system-reply
+       (error 'invalid-file-system :name file-system-name))
+      (otherwise
+       (unexpected-reply net-block)))))
+
+(defmethod (destroy-dbfs-file remote-transaction-element) (file)
+  (setf (net-block-command net-block) %destroy-file-cmd
+	(net-block-remote-id net-block) (file-remote-id file)
+	(fill-pointer net-block) %destroy-file-cmd-fixed-size)
+  (send-net-command-and-read-reply connection self net-block)
+  (unless (= %done-reply (net-block-command net-block))
+    (unexpected-reply net-block))
+  (unlock (transaction-lock transaction))
+  (shutdown-file file))
+
+(defresource kludge-buffer ()
+  :constructor (make-array max-supported-page-size :element-type '(unsigned-byte 8)))
+
+(defmethod (read-dbfs-page remote-transaction-element) (page lock-type &optional create-p)
+  (declare (values extant-p))
+  (multiple-value-bind (file page-n) (page-address page)
+    (let ((array (page-byte-array page))
+	  (file-page-size-in-bytes (* 4 (file-page-size-in-words file))))
+      (setf (net-block-command net-block) %read-page-cmd
+	    (net-block-remote-id net-block) (file-remote-id file)
+	    (net-block-page-n net-block) page-n
+	    (read-page-cmd-lock-type net-block) lock-type
+	    (read-page-cmd-create-p net-block) create-p
+	    (fill-pointer net-block) %read-page-cmd-fixed-size)
+      (send-net-command-and-read-reply connection self net-block)
+      (select (net-block-command net-block)
+	(%read-page-reply
+	 (unless (eql (read-page-reply-n-bytes net-block) (length array))
+	   (error "Size of remote page is ~D bytes; expecting a size of ~D bytes."
+		  (read-page-reply-n-bytes (length array))))
+	 ;; The following hair is necessary because we must read in the
+	 ;; bytes for the page before calling lock-page, because
+	 ;; lock-page can return-to-top-level, which would leave the
+	 ;; bytes lying in the stream.  Review all this when we revise
+	 ;; the way locking works.
+	 (multiple-value-bind (temp-array temp-desc)
+	     (allocate-resource 'kludge-buffer)
+	   (unwind-protect
+	       (progn
+		 ;; Read in the bytes
+		 (send connection :string-in nil temp-array 0 file-page-size-in-bytes)
+		 ;; Promote the local lock if need be.
+		 (lock-page page self lock-type)
+		 (copy-array-portion temp-array 0 file-page-size-in-bytes array
+				     0 file-page-size-in-bytes))
+	     (deallocate-resource 'kludge-buffer temp-array temp-desc)))
+	 (let ((cache-valid (read-page-reply-cache-valid-p net-block)))
+	   (setf (page-data-state page) %valid)
+	   (case (remote-page-pessimistic-state page)
+	     ((nil)
+	      (setf (remote-page-next-pessimistic-state page) 'read))
+	     (pessimistic
+	       (when cache-valid
+		 (setf (remote-page-next-pessimistic-state page) nil)))))
+	 t)
+	(%created-page-reply
+	 (lock-page page self %write-lock)
+	 (set-page-modified page self)
+	 (setf (page-data-state page) %valid)
+	 (case (remote-page-pessimistic-state page)
+	   ((nil) (setf (remote-page-next-pessimistic-state page) 'read))
+	   (pessimistic))
+	 (fill (page-data-array page) 0)
+	 t)
+	(%nonextant-page-reply
+	 (lock-page page self %read-lock)
+	 (setf (page-data-state page) %uninitialized)
+	 nil)
+	(otherwise
+	 (unexpected-reply net-block))))))
+
+(defmethod (write-dbfs-page remote-transaction-element) (page)
+  (multiple-value-bind (file page-n) (page-address page)
+    (let ((byte-array (page-byte-array page)))
+      (setf (net-block-command net-block) %write-page-cmd
+	    (net-block-remote-id net-block) (file-remote-id file)
+	    (net-block-page-n net-block) page-n
+	    (write-page-cmd-n-bytes net-block) (length byte-array)
+	    (fill-pointer net-block) %write-page-cmd-fixed-size)
+      (if (not *debug-net*)
+	  (send-net-command connection self nil net-block byte-array)
+	  (let ((sn (send-net-command connection self t net-block byte-array)))
+	    (read-net-reply connection self net-block sn)
+	    (unless (= %done-reply (net-block-command net-block))
+	      (error "Wrong reply after sending over a page."))))))
+  (setf (page-write-state page) %written))
+
+(defmethod (dbfs-page-extant-p remote-transaction-element) (page)
+  (declare (values extant-p))
+  (multiple-value-bind (file page-n) (page-address page)
+    (setf (net-block-command net-block) %page-extant-p-cmd
+	  (net-block-remote-id net-block) (file-remote-id file)
+	  (net-block-page-n net-block) page-n
+	  (fill-pointer net-block) %page-extant-p-cmd-fixed-size)
+    (send-net-command-and-read-reply connection self net-block)
+    (lock-page page self %read-lock)
+    (select (net-block-command net-block)
+      (%extant-page-reply
+       ;; The page existed.  Since this function can only be called if
+       ;; the state was (2 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")%0uninitialized, initialize the state.
+       (setf (page-data-state page) %invalid)
+       t)
+      (%nonextant-page-reply
+       nil)
+      (otherwise
+       (unexpected-reply net-block)))))
+
+(defmethod (create-dbfs-page remote-transaction-element) (page page-n extant-ok-p)
+  (declare (values created-p))
+  (let ((optimistic-p (and *optimistic-locking* extant-ok-p))
+	(file (page-file page))
+	reply)
+    (setf (net-block-command net-block) (if optimistic-p
+					    %optimistic-create-page-cmd
+					    %create-page-cmd)
+	  (net-block-remote-id net-block) (file-remote-id file)
+	  (net-block-page-n net-block) page-n
+	  (create-page-cmd-extant-ok-p net-block) extant-ok-p
+	  (fill-pointer net-block) %create-page-cmd-fixed-size)
+    (if optimistic-p
+	;; Just send the creation command and continue running happily along
+	;; as if this were really simply a write-lock command which happens
+	;; to create the page if it didn't already exist.  The only failure
+	;; which can occur is the same as for a normal write-lock.
+	(send-net-command connection self *force-out-optimistic-commands* net-block)
+	(send-net-command-and-read-reply connection self net-block))
+    (case (remote-page-pessimistic-state page)
+      ((nil) (setf (remote-page-next-pessimistic-state page) 'read))
+      (pessimistic))
+    (cond ((or optimistic-p
+	       (= %created-page-reply (setq reply (net-block-command net-block))))
+	   (lock-page page self %write-lock)
+	   (set-page-modified page self)
+	   (setf (page-data-state page) %valid)
+	   (fill (page-data-array page) 0)
+	   t)
+	  ((= %extant-page-reply reply)
+	   (when ( (page-data-state page) %valid)
+	     ;; Change uninitialized or nonextant to be extant, but unknown data
+	     (setf (page-data-state page) %invalid))
+	   (lock-page page self %read-lock)
+	   nil)
+	  (t
+	   (unexpected-reply net-block)))))
+
+(defmethod (destroy-dbfs-page remote-transaction-element) (page)
+  (multiple-value-bind (file page-n) (page-address page)
+    (setf (net-block-command net-block) %destroy-page-cmd
+	  (net-block-remote-id net-block) (file-remote-id file)
+	  (net-block-page-n net-block) page-n
+	  (fill-pointer net-block) %destroy-page-cmd-fixed-size)
+    (send-net-command-and-read-reply connection self net-block)
+    (select (net-block-command net-block)
+      (%done-reply
+       (lock-page page self %write-lock)
+       (set-page-modified page self)
+       t)
+      (%nonextant-page-reply
+       (lock-page page self %read-lock)
+       (setf (page-data-state page) %uninitialized)
+       nil)
+      (otherwise
+       (unexpected-reply net-block)))))
+
+;; Do the local lock first.  This optimizes out bothering the server if
+;; the local transactions must be serialized, and it also avoids a tricky
+;; situation where a transaction can be hung on a local lock with another
+;; transaction which is hung on a remote lock with the first transaction.
+;; (That is, the server serializes two transactions in a different order
+;; than the client machine serializes the transactions).
+;; For example, T1 and T2 are running on the same client machine.
+;; T1 optimistically write locks P0 (sending  the server command
+;; to write lock P0 and then locally write locking P0).  T2 then tries to
+;; read lock P0 (sending the server command to read lock P0 and then
+;; locally hanging on P0).  The server grants T2 the read lock on P0, and
+;; then sees T1's attempt to lock P0, making it wait for T1.  Now T1 is
+;; hung on T2 on the server, but T2 is hung on T1 on the client.
+;;
+;; By doing the local locks first, this problem is avoided by distributing
+;; the serialization in such a way that transactions on a client are serialized
+;; before the server even sees them to serialize them.  In the above example,
+;; T1 would optimistically lock P0 as before; T2 would hang on P0 locally
+;; without sending the server the read lock request.  The server would grant
+;; T1 the lock, T1 would complete, and then T2 would run.
+;;
+;;+++ However, global deadlock detect is going to be complex in that the server
+;; would not know that T2 was waiting on T1, so that if T3 on a different machine
+;; was waiting for T2, and T1 was waiting for T3, the server would just see
+;; T3->T2, T1->T3 and wouldn't know that T2->T1.  When global deadlock detect is
+;; implemented, this will have to be solved by making local waits (page-locked-handler)
+;; send information to the server informing it of the wait.
+(defmethod (lock-dbfs-page remote-transaction-element)
+	   (page lock-type &optional invalid-data-ok-p)
+  ;; When invalid-data-ok-p is true, just the page frame is being locked.  This
+  ;; is used when locking a page whose data is known to be invalid for an operation
+  ;; which doesn't care about the data, but which is locking the page frame itself
+  ;; to protect some state.  For example, before read-page can error on a page it
+  ;; knows is non-extant, it has to read-lock the page to prevent any other transaction
+  ;; from creating the page.  Saying invalid-data-ok-p prevents the server from sending
+  ;; a cache-invalid reply back.
+  (when (eq 'read (remote-page-pessimistic-state page))
+    (setf (remote-page-next-pessimistic-state page) nil))
+  ;; Do the local lock first to serialize local transactions on the client machine
+  ;; per the above comment.
+  (let ((send-p (or (> lock-type (remote-page-remote-lock-state page))
+		    (not (member-or-eql transaction (remote-page-remote-transactions page))))))
+    (lock-page page self lock-type)
+    (unwind-protect-case ()
+	(when send-p
+	  (multiple-value-bind (file page-n) (page-address page)
+	    (setf (net-block-command net-block) (if *optimistic-locking*
+						    %optimistic-lock-page-cmd
+						    %lock-page-cmd)
+		  (net-block-remote-id net-block) (file-remote-id file)
+		  (net-block-page-n net-block) page-n
+		  (lock-page-cmd-lock-type net-block) lock-type
+		  (lock-page-cmd-invalid-data-ok-p net-block) invalid-data-ok-p
+		  (fill-pointer net-block) %lock-page-cmd-fixed-size)
+	    (cond (*optimistic-locking*
+		   (send-net-command connection self *force-out-optimistic-commands*
+				     net-block)
+		   (setf optimistic-p t))
+		  (t
+		   (send-net-command-and-read-reply connection self net-block)
+		   (select (net-block-command net-block)
+		     (%done-reply nil)
+		     (t (unexpected-reply net-block)))))))
+      (:abort
+	;; This cleanup handler forgets the remote lock state so that if the lock
+	;; request is not optimistic and it gets an error such as the page being
+	;; remotely locked, when the top-level handler locks the page and
+	;; restarts the call, lock-dbfs-page will go ahead and resend the request
+	;; to the server like it has to so that subsequent errors (such as
+	;; a cache skew) will still be detected.
+	(setf (remote-page-remote-lock-state page) %unlocked
+	      (remote-page-remote-transactions page) nil)))))
+
+
+(defmethod (validate-when-optimistic remote-transaction-element) ()
+  (when optimistic-p
+    (validate self)
+    (setf optimistic-p nil)))
+
+#||
+(defmethod (return-dbfs-page remote-transaction-element) (page)
+  ;;+++ send a command to let the server return the page as well?
+  ;; This is why this is a method to the access path instead of return-page
+  ;; just calling directly into return-data-array.
+  (return-data-array page self))
+||#
+
+
+(defmethod (dbfs-file-page-length remote-transaction-element) (file)
+  (declare (values n-extant-pages first-nonextant-page-n free-page-n-after-last-extant-page))
+  (setf (net-block-command net-block) %file-page-length-cmd
+	(net-block-remote-id net-block) (file-remote-id file)
+	(fill-pointer net-block) %file-page-length-cmd-fixed-size)
+  (send-net-command-and-read-reply connection self net-block)
+  (select (net-block-command net-block)
+    (%file-page-length-reply nil)
+    (t (unexpected-reply net-block)))
+  (values (file-page-length-reply-n-pages net-block)
+	  (file-page-length-reply-first-page-n net-block)
+	  (file-page-length-reply-last-page-n net-block)))
+
+(defmethod (page-locked-handler remote-transaction-element) (page lock-type)
+  ;; Have to let the server know of the dependency
+  (multiple-value-bind (file page-n) (page-address page)
+    (setf (net-block-command net-block) %note-pending-cmd
+	  (net-block-remote-id net-block) (file-remote-id file)
+	  (net-block-page-n net-block) page-n
+	  (fill-pointer net-block) %note-pending-cmd-fixed-size)
+    (send-net-command connection self t net-block))
+  (wait-for-page page self lock-type transaction))
+
+
+(defmethod (page-locked-remotely-handler remote-transaction-element) (remote-id page-n)
+  ;; Wait for a %page-lock-cmd (reply)
+  (with-debugger-message ("Waiting for page #~D locked on server" page-n)
+    (read-net-reply connection self net-block nil `(,%transaction-abort-reply)))
+  (select (net-block-command net-block)
+    (%lock-page-cmd
+     ;; Make sure that the page being locked remotely agrees with this page
+     (unless (and (= page-n (net-block-page-n net-block))
+		  (= remote-id (net-block-remote-id net-block)))
+       (error "Remote page lock wait on page ~D of remote ID ~D, expected page ~D of ID ~D"
+	      (net-block-page-n net-block)
+	      (net-block-remote-id net-block)
+	      page-n
+	      remote-id))
+     #+ignore
+     ;; Can't set the lock state here since that will change the remote-lock-state,
+     ;; which will in turn optimize out the recall to the lock request.
+     (let ((page nil))
+       (unwind-protect-case ()
+	   (let ((file (lookup-remote-id atomic-commit-unit remote-id)))
+	     (setq page (lookup-page file page-n))
+	     ;; Now set the local state to correspond to the server
+	     ;;+++ Have to think a bit about this.  I don't think I can just call lock-page
+	     ;; since its contract permits it to throw to with-page, while this is called
+	     ;; from the catch handler in with-page.  But can a conflict really ever occur?
+	     ;; Yes, because even though we have the global lock for the page on the server
+	     ;; another local process can first grab the local lock before going to the server.
+	     ;; AArgh, have to think about this - can there be a deadlock here with optimistic
+	     ;; locking?
+	     ;; Maybe this should just set the local lock state, and gun any conflicting
+	     ;; people since we know we have the server lock.
+	     (let ((lock-type (lock-page-cmd-lock-type net-block)))
+	       (unless (update-page-lock page self lock-type)
+		 ;; Someone else thinks they have the lock?  Gun them
+		 (error "++++++++ haven't thought this out yet."))
+	       (when (> lock-type (remote-page-remote-lock-state page))
+		 (setf (remote-page-remote-lock-state page) lock-type))
+	       ;; Make sure the update didn't return due to the transaction being smashed
+	       ;; locally.
+	       (check-state transaction))
+	     (unlock (page-lock page)))
+	 (:abort
+	   (recover-from-lookup-page page file page-n)))))
+    (%transaction-abort-reply
+     (close-transaction
+       transaction
+       :abort-error 'two-transaction-deadlock-restartable-transaction-abort))))
+
+(defmethod (cache-invalid-handler remote-transaction-element)
+	   (remote-id page-n invalid-array)
+  (flet ((handle-page (remote-id page-n)
+	   (let ((page nil)
+		 (file (lookup-remote-id atomic-commit-unit remote-id)))
+	     (process::with-stack-lock-argument (lock-arg nil)
+	       (unwind-protect-case ()
+		   (when file
+		     (setq page (lookup-page file page-n lock-arg))
+		     (cache-invalid-error page)
+		     (unlock (page-lock page) lock-arg))
+		 (:abort
+		   (recover-from-lookup-page page file page-n lock-arg)))))))
+    (when invalid-array
+      (loop for i below (length invalid-array) by 2
+	    doing (handle-page (aref invalid-array i) (aref invalid-array (1+ i)))))
+    (handle-page remote-id page-n)
+    (close-transaction transaction :abort-error 'cache-skew-restartable-transaction-abort)))
+
+(defmethod (nonextant-file-handler remote-transaction-element) (remote-id)
+  (let ((file (lookup-remote-id atomic-commit-unit remote-id)))
+    (process:without-lock ((transaction-lock transaction))
+      (shutdown-file file))
+    (close-transaction transaction :abort-error 'cache-skew-restartable-transaction-abort)))
+
+(defmethod (zap-all-connections remote-transaction-element) ()
+  (when connection
+    (zap-connection connection)))
+
+(compile-flavor-methods remote-transaction-element)
+
+(defresource remote-transaction-element () :constructor (make-remote-transaction-element))

@@ -1,0 +1,2110 @@
+;;; -*- Mode:Lisp; Syntax:Common-Lisp; Package:STORAGE; Base:10; Lowercase:T; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;; Global state
+
+;;; The head of the free pool of disk request objects, which are threaded together
+;;; through their disk-request-next-request fields.  See allocate-disk-request and
+;;; deallocate-disk-request.
+(defvar-wired *disk-request-pool* nil)
+;;; Used to reconstruct the pool after a warm boot
+(defvar-wired *disk-request-pool-base* nil)
+
+;;; The head of the free pool of memory descriptors, which are threaded together through
+;;; their cars.  See allocate-memory-descriptor and deallocate-memory-descriptor.
+(defvar-wired *memory-descriptor-pool* nil)
+;;; Used to reconstruct the pool after a warm boot
+(defvar-wired *memory-descriptor-pool-base* nil)
+
+;;; An array of unit queue objects indexed by unit number (might be sparse).
+(defvar-wired *unit-table* nil)
+;;; A list of active unit queue objects.
+(defvar-wired *unit-list* nil)
+
+;;; The lock on the disk event structures, held during request enqueueing and completion.
+;;; See locking definitions and discussion below.
+(defvar-wired *master-disk-lock* nil)
+
+;;; The last enqueued request is remembered, as a hint for the next enqueue (if it's for
+;;; the same unit and a nearby address then it helps a lot).  This is set after each enqueue,
+;;; and possibly cleared by a unit if that request advances to the unit driver.  It is
+;;; protected by the unit lock for the unit of the request; see enqueue-disk-request to
+;;; see how this works.
+(defvar-wired *disk-last-request* nil)
+;;; Cleared whenever new dependencies are inserted/deleted so
+;;; optimizations know they have to do things the hard way
+(defwiredvar *interunit-dependencies-cache-valid* nil)
+
+;;; A list, threaded through disk-event-error-thread, of all disk events with unreported
+;;; errors.  See record-disk-error, lookup-disk-error.
+(defvar-wired *disk-error-events* nil)
+
+;;; The following `system' disk events are allocated in wired-control-tables by
+;;; the cold load generator.
+;;; The absolute root of the disk event hierarchy.  This is a parallel disk event with
+;;; no parent and few children.
+(defvar-wired *root-disk-event* nil)
+;;; The root of the disk events used by the storage system, a child of *root-disk-event*.
+(defvar-wired *storage-root-disk-event* nil)
+;;; The storage system uses three disk events: one for all reads and one for background
+;;; writes, both of which allow reordering, and one for forced writes which serializes
+;;; against all storage requests.  Actually, the serial disk event is the root, above,
+;;; and the other two are its children.
+(defvar-wired *storage-serial-disk-event* nil)
+(defvar-wired *storage-parallel-disk-event* nil)
+(defvar-wired *storage-background-disk-event* nil)
+
+;;; This gets set to T within a with-disk-wakeup-optimization form, which inhibits
+;;; the wakeup after each enqueued request to allow more high-level optimization.
+(defvar-wired *optimize-disk-wakeups* nil)
+
+;;; The number of processes that are currently blocked waiting for disk events.  This
+;;; counter is maintained by the user disk system (wait-for-disk-event et al), and used
+;;; during request-completion to decide whether to think about issuing process wakeups.
+(defvar-wired *disk-event-blocked-processes* 0)
+
+;;; Counters of the number of disk request objects allocated and deallocated since disk
+;;; initialization, used by WAIT-FOR-DISK-DONE to implement its wierd semantics.  They must
+;;; be kept in sync, so that when they're equal there are no pending requests.
+(defvar-wired *total-disk-requests-allocated* 0)
+(defvar-wired *total-disk-requests-deallocated* 0)
+
+(si:define-wired-meters *disk-meters*
+  *count-disk-requests-completed*
+  *count-disk-requests-failed*
+  *count-disk-requests-aborted*
+  *count-disk-slow-insertions*
+  *count-disk-fast-insertions*
+  *count-disk-insertion-restarts*
+  *count-disk-requests-appended*
+  *count-disk-requests-prepended*
+  *count-background-writes*
+  *count-blocked-background-writes*
+  *count-disk-pending-matches*
+  *count-disk-pending-flushes*
+  *count-disk-pending-adjoins*
+  *count-disk-errors*
+  *count-disk-controller-faults*
+  *count-disk-drive-faults*
+  *count-disk-select-errors*
+  *count-disk-seek-errors*
+  *count-disk-search-errors*
+  *count-disk-overruns*
+  *count-disk-ecc-errors*
+  *count-disk-data-errors*
+  *count-disk-compare-errors*)
+
+
+;;;; Miscellaneous run time support
+
+(defmacro verify-unit-lock (unit)
+  `(when* (= (unit-lock ,unit) 0) (wired-ferror :fatal "Unit unlocked?!")))
+
+(defmacro verify-master-lock ()
+  `(when* (= *master-disk-lock* 0) (wired-ferror :fatal "Master unlocked?!")))
+
+(define-disk-generic unit-wakeup-internal (unit))
+(define-disk-generic unit-geometry-query (unit address))
+(define-disk-generic unit-localization-query (unit address))
+(define-disk-generic decode-disk-address (unit address))
+(define-disk-generic decode-disk-error (unit error-type))
+
+(defun disk-command-name (type)
+  (select type
+    (%disk-command-read32 "READ32")
+    (%disk-command-read40 "READ40")
+    (%disk-command-write32 "WRITE32")
+    (%disk-command-write40 "WRITE40")
+    (%disk-command-compare32 "COMPARE32")
+    (%disk-command-compare40 "COMPARE40")
+    (%disk-command-event "EVENT")
+    (%disk-command-wakeup "WAKEUP")
+    (%disk-command-long-read32 "LONG-READ32")
+    (%disk-command-long-write32 "LONG-WRITE32")
+    (%disk-command-mount "MOUNT")
+    (%disk-command-seek "SEEK")
+    (%disk-command-read-all "READ-ALL")
+    (%disk-command-write-all "WRITE-ALL")
+    (%disk-command-format-track "FORMAT-TRACK")
+    (%disk-command-read-header "READ-HEADER")))
+
+(si:defselect-cold ((:property disk-event named-structure-invoke))
+  (:print-self (event stream &rest ignore)
+    (printing-random-object (event stream :typep)
+      (format stream "~[Parallel~;Serial~], Depth=~D"
+              (disk-event-type event)
+              (disk-event-depth event)))))
+
+(si:defselect-cold ((:property disk-request named-structure-invoke))
+  (:print-self (disk-request stream &rest ignore)
+    (printing-random-object (disk-request stream :typep)
+      (format stream "~A ~S kilobits at ~S"
+              (disk-command-name (disk-request-command disk-request))
+              (disk-request-length disk-request)
+              (disk-request-address disk-request)))))
+
+(si:defselect-cold ((:property unit-queue named-structure-invoke))
+  (:print-self (unit stream &rest ignore)
+   (printing-random-object (unit stream :typep)
+     (format stream "unit ~D" (unit-unit-number unit))))
+  (:describe (unit)
+   (format t "~&~S has fields:" unit)
+   (describe-unit-queue-fields unit *standard-output*)))
+
+(defun describe-unit-queue-fields (unit stream)
+  (format stream "~&  Unit: ~40T~S" (unit-unit-number unit))
+  (format stream "~&  Lock: ~40T~[Free~;Locked~;Promoted~]" (unit-lock unit))
+  (format stream "~&  Request Count: ~40T~S" (unit-request-count unit))
+  (format stream "~&  Pending Queue Head: ~40T~S" (unit-pending-head unit))
+  (format stream "~&  Pending Queue Tail: ~40T~S" (unit-pending-tail unit))
+  (format stream "~&  Outstanding Queue Head: ~40T~S" (unit-outstanding-head unit))
+  (format stream "~&  Outstanding Queue Tail: ~40T~S" (unit-outstanding-tail unit))
+  (format stream "~&  Aborted Queue Head: ~40T~S" (unit-aborted-head unit))
+  (format stream "~&  Aborted Queue Tail: ~40T~S" (unit-aborted-tail unit))
+  (format stream "~&  Completed Queue Head: ~40T~S" (unit-completed-head unit))
+  (format stream "~&  Completed Queue Tail: ~40T~S" (unit-completed-tail unit))
+  (format stream "~&  Pending Region Root: ~40T~S" (unit-pending-region-root unit))
+  (format stream "~&  Pending Region Event 0: ~40T~S" (unit-pending-region-event-0 unit))
+  (format stream "~&  Pending Region Event 1: ~40T~S" (unit-pending-region-event-1 unit))
+  (format stream "~&  Pending Region Event 2: ~40T~S" (unit-pending-region-event-2 unit))
+  (format stream "~&  Pending Region Event 3: ~40T~S" (unit-pending-region-event-3 unit))
+  (format stream "~&  Cylinder Size: ~40T~S" (unit-cylinder-size unit))
+  (format stream "~&  Track Size: ~40T~S" (unit-track-size unit))
+  (format stream "~&  Sector Size: ~40T~S" (unit-sector-size unit))
+  (format stream "~&  Background Tracks: ~40T~S" (unit-background-tracks unit))
+  (format stream "~&  Background Batch Requests: ~40T~[No~;Yes~]"
+          (unit-background-batch-p unit))
+  (format stream "~&  Background Queue Base: ~40T~S" (unit-background-queue-base unit))
+  (format stream "~&  Background Queue Bound: ~40T~S" (unit-background-queue-bound unit))
+  (format stream "~&  Background Queue Fill: ~40T~S" (unit-background-queue-fill unit))
+  (format stream "~&  Background Queue Empty: ~40T~S" (unit-background-queue-empty unit)))
+
+(defwiredfun split-daps (daps words)
+  (loop for d first daps then (cdr d)
+        summing (pop d) into w
+        do
+    (when* ( w words)
+      (return
+        (if (= w words)
+            (cdr d)
+          (wired-ferror :fatal "DAP list doesn't break properly at block boundary"))))))
+
+;;; Walk through the memory descriptors funcalling the argument with the specified
+;;; PPNs.  This doesn't do anything to delete duplicates; for paging transfers there
+;;; shouldn't ever be an overlap, and for user transfers it probably doesn't matter.
+(defwiredfun map-over-request-ppns (request function)
+  (declare (sys:downward-funarg function))
+  (macrolet ((process-extent (address words)
+               `(let ((pma (if (type-member ,address dtp-physical-address)
+                               (%pointer ,address)
+                             (ldb %%vma-pma (%pointer ,address)))))
+                  (loop for ppn from (extract-ppn pma) to (extract-ppn (+ pma ,words -1)) do
+                    (funcall function ppn)))))
+    (loop for descriptor first (disk-request-memory-descriptors request)
+                         then (memory-descriptor-link descriptor)
+          until (null descriptor)
+          do
+      (let ((descriptor-words (memory-descriptor-words descriptor))
+            (descriptor-daps (memory-descriptor-daps descriptor)))
+        (if (atom descriptor-daps)
+            (process-extent descriptor-daps descriptor-words)
+          (loop until (null descriptor-daps) do
+            (let ((words (pop descriptor-daps))
+                  (address (pop descriptor-daps)))
+              (process-extent address words))))))))
+
+(defwiredfun disk-wait (function &rest arguments)
+  (apply #'wired-wait nil 30000. function arguments))
+
+(defwiredfun usleep (usecs)
+  (let ((start-time (%microsecond-clock)))
+    (loop until (< usecs (wired-time-difference (%microsecond-clock) start-time)))))
+
+(define-disk-generic service-controller-internal (controller))
+
+(defwiredfun service-controller (controller)
+  (with-controller-lock (controller :if-locked :poll :wrapper 'progn)
+    (service-controller-internal controller)))
+
+;;; Callable at interrupt level only.  Make sure the controller's service routine will run
+;;; in the near future, either by asking a running copy of it to poll again or by queueing
+;;; an interrupt task to run it.
+(defwiredfun wakeup-controller (controller)
+  (let ((location (locf (controller-lock controller))))
+    (when (and ( (location-contents location) %disk-lock-poll)
+	       (not (store-conditional location %disk-lock-held %disk-lock-poll)))
+      (cli::enqueue-interrupt-task #'service-controller controller 2))))
+
+
+;;;; Initialization
+
+;;; Called only when cold booting the disk system.
+(defwiredfun initialize-disk-globals ()
+  (let ((nil-value nil))
+    (setq *disk-request-pool* nil-value)
+    (setq *disk-request-pool-base* nil-value)
+    (setq *memory-descriptor-pool* nil-value)
+    (setq *memory-descriptor-pool-base* nil-value)
+    (setq *unit-table* nil-value)
+    (setq *unit-list* nil-value)
+    (setq *count-disk-requests-completed* 0)
+    (setq *count-disk-requests-failed* 0)
+    (setq *count-disk-requests-aborted* 0)
+    (setq *count-disk-slow-insertions* 0)
+    (setq *count-disk-fast-insertions* 0)
+    (setq *count-disk-insertion-restarts* 0)
+    (setq *count-disk-requests-appended* 0)
+    (setq *count-disk-requests-prepended* 0)
+    (setq *count-background-writes* 0)
+    (setq *count-blocked-background-writes* 0)
+    (setq *count-disk-pending-matches* 0)
+    (setq *count-disk-pending-flushes* 0)
+    (setq *count-disk-pending-adjoins* 0)
+    (setq *count-disk-errors* 0)
+    (setq *count-disk-controller-faults* 0)
+    (setq *count-disk-drive-faults* 0)
+    (setq *count-disk-select-errors* 0)
+    (setq *count-disk-seek-errors* 0)
+    (setq *count-disk-search-errors* 0)
+    (setq *count-disk-overruns* 0)
+    (setq *count-disk-ecc-errors* 0)
+    (setq *count-disk-data-errors* 0)
+    (setq *count-disk-compare-errors* 0))
+  nil)
+
+(defwiredfun initialize-disk ()
+  (when (not *disk-exists-p*)
+    (setf (region-free-pointer %wired-dynamic-area-region) 0)
+    (initialize-disk-globals))
+  (when (null *unit-table*)
+    (setq *unit-table* (allocate-unmapped-array 32)))
+  (%block-store-cdr-and-contents (locf (aref *unit-table* 0)) 32 0 nil 0)
+  (setq *disk-last-request* nil)
+  (setq *interunit-dependencies-cache-valid* nil)
+  (setq *master-disk-lock* %disk-lock-free)
+  (setq *optimize-disk-wakeups* nil)
+  (setq *disk-error-events* nil)
+  (setq *disk-event-blocked-processes* 0)
+  ;; Yes, these need to be reset because we're initializing the disk request pool
+  (setq *total-disk-requests-allocated* 0 *total-disk-requests-deallocated* 0)
+  (initialize-system-disk-event *root-disk-event*
+                                nil %disk-event-parallel)
+  #-VLM
+  (initialize-system-disk-event *storage-serial-disk-event*
+                                *root-disk-event* %disk-event-serial)
+  #-VLM
+  (initialize-system-disk-event *storage-parallel-disk-event*
+                                *storage-serial-disk-event* %disk-event-parallel)
+  #-VLM
+  (initialize-system-disk-event *storage-background-disk-event*
+                                *storage-serial-disk-event* %disk-event-parallel)
+  (initialize-disk-request-pool 64)
+  (initialize-memory-descriptor-pool 128)
+  (system-case
+    ((Merlin Zora)
+     (scsi::initialize-scsi-manager)
+     (neti::merlin-82586-make-and-initialize-ethernet))
+    (Domino
+      (scsi::initialize-domino-scsi-manager)
+      (neti::domino-82596-make-and-initialize-ethernet))
+    (otherwise nil))
+  (system-case
+    (MacIvory
+      (neti:initialize-embedded-network)
+      (initialize-embedded-disks))
+    ((XL400 XL1200)
+      ;; Normally, the first 7 units are ESDI drives, and the next 8 are SCSI drives, but
+      ;; if the FEP set them up the other way, we have to go with that.  *DISK-UNIT-TABLE*
+      ;; might be unbound in FEPs that don't support this.
+      (cond ((eq (%memory-read (locf *disk-unit-table*) :cycle-type %memory-data-write) t)
+	     (initialize-Merlin-ESDI-disks 0)
+	     (initialize-Merlin-SCSI-disks 7))
+	    (t
+	     (initialize-Merlin-SCSI-disks 0)
+	     (initialize-Merlin-ESDI-disks 8))))
+    ((Zora)
+     (initialize-Merlin-SCSI-disks 0))
+    (Solstice
+      (neti:initialize-embedded-network)
+      (initialize-embedded-disks)
+      (when (cli::merlin-io-board-present-p 0)
+	;; Normally, the first 7 units are ESDI drives, and the next 8 are SCSI drives, but
+	;; if the FEP set them up the other way, we have to go with that.  *DISK-UNIT-TABLE*
+	;; might be unbound in FEPs that don't support this.
+	(cond ((eq (%memory-read (locf *disk-unit-table*) :cycle-type %memory-data-write) t)
+	       (initialize-Merlin-ESDI-disks 17)
+	       (initialize-Merlin-SCSI-disks 24))
+	      (t
+	       (initialize-Merlin-SCSI-disks 17)
+	       (initialize-Merlin-ESDI-disks 25)))))
+    (Domino
+      (initialize-Domino-SCSI-disks 0))
+    (VLM
+      (neti:initialize-embedded-network)
+      (initialize-embedded-disks)))
+  (initialize-unit-list)
+  #-VLM		;; The VLM doesn't use embedded disks for VM so it's OK if there are none.
+  (when (null *unit-list*)
+    (wired-ferror :proceedable-halt "Didn't find any disk units, Continue to retry")
+    (return-from initialize-disk (initialize-disk)))
+  (setq *disk-exists-p* t)
+  nil)
+
+;;; Initialize *unit-list* from *unit-table*, and make sure we found at least one unit.
+;;; The cdr-coded list is always built in 32 words of memory, in case more units are found
+;;; after a future warm boot.
+(defwiredfun initialize-unit-list ()
+  (let ((list (or *unit-list*
+                  (%make-pointer dtp-list (locf (aref (allocate-unmapped-array 32) 0)))))
+        (units 0))
+    (setq *unit-list* list)
+    (loop with table = *unit-table* for i below 32 do
+      (let ((unit (aref table i)))
+        (when (not (null unit))
+          (incf units)
+          (%memory-write (shiftf list (%pointer-plus list 1)) unit))))
+    ;; If we didn't find any units, we end up throwing away 32 words of wired space.
+    ;; That's probably the least of our problems at that point, though.
+    (if (= units 0)
+	(setq *unit-list* nil)
+      ;; Terminate the list.
+      (setf (%p-cdr-code (%pointer-plus list -1)) cdr-nil))
+    nil))
+
+(defwiredfun initialize-system-disk-event (event parent type)
+  (declare (unsafeguarded-reference disk-event))
+  (%block-store-cdr-and-contents (locf (aref event 0)) (1+ %disk-event-object-size) 0 nil 0)
+  (setf (aref event 0) 'disk-event)
+  (setf (array-named-structure-bit event) 1)
+  (setf (disk-event-flags event)
+        (dpbs %disk-event-error-enqueue-error %%disk-event-error-enqueue-action
+              %disk-event-error-dequeue-crash %%disk-event-error-dequeue-action
+              (if (null parent) 0 (1+ (disk-event-depth parent))) %%disk-event-depth
+              type))
+  (setf (disk-event-parent event) parent)
+  (when (not (null parent))
+    (let ((siblings (disk-event-children parent)))
+      (setf (disk-event-previous-event event) siblings)
+      (when (not (null siblings))
+        (setf (disk-event-next-event siblings) event))
+      (setf (disk-event-children parent) event)))
+  (setf (disk-event-error-index event) 0)
+  ;; Don't need an error table, because we crash upon irrecoverable errors.
+  #|(setf (disk-event-error-table event) nil)|#
+  (setf (disk-event-flushed-transfers event) 0)
+  (setf (disk-event-active-tasks event) 0)
+  (setf (disk-event-completed-tasks event) 0)
+  (setf (disk-event-blocked-process event) nil)
+  event)
+
+(defwiredfun initialize-memory-descriptor-pool (descriptors)
+  (when (null *memory-descriptor-pool-base*)
+    (let ((base (allocate-unmapped-memory (1+ (* descriptors 3)))))
+      (%p-store-cdr-type-and-pointer base %header-type-array dtp-header-i
+        #+3600 (si:build-defstorage-word array-dispatch-field %array-dispatch-word
+                                         array-type-field art-q
+                                         array-normal-length-field
+                                         (* descriptors 3))
+        #+IMach (si:build-defstorage-word array-type-field art-q
+                                          array-short-length-field
+                                          (* descriptors 3)))
+      (setq *memory-descriptor-pool-base* (%make-pointer-offset dtp-locative base 1))))
+  (setq *memory-descriptor-pool* (%make-pointer dtp-list *memory-descriptor-pool-base*))
+  (loop repeat descriptors
+        for this first *memory-descriptor-pool* then next
+        for next = (%make-pointer-offset dtp-list this 3)
+        do (setf (car this) next)
+	   (%p-store-cdr-code (%pointer-plus this 2) cdr-nil)
+        finally (setf (car this) nil)))
+
+(defwiredfun initialize-disk-request-pool (requests)
+  (declare (unsafeguarded-reference disk-request))
+  ;; Allocate all the disk request objects if necessary.
+  (when (null *disk-request-pool-base*)
+    (let ((base (allocate-unmapped-memory (* (+ %disk-request-object-size 2) requests))))
+      (setq *disk-request-pool-base* base)
+      (loop repeat requests
+            for p first base then (%pointer-plus p (+ %disk-request-object-size 2))
+            do
+        (%p-store-cdr-type-and-pointer
+          p %header-type-array dtp-header-i
+          #+3600 (si:build-defstorage-word array-dispatch-field %array-dispatch-word
+                                           array-type-field art-q
+                                           array-normal-length-field
+                                           (1+ %disk-request-object-size))
+          #+IMach (si:build-defstorage-word array-type-field art-q
+                                            array-short-length-field
+                                            (1+ %disk-request-object-size))))))
+  (setq *disk-request-pool* (%make-pointer dtp-array *disk-request-pool-base*))
+  ;; Rebuild all the disk request objects in the pool.
+  (loop repeat requests
+        for this first *disk-request-pool* then next
+        for next = (%make-pointer-offset dtp-array this (+ %disk-request-object-size 2))
+        do (let ((event (disk-request-event this)))
+             ;; Initialize the disk event for this request (it must be wired if it had
+             ;; a pending request).
+             (when (not (null event))
+               (setf (disk-event-request-head event) nil)
+               (setf (disk-event-request-tail event) nil)
+               (setf (disk-event-blocked-process event) nil)
+               (setf (disk-event-error-thread event) nil)
+               (setf (disk-event-error-index event) 0)
+               (setf (disk-event-flushed-transfers event) 0)
+               (setf (disk-event-active-tasks event) 0)
+               (setf (disk-event-completed-tasks event) 0)))
+           (setf (aref this 0) 'disk-request)
+           (setf (array-named-structure-bit this) 1)
+           (setf (disk-request-next-request this) next)
+        finally (setf (disk-request-next-request this) nil)))
+
+(si:declare-storage-category :function-cell default-decode-disk-address :wired)
+(si:declare-storage-category :function-cell default-decode-disk-error :wired)
+
+(defwiredfun initialize-unit-queue (unit unit-number)
+  (declare (unsafeguarded-reference unit-queue))
+  (declare (safeguarded-reference default-decode-disk-address default-decode-disk-error))
+  (let ((nil-value nil))
+    (setf (unit-named-structure-symbol unit) 'unit-queue)
+    (setf (array-named-structure-bit unit) 1)
+    (setf (unit-unit-number unit) unit-number)
+    (setf (aref *unit-table* unit-number) unit)
+    (setf (unit-request-count unit) 0)
+    (setf (unit-active-event-0 unit) nil-value (unit-active-event-count-0 unit) 0
+	  (unit-active-event-1 unit) nil-value (unit-active-event-count-1 unit) 0
+	  (unit-active-event-2 unit) nil-value (unit-active-event-count-2 unit) 0
+	  (unit-active-event-3 unit) nil-value (unit-active-event-count-3 unit) 0)
+    (setf (unit-lock unit) %disk-lock-free)
+    (setf (unit-pending-head unit) nil-value (unit-pending-tail unit) nil-value)
+    (setf (unit-pending-region-root unit) nil-value
+	  (unit-pending-region-event-0 unit) nil-value
+	  (unit-pending-region-event-1 unit) nil-value
+	  (unit-pending-region-event-2 unit) nil-value
+	  (unit-pending-region-event-3 unit) nil-value)
+    (setf (unit-outstanding-head unit) nil-value (unit-outstanding-tail unit) nil-value)
+    (setf (unit-aborted-head unit) nil-value (unit-aborted-tail unit) nil-value)
+    (setf (unit-completed-head unit) nil-value (unit-completed-tail unit) nil-value)
+    (setf (unit-geometry-info unit) 0)
+    #-VLM
+    (let ((base (or (unit-background-queue-base unit)
+		    (locf (aref (allocate-unmapped-array (*2 %background-size)) 0)))))
+      (%block-store-cdr-and-contents base (*2 %background-size) 0 nil-value 0)
+      (setf (unit-background-queue-base unit) base)
+      (setf (unit-background-queue-bound unit) (%pointer-plus base (*2 %background-size)))
+      (setf (unit-background-queue-fill unit) base)
+      (setf (unit-background-queue-empty unit) base))
+    (initialize-disk-method (unit-geometry-query-method unit)
+			    default-unit-geometry-query)
+    (initialize-disk-method (unit-localization-query-method unit)
+			    default-unit-localization-query)
+    (initialize-disk-method (decode-disk-address-method unit) default-decode-disk-address)
+    (initialize-disk-method (decode-disk-error-method unit) default-decode-disk-error)))
+
+
+;;;; Disk events
+
+(defwiredfun disk-event-idle-p (event)
+  (and (or (null (disk-event-request-head event))
+	   ( (disk-event-error-index event) 0))
+       (loop for child first (disk-event-children event)
+                       then (disk-event-previous-event child)
+             until (null child)
+             always (disk-event-idle-p child))))
+
+(defwiredfun map-over-descendent-events (event function)
+  (declare (sys:downward-funarg function))
+  (labels ((kernel (event)
+             (loop for e first (disk-event-children event) then next
+                   until (null e)
+                   as next = (disk-event-previous-event e)
+                   do (kernel e)
+                      (funcall function e))))
+    (kernel event)))
+
+;;; T if A is a descendent of B.
+(defwiredfun disk-event-descendent-p (a b)
+  (labels ((kernel (event)
+             (loop until (null event)
+                   when (or (eq event a) (kernel (disk-event-children event))) return t
+                   do (setq event (disk-event-previous-event event)))))
+    (kernel (disk-event-children b))))
+
+;;; T if the most-specific disk-event inherited by the two is serial.
+(defwiredfun disk-events-dependent-p (a b)
+  (let ((a-depth (disk-event-depth a))
+        (b-depth (disk-event-depth b)))
+    (cond ((< a-depth b-depth)
+           (loop repeat (- b-depth a-depth) do (setq b (disk-event-parent b))))
+          ((> a-depth b-depth)
+           (loop repeat (- a-depth b-depth) do (setq a (disk-event-parent a))))))
+  (loop until (eq a b) do
+    (setq a (disk-event-parent a))
+    (setq b (disk-event-parent b)))
+  (disk-event-serial-p a))
+
+(defwiredfun disk-events-equivalent-p (a b) a b nil)
+
+;;; Apply function to every disk event such that the most-specific event shared with
+;;; EVENT is serial.  Note: this excludes EVENT, if it's serial itself.
+;;; +++ should use a better algorithm for this
+(defwiredfun map-over-dependent-events (event function)
+  (declare (sys:downward-funarg function))
+  (let ((parent
+          (loop for e first event then parent
+                as parent = (disk-event-parent e)
+                when (null parent) return e)))
+    (map-over-descendent-events parent
+      (lambda (e)
+        (when (and (neq e event) (disk-events-dependent-p e event))
+          (funcall function e))))))
+
+
+;;;; Unit parameters (geometry, etc)
+
+(defwiredfun default-unit-geometry-query (unit address)
+  (let ((cylinder-size (unit-cylinder-size unit))
+        (track-size (unit-track-size unit))
+        (sector-size (unit-sector-size unit)))
+    (multiple-value-bind (cylinder remainder)
+        (floor address cylinder-size)
+      (multiple-value-bind (track offset)
+          (floor remainder track-size)
+        (values cylinder track offset cylinder-size track-size sector-size)))))
+
+(defwiredfun default-unit-localization-query (unit address)
+  (multiple-value-bind (cylinder track offset cylinder-size track-size)
+      (unit-geometry-query unit address)
+    (declare (ignore cylinder))
+    (let* ((track-address (- address offset))
+           (cylinder-address (- track-address (* track track-size))))
+      (values track-address track-size cylinder-address cylinder-size
+              (unit-background-tracks unit) (unit-background-batch-p unit)))))
+
+(defun default-decode-disk-address (unit address)
+  (declare (ignore unit))
+  (declare (safeguarded-function) (unsafeguarded-reference format))
+  (format nil "DPN #o~O" (kilobitspages address)))
+
+(defun default-decode-disk-error (unit error-type)
+  (declare (ignore unit error-type))
+  (declare (safeguarded-function))
+  nil)
+
+
+;;;; Memory descriptor allocation
+
+;;; The thread that makes up *memory-descriptor-pool* is protected by the master
+;;; disk driver lock.
+
+(defmacro allocate-memory-descriptor ()
+  `(let ((descriptor *memory-descriptor-pool*))
+     (%memory-write (locf *memory-descriptor-pool*) (car descriptor))
+     descriptor))
+
+(defmacro deallocate-memory-descriptor (descriptor &environment environment)
+  (once-only (descriptor &environment environment)
+    `(progn
+       (%memory-write ,descriptor *memory-descriptor-pool*)
+       (%memory-write (locf *memory-descriptor-pool*) ,descriptor))))
+
+(defmacro initialize-memory-descriptor (descriptor class words daps next)
+  #+3600
+  `(progn
+     (%p-store-cdr-and-contents ,descriptor ,words cdr-next)
+     (%p-store-cdr-and-contents (%make-pointer-offset dtp-list descriptor 1) ,daps cdr-normal)
+     (%p-store-cdr-and-contents (%make-pointer-offset dtp-list descriptor 2) ,next cdr-nil))
+  #+IMach
+  `(progn
+     (setf (%block-register 1) ,descriptor)
+     (%block-write 1 (prog1 (dpb ,class %%memory-descriptor-class ,words)
+			    (si:prepare-for-block-write)))
+     (%push ,daps)
+     (%set-cdr-code-2 (compiler:%stack-location-internal 0))
+     (%block-write 1 (%pop))
+     (%push ,next)
+     (%set-cdr-code-1 (compiler:%stack-location-internal 0))
+     (%block-write 1 (%pop))))
+
+(defwiredfun memory-descriptors-available-p () *memory-descriptor-pool*)
+
+
+;;;; Disk request allocation
+
+;;; The thread that makes up *disk-request-pool*, and the disk-event request threads,
+;;; are protected by the master disk driver lock.
+
+(defwiredfun allocate-disk-request (event)
+  (verify-master-lock)
+  (let ((request *disk-request-pool*))
+    (when (not (null request))
+      (increment-meter *total-disk-requests-allocated*)
+      (setq *disk-request-pool* (disk-request-next-request request))
+      (setf (disk-request-event request) event)
+      ;; Insert the request into its disk-event.
+      (let ((previous (disk-event-request-head event)))
+        (setf (disk-request-event-next-request request) nil)
+        (setf (disk-request-event-previous-request request) previous)
+        (if (null previous)
+            (setf (disk-event-request-tail event) request)
+          (setf (disk-request-event-next-request previous) request))
+        (setf (disk-event-request-head event) request))
+      request)))
+
+(defwiredfun deallocate-disk-request (request)
+  (verify-master-lock)
+  (increment-meter *total-disk-requests-deallocated*)
+  ;; Wake up any waiters on the disk event or its parents.
+  (let ((event (disk-request-event request)))
+    (when ( *disk-event-blocked-processes* 0)
+      (loop for disk-event first event then (disk-event-parent disk-event)
+	    until (null disk-event)
+	    do
+	(let ((handle (disk-event-blocked-process disk-event)))
+	  (when (not (null handle))
+	    (si:aux-process-wakeup handle)))))
+    ;; Delete the request from its disk-event.
+    (let ((next (disk-request-event-next-request request))
+          (previous (disk-request-event-previous-request request)))
+      (if (null previous)
+          (setf (disk-event-request-tail event) next)
+	  (setf (disk-request-event-next-request previous) next))
+      (if (null next)
+          (setf (disk-event-request-head event) previous)
+	  (setf (disk-request-event-previous-request next) previous)))
+    ;; During warm booting, INITIALIZE-DISK-REQUEST-POOL looks at this field in all
+    ;; requests, allocated or not, to see if the event needs to be reset.  Clobber the
+    ;; field, so it doesn't point to a stale, possibly unwired, disk event.
+    (setf (disk-request-event request) nil))
+  ;; Deallocate all the disembodied memory descriptors associated with this request.
+  ;; Be careful not to deallocate the descriptor embedded in this request, though!
+  (let ((embedded-descriptor
+          (%make-pointer sys:dtp-list (locf (disk-request-descriptor-0 request)))))
+    (loop for descriptor first (disk-request-memory-descriptors request) then next
+          until (null descriptor)
+          as next = (memory-descriptor-link descriptor)
+          do
+      (when (neq descriptor embedded-descriptor)
+        (deallocate-memory-descriptor descriptor))))
+  ;; Add the request to the free pool.
+  (shiftf (disk-request-next-request request) *disk-request-pool* request)
+  nil)
+
+(defwiredfun disk-requests-available-p () *disk-request-pool*)
+
+
+;;;; Interunit dependencies
+
+;;; The disk request insertion algorithm below properly chooses the order of execution for
+;;; requests within a single unit, obeying any serialization requested by the client
+;;; through the disk event mechanism.  However, it doesn't enforce dependencies between
+;;; disk units, i.e. one could enqueue requests for a serial disk event to two different
+;;; units, and they might execute out of order.
+;;;
+;;; We enforce these dependencies with a special mechanism.  The rule we use is that you
+;;; can't enqueue a request if there are any active requests that depend on the new one in
+;;; any other unit queue.  That is, the unit queues can process all requests within them
+;;; at their own pace, without violating dependencies.  It also greatly simplifies error
+;;; processing, since the only requests that can be affected by a disk error are those
+;;; within the same unit.
+;;;
+;;; There's very little structure to help determine when these dependencies exist.
+;;; Searching all the request queues of every unit for conflicting requests would be very
+;;; expensive, and would probably cause locking problems.  So we use a caching sort of
+;;; approach.  For each unit, we maintain a count of the number of active requests anywhere
+;;; within it, and a table of up to 4 of the disk events active within the unit.  When
+;;; inserting a new request into the unit, its disk event is recorded in the table (each
+;;; entry is a pair of an event and a counter, when the counter gets to zero the event is
+;;; deleted), and when completing a request its disk event is removed (or the count is
+;;; decremented).  If the table overflows, it is marked as such by setting the first entry
+;;; to T; then we've lost all information about dependencies, and have to wait for the unit
+;;; to empty out.
+;;;
+;;; All modification and querying of this database is done with the master disk lock.
+;;;
+;;; Before enqueueing a new request, we guarantee that there are no conflicting requests in
+;;; other unit queues by assuring that none of their active-event tables have overflowed,
+;;; and that none of them have active-events that are dependent on the new one.  This is
+;;; moderately expensive (dozens of microseconds per unit), but is optimized out in heavy
+;;; traffic situations.
+
+;;; NIL if it's OK to execute a request for the specified disk event and unit.
+(defwiredfun interunit-dependencies-p (insertion-unit event)
+  (verify-master-lock)
+  (prog1
+    (block dependencies-p
+      (map-over-unit-queues
+	(lambda (unit)
+	  (when (and (neq unit insertion-unit)
+		     (> (unit-request-count unit) 0))
+	    (let ((event-0 (unit-active-event-0 unit))
+		  (event-1 (unit-active-event-1 unit))
+		  (event-2 (unit-active-event-2 unit))
+		  (event-3 (unit-active-event-3 unit)))
+	      (when (or (eq event-0 t)
+			(and (not (null event-0))
+			     (disk-events-dependent-p event event-0))
+			(and (not (null event-1))
+			     (disk-events-dependent-p event event-1))
+			(and (not (null event-2))
+			     (disk-events-dependent-p event event-2))
+			(and (not (null event-3))
+			     (disk-events-dependent-p event event-3)))
+		(return-from dependencies-p t))))))
+      nil)
+    (setq *interunit-dependencies-cache-valid* insertion-unit)))
+
+;;; Called when enqueueing a request for the specified unit and disk event.
+(defwiredfun insert-interunit-dependency (unit event)
+  (verify-master-lock)
+  (incf (unit-request-count unit))
+  (let ((event-0 (unit-active-event-0 unit))
+        (event-1 (unit-active-event-1 unit))
+        (event-2 (unit-active-event-2 unit))
+        (event-3 (unit-active-event-3 unit))
+	;; cache remains valid if this unit is what is cached (there are
+	;; no inter-unit dependencies between a unit and itself!)
+	(new-cache-state (if (eq *interunit-dependencies-cache-valid* unit)
+			     *interunit-dependencies-cache-valid*
+			     nil)))
+    (cond ((eq event-0 event)
+	   (incf (unit-active-event-count-0 unit)))
+	  ((eq event-1 event)
+	   (incf (unit-active-event-count-1 unit)))
+	  ((eq event-2 event)
+	   (incf (unit-active-event-count-2 unit)))
+	  ((eq event-3 event)
+	   (incf (unit-active-event-count-3 unit)))
+	  ((null event-0)
+	   (setf (unit-active-event-0 unit) event)
+	   (setf *interunit-dependencies-cache-valid* new-cache-state)
+           (incf (unit-active-event-count-0 unit)))
+          ((null event-1)
+	   (setf (unit-active-event-1 unit) event)
+	   (setf *interunit-dependencies-cache-valid* new-cache-state)
+           (incf (unit-active-event-count-1 unit)))
+          ((null event-2)
+	   (setf (unit-active-event-2 unit) event)
+	   (setf *interunit-dependencies-cache-valid* new-cache-state)
+           (incf (unit-active-event-count-2 unit)))
+          ((null event-3)
+	   (setf (unit-active-event-3 unit) event)
+	   (setf *interunit-dependencies-cache-valid* new-cache-state)
+           (incf (unit-active-event-count-3 unit)))
+          (t
+           (setf (unit-active-event-0 unit) t)
+	   (setf *interunit-dependencies-cache-valid* new-cache-state)))
+    nil))
+
+;;; Called when dequeueing a request for the specified unit and disk event.
+(defwiredfun delete-interunit-dependency (unit event)
+  (verify-master-lock)
+  (let ((event-0 (unit-active-event-0 unit))
+        (event-1 (unit-active-event-1 unit))
+        (event-2 (unit-active-event-2 unit))
+        (event-3 (unit-active-event-3 unit)))
+    (if (eq event-0 t)
+        (when (= (decf (unit-request-count unit)) 0)
+          (setf (unit-active-event-0 unit) nil)
+          (setf (unit-active-event-1 unit) nil)
+          (setf (unit-active-event-2 unit) nil)
+          (setf (unit-active-event-3 unit) nil)
+          (setf (unit-active-event-count-0 unit) 0)
+          (setf (unit-active-event-count-1 unit) 0)
+          (setf (unit-active-event-count-2 unit) 0)
+          (setf (unit-active-event-count-3 unit) 0))
+      (selector event eq
+	(event-0
+	  (when (= (decf (unit-active-event-count-0 unit)) 0)
+	    (setf (unit-active-event-0 unit) nil)))
+	(event-1
+	  (when (= (decf (unit-active-event-count-1 unit)) 0)
+	    (setf (unit-active-event-1 unit) nil)))
+	(event-2
+	  (when (= (decf (unit-active-event-count-2 unit)) 0)
+	    (setf (unit-active-event-2 unit) nil)))
+	(event-3
+	  (when (= (decf (unit-active-event-count-3 unit)) 0)
+	    (setf (unit-active-event-3 unit) nil)))
+	(t
+	  (wired-ferror :proceedable-halt
+			"No event corresponding to ~A for unit ~O" event unit)))
+	(decf (unit-request-count unit)))
+    nil))
+
+
+;;; Forward the request to the appropriate unit for insertion into its pending queue,
+;;; checking for interunit serialization if necessary, and merging requests if possible.
+(defwiredfun enqueue-disk-request (info event address length daps &aux last-request)
+  (macrolet ((enqueue-disk-request-wrapper (&body body)
+               `(let* ((unit-number (ldb %%disk-request-unit info))
+                       (unit (aref *unit-table* unit-number)))
+                  ;; If the request we insert is the first one in the queue, wakeup the driver.
+                  (when (and (with-insertion-transaction
+                               (with-master-lock (:if-locked :loop)
+                                 (with-unit-lock (unit :if-locked :loop)
+                                   (block enqueue-disk-request-wrapper
+                                     (eq (setq *disk-last-request* (progn ,@body))
+                                         (unit-pending-tail unit))))))
+                             (not *optimize-disk-wakeups*))
+                    (unit-wakeup unit)))))
+    (enqueue-disk-request-wrapper
+      ;; If there are any disk events with unreported errors in them, search for any that
+      ;; affect this event, and flush this transfer if necessary.
+      (map-over-disk-error-events
+	(lambda (error-event)
+	  (when (or (eq event error-event)
+		    (disk-events-dependent-p event error-event))
+	    ;; +++ should look at disk-event-error-enqueue-action and signal errors
+	    (incf (disk-event-flushed-transfers event))
+	    (return-from enqueue-disk-request-wrapper nil))))
+      (cond (;; *DISK-LAST-REQUEST* is protected by our unit lock only if it's for our
+	     ;; unit, so we're careful to examine a consistent copy of it until we know
+	     ;; it's protected.
+	     (and (eq *interunit-dependencies-cache-valid* unit)
+		  (not (null (setq last-request *disk-last-request*)))
+                  (= (disk-request-unit last-request) unit-number)
+                  (eq (disk-request-event last-request) event))
+             ;; This request is for the same unit and event as the last one, so we might be
+             ;; able to merge them together.  Even if we can't, we can simply insert a new
+             ;; request without checking for interunit dependencies.
+             (increment-meter *count-disk-fast-insertions*)
+             (cond (( (disk-request-length last-request) %maximum-disk-request-length)
+		    (insert-pending-request unit event info address length daps))
+		   ((and (= (disk-request-command last-request)
+			    (ldb %%disk-request-command info))
+			 ( (ldb %%disk-request-command info) %disk-command-compare40)
+                         (= (+ (disk-request-address last-request)
+                               (disk-request-length last-request))
+                            address))
+                    (append-pending-request unit last-request event info address length daps))
+                   ((and ;; Don't prepend requests that must be executed in order.
+                         (not (disk-event-serial-p event))
+                         (= (disk-request-command last-request)
+                            (ldb %%disk-request-command info))
+			 ( (ldb %%disk-request-command info) %disk-command-compare40)
+                         (= (disk-request-address last-request) (+ address length)))
+                    (prepend-pending-request unit last-request event info address length daps))
+                   (t
+                    (insert-pending-request unit event info address length daps))))
+            ((= (unit-request-count unit) 0)
+	     ;; No requests for this unit, bypass some checking
+             (increment-meter *count-disk-fast-insertions*)
+	     (when (and ( *total-disk-requests-allocated* *total-disk-requests-deallocated*)
+			(interunit-dependencies-p unit event))
+	       (restart-insertion-transaction
+		 (lambda (unit event)
+		   (with-master-lock (:if-locked :skip :wrapper 'prog1)
+		     (not (interunit-dependencies-p unit event))))
+		 unit event))
+	     ;; Start a new pending region
+	     (setf (unit-pending-region-event-0 unit) event)
+	     ;; Insert this request in the pending queue (if any)
+	     ;; and start a root for the new insertion region.
+	     (install-pending-request unit nil nil nil event info address length daps))
+            (t
+             ;; This request is for a different unit or disk event, so we have to go
+             ;; through the full insertion procedure.
+             (increment-meter *count-disk-slow-insertions*)
+	     ;; If there are other requests in any unit queue, check for interunit dependencies
+	     (when ( *total-disk-requests-allocated* *total-disk-requests-deallocated*)
+	       ;; Before checking for interunit dependencies, which is kind of expensive, see
+	       ;; if there are any other requests for this disk event already in this unit.
+	       (when (or (eq (unit-active-event-0 unit) t)	;active event table overflow
+			 ;; Even if there is another request for this
+			 ;; disk event already in this unit, background
+			 ;; writes may have been promoted (which,
+			 ;; rightly or not, do not hang for interunit
+			 ;; depenbdencies but can create them) so we
+			 ;; have to check the hard way if the cache has
+			 ;; been invalidated
+			 (not (eq *interunit-dependencies-cache-valid* unit))
+			 (and (neq (unit-active-event-0 unit) event)
+			      (neq (unit-active-event-1 unit) event)
+			      (neq (unit-active-event-2 unit) event)
+			      (neq (unit-active-event-3 unit) event)))
+		 (when (interunit-dependencies-p unit event)
+		   (restart-insertion-transaction
+		     (lambda (unit event)
+		       (with-master-lock (:if-locked :skip :wrapper 'prog1)
+			 (not (interunit-dependencies-p unit event))))
+		     unit event))))
+             (insert-pending-request unit event info address length daps))))
+    nil))
+
+;;; +++ extending a request might make it mergeable with adjacent requests, ad infinitum
+(defwiredfun append-pending-request (unit request event info address length daps)
+  (declare (ignore unit address))
+  (unless (= (disk-request-status request) %disk-request-status-pending)
+    (wired-ferror :proceedable-halt
+		  "Appending to a status ~O request ~A for event ~A"
+		  (disk-request-status request) request event))
+  ;; Allocate a memory descriptor, initialize it with this DAP list, and append it to
+  ;; the other memory descriptors for this request.
+  (let ((descriptor
+          (or (allocate-memory-descriptor)
+              (restart-insertion-transaction #'memory-descriptors-available-p))))
+    (initialize-memory-descriptor descriptor
+      (ldb %%disk-request-class info)
+      (disk-request-words length info)
+      daps
+      nil)
+    (loop for d first (disk-request-memory-descriptors request) then n
+          for n = (memory-descriptor-link d)
+          until (null n)
+          finally (setf (memory-descriptor-link d) descriptor))
+    (incf (disk-request-length request) length)
+    (increment-meter *count-disk-requests-appended*)
+    request))
+
+;;; +++ extending a request might make it mergeable with adjacent requests, ad infinitum
+(defwiredfun prepend-pending-request (unit request event info address length daps)
+  (declare (ignore unit))
+  (unless (= (disk-request-status request) %disk-request-status-pending)
+    (wired-ferror :proceedable-halt
+		  "Prepending to a status ~O request ~A for event ~A"
+		  (disk-request-status request) request event))
+  ;; Allocate a memory descriptor, initialize it with this DAP list, and prepend it to
+  ;; the other memory descriptors for this request.
+  (let ((descriptor
+          (or (allocate-memory-descriptor)
+              (restart-insertion-transaction #'memory-descriptors-available-p))))
+    (initialize-memory-descriptor descriptor
+      (ldb %%disk-request-class info)
+      (disk-request-words length info)
+      daps
+      (shiftf (disk-request-memory-descriptors request) descriptor))
+    (setf (disk-request-address request) address)
+    (incf (disk-request-length request) length)
+    (increment-meter *count-disk-requests-prepended*)
+    request))
+
+(defwiredfun install-pending-request
+	     (unit previous next ascendent event info address length daps)
+  (verify-unit-lock unit)
+  ;; Allocate and initialize a new request, and insert it in between the specified previous
+  ;; and next requests.
+  (let ((new (or (allocate-disk-request event)
+		 (restart-insertion-transaction #'disk-requests-available-p))))
+    ;; Initialize the new request.
+    (setf (%block-register 1) (locf (disk-request-flags new)))
+    (si:prepare-for-block-write)
+    ;; Write disk-request-flags
+    (%block-write 1 (dpbs (disk-event-type event) %%disk-request-serial-request info))
+    ;; Write disk-request-address
+    (%block-write 1 address)
+    ;; Write disk-request-length
+    (%block-write 1 length)
+    ;; Write disk-request-event (actually it's already been initialized, but...)
+    (%block-write 1 event)
+    (let ((descriptor (%make-pointer dtp-list (locf (disk-request-descriptor-0 new)))))
+      ;; Write disk-request-memory-descriptors
+      (%block-write 1 descriptor)
+      ;; Initialize the embedded memory descriptor
+      (initialize-memory-descriptor descriptor
+				    (ldb %%disk-request-class info)
+				    (disk-request-words length info)
+				    daps nil))
+    ;; Link the new request into the linear pending queue.
+    (setf (%block-register 1) (locf (disk-request-next-request new)))
+    ;; Write disk-request-next-request
+    (%block-write 1 next)
+    ;; Write disk-request-previous-request
+    (%block-write 1 previous)
+    (if (null previous)
+	(setf (unit-pending-tail unit) new)
+        (setf (disk-request-next-request previous) new))
+    (if (null next)
+	(setf (unit-pending-head unit) new)
+        (setf (disk-request-previous-request next) new)
+        (when (= (disk-request-serial-marker next) 1)
+          (setf (disk-request-serial-marker next) 0)
+          (setf (disk-request-serial-marker new) 1)))
+    ;; Insert the new request into the active pending-queue tree.  It always goes directly
+    ;; under the specified ascendent: if the ascendent is the next request, the new request
+    ;; becomes its previous-descendent; if the ascendent is the previous request, the
+    ;; new request becomes its next-descendent.
+    (multiple-value-bind (next-descendent previous-descendent)
+	(cond ((null ascendent)
+	       (setf (unit-pending-region-root unit) new)
+	       (values nil nil))
+	      ((eq ascendent next)
+	       ;; Make the new request be the ascendent's previous-descendent.
+	       (values nil (shiftf (disk-request-previous-descendent ascendent) new)))
+	      ((eq ascendent previous)
+	       ;; Make the new request be the ascendent's next-descendent.
+	       (values (shiftf (disk-request-next-descendent ascendent) new) nil)))
+      (setf (%block-register 1) (locf (disk-request-ascendent new)))
+      (si:prepare-for-block-write)
+      (%block-write 1 ascendent)
+      (%block-write 1 next-descendent)
+      (%block-write 1 previous-descendent))
+    (insert-interunit-dependency unit event)
+    new))
+
+(defwiredfun discard-pending-region (unit &optional event)
+  (setf (%block-register 1) (locf (unit-pending-region-root unit)))
+  (%block-write 1 nil)
+  (%block-write 1 event)
+  (%block-write 1 nil)
+  (%block-write 1 nil)
+  (%block-write 1 nil)
+  (increment-meter *count-disk-pending-flushes*)
+  nil)
+
+(defwiredfun insert-pending-request (unit event info address length daps)
+  ;; Compare the event for the new request with the events already represented in the
+  ;; insertion region.  If there are any serial dependencies, freeze the current insertion
+  ;; region and start a new one.
+  (let ((event-0 (unit-pending-region-event-0 unit))
+        (event-1 (unit-pending-region-event-1 unit))
+        (event-2 (unit-pending-region-event-2 unit))
+        (event-3 (unit-pending-region-event-3 unit)))
+    ;; If the disk event for the new request is already represented in the
+    ;; active region, we don't need to do anything.
+    ;; +++ might include functionally equivalent events here
+    (cond ((or (eq event event-0) (eq event event-1)
+               (eq event event-2) (eq event event-3))
+           (increment-meter *count-disk-pending-matches*)
+           ;; There's already a request for this disk event.  If it's a parallel
+           ;; disk event, we know we can insert another request, so do nothing.
+           ;; If it's a serial disk event, that's obviously a serial dependency,
+           ;; so we must start a new insertion region.
+           (when (disk-event-serial-p event)
+             (discard-pending-region unit event)))
+          ;; The new disk event is not in the active region.  If there are already
+          ;; four disk events represented in the active region, or if the new
+          ;; event depends on any existing ones, we have to start a new region.
+          ((or (not (null event-3))
+               (and event-0 (disk-events-dependent-p event event-0))
+               (and event-1 (disk-events-dependent-p event event-1))
+               (and event-2 (disk-events-dependent-p event event-2))
+               (and event-3 (disk-events-dependent-p event event-3)))
+           (discard-pending-region unit event))
+          (t
+           (increment-meter *count-disk-pending-adjoins*)
+           ;; Add the new event to the pending region.
+           (cond ((null event-0) (setf (unit-pending-region-event-0 unit) event))
+                 ((null event-1) (setf (unit-pending-region-event-1 unit) event))
+                 ((null event-2) (setf (unit-pending-region-event-2 unit) event))
+                 ((null event-3) (setf (unit-pending-region-event-3 unit) event))))))
+  ;; If there's no pending insertion region, the pending queue might be empty, or we
+  ;; might have just started a new insertion region.
+  (when (null (unit-pending-region-root unit))
+    (let ((request
+            ;; Insert this request after the last request in the pending queue (if any) and
+            ;; start a root for the new insertion region.
+            (install-pending-request unit (unit-pending-head unit) nil nil
+				     event info address length daps)))
+      ;; All previous requests, whether they've been delivered to the unit driver or not,
+      ;; must be completed before this request.
+      (setf (disk-request-serial-marker request) 1)
+      (return-from insert-pending-request request)))
+  ;; Search the binary tree of the pending region for the appropriate place to insert
+  ;; the new request.
+  (let ((node (unit-pending-region-root unit))
+        (command&class (ldb %%disk-request-command&class info)))
+    (loop do
+      (let ((node-address (disk-request-address node))
+            (node-length (disk-request-length node))
+            (node-event (disk-request-event node))
+            (node-command&class (disk-request-command&class node)))
+        (if (< address node-address)
+            ;; Execute the new request before this one.
+            (let ((previous (disk-request-previous-descendent node)))
+              (cond ((and (eq event node-event)
+                          (eq command&class node-command&class)
+			  ( node-length %maximum-disk-request-length)
+                          (= (+ address length) node-address))
+                     ;; The new request can be prepended to this node.
+                     (return
+                       (prepend-pending-request unit node event info address length daps)))
+                    ((not (null previous))
+                     (setq node previous))      ;keep searching
+                    (t
+                     ;; Allocate and initialize a new disk request, and insert it
+                     ;; immediately before this node as its previous descendent.
+                     (return
+		       (install-pending-request unit
+						(disk-request-previous-request node) node node
+						event info address length daps)))))
+	    ;; Execute the new request after this one.
+	    (let ((next (disk-request-next-descendent node)))
+	      (cond ((and (eq node-event event)
+			  (eq node-command&class command&class)
+			  ( node-length %maximum-disk-request-length)
+			  (= (+ node-address node-length) address))
+		     ;; The new request can be appended to this node.
+		     (return
+		       (append-pending-request unit node event info address length daps)))
+		    ((not (null next))
+		     (setq node next))		;keep searching
+		    (t
+		     ;; Allocate and initialize a new disk request, and insert it
+		     ;; immediately after this node as its next descendent.
+		     (return
+		       (install-pending-request unit
+						node (disk-request-next-request node) node
+						event info address length daps))))))))))
+
+(defwiredfun delete-pending-request (unit request)
+  (verify-unit-lock unit)
+  (store-conditional (locf *disk-last-request*) request nil)
+  ;; Splice the request out of the (linear) pending queue.
+  (let ((previous (disk-request-previous-request request))
+        (next (disk-request-next-request request)))
+    (if (not (null previous))
+        (setf (disk-request-next-request previous) next)
+      (setf (unit-pending-tail unit) next))
+    (if (not (null next))
+        (setf (disk-request-previous-request next) previous)
+      (setf (unit-pending-head unit) previous)
+      ;; If the pending queue becomes empty as a result, reset the insertion region,
+      ;; and don't bother splicing the request out of the search tree, just reset it.
+      (when (null previous)
+        (discard-pending-region unit nil)
+	(setf (unit-pending-region-root unit) nil)
+	(return-from delete-pending-request nil))))
+  ;; Splice the request out of the search tree.  It might not be in the active portion
+  ;; of the tree, but we have no way of knowing that.
+  (let ((ascendent (disk-request-ascendent request))
+        (next (disk-request-next-descendent request))
+        (previous (disk-request-previous-descendent request)))
+    (multiple-value-bind (descendent)
+        ;; Decide which of the deleted request's descendents will take its place below
+        ;; its ascendent, and update that request's ascendent pointer.
+        (cond ((and (null next) (null previous))
+               (values nil))
+              ((null previous)
+               (setf (disk-request-ascendent next) ascendent)
+               (values next))
+              ((null next)
+               (setf (disk-request-ascendent previous) ascendent)
+               (values previous))
+              (t
+               ;; The deleted request has both previous and next-descendents.  Make the
+               ;; next-descendent take its place, and install the previous-descendent below
+               ;; that one in the tree.
+               (setf (disk-request-ascendent next) ascendent)
+               (setf (disk-request-ascendent previous) next)
+               (setf (disk-request-previous-descendent next) previous)
+               (values next)))
+      ;; Update the deleted request's ascendent to point to the replacement node.
+      (cond ((not (null ascendent))
+             (if (eq request (disk-request-next-descendent ascendent))
+                 (setf (disk-request-next-descendent ascendent) descendent)
+               (setf (disk-request-previous-descendent ascendent) descendent)))
+            ((eq (unit-pending-region-root unit) request)
+             ;; We're deleting the root, so update that to point to the replacement.
+             ;; Note that just because a request has no ascendent doesn't mean that it
+             ;; is the root, because it might not belong to the active region.
+             (setf (unit-pending-region-root unit) descendent)))))
+  nil)
+
+
+;;;; Outstanding, completed, and aborted queue manipulation
+
+;;; Inserting and deleting requests from the outstanding, aborted, and completed queues
+;;; is done by the following shared functions that know that the heads and tails of each
+;;; of those queues are laid out consecutively in the unit structure.  This saves space
+;;; and speed.
+
+;;; Insert a request into the outstanding, aborted, or completed queue (the location of
+;;; the head of the queue is passed in as an argument.  Here's the unbummed version, for
+;;; the outstanding queue:
+;;;  (let ((previous (unit-outstanding-head unit)))
+;;;    (setf (disk-request-next-request request) nil)
+;;;    (setf (disk-request-previous-request request) previous)
+;;;    (if (null previous)
+;;;        (setf (unit-outstanding-tail unit) request)
+;;;      (setf (disk-request-next-request previous) request))
+;;;    (setf (unit-outstanding-head unit) request))
+(defwiredfun insert-disk-queue-request (queue-location request)
+  (setf (%block-register 1) queue-location)
+  (let ((previous (%block-read 1 :no-increment t)))
+    (%block-write 1 request)
+    (if (null previous)
+        (%block-write 1 request)
+      (setf (disk-request-next-request previous) request))
+    (setf (%block-register 1) (locf (disk-request-next-request request)))
+    (%block-write 1 nil)
+    (%block-write 1 previous)
+    nil))
+
+;;; Delete a request from the outstanding, aborted, or completed queue (the location of
+;;; the head of the queue is passed in as an argument.  Here's the unbummed version, for
+;;; the outstanding queue:
+;;;  (let ((previous (disk-request-previous-request request))
+;;;        (next (disk-request-next-request request)))
+;;;    (if (null previous)
+;;;        (setf (unit-outstanding-tail unit) next)
+;;;      (setf (disk-request-next-request previous) next))
+;;;    (if (null next)
+;;;        (setf (unit-outstanding-head unit) previous)
+;;;      (setf (disk-request-previous-request next) previous)))
+(defwiredfun delete-disk-queue-request (queue-location request)
+  (setf (%block-register 1) (locf (disk-request-next-request request)))
+  (let ((next (%block-read 1))
+        (previous (%block-read 1 :prefetch nil)))
+    (if (null previous)
+        (%memory-write (%pointer-plus queue-location 1) next)
+      (setf (disk-request-next-request previous) next))
+    (if (null next)
+        (%memory-write queue-location previous)
+      (setf (disk-request-previous-request next) previous))
+    nil))
+
+(defmacro insert-outstanding-request (unit request)
+  `(insert-disk-queue-request (locf (unit-outstanding-head ,unit)) ,request))
+
+(defmacro delete-outstanding-request (unit request)
+  `(delete-disk-queue-request (locf (unit-outstanding-head ,unit)) ,request))
+
+(defmacro insert-completed-request (unit request)
+  `(insert-disk-queue-request (locf (unit-completed-head ,unit)) ,request))
+
+(defmacro delete-completed-request (unit request)
+  `(delete-disk-queue-request (locf (unit-completed-head ,unit)) ,request))
+
+(defmacro insert-aborted-request (unit request)
+  `(insert-disk-queue-request (locf (unit-aborted-head ,unit)) ,request))
+
+(defmacro delete-aborted-request (unit request)
+  `(delete-disk-queue-request (locf (unit-aborted-head ,unit)) ,request))
+
+
+;;;; Error processing
+
+;;; The unit driver is responsible for detecting and recovering from errors to the best of
+;;; its ability.  The master disk driver deals with irrecoverable errors, enforcing
+;;; dependencies between requests affected by the error, signalling errors to the client at
+;;; the appropriate time, and getting things consistent again.
+;;;
+;;; Disk errors are reported whenn (sic) the client blocks on any of the affected
+;;; transfers.  In our synchronization model, an error on any request in a given disk event
+;;; will be signaled when the client waits for that disk event (or for a task within it,
+;;; for compatibility).  There is some confusion about the meaning of "the client" here; I
+;;; assume it to mean the user of a disk event, and if there are multiple processes using a
+;;; single disk event, an error might be reported to the wrong one.
+;;;
+;;; There are two major differences in disk error handling from that in the 3600:
+;;;
+;;;  - in the 3600, an error was attributed to a single disk event, and only requests
+;;;    for that disk event were affected.  Here, an error is recorded in a single
+;;;    disk event, but related disk events may be affected.  For example, requests
+;;;    for disk events that depend on a erring disk event must also be aborted, and
+;;;    if the client waits for a disk event that has an erring disk event as a
+;;;    descendent, the error should be reported.
+;;;
+;;;  - multiple disk errors can occur "simultaneously".  In the 3600, only one disk
+;;;    request executed at a time.  Here, up to <n-units> requests may be executed
+;;;    at the same time, they might all get errors, and they might all be for the
+;;;    same (parallel) disk event.
+;;;
+;;; What has to happen, roughly, is this: when a failed request is emitted by a unit
+;;; driver, the error information (disk-request-flags (which include command, unit number,
+;;; and other useful info) and error address) must be recorded in the disk event associated
+;;; with that request.  Then all requests for disk events dependent on the erring event
+;;; must be flushed; note that such requests may only be in that unit due to the way we
+;;; handle interunit dependencies.  The unit driver is supposed to abort all outstanding
+;;; requests, so the master gets a chance to reevaluate their status.  Then, we have to
+;;; take steps to ensure that no requests for events dependent on erring events are
+;;; enqueued until the error has been reported to the client.
+;;;
+;;; The most important goal of this level of error processing is to note the error, reclaim
+;;; all the resources associated with the request, and set things right again so that
+;;; requests for unaffected disk events (i.e. paging requests) may proceed.
+;;;
+;;; Specific error information is recorded in disk events in a table large enough to record
+;;; <n-units> errors, the maximum number that can occur "simultaneously".  This information
+;;; is retrieved at the time the error is reported to the client.  Actually, the error
+;;; reporter may have to loop signalling multiple errors; see WAIT-FOR-DISK-EVENT.
+;;;
+;;; Disk events containing unreported errors are threaded together in *disk-error-events*.
+;;; WAIT-FOR-DISK-EVENT and ENQUEUE-DISK-REQUEST perform a linear search of this list to
+;;; determine if their disk event is related to an erring disk event, and take appropriate
+;;; action.  This slows down normal operation when their are pending disk errors, too bad.
+
+;;; Record information about the error (the affected address and the disk-request
+;;; flags) in the disk event's error-table, and add the disk event to the list
+;;; of failed disk events if necessary.
+(defwiredfun record-disk-error (error-event error-flags error-address)
+  (let ((array (disk-event-error-table error-event))
+        (index (*2 (1- (process:atomic-incf (disk-event-error-index error-event))))))
+    (when (< index (array-short-length-field array))
+      (setf (aref array index) error-flags)
+      (setf (aref array (1+ index)) error-address))
+    ;; If this is the first error recorded in the event, push the event onto the list
+    ;; of failed disk events.
+    (when (= index 0)
+      (let ((location (locf *disk-error-events*)))
+        (loop do
+          (let ((head (location-contents location)))
+            (setf (disk-event-error-thread error-event) head)
+            (when (store-conditional location head error-event)
+              (return nil))))))))
+
+;;; Lookup information about an error in the specified disk event, and return it.  Deletes
+;;; all traces of this particular error from the disk event, though there may still be other
+;;; errors.  Must be called without-interrupts.
+(defun lookup-disk-error (error-event)
+  (let ((array (disk-event-error-table error-event))
+        (index (*2 (process:atomic-decf (disk-event-error-index error-event)))))
+    (multiple-value-bind (error-flags error-address)
+        (when (< index (array-short-length-field array))
+          (values (shiftf (aref array index) nil)
+                  (shiftf (aref array (1+ index)) nil)))
+      ;; If this was the last error recorded in the event, remove the event from the
+      ;; list of failed disk events.
+      (when (= index 0)
+        ;; Search the list for this event, and snap it out.  Asynchronous execution of
+        ;; record-disk-error can atomically push new events on the head of the list
+        ;; while we're doing this, but otherwise we don't have to worry about locking.  The
+        ;; only screw case is if the event is we're searching for is at the head of the
+        ;; list; we use a store-conditional to deal with that.
+        (loop for location first (locf *disk-error-events*)
+                           then (locf (disk-event-error-thread event))
+              as event = (location-contents location)
+              until (null event)
+              do
+          (when (and (eq event error-event)
+                     (store-conditional location event (disk-event-error-thread event)))
+            (return nil))))
+      (values error-event error-flags error-address))))
+
+;;; Called by unit-output-request to deal with a failed transfer.  Note the error in the
+;;; appropriate disk event so that it may be signalled later (in sync with the client
+;;; program), and so further transfers dependent on this one are flushed properly.  Then
+;;; remove all traces of the failed request and those dependent on it; when we're done this
+;;; unit should work normally for requests with unaffected disk events.
+(defwiredfun process-failed-request (unit error-request error-address)
+  (let ((error-event (disk-request-event error-request)))
+    (if (= (disk-event-error-dequeue-action error-event) %disk-event-error-dequeue-crash)
+        ;; Error recovery disabled for this disk event (probably it's used for paging).
+        (system-disk-error error-request error-address)
+      ;; Record information about the error (the affected address and the disk-request
+      ;; flags) in the disk event's error-table.
+      (record-disk-error error-event (disk-request-flags error-request) error-address)
+      ;; Scan through the pending queue deleting all requests for this disk event and any
+      ;; that depend on it; just mark them as flushed and move them to the completed queue
+      ;; for later deallocation.  Note that by definition there can be no pending requests
+      ;; in other unit queues for events dependent on the failed one.  It's a good thing,
+      ;; too, because we couldn't get their unit locks to delete them.
+      (loop for request first (unit-pending-head unit) then next
+            until (null request)
+            as next = (disk-request-previous-request request)
+            as event = (disk-request-event request)
+            do
+        (when (or (eq event error-event)
+                  (disk-events-dependent-p event error-event))
+          (delete-pending-request unit request)
+          (setf (disk-request-status request) %disk-request-status-flushed)
+          (insert-completed-request unit request)
+          (process:atomic-incf (disk-event-flushed-transfers event)))))))
+
+(defwiredfun system-disk-error (error-request error-address)
+  (wired-ferror :fatal "Irrecoverable disk error (~A) at DPN #o~O (unit ~D)"
+		(select (ldb %%disk-error-type-class (disk-request-error-type error-request))
+		  (%disk-error-controller-fault "Controller Fault")
+		  (%disk-error-drive-fault "Drive Fault")
+		  (%disk-error-select "Select Error")
+		  (%disk-error-seek "Seek Error")
+		  (%disk-error-search "Search Error")
+		  (%disk-error-overrun "Overrun Error")
+		  (%disk-error-ecc "ECC Error")
+		  (%disk-error-data "Data Error")
+		  (otherwise "Unrecognized Error"))
+		(%logdpb (disk-request-unit error-request)
+			 %%dpn-unit
+			 (kilobitspages error-address))
+		(disk-request-unit error-request)))
+
+
+;;;; Request processing
+
+(defwiredfun unit-wakeup (unit)
+  (with-unit-lock (unit :if-locked :poll :wrapper 'progn)
+    (unit-wakeup-locked unit))
+  nil)
+
+;;; WITH-UNIT-LOCK calls this directly to implement the :IF-LOCKED :POLL option.
+(defwiredfun unit-wakeup-locked (unit)
+  (verify-unit-lock unit)
+  (unit-wakeup-internal unit)
+  ;; Perform any needed completion processing, or arrange for it to happen.
+  (when (not (null (unit-completed-tail unit)))
+    ;; Have to make sure we're not in the storage system, and we need the master lock.
+    (if (storage-system-locked-p)
+        ;; Can't get the storage lock, arrange for disk-wakeup to run sometime.
+	(%funcall-in-interrupt-mode #'cli::enqueue-interrupt-task #'disk-wakeup nil 1)
+      (with-master-lock (:if-locked :poll :wrapper 'progn)
+        ;; We've got the completion processing locks.  Do them all.
+        (process-completed-requests unit))))
+  nil)
+
+;;; WITH-DISK-WAKEUP-OPTIMIZATION inhibits the wakeups normally issued after a request
+;;; is enqueued to an empty unit, to allow more optimization.  Afterwards, it calls this,
+;;; which should wakeup any unit with pending requests that doesn't seem to be running.
+(defwiredfun issue-deferred-unit-wakeups ()
+  (map-over-unit-queues
+    (lambda (unit)
+      ;; This test is just a minor optimization, it's done without the lock.
+      (when (unit-pending-tail unit)
+        ;; If the unit is locked, just ask it to poll, to make sure.
+        (with-unit-lock (unit :if-locked :poll :wrapper 'progn)
+          (when (and (unit-pending-tail unit)
+                     (not (unit-outstanding-tail unit)))
+            (unit-wakeup-locked unit))))))
+  nil)
+
+;;; Unit driver calls this, with the unit lock, to get the next request from the master.
+(defwiredfun unit-input-request (unit)
+  (verify-unit-lock unit)
+  (setf (unit-activity-timestamp unit) (%microsecond-clock))
+  (let ((request (unit-aborted-tail unit)))
+    (if (not (null request))
+        (delete-aborted-request unit request)
+      (if (and (not (null (setq request (unit-pending-tail unit))))
+	       ;; enforce serial-marker, which says all previous
+               ;; requests must have been serviced before enqueuing this
+               ;; one --- might be able to optimize to only require next
+               ;; queue empty if we remodularized unit-output-request
+               (or (zerop (disk-request-serial-marker request))
+		   (and (null (unit-outstanding-tail unit))
+                        (null (unit-completed-tail unit)))))
+          (delete-pending-request unit request)
+        (return-from unit-input-request nil)))
+    (setf (disk-request-status request) %disk-request-status-outstanding)
+    (insert-outstanding-request unit request)
+    request))
+
+;;; Unit driver calls this, with the unit lock, to deliver a completed request to the master.
+(defwiredfun unit-output-request (unit request status &optional error-address)
+  (verify-unit-lock unit)
+  (setf (unit-activity-timestamp unit) (%microsecond-clock))
+  (delete-outstanding-request unit request)
+  (select (setf (disk-request-status request) status)   ;--- necessary?
+    (%disk-request-status-completed
+     (increment-meter *count-disk-requests-completed*)
+     (insert-completed-request unit request))
+    (%disk-request-status-failed
+     (increment-meter *count-disk-requests-failed*)
+     (insert-completed-request unit request)
+     (process-failed-request unit request error-address))
+    (%disk-request-status-aborted
+     (increment-meter *count-disk-requests-aborted*)
+     (insert-aborted-request unit request))
+    (t
+     (wired-ferror :proceedable-halt "Invalid request propagated through unit queue")))
+  nil)
+
+(defwiredfun process-completed-request (unit request)
+  (verify-unit-lock unit)
+  (setf (unit-activity-timestamp unit) (%microsecond-clock))
+  (select (disk-request-command request)
+    (%disk-command-event
+     (disk-event-task-complete (disk-request-event request) (disk-request-task-id request)))
+    (%disk-command-wakeup
+     nil)
+    (otherwise
+     ;; Walk through the memory descriptors funcalling the argument with the specified
+     ;; PPNs.  This doesn't do anything to delete duplicates; for paging transfers there
+     ;; shouldn't ever be an overlap, and for user transfers it probably doesn't matter.
+     (labels ((process-extent (class address words)
+		(let ((pma (if (type-member address dtp-physical-address)
+			       (%pointer address)
+			       (ldb %%vma-pma (%pointer address)))))
+		  (select (if ( class 0)	;patching kludge
+			      class
+			      (disk-request-class request))
+		    #-VLM (%class-netboot-read (si:packet-read-complete
+						 (packet-from-address address)))
+		    #-VLM (%class-netboot-write (si:packet-write-complete
+						  (packet-from-address address)))
+		    (otherwise
+		     (loop for ppn from (extract-ppn pma)
+				   to (extract-ppn (1- (%32-bit-plus pma words)))
+			   do
+		       (select (if ( class 0)	;patching kludge
+				   class
+				   (disk-request-class request))
+			 #-VLM (%class-fetch (fetch-complete ppn))
+			 #-VLM (%class-write (write-complete ppn))
+			 #-VLM (%class-prefetch (prefetch-complete ppn))
+			 #-VLM (%class-prefetch-mark (prefetch-mark-complete ppn))
+			 #-VLM (%class-fetch-load (fetch-load-complete ppn))
+			 #-VLM (%class-prefetch-load (prefetch-load-complete ppn))
+			 #-VLM (%class-prefetch-load-mark (prefetch-load-mark-complete ppn))
+			 (%class-user (user-disk-complete ppn)))))))))
+       (loop with descriptor = (disk-request-memory-descriptors request)
+	     until (null descriptor)
+	     do
+	 (setf (%block-register 1) descriptor)
+	 (let ((info (%block-read 1))
+	       (daps (%block-read 1))
+	       (next (%block-read 1 :prefetch nil)))
+	   (if (atom daps)
+	       (process-extent (ldb %%memory-descriptor-class info)
+			       daps
+			       (ldb %%memory-descriptor-words info))
+	       (loop until (null daps) do
+		 (let ((words (pop daps))
+		       (address (pop daps)))
+		   (process-extent (ldb %%memory-descriptor-class info) address words))))
+	   (setq descriptor next)))))))
+
+(defwiredfun process-completed-requests (unit)
+  (verify-unit-lock unit)
+  (loop as request = (unit-completed-tail unit)
+        until (null request)
+        do
+    (delete-completed-request unit request)
+    (select (disk-request-status request)
+      (%disk-request-status-completed
+       (process-completed-request unit request))
+      ((%disk-request-status-flushed %disk-request-status-failed))
+      (t
+       (wired-ferror :proceedable-halt "Invalid request propagated through completed queue")))
+    (delete-interunit-dependency unit (disk-request-event request))
+    (deallocate-disk-request request))
+  ;; if there are deferred pending requests, wakeup the driver; if there
+  ;; are no pending requests, advance the background queue
+  (let (request)
+    (if (not (null (setq request (unit-pending-tail unit))))
+	(when (and (not (zerop (disk-request-serial-marker request)))
+                   (null (unit-outstanding-tail unit)))
+	  ;; We can't actually do the wakeup processing now, since we've
+          ;; got the unit lock, but calling unit-wakeup will promote the
+          ;; unit lock so the outer lock holder will do it.
+          (unit-wakeup unit))
+        #-VLM
+	(when (not (background-queue-empty-p unit))
+          (promote-background-writes unit)))))
+
+;;; Called only through a priority 1 interrupt task, to do any request completion processing
+;;; that couldn't be performed earlier (because the master was locked, or the storage system
+;;; was locked).  Priority 1 interrupt tasks are scheduled only during wired-wait and by the
+;;; preempt handler, so the storage system will be unlocked (but check this to make sure).
+(defwiredfun disk-wakeup (&optional ignore)
+  (when (storage-system-locked-p)
+    (wired-ferror :proceedable-halt "DISK-WAKEUP called while storage system locked"))
+  (with-master-lock (:if-locked :poll :wrapper 'progn)
+    (disk-wakeup-locked))
+  nil)
+
+;;; WITH-MASTER-LOCK calls this directly to implement the :IF-LOCKED :POLL option.  We don't
+;;; have to check the storage lock, because it's not possible to seize the master lock
+;;; unless the storage system is unlocked.  This is because when you seize the master lock
+;;; to enqueue a request, you have to be able to perform completion processing to free up
+;;; scarce resources in the disk system.  Note that the storage system isn't necessarily
+;;; unlocked when the master lock is held, but we can pretend that it is.
+(defwiredfun disk-wakeup-locked ()
+  (verify-master-lock)
+  (when (not (null *unit-table*))          ;--- await initialization patching hack
+    (map-over-unit-queues
+      (lambda (unit)
+        (when (not (null (unit-completed-tail unit)))
+          (with-unit-lock (unit :if-locked :poll :wrapper 'progn)
+            (process-completed-requests unit))))))
+  nil)
+
+(defwiredfun check-unit-hung (unit)
+  (when (with-unit-lock (unit :if-locked :loop :wrapper 'prog1)
+          (and (or (unit-outstanding-tail unit)
+                   (unit-pending-tail unit)
+                   (unit-completed-tail unit))
+               (> (wired-time-difference (%microsecond-clock) (unit-activity-timestamp unit))
+                  10000000)))
+    ;; +++ should have some protocol for resetting and recovering here
+    (wired-ferror :fatal "Disk unit ~D hung" (unit-unit-number unit))
+    t))
+
+
+;;;; Background queue
+
+#-VLM (progn
+(defwiredfun advance-background-queue-pointer (unit pointer)
+  (verify-unit-lock unit)
+  (let ((new (%pointer-plus pointer 2)))
+    (if (neq (unit-background-queue-bound unit) new)
+        new
+      (unit-background-queue-base unit))))
+
+(defwiredfun background-queue-full-p (unit)
+  (verify-unit-lock unit)
+  (let ((next (%pointer-plus (unit-background-queue-fill unit) 2)))
+    (if (eq next (unit-background-queue-bound unit))
+        (eq (unit-background-queue-empty unit) (unit-background-queue-base unit))
+      (eq (unit-background-queue-empty unit) next))))
+
+(defwiredfun background-queue-empty-p (unit)
+  (verify-unit-lock unit)
+  (eq (unit-background-queue-fill unit) (unit-background-queue-empty unit)))
+
+(defwiredfun enqueue-background-write (unit dpn ppn)
+  (loop do
+    ;; This is only called synchronously from the storage system.
+    (with-master-lock (:if-locked :loop)
+      (with-unit-lock (unit :if-locked :loop)
+	(when (not (background-queue-full-p unit))
+	  (let ((background-queue-fill (unit-background-queue-fill unit)))
+	    (setf (background-queue-dpn background-queue-fill) dpn)
+	    (setf (background-queue-ppn background-queue-fill) ppn)
+	    (setf (unit-background-queue-fill unit)
+		  (advance-background-queue-pointer unit background-queue-fill)))
+	  (when (null (unit-pending-tail unit))
+	    (promote-background-writes unit))
+	  (return-from enqueue-background-write nil))))
+    (disk-wait #'disk-background-space-p)))
+
+(defwiredfun delete-background-write (unit ppn)
+  (verify-unit-lock unit)
+  (loop with found-one = nil
+        for p first (unit-background-queue-empty unit)
+              then (advance-background-queue-pointer unit p)
+        until (eq p (unit-background-queue-fill unit))
+        do (when (eq (background-queue-ppn p) ppn)
+             (setf (background-queue-ppn p) nil)
+             (setf (background-queue-dpn p) nil)
+             (setq found-one t))
+        finally (return found-one)))
+
+;;; We've got both the unit and master locks, so we can run the insertion code.
+(defwiredfun promote-background-writes (unit)
+  (verify-unit-lock unit)
+  ;; Insertions into the pending queue can abort, in which case we just exit.
+  ;; Be careful not to lose the aborted request, though!
+  (catch %disk-insertion-transaction-id
+    (let ((block-base nil)
+          (block-bound nil)
+          (request (let ((last-request *disk-last-request*))
+		     ;; slight optimization, if you are picking up where
+		     ;; you left off
+		     (if (and (not (null last-request))
+			      (= (disk-request-unit last-request) (unit-unit-number unit))
+			      (eq (disk-request-event last-request)
+				  *storage-background-disk-event*))
+			 last-request
+			 nil)))
+          (info (dpbs (unit-unit-number unit) %%disk-request-unit
+                      %disk-command-write40 %%disk-request-command
+                      %class-write %%disk-request-class
+                      0))
+          (length (pageskilobits 1)))
+      (loop while (not (background-queue-empty-p unit)) do
+        (multiple-value-bind (ppn dpn)
+            (let ((pointer (unit-background-queue-empty unit)))
+              (values (background-queue-ppn pointer) (background-queue-dpn pointer)))
+          (when (not (null ppn))
+            (let ((address (pageskilobits (ldb %%dpn-page-num dpn))))
+              (when (null block-base)
+                (multiple-value-bind (base size)
+                    (unit-localization-query unit address)
+                  (setq block-base base block-bound (+ base size))))
+              (when (or (< address block-base) ( address block-bound))
+                (return nil))
+              (if (or (null request)
+                      ( (+ (disk-request-address request)
+                            (disk-request-length request))
+                         address))
+                  (setq *disk-last-request*
+			(setq request (insert-pending-request unit
+							      *storage-background-disk-event*
+							      info address length
+							      (%make-physical-address
+								(deposit-ppn ppn 0)))))
+                (setq *disk-last-request*
+		      (setq request (append-pending-request unit request
+							    *storage-background-disk-event*
+							    info address length
+							    (%make-physical-address
+							      (deposit-ppn ppn 0)))))
+                ;; Means something different than on 3600...
+                (increment-meter *count-blocked-background-writes*))
+              (increment-meter *count-background-writes*)))
+          ;; Don't advance the empty pointer until the request is successfully queued.
+          (setf (unit-background-queue-empty unit)
+                (advance-background-queue-pointer unit (unit-background-queue-empty unit)))))))
+  ;; We can't actually do the wakeup processing now, since we've got the unit lock, but
+  ;; calling unit-wakeup will promote the unit lock so the outer lock holder will do it.
+  (unit-wakeup unit))
+)
+
+
+;;;; Storage system interface
+
+#-VLM (progn
+(defwiredfun disk-enqueue-page-read (class dpn ppn)
+  (verify-frame-status (mmpt-lookup ppn)
+		       (%mmpt-status-reading	;normal
+			%mmpt-status-writing	;flush-write queued
+			%mmpt-status-wired	;disk-save
+			 )
+		       (= status %mmpt-status-writing)
+		       (= status %mmpt-status-writing)
+		       )
+  (enqueue-disk-request (dpbs (ldb %%dpn-unit dpn) %%disk-request-unit
+                              %disk-command-read40 %%disk-request-command
+                              class %%disk-request-class
+                              0)
+                        *storage-parallel-disk-event*
+                        (pageskilobits (ldb %%dpn-page-num dpn))
+                        (pageskilobits 1)
+			(let ((pma (deposit-ppn ppn 0)))
+			  (if (ldb-test %%vma-equals-pma pma)
+			      (%make-physical-address pma)
+			    (%make-unmapped-address pma))))
+  nil)
+
+(defwiredfun disk-enqueue-page-write (class dpn ppn)
+  (verify-frame-status (mmpt-lookup ppn)
+		       (%mmpt-status-flushable	;background write
+			 %mmpt-status-normal	;write-frame
+			 %mmpt-status-writing	;flush-write
+			 %mmpt-status-wired	;write-all-modified
+			 %mmpt-status-preparing	;transition
+			 %mmpt-status-prefetched	;load-to-swap
+			 %mmpt-status-prefetched-mark	;ditto
+			 )
+		       (= status %mmpt-status-writing)
+		       ;; disk-save does not lock frames (perhaps erroneously?)
+		       (and (not (= class %class-nop)) t)
+		       )
+  (enqueue-disk-request (dpbs (ldb %%dpn-unit dpn) %%disk-request-unit
+                              %disk-command-write40 %%disk-request-command
+                              class %%disk-request-class
+                              0)
+                        *storage-serial-disk-event*
+                        (pageskilobits (ldb %%dpn-page-num dpn))
+                        (pageskilobits 1)
+                        (%make-physical-address (deposit-ppn ppn 0)))
+  nil)
+
+(defwiredfun disk-enqueue-wakeup () nil)
+)
+
+(defwiredfun wakeup-all-units ()
+  (map-over-unit-queues
+    #'unit-wakeup))
+
+#-VLM (progn
+(defwiredfun disk-background-geometry (dpn)
+  ;; BATCH-P indicates that contiguous transfers are very desirable for that unit, so VM
+  ;; should attempt to make its transfers contiguous even at the expense of doing some extra
+  ;; work (such as writing out a resident unmodified page that lies between two modified
+  ;; pages on disk).  This should be T for disks with unnatural sector sizes.
+  (declare (values base-dpn n-pages batch-p))
+  (let* ((unit-number (ldb %%dpn-unit dpn))
+         (page (ldb %%dpn-page-num dpn))
+         (unit (unit-queue unit-number)))
+    (multiple-value-bind (track-base track-size cylinder-base cylinder-size tracks batch-p)
+        (unit-localization-query unit (pageskilobits page))
+      (declare (ignore cylinder-base cylinder-size tracks))
+      ;; For now, just write out a track at a time.  Later we might do more.
+      (values (%logdpb unit-number %%dpn-unit (kilobitspages track-base))
+              (kilobitspages track-size)
+              batch-p))))
+
+;;; Enqueue the background request to the proper unit queue.
+(defwiredfun disk-enqueue-background-page-write (class dpn ppn)
+  (ignore class)
+  (enqueue-background-write (unit-queue (ldb %%dpn-unit dpn)) dpn ppn))
+
+;;; True if none of the unit background queues are full.
+(defwiredfun disk-background-space-p ()
+  (map-over-unit-queues
+    (lambda (unit)
+      (when (with-unit-lock (unit :if-locked :loop :wrapper 'prog1)
+              (background-queue-full-p unit))
+        (return-from disk-background-space-p nil))))
+  t)
+
+;;; True if any of the unit background queues are full.
+(defwiredfun disk-background-full-p ()
+  (not (disk-background-space-p)))
+
+(defwiredfun disk-background-delete (ppn)
+  ;; We don't know what unit the request is in, so we have to search.  No big deal.
+  (map-over-unit-queues
+    (lambda (unit)
+      (when (with-unit-lock (unit :if-locked :loop :wrapper 'prog1)
+              (delete-background-write unit ppn))
+        (return-from disk-background-delete t))))
+  nil)
+
+(defwiredfun disk-background-promote-all ()
+  (without-storage-lock
+    (map-over-unit-queues
+      (lambda (unit)
+	(loop named rover do
+	  (with-master-lock (:if-locked :loop)
+	    (with-unit-lock (unit :if-locked :loop)
+	      (when (background-queue-empty-p unit)
+		(return-from rover nil))
+	      (promote-background-writes unit))))))))
+)
+
+(defwiredfun check-disk-hung ()
+  (map-over-unit-queues #'check-unit-hung)
+  nil)
+
+;;; This is supposed to wait until all previously-issued requests have completed.
+;;; Implement it by waiting for the requests-deallocated counter to catch up with
+;;; the current value of the requests-allocated counter.  Kinda kludgy.
+(defwiredfun wait-for-disk-done ()
+  ;; TARGET is the value we're going to wait for the requests-deallocated counter to have.
+  (let ((target *total-disk-requests-allocated*))
+    ;; There are two waiting strategies.  One is to let wired-wait poll, either in system
+    ;; or in user mode.  This is slow in user mode, since no process wakeups are issued.
+    ;; The other is to use the existing machinery for issueing process wakeups to the
+    ;; a process waiting for a specific disk event, in this case the root disk event.
+    (labels ((verify-function (target)
+	       ( (%32-bit-difference *total-disk-requests-deallocated* target) 0))
+	     (user-wait ()
+	       (declare (sys:unsafeguarded-function))
+	       (let ((disk-event *root-disk-event*))
+		 (process:with-lock ((disk-event-lock disk-event))
+		   (when (not (verify-function target))
+		     (unwind-protect-case ()
+			 (progn
+			   (register-disk-event-blocked-process disk-event *current-process*)
+			   (process:process-block "Disk wait" #'verify-function target))
+		       (:abort (%funcall-in-system-mode #'si:aux-wait-for-disk-done))
+		       (:always (unregister-disk-event-blocked-process disk-event))))))))
+      (if (or (%auxiliary-stack-p)
+	      ;; If the locks haven't been created yet, wait the slow way.
+	      (null (disk-event-lock *root-disk-event*)))
+	  (disk-wait #'verify-function target)
+	(user-wait)))))
+
+;;; This is called only when halting the system, and is supposed to wait for all
+;;; disk activity to complete, while calling a minimum of other stuff.
+(defwiredfun si:aux-wait-for-disk-done ()
+  (loop until (disk-event-idle-p *root-disk-event*)))
+
+
+;;;; Copying routines for device drivers that simulate DMA in software
+
+;;; Copy data between a portion of memory, as described by a list of memory descriptors,
+;;; and a buffer memory, as described by a block of <n-words,offset> pairs.  The copy is
+;;; appropriate for the specified transfer type (read, write or compare, direct copy or
+;;; pack/unpack).  The number of words to copy is specified in terms of the number of
+;;; buffer words, not memory words, and must be a multiple of 10 for un/packing operations.
+;;; In addition to the memory descriptors, the memory portion is specified by an offset,
+;;; which indicates how many memory words into the copy to skip before starting to copy
+;;; stuff from the buffer.  For compare transfer types, return T if there's a mismatch.
+(defwiredfun disk-copy-homunculus
+             (transfer-type words buffer-descriptors buffer-base memory-descriptors offset)
+  (let ((memory-descriptors memory-descriptors)
+        (buffer-words 0)
+        (buffer-address nil)
+        (descriptor-words 0)
+        (dap-words 0)
+        (memory-address nil)
+        (descriptor-daps nil)
+	(cache-p
+	  ;; True if we might run into cache coherency issues
+	  (system-case
+	    (MacIvory-1&2 (disk-transfer-read-p transfer-type))
+	    ;; Merlin-II and MacIvory model 3 caches physical reads and writes to main memory
+	    ;; so we don't have worry about cache coherency for these machines.
+	    (otherwise nil))))
+    (macrolet ((read-descriptor-dap (daps)
+                 `(progn
+                    (setf (%block-register 1) ,daps)
+                    (setq dap-words (%block-read 1))
+                    (setq memory-address (%block-read 1 :prefetch nil))
+                    (setq descriptor-daps (%block-register 1)))))
+      (si:saving-registers-for-value (%register-bar-1)
+        ;; If there's an offset, we need to scan through the memory descriptors until we
+        ;; get to the ones describing the relevant part of memory.
+        (when ( offset 0)
+          ;; The offset is specified in words of disk space, translate to memory words.
+          (let ((qs (if (disk-transfer-conversion-p transfer-type) (*4/5 offset) offset)))
+            (loop while (> qs 0) do
+              (when (= descriptor-words 0)
+                (multiple-value-setq (descriptor-words descriptor-daps memory-descriptors)
+                  (destructure-memory-descriptor memory-descriptors))
+		(setq descriptor-words (ldb %%memory-descriptor-words descriptor-words))
+                (if (atom descriptor-daps)
+                    (setq dap-words descriptor-words memory-address descriptor-daps)
+                  (read-descriptor-dap descriptor-daps)))
+              (when (= dap-words 0)
+                (read-descriptor-dap descriptor-daps))
+              (let ((chunk-words (min descriptor-words dap-words qs)))
+                (setq memory-address (%pointer-plus memory-address chunk-words))
+                (decf descriptor-words chunk-words)
+                (decf dap-words chunk-words)
+                (decf qs chunk-words)))))
+        (loop until (= words 0) do
+          (when (= buffer-words 0)
+            (setf (%block-register 1) buffer-descriptors)
+            (setq buffer-address (%pointer-plus buffer-base (%block-read 1)))
+            (setq buffer-words (%block-read 1 :prefetch nil))
+            (setq buffer-descriptors (%block-register 1)))
+          (when (= descriptor-words 0)
+            (multiple-value-setq (descriptor-words descriptor-daps memory-descriptors)
+              (destructure-memory-descriptor memory-descriptors))
+	    (setq descriptor-words (ldb %%memory-descriptor-words descriptor-words))
+            (if (atom descriptor-daps)
+                (setq dap-words descriptor-words memory-address descriptor-daps)
+              (read-descriptor-dap descriptor-daps)))
+          (when (= dap-words 0)
+            (read-descriptor-dap descriptor-daps))
+          (multiple-value-bind (buffer-chunk memory-chunk)
+              (let ((buffer-min (min words buffer-words))
+                    (memory-min (min descriptor-words dap-words)))
+                (if (not (disk-transfer-conversion-p transfer-type))
+                    (let ((words (min memory-min buffer-min)))
+                      (values words words))
+                  (let ((words (min (*5/4 memory-min) buffer-min)))
+                    (values words (*4/5 words)))))
+            #-VLM
+	    (when (disk-transfer-conversion-p transfer-type)	;system request
+	      (loop for ppn upfrom
+			(if (typep memory-address 'cli::physical-address)
+			    (extract-ppn (%pointer memory-address))
+			    (extract-ppn (ldb %%vma-pma (%pointer memory-address))))
+		    repeat (extract-ppn memory-chunk)
+		    do
+		(let ((index (mmpt-lookup ppn)))
+		  (if (disk-transfer-read-p transfer-type)
+		      (verify-frame-status index
+					   (%mmpt-status-reading	;normal
+					     %mmpt-status-wired	;disk-save
+					     )
+					   nil
+					   nil
+					   ) 
+		      (verify-frame-status index
+					   (%mmpt-status-flushable	;background write
+					     %mmpt-status-normal	;write-frame
+					     %mmpt-status-writing	;flush-write
+					     %mmpt-status-wired	;write-all-modified
+					     %mmpt-status-preparing	;transition
+					     %mmpt-status-prefetched	;load-to-swap
+					     %mmpt-status-prefetched-mark	;ditto
+					     )
+					   (= status %mmpt-status-writing)
+					   ;; can't check locked due to disk-save abuse
+					   )))))
+	      (select transfer-type
+		(%data-transfer-read32
+		 (%block-copy-3232 buffer-address memory-address buffer-chunk))
+		(%data-transfer-read40
+		 (%block-copy-3240 buffer-address memory-address memory-chunk))
+		(%data-transfer-write32
+		 (%block-copy-3232 memory-address buffer-address buffer-chunk))
+		(%data-transfer-write40
+		 (%block-copy-4032 memory-address buffer-address memory-chunk))
+		(%data-transfer-compare32
+		 (unless (%block-compare-3232 buffer-address memory-address buffer-chunk)
+		   (return t)))
+		(%data-transfer-compare40
+		 (unless (%block-compare-3240 buffer-address memory-address memory-chunk)
+		   (return t))))
+	      (when cache-p
+		;; This may actually be MacIvory dependent.
+		(when (type-member memory-address dtp-physical-address)
+		  (cache-purge (%pointer memory-address) memory-chunk)))
+	      (setq buffer-address (%pointer-plus buffer-address buffer-chunk))
+	      (setq memory-address (%pointer-plus memory-address memory-chunk))
+	      (decf buffer-words buffer-chunk)
+	      (decf descriptor-words memory-chunk)
+	      (decf dap-words memory-chunk)
+	      (decf words buffer-chunk)))))))
+
+;;--- This should be expanded to full metering of time and materials later
+(defwiredvar *count-cache-purges* 0)
+
+;;; Purge a range of physical addresses out of the cache
+;;; This is a no-op on systems that do not have a cache
+(defwiredfun cache-purge (physical-address n-words)
+  (declare (future-common-lisp:ignorable physical-address n-words))
+  (system-case
+    (MacIvory-1&2
+      (with-system-block-registers (1)
+	(incf* *count-cache-purges*)
+	;; Find an address that turns on cache-enable and aliases to the same cache slots
+	(setf (%block-register 1) (%make-unmapped-address physical-address))
+	(setq n-words (min n-words 32768))	;32768 is maximum MacIvory cache size
+	;; Disable all interrupts and traps while we break the memory hardware
+	;; Exiting the function will turn them back on
+	;; If we bomb here, we'll go to the emergency trap handler, which should
+	;; re-enable memory writes before doing anything else, so we have some
+	;; chance of debugging the situation.  That's why we use trap-mode-fep
+	;; instead of trap-mode-io, so all traps will go to one place.
+	(%set-trap-mode trap-mode-fep)
+	;; Make sure no stack cache overflows will occur while memory writes are disabled
+	;; Do enough pushes so that we can be sure that the emergency trap handler will
+	;; be able to turn the memory back on before any stack cache overflows occur
+	(%push nil) (%push nil) (%push nil) (%push nil)
+	(%push nil) (%push nil) (%push nil) (%push nil)
+	(%push nil) (%push nil) (%push nil) (%push nil)
+	(compiler:no-op)
+	(%pop) (%pop) (%pop) (%pop)
+	(%pop) (%pop) (%pop) (%pop)
+	(%pop) (%pop) (%pop) (%pop)
+	;; Disable the cache
+	(write-MacIvory-register 0 0)
+	;; Disable writes to memory, in a magic way that purges the write-buffer first
+	(write-MacIvory-register 7
+				 (%memory-read (locf #'cache-purge) :cycle-type %memory-raw))
+	;; Do fake writes that will clear the cache valid bits
+	;; No need for (si:prepare-for-block-write), since the address is unmapped.
+	(unroll-block-forms (n-words 8)
+	  (%block-write 1 0))
+	;; Re-enable writes to memory
+	(write-MacIvory-register 6 0)
+	;; Turn the cache back on
+	(write-MacIvory-register 1 0)))
+    (otherwise nil)))				;no-op, not error, if no cache exists

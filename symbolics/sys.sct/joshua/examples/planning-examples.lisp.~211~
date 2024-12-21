@@ -1,0 +1,1591 @@
+;;; -*- Mode: Joshua; Package: PLAN; Syntax: Joshua; -*-
+;;;> EXAMPLES-MESSAGE
+;;;>
+;;;>******************************************************************************************
+;;;>
+;;;>       Symbolics hereby grants permission to customer to incorporate
+;;;>       the examples in this file in any work belonging to customer.
+;;;>
+;;;>******************************************************************************************
+;;; Created 11/11/86 11:55:15 by sgr running on GROUSE at SCRC.
+
+;;;
+;;; A planning expert system shell written in Joshua, with two example applications.
+;;; 
+;;; This comes in 3 parts: the planning substrate, a monkey & bananas system, and
+;;; a blocks world system.  The latter demonstrates how to do a user interface to a 
+;;; Joshua program, as well.
+;;;
+
+
+
+;;;
+;;; Planning substrate.
+;;;
+;;; Plans strongly resemble lisp forms, largely because that makes them easy to execute.  A typical
+;;; plan operation looks like (<operator> <0-or-more-args> <previous-operation>), e.g.,
+;;; (handle bananas eat (handle bananas take (walk left now))).  "Now" in the last example is the 
+;;; start time.  Subsequent times are gotten by plan operations, i.e., the last expression is both
+;;; a plan operation and a name for the time just after executing the plan operation.
+;;;
+;;; Time-dependent predications include the time (i.e., plan operation) as their last argument, e.g.,
+;;; [not [hungry (handle bananas eat (handle bananas take (walk left now)))]] says the monkey's not
+;;; hungry after executing a plan that results in his eating the bananas.
+;;;
+
+(define-predicate true-at-time (fact time))
+
+(defun flatten-plan (plan)
+  ;; return a flat version, e.g.,
+  ;; (handle bananas eat (handle bananas take now))  ((handle bananas take) (handle bananas eat))
+  ;; humans usually find the flat version easier to deal with, since the steps are in time order.
+  ;; the non-flattened version, however, is very like a nested lisp form, suitable for evalling.
+  (loop with flat-version = nil
+	for plan-operation = plan then (car (last plan-operation))
+	while (consp plan-operation)
+	doing (push (butlast plan-operation) flat-version)
+	finally (return flat-version)))
+
+(def-defining-form define-plan-operation
+   :definer
+   ((name args &key printer &aux print-function)
+    ;;other keywords eventually (e.g., :executor)
+    (unless (every #'(lambda (x) (and (symbolp x) (not (member x lambda-list-keywords)))) args)
+      (error "Every arg to a plan-operation must be a symbol, not a lambda-list keyword: ~S" args))
+    (when printer
+      ;; have a funny way of printing this kind of plan operation -- used by format-plan
+      (setq print-function `((defun (:property ,name plan-printer) ,(car printer)
+			       (declare (sys:function-parent ,name define-plan-operation))
+			       ,@(cdr printer)))))
+    `(progn (record-source-file-name ',name 'define-plan-operation)
+	    ;; record the arguments for the killer
+	    (defprop ,name ,args plan-operation-args)
+	    ;; define some accessors.  generates less hair than a corresponding defstruct.
+	    ,@(loop for arg in args
+		    for number from 1
+		    collecting `(defsubst ,(intern (string-append name "-" arg)) (,name)
+				  (declare (sys:function-parent ,name define-plan-operation))
+				  (nth ,number ,name)))
+	    ;; define the print function, if supplied
+	    ,@print-function))
+   :killer
+   ((name)
+    ;; how to undo one of these
+    (loop for arg in (get name 'plan-operation-args)
+	  doing (fundefine (intern (string-append name "-" arg))))
+    (remprop name 'plan-operation-args)
+    (when (get name 'plan-printer)
+      (fundefine `(:property ,name plan-printer)))
+    name)
+   :shower
+   ((form)
+    ;; how to chatter meaninglessly about one of these
+    (let* ((name (second form))
+	   (args (get name 'plan-operation-args)))
+      (cond (args
+	      ;; has been defined before
+	      (zwei:typein-line "~&Evaluating this would redefine the Plan Operation ~S ~
+                                with ~:[different~;the same~] arguments."
+				name (equal args (third form))))
+	    (t
+	      ;; not defined before
+	      (zwei:typein-line
+		"~&Evaluating this would define the Plan Operation ~S for the first time."
+		name))))
+    ;; prevent further macroexpansion
+    t)
+   :type-name "Plan Operation")
+
+(defun format-plan (plan &optional (stream *standard-output*))
+  ;; print it prettily
+  (flet ((print-plan-operation (operation stream)
+	    ;; use the funny printers in define-plan-operation to print a plan
+	    (funcall (or (and (symbolp (car operation))
+			      (get (car operation) 'plan-printer))
+			 #'prin1)
+		     operation stream)))
+    (cond ((nlistp plan)
+	   ;; trivial plan
+	   (format stream "doing nothing"))
+	  (t
+	    ;; non-trivial plan
+	    (format-textual-list (flatten-plan plan)
+				 #'print-plan-operation
+				 :conjunction "and"
+				 :stream stream)))))
+
+(defmacro benchmark-plan (database-initializer plan-variable query
+			  &aux (rules (sys:gensymbol "RULES"))
+			  (time (sys:gensymbol "TIME")))
+  ;; make it easy to take timings of planning systems
+  `(progn ,database-initializer
+	  (process:without-preemption
+	    ;; get better timing results
+	    (let ((,rules ji:*backward-fire-count*)
+		  (,time (get-internal-run-time)))
+	      (do-queries* ((ignore ,query))
+		(setq ,time (float (/ (- (get-internal-run-time) ,time) internal-time-units-per-second))
+		      ,rules (- ji:*backward-fire-count* ,rules))
+		(return (values (copy-object-if-necessary ,plan-variable) ,rules ,time)))))))
+       
+
+;;;
+;;; Next, some facilities for tracing goals.  This makes a nice display.
+;;;
+
+;;; Make sure you bind these, not setq them.
+
+(defvar *goal-depth* 0 "Current depth of planner.")
+(defvar *goal-trace-stream* nil "If this is non-nil, yatter about goals to this stream.")
+
+(defmacro with-new-goal (&body body)
+  ;; increment the counter that tells us how to indent.
+  `(let ((*goal-depth* (1+ *goal-depth*)))
+     ,@body))
+
+(defmacro with-goal-hacking ((stream indentation) &body body)
+  ;; what we typically do in the report-~A functions
+  `(when ,stream
+     ;; when there is a stream to which we're supposed to yatter about goals
+     (indenting-output (,stream ,indentation)
+       ;; indent a depth (usually) proportional to the goal depth
+       (dw:with-output-truncation (,stream :vertical nil :horizontal t)
+	 ;; use the scroll bars instead of wrapping
+	 ,@body))))
+
+(defun report-goal-start (goal)
+  ;; yatter about this goal's starting.
+  (with-goal-hacking (*goal-trace-stream* *goal-depth*)
+    (format *goal-trace-stream* "~&~'bGoal ~D:~ ~\\SAY\\" *goal-depth* goal)))
+
+(defun report-goal-trivial ()
+  ;; Yatter about how easy this was, with the trivial plan.
+  (with-goal-hacking (*goal-trace-stream* *goal-depth*)
+    (format *goal-trace-stream* " ... ~'btrivial.~")))
+
+(defun report-verification-attempt (goal plan)
+  ;; yatter when this goal has a proposed solution we're going to check.
+  (with-goal-hacking (*goal-trace-stream* (1- *goal-depth*))
+    (format *goal-trace-stream* "~&~'bVerifying:~ ~\\SAY\\ after " goal)
+    (format-plan plan *goal-trace-stream*)))
+
+(defun report-verification-success ()
+  ;; Yatter when verification succeeds.
+  (with-goal-hacking (*goal-trace-stream* (1- *goal-depth*))
+    (format *goal-trace-stream* " ... ~'bsucceeded.~")))
+
+(defun report-verification-failure () ;give goal?
+  ;; yatter about this goal's failure. 
+  (with-goal-hacking (*goal-trace-stream* (1- *goal-depth*))
+    (format *goal-trace-stream* " ... ~'bfailed.~")))
+
+(defun report-hard-failure () ;give goal?
+  ;; yatter about how we really, really couldn't do it
+  (with-goal-hacking (*goal-trace-stream* (1- *goal-depth*))
+    (format *goal-trace-stream* "~&~'bHard planning failure.~")))
+
+(defun report-goal-backtracking ()
+  ;; yatter about goal backtracking when appropriate.
+  (with-goal-hacking (*goal-trace-stream* (1- *goal-depth*))
+    (format *goal-trace-stream* "~&~'bGoal ~D~ backtracking to reverse order." (1- *goal-depth*))))
+
+(defun report-STRIPS-attempt ()
+  ;; yatter about how desperate we are
+  (with-goal-hacking (*goal-trace-stream* *goal-depth*)
+    (format *goal-trace-stream* "~&~'bBacktracking to STRIPS-style replanning.~")))
+
+(defun report-STRIPS-success ()
+  ;; yatter about how we saved our behind
+  (with-goal-hacking (*goal-trace-stream* (1- *goal-depth*))
+    (format *goal-trace-stream* "~&~'bSTRIPS re-planning succeeded.~")))
+
+
+
+;;;
+;;; Domain-independent planner.  Uses linear refinement first, followed by STRIPS-style
+;;; re-planning if necessary.  The latter usually produces a fairly bizarre plan, but it
+;;; succeeds.
+
+(define-predicate-model conjunctive-subgoal-model () (default-predicate-model)
+  ;; a model for dealing with conjunctive subgoals.  that's the only
+  ;; really interesting problem in domain-independent planning, evidently.
+  (:required-instance-variables plan root goals))
+
+(define-predicate-model plan-model () (default-predicate-model)
+  ;; a model that finds a heuristic plan to achieve a goal.  This used
+  ;; to verify each heuristic.  It only does that in the case of conjunctive
+  ;; subgoals now, since for simple applications like these, the simple heuristics
+  ;; are always right.
+  (:required-instance-variables plan goal root))
+
+;;;
+;;; The 3 predicates, is-plan-for is-heuristic-plan-for and
+;;; is-plan-for-conjunctive-subgoals, are the programmer interface to the
+;;; planner.
+;;;
+
+;;; ?plan is an output variable in which the answer gets stashed.
+;;; ?goal is what you want to be true after the plan
+;;; ?root is the root situation from which the plan starts.
+
+
+(define-predicate is-plan-for (goal plan root) (plan-model)
+  :destructure-into-instance-variables)
+
+(define-predicate is-plan-for-conjunctive-subgoals (goals plan root)
+		  (conjunctive-subgoal-model)
+  :destructure-into-instance-variables)
+
+(define-predicate is-heuristic-plan-for (goal plan root)
+		  (ask-rules-only-mixin default-protocol-implementation-model))
+
+(define-predicate-method (ask conjunctive-subgoal-model) (truth-value continuation &rest ignore
+							   &aux goal1 goal2 aux-start aux-goal)
+  (when (or (sys:unbound-logic-variable-p goals)
+	    (sys:unbound-logic-variable-p root))
+    (signal 'ji:model-cant-handle-query
+	    :query self
+	    :model 'conjunctive-subgoal-model))
+  (unless (eql truth-value *true*)
+    (signal 'ji:model-can-only-handle-positive-queries
+	    :query self
+	    :model 'conjunctive-subgoal-model))
+  ;; try to satisfy conjunctive subgoals in some order
+  (if (> (length goals) 2)
+      ;; kludge around until I get some time.
+      (error "Can't deal with more than 2 conjunctive subgoals yet.")
+      (setq goal1 (first goals) goal2 (second goals)))
+  (with-unbound-logic-variables (first-phase-plan second-phase-plan)
+    ;; plan for goal1 from the root situation
+    (flet ((succeed ()
+	     ;; what to do when you find a successful plan
+	     (with-unification
+	       (unify plan second-phase-plan)
+	       (stack-let ((support `(,self ,truth-value conjunctive-subgoal-model)))
+		 (funcall continuation support)))))
+      (ask `[is-plan-for ,goal1 ,first-phase-plan ,root]
+	   #'(lambda (ignore)
+	       (ask `[is-plan-for ,goal2 ,second-phase-plan ,first-phase-plan]
+		    #'(lambda (ignore)
+			;; achieved goal1 and goal2 in that order, now check that goal1 is still true.
+			(cond ((equal second-phase-plan first-phase-plan)
+			       ;; no extra planning occured, so no need to verify
+			       (succeed))
+			      (t
+			       ;; something done to acheive goal2, so check goal1
+			       (setq aux-goal `[true-at-time ,goal1 ,second-phase-plan))
+			       (report-verification-attempt goal1 second-phase-plan)
+			       ;; normally we'd use do-queries-named* and return-from instead of catch here.
+			       ;; but that would make it impossible to put in the report-verification-failure
+			       ;; as an "else" clause.
+			       (catch goal2 ;catch/throw is like CUT
+				 (ask aux-goal
+				      #'(lambda (ignore)
+					  ;; success.  Bind plan variable and succeed.
+					  ;; the throw ensures we do just ONE verification.
+					  (report-verification-success)
+					  (throw goal2 (succeed))))
+				 (report-verification-failure))))))))
+      (report-goal-backtracking)
+      ;; plan for goal2 from the root situation
+      (ask `[is-plan-for ,goal2 ,first-phase-plan ,root]
+	   #'(lambda (ignore)
+	       (ask `[is-plan-for ,goal1 ,second-phase-plan ,first-phase-plan]
+		    #'(lambda (ignore)
+			;; achieved goal2 and goal1 in that order, now make sure goal2 is still true.
+			(cond ((equal second-phase-plan first-phase-plan)
+			       ;; no extra planning occured, so no need to verify
+			       (succeed))
+			      (t
+			       ;; something done to acheive goal1, so check goal2
+			       (setq aux-goal `[true-at-time ,goal2 ,second-phase-plan])
+			       (report-verification-attempt goal2 second-phase-plan)
+			       (catch goal1 ;CUT
+				 (ask aux-goal
+				      #'(lambda (ignore)
+					  ;; success.  Bind plan variable and succeed.
+					  ;; the throw ensures we do just ONE verification.
+					  (report-verification-success)
+					  (throw goal1 (succeed))))
+				 (report-verification-failure))))
+			;; copy out from stack so we can use it in STRIPS stuff
+			(setq aux-start (copy-object-if-necessary second-phase-plan))))))
+      ;; Now try STRIPS-style re-planning.  Done here instead of just above where the copy
+      ;; is to prevent needless stack-overflow.  All we want is the place for STRIPS planning
+      ;; to start; the rest of the stack was uninteresting.  (The Sussman anomaly example still
+      ;; overflows, but for reasons not this guy's fault.)
+      (when aux-start
+	;; don't try this unless linear refinement changed the state of the world somehow.
+	;; otherwise, this would chase around an infinite loop of planning failures
+	(report-strips-attempt)
+	(block strips-planning
+	  (ask `[is-plan-for [and ,goal1 ,goal2] ,second-phase-plan ,aux-start]
+	       #'(lambda (ignore)
+		   ;; already verified
+		   (report-strips-success)
+		   (return-from strips-planning (succeed)))))))))
+
+(define-predicate-method (ask plan-model) (truth-value continuation &rest ignore)
+  ;; how to do linear-refinement planning
+  (when (or (sys:unbound-logic-variable-p goal) (sys:unbound-logic-variable-p root))
+    (signal 'ji:model-cant-handle-query
+	    :query self
+	    :model 'plan-model))
+  (unless (eql truth-value *true*)
+    (signal 'ji:model-can-only-handle-positive-queries
+	    :query self
+	    :model 'plan-model))
+  (unless (sys:unbound-logic-variable-p plan)
+    (error "Can't deal with instantiated plans ~a." plan))
+  (report-goal-start goal)
+  (catch self
+    ;; Use self as a catch tag, since this will recurse.  The catch here is like CUT.
+    ;; It assures that we commit to the first successful plan, rather than trying to
+    ;; enumerate all possible plans!
+    (with-unification
+      ;; check if it's already true in the root situation.
+      (unify plan root)
+      (ask `[true-at-time ,goal ,plan]
+	   #'(lambda (ignore)
+	       (report-goal-trivial)
+	       (throw self (stack-let ((support `(,self ,truth-value plan-model)))
+			     (funcall continuation support))))))
+    (with-new-goal 
+      ;; not true in the root, so we gotta write some plan.  Ask a planning expert.
+      (ask `[is-heuristic-plan-for ,goal ,plan ,root] 
+	   #'(lambda (ignore)
+	       ;; This used to verify that the heuristic succeeded, but no more.  The blocks
+	       ;; world heuristics never fail, except in the case of conjunctive subgoals.
+	       ;; That part is checked above, so the verification here was just needless wheel-spinnage.
+	       (throw self (stack-let ((support `(,self ,truth-value plan-model)))
+			     (funcall continuation support))))))
+    (report-hard-failure))
+  ;;don't return stack-consed thingy
+  nil) 
+
+(defrule plan-conjunctive-subgoals (:backward)
+  ;; conjunctive subgoals have to get ordered somehow; this guy tries it.
+  IF [is-plan-for-conjunctive-subgoals ?goals ?plan ?root] 
+  THEN [is-heuristic-plan-for [and . ?goals] ?plan ?root])
+
+
+
+
+;;; The Ratiocinative Simian, -or- How to Build a Monkey in 26 Rules.
+;;;
+;;; Here's what the world looks like to the poor simp (place names in quotes):
+;;;
+;;;                              Bananas "Tree-Top"
+;;;
+;;;
+;;;     Ladder
+;;;   "Ground"                   Monkey  "Tree-Bottom"
+;;; 
+;;; i.e., he's sitting under the bananas, but has to go get the ladder 
+;;; in order to get at them.
+;;;
+;;; To run this, you probably want to do something like 
+;;; (let ((*goal-trace-stream* *terminal-io*))
+;;;   (benchmark-monkey-world))
+;;;
+
+(define-predicate hungry (who)) ;monkey is hungry at some time.
+(define-predicate good-to-eat (thing)) ;something is good to eat.
+(define-predicate at (object place)) ;location of object at some time.
+(define-predicate carrying (who object)) ;monkey's carrying object at some time.
+
+(define-predicate-method (say hungry) (&optional (stream *standard-output*))
+  (with-statement-destructured (thing) ()
+    (format stream "The ~a is hungry" thing)))
+
+(define-predicate-method (say good-to-eat) (&optional (stream *standard-output*))
+  (with-statement-destructured (thing) ()
+    (format stream "~A is good to eat" thing)))
+
+(define-predicate-method (say at) (&optional (stream *standard-output*))
+  (with-statement-destructured (object place) ()
+    (format stream "~A should be at ~A" object place)))
+
+(define-predicate-method (say carrying) (&optional (stream *standard-output*))
+  (with-statement-destructured (who object) ()
+    (format stream "The ~a is carrying the ~A" who object)))
+
+;;;
+;;; The monkey knows how to do 2 things: walk around, and handle stuff.
+;;;
+
+(define-plan-operation walk (direction time)
+  ;; (walk direction time) means walk in a certain direction at a certain time.
+  ;; direction can be left, right, up, or down.
+  :printer ((self stream)
+	    (format stream "walk ~(~A~)" (walk-direction self))))
+
+(define-plan-operation handle (object manner time)
+  ;; (handle object manner time) means to handle an object in some manner at time.
+  ;; manner can be take, drop, or eat.
+  :printer ((self stream)
+	    (format stream "~(~A~) the ~(~A~)" (handle-manner self) (handle-object self))))
+
+
+;;;
+;;; Geography rules.
+;;; 
+
+(defrule at-1 (:backward)
+  ;; walking left from tree-bottom gets you to ground.
+  IF [true-at-time [at monkey tree-bottom] ?time]
+  THEN [true-at-time [at monkey ground] (walk left ?time)])
+
+(defrule at-2 (:backward)
+  ;; walking right from ground gets you to tree-bottom.
+  IF [true-at-time [at monkey ground] ?time]
+  THEN [true-at-time [at monkey tree-bottom] (walk right ?time)])
+
+(defrule at-3 (:backward)
+  ;; going up the ladder from tree-bottom gets you to tree-top.
+  IF [AND [true-at-time [at monkey tree-bottom] ?time]
+	  [true-at-time [at ladder tree-bottom] ?time]
+	  [true-at-time [NOT [carrying monkey ladder]] ?time]]
+  THEN [true-at-time [at monkey tree-top] (walk up ?time)])
+
+(defrule at-4 (:backward)
+  ;; going down the ladder from tree-top gets you to tree-bottom.
+  IF [AND [true-at-time [at monkey tree-top] ?time]
+	  [true-at-time [at ladder tree-bottom] ?time]
+	  [true-at-time [NOT [carrying monkey ladder]] ?time]]
+  THEN [true-at-time [at monkey tree-bottom] (walk down ?time)])
+
+(defrule at-5 (:backward)
+  ;; Things you're carrying are co-located with you.
+  IF [AND (different-objects ?object 'monkey)
+	  [true-at-time [at monkey ?place] ?time]
+	  [true-at-time [carrying monkey ?object] ?time]]
+  THEN [true-at-time [at ?object ?place] ?time])
+
+(defrule at-6 (:backward)
+  ;; Things located somewhere else aren't where you are.
+  IF [AND [true-at-time [at ?object ?place1] ?time]
+	  (different-objects ?place1 ?place2)] ;second to get ?place1 instantiated
+  THEN [true-at-time [NOT [at ?object ?place2]] ?time])
+
+
+
+;;;
+;;; What "carrying" means.
+;;;
+
+(defrule carrying-1 (:backward)
+  ;; you're carrying things you pick up.
+  IF [AND (different-objects ?object 'monkey)
+	  [true-at-time [at monkey ?place] ?time]
+	  [true-at-time [at ?object ?place] ?time]]
+  THEN [true-at-time [carrying monkey ?object] (handle ?object take ?time)])
+
+(defrule carrying-2 (:backward)
+  ;; you're not carrying things you drop.
+  IF t
+  THEN [true-at-time [NOT [carrying monkey ?object]] (handle ?object drop ?time)])
+
+(defrule carrying-3 (:backward)
+  ;; Frobbing one object doesn't affect carrying-ness of others.
+  IF [AND (different-objects ?object1 ?object2)
+	  [true-at-time [carrying monkey ?object1] ?time]]
+  THEN [true-at-time [carrying monkey ?object1] (handle ?object2 ?manner ?time)])
+
+(defrule carrying-4 (:backward)
+  ;; Ditto, except negated.
+  IF [AND (different-objects ?object1 ?object2)
+	  [true-at-time [NOT [carrying monkey ?object1]] ?time]]
+  THEN [true-at-time [NOT [carrying monkey ?object1]] (handle ?object2 ?manner ?time)])
+
+
+
+;;;
+;;; Motivation for eating.
+;;;
+
+(defrule hungry-1 (:backward)
+  ;; if you're hungry at time t and you eat something at time t+1,
+  ;; then you're not hungry at time t+1.
+  IF [and [true-at-time [hungry monkey] ?time]
+	  [good-to-eat ?food]
+	  [true-at-time [carrying monkey ?food] ?time]]
+  THEN [true-at-time [not [hungry monkey]] (handle ?food eat ?time)])
+
+(defparameter *foods* '(monkey bananas) "Things that are edible (by somebody, maybe not the monkey!).")
+(defrule hungry-2 (:backward)
+  ;; things that are good to eat
+  IF (typecase ?candidate-food
+       (unbound-logic-variable
+	 ;; use hairy Conniver-like hacks to succeed once for each food.
+	 (loop for food in *foods*
+	       doing (with-unification
+		       (unify ?candidate-food food)
+		       (succeed))))
+       (otherwise
+	 ;; already bound, succeed if it's one of the known foods.
+	 (member ?candidate-food *foods*)))
+  THEN [good-to-eat ?candidate-food])
+
+
+
+;;;
+;;; Frame axioms.
+;;;
+
+(defrule frame-1 (:backward)
+  ;; handling objects in any manner not involving eating them leaves you unsatisfied.
+  IF [and (different-objects ?manner 'eat)
+	  [true-at-time [hungry monkey] ?time]]
+  THEN [true-at-time [hungry monkey] (handle ?object ?manner ?time)])
+
+(defrule frame-2 (:backward)
+  ;; Ditto, except negated.
+  IF [and (different-objects ?manner 'eat)
+	  [true-at-time [not [hungry monkey]] ?time]]
+  THEN [true-at-time [not [hungry monkey]] (handle ?object ?manner ?time)])
+
+(defrule frame-3 (:backward)
+  ;; walking doesn't affect hunger, either
+  IF [true-at-time [hungry monkey] ?time]
+  THEN [true-at-time [hungry monkey] (walk ?direction ?time)])
+
+(defrule frame-4 (:backward)
+  ;; ditto, except negated
+  IF [true-at-time [not [hungry monkey]] ?time]
+  THEN [true-at-time [not [hungry monkey]] (walk ?direction ?time)])
+
+(defrule frame-5 (:backward)
+  ;; walking around doesn't affect carrying-ness.
+  IF [true-at-time [carrying monkey ?object] ?time]
+  THEN [true-at-time [carrying monkey ?object] (walk ?direction ?time)])
+
+(defrule frame-6 (:backward)
+  ;; ditto, except negated
+  IF [true-at-time [not [carrying monkey ?object]] ?time]
+  THEN [true-at-time [not [carrying monkey ?object]] (walk ?direction ?time)])
+
+(defrule frame-7 (:backward)
+  ;; handing things doesn't affect their location (although
+  ;; handle followed by walk might...)
+  IF [true-at-time [at ?object ?place] ?time]
+  THEN [true-at-time [at ?object ?place] (handle ?another-object ?manner ?time)])
+
+(defrule frame-8 (:backward)
+  ;; walking doesn't affect location of things you're not carrying.
+  IF [and (different-objects ?object 'monkey)
+	  [true-at-time [not [carrying monkey ?object]] ?time]
+	  [true-at-time [at ?object ?place] ?time]]
+  THEN [true-at-time [at ?object ?place] (walk ?direction ?time)])
+
+
+
+;;;
+;;; Generating heuristic plans from a plan library.
+;;;
+
+(defrule heuristic-plan-for-not-hungry (:backward)
+  ;; find a food distinct from yourself, get colocated with it, and eat it
+  IF [and [good-to-eat ?food]
+	  (different-objects ?food 'monkey) ;?food instantiated in previous pattern
+	  [true-at-time [at ?food ?place] ?root]
+	  ;; may as well move monkey to food, since we'd have to do that to move the
+	  ;; food to the monkey, anyway.  A lot of this assumes that things only move
+	  ;; when the monkey touches them.
+	  [is-plan-for [at monkey ?place] ?at-plan ?root]]
+  THEN [is-heuristic-plan-for [not [hungry monkey]] (handle ?food eat (handle ?food take ?at-plan)) ?root])
+
+(defrule heuristic-plan-for-at (:backward)
+  ;; how to arrange for something other than the monkey to be somewhere
+  IF [and (different-objects ?object 'monkey)
+	  [true-at-time [at ?object ?other-place] ?root]
+	  [is-plan-for [at monkey ?other-place] ?go-get-it ?root]
+	  [is-plan-for [at monkey ?place] ?come-here-with-it (handle ?object take ?go-get-it)]]
+  THEN [is-heuristic-plan-for [at ?object ?place] (handle ?object drop ?come-here-with-it) ?root])
+
+(defrule heuristic-plan-for-monkey-at-tree-bottom-1 (:backward)
+  ;; plan for ground  tree-bottom
+  IF [true-at-time [at monkey ground] ?root]
+  THEN [is-heuristic-plan-for [at monkey tree-bottom] (walk right ?root) ?root])
+
+(defrule heuristic-plan-for-monkey-at-tree-bottom-2 (:backward)
+  ;; plan for tree-top  tree-bottom
+  IF [and [true-at-time [at monkey tree-top] ?root]
+	  [is-plan-for [at ladder tree-bottom] ?ladder-plan ?root]]
+  THEN [is-heuristic-plan-for [at monkey tree-bottom] (walk down ?ladder-plan) ?root])
+
+(defrule heuristic-plan-for-monkey-at-tree-top (:backward)
+  ;; plan to arrive at tree-top: get to the bottom of the tree with the ladder,
+  ;; drop the ladder, and then walk up it.
+  IF [and [is-plan-for [and [at ladder tree-bottom] [at monkey tree-bottom]]
+		       ?ladder-plan ?root]]
+  THEN [is-heuristic-plan-for [at monkey tree-top] (walk up ?ladder-plan) ?root])
+
+(defrule heuristic-plan-for-monkey-at-ground (:backward)
+  ;; plan to arrive at ground.  First go to tree-bottom, then walk left.
+  IF [is-plan-for [at monkey tree-bottom] ?at-tree-bottom ?root]
+  THEN [is-heuristic-plan-for [at monkey ground] (walk left ?at-tree-bottom) ?root])
+
+
+
+;;;
+;;; Initial monkey world.
+;;;
+
+(defun initial-monkey-world ()
+  ;; first clear the decks
+  (clear)
+  ;; insert basis facts about the monkey and bananas world
+  (tell [and [true-at-time [not [carrying monkey bananas]] now]
+	     [true-at-time [not [carrying monkey ladder]] now]
+	     [true-at-time [at monkey tree-bottom] now]
+	     [true-at-time [at ladder ground] now]
+	     [true-at-time [at bananas tree-top] now]
+	     [true-at-time [hungry monkey] now]])
+  t)
+
+;;; System 362.273, Joshua 17.3  159.9 rules/second.
+
+(defun benchmark-monkey-world (&optional (print-plan-p t) (print-time-p t))
+  (with-unbound-logic-variables (var)
+    (multiple-value-bind (plan rules time)
+	(benchmark-plan (initial-monkey-world)
+			var
+			`[is-heuristic-plan-for [not [hungry monkey]] ,var now])
+      (when print-time-p
+	(format t "~&~D rules, ~D seconds, ~A rules/second" rules time (float (/ rules time))))
+      (when print-plan-p 
+	;; this takes about half the execution time to print out the answer.
+	(format t "~&The plan is: ") (format-plan plan) (princ #\.))
+      (values plan rules time))))
+
+
+
+
+;;;
+;;; Blocks world.  See "Explicit Control of Reasoning", by Sussman et al.
+;;;  in Artificial Intelligence: An MIT Perspective.
+;;;
+;;;                       -OR-
+;;;
+;;;       How to Play with a Child's Blocks in 9 Rules.
+;;;
+;;;
+;;; Watch goal ordering:  Put Frotz Bar :And Put Mumble Quux  vs Put Mumble Quux :And Put Frotz Bar
+;;; Watch linear refinement work: Put Baz Bar :And Put Foo Mumble
+;;; Sussman anomaly: Put Baz Bar :And Put Foo Baz
+;;; joseph's anomaly: Put Foo Bar :And Put Bar Foo
+;;;
+
+;;; More-than-binary conjunctive subgoals don't work
+;;; Make the table an object? 
+;;; Get it to close the typeout window before doing any animation or refreshage.
+
+;;;
+;;; Predicate/model definitions.  
+;;;
+
+(define-predicate top-is-clear (block))
+;; table not clear, but anything will fit on top of it.  So top-is-clear and can-fit-on-top-of
+;; have to be separate concepts.
+(define-predicate can-fit-on-top-of (block1 block2)) 
+
+(define-predicate is-on (block1 block2))
+
+;;; These don't do with-output-as-presentation 'cause they're usually stack-consed.
+(define-predicate-method (say top-is-clear) (&optional (stream *standard-output*))
+  ;; how to say top-is-clear predications.
+  (with-statement-destructured (block) ()
+    (format stream "~A's top should be clear" block)))
+
+(define-predicate-method (say can-fit-on-top-of) (&optional (stream *standard-output*))
+  ;; how to say can-fit-on-top-of predications.
+  (with-statement-destructured (block1 block2) ()
+    (format stream "~A should fit on top of ~A" block1 block2)))
+
+(define-predicate-method (say is-on) (&optional (stream *standard-output*))
+  ;; how to say is-on predications.
+  (with-statement-destructured (block1 block2) ()
+    (format stream "~A should be on top of ~A" block1 block2)))
+
+(define-plan-operation put-on (top bottom time)
+  ;; the only plan operation in the blocks world: (put-on top bottom time)
+  ;; means put top on top of bottom at time.
+  :printer ((self stream)
+	    (format stream "putting ~A on ~A" (put-on-top self) (put-on-bottom self))))
+
+
+
+;;;
+;;; Rules true about just one situation, no operators.  Other patterns, like queries
+;;; about is-on and top-is-clear, are answered by inspecting the database's initial
+;;; situation, or by backward-chaining to the initial situation from some other
+;;; situation.
+;;;
+
+(defrule top-is-clear-means-can-fit-on-top-of (:backward)
+  ;; you can put things on top of things whose tops are clear
+  IF [true-at-time [top-is-clear ?candidate-bottom] ?situation]
+  THEN [true-at-time [can-fit-on-top-of ?candidate-top ?candidate-bottom] ?situation])
+
+;;; This "rule" could be implemented simply by puting
+;;; [can-fit-on-top-of ?anything table ?any-situation] in the database.
+;;; The rule implementation has the advantage of hanging around when you clear the database.
+
+(defrule always-room-on-table (:backward)
+  ;; there's always room on the table
+  IF t
+  THEN [true-at-time [can-fit-on-top-of ?anything table] ?situation])
+
+;;;
+;;; The meaning of the put-on operator, which changes situations.
+;;;
+
+(defrule put-on-causes-is-on (:backward)
+  ;; IF two blocks are not the same, one is clear and can hold the other
+  ;; THEN put-on is an appropriate action to get one on top of the other
+  ;; this is a partial definition of the operator put-on
+  IF [and (different-objects ?top-block ?bottom-block)
+	  [true-at-time [top-is-clear ?top-block] ?situation]
+	  [true-at-time [can-fit-on-top-of ?top-block ?bottom-block] ?situation]]
+  THEN [true-at-time [is-on ?top-block ?bottom-block] (put-on ?top-block ?bottom-block ?situation)])
+
+(defrule put-on-causes-top-is-clear (:backward)
+  ;; moving a block leaves its previous support clear
+  ;; more of the meaning of put-on
+  IF [and (different-objects ?old-bottom 'table)
+	  (different-objects ?old-bottom ?new-bottom)
+	  [true-at-time [is-on ?moving-top ?old-bottom] ?situation]]
+  THEN [true-at-time [top-is-clear ?old-bottom] (put-on ?moving-top ?new-bottom ?situation)])
+
+;;;
+;;; Frame axioms of the put-on operator (what doesn't change):
+;;;
+
+(defrule is-on-frame-axiom (:backward)
+  ;; Frame axiom about is-on and put-on: doing put-on doesn't affect
+  ;; is-on for any blocks but those involved
+  IF [and [true-at-time [is-on ?spectator-top ?spectator-bottom] ?situation]
+	  (different-objects ?spectator-top ?participant-top)] ;2nd to get ?spectator-top instantiated
+  THEN [true-at-time [is-on ?spectator-top ?spectator-bottom]
+		     (put-on ?participant-top ?participant-bottom ?situation)])
+
+(defrule top-is-clear-frame-axiom (:backward)
+  ;; Frame axiom about top-is-clear and put-on: doing put-on doesn't
+  ;; affect is-on for any blocks but those involved
+  IF [and (different-objects ?spectator ?bottom)
+	  [true-at-time [top-is-clear ?spectator] ?situation]]
+  THEN [true-at-time [top-is-clear ?spectator] (put-on ?top ?bottom ?situation)])
+
+
+
+;;;
+;;; Generating heuristic plans from a plan library.
+;;;
+
+(defrule heuristic-plan-for-on (:backward)
+  ;; a good plan for getting something to fit on top of something else
+  ;; is to make the top be clear (so the hand can reach it) and arrange space
+  ;; for it on the bottom.  Then do put-on.
+  IF [and (different-objects ?top ?bottom) ;good demo to leave this out!
+	  [is-heuristic-plan-for [and [top-is-clear ?top] [can-fit-on-top-of ?top ?bottom]]
+				 ?intermediate-plan
+				 ?root]]
+  THEN [is-heuristic-plan-for [is-on ?top ?bottom] (put-on ?top ?bottom ?intermediate-plan) ?root])
+
+(defrule heuristic-plan-for-can-fit-on-top-of (:backward)
+  ;; a good plan for can-fit-on-top-of is a top-is-clear plan.  
+  IF [is-heuristic-plan-for [top-is-clear ?maybe-bottom] ?plan ?root]
+  THEN [is-heuristic-plan-for [can-fit-on-top-of ?maybe-top ?maybe-bottom] ?plan ?root])
+
+(defrule heuristic-plan-for-top-is-clear (:backward)
+  ;; a good plan for getting top-is-clear is to put whoever's in the way on the table.
+  IF [and [true-at-time [is-on ?idiot-in-the-way ?victim] ?root]
+	  [is-heuristic-plan-for [is-on ?idiot-in-the-way table] ?plan ?root]]
+  THEN [is-heuristic-plan-for [top-is-clear ?victim] ?plan ?root])
+
+
+
+;;; Sussman anomaly: Put C B :And Put A C
+;;;
+;;; A situation to think about:
+;;;
+;;;   +---------+  +---------+
+;;;   |         |  |         |
+;;;   |   B     |  |  D      |
+;;;   |         |  |         |
+;;;   +---------+  +---------+
+;;;   +---------+  +---------+  +---------+
+;;;   |         |  |         |  |         |
+;;;   |   A     |  |   C     |  | E       |
+;;;   |         |  |         |  |         |
+;;;   +---------+  +---------+  +---------+
+;;;   +---------------------------------------------------------------------+
+;;;   |                   TABLE                                             |
+;;;   +---------------------------------------------------------------------+
+;;;
+
+(defun debugging-blocks-world ()
+  ;; stuff in predications that establish the above
+  (clear)
+  (tell [true-at-time [is-on a table] now])
+  (tell [true-at-time [is-on b a] now])
+  (tell [true-at-time [top-is-clear b] now])
+  (tell [true-at-time [is-on c table] now])
+  (tell [true-at-time [is-on d c] now])
+  (tell [true-at-time [top-is-clear d] now])
+  (tell [true-at-time [is-on e table] now])
+  (tell [true-at-time [top-is-clear e] now])
+  'done)
+
+;;; System 362.273, Joshua 17.3  215 rules/second
+(defun benchmark-blocks-world (&optional (print-plan-p t) (print-time-p t))
+  ;; how to benchmark the blocks world.
+  (with-unbound-logic-variables (var)
+    (multiple-value-bind (plan rules time)
+	(benchmark-plan (debugging-blocks-world)
+			var
+			`[is-plan-for [and [is-on c b] [is-on a c]] ,var now])
+      (when print-time-p
+	(format t "~&~D rules, ~D seconds, ~A rules/second" rules time (float (/ rules time))))
+      (when print-plan-p 
+	;; this takes about half the execution time to print out the answer.
+	(format t "~&The plan is: ") (format-plan plan) (princ #\.))
+      (values plan rules time))))
+
+;;; (time-values (benchmark-blocks-world)) returns first value of what
+;;; (benchmark-blocks-world) would return, and 4 more values: elapsed time, 
+;;; disk-wait time, page-fault count, and sequence-break time.
+
+
+
+;;;
+;;; So much for AI.  From here on, it's all user interface.
+;;;
+
+(defflavor demo-block (name (color tv:50%-gray) column row) ()
+  (:readable-instance-variables name column row)
+  (:writable-instance-variables column row)
+  (:initable-instance-variables name color column row)
+  (:required-init-keywords :name :column :row))
+
+(defmethod (sys:print-self demo-block) (stream depth slashify-p)
+  ;; necessary for presentation-to-command-translator to work.
+  (ignore depth slashify-p)
+  (format stream "~A" name))
+
+(defmethod (draw-block demo-block) (stream left top block-size)
+  ;; draw a picture of yourself.
+  (let* ((width               (1- block-size))
+	 (edge-thickness      2) ;bug if this is odd > 1...
+ 	 (half-edge-thickness (round edge-thickness 2)) ;center of wide line
+	 (edge-whitespace     1)
+	 (text-margin         1)
+	 (text-style          '(:swiss :bold :very-large))
+	 (inside-left         (+ left edge-whitespace))
+	 (inside-top          (+ top  edge-whitespace))
+	 (inside-right        (+ left width (- edge-whitespace)))
+	 (inside-bottom       (+ top width (- edge-whitespace))))
+    (dw:with-output-as-presentation (:stream stream
+				     :object self
+				     :single-box t
+				     :type (type-of self))
+      ;; draw the border, leaving whitespace 
+      (graphics:draw-rectangle (+ inside-left   half-edge-thickness)
+			       (+ inside-top    half-edge-thickness)
+			       (+ inside-right  (- half-edge-thickness))
+			       (+ inside-bottom (- half-edge-thickness))
+			       :stream stream :thickness edge-thickness :filled nil)
+      ;; fill with color, just the inside
+      (graphics:draw-rectangle (+ inside-left   edge-thickness)
+			       (+ inside-top    edge-thickness)
+			       (+ inside-right  (- edge-thickness))
+			       (+ inside-bottom (- edge-thickness))
+			       :stream stream :pattern color)
+      ;; draw in the name
+      (graphics:draw-string name
+			    (/ (+ inside-left inside-right) 2)
+			    (+ top (round width 2)) ;allow for 1/2 char height
+			    :attachment-x :center
+			    :character-style text-style
+			    :toward-x (- inside-right edge-thickness text-margin)
+			    :alu (if (dark-color-p color) :erase :draw)
+			    ;;:stretch-p t
+			    :stream stream))))
+
+(defun dark-color-p (color)
+  ;; whether this color is dark or not
+  (and (graphics::stipple-array-p color)
+       (> (graphics::stipple-array-gray-level color) 1/2)))
+
+(defun make-default-blocks ()
+  ;; initial blocks world.
+  (list (make-instance 'demo-block :name "A" :column 0 :row 0 :color tv:6%-gray)
+	(make-instance 'demo-block :name "B" :column 0 :row 1 :color tv:25%-gray)
+	(make-instance 'demo-block :name "C" :column 1 :row 0 :color tv:33%-gray)
+	(make-instance 'demo-block :name "D" :column 1 :row 1 :color tv:50%-gray)
+	(make-instance 'demo-block :name "E" :column 1 :row 2 :color tv:10%-gray)
+	(make-instance 'demo-block :name "F" :column 3 :row 0 :color tv:75%-gray)))
+
+(compile-flavor-methods demo-block)
+
+;;;
+;;; The robot hand.  The operations you can do with it are: draw-hand, sweep-hand-to,
+;;; lift-hand-to, open-hand, close-hand, and home-hand.
+;;;
+
+(defvar *motion-increment* 15 ;relatively fast but still smooth.
+  "How many pixels to move each step.")
+
+(defflavor hand (row column home-row home-column (contents nil) (cable-thickness 1)) ()
+  :readable-instance-variables)
+
+;;; used after instantiation
+(defmethod (set-home-position hand) (number-of-blocks)
+  (setq home-row number-of-blocks
+	home-column (floor number-of-blocks 2)))
+
+(defmethod (hand-reset hand) ()
+  ;; an "oops!" method
+  (setq contents nil
+	row home-row
+	column home-column))
+
+(defun-in-flavor (block-to-pixel-coords hand) (row-number column-number block-size sheet-height) 
+  ;; convert to pixel coordinates, so we can draw.
+  (declare (values left top))
+  (values (* column-number block-size)
+	  (- sheet-height (* (1+ row-number) block-size)))) ;1+ to get to top of block
+
+(defmethod (draw-hand hand) (stream block-size)
+  ;; Draw the hand.  The hand consists of a couple of downward-pointing triangles.
+  (multiple-value-bind (left top)
+      (block-to-pixel-coords row column block-size (send stream :inside-height))
+    (let ((center-x     (+ (round block-size 2) left))
+	  (jaw-top      (+ (round block-size 5) top))
+	  (jaw-bottom   (+ (round block-size 3) top))
+	  (tooth-bottom (if contents
+			    (+ (1- block-size) top) ;full hand
+			    (+ (round block-size 2) top))) ;empty hand
+	  (right-edge   (+ (1- block-size) left)))
+      ;; draw the jaw as 2 downward triangles, and enough cable to reach to the top of the
+      ;; block-sized square by which the hand is cicrcumscribed.  (The blting routines will
+      ;; leave cable-blots behind when moving the hand to give the impression of a moving cable.)
+      (graphics:draw-triangle center-x jaw-top center-x jaw-bottom left tooth-bottom
+			      :stream stream :alu :flip)
+      (graphics:draw-triangle center-x jaw-top center-x jaw-bottom right-edge tooth-bottom
+			      :stream stream :alu :flip)
+      (graphics:draw-line     center-x jaw-top center-x top
+			      :stream stream :thickness cable-thickness :alu :flip))))
+
+(defsubst directed-< (sign first second)
+  ;; direction-dependent termination condition
+  (if (plusp sign)
+      (< first second)
+      (> first second)))
+
+(defsubst directed- (sign first second)
+  ;; direction-dependent termination condition
+  (if (plusp sign)
+      ( first second)
+      ( first second)))
+
+;;; In 7.2, I'll use graphics:replacing-graphics-presentation, maybe?
+(defun-in-flavor (drag-bits hand) (sheet difference-array block-size
+					 from-row from-column to-row to-column
+					 &aux (sheet-height (send sheet :inside-height)))
+  (labels ((move-bits (sheet difference-array width height from-x from-y delta-x delta-y)
+	     ;; animation subroutine -- calculates difference between current image and desired one
+	     ;; on a background array and then updates the screen in one operation, for minimum flicker.
+	     ;; Nothing else can be in the affected rectangle.
+	     (let* ((to-x   (+ from-x delta-x))
+		    (to-y   (+ from-y delta-y))
+		    ;; (min-x, min-y) is upper-left corner of affected rectangle
+		    (min-x  (min from-x to-x))
+		    (min-y  (min from-y to-y))
+		    ;; wider & higher  width & height of affected rect
+		    (wider  (+ width (abs delta-x)))	
+		    (higher (+ height (abs delta-y))))
+	       ;; copy existing bits to difference array, xor in translated bits,
+	       ;; and copy back to original
+	       (send sheet :bitblt-from-sheet tv:alu-seta wider higher min-x  min-y
+		     difference-array min-x min-y)
+	       (send sheet :bitblt-from-sheet tv:alu-xor  width height from-x from-y
+		     difference-array to-x  to-y)
+	       (send sheet :bitblt            tv:alu-xor  wider higher
+		     difference-array min-x min-y min-x min-y)))
+	   (move-cable-sideways (sheet from-x from-y delta-x cable-left-offset)
+	     ;; fancy way of saying, "Move this (thick) line over delta-x pixels."
+	     (let ((cable-left-x (+ from-x cable-left-offset)))
+	       ;; Could reduce cable flicker by calling move-bits here, I suppose.
+	       ;; Doesn't seem to have much effect, though.
+	       ;;(move-bits sheet difference-array cable-thickness from-y cable-left-x 0 delta-x 0)
+	       (send sheet :bitblt-within-sheet tv:alu-xor cable-thickness from-y cable-left-x 0
+		     (+ cable-left-x delta-x) 0)
+	       (send sheet :bitblt-within-sheet tv:alu-xor cable-thickness from-y cable-left-x 0
+		     cable-left-x 0)))
+	   (hand-height (block-size)
+	     ;; higher if carrying a block
+	     (if contents
+		 (* block-size 2)
+		 block-size))
+	   (increment (from to)
+	     ;; figure out which way we're going.
+	     (if (< from to)
+		 *motion-increment*
+		 (- *motion-increment*))))
+    (multiple-value-bind (from-x from-y)
+	(block-to-pixel-coords from-row from-column block-size sheet-height)
+      (multiple-value-bind (to-x to-y)
+	  (block-to-pixel-coords to-row to-column block-size sheet-height)
+	;; first move vertically (this makes home-hand simple)
+	(let ((increment (increment from-y to-y)))
+	  (if (plusp increment)
+	      ;; moving downward, want to do it in 1 blt and leave cable behind us
+	      ;; -- assumes increment is more than height of cable at top of block
+	      (loop with height = (- (hand-height block-size))	;be nice to bitblt
+		    for y from from-y by increment
+		    while (< (+ y increment) to-y)
+		    doing (send sheet :bitblt-within-sheet tv:alu-seta block-size height from-x y
+				from-x (+ y increment))
+		    finally
+		      (unless (= to-y y)
+			;; final partial increment is necessary
+			(send sheet :bitblt-within-sheet tv:alu-seta block-size height from-x y
+			      from-x to-y)))
+	      ;; moving upward, gotta use move-bits, or else we leave pieces of block behind us!
+	      (loop with height = (hand-height block-size)
+		    for y from from-y by increment
+		    while (> (+ y increment) to-y)
+		    doing (move-bits sheet difference-array block-size height from-x y 0 increment)
+		    finally
+		      (unless (= to-y y)
+			;; final partial increment is necessary
+			(move-bits sheet difference-array block-size height from-x y 0 (- to-y y))))))
+	;; then move horizontally 
+	(loop with increment = (increment from-x to-x)
+	      with height = (hand-height block-size)
+	      with cable-left-offset = (- (round block-size 2) (round cable-thickness 2))
+	      for x from from-x by increment
+	      while (directed-< increment (+ x increment) to-x)
+	      doing (move-bits sheet difference-array block-size height x to-y increment 0)
+		    (move-cable-sideways sheet x to-y increment cable-left-offset)
+	      finally
+		(unless (= to-x x)
+		  ;; final partial increment is necessary
+		  (setq increment (- to-x x))
+		  (move-bits sheet difference-array block-size height x to-y increment 0)
+		  (move-cable-sideways sheet x to-y increment cable-left-offset)))))))
+
+(defmethod (sweep-hand-to hand) (stream difference-array block-size new-column)
+  ;; move the hand horizontally & update its position.
+  (drag-bits stream difference-array block-size row column row new-column)
+  (setq column new-column))
+
+(defmethod (lift-hand-to hand) (stream difference-array block-size new-row)
+  ;; move the hand vertically and update its position.
+  (drag-bits stream difference-array block-size row column new-row column)
+  (setq row new-row))
+
+(defmethod (home-hand hand) (stream difference-array block-size)
+  ;; move hand to home position -- particularly simple because of drag-bits's
+  ;; commitment to vertical motion ahead of horizontal motion.
+  (drag-bits stream difference-array block-size row column home-row home-column)
+  (setq row home-row column home-column))
+
+;;; Use difference-array for these 2?  (No, they need a graphics stream.)
+(defmethod (open-hand hand) (stream block-size)
+  ;; check if holding an unsupported block.  Alter the block's coordinates.
+  ;; xor out the old hand, drop what it's holding, and draw in the new hand
+  (draw-hand self stream block-size)
+  (setq contents nil)
+  (draw-hand self stream block-size))
+
+(defmethod (close-hand hand) (stream block-size block)
+  ;; check if no block in jaws
+  ;; xor out the old hand, pick up what we're told, and draw in the new hand
+  (draw-hand self stream block-size)
+  (setq contents block)
+  (draw-hand self stream block-size))
+
+(compile-flavor-methods hand)
+
+;;;
+;;; Window system code.
+;;;
+
+(dw:define-program-framework blocks-demo
+  ;; the blocks world demo
+  :pretty-name "Blocks World"
+  :inherit-from (jericho:joshua-demo-program)
+  :command-definer t
+  :command-table (:inherit-from '("Joshua-Demo-Program") :kbd-accelerator-p t)
+  :top-level (blocks-demo-top-level)
+  :state-variables ((blocks (make-default-blocks))
+		    (number-of-stack-overflows 0)
+		    (number-columns)		;rows & cols are 0-based.
+		    (number-rows)
+		    (hand))
+  :other-defflavor-options (:readable-instance-variables
+			     (:default-init-plist :title-string "Blocks World Planning Demo"))
+  :panes ((interactor :interactor
+		      :margin-components '((dw:margin-ragged-borders :thickness 1)
+					   (dw:margin-scroll-bar :history-noun "interaction"))
+		      :default-character-style '(:swiss :roman :normal)
+		      :height-in-lines 4)
+	  (title :title
+		 :margin-components '((dw:margin-white-borders :thickness 0))
+		 :default-character-style '(:dutch :bold :large)
+		 :redisplay-function #'jericho:redisplay-joshua-demo-program-title
+		 :height-in-lines 1
+		 :redisplay-after-commands nil)
+	  (BLOCKS-DISPLAY :DISPLAY
+			  :redisplay-function 'redisplay-blocks
+			  :TYPEOUT-WINDOW T)
+	  (BLOCKS-GOALS :DISPLAY
+			:default-character-style '(:swiss :roman :normal)
+			:more-p nil
+			:margin-components `((dw:margin-ragged-borders :thickness 1)
+					     (dw:margin-scroll-bar :history-noun "goals")
+					     (dw:margin-scroll-bar :margin :bottom
+								   :history-noun "goal width")
+					     (dw:margin-label :margin :top
+							      ;;:background-gray ,tv:50%-gray
+							      :centered-p t
+							      :style (:swiss :bold :small)
+							      :box :inside
+							      :string "Reasoning Goals")))
+	  (BLOCKS-PROGRAM :DISPLAY
+			  :more-p nil
+			  :default-character-style '(:swiss :roman :normal)
+			  :margin-components `((dw:margin-ragged-borders :thickness 1)
+					       (dw:margin-scroll-bar :history-noun "program")
+					       (dw:margin-label :margin :top
+								;;:background-gray ,tv:50%-gray
+								:centered-p t
+								:style (:swiss :bold :small)
+								:box :inside
+								:string "Robot Program")))
+	  (BLOCKS-COMMAND-MENU :COMMAND-MENU
+			       :default-character-style '(:swiss :roman :large)
+			       :margin-components '((dw:margin-ragged-borders :thickness 1)
+						    (dw:margin-white-borders :thickness 3)
+						    (dw:margin-label :margin :top
+								     ;;:background-gray ,tv:50%-gray
+								     :centered-p t
+								     :style (:swiss :bold :small)
+								     :box :inside
+								     :string "Blocks Demo Commands"))
+			       :CENTER-P T
+			       :MENU-LEVEL :BLOCKS-COMMAND-MENU))
+  :configurations '((BLOCKS-demo
+		      (:LAYOUT
+			(BLOCKS-demo :column title top interactor)
+			(top :ROW LEFT-COLUMN RIGHT-COLUMN)
+			(LEFT-COLUMN :COLUMN BLOCKS-DISPLAY BLOCKS-COMMAND-MENU)
+			(RIGHT-COLUMN :COLUMN BLOCKS-GOALS BLOCKS-PROGRAM))
+		      (:SIZES
+			(BLOCKS-demo (title 1 :lines) (interactor 4 :lines) :then (top :even))
+			(top (LEFT-COLUMN 0.6) :THEN (RIGHT-COLUMN :EVEN))
+			(LEFT-COLUMN
+			  (BLOCKS-COMMAND-MENU :ASK-WINDOW SELF
+					       :SIZE-FOR-PANE BLOCKS-COMMAND-MENU)
+			  :THEN (BLOCKS-DISPLAY :EVEN))
+			(RIGHT-COLUMN			 
+			  (BLOCKS-GOALS 0.7)
+			  :THEN (BLOCKS-PROGRAM :EVEN))))))
+
+(defmethod (blocks-demo-top-level blocks-demo) (&rest args)
+  (let ((*package* (pkg-find-package "plan")))
+    (jericho:with-stack-overflows 2
+      (apply #'dw:default-command-top-level self
+	     :unknown-accelerator-is-command t
+	     args))))
+
+(defmethod (make-instance blocks-demo :after) (&rest ignore)
+  (let ((number-of-blocks (length blocks)))
+    (setq number-columns number-of-blocks)
+    (setq number-rows (1+ number-of-blocks))
+    (setq hand (make-instance 'hand))
+    (set-home-position hand number-of-blocks)
+    (hand-reset hand)))
+
+(defun-in-flavor (clear-goals-&-program blocks-demo) ()
+  ;; subroutine to clear the goal and program panes
+  (jericho:redisplay-pane self 'blocks-goals t)
+  (jericho:redisplay-pane self 'blocks-program t))
+
+(defmacro-in-flavor (with-goal-trace-stream blocks-demo)
+		    ((&optional (stream '(dw:get-program-pane 'blocks-goals))) &body body)
+  ;; execute body so that any queries will type out to some stream, usually the goals pane
+  `(let ((*goal-trace-stream* ,stream))
+     ,@body))
+
+(defun-in-flavor (who-is-at blocks-demo) (row column)
+  ;; linear search for a block at these coordinates.
+  (loop for block in blocks
+	when (and (= (demo-block-column block) column)
+		  (= (demo-block-row block) row))
+	  return block))
+
+(defun-in-flavor (calculate-block-size blocks-demo) (stream)
+  ;; see how big the blocks can be.  A DW "pseudo-feature" wants you to call this from under
+  ;; a with-own-coordinates.  With-own-coordinates changes the height of the stream to be an
+  ;; integer number of lines, allegedly to make scrolling easier.
+  (declare (values block-size stream-width stream-height))
+  (multiple-value-bind (stream-width stream-height) (send stream :inside-size)
+    (let ((number-of-blocks (length blocks)))
+      ;; fix it so you can stack the blocks any way you want, and they all fit
+      ;; and still leave room for the hand
+      (values (floor (min (/ stream-width number-of-blocks)
+			  (/ stream-height (1+ number-of-blocks)))) ;allow for hand
+	      stream-width
+	      stream-height))))
+
+;;; Always seems to think the typeout window is deexposed?
+(defmethod (redisplay-blocks blocks-demo) (stream)
+  ;; re-draw the blocks, hand, etc. in the display pane.
+  (dw:remove-window-typeout-window (dw:get-program-pane 'blocks-display))
+  (dw:with-own-coordinates (stream :clear-window nil :erase-window t)
+    ;; clear the viewport and use graphics coords relative to current viewport
+    (multiple-value-bind (block-size width height) (calculate-block-size stream)
+      (ignore width)
+      ;; loop over the columns
+      (loop for column-number below number-columns
+	    for left-edge = (* block-size column-number)
+	    ;; loop over the rows
+	    do (loop for row-number below number-rows
+		     for top-edge = (- height (* (1+ row-number) block-size))	;1+ to get top of block
+		     for block = (who-is-at row-number column-number)
+		     ;; continue through top of tower at this position
+		     while block
+		     ;; draw this block
+		     do (draw-block block stream left-edge top-edge block-size)))
+      ;; now draw the hand
+      (draw-hand hand stream block-size))))
+
+(defun-in-flavor (blocks-world-facts blocks-demo) ()
+  ;; figure out current state of world from blocks instance variable,
+  ;; and put a bunch of assertions in the database to describe that.
+  (clear)
+  ;; loop over columns, finding blocks at base.
+  (loop for column-number below number-columns
+	for bottom-of-column = (who-is-at 0 column-number)
+	when bottom-of-column
+	  ;; found somebody on the table. loop over guys on top of him.
+	  do (loop for current-row from 0
+		   for previous-block = 'table then current-block
+		   for current-block = bottom-of-column then (who-is-at current-row column-number)
+		   while current-block
+		   ;; first guy's on the table, everybody else stacks
+		   doing (tell `[true-at-time [is-on ,current-block ,previous-block] now])
+		   finally
+		     ;; top guy is clear
+		     (tell `[true-at-time [top-is-clear ,previous-block] now]))))
+
+(defmacro-in-flavor (with-stack-overflows blocks-demo) (max-overflows &body body
+								      &environment env)
+  ;; run body in an environment that will grow stacks a bounded number of times.
+  (once-only (max-overflows &environment env)
+    `(condition-bind ((sys:pdl-overflow
+			#'(lambda (condition)
+			    (when (< number-of-stack-overflows ,max-overflows)
+			      ;; it's still ok to grow the stack, so note it and do it.
+			      ;; otherwise, we decline to handle it and look for other handlers
+			      (incf number-of-stack-overflows)
+			      (send condition :proceed :grow-pdl)))))
+       ,@body)))
+
+(defmacro-in-flavor (with-compatible-raster-stack-array blocks-demo) ((var window) &body body
+								      &environment env)
+  ;; execute body with var bound to a raster array sized to fit window and "fit to blt"
+  (let ((screen-array         (gensym))
+	(screen-array-zl-type (gensym))
+	(elements-per-word    (gensym))
+	(bitblt-able-width    (gensym)))
+    (once-only (window &environment env)
+      `(let* ((,screen-array         (send ,window :screen-array)) ;attempt to be nice to color screens
+	      (,screen-array-zl-type (zl:array-type ,screen-array))
+	      ;; cribbed from somewhere in the system, I forget where.  (something about bitblt)
+	      (,elements-per-word    (ceiling (/ 32 (or (cdr (assoc ,screen-array-zl-type
+								    sys:array-bits-per-element))
+							32))))
+	      (,bitblt-able-width    (* (ceiling (send ,window :width) ,elements-per-word)
+					,elements-per-word)))
+	 (sys:with-raster-stack-array (,var ,bitblt-able-width (send ,window :height)
+				       :type ,screen-array-zl-type)
+	   ,@body)))))
+
+;;; Now, new and improved with rudimentary hand-motion optimization!
+(defun-in-flavor (animate-plan blocks-demo) (plan)
+  ;; animation of plan.  plan is either 'now, in which case we do nothing,
+  ;; or a bunch of nested put-on operations: (put-on <top> <bottom> <previous-plan>).
+  (cond ((nlistp plan)
+	 ;; trivial plan
+	 (format (dw:get-program-pane 'blocks-program) "~&Do nothing."))
+	(t
+	  ;; non-trivial plan, so execute it
+	  (labels ((clear-table-column ()
+		     ;; find column number of nearest place on table where there's some free space.
+		     ;; (Would be more correct to consider next direction of motion.)
+		     (loop with initial-column = (hand-column hand)
+			   ;; check if over some free space now
+			   initially (unless (who-is-at 0 initial-column) (return initial-column))
+			     ;; check both to the right and to the left.
+			     ;; (Consider next direction of motion?)
+			   for column-to-left downfrom (1- initial-column)
+			   for column-to-right from (1+ initial-column)
+			   ;; until both are out of bounds
+			   until (and (< column-to-left 0) ( number-columns column-to-right))
+			   ;; succeed if you find some space, remembering who's out of bounds.
+			   unless (or (< column-to-left 0) (who-is-at 0 column-to-left))
+			     return column-to-left
+			   unless (or ( number-columns column-to-right) (who-is-at 0 column-to-right))
+			     return column-to-right
+			   finally (error "The table is full.")))
+		   (clearance-height-at (column)
+		     ;; how high you have to be to just clear this column
+		     (loop for row from 0
+			   for block = (who-is-at row column)
+			   unless block return row))
+		   (how-high-to-go (dest-column gonna-pick-up-p)
+		     ;; how high to raise the hand to get to dest-column
+		     ;; assumes hand is just above the source column
+		     (loop with initial-column = (hand-column hand)
+			   with increment = (if (< initial-column dest-column) 1 -1)
+			   for column = initial-column then (+ column increment)
+			   while (directed- increment column dest-column)
+			   for height = (clearance-height-at column)
+			   ;; if we're gonna pick up block in initial column, lower his max height by 1.
+			   doing (when (and (= column initial-column) gonna-pick-up-p) (decf height)) 
+			   maximize height into answer
+				 ;; allow for load
+			   finally (return (if (hand-contents hand) (1+ answer) answer)))) 
+		   (execute-put-on (top bottom stream size difference-array &aux new-row new-column)
+		     ;; expand this into a series of hand-motions.  Run-time optimization of not doing
+		     ;; anything if the put-on is already true?  (Another lexical function already-on-p,
+		     ;; that checks that their columns are the same and row of bottom = row of top - 1)
+		     ;; First, get the top guy in the gripper and lift him out of the way.
+		     (open-hand hand stream size) ;occasionally left open by c-Abort's.
+		     (lift-hand-to hand stream difference-array size
+				   (how-high-to-go (demo-block-column top) nil))
+		     (sweep-hand-to hand stream difference-array size (demo-block-column top))
+		     ;; just above block
+		     (lift-hand-to hand stream difference-array size (1+ (demo-block-row top))) 
+		     (close-hand hand stream size top)
+		     ;; now move over the target and lower to it
+		     (cond ((eq bottom 'table)
+			    ;; trying to put a block on the table
+			    (setq new-column (clear-table-column)
+				  new-row    0))
+			   (t
+			     ;; trying to put a block on another block.
+			     (setq new-column (demo-block-column bottom)
+				   new-row    (1+ (demo-block-row bottom)))))
+		     ;; minimum raising
+		     (lift-hand-to hand stream difference-array size (how-high-to-go new-column t)) 
+		     (sweep-hand-to hand stream difference-array size new-column)
+		     (lift-hand-to hand stream difference-array size (1+ new-row)) ;just above support
+		     ;; let go and go to top row.
+		     (open-hand hand stream size)
+		     (setf (demo-block-row top)    new-row
+			   (demo-block-column top) new-column))
+		   (optimize-plan (flat-plan)
+;;; This is correct, but the foibles of the planning process are more obvious 
+;;; if you leave it out.
+;		     ;; look for things like (put-on a c) (put-on a table), and optimize it
+;		     ;; into (put-on a table).  (The STRIPS-style planning used in the Sussman
+;		     ;; anomaly case does this.) 
+;		     (loop for rest-plan on flat-plan
+;			   for (nil top bottom) = (first rest-plan)
+;			   for (nil next-top next-bottom) = (second rest-plan)
+;			   when (eql top next-top)
+;			     ;; can optimize out the first put-on (this works even if we're optimizing
+;			     ;; out the first put-on, I think.)
+;			     do (format (dw:get-program-pane 'jericho:demo-interactor)
+;                                       "~&Optimized ~S, ~S into ~S."
+;					(first rest-plan) (second rest-plan) (second rest-plan))
+;				(setf (first rest-plan) (second rest-plan)
+;				      (rest rest-plan)  (cddr rest-plan))
+;			   finally (return flat-plan)))
+		     flat-plan)
+		   (execute-plan (plan)
+		     ;; display the plan in the program pane and then run it
+		     (let* ((display-pane (dw:get-program-pane 'blocks-display))
+			    (program-pane (dw:get-program-pane 'blocks-program))
+			    (flat-version (optimize-plan (flatten-plan plan))))
+		       (dw:with-output-truncation (program-pane :vertical nil :horizontal t)
+			 (loop for (nil top bottom) in flat-version
+			       ;; print the plan in the program pane.  this should be done with
+			       ;; replayable output, so each put-on can be expanded while
+			       ;; being executed.
+			       doing (format program-pane "~&Put ~A on ~A." top bottom)))
+		       (tv:with-temporary-sheet-bit-raster
+			 (difference-array display-pane
+					   (send display-pane :width)
+					   (send display-pane :height))
+			 (dw:with-own-coordinates (display-pane :clear-window nil)
+			   (loop with block-size = (calculate-block-size display-pane)
+				 for (nil top bottom) in flat-version
+				 ;; for each put-on, expand, execute, & update state.
+				 doing (execute-put-on top bottom display-pane
+						       block-size difference-array)
+				 finally (home-hand hand display-pane difference-array block-size)))))))
+	    (execute-plan plan))))
+  ;; keep the database up-to-date with the side-effects we just performed.
+  (blocks-world-facts))
+
+(defun-in-flavor (failure-plan blocks-demo) (&rest ignore)
+  ;; what to do if you blow it.
+  (format (dw:get-program-pane 'blocks-program)
+	  "~&I don't know how to do that.  I'm so worthless...")
+  (beep))
+
+(defmacro-in-flavor (achieve-goal blocks-demo) (plan-variable goal &optional (stack-overflows 1)
+							      &environment env)
+  ;; useful for writing the bodies of blocks world commands.
+  (once-only (goal &environment env)
+    `(with-stack-overflows ,stack-overflows
+       ;; clear goal & program panes
+       (clear-goals-&-program)
+       ;; make Joshua database reflect current state of world
+       (blocks-world-facts)
+       (with-goal-trace-stream ()
+	 (catch ,goal
+	   ;; ask the goal, with goal tracing on and a catch tag to exit to
+	   (ask (make-predication (list 'is-plan-for ,goal ,plan-variable 'now)) ;trouble with double `
+		#'(lambda (ignore)
+		    (throw ,goal (animate-plan ,plan-variable))))
+	   ;; in case we lose
+	   (failure-plan ,goal))))))
+
+;;;
+;;; Blocks world commands.
+;;;
+
+(define-blocks-demo-command (com-reset-blocks :menu-accelerator t :menu-level :BLOCKS-COMMAND-MENU)
+    ((clear-history 'boolean
+		    :prompt "clear history"
+		    :default nil
+		    :documentation
+		    "Whether to clear interactor's history."))
+   ;; out with the old blocks, in with the new
+   (setq blocks (make-default-blocks))
+   (let ((number-of-blocks (length blocks)))
+     (setq number-columns number-of-blocks)
+     (setq number-rows (1+ number-of-blocks))
+     (set-home-position hand number-of-blocks))
+   (hand-reset hand)
+   ;; tell Joshua about them
+   (blocks-world-facts)
+   ;; redisplay
+   (when clear-history
+     (jericho:redisplay-pane self'blocks-goals t)
+     (jericho:redisplay-pane self'blocks-program t)))
+
+(define-blocks-demo-command (com-show-database :menu-accelerator t :menu-level :blocks-command-menu) ()
+   ;; show everything it knows
+   (blocks-world-facts)
+   ji::(without-joshua-tracing
+	 (condition-bind ((model-cant-handle-query
+			    #'(lambda (ignore)
+				(throw 'ask-variable-predicate-escape nil))))
+	   (ask [? . ?]
+		;; This isn't right.  It works for predications which store and
+		;; return their canonical predications, but not for other kinds.
+		#'(lambda (backward-support)
+		    (when (and (consp backward-support)
+			       (consp (rest backward-support))
+			       (predicationp (third backward-support)))
+		      (select (second backward-support)
+			(*true*
+			 (print (third backward-support)))
+			(*false*))))
+		:do-backward-rules nil))))
+
+(defun-in-flavor (goal-from-command blocks-demo) (cmnd)
+  ;; given a command, construct a corresponding goal, possibly conjunctive
+  (loop for command = cmnd then (loop for rest on command when (eq (car rest) :and) return (cadr rest))
+	while command
+	;; for each element of the cp command, build a goal and put it in the list
+	if (eq (first command) 'com-put-block)
+	  collect `[is-on ,(second command) ,(third command)] into goals
+	else if (eq (first command) 'com-clear-block)
+	       collect `[top-is-clear ,(second command)] into goals
+	else do (error "~&Can't get goal from command ~S." command)
+	finally
+	  ;; build the final goal, checking if we've got a conjunct or not.
+	  (return (if (= (length goals) 1)
+		      (first goals)
+		      `[and ,@goals]))))
+
+(define-blocks-demo-command (com-put-block :menu-accelerator t :menu-level :BLOCKS-COMMAND-MENU)
+    ((top `((member ,@blocks))
+	  :prompt "top"
+	  :documentation "Block to go on top.")
+     (bottom `(token-or-type (("Table" . Table))
+			     ((member ,@blocks)))
+	     :default 'table
+	     :confirm t
+	     :prompt "on bottom"
+	     :documentation "Block to go on bottom, or the table.")
+     &key
+     (and 'cp:command
+	  :default nil
+	  :prompt "and"
+	  :documentation "Another part of a conjunctive query."))
+   ;; put one block on top of another
+   (with-unbound-logic-variables (plan)
+     (achieve-goal plan (goal-from-command `(com-put-block ,top ,bottom :and ,and)))))
+
+(define-blocks-demo-command (com-clear-block :menu-accelerator t :menu-level :BLOCKS-COMMAND-MENU)
+    ((block `((member ,@blocks))
+       :prompt "top of block"
+       :confirm t
+       :documentation "Block whose top to clear.")
+     &key
+     (and 'cp:command
+	  :default nil
+	  :prompt "and"
+	  :documentation "Another part of a conjunctive query."))
+   ;; clear the top of some block
+   (with-unbound-logic-variables (plan)
+     (achieve-goal plan (goal-from-command `(com-clear-block ,block :and ,and)))))
+
+;;; Put on left.
+(define-presentation-to-command-translator
+  put-block-translator
+   (demo-block					;I don't understand why this works.
+     :tester ((block)
+	      ;; this looks kludgey
+	      (and (boundp 'dw:*program*)
+		   (typep dw:*program* 'blocks-demo)
+		   (member block (blocks-demo-blocks dw:*program*))))
+     :gesture :left)
+   (block)
+  (values `(com-put-block ,block)
+	  ;; allow other arg to be edited
+	  'cp:command
+	  :activate nil))
+
+;;; Clear on middle.
+(define-presentation-to-command-translator
+  clear-block-translator
+   (demo-block					;I don't understand why this works.
+     :tester ((block)
+	      ;; this looks kludgey
+	      (and (boundp 'dw:*program*)
+		   (typep dw:*program* 'blocks-demo)
+		   (member block (blocks-demo-blocks dw:*program*))))
+     :gesture :middle)
+   (block)
+  (values `(com-clear-block ,block)
+	  ;; allow arg to be edited
+	  'cp:command
+	  :activate nil))
+
+;;;
+;;; Now compile away!
+;;;
+
+(compile-flavor-methods blocks-demo)

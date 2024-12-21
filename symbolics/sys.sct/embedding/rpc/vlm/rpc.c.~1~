@@ -1,0 +1,759 @@
+/*-*- Mode: C; Package: C-USER; Search-List: RPC -*- */
+/*>
+ *> *****************************************************************************************
+ *> ** (c) Copyright 1993-1988 Symbolics, Inc.  All rights reserved.
+ *> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+ *>
+ *>    The software, data, and information contained herein are proprietary 
+ *> to, and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+ *> to keep such software, data, and information confidential and to preserve 
+ *> them as trade secrets.  They are given in confidence by Symbolics pursuant 
+ *> to a written license agreement, and may be used, copied, transmitted, and 
+ *> stored only in accordance with the terms of such license.
+ *> 
+ *> Symbolics, Symbolics 3600, Symbolics 3670 (R), Symbolics 3675 (R), Symbolics
+ *> 3630, Symbolics 3640, Symbolics 3645 (R), Symbolics 3650 (R), Symbolics 3653,
+ *> Symbolics 3620 (R), Symbolics 3610 (R), Symbolics Common Lisp (R),
+ *> Symbolics-Lisp (R), Zetalisp (R), Genera (R), Wheels (R), Dynamic Windows (R),
+ *> SmartStore (R), Semanticue (R), Frame-Up (R), Firewall (R), Document Examiner (R),
+ *> Delivery Document Examiner, "Your Next Step in Computing" (R), Ivory, MacIvory,
+ *> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+ *> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal (R),
+ *> Symbolics Prolog, Symbolics Fortran (R), CLOE (R), CLOE Application Generator,
+ *> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia, Joshua,
+ *> Statice (R), and Minima are trademarks of Symbolics, Inc.
+ *> 
+ *> RESTRICTED RIGHTS LEGEND
+ *>    Use, duplication, and disclosure by the Government are subject to restrictions 
+ *> as set forth in subdivision (c)(1)(ii) of the Rights in Technical Data and Computer 
+ *> Software Clause at DFAR 52.227-7013.
+ *> 
+ *>      Symbolics, Inc.
+ *>      6 Concord Farms
+ *>      555 Virginia Road
+ *>      Concord, Massachusetts 01742-2727
+ *>      United States of America
+ *>      508-287-1000
+ *>
+ *> *****************************************************************************************
+ *>
+ */
+
+/* This file is SYS:EMBEDDING;RPC;GENERIC;RPC.C. */
+
+/* RPC support.
+   This file contains both server stuff and client stuff, but no specific agent.
+   The conditionals are a bitch, but easier to deal with than parallel sources. */
+
+#include "RPC.h"
+#include "stdagent.h"
+
+
+#ifdef RPC_OS_MAC
+
+#include <Files.h>
+#include <Resources.h>
+#include <OSUtils.h>
+#include "TrapUtils.h"
+
+#else
+
+#ifndef RPC_OS_UNIX
+
+#include <stdlib.h>
+#include <string.h>
+
+#endif
+#endif
+
+#ifdef RPC_OS_MS_DOS
+
+#include <time.h>
+
+#endif
+
+/* What to do when life gets you down */
+#ifndef lose
+#define lose Debugger()
+#endif
+
+/* Spend up to 1/6 second at a burst handling incoming RPCs */
+#define rpc_poll_quantum 10
+
+#ifdef RPC_OS_MAC
+
+LongInt SystemClock ()
+{
+  return(TickCount());
+}
+
+#endif
+
+#ifdef RPC_OS_UNIX
+
+LongInt SystemClock ()
+{
+  return(time(0));
+}
+
+Debugger ()
+{
+  /* This will create a core dump for later debugging */
+  abort();
+}
+
+#endif
+
+#ifdef RPC_OS_MS_DOS
+
+LongInt SystemClock ()
+{
+  return(clock() / 2);
+}
+
+Debugger ()
+{
+  ClearText();
+  printf("Error!");
+  exit(1);
+}
+
+#endif
+
+#ifndef RPC_EXTERNAL_AGENTS
+
+/* Table in which we record the remote modules for which we have servers */
+
+#include "Modules.h"
+#include "stdagent.h"
+
+ModuleDefinition *ModuleTable;		/* Table of loaded modules */
+LongInt ModuleTableSize;			/* Current number of entries */
+
+XDRAgent DefaultXDRAgent;
+
+/* Unique transaction numbers */
+
+LongInt TransactionCounter;
+
+LongInt NextTransactionID()
+{
+  return(++TransactionCounter);
+}
+
+#ifdef RPC_USE_PROTOTYPES
+static void InitializeModules PROTO_ARGS((void));
+static OSErr MoreModules PROTO_ARGS((void));
+static OSErr FindModule PROTO_ARGS((LongInt module_number, LongInt module_version, 
+				    ModuleDefinition** ret_module, 
+				    LongInt* ret_lowest_version, LongInt* ret_highest_version));
+static ModuleDefinition* FindModuleSlot PROTO_ARGS((void));
+static void CallModule PROTO_ARGS((XDRAgent agent, 
+				   LongInt module_number, LongInt module_version, LongInt entry_number,
+				   LongInt TransactionID, XDRBlock block, LongInt* pointer, 
+				   LongInt* limit));
+static OSErr RemoteCallError PROTO_ARGS((XDRAgent agent, XDRBlock call_block, 
+					 LongInt TransactionID, OSErr err,
+					 LongInt ActualModuleVersion, LongInt LowestModuleVersion,
+					 LongInt HighestModuleVersion));
+extern void PollRPC PROTO_ARGS((void));
+#endif
+
+
+
+static void InitializeModules ()
+{ register short i;
+  OSErr err;
+
+  ModuleTableSize = 5;
+  err = AllocateMemory(sizeof(*ModuleTable) * ModuleTableSize, (void**)&ModuleTable);
+  if (err) {		      /* Can't happen */
+#ifdef RPC_OS_UNIX
+    exit(-1);
+#else
+    ExitToShell();
+#endif
+  }
+  for(i=0; i < ModuleTableSize; i++)
+    ModuleTable[i].type = NoModule;
+}
+
+static OSErr MoreModules ()
+{ register short i;
+  ModuleDefinition* old = ModuleTable;
+  OSErr err;
+
+  err = AllocateMemory(sizeof(*ModuleTable) * ModuleTableSize * 2, (void**)&ModuleTable);
+  if (err) return(err);
+  for(i=0; i < ModuleTableSize; i++)
+    ModuleTable[i] = old[i];
+  ModuleTableSize = ModuleTableSize * 2;
+  for(; i < ModuleTableSize; i++)
+    ModuleTable[i].type = NoModule;
+  FreeMemory((void**)&old);
+  return(noErr);
+}
+
+static OSErr FindModule (module_number, module_version, 
+			 ret_module, ret_lowest_version, ret_highest_version)
+  LongInt module_number, module_version;
+  ModuleDefinition** ret_module;
+  LongInt* ret_lowest_version;
+  LongInt* ret_highest_version;
+{ register short i;
+  short found = 0;
+  register LongInt version;
+
+  *ret_module = NULL;
+  *ret_lowest_version = 1L << 30;
+  *ret_highest_version = 0;
+  for(i=0; i < ModuleTableSize; i++)
+    if ( ModuleTable[i].type != NoModule &&
+        ModuleTable[i].module_number == module_number )
+      { found = 1;
+	version = ModuleTable[i].module_version;
+	if ( version < *ret_lowest_version )
+	  *ret_lowest_version = version;
+	if ( version > *ret_highest_version )
+	  *ret_highest_version = version;
+        if ( version == module_version )
+          { *ret_module = &ModuleTable[i];
+            return ( noErr );
+          };
+      };
+  if ( found )
+    return ( RPC_PROG_MISMATCH );
+  else return ( RPC_PROG_UNAVAIL );
+}
+
+/* Find a usable slot */
+static ModuleDefinition* FindModuleSlot ()
+{ register short i;
+
+  for(i=0; i < ModuleTableSize; i++)
+    if ( ModuleTable[i].type == NoModule )
+      return ( &ModuleTable[i] );
+  if ( MoreModules() != noErr ) return ( NULL );
+  if ( ModuleTable[i].type == NoModule )
+    return ( &ModuleTable[i] );
+    else return ( NULL );
+}
+
+OSErr RegisterModule (module_number, module_version, handler)
+  LongInt module_number, module_version;
+  FunctionPtr handler;
+{ ModuleDefinition* module = FindModuleSlot();
+  if ( module == NULL ) return ( dirFulErr );
+  module->module_number = module_number;
+  module->module_version = module_version;
+  module->when_called = 0;
+  module->type = LinkedModule;
+  module->u.linked.handler = handler;
+  module->u.linked.static_pointer = NULL;
+  return ( noErr );
+}
+
+OSErr RegisterModuleWithStatic (module_number, module_version, handler, static_pointer)
+  LongInt module_number, module_version;
+  FunctionPtr handler;
+  Ptr static_pointer;
+{ ModuleDefinition* module = FindModuleSlot();
+  if ( module == NULL ) return ( dirFulErr );
+  module->module_number = module_number;
+  module->module_version = module_version;
+  module->when_called = 0;
+  module->type = LinkedModule;
+  module->u.linked.handler = handler;
+  module->u.linked.static_pointer = static_pointer;
+  return ( noErr );
+}
+
+/* Looking for a remote module in the file system */
+
+#ifdef RPC_LOADABLE_MODULES
+
+#ifdef RPC_USE_PROTOTYPES
+static OSErr LoadModuleFromFile PROTO_ARGS((LongInt module_number, LongInt module_version, 
+					    ModuleDefinition** ret_module,
+					    LongInt* ret_lowest_version,
+					    LongInt* ret_highest_version,
+					    short volume, LongInt directory, 
+					    unsigned char* file_name, short already_open));
+static OSErr CombineErrors PROTO_ARGS((OSErr err1, OSErr err2));
+static OSErr LoadModuleFromDirectory PROTO_ARGS((LongInt module_number, LongInt module_version,
+						 ModuleDefinition** ret_module,
+						 LongInt* ret_lowest_version,
+						 LongInt* ret_highest_version,
+						 short volume, LongInt directory));
+static OSErr LoadModule PROTO_ARGS((LongInt module_number, LongInt module_version,
+				    ModuleDefinition** ret_module,
+				    LongInt* ret_lowest_version, LongInt* ret_highest_version));
+#endif
+
+/* Try loading from one file */
+static OSErr LoadModuleFromFile (module_number, module_version, ret_module,
+				 ret_lowest_version, ret_highest_version,
+				 volume, directory, file_name, already_open)
+  LongInt module_number, module_version;
+  ModuleDefinition** ret_module;
+  LongInt* ret_lowest_version;
+  LongInt* ret_highest_version;
+  short volume;
+  LongInt directory;
+  unsigned char* file_name;
+  short already_open;
+{ WDPBRec wdpb;
+  OSErr err;
+  short won = FALSE;
+  short system_err = FALSE;
+  short default_volume;
+  LongInt default_directory;
+  short res_file, index, default_res_file, found, needed, default_res_load;
+  LongInt this_number, this_version, ignore;
+  Handle h;
+  LongInt* p;
+  register ModuleDefinition* m;
+  short resource_id;
+  LongInt resource_type;
+  Str255 resource_name;
+
+  /* Save the default directory and default resource file */
+  wdpb.ioCompletion = NULL;
+  wdpb.ioNamePtr = NULL;
+  err = PBHGetVol(&wdpb, 0);
+  if ( err ) return ( err );
+  default_volume = wdpb.ioVRefNum;
+  default_directory = wdpb.ioWDDirID;
+  default_res_file = CurResFile();
+  default_res_load = ResLoad;
+
+  /* Set the default to the directory containing this file */
+  wdpb.ioVRefNum = volume;
+  wdpb.ioWDDirID = directory;
+  err = PBHSetVol(&wdpb, 0);
+  if ( err ) return ( err );
+
+  /* Open the file as a resource file */
+  /* If the resfile was already open, OpenRFPerm changes CurResFile, 
+     contrary to IM p.I-115, so use default_res_file to remember
+     which resfile should be left current when we're done.  While
+     actually searching the resfile, leave this one current.
+     The only way to tell whether a particular call to OpenRFPerm actually
+     opened the file is to check whether TopMapHndl changed. Later -
+     Checking already_open should prevent OpenRFPerm from being called on a file
+     thats already open, in most (but not all) cases, making this less of an issue. 
+     */
+  h = TopMapHndl;
+  if ( already_open )
+    { UseResFile(already_open);
+      if ( ResError() )
+	/* It was not open as a resource file */
+        already_open = 0;
+        /* Use the already opened resource file since calling OpenRFPerm
+           would open the file twice */
+        else res_file = already_open;
+    }
+  if ( ! already_open )
+    res_file = OpenRFPerm(file_name, 0, fsRdPerm);
+  if ( res_file < 0 ) err = ResError();
+  else if ( h != TopMapHndl ) default_res_file = res_file;	/* new, keep open */
+  if ( err == noErr )
+    { /* See if this file contains the desired module */
+      found = FALSE;
+      SetResLoad(TRUE);
+      for(index=1;;index++)
+        { h = Get1IndResource(RPC_RESOURCE_TYPE, index);
+          if ( h == NULL ) break;
+          GetResInfo(h, &resource_id, &resource_type, resource_name);
+          p = *(LongInt**)h;
+          if ( p[0] == module_number )
+            { found = TRUE;
+              this_version = p[1];
+	      if ( this_version < *ret_lowest_version )
+		*ret_lowest_version = this_version;
+	      if ( this_version > *ret_highest_version )
+		*ret_highest_version = this_version;
+	      if ( this_version == module_version )
+		won = TRUE;
+              }
+        }
+      if ( won )
+        /* Put all the modules in this file into the table
+           But only load the code for the module we are actually calling */
+	for(index=1;;index++)
+	  { SetResLoad(TRUE);
+	    h = Get1IndResource(RPC_RESOURCE_TYPE, index);
+	    if ( h == NULL ) break;
+	    GetResInfo(h, &resource_id, &resource_type, resource_name);
+	    p = *(LongInt**)h;
+	    this_number = p[0];
+	    this_version = p[1];
+	    ReleaseResource(h);
+	    needed = (this_number == module_number) && (this_version == module_version);
+	    if ( (m = FindModuleSlot()) == FALSE )
+	      { err = dirFulErr;
+		system_err = TRUE;
+		won = FALSE;
+		break;
+	      }
+	    SetResLoad(needed);
+	    if ( h = Get1Resource(CODE_RESOURCE_TYPE, resource_id) )
+	      { if ( *h )
+		  {
+		    if ( (GetResAttrs(h) & resPurgeable) == 0 )
+		      { /* The resource was loaded and is not purgeable, so lock it
+		           now in case the code stashes its address somewhere */
+		        MoveHHi(h);
+		        HLock(h);
+		      }
+		    if (TrapAvailable (_HWPriv, OSTrap))
+		      { OSErr error;
+			error = FlushCodeCacheRange (*h, GetHandleSize (h));
+			if (error)
+			  FlushInstructionCache ();
+		      }
+		  }
+		m->module_number = this_number;
+		m->module_version = this_version;
+		m->when_called = 0;
+		m->type = LoadedModule;
+		m->u.loaded.code = h;
+		m->u.loaded.file = res_file;
+	      }
+	    else
+	      { if ( needed )
+		  { err = resNotFound;
+		    system_err = TRUE;
+		    break;
+		  }
+	      }
+          }
+    }
+
+  /* Close file if it was not already open and we didn't use it */
+  if ( won == FALSE && res_file != already_open )
+    CloseResFile(res_file);
+
+  /* Restore the default directory and resource file */
+  UseResFile(default_res_file);
+  SetResLoad(default_res_load);
+  wdpb.ioVRefNum = default_volume;
+  wdpb.ioWDDirID = default_directory;
+  PBHSetVol(&wdpb, 0);
+
+  /* Return result code */
+  if ( system_err ) return ( err );
+  else if ( won ) 
+    return ( FindModule (module_number, module_version, ret_module, &ignore, &ignore) );
+  else if ( found ) return ( RPC_PROG_MISMATCH );
+    else return ( RPC_PROG_UNAVAIL );
+}
+
+static OSErr CombineErrors (err1, err2)
+  OSErr err1, err2;
+{ if ( err2 == noErr )
+    return ( err2 );
+  if ( err1 == RPC_PROG_UNAVAIL )
+    return ( err2 );
+  else return ( err1 );
+}
+
+static OSErr LoadModuleFromDirectory (module_number, module_version,
+				      ret_module, ret_lowest_version, ret_highest_version,
+				      volume, directory)
+  LongInt module_number, module_version, directory;
+  ModuleDefinition** ret_module;
+  LongInt* ret_lowest_version;
+  LongInt* ret_highest_version;
+  short volume;
+{ HFileInfo pb;
+  Str255 file_name;
+  OSErr err;
+  OSErr last_err = RPC_PROG_UNAVAIL;
+
+  pb.ioCompletion = NULL;
+  pb.ioNamePtr = file_name;
+  pb.ioVRefNum = volume;
+
+  /* Search all files of type RPC_RESOURCE_TYPE in this directory */
+  for(pb.ioFDirIndex=1;;pb.ioFDirIndex++)
+    { pb.ioDirID = directory;
+      err = PBHGetFInfo(&pb, 0);
+      if ( err ) break;
+      if ( pb.ioFlFndrInfo.fdType == RPC_RESOURCE_TYPE )
+        { err = LoadModuleFromFile(module_number, module_version, ret_module,
+				   ret_lowest_version, ret_highest_version,
+                                   volume, directory, file_name, pb.ioFRefNum);
+          if ( err == noErr ) return ( noErr );
+          last_err = CombineErrors(last_err, err);
+        }
+    }
+  return ( last_err );
+}
+
+static OSErr LoadModule (module_number, module_version, 
+			 ret_module, ret_lowest_version, ret_highest_version)
+  LongInt module_number, module_version;
+  ModuleDefinition** ret_module;
+  LongInt* ret_lowest_version;
+  LongInt* ret_highest_version;
+{ WDPBRec wdpb;
+  DirInfo dpb;
+  OSErr err, last_err;
+
+  *ret_module = NULL;
+  dpb.ioCompletion = NULL;
+  dpb.ioFDirIndex = 0;
+
+  /* Try the default directory */
+  wdpb.ioCompletion = NULL;
+  wdpb.ioNamePtr = NULL;
+  err = PBHGetVol(&wdpb, 0);
+  if ( err ) return ( RPC_PROG_UNAVAIL );
+  err = LoadModuleFromDirectory(module_number, module_version, ret_module,
+				ret_lowest_version, ret_highest_version,
+                                wdpb.ioVRefNum, wdpb.ioWDDirID);
+  
+  if ( last_err = err )
+    { /* Try a directory named "RPC" in one named "Ivory" in the boot system folder */
+      SysEnvRec theWorld;
+
+      SysEnvirons (1, &theWorld);
+      dpb.ioNamePtr = (StringPtr)"\pIvory";
+      dpb.ioVRefNum = theWorld.sysVRefNum;
+      dpb.ioDrDirID = 0;
+      err = PBGetCatInfo(&dpb, 0);
+      if ( err == noErr )
+	{ dpb.ioNamePtr = (StringPtr)"\pRPC";
+	  err = PBGetCatInfo(&dpb, 0);
+	  if ( (err == noErr) && (dpb.ioFlAttrib & 020) )
+	    err = LoadModuleFromDirectory(module_number, module_version, ret_module,
+					  ret_lowest_version, ret_highest_version,
+					  dpb.ioVRefNum, dpb.ioDrDirID);
+	}
+      if ( err == fnfErr ) err = dirNFErr;
+      last_err = CombineErrors(last_err, err);
+    }
+
+  return ( last_err );
+}
+
+static void CallModule (agent, module_number, module_version, entry_number,
+		        TransactionID, block, pointer, limit)
+  XDRAgent agent;
+  LongInt module_number, module_version, entry_number, TransactionID;
+  XDRBlock block;
+  LongInt* pointer;
+  LongInt* limit;
+{ ModuleDefinition* module;
+  FunctionPtr handler;
+  Ptr code;
+  Handle h;
+  short needs_locking = false;
+  Ptr statick;
+  LongInt ActualModuleVersion = 0;
+  LongInt LowestModuleVersion = 1L << 30;
+  LongInt HighestModuleVersion = 0;
+  OSErr err, err1;
+  Ptr A4_value, D1_value;
+
+  err = FindModule(module_number, module_version, 
+		   &module, &LowestModuleVersion, &HighestModuleVersion);
+  if ( err )
+    { err1 = LoadModule(module_number, module_version, 
+			&module, &LowestModuleVersion, &HighestModuleVersion);
+      err = CombineErrors(err, err1);
+    };
+  if ( err == noErr )
+    { module->when_called = SystemClock();
+      ActualModuleVersion = module->module_version;
+      switch ( module->type ) {
+        case LinkedModule:
+          handler = module->u.linked.handler;
+	  statick = module->u.linked.static_pointer;
+          break;
+        case LoadedModule: case LoadedModuleWithStaticData:
+          h = module->u.loaded.code;
+	  if ( *h == NULL )
+            { /* The resource has not been loaded yet, or has been purged */
+	      short save_res_load = ResLoad;
+              SetResLoad(TRUE);
+              LoadResource(h);
+	      if ( (GetResAttrs(h) & resPurgeable) == 0 )
+		{ /* The resource is not purgeable, so lock it
+		     now in case the code stashes its address somewhere */
+		  MoveHHi(h);
+		  HLock(h);
+		}
+		if (TrapAvailable (_HWPriv, OSTrap))
+		  { OSErr error;
+		    error = FlushCodeCacheRange (*h, GetHandleSize (h));
+		    if (error)
+		      FlushInstructionCache ();
+		  }
+              SetResLoad(save_res_load);
+            }
+	  needs_locking = (HGetState(h) & 128) == 0;
+	  if ( needs_locking )     /* not locked already, needs to be locked during call */
+	    HLock(h);
+          code = statick = *h;
+          if ( module->type == LoadedModule )
+            handler = (FunctionPtr)code;
+          else 
+            { handler = (FunctionPtr)( code + module->u.statick.handler_offset );
+              statick = code + module->u.statick.static_offset;
+            };
+          break;
+        default: ;
+        };
+      asm { move.l A4,-(sp) };
+      if ( statick )
+        asm { move.l statick,A4 };
+      err = (*handler)(agent, TransactionID, entry_number, block, pointer, limit);
+      if ( err == RPC_MODULE_INITIALIZED )
+        { /* LoadedModuleWithStaticData just initialized itself */
+          /* Returns: D0: 2 as a flag, D1: server, A4: static */
+          asm { move.l A4, A4_value
+                move.l D1, D1_value };
+          module->type = LoadedModuleWithStaticData;
+          module->u.statick.handler_offset = D1_value - code;
+          module->u.statick.static_offset = A4_value - code;
+          /* Call the real handler */
+          handler = (FunctionPtr)( code + module->u.statick.handler_offset );
+          err = (*handler)(agent, TransactionID, entry_number, block, pointer, limit);
+        }
+      asm { move.l (sp)+, A4 };
+      if ( needs_locking )
+        HUnlock(h);
+    };
+  /* If an error occurred, reply has not been sent yet */
+  if ( err )
+    err = RemoteCallError(agent, block, TransactionID, err, ActualModuleVersion,
+			  LowestModuleVersion, HighestModuleVersion);
+  else XDRReleaseBlock(agent, block);
+  if ( err ) lose;
+}
+
+#else
+
+static void CallModule (agent, module_number, module_version, entry_number,
+		        TransactionID, block, pointer, limit)
+  XDRAgent agent;
+  LongInt module_number, module_version, entry_number, TransactionID;
+  XDRBlock block;
+  LongInt* pointer;
+  LongInt* limit;
+{
+  ModuleDefinition* module;
+  FunctionPtr handler;
+  LongInt ActualModuleVersion = 0;
+  LongInt LowestModuleVersion = 1L << 30;
+  LongInt HighestModuleVersion = 0;
+  OSErr err;
+
+  err = FindModule(module_number, module_version, 
+		   &module, &LowestModuleVersion, &HighestModuleVersion);
+  if ( err == noErr )
+    { module->when_called = SystemClock();
+      ActualModuleVersion = module->module_version;
+      handler = module->u.linked.handler;
+      /*--- At least for now, assume module->u.linked.static_pointer can be ignored ---*/
+      err = (*handler)(agent, TransactionID, entry_number, block, pointer, limit);
+    }
+  /* If an error occurred, reply has not been sent yet */
+  if ( err )
+    err = RemoteCallError(agent, block, TransactionID, err, ActualModuleVersion,
+			  LowestModuleVersion, HighestModuleVersion);
+  else XDRReleaseBlock(agent, block);
+  if ( err ) lose;
+}
+
+#endif
+
+static OSErr RemoteCallError (agent, call_block, TransactionID, err, 
+			      ActualModuleVersion, LowestModuleVersion, HighestModuleVersion)
+  XDRAgent agent;
+  XDRBlock call_block;
+  LongInt TransactionID;
+  OSErr err;
+  LongInt ActualModuleVersion, LowestModuleVersion, HighestModuleVersion;
+{ XDRBlock block;
+  LongInt* pointer;
+  LongInt* limit;
+  register RPCErrorReplyHeader* h;
+  LongInt length;
+  OSErr err2;
+  register RPCCallHeader* ch = (RPCCallHeader*)XDRDataPointer(agent, call_block);
+  LongInt ModuleNumber = ch->ModuleNumber;
+  LongInt ModuleVersion = ch->ModuleVersion;
+  LongInt EntryNumber = ch->EntryNumber;
+
+  XDRReleaseBlock(agent, call_block);
+  length = RPCErrorReplyHeaderLength - RPCReplyHeaderLength;
+  err2 = XDRInitiateReply(agent, TransactionID, length, &block, &pointer, &limit);
+  if ( err2 ) return(err2);
+
+  h = (RPCErrorReplyHeader*)XDRDataPointer(agent, block);
+  switch ( err ) {
+    case RPC_PROG_UNAVAIL:  h->AcceptStatus = PROG_UNAVAIL; break;
+    case RPC_PROG_MISMATCH: h->AcceptStatus = PROG_MISMATCH; break;
+    case RPC_PROC_UNAVAIL:  h->AcceptStatus = PROC_UNAVAIL; break;
+    case RPC_GARBAGE_ARGS:  h->AcceptStatus = GARBAGE_ARGS; break;
+    case RPC_REMOTE_ERROR:  h->AcceptStatus = REMOTE_ERROR; break;
+    default: h->AcceptStatus = GARBAGE_ARGS;
+  };
+  h->LowestModuleVersion = LowestModuleVersion;
+  h->HighestModuleVersion = HighestModuleVersion;
+  h->ModuleNumber = ModuleNumber;
+  h->ModuleVersion = ModuleVersion;
+  h->EntryNumber = EntryNumber;
+  h->ActualModuleVersion = ActualModuleVersion;
+  h->ErrorCode = err;
+
+  XDRSendReply(agent, block);
+  return( noErr );
+}
+
+OSErr HandleRemoteCall (agent, block)
+  XDRAgent agent;
+  XDRBlock block;
+{ OSErr err;
+  LongInt* pointer = XDRDataPointer(agent, block);
+  LongInt* limit = pointer + XDRDataSize(agent, block);
+  register RPCCallHeader* h = (RPCCallHeader*)pointer;
+  LongInt TransactionID = h->TransactionID;
+  
+  CallModule(agent,h->ModuleNumber, h->ModuleVersion, h->EntryNumber, TransactionID,
+             block, pointer + RPCCallHeaderLength, limit);
+  return(noErr);
+}
+
+void PollRPC ()
+{ XDRAgent agent = DefaultXDRAgent;
+  XDRBlock block;
+  LongInt* pointer;
+  LongInt* limit;
+  LongInt module_number, module_version, entry_number, transaction_id;
+  OSErr err;
+  LongInt deadline = SystemClock() + rpc_poll_quantum;
+
+  while(true) {
+    err = RPCPollForCall(agent, &block, &pointer, &limit,
+			 &module_number, &module_version, &entry_number, &transaction_id);
+    if ( err ) lose;
+    if ( block == NULL ) break;
+    err = HandleRemoteCall(agent, block);
+    if ( err ) lose;
+    if ( SystemClock() > deadline ) break;
+    }
+}
+
+void InitializeRPC ()
+{ /* Initialize transaction ID from this pseudo-random seed so that if this
+     program is killed and started again, we will be less likely to mistake
+     replies to old transactions for replies to new transactions. */
+  TransactionCounter = SystemClock();
+  InitializeModules();
+}
+
+#endif

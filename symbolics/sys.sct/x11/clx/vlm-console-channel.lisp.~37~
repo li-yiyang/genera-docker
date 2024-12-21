@@ -1,0 +1,379 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: XLIB; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; The Virtual Lisp Machine's Life Support implements a direct interface to the
+;;; host's X server which is called the console channel.  The console channel processes
+;;; commands from Genera which instruct it to read or write raw X data from or to the
+;;; server.  This file implements the Genera side of the channel and is used when an
+;;; X screen is started with the :VLM protocol.  For best U.I. performance, output is
+;;; done via a coprocessor call to avoid the overhead of thread scheduling in the VLM.
+
+(sys:defwiredvar *console-channel-ids* 
+		 (scl:make-array 128 :initial-element nil :area neti:ether-buffer-area))
+(sys:defwiredvar *console-channel-processes*
+		 (scl:make-array 128 :initial-element nil :area neti:ether-buffer-area))
+(sys:defwiredvar *console-channel-reply-available* 
+		 (scl:make-array 128 :element-type 'scl:boolean
+				     :initial-element nil :area neti:ether-buffer-area))
+
+(defun allocate-console-buffer-id ()
+  (loop
+    (scl:without-interrupts
+      (loop for i from 0 below (length *console-channel-ids*) doing
+	(when (null (aref *console-channel-ids* i))
+	  (return-from allocate-console-buffer-id
+	    (values 
+	      (setf (aref *console-channel-ids* i)
+		    (sys:%logdpb (sys:%microsecond-clock) (byte 24 8) i))
+	      i)))))
+    (scl:process-wait "Free ID"
+      #'(lambda () (position nil *console-channel-ids*)))))
+
+(sys:defwiredfun console-channel-process-queue (queue)
+  (let ((channel-ids *console-channel-ids*)
+	(channel-reply-available *console-channel-reply-available*)
+	(channel-processes *console-channel-processes*))
+    (declare (sys:array-register channel-ids channel-processes channel-reply-available))
+    (loop for buffer-pointer = (sys:emb-queue-take queue)
+	  while buffer-pointer
+	  doing
+      (let* ((buffer (sys:emb-pointer-to-pma buffer-pointer))
+	     (id (sys:emb-console-command-id buffer))
+	     (index (let ((putative-index (ldb (byte 8 0) id)))
+		      (and (eql id (aref channel-ids putative-index))
+			   putative-index))))
+	(cond ((null index)
+	       ;; During a disk save, we might get back a response after we've
+	       ;; shutdown the channel and reset all processes, including those
+	       ;; which may have had an outstanding request.  In that case, their
+	       ;; unwind-protect forms will have already free the buffer.
+	       ;; Unfortunately, there's no flag we can test to see if we're in
+	       ;; this situation, so we must instead always check the buffer. 
+	       (let ((handle (sys:emb-buf-handle buffer)))
+		 (when (sys:emb-buf-allocated handle)
+		   (sys:wired-deallocate-emb-buffer handle))))
+	      ((aref channel-processes index)
+	       (setf (aref channel-reply-available index) t)
+	       (si:aux-process-wakeup (aref channel-processes index)))
+	      (t
+	       ;; See explanation above.
+	       (let ((handle (sys:emb-buf-handle buffer)))
+		 (when (sys:emb-buf-allocated handle)
+		   (sys:wired-deallocate-emb-buffer handle)))
+	       (setf (aref channel-ids index) nil)))))))
+
+(defun start-console-channel-manager ()
+  (let ((cc (sys:emb-pointer-to-pma (sys:vlm-console-channel))))
+    (when cc
+      (fill *console-channel-ids* nil)
+      (fill *console-channel-processes* nil)
+      (fill *console-channel-reply-available* nil)
+      (let ((output-queue (sys:emb-pointer-to-pma (sys:emb-console-output-reply-queue cc)))
+	    (input-queue (sys:emb-pointer-to-pma (sys:emb-console-input-reply-queue cc))))
+	(setf (sys:emb-queue-signal input-queue) (sys:install-wired-emb-signal-handler
+						   #'console-channel-process-queue
+						   input-queue 2)
+	      (sys:emb-queue-signal output-queue) (sys:install-wired-emb-signal-handler
+						    #'console-channel-process-queue
+						    output-queue 2))))))
+
+(scl:add-initialization "Start Console Channel Manager"
+			'(start-console-channel-manager)
+			'(:warm :now))
+
+(defmacro with-console-channel-buffer ((opcode direction
+					&key (data-length 0)
+					     (wait-p t)
+					     whostate)
+				       &body (((request-buffer) &body request-forms)
+					      ((reply-buffer) &body reply-forms)))
+  (if (and (symbolp data-length) (get data-length 'sys:defstorage-size))
+      (setf data-length `(- (sys:defstorage-size ,data-length)
+			    (sys:defstorage-size sys:emb-console-command)))
+      (setf data-length `(ceiling ,data-length 4)))
+  (ecase direction
+    (:input
+      `(with-console-channel-input-buffer-internal ,opcode ,data-length ,whostate
+	 #'(lambda (,request-buffer) ,@request-forms)
+	 (and ,wait-p #'(lambda (,reply-buffer) ,@reply-forms))))
+    (:output
+      `(with-console-channel-output-buffer-internal ,opcode ,data-length
+	 #'(lambda (,request-buffer) ,@request-forms)
+	 (and ,wait-p #'(lambda (,reply-buffer) ,@reply-forms))))))
+
+(defun with-console-channel-input-buffer-internal (opcode data-length whostate
+						   request-body reply-body)
+  (declare (dynamic-extent request-body reply-body))
+  (when (= (sys:vlm-console-channel) -1)
+    (error "No console channel available!"))
+  (multiple-value-bind (id index)
+      (allocate-console-buffer-id)
+    (let* ((nwords (+ (sys:defstorage-size sys:emb-console-command) data-length))
+	   (handle (sys:allocate-emb-buffer nwords))
+	   (buffer (sys:emb-buf-pma handle))
+	   (process (if reply-body
+			(process::register-process-for-sequence-break scl:*current-process*)
+			nil)))
+      (setf (aref *console-channel-processes* index) process
+	    (aref *console-channel-reply-available* index) nil)
+      (setf (sys:emb-console-command-opcode buffer) opcode
+	    (sys:emb-console-command-id buffer) id)
+      (funcall request-body buffer)
+      (let* ((cc (sys:emb-pointer-to-pma (sys:vlm-console-channel)))
+	     (request-queue (sys:emb-pointer-to-pma (sys:emb-console-input-request-queue cc))))
+	(when (cli::emb-queue-full-p request-queue)
+	  (scl:process-wait whostate
+	    #'(lambda (q) (not (cli::emb-queue-full-p q)))
+	    request-queue))
+	(sys:emb-queue-put request-queue (sys:pma-to-emb-pointer buffer))
+	(when (null reply-body)
+	  (return-from with-console-channel-input-buffer-internal))
+	(unwind-protect
+	    (progn
+	      (scl:process-wait whostate
+		#'(lambda (index)
+		    (not (null (aref *console-channel-reply-available* index))))
+		index)
+	      (funcall reply-body buffer))
+	  (process::unregister-process-for-sequence-break process)
+	  ;; Warm booting (or disk saving) may run these unwind-protect forms so
+	  ;; we must protect ourself against trying to free the buffer which would
+	  ;; already have been freed as part of the warm boot process.
+	  (when (sys:emb-buf-allocated handle)
+	    (sys:deallocate-emb-buffer handle))
+	  (setf (aref *console-channel-ids* index) nil))
+	nil))))
+
+(defun with-console-channel-output-buffer-internal (opcode data-length request-body reply-body)
+  (declare (dynamic-extent request-body reply-body))
+  (let* ((nwords (+ (sys:defstorage-size sys:emb-console-command) data-length))
+	 (handle (sys:allocate-emb-buffer nwords))
+	 (buffer (sys:emb-buf-pma handle)))
+    (setf (sys:emb-console-command-opcode buffer) opcode
+	  (sys:emb-console-command-id buffer) 0)
+    (funcall request-body buffer)
+    (unwind-protect
+	(progn
+	  (sys:%coprocessor-write (sys:pma-to-emb-pointer buffer)
+				  sys:%coprocessor-register-console-io)
+	  (unless (null reply-body)
+	    (funcall reply-body buffer)))
+      ;; Warm booting (or disk saving) may run these unwind-protect forms so
+      ;; we must protect ourself against trying to free the buffer which would
+      ;; already have been freed as part of the warm boot process.
+      (when (sys:emb-buf-allocated handle)
+	(sys:deallocate-emb-buffer handle)))
+    nil))
+
+
+;;; The interface to CLX itself ...
+
+(defparameter *max-embedded-transfer-size* 1400)
+
+(defun console-channel-write (vector display start end)
+  (let ((cc (display-output-stream display)))
+    (unless (null cc)
+      (multiple-value-bind (array control base-address length)
+	  (sys:setup-1d-array vector)
+	(declare (ignore array control length))
+	(if (eql (sys:%area-number base-address) neti:ether-buffer-area)
+	    (with-console-channel-buffer (sys:%emb-console-command-write :output
+					   :data-length sys:emb-console-data-transfer
+					   :wait-p nil
+					   :whostate "CLX Output")
+	      ((wc)
+	       (setf (sys:emb-console-data-transfer-address wc) (sys:%pointer base-address)
+		     (sys:emb-console-data-transfer-offset wc) start
+		     (sys:emb-console-data-transfer-n-bytes wc) (- end start)))
+	      ((wc)
+	       (declare (ignore wc))))
+	    (slow-console-channel-write vector start end))))))
+
+(defun slow-console-channel-write (vector start end)
+  (loop for bytes-left = (- end start) then (- bytes-left bytes-this-time)
+	for start-this-time = start then (+ start-this-time bytes-this-time)
+	for bytes-this-time = (min bytes-left *max-embedded-transfer-size*)
+	for end-this-time = (+ start-this-time bytes-this-time)
+	while (plusp bytes-left)
+	do
+    (let ((data-length (+ bytes-this-time
+			  (* 4 (- (sys:defstorage-size sys:emb-console-data-transfer)
+				  (sys:defstorage-size sys:emb-console-command))))))
+      (with-console-channel-buffer (sys:%emb-console-command-write :output
+								   :data-length data-length
+								   :wait-p nil
+								   :whostate "CLX Output")
+	((wc)
+	 (let ((buffer (sys:%pointer-plus
+			 (scl:locf (sys:emb-console-data-transfer-n-bytes wc)) 1)))
+	   (scl:stack-let ((bytes (scl:make-array bytes-this-time
+						  :element-type '(unsigned-byte 8)
+						  :displaced-to buffer)))
+	     (declare (dynamic-extent bytes))
+	     (replace bytes vector :start2 start-this-time :end2 end-this-time)
+	     (setf (sys:emb-console-data-transfer-address wc) (sys:%pointer buffer)
+		   (sys:emb-console-data-transfer-offset wc) 0
+		   (sys:emb-console-data-transfer-n-bytes wc) bytes-this-time))))
+	((wc)
+	 (declare (ignore wc)))))))
+
+(defun console-channel-force-output (display)
+  (let ((cc (display-output-stream display)))
+    (unless (null cc)
+      (with-console-channel-buffer (sys:%emb-console-command-noop :output)
+	((nc) (declare (ignore nc)))
+	((nc) (declare (ignore nc)))))))
+
+(defun console-channel-close (display &key abort)
+  (let ((cc (display-output-stream display)))
+    (unless (null cc)
+      (with-console-channel-buffer (sys:%emb-console-command-close-display :output
+				     :wait-p (not abort)
+				     :whostate "Close Display")
+	((cdc) (declare (ignore cdc)))
+	((cdc) (declare (ignore cdc)))))))
+
+(defun console-channel-input (display vector start end &optional timeout)
+  (let ((cc (display-input-stream display)))
+    (or (cond ((null cc))
+	      ((console-channel-listen display) nil)
+	      ((and timeout (= timeout 0)) :timeout)
+	      ((console-channel-input-wait display timeout)))
+	(multiple-value-bind (array control base-address length)
+	    (sys:setup-1d-array vector)
+	  (declare (ignore array control length))
+	  (if (eql (sys:%area-number base-address) neti:ether-buffer-area)
+	      (with-console-channel-buffer (sys:%emb-console-command-read :input
+					     :data-length sys:emb-console-data-transfer
+					     :whostate "CLX Input")
+		((rc)
+		 (setf (sys:emb-console-data-transfer-address rc) (sys:%pointer base-address)
+		       (sys:emb-console-data-transfer-offset rc) start
+		       (sys:emb-console-data-transfer-n-bytes rc) (- end start)))
+		((rc)
+		 (cond ((zerop (sys:emb-console-command-result rc)) nil)
+		       ((= (sys:emb-console-command-result rc) 28)
+			;; Error code 28 is returned by the VLM console channel for EOF.
+			(return-from console-channel-input :eof))
+		       (t (error "?????")))))
+	      (slow-console-channel-input vector start end))))))
+
+(defun slow-console-channel-input (vector start end)
+  (loop for bytes-left = (- end start) then (- bytes-left bytes-this-time)
+	for start-this-time = start then (+ start-this-time bytes-this-time)
+	for bytes-this-time = (min bytes-left *max-embedded-transfer-size*)
+	for end-this-time = (+ start-this-time bytes-this-time)
+	while (plusp bytes-left)
+	do
+    (let ((data-length (+ bytes-this-time
+			  (* 4 (- (sys:defstorage-size sys:emb-console-data-transfer)
+				  (sys:defstorage-size sys:emb-console-command))))))
+      (with-console-channel-buffer (sys:%emb-console-command-read :input
+								  :data-length data-length
+								  :whostate "CLX Input")
+	((rc)
+	 (let ((buffer (sys:%pointer-plus
+			 (scl:locf (sys:emb-console-data-transfer-n-bytes rc)) 1)))
+	   (setf (sys:emb-console-data-transfer-address rc) (sys:%pointer buffer)
+		 (sys:emb-console-data-transfer-offset rc) 0
+		 (sys:emb-console-data-transfer-n-bytes rc) bytes-this-time)))
+	((rc)
+	 (cond ((zerop (sys:emb-console-command-result rc))
+		(let ((buffer (sys:%pointer-plus
+				(scl:locf (sys:emb-console-data-transfer-n-bytes rc)) 1)))
+		  (scl:stack-let ((bytes (scl:make-array bytes-this-time
+							 :element-type '(unsigned-byte 8)
+							 :displaced-to buffer)))
+		    (declare (dynamic-extent bytes))
+		    (replace vector bytes :start1 start-this-time :end1 end-this-time)))
+		nil)
+	       ((= (sys:emb-console-command-result rc) 28)
+		;; Error code 28 is returned by the VLM console channel for EOF.
+		(return-from slow-console-channel-input :eof))
+	       (t (error "?????"))))))))
+
+;;; Never wait indefinitely on the console channel as we have no way to interrupt it.
+(defvar *console-channel-input-wait-poll-interval* (* 1 1000))
+
+(defun console-channel-input-wait (display timeout)
+  (let ((cc (display-input-stream display)))
+    (cond ((null cc))
+	  ((console-channel-listen display) nil)
+	  ((and timeout (= timeout 0)) :timeout)
+	  (t
+	   (let ((timeout (and timeout (* timeout 1000))))
+	     (loop while (or (null timeout) (plusp timeout))
+		   do
+	       (let ((one-shot-timeout (min (or timeout most-positive-fixnum)
+					    *console-channel-input-wait-poll-interval*)))
+		 (when timeout
+		   (decf timeout one-shot-timeout))
+		 (with-console-channel-buffer (sys:%emb-console-command-input-wait :input
+						:data-length sys:emb-console-input-wait
+						:whostate "CLX Input")
+		   ((iwc)
+		    (setf (sys:emb-console-input-wait-timeout iwc) one-shot-timeout))
+		   ((iwc)
+		    (cond ((not (zerop (sys:emb-console-command-result iwc)))
+			   (error "?????"))
+			  ((sys:%coprocessor-read
+			     sys:%coprocessor-register-console-input-available-p)
+			   (return-from console-channel-input-wait nil)))))))
+	     :timeout)))))
+
+(defun console-channel-listen (display)
+  (let ((cc (display-input-stream display)))
+    (if (null cc)
+	t
+	(sys:%coprocessor-read sys:%coprocessor-register-console-input-available-p))))

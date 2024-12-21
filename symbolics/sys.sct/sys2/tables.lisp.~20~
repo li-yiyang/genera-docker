@@ -1,0 +1,2791 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: COMMON-LISP-INTERNALS; Base: 10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;
+;;; New hash table implementation.
+;;;
+
+
+
+;;;
+;;; This array stores the *smaller* of each pair.
+;;;
+(defvar *prime-numbers-for-table-system*
+	;; isn't there a better way to do this at compile time than #.???  eval-when???
+	(let ((primes '#.(prime-numbers-for-table-system)))
+	  ;; (coerce primes 'vector)  doesn't exist at QLD time
+	  (make-array (length primes) ':initial-contents primes)))
+
+(defun find-next-larger-prime-pair (size)
+  ;; simple, doesn't run often...
+  (loop for p being the array-elements of *prime-numbers-for-table-system*
+	for p+2 = (+ p 2)
+	when (<= size p+2)
+	  do (return (values p p+2))
+	finally (error "Out of primes!  Perhaps you need to increase ~A?"
+		       '*max-defined-prime-for-table*)))
+
+;;; utility functions for dealing fixnums. 
+
+(defun power-of-two-p (i)
+  (zerop (logand i (1- i))))			; positive fixnums only please!
+
+;;; like log, but only return a result if the number is a power of two.
+(defun simple-log2 (i)
+  (and (power-of-two-p i)
+       (1- (integer-length i))))
+
+(defun nearest-greater-power-of-two (i)
+  (if (power-of-two-p i)
+      i
+      (ash 1 (integer-length i))))
+
+
+;;; utility function used various places in here.
+
+(defun fixup-function-for-table-system (fun-or-name)
+  (declare (values fun name))
+  (let ((fun fun-or-name)
+	(name fun-or-name))
+    (when (symbolp fun)
+      (setq fun (symbol-function fun)))
+    ;; try to allow random things that aren't regular compiled functions
+    (when (and (not (symbolp name))
+	       (typep fun 'compiled-function))
+      (setq name (sys:function-name fun)))
+    (values fun name)))
+
+;;; ****************************************************************
+
+;;; a table instance contains a flags word, with these bits in it
+
+;;; zzz can't defstruct do this?
+
+(defconstant %%table-need-growth	(byte 1 0))	; boolean
+(defconstant %%table-need-shrink	(byte 1 1))	; boolean
+(defconstant %%table-need-rehash	(byte 1 2))	; boolean
+(defconstant %%table-number-of-values	(byte 1 3))	; 0/1
+(defconstant %%table-store-hash-code	(byte 1 4))	; boolean
+(defconstant %%table-ignore-gc		(byte 1 5))	; boolean
+(defconstant %%table-gc-protect-values	(byte 1 6))	; boolean
+(defconstant %%table-inhibit-resize	(byte 1 7))	; boolean.  inhibit grow/shrink, not rehash
+(defconstant %%table-block-format	(byte 1 8))	; boolean
+(defconstant %%table-map-in-progress	(byte 1 9))	; boolean
+
+;; zzz could maybe put gc-dependence-level in here too
+
+(defmacro table-flags-need-growth-p (flags)	`(ldb-test %%table-need-growth ,flags))
+(defmacro table-flags-need-shrink-p (flags)	`(ldb-test %%table-need-shrink ,flags))
+(defmacro table-flags-need-rehash-p (flags)	`(ldb-test %%table-need-rehash ,flags))
+(defmacro table-flags-number-of-values (flags)	`(ldb %%table-number-of-values ,flags))
+(defmacro table-flags-store-hash-code-p (flags)	`(ldb-test %%table-store-hash-code ,flags))
+(defmacro table-flags-ignore-gc-p (flags)	`(ldb-test %%table-ignore-gc ,flags))
+(defmacro table-flags-gc-protect-values-p (flags) `(ldb-test %%table-gc-protect-values ,flags))
+(defmacro table-flags-inhibit-resize-p (flags)	`(ldb-test %%table-inhibit-resize ,flags))
+(defmacro table-block-formatted-p (flags)	`(ldb-test %%table-block-format ,flags))
+(defmacro table-map-in-progress-p (flags)	`(ldb-test %%table-map-in-progress ,flags))
+
+;;; ****************************************************************
+;;; new table base flavor
+
+(defflavor future-common-lisp:hash-table () () :abstract-flavor)
+
+(defflavor basic-table
+	((name nil)				; what table this is
+	 internal-representation		; an array (with a leader) key,val
+	 (area sys:default-cons-area)		; area in which to cons 
+
+	 n-filled-elements			; N elts in table now
+
+	 growth-factor				; factor to grow by, ie 1.67 or something
+	 growth-threshold			; percentage full at which to grow, ie .67 or so
+
+	 growth-size				; N elts above which we grow table
+	 shrink-size				; N elts below which we shrink
+
+	 n-vacated-elements			; N elts vacated by remhash
+
+	 flags					; flag bits, as above
+
+	 (gc-dependence-current			; what gc level this table depends on
+	   sys:%gc-dependence-none)
+	 gc-generation-number			; sys:%gc-generation-number at which all 
+						;  keys were known to be correctly hashed.
+	 gc-dynamic-generation-number		; when gc-dependence-level is 
+						;  sys:%gc-dependence-dynamic, the value of
+						;  sys:%gc-dynamic-generation-number at which
+						;  all keys were known to be correctly hashed
+	 gc-static-generation-number		; Same thing for sys:%gc-dependence-static
+
+	 test-function				; function used for matching
+	 hash-function				; function used for hashing
+
+;;	 (locking t)				; whether this table uses locking
+	 lock					; the lock cell
+
+	 (options nil)				; non-defaulted options plist, for 
+						;  printing, and (later) :fasd-form
+	 )
+	(future-common-lisp:hash-table)
+  (:abstract-flavor)
+  (:initable-instance-variables name area options)
+  (:readable-instance-variables)
+  (:writable-instance-variables)
+  (:init-keywords :rehash-before-cold :rehash-after-full-gc :locking :number-of-values
+		  :store-hash-code :ignore-gc :growth-threshold :growth-factor
+		  :size :size-supplied-p :gc-protect-values :test :hash-function)
+  (:default-init-plist :rehash-before-cold nil
+		       :locking t
+		       :ignore-gc nil
+		       :gc-protect-values t))
+
+(defflavor scatter-table
+	() 
+	(basic-table)
+  :abstract-flavor)
+
+;;; ****************************************************************
+
+;;;
+;;; the array that goes in the 'internal-representation' slot, above,
+;;; when using scatter tables.  total array size is (* entry-size
+;;; entries-per-bucket n-buckets).
+;;;
+(defstruct (table-implementation 
+	     :array-leader :named (:conc-name nti-)
+	     :size-symbol)
+  length					; avoid looking like a fill-pointer?
+
+  values-array					; if some kind of weak-table, keys and
+						;  values live in separate arrays, one 
+						;  in weak-space.
+
+  entry-size					; n words per entry; 1, 2, or 3
+
+  ;; bucket-size moved down here, to make with-internal-representation-values work better
+  bucket-size					; (* entry-size entries-per-bucket)
+
+  ;; the following six words should stay in order, as
+  ;; with-internal-representation-values knows about them.
+  n-buckets					; n hash buckets this table, always 
+						;  prime, n-2 also prime
+;;  n-buckets-minus-2
+
+  value-offset					; offset from key to find value, or nil
+						;  if number-of-values 0.  should maybe
+						;   just be T/NIL?
+  hash-code-offset				; offset from key to find hash-code, or
+						;  nil if not storing hash-codes
+
+  entries-per-bucket				; how many entries per bucket
+  total-size					; (* n-buckets bucket-size)
+
+  ;; This is the shift count to use when doing "multiplies" by
+  ;; bucket-size.  we don't need an entry-size-shift, as nobody ever
+  ;; multiplies by entry-size except at setup time.
+  bucket-size-shift				; (log bucket-size 2)
+  )
+
+;;; Conceptually, the array is 3D, ie an array of buckets, where each
+;;; bucket consists of a block of keys, an optional block of values, and
+;;; an optional block of hash-codes.  It's faster to use a 1D array, so
+;;; the actual layout uses the obvious method of spreading the stuff
+;;; out; ie
+;;;
+;;; real-entry-index = (+ (* bucket-index entries-per-bucket entry-size) 
+;;;                       entry-index-in-bucket)
+;;; keys are always first; there are ENTRIES-PER-BUCKET keys, followed by 
+;;; ENTRIES-PER-BUCKET values (if number-of-values > 0) and ENTRIES-PER-BUCKET
+;;; hash-codes, if :store-hash-code T. 
+;;; real-value-index = (+ key-index value-offset)
+;;; real-hash-code-index = (+ key-index hash-code-offset)
+
+
+;;; ****************************************************************
+
+;;; support for weak tables.  
+
+;;; strong/weak tables differ in where the keys and values are stored.
+;;; in strong tables, blocks of values are "right next to" the blocks of
+;;; keys, in weak tables, they're in parallel positions in the
+;;; values-array.
+
+(defflavor strong-table-mixin			; neither weak-values nor weak-keys
+	() ()
+  (:required-flavors basic-table)
+  :abstract-flavor)
+
+;;; these do the 'obvious thing' for strong tables
+(defmacro-in-flavor (key-aref strong-table-mixin) (implementation-array index)
+  `(aref ,implementation-array ,index))
+
+(defmacro-in-flavor (value-aref strong-table-mixin) (implementation-array index)
+  `(aref ,implementation-array (+ value-offset ,index)))
+
+(defmacro-in-flavor (value-aref-gethash-values strong-table-mixin) (implementation-array index all-values)
+  `(values (if value-offset
+	       (value-aref ,implementation-array ,index)
+	       t)
+	   ,@(if all-values '(t hash-key))))
+
+(defmacro-in-flavor (hash-code-aref strong-table-mixin) (implementation-array index)
+  `(aref ,implementation-array (+ hash-code-offset ,index)))
+
+;;; for strong tables, entry-size is 1 (key) plus 1 each for value and hash-code
+(defmethod (entry-size strong-table-mixin) ()
+  (+ 1						; one for key
+     (table-flags-number-of-values flags)	; one for value if any
+     (if (table-flags-store-hash-code-p flags)	; one for hash code if any
+	 1 0)))
+
+(defflavor weak-values-table-mixin
+	() ()
+  (:required-flavors basic-table)
+  :abstract-flavor)
+
+;;; for weak-values tables, the key and hash-code are in the regular
+;;; array, the value is in the values-array.  If hash-codes are stored,
+;;; the values-array is half empty.  BFD.
+(defmacro-in-flavor (key-aref weak-values-table-mixin) (implementation-array index)
+  `(aref ,implementation-array ,index))
+
+(defmacro-in-flavor (value-aref weak-values-table-mixin) (implementation-array index)
+  `(aref (nti-values-array ,implementation-array) ,index))
+
+(defmacro-in-flavor (value-aref-gethash-values weak-values-table-mixin) (implementation-array index all-values)
+  `(progn 
+     (ignore value-offset)			; not used, always there in weak tables
+     (multiple-value-bind (val boundp)
+	 (si:%weak-link-contents (locf (value-aref ,implementation-array ,index)))
+       (if boundp
+	   (values val ,@(if all-values '(t hash-key)))
+	   (values ,@(if all-values '(default nil nil) '(nil)))))))
+
+(defmacro-in-flavor (hash-code-aref weak-values-table-mixin) (implementation-array index)
+  `(aref ,implementation-array (+ hash-code-offset ,index)))
+
+;;; for weak values tables, entry size is one for key, plus one for
+;;; hash-code; value is elsewhere.
+(defmethod (entry-size weak-values-table-mixin) ()
+  (+ 1						; one for key
+     (if (table-flags-store-hash-code-p flags)	; one for hash code if any
+	 1 0)))
+
+;;; ****************************************************************
+
+;;; Currently, store-hash-code-ness is not split out into separate
+;;; flavors, ie the tests for whether there are stored hash codes in a
+;;; table happen at runtime.  It seems to be small enough overhead (a
+;;; push and a branch-false) that it's not really worth doubling the
+;;; number of flavors over, however, it wouldn't be hard to do, and
+;;; maybe someone will decide it's worth it.
+
+;;; this macro is referenced from gethash-scatter-body and
+;;; puthash-scatter-body.  it makes free references to hash-code-offset,
+;;; hash-code, array, index, hash-key, and key. (Sheesh!)  It also
+;;; expects funcall-test-function and hash-code-aref to be defined.  If
+;;; store-hash-codes is ever done with flavors, this should get split
+;;; into the obvious two variants.
+
+(defmacro-in-flavor (compare-hash-codes-or-keys scatter-table) ()
+  '(and (or (not hash-code-offset)		; if there's a hash-code
+	    (= (hash-code-aref array index)	;  compare stored one to the
+	       hash-code))			;   one we have, then run test fun,
+	(funcall-test-function hash-key key))	; else just run test fun
+  )
+
+;;; ****************************************************************
+
+;;;
+;;; this macro helps reduce setup overhead in things like gethash
+;;; methods, which want to cache a bunch of the values from the internal
+;;; representation.
+;;;
+#+3600
+(defmacro with-internal-representation-values ((array) &body body)
+  `(let* ((ptr (locf (nti-bucket-size ,array)))	
+	  (n-buckets 		(sys:%p-contents-increment-pointer ptr))
+;;	  (n-buckets-minus-2	(sys:%p-contents-increment-pointer ptr))
+	  (value-offset		(sys:%p-contents-increment-pointer ptr))
+	  (hash-code-offset	(sys:%p-contents-increment-pointer ptr))
+	  (entries-per-bucket 	(sys:%p-contents-increment-pointer ptr))
+	  (total-size 		(sys:%p-contents-increment-pointer ptr))
+	  (bucket-size-shift 	(sys:%p-contents-increment-pointer ptr)))
+     ,@body))
+
+#+imach
+(defmacro with-internal-representation-values ((array) &body body)
+  `(sys:with-block-registers (1)		; doesn't need saving
+     (setf (sys:%block-register 1) 
+	   ;; array-leader slots go backwards on ivory!
+	   (locf (nti-bucket-size-shift ,array)))
+     (let* ((bucket-size-shift 	(sys:%block-read 1))
+	    (total-size 	(sys:%block-read 1))
+	    (entries-per-bucket	(sys:%block-read 1))
+	    (hash-code-offset	(sys:%block-read 1))
+	    (value-offset 	(sys:%block-read 1))
+;;	    (n-buckets-minus-2 	(sys:%block-read 1))
+	    (n-buckets 		(sys:%block-read 1 :prefetch nil)))
+       ,@body)))
+
+#-lispm
+(defmacro with-internal-representation-values ((array) &body body)
+  `(let* ((n-buckets 		(nti-n-buckets ,array))
+;;	  (n-buckets-minus-2 	(nti-n-buckets-minus-2 ,array))
+	  (value-offset		(nti-value-offset ,array))
+	  (hash-code-offset	(nti-hash-code-offset ,array))
+	  (entries-per-bucket 	(nti-entries-per-bucket ,array))
+	  (total-size 		(nti-total-size ,array))
+	  (bucket-size-shift 	(nti-bucket-size-shift ,array)))
+     ,@body))
+
+;;;
+;;; magic value to use for 'empty' slots.  this will work in any
+;;; implementation; maybe use "unbound" on lispms.
+;;;
+(defvar *table-empty-slot-value* 
+	(cons '*if-you-use-this-cons-as-a-key-you-deserve-to-lose* nil))
+
+;;;
+;;; magic place-holder slot, for identifying slots that have had entries
+;;; remhash'ed from them.
+;;;
+(defvar *table-vacated-slot-value*
+	(cons '*table-vacated-slot-value* nil))
+
+
+;;; we use this a lot...
+(defun make-array-for-table (size area
+			     &optional leader-length named-structure-symbol)
+  (if (eq area ':stack)				; make-array doesn't take :area :stack?
+      (make-stack-array size 
+			:leader-length leader-length
+			:named-structure-symbol named-structure-symbol
+			:initial-element *table-empty-slot-value*)
+      (make-array size
+		  ':area area
+		  ':leader-length leader-length
+		  ':named-structure-symbol named-structure-symbol
+		  ':initial-element *table-empty-slot-value*)))
+
+;;; handed a test-function, find the function to use for comparison; 
+;;; these are considerably faster than the general purpose ones.
+(defvar *table-test-functions* 
+	'((string-equal fast-hash-table-string-equal)
+	  (string= fast-hash-table-string=)))
+
+(defun table-test-function (test-function-name)
+  (declare (values real-test-function))
+  (second (assoc test-function-name *table-test-functions*)))
+
+;;; Table test functions with default hash functions.  Use this to find
+;;; the matching hash function for a test function, when one wasn't
+;;; handed in.
+(defvar *table-hash-functions*
+	'((eq		xeqhash			xeqhash-no-gc)
+	  (eql		xeqlhash		xeqlhash-no-gc)
+	  (equal	xequal-hash		xequal-hash-no-gc)
+	  (equalp	equalp-hash		equalp-hash)
+	  (zl:equal	xequal-hash		xequal-hash-no-gc)
+	  (string-equal	sys:sxhash-string	sys:sxhash-string)
+	  (zl:string-equal
+			sys:sxhash-string	sys:sxhash-string)
+	  (string=	sys:sxhash-string	sys:sxhash-string)
+	  (zl:string=	sys:sxhash-string	sys:sxhash-string)
+	  (char-equal	si:sxhash-character	si:sxhash-character)
+	  (char=	si:sxhash-character	si:sxhash-character)
+	  (=		=-hash			=-hash)
+	  ))
+
+(defun table-hash-function (test-function-name)
+  (declare (values hash-function-gc hash-function-no-gc))
+  (let ((elt (assoc test-function-name *table-hash-functions*)))
+    (values (second elt) (third elt))))
+
+(defun table-hash-function-no-gc (hash-function-name)
+  (declare (values hash-function-no-gc))
+  (let ((elt (find hash-function-name *table-hash-functions* ':key #'second)))
+    (third elt)))
+
+(defvar *table-gc-independent-hash-functions*
+	'(sxhash sys:sxhash-string si:sxhash-character number-eql-hash =-hash))
+
+
+;;;
+;;; Applications can call this to install their own correspondences
+;;; between test and hash functions.  In most cases, this isn't really
+;;; necessary, as you can just make-hash-table with explicitly supplied
+;;; test and hash function specs, but (a) applications already call
+;;; this, leftover from the old system, and (b) you get to supply more
+;;; info this way.
+;;;
+(defun add-test-function-hash-function (test-function hash-function 
+					&optional hash-function-no-gc gc-independent-p)
+  (unless hash-function-no-gc 
+    (setq hash-function-no-gc hash-function))
+
+  (multiple-value-setq (nil test-function) (fixup-function-for-table-system test-function))
+  (multiple-value-setq (nil hash-function) (fixup-function-for-table-system hash-function))
+  (multiple-value-setq (nil hash-function-no-gc) (fixup-function-for-table-system hash-function-no-gc))
+
+  (without-interrupts
+    (let ((elt (assoc test-function *table-hash-functions*)))
+      (if elt
+	  (progn 
+	    (setf (second elt) hash-function)
+	    (setf (third elt) hash-function-no-gc))
+	  (push (list test-function hash-function hash-function-no-gc)
+		*table-hash-functions*)))
+    (if gc-independent-p 
+	(pushnew hash-function *table-gc-independent-hash-functions*)
+	(setq *table-gc-independent-hash-functions* (delete hash-function *table-gc-independent-hash-functions*)))))
+  
+;;;
+;;; This is a hook for one of the GC optimizations that happens at
+;;; world-build time.  SI:REORDER-SOME-SYSTEM-SYMBOLS calls this, and
+;;; want a list of the symbols that should be reordered.  It used to
+;;; simply assume it knew what data structures the table system was
+;;; using.  This is a small step more modular.
+;;;
+(defun table-system-symbols-to-reorder ()
+  (remove-duplicates				; necessary?
+    (append (loop for (nil test-sym) in *table-test-functions*
+		  collect test-sym)
+	    (loop for (t1 f1 f2) in *table-hash-functions*
+		  collect t1
+		  collect f1 
+		  collect f2))))
+
+(defun table-hash-function-gc-independent-p (function-name)
+  (member function-name *table-gc-independent-hash-functions*))
+
+;;; translate options to table flavor.  nested alists, keyed by
+;;; gc-protect, test, locking, ignore-gc.
+(defvar *table-options-to-flavor*
+	;; gc-p	test 		lock    ign-gc
+	;; 	EQ
+	'((t	(eq		(t	(t	. eq-locking-table)
+					(nil	. eq-locking-gc-table))
+				(nil	(t	. eq-table)
+					(nil	. eq-gc-table)))
+		;; EQL
+		(eql		(t	(t	. eql-locking-table)
+					(nil	. eql-locking-gc-table))
+				(nil	(t	. eql-table)
+					(nil	. eql-gc-table)))
+		;; EQUAL
+		(equal		(t	(t	. equal-locking-table)
+					(nil	. equal-locking-gc-table))
+				(nil	(t	. equal-table)
+					(nil	. equal-gc-table)))
+		;; STRING-EQUAL
+		(string-equal	(t	(:any	. string-equal-locking-table))
+				(nil	(:any	. string-equal-table)))
+		;; general purpose ones
+		(:any		(t	(t	. general-locking-table)
+					(nil	. general-locking-gc-table))
+				(nil	(t	. general-table)
+					(nil	. general-gc-table))))
+	  ;; weak tables
+	  ;; EQL weak-values values
+	  (nil	(eql		(t	(t	. eql-weak-locking-table)
+					(nil	. eql-weak-locking-gc-table))
+				(nil	(t	. eql-weak-table)
+					(nil	. eql-weak-gc-table)))
+		;; general purpose ones
+		(:any		(t	(t	. general-weak-locking-table)
+					(nil	. general-weak-locking-gc-table))
+				(nil	(t	. general-weak-table)
+					(nil	. general-weak-gc-table))))))
+
+(defun table-flavor-from-options (test-function-name hash-function-name
+				      locking ignore-gc store-hash-code gc-protect-values)
+  (declare (values table-flavor))
+  (ignore store-hash-code)			; use this later if split flavorarchy
+  (flet ((eql-or-any (x y)
+	   (or (eql x y) (eq x ':any) (eq y ':any))))
+
+    ;; if test-function-name is one of the ones we know how to build
+    ;; specialized flavors for, but hash-function-name is not the
+    ;; "right" hash-function for that test function, then we need to
+    ;; force flavor to be one of the general-purpose ones.
+    (let ((expected-hash-function-name (table-hash-function test-function-name)))
+      (when (and expected-hash-function-name
+		 (not (eq expected-hash-function-name hash-function-name)))
+	(setq test-function-name nil)))		; prevents finding the specialized 
+						;  flavor for this test-function
+
+    (let ((flav
+	    (cdr (assoc ignore-gc 
+			(cdr (assoc locking 
+				    (cdr (assoc test-function-name
+						(cdr (assoc gc-protect-values
+							    *table-options-to-flavor*
+							    ':test #'eql-or-any))
+						':test #'eql-or-any))
+				    ':test #'eql-or-any))
+			':test #'eql-or-any))))
+      (unless flav
+	(error "Table options ~S is not supported"
+	       `(:TEST ,test-function-name 
+		 :LOCKING ,locking 
+		 :IGNORE-GC ,ignore-gc
+		 :STORE-HASH-CODE ,store-hash-code 
+		 :GC-PROTECT-VALUES ,gc-protect-values)))
+      flav)))
+
+;;; NB!!! If this var is set too low, you can't QLD.
+;;; FLAVOR:*STANDARDIZED-GENERIC-FUNCTION-NAMES* will try to grow before
+;;; the scheduler's all there, and that will lose because things called
+;;; by process-lock aren't there yet.  100 is too small; 120 is big
+;;; enough.  More experimentation called for...
+(defvar *default-table-size* 120)		; default initial size for a table
+
+;;; max size of a block-formatted table.  
+(defvar *maximum-block-size* 128)
+(defvar *minimum-block-size* 5)
+
+(defvar *default-table-growth-factor* 1.66667)	; factor to grow by
+(defvar *default-table-growth-threshold* 0.66667)	; fullness threshold at which to grow
+
+;;; ****************************************************************
+
+;;; support macros
+
+;(defmacro incf-carefully (place)
+;  (let ((loc-sym (gensym)))
+;    `(loop with ,loc-sym = (locf ,place) 
+;	   for old-val = (location-contents ,loc-sym)
+;	   until (store-conditional ,loc-sym old-val (1+ old-val)))))
+;
+;(defmacro decf-carefully (place)
+;  (let ((loc-sym (gensym)))
+;    `(loop with ,loc-sym = (locf ,place) 
+;	   for old-val = (location-contents ,loc-sym)
+;	   until (store-conditional ,loc-sym old-val (1- old-val)))))
+
+;; those are only needed if we do multiple-reader locks.  maybe later.
+(defmacro incf-carefully (place)
+  `(incf ,place))
+
+(defmacro decf-carefully (place)
+  `(decf ,place))
+
+;;; ****************************************************************
+
+(defmethod (initialize-table-array scatter-table) (arr)
+  (let ((entries-per-bucket (nti-entries-per-bucket arr)))
+    (setf (nti-value-offset arr)
+	  (if (table-flags-gc-protect-values-p flags)
+	      (if (plusp (table-flags-number-of-values flags)) 
+		  entries-per-bucket 
+		  nil)
+	      0))
+    ;; never store hash-codes if we're a block-formatted table
+    (setf (nti-hash-code-offset arr)
+	  (if (and (table-flags-store-hash-code-p flags)
+		   (> (nti-n-buckets arr) 1))
+	      (+ (or (nti-value-offset arr) 0)
+		 entries-per-bucket)
+	      nil))
+
+    (let ((shift (simple-log2 (nti-bucket-size arr))))
+      (unless shift
+	;; it's ok for block-formatted tables to use block sizes that
+	;; aren't powers of two, as there's only one bucket.  can't
+	;; leave it NIL, though, as things like REMHASH want to use it
+	;; in their setup code.
+	(if (table-block-formatted-p flags)
+	    (setq shift 0)
+	    (error "BUCKET-SIZE not a power of 2?")))
+      (setf (nti-bucket-size-shift arr) shift))
+
+    (setf (nti-total-size arr)
+	  (* (nti-n-buckets arr) (nti-bucket-size arr)))
+    (setf (nti-length arr) (nti-total-size arr))))
+
+(defmethod (clear-table-internal basic-table) ()
+  (initialize-table-array self internal-representation)
+  (fill internal-representation *table-empty-slot-value*)
+  (setq n-filled-elements 0)
+  (setf n-vacated-elements 0))
+
+(defmethod (make-instance basic-table :after) (&rest init-plist)
+  (let (initial-size
+	(flags-word 0))
+    (setq test-function (getf init-plist ':test))
+    (setq hash-function (getf init-plist ':hash-function))
+
+    (unless (setq initial-size (getf init-plist ':size))
+      (error "No size supplied"))
+
+    (setq growth-factor
+	  (getf init-plist ':growth-factor *default-table-growth-factor*))
+    (setq growth-threshold
+	  (getf init-plist ':growth-threshold *default-table-growth-threshold*))
+    (setf (table-flags-store-hash-code-p flags-word)
+	  (getf init-plist ':store-hash-code))
+    (setf (table-flags-number-of-values flags-word)
+	  (or (getf init-plist ':number-of-values 1)))
+    (setf (table-flags-gc-protect-values-p flags-word)
+	  (getf init-plist ':gc-protect-values t))
+
+    (setq n-filled-elements 0)
+    (setq n-vacated-elements 0)
+
+    (setq flags flags-word)
+
+    (let ((entry-size (entry-size self)))
+      (multiple-value-bind (n-buckets entries-per-bucket bucket-size total-size)
+	  (compute-internal-dimensions self initial-size entry-size)
+
+	;; if size was specified, and the we're building a
+	;; scatter-formatted table, adjust the size up by growth-factor,
+	;; so that the table, as constructed, will actually hold that
+	;; many frobs before growing.  I've opted to make that decision
+	;; here, rather than in compute-internal-dimensions, because
+	;; this case is somewhat special, and disambiguating it from a
+	;; normal GROW or whatever would require hairing up those
+	;; functions.
+
+	(when (and (> n-buckets 1) (getf init-plist ':size-supplied-p))
+	  (setq initial-size (ceiling (* initial-size growth-factor)))
+	  (multiple-value-setq (n-buckets entries-per-bucket bucket-size total-size)
+	    (compute-internal-dimensions self initial-size entry-size)))
+
+	(setq internal-representation 
+	      (make-array-for-table total-size area
+				    table-implementation-size
+				    'table-implementation))
+	(unless (table-flags-gc-protect-values-p flags-word)
+	  (setf (nti-values-array internal-representation)
+		(make-array-for-table total-size hash-table-weak-link-area)))
+	(setf (nti-n-buckets internal-representation) n-buckets)
+	(setf (nti-bucket-size internal-representation) bucket-size)
+	(setf (nti-entries-per-bucket internal-representation) entries-per-bucket)
+	(setf (nti-entry-size internal-representation) entry-size)
+
+	(setf (table-block-formatted-p flags) (= n-buckets 1))
+
+	(initialize-table-array self internal-representation)
+
+	(setq growth-size
+	      (if (table-block-formatted-p flags)
+		  (1- (table-size self))
+		  (floor (* (table-size self) growth-threshold))))
+	(setq shrink-size 0)))
+
+    (when (getf init-plist ':rehash-before-cold)
+      (push self si:rehash-these-hash-tables-before-cold))
+    (when (getf init-plist ':rehash-after-full-gc)
+      (push self *rehash-these-tables-after-full-gc*))
+
+    (setq lock (and (getf init-plist ':locking)
+		    (process::make-lock 
+		      (string-append (or (and name (string name)) "Table") " Lock")
+		      ':recursive t)))))
+
+;;; ****************************************************************
+
+;;; "mutation" is accomplished by arranging the geometry of the internal
+;;; representation such that it's essentially one big bucket.  For the
+;;; kinds of tables that can do this (EQ and EQL) that case is detected
+;;; in gethash and puthash, and a block-search is done on the keys part
+;;; of the bucket.  All this is controlled by the
+;;; compute-internal-dimensions method, which, handed a size, returns
+;;; the number of buckets to use, and the number of entries per bucket.
+;;; For block-searchable tables, compute-internal-dimensions will return
+;;; (1 max) if N is less than *maximum-block-size*, for others it
+;;; just does the usual algorithm.
+
+
+;;; Ivory rev 4 has a nasty bug that causes integer multiply to trap,
+;;; thus slowing it down immensely.  To avoid multiplying, we'll make
+;;; bucket-size and entry-size powers of two, and use shifts instead of
+;;; multiplies.  
+
+;;; wants considerable tuning later...
+(defun compute-internal-dimensions-internal (n-entries entry-size)
+  (declare (values n-buckets entries-per-bucket bucket-size total-size))
+  (setq n-entries (max n-entries 1))
+
+  ;; we want bucket-size to be a power of 2, but that doesn't mean
+  ;; entries-per-bucket is a power of 2, as in the case of
+  ;; :number-of-values 1 :store-hash-codes t, entry-size is 3, so we
+  ;; could end up with, for instance, bucket-size 16, and
+  ;; entries-per-bucket 5, which only wastes one word per bucket.
+  ;;
+  ;; assuming no wasted space, compute the number of entries per bucket.
+  ;; use that to compute the bucket size (rounding up to the next power
+  ;; of two).  recompute entries-per-bucket, based on the rounded-up
+  ;; bucket-size.  
+
+  (let (n-buckets entries-per-bucket bucket-size)
+    (setq entries-per-bucket 
+	  (nearest-greater-power-of-two
+	    (max 1 (simple-log2
+		     (nearest-greater-power-of-two (floor n-entries 256))))))
+    (setq bucket-size (nearest-greater-power-of-two (* entries-per-bucket entry-size)))
+    (setq entries-per-bucket (floor bucket-size entry-size))
+    (setq n-buckets (ceiling n-entries entries-per-bucket))
+
+    (multiple-value-bind (p p+2)
+	(find-next-larger-prime-pair n-buckets)
+      (ignore p)
+      (values p+2 entries-per-bucket bucket-size (* bucket-size p+2)))))
+
+(defflavor non-block-searchable-table-mixin
+	() ()
+  :abstract-flavor)
+
+(defmacro-in-flavor (maybe-gethash-block-search non-block-searchable-table-mixin) (all-values &body body)
+  (ignore all-values)
+  `(progn ,@body))
+
+(defmacro-in-flavor (maybe-puthash-block-search non-block-searchable-table-mixin) (&body body)
+  `(progn ,@body))
+
+(defmethod (compute-internal-dimensions non-block-searchable-table-mixin) (n-entries entry-size)
+  (declare (values n-buckets entries-per-bucket bucket-size total-size))
+  (compute-internal-dimensions-internal n-entries entry-size))
+
+(defflavor block-searchable-table-mixin 
+	() () 
+  :abstract-flavor)
+
+(defmacro-in-flavor (maybe-gethash-block-search block-searchable-table-mixin) (all-values &body body)
+  `(if (table-block-formatted-p flags)		; only one bucket?
+       (gethash-block-body ,all-values)		; yes, do a block search.
+       (progn ,@body)))
+
+(defmacro-in-flavor (maybe-puthash-block-search block-searchable-table-mixin) (&body body)
+  `(if (table-block-formatted-p flags)		; only one bucket?
+       (puthash-block-body)			; yes, do block searches
+       (progn ,@body)))
+
+(defmethod (compute-internal-dimensions block-searchable-table-mixin) (n-entries entry-size)
+  (declare (values n-buckets entries-per-bucket bucket-size total-size))
+  (if (< n-entries *maximum-block-size*)
+      (let* ((entries-per-bucket (max n-entries *minimum-block-size*))
+	     (bucket-size (* entries-per-bucket entry-size)))
+	(values 1 
+		entries-per-bucket
+		bucket-size 
+		bucket-size))
+      (compute-internal-dimensions-internal n-entries entry-size)))
+
+;;; ****************************************************************
+
+;;; At some point, it would be nice to use multiple-reader locks for the
+;;; cases where it's legal (multiple calls to gethash, for instance) For
+;;; now, lock-for-reading and lock-for-writing do the same thing.
+
+;(defmacro with-lock-for-reading (&body body)
+;  `(process::with-lock (lock :mode :exclusive-read)
+;     ,@body))
+;
+;(defmacro with-lock-for-writing (&body body)
+;  `(process::with-lock (lock :mode :write)
+;     ,@body))
+
+(defmacro with-lock-for-reading (&body body)
+  `(process::with-lock (lock)
+     ,@body))
+
+(defmacro with-lock-for-writing (&body body)
+  `(process::with-lock (lock)
+     ,@body))
+
+;;; locking tables.  provides two defmacro-in-flavors, for the inline
+;;; variants of with-lock-for-reading-inline and
+;;; with-lock-for-writing-inline, and whoppers for methods that aren't
+;;; inlined.
+(defflavor locking-table-mixin
+	() () 
+  (:required-flavors basic-table))
+
+(defmacro-in-flavor (with-lock-for-reading-inline locking-table-mixin) (&body body)
+  `(with-lock-for-reading ,@body))
+
+(defmacro-in-flavor (with-lock-for-writing-inline locking-table-mixin) (&body body)
+  `(with-lock-for-writing ,@body))
+
+(defwhopper (clrhash locking-table-mixin) ()
+  (with-lock-for-reading (continue-whopper)))
+
+(defwhopper (maphash locking-table-mixin) (fun)
+  (with-lock-for-reading (continue-whopper fun)))
+
+(defwhopper (maptable locking-table-mixin) (fun type)
+  (with-lock-for-reading (continue-whopper fun type)))
+
+(defwhopper (remhash locking-table-mixin) (key)
+  (with-lock-for-reading (continue-whopper key)))
+
+(defwhopper (grow locking-table-mixin) ()
+  (with-lock-for-writing (continue-whopper)))
+
+(defwhopper (shrink locking-table-mixin) ()
+  (with-lock-for-writing (continue-whopper)))
+
+(defwhopper (rehash locking-table-mixin) ()
+  (with-lock-for-writing (continue-whopper)))
+
+(defwhopper (si:with-table-elements-1 locking-table-mixin) (fun)
+  (with-lock-for-reading (continue-whopper fun)))
+
+;;; this should be inlined... fix later
+(defwhopper (modify-hash locking-table-mixin) (key fun)
+  (with-lock-for-reading (continue-whopper key fun)))
+
+(defmethod (with-table-locked-internal locking-table-mixin) (function)
+  ;; too bad there's no protocol for specifying how much locking the app
+  ;; wants here...
+  (with-lock-for-writing 
+    (funcall function)))
+
+;;; nonlocking tables.  provides stubs for the the inlined locking macros
+(defflavor non-locking-table-mixin 
+	() ()
+  (:required-flavors basic-table))
+
+(defmacro-in-flavor (with-lock-for-reading-inline non-locking-table-mixin) (&body body)
+  `(progn ,@body)) 
+
+(defmacro-in-flavor (with-lock-for-writing-inline non-locking-table-mixin) (&body body)
+  `(progn ,@body))
+
+(defmethod (with-table-locked-internal non-locking-table-mixin) (function)
+  ;; should this be an error?
+  (funcall function))
+
+;;; ****************************************************************
+
+;;; support for gc dependence.  the idea here is as follows:  When a
+;;; gc-dependent key gets inserted, GC-DEPENDENCE-CURRENT gets pushed up
+;;; to the gc level for that key.  GC-GENERATION-NUMBER holds the last
+;;; SYS:%GC-GENERATION-NUMBER at which all keys were known to be hashed
+;;; correctly.  GC-DYNAMIC-GENERATION-NUMBER and
+;;; GC-STATIC-GENERATION-NUMBER are similar;
+;;; GC-DYNAMIC-GENERATION-NUMBER holds the last
+;;; SYS:%GC-DYNAMIC-GENERATION-NUMBER at which keys were known to be
+;;; correctly hashed, and GC-STATIC-GENERATION-NUMBER holds
+;;; SYS:%GC-STATIC-GENERATION-NUMBER.  
+;;;
+;;; All three of those generation numbers get reset whenever a table is
+;;; rehashed or grown etc, as all keys get rehashed at those times.  in
+;;; addition, generation numbers may get updated in
+;;; update-gc-dependence, when upgrading to a new gc-dependence level.
+;;; the one which matches the new level is the one that will be updated,
+;;; ie if the table contains keys that depend on
+;;; SYS:%GC-DYNAMIC-GENERATION-NUMBER, GC-DYNAMIC-GENERATION-NUMBER is
+;;; updated.  GC-GENERATION-NUMBER is updated in update-gc-dependence
+;;; and in verify-gc-dependence, when we've concluded that no rehash is
+;;; necessary, because GC-GENERATION-NUMBER is checked against
+;;; SYS:%GC-GENERATION-NUMBER in methods like GETHASH and PUTHASH that
+;;; might require rehashing due to GC flips.
+;;; 
+;;; when an operation that could be impacted by a GC flip fails to find
+;;; a key, it checks to see if any GC has flipped since it looked last,
+;;; by comparing GC-GENERATION-NUMBER against SYS:%GC-GENERATION-NUMBER.
+;;; If it has, it calls VERIFY-GC-DEPENDENCE, which will check the gc
+;;; generation number for the current gc-dependence level.  Ie, if the
+;;; table is currently at dependence level SYS:%GC-DEPENDENCE-DYNAMIC,
+;;; GC-DYNAMIC-GENERATION-NUMBER is checked against
+;;; SYS:%GC-DYNAMIC-GENERATION-NUMBER.  If the numbers are equal, it's a
+;;; false alarm, ie a gc level that's "higher" than the one the table
+;;; depends on has flipped.  In that case, no rehash is necessary, we
+;;; just update GC-GENERATION-NUMBER and return.
+;;;
+;;; If the numbers are different, a level that the table *does* depend
+;;; on has flipped.  the table is rehashed, (which updates all the gc
+;;; generation numbers) and the original operation (GETHASH or whatever)
+;;; is retried.
+
+(defflavor gc-dependent-table-mixin
+	() ()
+  (:required-flavors basic-table))
+
+(defmethod (make-instance gc-dependent-table-mixin :after) (&rest ignore)
+  (setq gc-generation-number sys:%gc-generation-number
+	gc-dynamic-generation-number sys:%gc-dynamic-generation-number
+	gc-static-generation-number sys:%gc-static-generation-number))
+
+;;; some gc has flipped; check our dependence level to see whether we
+;;; need to rehash.
+(defmethod (verify-gc-dependence gc-dependent-table-mixin) ()
+  (declare (values retry-needed-p))
+  ;; Make a local copy of sys:%gc-generation-number, so that the value
+  ;; stored into gc-generation-number, used to detect whether a flip has
+  ;; occurred since the last time verify-gc-dependence was called, will
+  ;; not be newer than the static, dynamic, or ephemeral gc generation
+  ;; number we used to decide whether to rehash, even if a flip occurs
+  ;; after verify-gc-dependence decides not to rehash and before it returns.
+  (let ((egc sys:%gc-generation-number))
+    ;; did the level we depend on flip?
+    (cond ((cond ((= gc-dependence-current sys:%gc-dependence-ephemeral)
+		  ( gc-generation-number sys:%gc-generation-number))
+		 ((= gc-dependence-current sys:%gc-dependence-dynamic)
+		  ( gc-dynamic-generation-number sys:%gc-dynamic-generation-number))
+		 ((= gc-dependence-current sys:%gc-dependence-static)
+		  ( gc-static-generation-number sys:%gc-static-generation-number))
+		 ;; should this error if a bad value gets in, or just
+		 ;; return NIL?
+		 )
+	   (rehash self)			; will update gc-generation-number.
+	   t)					; having rehashed, retry key search.
+	  (t					; our gc level didn't flip,
+	   (setq gc-generation-number egc)	;  we don't need to retry.
+	   nil))))
+
+(defmethod (rehash-if-necessary gc-dependent-table-mixin) ()
+  (verify-gc-dependence self))
+
+;;;
+;;; this is called by maybe-upgrade-gc-dependence, below.  new-level is
+;;; the gc-dependence-level of the key being added to the table.  The
+;;; hash code of the key will always be computed again after this
+;;; method returns, because the hash code must always be computed after
+;;; sys:%gc-generation-number is copied into gc-generation-number.
+;;; First, call verify-gc-dependence, to make sure that the table
+;;; is hashed correctly *before* upgrading to the new level.
+;;; If verify-gc-dependence rehashed, just rehash the key and try again
+;;; because gc-dependence-current might have changed and we might not
+;;; be upgrading any more.
+;;; If verify-gc-dependence did not rehash, stash the new level,
+;;; and update the corresponding static or dynamic generation-number,
+;;; which is safe because we know there are not yet any keys in the 
+;;; table whose hash code depends on that generation number.  Do not
+;;; update the ephemeral generation number, because verify-gc-dependence
+;;; has already updated it and because it also serves as an indicator
+;;; of whether there has been a flip since the last time that
+;;; verify-gc-dependence was called.  If we were upgrading from dynamic
+;;; to ephemeral, and there was a dynamic flip after verify-gc-dependence
+;;; returns, the table needs to be rehashed again for the benefit
+;;; of the dynamic keys and gc-generation-number indicates that fact.
+;;;
+(defmethod (upgrade-gc-dependence gc-dependent-table-mixin) (new-level)
+  (unless (verify-gc-dependence self)
+    (setq gc-dependence-current new-level)
+    (cond ((= new-level sys:%gc-dependence-dynamic)
+	   (setq gc-dynamic-generation-number sys:%gc-dynamic-generation-number))
+	  ((= new-level sys:%gc-dependence-static)
+	   (setq gc-static-generation-number sys:%gc-static-generation-number)))))
+
+;;; Use these macros in methods that must care about gc dependence.
+;;; wrap with-gc-dependence-checking-inline around the body of code that
+;;; may need to be rerun, and put check-for-gc-flip-inline in the
+;;; place that must test whether a restart is needed.
+
+(defmacro-in-flavor (with-gc-dependence-checking-inline gc-dependent-table-mixin) (&body body)
+  ;; just call the nonspecialized one.
+  `(with-gc-dependence-checking ,@body))
+
+;;; this one has to duplicate check-for-gc-flip, as this one doesn't do
+;;; the do-we-care-about-gc test; we assume we do.
+(defmacro-in-flavor (check-for-gc-flip-inline gc-dependent-table-mixin) ()
+  '(when (and ( gc-generation-number sys:%gc-generation-number)
+	      (verify-gc-dependence self))
+     ;; drat.  a gc level that we depend on has flipped while
+     ;; we were running the body.  restart.
+     (go gc-dependence-restart)))
+
+;;; gc-dependent tables use the gc variant of the hash-function
+(defmacro-in-flavor (funcall-hash-function gc-dependent-table-mixin) (key)
+  `(funcall-hash-function-gc ,key))
+
+;;; ordinarily, we could simply macrologize the call to the upgrade
+;;; method, and let the compiler optimize out the test in the degenerate
+;;; cases.  our compiler's too stupid to do that.
+(defmacro-in-flavor (maybe-upgrade-gc-dependence gc-dependent-table-mixin) (self new-level)
+  `(when (and ,new-level (> ,new-level gc-dependence-current))
+     ;; upgrade to new level.  since the key we're working on now is the
+     ;; only one at this level, just set the new dependence-level, and
+     ;; go back to the top of the body, to rehash this key.
+     (upgrade-gc-dependence ,self ,new-level)
+     (go gc-dependence-restart)))
+
+(defmacro-in-flavor (with-gc-dependence-checking basic-table) (&body body)
+  `(block gc-dependence-checking
+     (tagbody
+       gc-dependence-restart
+	  (return-from gc-dependence-checking (progn ,@body)))))
+
+(defmacro-in-flavor (check-for-gc-flip basic-table) ()
+  `(when (and (plusp gc-dependence-current)
+	      ( gc-generation-number sys:%gc-generation-number)
+	      (verify-gc-dependence self))
+     ;; drat.  a gc level that we depend on has flipped while
+     ;; we were running the body.  restart.
+     (go gc-dependence-restart)))
+
+;;; the stub for non-gc-dependent tables
+(defflavor non-gc-dependent-table-mixin
+	() ())
+
+(defmacro-in-flavor (with-gc-dependence-checking-inline non-gc-dependent-table-mixin) (&body body)
+  `(progn ,@body))
+
+(defmacro-in-flavor (check-for-gc-flip-inline non-gc-dependent-table-mixin) ()
+  nil)
+
+;;; gc-independent tables use the no-gc variant of the hash-function
+(defmacro-in-flavor (funcall-hash-function non-gc-dependent-table-mixin) (key)
+  `(funcall-hash-function-no-gc ,key))
+
+(defmacro-in-flavor (maybe-upgrade-gc-dependence non-gc-dependent-table-mixin) (self new-level)
+  (ignore self)
+  `(ignore ,new-level))
+
+(defmethod (rehash-if-necessary non-gc-dependent-table-mixin) ()
+  nil)
+
+
+;;; ****************************************************************
+
+;;; methods common to all these tables, ie methods that don't get
+;;; specialized on things like test, locking etc, but rather check those
+;;; things at runtime.
+
+(defmethod (clrhash basic-table) ()
+  (declare (values table))
+  (clear-table-internal self)
+  self)
+
+;;;
+;;; This macro is used to generate maphash and maptable for
+;;; scatter-tables.  it provides all the code to deal with traversing
+;;; all the keys in a table, and invoke a caller-supplied forms to fetch
+;;; the key, and process the key and value.  the caller-supplied forms
+;;; should make 'free' references to "real-entry-index",
+;;; "cached-value-offset", "keys-array" and "values-array".  Blech.
+;;;
+;;; it's done this way to (a) keep the code in one place, and (b) supply
+;;; suitable hooks for weak-values tables.
+;;;
+(defmacro traverse-scatter-table ((&optional optional-per-key-wrapper-form) key-fetch-form body-form)
+  `(let* ((keys-array internal-representation)
+	  (values-array (or (nti-values-array keys-array) keys-array)))
+     (declare (sys:array-register keys-array values-array))
+     (loop named traversing-all-buckets
+	   with cached-empty-slot-value = *table-empty-slot-value*
+	   with cached-vacated-slot-value = *table-vacated-slot-value*
+	   with cached-value-offset = (nti-value-offset keys-array)
+	   with entries-per-bucket = (nti-entries-per-bucket keys-array)
+	   ;; with entry-size = (nti-entry-size keys-array)
+	   with bucket-size = (nti-bucket-size keys-array)
+	   with total-size = (nti-total-size keys-array)
+	   for real-entry-base-index		; real-entry index is the idx in the array, 
+	       from 0 by bucket-size		;  not the entry number
+	   while (< real-entry-base-index total-size)
+	   do
+       (loop named traversing-one-bucket
+	     with real-entry-index = real-entry-base-index
+	     with final-entry-index = (+ real-entry-index entries-per-bucket)
+	     with key
+	     while (< real-entry-index final-entry-index)
+	     do
+	 (,(or optional-per-key-wrapper-form 'progn)
+	  (setq key ,key-fetch-form)
+	  ;; for ordinary tables, that's (aref keys-array real-entry-index)
+	  (when (eq key cached-empty-slot-value)
+	    (return-from traversing-one-bucket))
+	  (unless (eq key cached-vacated-slot-value)
+	    ,body-form))
+	 ;; do the increment this way, as if we remhash, we
+	 ;; may have moved a new key in on top of the one
+	 ;; we're looking at.
+	 (when (eq key ,key-fetch-form)		; key unchanged?
+	   (incf real-entry-index))))))
+
+;;;
+;;; Per CLTL, it *is* legal to alter the current element during a
+;;; maphash, ie maphash'ing remhash or puthash of a new value is legal.
+;;; Frobbing any other element of the table will cause unpredctable
+;;; results.  Since REMHASH can cause resizing, set the inhibit-resize
+;;; bit.
+;;;
+(defmethod (maphash scatter-table) (function)
+  (let* ((bummed-flags flags)
+	 (old-resize-bit (table-flags-inhibit-resize-p bummed-flags))
+	 (old-map-bit (table-map-in-progress-p bummed-flags)))
+    (unwind-protect 
+	(progn 
+	  (setf (table-flags-inhibit-resize-p bummed-flags) t)
+	  (setf (table-map-in-progress-p bummed-flags) t)
+	  (setq flags bummed-flags)
+	  (traverse-scatter-table
+	    ()
+	    (aref keys-array real-entry-index)
+	    (funcall function key
+		     (if cached-value-offset	
+			 (aref values-array
+			       (+ cached-value-offset real-entry-index))
+			 t))))
+      (let ((new-bummed-flags flags))
+	(setf (table-flags-inhibit-resize-p new-bummed-flags) old-resize-bit)
+	(setf (table-map-in-progress-p new-bummed-flags) old-map-bit)
+	(setq flags new-bummed-flags)))))
+
+;;;
+;;; maptable is not specified by CLTL.  It's also undocumented, so I'm
+;;; not sure I've got the intended functionality right.  Currently, it's
+;;; just like maphash internally.  It looks from the define-protocol
+;;; form in the old table system that the idea was to make result-type
+;;; (and returned-value) optional, but none of the callers seem to use
+;;; it that way.
+;;;
+(defmethod (maptable scatter-table) (function result-type)
+  (let* ((result-sequence 
+	   (and result-type (make-sequence result-type (hash-table-count self))))
+	 (result-cons (and (listp result-sequence) result-sequence))
+	 (result-index 0)
+	 (bummed-flags flags)
+	 (old-resize-bit (table-flags-inhibit-resize-p bummed-flags))
+	 (old-map-bit (table-map-in-progress-p bummed-flags)))	 
+    (unwind-protect 
+	(progn 
+	  (setf (table-flags-inhibit-resize-p bummed-flags) t)
+	  (setf (table-map-in-progress-p bummed-flags) t)
+	  (setq flags bummed-flags)
+	  (traverse-scatter-table
+	    ()
+	    (aref keys-array real-entry-index)
+	    (let ((result-element
+		    (funcall function key 
+			     (if cached-value-offset
+				 (aref values-array (+ cached-value-offset real-entry-index))
+				 t))))
+	      (when result-type
+		(if result-cons
+		    (progn 
+		      (setf (car result-cons) result-element)
+		      (setq result-cons (cdr result-cons)))
+		    (progn
+		      (setf (aref result-sequence result-index) result-element)
+		      (incf result-index))))))
+	  (when result-type
+	    ;; in case of weak-values tables, trim excess elements from
+	    ;; end of sequence.
+	    (if (listp result-sequence)
+		(when result-cons (setf (cdr result-cons) nil))
+		(when (< result-index (length result-sequence))
+		  (adjust-array result-sequence result-index))))		      
+	  result-sequence)
+      (let ((new-bummed-flags flags))
+	(setf (table-flags-inhibit-resize-p new-bummed-flags) old-resize-bit)
+	(setf (table-map-in-progress-p new-bummed-flags) old-map-bit)
+	(setq flags new-bummed-flags)))))
+
+(defmethod (si:with-table-elements-1 scatter-table) (function)
+  (let* ((bucket-base-index 0)			; array index of start of current bucket
+	 (index-in-bucket -1)			; idx in array of next key
+	 (array internal-representation)	; in case rehash needs to make a new
+						;   one while we're traversing this one.
+	 (last-key nil)				; last key processed
+	 (last-key-p nil)			; valid flag
+	 (bummed-flags flags)
+	 (old-resize-bit (table-flags-inhibit-resize-p bummed-flags))
+	 (old-map-bit (table-map-in-progress-p bummed-flags)))
+    (labels ((generator ()
+	       (declare (sys:downward-function))
+	       (let* ((keys-array array)
+		      (vals-array (or (nti-values-array keys-array) keys-array))
+		      (entries-per-bucket (nti-entries-per-bucket keys-array))
+		      (bucket-size (nti-bucket-size keys-array))
+		      (bucket-index-limit (ash (nti-n-buckets keys-array)
+					       (nti-bucket-size-shift keys-array)))
+		      (value-offset (nti-value-offset keys-array)))
+		 (declare (sys:array-register keys-array vals-array))	
+
+		 ;; first see if we should increment index-in-bucket.
+		 ;; if there's a last key cached, and it's different
+		 ;; than the key that's there now, previous key removed,
+		 ;; don't increment.
+		 (when (or (not last-key-p)
+			   (eq last-key (aref array (+ index-in-bucket bucket-base-index))))
+		   (incf index-in-bucket)
+		   (setq last-key-p nil))
+
+		 ;; now scan for keys
+		 (loop while (< bucket-base-index bucket-index-limit)	; while not off last bucket
+		       do
+		   (loop while (< index-in-bucket entries-per-bucket)	; while not off this bucket
+			 for entry-index = (+ index-in-bucket bucket-base-index)
+			 for key = (aref keys-array entry-index)
+			 until (eq key *table-empty-slot-value*)
+			 unless (eq key *table-vacated-slot-value*)
+			   do (multiple-value-bind (value value-p)
+				  (if value-offset
+				      ;; only really need
+				      ;; si:%weak-link-contents in
+				      ;; case of weak-values tables,
+				      ;; but it's cheaper to just do
+				      ;; it this way than to check
+				      ;; for weak-ness here...
+				      (let* ((value-loc (locf (aref vals-array (+ value-offset entry-index)))))
+					(si:%weak-link-contents value-loc))
+				      (values t t))
+				(when value-p
+				  (setq last-key key 
+					last-key-p t)
+				  (return-from generator (values value
+								 key
+								 #'generator))))
+			 do (incf index-in-bucket))	; didn't find a key, bump idx for next time
+		       do (setq index-in-bucket 0)
+			  (incf bucket-base-index bucket-size))	; bump to next bucket
+		 )))
+		 
+      (unwind-protect
+	  (progn
+	    (setf (table-flags-inhibit-resize-p bummed-flags) t)
+	    (setf (table-map-in-progress-p bummed-flags) t)
+	    (setq flags bummed-flags)
+	    (funcall function #'generator))
+	(let ((new-bummed-flags flags))
+	  (setf (table-flags-inhibit-resize-p new-bummed-flags) old-resize-bit)
+	  (setf (table-map-in-progress-p new-bummed-flags) old-map-bit)
+	  (setq flags new-bummed-flags))))))
+
+;;;
+;;; REMHASH.  This is tricky.  When deleting, we search for the key in
+;;; the table, and if it exists, zap it.  In the case of a real
+;;; scatter-table, empty slot must be filled with a magic value that's
+;;; different from the regular empty-value, so as to not confuse gethash
+;;; et al, when they're running thru their probe sequences.  In the case
+;;; of a block-table, the 'bucket' must be refilled such that the keys
+;;; remain contiguous.
+;;;
+;;; This method depends on weak-values tables never being block
+;;; formatted; it will need rework if that's changed.
+;;;
+(defmethod (remhash scatter-table) (key)
+  (declare (values removed))
+  (block remhash
+    ;; check for need to shrink or rehash
+    (let ((bummed-flags flags))
+      (when (and (not (table-flags-inhibit-resize-p bummed-flags))
+		 (table-flags-need-shrink-p bummed-flags))
+	(shrink self)))
+    (when (table-flags-need-rehash-p flags)
+      (rehash self))
+    (with-gc-dependence-checking
+      (let* ((hash-code (funcall hash-function key))
+	     (array internal-representation)
+	     ;; values-array almost always unused here
+	     (bucket-size-shift (nti-bucket-size-shift array))
+	     ;; (entry-size (nti-entry-size array))
+	     (entries-per-bucket (nti-entries-per-bucket array))
+	     (hash-code-offset (nti-hash-code-offset array))
+	     (n-buckets (nti-n-buckets array))
+	     (n-buckets-minus-2
+	       ;; (nti-n-buckets-minus-2 array)
+	       (- n-buckets 2))
+	     (original-base-entry-index 
+	       (ash (mod hash-code n-buckets) bucket-size-shift))
+	     (base-entry-index original-base-entry-index)
+	     (collision-offset
+	       (ash (1+ (mod hash-code n-buckets-minus-2)) bucket-size-shift))
+	     (total-size (nti-total-size array)))
+	(declare (sys:array-register array))
+
+	(loop named searching-buckets 
+	      with collisions = 0
+	      do
+	  (loop repeat entries-per-bucket
+		for index from base-entry-index 
+		for hash-key = (aref array index)
+		when (eq hash-key *table-empty-slot-value*)
+		  do ;; not found.
+		    (check-for-gc-flip)		; if gc flipped and we care, retry
+		    (return-from searching-buckets nil)
+		unless (eq hash-key *table-vacated-slot-value*) 
+		  do (when (and (or (not hash-code-offset)
+				    (= (aref array (+ index hash-code-offset))
+				       hash-code))
+				(funcall test-function hash-key key))
+		       ;;
+		       ;; Found the matching key.  Empty out this
+		       ;; slot.  if we've got a block-table, fill from
+		       ;; the end of the bucket into the empty slot
+		       ;; (to keep everything contiguous) else stuff
+		       ;; *table-vacated-slot-value* into the key
+		       ;; slot.
+		       ;;
+		       (cond ((table-block-formatted-p flags)
+			      (cond ((> n-filled-elements 1)	; anything to move in here?
+				     (let* ((last-index (1- n-filled-elements))
+					    (value-offset (nti-value-offset array))
+					    (values-array (or (nti-values-array array) array))
+					    (value (and value-offset 
+							(aref values-array (+ last-index value-offset)))))
+				       (without-interrupts	; protect against c-Abort
+					 (setf (aref array index)
+					       (aref array last-index))
+					 (setf (aref array last-index)
+					       *table-empty-slot-value*)
+					 (when value-offset 
+					   (setf (aref values-array (+ index value-offset))
+						 value))
+					 (when hash-code-offset 
+					   (setf (aref array (+ index hash-code-offset))
+						 (aref array (+ last-index hash-code-offset))))
+					 (decf-carefully n-filled-elements))))
+				    (t
+				     ;; only one element here, and we're deleting it
+				     (without-interrupts	; protect against c-Abort
+				       (setf (aref array index) *table-empty-slot-value*)
+				       (decf-carefully n-filled-elements)))))
+			     (t
+			      ;; scatter-table, use *table-vacated-slot-value*
+			      (without-interrupts	; protect against c-Abort
+				(setf (aref array index) *table-vacated-slot-value*)
+				(incf n-vacated-elements)
+				(decf-carefully n-filled-elements))))
+
+		       ;; see if we need to shrink this table
+		       (when (< n-filled-elements shrink-size)
+			 (setf (table-flags-need-shrink-p flags) t))
+
+		       ;; check to see if we've put in enough vacated
+		       ;; values to justify a rehash.  if half the empty
+		       ;; slots are vacated, rehash.
+		       (when (not (table-block-formatted-p flags))
+			 (cond ((> n-vacated-elements 
+				   (floor (- (table-size self) n-filled-elements) 2))
+				(setf (table-flags-need-rehash-p flags) t))	; arrange to rehash next time
+			       ((and (zerop n-filled-elements)
+				     (> n-vacated-elements 
+					(floor (table-size self) 4)))
+				(without-interrupts	; protect against c-Abort
+				  ;; just zap everything
+				  (fill array *table-empty-slot-value*)
+				  (setf n-vacated-elements 0)))))
+
+		       (return-from searching-buckets t)))
+
+	  ;; if get here, we have a collision, try next bucket
+	  (when (table-block-formatted-p flags)
+	    ;; somewhat pathological case:  a block-formatted table has
+	    ;; become full; needs growth.  we get here because there are
+	    ;; no free slots.  it's not a collision, it's a failure to
+	    ;; find the key.
+	    (return nil))
+	  (incf collisions)
+	  (when (> collisions n-buckets)	; searched all buckets, not found?
+	    (return nil))
+	  (decf base-entry-index collision-offset)
+	  (when (minusp base-entry-index)
+	    (incf base-entry-index total-size))
+	      finally (return nil))))))
+
+(defmethod (page-in-table basic-table) (&key type hang-p)
+  (ignore type)
+  (sys:page-in-array internal-representation 0 
+		     (sys:array-length internal-representation) hang-p))
+
+(defmethod (page-in-table weak-values-table-mixin :after) (&key type hang-p)
+  (ignore type)
+  (sys:page-in-array (nti-values-array internal-representation) 0 
+		     (sys:array-length internal-representation) hang-p))
+
+(defmethod (page-out-table basic-table) (&key (write-modified :reuse))
+  (declare (values))
+  (ignore write-modified)
+  (sys:page-out-array internal-representation)
+  (values))
+
+(defmethod (page-out-table weak-values-table-mixin :after) (&key (write-modified :reuse))
+  (declare (values))
+  (ignore write-modified)
+  (sys:page-out-array (nti-values-array internal-representation))
+  (values))
+
+(defmethod (hash-table-count basic-table) (&rest ignore)
+  n-filled-elements)
+
+(defmethod (test-function basic-table) () 
+  test-function)
+
+(defmethod (table-number-of-values basic-table) ()
+  (table-flags-number-of-values flags))
+
+(defmethod (table-size scatter-table) ()
+  (* (nti-n-buckets internal-representation)
+     (nti-entries-per-bucket internal-representation)))
+
+
+;;; ****************************************************************
+
+;;; growing, rehashing, etc
+
+
+;;; this macro is used to generate the bodies of copy-to-new-array
+;;; methods.  currently there are two, for normal tables and weak-values
+;;; tables; they differ only in the way keys and values are fetched from
+;;; the source array.
+;;;
+;;; key-and-value-fetch-form should return two values; key and value.
+
+(defmacro copy-to-new-array-body (key-and-value-fetch-form)
+  `(let* ((old-representation-keys internal-representation)
+	  (old-representation-values (or (nti-values-array old-representation-keys)
+					 old-representation-keys))
+	  ;; (old-n-buckets (nti-n-buckets old-representation))
+	  (old-entries-per-bucket (nti-entries-per-bucket old-representation-keys))
+	  (old-bucket-size (nti-bucket-size old-representation-keys))
+	  (old-value-offset (nti-value-offset old-representation-keys))
+	  (old-hash-code-offset (nti-hash-code-offset old-representation-keys))
+	  (old-table-size (nti-total-size old-representation-keys))
+
+	  (new-representation-keys new-internal-representation)
+	  (new-representation-values (or (nti-values-array new-representation-keys)
+					 new-representation-keys))
+	  (new-n-buckets (nti-n-buckets new-representation-keys))
+	  (new-entries-per-bucket (nti-entries-per-bucket new-representation-keys))
+	  (new-value-offset (nti-value-offset new-representation-keys))
+	  (new-hash-code-offset (nti-hash-code-offset new-representation-keys))
+	  (new-bucket-size-shift (nti-bucket-size-shift new-representation-keys))
+	  (new-total-size (nti-total-size new-representation-keys))
+
+	  ;; (entry-size (nti-entry-size new-representation-keys))
+	  (new-n-buckets-minus-2
+	    ;; (nti-n-buckets-minus-2 new-representation-keys)
+	    (- new-n-buckets 2))
+	  (n-entries-copied 0)
+	  (new-gc-dependence-level nil))
+     (declare (sys:array-register old-representation-keys old-representation-values
+				  new-representation-keys new-representation-values))
+
+     ;; first order of business here is to set all the gc-generation
+     ;; numbers to their current values; these numbers are guaranteed
+     ;; accurate (at least for now) as we'll be rehashing all the keys in
+     ;; the table.  with luck, no gc (that we care about) will flip while
+     ;; we're doing the copy.
+     (setq gc-generation-number sys:%gc-generation-number
+	   gc-dynamic-generation-number sys:%gc-dynamic-generation-number
+	   gc-static-generation-number sys:%gc-static-generation-number)
+
+     (loop named traversing-all-buckets
+	   with cached-empty-slot-value = *table-empty-slot-value*
+	   with cached-vacated-slot-value = *table-vacated-slot-value*
+	   with old-entry-base-index = 0	; this is the idx in the array,
+						;  not the entry number
+	   while (< old-entry-base-index old-table-size)
+	   do
+       (tv:note-progress old-entry-base-index old-table-size)
+       (loop named traversing-one-bucket
+	     repeat old-entries-per-bucket
+	     for old-entry-index from old-entry-base-index
+	     with key 
+	     with value
+	     do (multiple-value-setq (key value)
+		  ,key-and-value-fetch-form)
+	     when (eq key cached-empty-slot-value)
+	       do (return-from traversing-one-bucket)
+	     unless (eq key cached-vacated-slot-value)
+	       do
+	 ;; 'puthash' this key/value into the target array
+		 (let ((hash-code
+			 (if (and old-hash-code-offset (not force-rehash-p))
+
+			     ;; use the stored hash code, rather than
+			     ;; recomputing it.
+			     (aref old-representation-keys
+				   (+ old-hash-code-offset old-entry-index))
+
+			     ;; recompute it.
+			     (multiple-value-bind (hash-code gc-level)
+				 (funcall hash-function key)
+
+			       ;; track gc dependence level
+			       (setq new-gc-dependence-level
+				     (max (or gc-level sys:%gc-dependence-none)
+					  (or new-gc-dependence-level sys:%gc-dependence-none)))
+			       hash-code))))
+
+		   (let* ((new-bucket-index (mod hash-code new-n-buckets))
+			  (new-entry-base-index
+			    (ash new-bucket-index new-bucket-size-shift))
+			  (collision-offset
+			    (ash (1+ (mod hash-code new-n-buckets-minus-2))
+				 new-bucket-size-shift)))
+
+		     ;; we're at the beginning of the 'right' bucket for this
+		     ;; hash-code.  try to find a free slot in it.
+		     (loop named puthash-one-key
+			   for collisions from 0
+			   with max-collisions = new-n-buckets
+			   while (< collisions max-collisions)
+			   do
+		       (loop named puthash-search-bucket
+			     repeat new-entries-per-bucket
+			     for index from new-entry-base-index
+			     for old-key-slot-contents = (aref new-representation-keys index)
+			     when (eq old-key-slot-contents
+				      cached-empty-slot-value)	; found empty slot!
+			       do (setf (aref new-representation-keys index) key)
+				  (when new-value-offset
+				    (setf (aref new-representation-values
+						(+ new-value-offset index))
+					  value))
+				  (when new-hash-code-offset
+				    (setf (aref new-representation-keys
+						(+ new-hash-code-offset index)) hash-code))
+				  (incf n-entries-copied)
+				  (return-from puthash-one-key))
+
+		       ;; if we reach here, we collided, ie that bucket was
+		       ;; full.  offset base index by collision-offset, and
+		       ;; probe the next bucket.
+		       (decf new-entry-base-index collision-offset)
+		       (when (minusp new-entry-base-index)	; wrapped?
+			 (incf new-entry-base-index new-total-size))
+			   finally (error "Table full?  Can't happen")))))
+
+       ;; done raversing this bucket.  inc base-index to the next one.
+       (incf old-entry-base-index old-bucket-size))
+
+     (when (and new-gc-dependence-level		; we've come up with a gc-dependence level
+		(or force-rehash-p		; and we've actually recomputed
+		    (not old-hash-code-offset)))	;  the hash-codes, not reused old ones
+       (setq gc-dependence-current new-gc-dependence-level))
+
+     (setq internal-representation new-representation-keys)
+     (setq n-vacated-elements 0)		; we just cleaned them up
+
+     ;; (si:return-array old-representation)   is there any way to make this safe?
+     n-entries-copied))
+
+(defmethod (copy-to-new-array scatter-table) (new-internal-representation &optional force-rehash-p)
+  (declare (values n-entries-copies))
+  (copy-to-new-array-body 
+    (values (aref old-representation-keys old-entry-index)
+	    (if old-value-offset
+		(aref old-representation-values
+		      (+ old-value-offset old-entry-index))
+		t))))
+
+(defmethod (grow scatter-table) ()
+  (let ((old-bucket-count (nti-n-buckets internal-representation))
+	(old-entries-per-bucket (nti-entries-per-bucket internal-representation))
+	(entry-size (nti-entry-size internal-representation)))
+    
+    (multiple-value-bind (new-bucket-count new-entries-per-bucket new-bucket-size new-total-size)
+	(compute-internal-dimensions self
+				     (floor (* (1+	; protect against :size 0
+						 (* old-bucket-count old-entries-per-bucket))
+					       growth-factor))
+				     entry-size)
+
+      (let ((new-representation 
+	       (make-array-for-table new-total-size area
+				     table-implementation-size
+				     'table-implementation)))
+	(when (nti-values-array internal-representation)
+	  (setf (nti-values-array new-representation)
+		(make-array-for-table new-total-size hash-table-weak-link-area)))
+	(setf (nti-n-buckets new-representation) new-bucket-count)
+	(setf (nti-bucket-size new-representation) new-bucket-size)
+	(setf (nti-entries-per-bucket new-representation) new-entries-per-bucket)
+	(setf (nti-entry-size new-representation) entry-size)
+
+	(setf (table-block-formatted-p flags) (= new-bucket-count 1))
+
+	(initialize-table-array self new-representation)
+
+	(tv:noting-progress ((format nil "Growing ~:[a table~;table ~:*~A~]" name))
+	  (copy-to-new-array self new-representation nil)))
+
+      (let ((bummed-flags flags))
+	(setf (table-flags-need-shrink-p bummed-flags) nil)
+	(setf (table-flags-need-growth-p bummed-flags) nil)
+	(setf (table-flags-need-rehash-p bummed-flags) nil)
+	(setq flags bummed-flags)
+	(setq growth-size
+	      (if (table-block-formatted-p bummed-flags)
+		  (1- (table-size self))
+		  (floor (* (table-size self)
+			    growth-threshold)))))
+      (setq shrink-size (ceiling (* n-filled-elements
+				    growth-threshold))))))
+
+
+(defmethod (shrink scatter-table) ()
+  (unless (eq area ':stack)			; don't shrink stack tables, it's just wasteful
+    (let ((entry-size (nti-entry-size internal-representation)))
+      (multiple-value-bind (new-bucket-count new-entries-per-bucket new-bucket-size new-total-size)
+	  (compute-internal-dimensions self
+				       (floor (* (1+ n-filled-elements)			  
+						 (/ 1 (expt growth-threshold 2))))
+				       entry-size)
+
+	;; don't bother shrinking if new size calculated is greater than
+	;; what we've already got.  that can happen with a small
+	;; growth-factor, and small growth-threshold.
+
+	(when (< new-total-size (table-size self))
+	  (let* ((new-representation		
+		   (make-array-for-table new-total-size area
+					 table-implementation-size 
+					 'table-implementation)))
+	    (when (nti-values-array internal-representation)
+	      (setf (nti-values-array new-representation)
+		    (make-array-for-table new-total-size hash-table-weak-link-area)))
+	    (setf (nti-n-buckets new-representation) new-bucket-count)
+	    (setf (nti-bucket-size new-representation) new-bucket-size)
+	    (setf (nti-entries-per-bucket new-representation) new-entries-per-bucket)
+	    (setf (nti-entry-size new-representation) entry-size)
+
+	    (setf (table-block-formatted-p flags) (= new-bucket-count 1))
+
+	    (initialize-table-array self new-representation)
+
+	    (tv:noting-progress ((format nil "Shrinking ~:[a table~;table ~:*~A~]" name))
+	      (copy-to-new-array self new-representation nil))))
+
+	(setq growth-size 
+	      (if (table-block-formatted-p flags)
+		  (1- (table-size self))
+		  (floor (* (table-size self) growth-threshold)))))))
+
+  (setq shrink-size (ceiling (* n-filled-elements growth-threshold)))
+  (let ((bummed-flags flags))
+    (setf (table-flags-need-shrink-p bummed-flags) nil)
+    (setf (table-flags-need-growth-p bummed-flags) nil)
+    (setf (table-flags-need-rehash-p bummed-flags) nil)
+    (setq flags bummed-flags)))
+
+;;;
+;;; Something like grow, but same size.  Unless table-map-in-progress-p
+;;; is set, cons a temporary array, copy into that, rehash back into the
+;;; original, then return-array the temp.  This is slower, but keeps
+;;; down the number of gc flips.  If table-map-in-progress-p is set,
+;;; we're being called because a gc has flipped in the middle of a
+;;; maphash operation.  In that case, we cannot store back into the
+;;; original array, so we make a new one, rehash into it, and replace it
+;;; in the table instance, ie just what grow and shrink do.
+;;;
+(defmethod (rehash scatter-table) ()
+  (let* ((bucket-count (nti-n-buckets internal-representation))
+	 (bucket-size (nti-bucket-size internal-representation))
+	 (total-size (nti-total-size internal-representation))
+	 (target-representation			; ordinarily we hash back into here.
+	    internal-representation)
+	 temp-representation 			;   ... having first copied contents to here.
+	 (temp-area area)			; area to build the temp in
+	 )
+    (when (eq temp-area :stack)			; don't try to build temp on the stack
+      (setq temp-area default-cons-area))
+
+    (setq temp-representation (make-array-for-table total-size temp-area
+				 table-implementation-size
+				 'table-implementation))
+    (when (nti-values-array internal-representation)
+      (setf (nti-values-array temp-representation)
+	    (make-array-for-table total-size 
+				  (if (table-map-in-progress-p flags) 
+				      hash-table-weak-link-area
+				      default-cons-area))))
+    (setf (nti-n-buckets temp-representation) bucket-count)
+    (setf (nti-bucket-size temp-representation) bucket-size)
+    (setf (nti-entries-per-bucket temp-representation) 
+	  (nti-entries-per-bucket internal-representation))
+    (setf (nti-entry-size temp-representation)
+	  (nti-entry-size internal-representation))
+
+    (setf (table-block-formatted-p flags) (= bucket-count 1))
+
+    (initialize-table-array self temp-representation)
+      
+    (cond ((table-map-in-progress-p flags)
+	   ;; swap temp array and current
+	   (shiftf target-representation temp-representation target-representation))
+	  (t
+	   ;; copy the old rep to new, so we can clear old and rehash back.
+	   (copy-array-portion target-representation 0 total-size
+			       temp-representation 0 total-size)
+	   ;; when there's a values-array, copy that one too.  this has to be a
+	   ;; little trickier, to avoid barfing on unbound slots.
+	   (when (nti-values-array temp-representation)
+	     (let ((old-v (nti-values-array internal-representation))
+		   (temp-v (nti-values-array temp-representation)))
+	       (multiple-value-bind (nil nil old-loc nil)
+		   (setup-1d-array old-v)
+		 (multiple-value-bind (nil nil temp-loc nil)
+		     (setup-1d-array temp-v)
+		   (loop repeat total-size
+			 do (multiple-value-bind (value value-p)
+				(si:%weak-link-contents old-loc)
+			      (if value-p
+				  #+Imach (sys:%memory-write temp-loc value)
+				  #+3600 (sys:%p-store-cdr-and-contents temp-loc value cdr-nil)
+				  (location-makunbound temp-loc)))
+
+;			    (without-interrupts
+;			      (if (location-boundp old-loc)
+;				  (setf (location-contents temp-loc)
+;					(location-contents old-loc))
+;				  (location-makunbound temp-loc)))
+		     
+			    (setq old-loc (sys:%pointer-plus old-loc 1))
+			    (setq temp-loc (sys:%pointer-plus temp-loc 1)))))))
+	   (setq internal-representation temp-representation)
+	   (fill target-representation *table-empty-slot-value*)))
+
+    (tv:noting-progress ((format nil "Rehashing ~:[a table~;table ~:*~A~]" name))
+      (copy-to-new-array self target-representation t))
+
+    ;; now free up the temp(s)
+    (unless (table-map-in-progress-p flags)
+      (when (nti-values-array temp-representation)
+	(si:return-array (nti-values-array temp-representation)))
+      (si:return-array temp-representation))
+    
+    ;; clear the need-rehash flag
+    (setf (table-flags-need-rehash-p flags) nil)))
+
+;;; kludge for now...
+(defmethod (modify-hash basic-table) (key function)
+  (declare (values new-value key))
+  (multiple-value-bind (val found-p real-key)
+      (gethash key self)
+    (let ((new-value
+	    (funcall function (if found-p real-key key) val found-p)))
+      (setf (gethash key self) new-value)
+      (values new-value real-key))))
+
+;;; ****************************************************************
+
+;;; compatibility methods
+
+(defmethod (:get-hash basic-table) (key)
+  (gethash key self))
+
+(defmethod (:put-hash basic-table) (key val)
+  (setf (gethash key self) val))
+
+(defmethod (:clear-hash basic-table) ()
+  (clrhash self))
+
+(defmethod (:rem-hash basic-table) (key)
+  (remhash key self))
+
+(defmethod (:map-hash basic-table) (fun &rest args)
+  ;; this would be just a call to maphash, except that this one allows
+  ;; extra args.
+  (maphash #'(lambda (key val) (apply fun key val args)) self))
+
+(defmethod (:swap-hash basic-table) (key new-value)
+  (let ((old-value nil) (foundp nil))
+    (modify-hash self key #'(lambda (ignore ovalue found)
+			      (when found
+				(setf old-value ovalue)
+				(setf foundp t))
+			      new-value))
+    (values old-value foundp)))
+
+(defmethod (:modify-hash basic-table) (key function &rest args)
+  (modify-hash self key #'(lambda (key value found-p)
+			    (apply function key value found-p args))))
+
+(defmethod (:filled-elements basic-table) ()
+  (hash-table-count self))
+
+;;; This method preserved with its comment intact from 8.0...
+
+;;; >>> Another compatibility kludge. <<<
+(defmethod (:size basic-table) ()
+  (table-size self))
+
+;;; ****************************************************************
+
+;;; describing
+
+(defmethod (sys:print-self scatter-table) (stream &rest ignore)
+  (sys:printing-random-object (self stream)
+    (princ "Table " stream)
+    (if name
+	(format stream "(~S)" name)
+	(progn 
+	  (format stream ":TEST ~A" (sys:function-name test-function))
+	  (loop for thing in options do
+	    (format stream " ~S" thing))))    
+    (format stream " ~D/~D" n-filled-elements (table-size self))))
+
+(defmethod (:describe scatter-table) ()
+  (format t "~&Table ~A~% contains ~:D element~:P" self n-filled-elements)
+  (when (and internal-representation (arrayp internal-representation)) 
+    (format t ", with a total capacity of ~:D." 
+	    (* (nti-n-buckets internal-representation)
+	       (nti-entries-per-bucket internal-representation))))
+  (format t "~&Growth threshold ~,2F; Growth factor ~,2F"
+	  growth-threshold
+	  growth-factor)
+  (format t "~&Test function ~S; Hash function ~S" 
+	  (multiple-value-bind (nil name)
+	      (fixup-function-for-table-system test-function)
+	    name)
+	  (multiple-value-bind (nil name) 
+	      (fixup-function-for-table-system hash-function)
+	    name))
+  (when (> n-filled-elements 0)
+    (when (and (not (table-block-formatted-p flags))
+	       (y-or-n-p "Do you want to see distribution information? "))
+      (describe-distribution self))
+    (when (y-or-n-p "Do you want to see the contents of the hash table? ")
+      (describe-contents self (y-or-n-p "Do you want it sorted? ")))))
+      
+
+(defmethod (describe-distribution scatter-table) ()
+  (let ((probe-frequency (make-array (nti-entries-per-bucket internal-representation)
+				     ':initial-element 0))
+	(collisions-alist nil))
+    (flet ((process-one-key (key val)
+	     (ignore val)
+	     ;; figure out what it takes to find this key.
+	     (let* ((hash-value (funcall hash-function key))
+		    (n-buckets (nti-n-buckets internal-representation))
+		    (bucket-size (nti-bucket-size internal-representation))
+		    (entries-per-bucket (nti-entries-per-bucket internal-representation))
+		    ;; (entry-size (nti-entry-size internal-representation))
+		    (bucket-index (mod hash-value (nti-n-buckets internal-representation)))
+		    (collision-offset 
+		      (1+ (mod hash-value 
+			       ;; (nti-n-buckets-minus-2 internal-representation)
+			       (- n-buckets 2)))))
+	       ;; do a fake gethash here, and collect stats on what happened
+	       (loop named searching-buckets 
+		     for n-buckets-searched from 0 do
+		 (loop named searching-one-bucket 
+		       repeat entries-per-bucket
+		       for entry-index from 0
+		       for n-keys-probed from 0 do 
+		   (when (funcall test-function key (aref internal-representation 
+							  (+ (* bucket-index bucket-size)
+							     entry-index)))
+		     ;; found it.  collect stats and return
+		     (let ((collisions-elt (assoc n-buckets-searched collisions-alist)))
+		       (unless collisions-elt
+			 (setq collisions-elt (list n-buckets-searched 0))
+			 (push collisions-elt collisions-alist))
+		       (incf (second collisions-elt)))
+		     (incf (aref probe-frequency n-keys-probed))
+		     (return-from searching-buckets)))
+		 ;; collision.  try next bucket
+		 (decf bucket-index collision-offset)
+		 (when (minusp bucket-index)
+		   (incf bucket-index n-buckets))))))
+      (maphash #'process-one-key self)
+      (setq collisions-alist 
+	    (sort collisions-alist #'< ':key #'car))
+      (loop for (n c) in collisions-alist do
+	(when (plusp c)
+	  (format t "~&~8D (~3D%) key~A had ~2D collision~:P" 
+		  c (round (* 100 (/ c n-filled-elements))) 
+		  (if (= c 1) " " "s") n)))
+      (let ((total-bucket-searches (loop for i below (length probe-frequency) 
+					 sum (aref probe-frequency i))))
+	(loop for i below (length probe-frequency)
+	      with cumulative-percentage = 0 
+	      for this-percentage = 
+		  (round (* 100 (/ (aref probe-frequency i) total-bucket-searches)))
+	      when (plusp (aref probe-frequency i))
+		do
+		  (format t "~&~8D final bucket search~A (~3D%) probed ~2D key~A (~3D%)"
+			  (aref probe-frequency i) 
+			  (if (= (aref probe-frequency i) 1) "  " "es")
+			  this-percentage
+			  (1+ i)
+			  (if (= (1+ i) 1) " " "s")
+			  (setq cumulative-percentage (+ cumulative-percentage this-percentage))))))))
+
+(defmethod (describe-contents basic-table) (&optional sort-p)
+  (if sort-p
+      (loop for (key val) in (sort (maptable self #'list 'list) #'alphalessp :key #'car) do
+	(format t "~&~S  ~S" key val))
+      (maphash #'(lambda (key val) (format t "~&~S  ~S" key val)) self)))
+
+
+;;; ****************************************************************
+
+;;; methods that get compiled inline, per hash-table flavor.
+
+;;; the guts of GETHASH and FAST-TABLE-GET.  
+;;; all-values means return all three values (ie a real GETHASH) or only one
+;;; (FAST-TABLE-GET)
+(defmacro gethash-scatter-body (all-values) ;; (key &optional default)
+  `(with-lock-for-reading-inline
+
+     (maybe-gethash-block-search ,all-values	; generate block-search code
+						;  for flavors that use it
+
+       ;; If flags say we need a rehash, do it now, rather than waiting
+       ;; to see if we find the key.  That way could defer the rehash a
+       ;; little longer, but this is safer.
+       (when (table-flags-need-rehash-p flags)
+	 (rehash self))
+       
+       (with-gc-dependence-checking-inline 
+	 (let* ((hash-code (funcall-hash-function-no-gc key))
+		(array internal-representation))
+	   (declare (sys:array-register array))
+	   (with-internal-representation-values (array)
+	     (let ((base-entry-index 
+		     (ash (mod hash-code n-buckets) bucket-size-shift))
+		   ;; don't compute collision-offset until the first
+		   ;; time we need it.
+		   (collision-offset nil)
+		   (cached-empty-slot-value *table-empty-slot-value*)
+		   (cached-vacated-slot-value *table-vacated-slot-value*)
+		   )
+
+	       (loop named searching-buckets do
+		 (loop repeat entries-per-bucket
+		       for index from base-entry-index 
+		       for hash-key = (key-aref array index)
+		       when (eq hash-key cached-empty-slot-value)
+			 do ;; key not found.  if gc flipped, rehash and try 
+			    ;;  again, else give up
+			   (check-for-gc-flip-inline)
+			   (return-from searching-buckets
+			     (values ,@(if all-values '(default nil nil) '(nil))))
+		       when (and (neq hash-key cached-vacated-slot-value)
+				 (compare-hash-codes-or-keys))
+			 do (return-from searching-buckets
+			      (value-aref-gethash-values array index ,all-values)))
+		  
+		 ;; if get here, we have a collision.  compute
+		 ;; collision-offset, and start looking in other
+		 ;; buckets.
+		     unless collision-offset
+		       do (setq collision-offset
+				(ash (1+ (mod hash-code (- n-buckets 2))) 
+				     bucket-size-shift))
+		     with n-collisions = 0
+		     do (incf n-collisions)
+			(when (> n-collisions n-buckets)
+			  (error "Too many collisions!  Can't happen."))
+			(decf base-entry-index collision-offset)
+			(when (minusp base-entry-index)
+			  (incf base-entry-index total-size))))))))))
+
+;;; same idea, but assume one bucket, and block-search for the keys.
+(defmacro gethash-block-body (all-values) ;; (key &optional default)
+  `(multiple-value-bind (array control base length)
+       (sys:setup-1d-array internal-representation)
+     (ignore control length)
+     (let* ((n-entries (nti-entries-per-bucket array))
+	    (key-location (block-search-inline key base n-filled-elements)))
+       (if key-location
+	   (values (if (nti-value-offset array)	; we store values?
+		       (location-contents 
+			 (sys:%pointer-plus key-location n-entries))
+		       t)
+		   ,@(if all-values '(t (location-contents key-location))))
+	   (values ,@(if all-values '(default nil nil) '(nil)))))))
+
+(defmacro puthash-scatter-body ()
+  `(with-lock-for-reading-inline
+     (when (let ((bummed-flags flags))
+;	     (and (not (table-flags-inhibit-resize-p bummed-flags))
+;		  (table-flags-need-growth-p bummed-flags))
+	     ;; one of the GC optimizations is out of spec, needs to be able to
+	     ;; grow during maphash...
+	     (table-flags-need-growth-p bummed-flags))
+       (grow self))				; yes, do it now.
+
+     (maybe-puthash-block-search		; generate block-search code
+						;  for flavors that use it
+
+       ;; If flags say we need a rehash, do it now, rather than waiting
+       ;; to see if we find the key.  That way could defer the rehash a
+       ;; little longer, but this is safer.
+       (when (table-flags-need-rehash-p flags)
+	 (rehash self))
+       
+       (with-gc-dependence-checking-inline
+	 (multiple-value-bind (hash-code gc-dependence-level)
+	     (funcall-hash-function key)
+
+	   (maybe-upgrade-gc-dependence self gc-dependence-level)
+
+	   (let* ((array internal-representation))
+	     (declare (sys:array-register array))
+	     (with-internal-representation-values (array)	       
+	       (let ((base-entry-index (ash (mod hash-code n-buckets) 
+					    bucket-size-shift))
+		     (collision-offset nil)
+		     (cached-empty-slot-value *table-empty-slot-value*)
+		     (cached-vacated-slot-value *table-vacated-slot-value*)
+		     (vacated-slot-index nil))	; place to remember vacated slot seen
+
+		 (loop named searching-buckets do
+		   (loop repeat entries-per-bucket
+			 for index from base-entry-index 
+			 for hash-key = (key-aref array index) do
+		     (cond ((eq hash-key cached-empty-slot-value)
+			    ;; key not found.  if gc flipped, rehash and try 
+			    ;;  again, else give up
+			    (check-for-gc-flip-inline)
+			    ;;
+			    ;; found an empty slot before found a match,
+			    ;; so must insert this key/val.  if we've seen
+			    ;; a vacated slot sometime previous in our
+			    ;; probe sequence, use that one instead.
+			    ;;
+			    (without-interrupts	; keep table consistent
+			      (when vacated-slot-index
+				(decf n-vacated-elements)	; we're about to re-use one
+				(setq index vacated-slot-index))
+			      (when value-offset
+				(setf (value-aref array index) value))
+			      (when hash-code-offset
+				(setf (hash-code-aref array index) hash-code))
+			      (setf (key-aref array index) key)
+			      (incf-carefully n-filled-elements)
+			      (when (> n-filled-elements growth-size)
+				;; say need to grow on next puthash
+				(setf (table-flags-need-growth-p flags) t))
+
+			      (when (and (plusp n-vacated-elements)	; don't bother if zero
+					 (> n-vacated-elements 
+					    (floor (- (* (nti-n-buckets 
+							   internal-representation)
+							 (nti-entries-per-bucket
+							   internal-representation))
+						      n-filled-elements)
+						   2)))
+				;; say need a rehash
+				(setf (table-flags-need-rehash-p flags) t)))
+
+			    (return-from searching-buckets value))
+
+			   ((eq hash-key cached-vacated-slot-value)
+			    ;; vacated slot.  remember it, in case we want
+			    ;; to fill it later, after satisfying
+			    ;; ourselves that the key isn't here.
+			    (unless vacated-slot-index
+			      (setq vacated-slot-index index)))
+
+			   ((compare-hash-codes-or-keys)
+			    ;; found a match, replace value
+			    (when value-offset 
+			      (setf (value-aref array index) value))
+			    (return-from searching-buckets value))))
+
+		   ;; if get here, we have a collision, try next bucket
+		       unless collision-offset
+			 do (setq collision-offset
+				  (ash (1+ (mod hash-code (- n-buckets 2)))
+				       bucket-size-shift))
+
+		       with n-collisions = 0
+		       do (incf n-collisions)
+			  (when (> n-collisions n-buckets)
+			    (error "Too many collisions!  Can't happen."))
+			  (decf base-entry-index collision-offset)
+			  (when (minusp base-entry-index)
+			    (incf base-entry-index total-size)))))))))))
+
+(defmacro puthash-block-body ()
+  `(multiple-value-bind (array control base length)	; easy way to get 
+       (sys:setup-1d-array internal-representation)	; (locf (aref foo 0))
+     (ignore control length)
+     (let ((value-offset (nti-value-offset array)))
+       (let* ((n-entries (nti-entries-per-bucket array))
+	      (key-location (block-search-inline key base n-filled-elements)))
+	 (if key-location
+	     (when value-offset			; we store values?
+	       (setf (location-contents (sys:%pointer-plus key-location value-offset)) value))
+	     ;; no key location.  add new one.
+	     (cond ((>= n-filled-elements n-entries)
+		    (error "Table full!  Can't happen."))
+		   (t
+		    (without-interrupts		; keep the table consistent
+		      (fast-aset-1 key n-filled-elements control)
+		      (when value-offset 
+			(fast-aset-1 value (+ n-filled-elements value-offset) control))
+		      (incf-carefully n-filled-elements)
+		      (when (> n-filled-elements growth-size)
+			(setf (table-flags-need-growth-p flags) t)))))))
+       value)))
+
+;;; ****************************************************************
+
+;;; real table flavors.  any table flavor must (1) include
+;;; scatter-table, and (2) supply defmacro-in-flavors for
+;;; FUNCALL-TEST-FUNCTION, FUNCALL-HASH-FUNCTION-GC and
+;;; FUNCALL-HASH-FUNCTION-NO-GC.  The rest is taken care of by the
+;;; compile-inline-table-methods macro.
+
+(defmacro compile-inline-table-methods (table-flavor)
+  `(progn
+     (defmethod (gethash ,table-flavor) (key &optional default)
+       (declare (values value found-p key))
+       (gethash-scatter-body t))
+     (defmethod (fast-table-get ,table-flavor) (key)
+       (declare (values value))
+       (gethash-scatter-body nil))
+     (defmethod (puthash ,table-flavor) (key value)
+       (declare (values value))
+       (puthash-scatter-body))
+     #+ignore
+     (defmethod (remhash ,table-flavor) (key)
+       (declare (values removed))
+       (remhash-body))
+     (compile-flavor-methods ,table-flavor)
+     ))
+
+
+;;; ****************************************************************
+
+;;; general purpose table, uses user-supplied hash and test functions			
+(defflavor general-purpose-table 
+	()
+	(scatter-table))
+
+(defmacro-in-flavor (funcall-test-function general-purpose-table) (x y)
+  `(funcall test-function ,x ,y))
+
+(defmacro-in-flavor (funcall-hash-function-gc general-purpose-table) (x)
+  `(funcall hash-function ,x))
+
+(defmacro-in-flavor (funcall-hash-function-no-gc general-purpose-table) (x)
+  `(funcall hash-function ,x))
+
+(defflavor general-purpose-strong-table
+	()
+	(non-block-searchable-table-mixin strong-table-mixin general-purpose-table))
+  
+(defflavor general-locking-gc-table ()
+	   (locking-table-mixin gc-dependent-table-mixin general-purpose-strong-table))
+(compile-inline-table-methods general-locking-gc-table)
+
+(defflavor general-locking-table () 
+	   (locking-table-mixin non-gc-dependent-table-mixin general-purpose-strong-table))
+(compile-inline-table-methods general-locking-table)
+
+(defflavor general-gc-table ()
+	   (non-locking-table-mixin gc-dependent-table-mixin general-purpose-strong-table))
+(compile-inline-table-methods general-gc-table)
+
+(defflavor general-table () 
+	   (non-locking-table-mixin non-gc-dependent-table-mixin general-purpose-strong-table))
+(compile-inline-table-methods general-table)
+
+;;; ****************************************************************
+
+;;; EQ tables
+(defflavor eq-test-table
+	()
+	(block-searchable-table-mixin scatter-table))
+
+(defmacro-in-flavor (funcall-test-function eq-test-table) (x y)
+  `(eq ,x ,y))
+
+(defmacro-in-flavor (funcall-hash-function-gc eq-test-table) (x)
+  `(xeqhash ,x))
+
+(defmacro-in-flavor (funcall-hash-function-no-gc eq-test-table) (x)
+  `(xeqhash-no-gc ,x))
+
+(defmacro-in-flavor (block-search-inline eq-test-table) (key address n-words)
+  `(sys:%block-search-eq ,key ,address ,n-words))
+
+(defflavor eq-strong-table 
+	()
+	(strong-table-mixin eq-test-table))
+
+(defflavor eq-locking-gc-table ()
+	   (locking-table-mixin gc-dependent-table-mixin eq-strong-table))
+(compile-inline-table-methods eq-locking-gc-table)
+
+(defflavor eq-locking-table () 
+	   (locking-table-mixin non-gc-dependent-table-mixin eq-strong-table))
+(compile-inline-table-methods eq-locking-table)
+
+(defflavor eq-gc-table ()
+	   (non-locking-table-mixin gc-dependent-table-mixin eq-strong-table))
+(compile-inline-table-methods eq-gc-table)
+
+(defflavor eq-table () 
+	   (non-locking-table-mixin non-gc-dependent-table-mixin eq-strong-table))
+(compile-inline-table-methods eq-table)
+
+;;; ****************************************************************
+
+;;; EQL tables
+
+(defflavor eql-test-table
+	()
+	(scatter-table))
+
+(defmacro-in-flavor (funcall-test-function eql-test-table) (x y)
+  `(eql ,x ,y))
+
+(defmacro-in-flavor (funcall-hash-function-gc eql-test-table) (x)
+  `(xeqlhash ,x))
+
+(defmacro-in-flavor (funcall-hash-function-no-gc eql-test-table) (x)
+  `(xeqlhash-no-gc ,x))
+
+(defflavor eql-strong-table
+	()
+	(strong-table-mixin block-searchable-table-mixin eql-test-table))
+
+(defmacro-in-flavor (block-search-inline eql-strong-table) (key address n-words)
+  (let ((count-sym (gensym))
+	#+3600
+	(pointer-sym (gensym)))
+    `(if (zl:typep key :extended-number)	; if not, we can use eq
+	 #+imach
+	 (let* ((,count-sym ,n-words))		; it is, must do it the hard way
+	   (sys:with-block-registers (1)
+	     (setf (sys:%block-register 1) ,address)
+	     (loop while (plusp ,count-sym)
+		   do (when (eql (sys:%block-read 1) ,key)
+			(return (sys:%pointer-plus (sys:%block-register 1) -1)))
+		      (decf ,count-sym)
+		   finally (return nil))))
+	 #+3600
+	 (let* ((,count-sym ,n-words)		; it is, must do it the hard way
+		(,pointer-sym (sys:%pointer-plus ,address -1)))
+	   (loop while (plusp ,count-sym)
+		 do (when (eql (sys:%p-contents-increment-pointer ,pointer-sym) ,key)
+		      (return ,pointer-sym))
+		    (decf ,count-sym)
+		 finally (return nil)))
+
+	 (sys:%block-search-eq ,key ,address ,n-words))))
+
+(defflavor eql-locking-gc-table () 
+	   (locking-table-mixin gc-dependent-table-mixin eql-strong-table))
+(compile-inline-table-methods eql-locking-gc-table)
+
+(defflavor eql-locking-table () 
+	   (locking-table-mixin non-gc-dependent-table-mixin eql-strong-table))
+(compile-inline-table-methods eql-locking-table)
+
+(defflavor eql-gc-table () 
+	   (non-locking-table-mixin gc-dependent-table-mixin eql-strong-table))
+(compile-inline-table-methods eql-gc-table)
+
+(defflavor eql-table () 
+	   (non-locking-table-mixin non-gc-dependent-table-mixin eql-strong-table))
+(compile-inline-table-methods eql-table)
+
+;;; ****************************************************************
+
+;;; EQUAL tables
+
+
+(defflavor equal-test-table
+	()
+	(non-block-searchable-table-mixin scatter-table))
+
+(defmacro-in-flavor (funcall-test-function equal-test-table) (x y)
+  `(equal ,x ,y))
+
+(defmacro-in-flavor (funcall-hash-function-gc equal-test-table) (x)
+  `(xequal-hash ,x))
+
+(defmacro-in-flavor (funcall-hash-function-no-gc equal-test-table) (x)
+  `(xequal-hash-no-gc ,x))
+
+(defflavor equal-strong-table
+	()
+	(strong-table-mixin equal-test-table))
+
+(defflavor equal-locking-gc-table ()
+	   (locking-table-mixin gc-dependent-table-mixin equal-strong-table))
+(compile-inline-table-methods equal-locking-gc-table)
+
+(defflavor equal-locking-table () 
+	   (locking-table-mixin non-gc-dependent-table-mixin equal-strong-table))
+(compile-inline-table-methods equal-locking-table)
+
+(defflavor equal-gc-table ()
+	   (non-locking-table-mixin gc-dependent-table-mixin equal-strong-table))
+(compile-inline-table-methods equal-gc-table)
+
+(defflavor equal-table () 
+	   (non-locking-table-mixin non-gc-dependent-table-mixin equal-strong-table))
+(compile-inline-table-methods equal-table)
+
+;;; STRING-EQUAL tables.  these tables don't need to mix in gc stuff
+
+(defun fast-hash-table-string-equal (str1 str2)
+  (si:coerce-string-arg str1)
+  (si:coerce-string-arg str2)
+  (sys:%string-equal str1 0 str2 0 nil))
+
+(defun fast-hash-table-string= (str1 str2)
+  (si:coerce-string-arg str1)
+  (si:coerce-string-arg str2)
+  (sys:%string= str1 0 str2 0 nil))
+
+(defflavor string-equal-test-table
+	()
+	(non-gc-dependent-table-mixin non-block-searchable-table-mixin scatter-table))
+
+(defmacro-in-flavor (funcall-test-function string-equal-test-table) (x y)
+  `(fast-hash-table-string-equal ,x ,y))
+
+;;; these are the same for gc and no-gc
+(defmacro-in-flavor (funcall-hash-function-gc string-equal-test-table) (x)
+  `(sys:sxhash-string ,x))
+
+(defmacro-in-flavor (funcall-hash-function-no-gc string-equal-test-table) (x)
+  `(sys:sxhash-string ,x))
+
+(defflavor string-equal-strong-table
+	()
+	(strong-table-mixin string-equal-test-table))
+
+(defflavor string-equal-locking-table ()
+	   (locking-table-mixin string-equal-strong-table))
+(compile-inline-table-methods string-equal-locking-table)
+
+(defflavor string-equal-table ()
+	   (non-locking-table-mixin string-equal-strong-table))
+(compile-inline-table-methods string-equal-table)
+
+;;; ****************************************************************
+
+;;; real weak-table flavors.  for now, only weak-values tables are
+;;; implemented, and for weak-values, the only specialized flavor is
+;;; EQL, as that's what Statice needs.
+
+;;; 'common' methods that need special treatment for weak-values tables
+(defmethod (maphash weak-values-table-mixin) (function)
+  (traverse-scatter-table
+    (without-interrupts)
+    (if (future-common-lisp::nth-value		; fetch key only
+	  1
+	  (si:%weak-link-contents
+	    (locf (aref values-array		;  if the value slot is 
+			real-entry-index))))	;  not unbound.
+	(aref keys-array real-entry-index)
+	(progn					; oops, it's disappeared.
+	  (decf-carefully n-filled-elements)	;  dec element-count
+	  (incf-carefully n-vacated-elements)
+	  (setf (aref values-array real-entry-index)
+		cached-empty-slot-value)	; zap value slot
+	  (setf (aref keys-array real-entry-index)	; and clobber key slot,
+		cached-vacated-slot-value)))	;         and return 'vacated'
+
+    (funcall function key			; this is ok as is, as 
+	     (if cached-value-offset		;  we wouldn't get here 
+		 (aref values-array		;  if we didn't have a key
+		       (+ cached-value-offset real-entry-index))
+		 t))))
+
+(defmethod (maptable weak-values-table-mixin) (function result-type)
+  (let* ((result-sequence 
+	   (and result-type (make-sequence result-type (hash-table-count self))))
+	 (result-cons (and (listp result-sequence) result-sequence))
+	 (result-index 0)
+	 (bummed-flags flags)
+	 (old-resize-bit (table-flags-inhibit-resize-p bummed-flags))
+	 (old-map-bit (table-map-in-progress-p bummed-flags))
+	 value
+	 value-p)	 
+    (unwind-protect 
+	(progn 
+	  (setf (table-flags-inhibit-resize-p bummed-flags) t)
+	  (setf (table-map-in-progress-p bummed-flags) t)
+	  (setq flags bummed-flags)
+	  (traverse-scatter-table 
+	    ;; wrapper form
+	    (without-interrupts)
+	    ;; the form to return the key
+	    (let ((this-key (aref keys-array real-entry-index)))
+	      (ignore cached-value-offset)	; might as well put this here...
+	      (cond ((eq this-key cached-vacated-slot-value)	; no key here?
+		     this-key)			; no, just return
+		    (t				; this key is present, look for value
+		     (multiple-value-setq (value value-p)
+		       (si:%weak-link-contents (locf (aref values-array real-entry-index))))
+		     (if value-p
+			 (aref keys-array real-entry-index)	; value slot bound, just return key
+			 (progn			; value slot not bound
+			   (decf-carefully n-filled-elements)	;  dec element-count
+			   (incf-carefully n-vacated-elements)
+			   (setf (aref values-array real-entry-index)
+				 cached-empty-slot-value)	; zap value slot
+			   (setf (aref keys-array real-entry-index)	; and clobber key slot,
+				 cached-vacated-slot-value))))))	;         and return 'vacated'
+
+	    ;; body form 
+	    (let ((result-element (funcall function key value)))
+	      (when result-type
+		(if result-cons
+		    (progn 
+		      (setf (car result-cons) result-element)
+		      (setq result-cons (cdr result-cons)))
+		    (progn
+		      (setf (aref result-sequence result-index) result-element)
+		      (incf result-index))))))
+
+	  (when result-type
+	    ;; if values have disappeared, trim excess elements from end
+	    ;; of sequence.
+	    (if (listp result-sequence)
+		(when result-cons (setf (cdr result-cons) nil))
+		(when (< result-index (length result-sequence))
+		  (adjust-array result-sequence result-index))))
+	  result-sequence)
+
+      (let ((new-bummed-flags flags))
+	(setf (table-flags-inhibit-resize-p new-bummed-flags) old-resize-bit)
+	(setf (table-map-in-progress-p new-bummed-flags) old-map-bit)
+	(setq flags new-bummed-flags)))))
+
+
+(defmethod (copy-to-new-array weak-values-table-mixin) (new-internal-representation &optional force-rehash-p)
+  (declare (values n-entries-copies))
+  (let ((n-copied
+	  (copy-to-new-array-body 
+	    (let ((this-key (aref old-representation-keys old-entry-index)))
+	      (if (eq this-key cached-vacated-slot-value)
+		  ;; no key here
+		  (values this-key nil)
+		  ;; there is a key, see if it's value's still here
+		  (multiple-value-bind (this-value bound-p)
+		      (si:%weak-link-contents (locf (aref old-representation-values old-entry-index)))
+		    (ignore old-value-offset)	; we know it's zero, here...
+		    (if bound-p
+			(values this-key this-value)
+			(values cached-vacated-slot-value nil))))))))
+    (setq n-filled-elements n-copied)))
+
+;;; at GROW time, make a pass over the table first, to flush out any
+;;; dead values.  then check the count again; if it's shrunk, don't
+;;; bother growing.
+(defwhopper (grow weak-values-table-mixin) ()
+  (maphash #'(lambda (k v) (ignore k v) nil) self)
+  (if (> n-filled-elements growth-size)
+      (continue-whopper)
+      (setf (table-flags-need-growth-p flags) nil)))
+
+;;; the specialized flavors and their inline methods
+
+;;;  EQL weak tables
+(defflavor eql-test-weak-table
+	()
+	(weak-values-table-mixin non-block-searchable-table-mixin eql-test-table))
+
+(defflavor eql-weak-locking-gc-table () 
+	   (locking-table-mixin gc-dependent-table-mixin eql-test-weak-table))
+(compile-inline-table-methods eql-weak-locking-gc-table)
+
+(defflavor eql-weak-locking-table () 
+	   (locking-table-mixin non-gc-dependent-table-mixin eql-test-weak-table))
+(compile-inline-table-methods eql-weak-locking-table)
+
+(defflavor eql-weak-gc-table () 
+	   (non-locking-table-mixin gc-dependent-table-mixin eql-test-weak-table))
+(compile-inline-table-methods eql-weak-gc-table)
+
+(defflavor eql-weak-table () 
+	   (non-locking-table-mixin non-gc-dependent-table-mixin eql-test-weak-table))
+(compile-inline-table-methods eql-weak-table)
+
+;;;
+
+(defflavor general-purpose-weak-values-table
+	()
+	(non-block-searchable-table-mixin weak-values-table-mixin general-purpose-table))
+  
+(defflavor general-weak-locking-gc-table ()
+	   (locking-table-mixin gc-dependent-table-mixin general-purpose-weak-values-table))
+(compile-inline-table-methods general-weak-locking-gc-table)
+
+(defflavor general-weak-locking-table () 
+	   (locking-table-mixin non-gc-dependent-table-mixin general-purpose-weak-values-table))
+(compile-inline-table-methods general-weak-locking-table)
+
+(defflavor general-weak-gc-table ()
+	   (non-locking-table-mixin gc-dependent-table-mixin general-purpose-weak-values-table))
+(compile-inline-table-methods general-weak-gc-table)
+
+(defflavor general-weak-table () 
+	   (non-locking-table-mixin non-gc-dependent-table-mixin general-purpose-weak-values-table))
+(compile-inline-table-methods general-weak-table)
+
+;;; ****************************************************************
+
+(defun make-hash-table (&key
+			(name nil)
+			(test 'eql)
+			(size *default-table-size* size-supplied-p)
+			(area default-cons-area)
+			(hash-function nil)
+			rehash-before-cold
+			rehash-after-full-gc
+			(number-of-values 1 number-of-values-supplied-p)
+			(store-hash-code nil store-hash-code-supplied-p)
+			(gc-protect-values t gc-protect-values-supplied-p)
+			(mutating t)
+			(initial-contents nil initial-contents-supplied-p)
+			(optimizations nil)
+			(locking :process locking-supplied-p)
+			(ignore-gc nil ignore-gc-supplied-p)
+			(growth-factor *default-table-growth-factor*
+				       growth-factor-supplied-p)
+			(growth-threshold *default-table-growth-threshold*
+					  growth-threshold-supplied-p)
+			(rehash-size nil rehash-size-supplied-p)
+			(rehash-threshold nil rehash-threshold-supplied-p))
+
+  ;; ignore leftover obsolete args.  should these just get dyked out?
+  (ignore optimizations
+	  mutating)
+  (let* (test-function-name test-function tab
+	 (flavor nil)				; flavor to make-instance of
+	 options
+	 hash-function-name
+	 (hash-function-defaulted-p nil))
+
+    ;; canonicalize random args
+    (setq locking (not (null locking)))
+    (setq ignore-gc (not (null ignore-gc)))
+    (setq store-hash-code (not (null store-hash-code)))
+
+    ;; canonicalize hash-function and test-function names.  if they're
+    ;; regular old functions with symbols for names, use the symbols
+    ;; instead of the functions themselves.
+
+    (multiple-value-setq (test-function test-function-name)
+      (fixup-function-for-table-system test))
+
+    ;; if no hash-function supplied, deduce it from test-function
+    (unless hash-function
+      (setq hash-function (table-hash-function test-function-name))
+      (setq hash-function-defaulted-p t))
+
+    (unless hash-function
+      (error "Don't know what hash-function to use for test-function ~A" test-function))
+
+    (multiple-value-setq (hash-function hash-function-name)
+      (fixup-function-for-table-system hash-function))
+
+    ;; if there's a faster version of the test-function, use that.
+    ;; Obvious cases are string-equal and string=.
+    (let ((real-test-function-name
+	    (table-test-function test-function-name)))
+      (when real-test-function-name
+	;; replace the supplied test-function with the internal one
+	(setq test-function-name real-test-function-name)
+	(setq test-function (symbol-function test-function-name))))
+
+    ;; mimic the behaviour of the old system; for EQUAL test, default
+    ;; store-hash-code to T.  Metering indicates that this is a net win
+    ;; for other things too, perhaps everything but EQ and EQL should do
+    ;; this?
+    (when (and (eq test-function-name 'equal)
+	       (not store-hash-code-supplied-p))
+      (setq store-hash-code t))
+
+    ;; when gc dependence defaulted, and we can tell that the
+    ;; hash-function doesn't depend on the GC, turn off set ignore-gc.
+    (when (and (not ignore-gc-supplied-p)
+	       (table-hash-function-gc-independent-p hash-function-name))
+      (setq ignore-gc t))
+
+    ;; figure out what flavor to make an instance of.
+    (setq flavor
+	  (table-flavor-from-options test-function-name hash-function-name locking ignore-gc
+				     store-hash-code gc-protect-values))
+
+    ;; if initial-contents supplied and size defaulted, set size to fit
+    ;; supplied initial contents
+    (when (and initial-contents-supplied-p
+	       (not size-supplied-p))
+      (setq size (cond ((sequencep initial-contents)
+			(floor (length initial-contents) 2))
+		       ((typep initial-contents 'basic-table)
+			(hash-table-count initial-contents))
+		       (t
+			(error "Don't know what to do with initial-contents ~S" 
+			       initial-contents)))))
+
+    ;; if growth-threshold not supplied, but rehash-threshold is,
+    ;; compute former from latter.
+    (unless growth-threshold-supplied-p
+      ;; should it be an error if both supplied?
+      (when rehash-threshold-supplied-p
+	(cond ((integerp rehash-threshold)
+	       ;; sanity check value
+	       (when (and (plusp rehash-threshold) (< rehash-threshold size))
+		 (setq growth-threshold 
+		       (float (- 1 (/ rehash-threshold size))))))
+	      ((not (floatp rehash-threshold))
+	       (error "~S is not a legal value for REHASH-THRESHOLD" rehash-threshold))
+	      (t
+	       (setq growth-threshold rehash-threshold)))))
+
+    ;; similar treatment for growth-factor
+    (unless growth-factor-supplied-p
+      (when rehash-size-supplied-p 
+	(cond ((integerp rehash-size)
+	       (when (plusp rehash-size)
+		 (setq growth-factor (float (/ (+ size rehash-size) size)))))
+	      ((not (floatp rehash-size))
+	       (error "~S is not a legal value for REHASH-SIZE" rehash-size))
+	      (t
+	       (setq growth-factor rehash-size)))))
+
+    ;; Note that neither of those are really right, as extrapolating a
+    ;; factor from a difference only works the first time.  The right
+    ;; thing is to make the rest of the code understand how to
+    ;; grow/shrink by fixed amounts, as well as percentages.
+
+    ;; collect 'options' to be cached in the instance
+    (setq options (append (unless hash-function-defaulted-p
+			    `(:hash-function ,hash-function))
+			  (when (and (not locking) locking-supplied-p)
+			    '(:locking nil))
+			  (unless (eq area default-cons-area)
+			    `(:area ,area))
+			  (when (and ignore-gc ignore-gc-supplied-p)
+			    `(:ignore-gc ,ignore-gc))
+			  (when (and store-hash-code store-hash-code-supplied-p)
+			    `(:store-hash-code ,store-hash-code))
+			  (when (and (zerop number-of-values) number-of-values-supplied-p)
+			    `(:number-of-values ,number-of-values))
+			  (when (and (not gc-protect-values) gc-protect-values-supplied-p)
+			    `(:gc-protect-values ,gc-protect-values))
+			  (when (and ( growth-threshold *default-table-growth-threshold*)
+				     growth-threshold-supplied-p)
+			    `(:growth-threshold ,growth-threshold))
+			  (when (and ( growth-factor *default-table-growth-factor*)
+				     growth-factor-supplied-p)
+			    `(:growth-factor ,growth-factor))))
+
+    ;; make the instance
+    (setq tab (make-instance flavor
+			     :name name
+			     :rehash-before-cold rehash-before-cold
+			     :rehash-after-full-gc rehash-after-full-gc
+			     :ignore-gc ignore-gc
+			     :gc-protect-values gc-protect-values
+			     :store-hash-code store-hash-code
+			     :number-of-values number-of-values
+			     :size size
+			     :size-supplied-p size-supplied-p
+			     :area area
+			     :test test-function
+			     :hash-function hash-function
+			     :growth-threshold growth-threshold
+			     :growth-factor growth-factor
+			     :options options))
+
+    (when initial-contents-supplied-p
+      (cond ((listp initial-contents)
+	     (loop for (k v) on initial-contents by #'cddr do
+	       (puthash tab k v)))
+	    ((arrayp initial-contents)
+	     (let ((ic initial-contents))
+	       (declare (sys:array-register ic))
+	       (loop for idx from 0 below (length ic) by 2
+		     for k = (aref ic idx)
+		     for v = (aref ic (1+ idx))
+		     do (puthash tab k v))))
+	    (t
+	     (maphash #'(lambda (k v) (puthash tab k v)) initial-contents))))
+
+    tab))
+
+(defmethod (:fasd-form basic-table) ()
+  (flet ((fixup-function (function)
+	   (when (functionp function)
+	     (let ((name (function-name function)))
+	       (when (and (not (null name))
+			  (validate-function-spec name)
+			  (fdefinedp name)
+			  (eq function (fdefinition name)))
+		 (setf function (cons compiler:eval-at-load-time-marker
+				      `(fdefinition ',name))))))
+	   function)
+	 (fixup-area (area)
+	   (when (numberp area)
+	     (setq area (cons compiler:eval-at-load-time-marker
+			      (area-name area))))
+	   area))
+    (let ((init-options 
+	    (list ':name name
+		  ':test (fixup-function test-function)
+		  ':hash-function (fixup-function hash-function)
+		  ':locking (and lock t)
+		  ':ignore-gc (table-flags-ignore-gc-p flags)
+		  ':gc-protect-values (table-flags-gc-protect-values-p flags)
+		  ':store-hash-code (table-flags-store-hash-code-p flags)
+		  ':number-of-values (table-flags-number-of-values flags)
+		  ':area (fixup-area area)
+		  ':size n-filled-elements
+		  ':growth-factor growth-factor
+		  ':growth-threshold growth-threshold)))
+      (setf (getf init-options :initial-contents) 
+	    (let ((contents nil))
+	      (maphash #'(lambda (k v)
+				(push v contents)
+				(push k contents)) self)
+	      contents))
+;    (loop for (indicator value) on custom-options by 'cddr
+;	  do (setf (getf init-options indicator) value))
+      `(apply #'make-hash-table ',init-options))))
+

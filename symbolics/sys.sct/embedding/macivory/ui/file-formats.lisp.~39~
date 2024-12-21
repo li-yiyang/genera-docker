@@ -1,0 +1,723 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: MACINTOSH-INTERNALS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;; File decoding
+
+(defun read-file-into-array (pathname &rest options
+				      &key package (element-type '(unsigned-byte 8))
+				      &allow-other-keys)
+  (with-open-stream (stream (si:with-rem-keywords (some-options options
+								'(:element-type :package))
+			      (apply #'open pathname :element-type element-type some-options)))
+    (when package
+      (si:set-file-stream-loaded-id stream package))
+    (if (send stream :length)
+	(let ((data (make-array (send stream :length) :element-type element-type)))
+	  (send stream :string-in "Unexpected EOF" data)
+	  data)
+	(let ((data (make-array 100 :element-type element-type :fill-pointer 0)))
+	  (loop as byte = (send stream :tyi)
+		while byte
+		do (vector-push-extend byte data))
+	  data))))
+
+;;; This is the header used for transmitting both forks of a Macintosh file as a single stream
+;;; of bytes.  It is used in conjunctions with protocols such as XModem.  It originally comes
+;;; from MacTerminal, but is now maintained by MAUG.  See the file MACBIN.STD.
+(define-mac-structure (macbinary :default-index 0 :alignment nil)
+  (version cardinal-8)	;Should be zero.
+  (name pascal-string-64)	;--- Loading problem
+  ;; This is the FInfo
+  (type ostype)
+  (creator ostype)
+  (flags integer-16)
+  (location point)
+  (window integer-16)
+  ;; End of that
+  (lock cardinal-16)		;Protected flag (whatever that is) in low-order bit
+  (data-fork-length cardinal-32)
+  (resource-fork-length cardinal-32)
+  (creation-date cardinal-32)
+  (modification-date cardinal-32)
+  (* (padding cardinal-8 27))	;Reserved
+  (computer-type cardinal-16))
+
+(defun map-over-mac-file (pathname function &key package progress-note)
+  (let* ((file (apply #'read-file-into-array pathname :package package
+		      (and (eq (send (send pathname :host) :system-type) :macintosh)
+			   '(:super-image t))))
+	 (header-length (octet-structure-total-size (macbinary file 0)))
+	 (data-length (macbinary-data-fork-length file))
+	 (resource-length (macbinary-resource-fork-length file)))
+    (funcall function :header
+	     :array file :start 0 :end header-length
+	     :name (macbinary-name file)
+	     :type (macbinary-type file) :author (macbinary-creator file)
+	     :creation-date (universal-time-from-mac-time
+			      (macbinary-creation-date file))
+	     :modification-date (universal-time-from-mac-time
+				  (macbinary-modification-date file)))
+    (when (plusp data-length)
+      (funcall function :data
+	       :array file :start header-length :end (+ header-length data-length)))
+    #+MacBinary-broken---
+    ;; Skip over the padding after the data fork.
+    (setq data-length (* 128 (ceiling data-length 128)))
+    (when (plusp resource-length)
+      (map-over-resource-fork function file
+			      :start (+ header-length data-length)
+			      :end (+ header-length data-length resource-length)
+			      :progress-note progress-note))))
+
+(defun map-over-mac-file-data-fork (file function &key (header-p t) (required-type nil)
+						       (package nil))
+  (if header-p
+      (map-over-mac-file file #'(lambda (ftype &key name type array start end
+					       &allow-other-keys)
+				  (case ftype
+				    (:header
+				      (unless (or (null required-type)
+						  (equal type required-type))
+					(cerror "Try to interpret data anyway"
+						"File ~A (~A) is of type ~A, not ~A."
+						file name type required-type)))
+				    (:data
+				      (return-from map-over-mac-file-data-fork
+					(funcall function array :start start :end end))))))
+      (let ((data (read-file-into-array file :package package)))
+	(funcall function data))))
+
+;;; Inverse of above
+(defun write-mac-file (pathname data-fork resource-fork
+		       &key (name (send pathname :raw-name))
+			    (type "TEXT")
+			    (author "ttxt")
+			    (creation-date (time:get-universal-time))
+			    (modification-date creation-date))
+  (with-open-stream (stream (apply #'open pathname
+				   :direction :output :element-type '(unsigned-byte 8)
+				   (and (eq (send (send pathname :host) :system-type)
+					    :macintosh)
+					`(:super-image t
+					  :file-type ,type :creator-signature ,author))))
+    (let ((header (make-macbinary :name name
+				  :type type :creator author
+				  :data-fork-length (length data-fork)
+				  :resource-fork-length (length resource-fork)
+				  :creation-date (mac-time-from-universal-time creation-date)
+				  :modification-date (mac-time-from-universal-time
+						       modification-date))))
+      (send stream :string-out header))
+    (when data-fork
+      (send stream :string-out data-fork))
+    #+MacBinary-broken---
+    ;; Pad out to a 128 boundary
+    (dotimes (ignore (mod (- (length data-fork)) 128))
+      (write-byte 0 stream))
+    (when resource-fork
+      (send stream :string-out resource-fork))
+    (close stream)
+    (send stream :truename)))
+
+
+;;;; Resource fork per Inside Macintosh I.5.
+
+(define-mac-structure (resource-fork-header :default-type integer-32)
+  data-offset
+  map-offset
+  data-length
+  map-length
+  (system-reserved (padding unsigned-byte 112))
+  (application-reserved (padding unsigned-byte 128)))
+
+(define-mac-structure resource-fork-resource
+  (length integer-32)
+  (data (vector unsigned-byte length)))
+
+(define-mac-structure resource-fork-map
+  (* (padding unsigned-byte (+ 16 4 2)))
+  attributes
+  type-list-offset
+  name-list-offset)
+
+(define-mac-structure resource-fork-type-list
+  (ntypes integer-16)
+  (types (vector resource-fork-type-list-entry (1+ ntypes))))
+
+(define-mac-structure resource-fork-type-list-entry
+  (type (vector character-8 4))
+  (nresources integer-16)
+  (reference-list-offset integer-16))
+
+(define-mac-structure resource-fork-reference-list
+  (id integer-16)
+  (name-list-offset integer-16)
+  (* (* integer-32
+	(attributes (load-byte 24 8))
+	(data-offset (load-byte 0 24))))
+  (* (padding cardinal-32)))
+
+(define-mac-structure resource-fork-name-list-elem
+  (name pascal-string))
+
+;;; Bits in the attributes byte
+(defconstant %mac-resource-sys-heap 64)
+(defconstant %mac-resource-purgeable 32)
+(defconstant %mac-resource-locked 16)
+(defconstant %mac-resource-protected 8)
+(defconstant %mac-resource-preload 4)
+
+(defun map-over-resource-fork (function array &key (start 0) end progress-note)
+  (tv:noting-progress-if progress-note (progress-note)
+    (let* ((data-start (+ start (resource-fork-header-data-offset array start)))
+	   (map-start (+ start (resource-fork-header-map-offset array start)))
+	   (type-list-start (+ map-start (resource-fork-map-type-list-offset array map-start)))
+	   (name-list-start (+ map-start (resource-fork-map-name-list-offset array
+									     map-start))))
+      (loop for type-start being the octet-structure-field-elements
+		of (resource-fork-type-list-types array type-list-start)
+	    do
+	(stack-let ((resource-type (octet-structure-field-indirect-array
+				     (resource-fork-type-list-entry-type array type-start)
+				     :element-type 'string-char))
+		    (nresources (1+ (resource-fork-type-list-entry-nresources array
+									      type-start)))
+		    (ref-list-start (+ type-list-start
+				       (resource-fork-type-list-entry-reference-list-offset
+					 array type-start))))
+	  (loop repeat nresources
+		do (let ((resource-id (resource-fork-reference-list-id array ref-list-start))
+			 (attributes (resource-fork-reference-list-attributes array
+									      ref-list-start))
+			 (resource-name (resource-fork-reference-list-name-list-offset
+					  array ref-list-start))
+			 (resource-data-start (+ data-start
+						 (resource-fork-reference-list-data-offset
+						   array ref-list-start))))
+		     (if (= resource-name -1)
+			 (setq resource-name nil)
+			 (incf resource-name name-list-start)
+			 (setq resource-name (sys:make-stack-array (aref array resource-name)
+					       :element-type 'string-char
+					       :displaced-to array
+					       :displaced-index-offset (1+ resource-name))))
+		     (when progress-note
+		       (tv:note-progress resource-data-start end))
+		     (funcall function :resource
+			      :name resource-name
+			      :type resource-type
+			      :id resource-id
+			      :attributes attributes
+			      :array array
+			      :start (octet-structure-field-index
+				       (resource-fork-resource-data array
+								    resource-data-start))
+			      :end (octet-structure-total-size
+				     (resource-fork-resource array resource-data-start))))
+		   (setq ref-list-start (octet-structure-total-size
+					  (resource-fork-reference-list array
+									ref-list-start)))))))))
+
+(defstruct (resource-elem (:type list))
+  data
+  type
+  id
+  name
+  attribute-byte)
+
+(defun make-resource-fork (resources)
+  (let ((resource-types (delete-duplicates (map 'list #'resource-elem-type resources)
+					   :test #'string=))
+	(resource-names (delete-duplicates (delete 'nil
+						   (map 'list #'resource-elem-name resources))
+					   :test #'string=)))
+    (setq resources (map 'list #'copy-resource-elem resources))
+    (let ((name-offsets (loop for name in resource-names
+			      collect total
+			      sum (1+ (string-length name)) into total)))
+      (dolist (resource resources)
+	(setf (resource-elem-type resource) (position (resource-elem-type resource)
+						      resource-types :test #'string=))
+	(setf (resource-elem-name resource) (if (resource-elem-name resource)
+						(nth (position (resource-elem-name resource)
+							       resource-names :test #'string=)
+						     name-offsets)
+						-1))))
+    (setq resources (sort resources #'< :key #'resource-elem-id))
+    (setq resources (stable-sort resources #'< :key #'resource-elem-type))
+    (let* ((header-start 0)
+	   (data-start (octet-structure-total-size
+			 (resource-fork-header array header-start)))
+	   (map-start (+ data-start
+			 (loop for (data) in resources
+			       sum (octet-structure-field-index
+				     (resource-fork-resource-data array 0))
+			       sum (length data))))
+	   (type-list-start (octet-structure-total-size
+			      (resource-fork-map array map-start)))
+	   (ref-list-start (+ (octet-structure-field-index
+				(resource-fork-type-list-types array type-list-start))
+			      (* (length resource-types)
+				 (octet-structure-total-size
+				   (resource-fork-type-list-entry array 0)))))
+	   (name-list-start (+ ref-list-start
+			       (* (length resources)
+				  (octet-structure-total-size
+				    (resource-fork-reference-list array 0)))))
+	   (array-end (+ name-list-start
+			 (loop for name in resource-names
+			       sum (1+ (string-length name)))))
+	   (array (make-array array-end :element-type '(unsigned-byte 8))))
+      (setf (resource-fork-header-data-offset array header-start) data-start
+	    (resource-fork-header-map-offset array header-start) map-start
+	    (resource-fork-header-data-length array header-start) (- map-start data-start)
+	    (resource-fork-header-map-length array header-start) (- array-end map-start))
+      (let ((index data-start))
+	(loop for (data) in resources do
+	  (let ((length (length data)))
+	    (setf (resource-fork-resource-length array index) length)
+	    (setq index (octet-structure-field-index
+			  (resource-fork-resource-data array index)))
+	    (when data
+	      (copy-array-portion data 0 length array index (incf index length)))))
+	(assert (= index map-start)))
+      (setf (resource-fork-map-type-list-offset array map-start) (- type-list-start map-start)
+	    (resource-fork-map-name-list-offset array map-start) (- name-list-start map-start)
+	    (resource-fork-type-list-ntypes array type-list-start) (1- (length
+									 resource-types)))
+      (let ((type-index (octet-structure-field-index
+			  (resource-fork-type-list-types array type-list-start)))
+	    (ref-index ref-list-start)
+	    (data-offset 0))
+	(loop for type-name in resource-types
+	      for type-name-index from 0
+	      do
+	  (stack-let ((name (octet-structure-field-indirect-array
+			      (resource-fork-type-list-entry-type array type-index)
+			      :element-type 'string-char)))
+	    (replace name type-name))
+	  (setf (resource-fork-type-list-entry-reference-list-offset array type-index)
+		(- ref-index type-list-start))
+	  (setf (resource-fork-type-list-entry-nresources array type-index)
+		(1-
+		  (loop while (and resources
+				   (= (resource-elem-type (first resources)) type-name-index))
+			do (let ((resource (pop resources)))
+			     (setf (resource-fork-reference-list-id array ref-index)
+				   (resource-elem-id resource))
+			     (setf (resource-fork-reference-list-name-list-offset array
+										  ref-index)
+				   (resource-elem-name resource))
+			     (setf (resource-fork-reference-list-data-offset array ref-index)
+				   data-offset)
+			     (setf (resource-fork-reference-list-attributes array ref-index)
+				   (or (resource-elem-attribute-byte resource) 0))
+			     (setq ref-index (octet-structure-total-size
+					       (resource-fork-reference-list array ref-index))
+				   data-offset (+ (octet-structure-field-index
+						    (resource-fork-resource-data array
+										 data-offset))
+						  (length (resource-elem-data resource)))))
+			count t)))
+	  (setq type-index (octet-structure-total-size 
+			     (resource-fork-type-list-entry array type-index))))
+	(assert (and (= type-index ref-list-start)
+		     (= ref-index name-list-start)))
+	(stack-let ((string (make-array array-end
+					:element-type 'string-char
+					:displaced-to array))
+		    (index name-list-start))
+	  (dolist (name resource-names)
+	    (let ((length (string-length name)))
+	      (setf (aref array index) length)
+	      (incf index)
+	      (copy-array-portion name 0 length string index (incf index length))))
+	  (assert (= index array-end))))
+      array)))
+
+
+(define-mac-structure (mac-version :default-index 0 :alignment nil)
+  (major cardinal-8)				D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");BCD
+0  (minors (* cardinal-8
+	     (minor (load-byte 4 4))
+	     (fix (load-byte 0 4))))
+  (stage cardinal-8)  ;20 - devo, 40 - alpha, 60 - beta, 80 - released
+  (devo-level cardinal-8)			1;BCD
+0  (country cardinal-16)
+  (short-string pascal-string)
+  (long-string pascal-string))
+
+(defun add-pascal-string (string array index)
+  (setf (aref array index) (string-length string))
+  (replace array (string-to-ascii string) :start1 (1+ index))
+  (+ index (1+ (string-length string))))
+
+(define-presentation-type mac-version ()
+   :parser
+     ((stream &key original-type)
+      (let* ((version-string (dw:read-standard-token stream))
+	     (mac-version (make-array (+ (octet-structure-field-index
+					   (mac-version-short-string mac-version))
+					 (* (1+ (string-length version-string)) 2)
+					 29)
+				      :element-type '(unsigned-byte 8))))
+	(let ((index (octet-structure-field-index (mac-version-short-string mac-version))))
+	  (setq index (add-pascal-string version-string mac-version index))
+	  (add-pascal-string (string-append version-string #\return (code-char #o251)
+					    " 1992-1988, Symbolics, Inc.")
+			     mac-version index))
+	(block okay
+	  (block noparse
+	    (let ((index 0))
+	      (flet ((encode-bcd (number)
+		       (multiple-value-bind (tens units)
+			   (floor number 10)
+			 (dpb tens (byte 4 4) units))))
+		(multiple-value-bind (major new-index)
+		    (parse-integer version-string :start index :junk-allowed t)
+		  (unless (and major (< major 100)) (return-from noparse))
+		  (setf (mac-version-major mac-version) (encode-bcd major))
+		  (setq index new-index))
+		(unless (char-equal (aref version-string index) #\.)
+		  (return-from noparse))
+		(incf index)
+		(multiple-value-bind (minor new-index)
+		    (parse-integer version-string :start index :junk-allowed t)
+		  (unless (and minor (< minor 10)) (return-from noparse))
+		  (setf (mac-version-minor mac-version) minor)
+		  (setq index new-index))
+		(if (= index (string-length version-string))
+		    (setf (mac-version-stage mac-version) #x80)
+		  (when (char-equal (aref version-string index) #\.)
+		    (incf index)
+		    (multiple-value-bind (fix new-index)
+			(parse-integer version-string :start index :junk-allowed t)
+		      (unless (and fix (< fix 10)) (return-from noparse))
+		      (setf (mac-version-fix mac-version) fix)
+		      (setq index new-index)))
+		  (if (= index (string-length version-string))
+		      (setf (mac-version-stage mac-version) #x80)
+		    (setf (mac-version-stage mac-version)
+			  (selector (aref version-string index) char-equal
+			    (#\d #x20) (#\a #x40) (#\b #x60) (#\p #x84)
+			    (#\F
+			     (incf index)
+			     (cond ((= index (string-length version-string))
+				    (return-from noparse))
+				   ((char-equal (aref version-string index) #\C)
+				    #x80)
+				   (t
+				    (return-from noparse))))
+			    (otherwise (return-from noparse))))
+		    (incf index)
+		    (multiple-value-bind (level new-index)
+			(parse-integer version-string :start index :junk-allowed t)
+		      (unless (and level
+				   (< level 100)
+				   (= new-index (string-length version-string)))
+			(return-from noparse))
+		      (setf (mac-version-devo-level mac-version) (encode-bcd level)))))))
+	    (return-from okay mac-version))
+	  (error 'dw:input-not-of-required-type
+		 :string version-string :type original-type))))
+   :printer
+     ((mac-version stream)
+      (write-string (ascii-to-string (let ((index (octet-structure-field-index
+						    (mac-version-short-string mac-version))))
+				       (subseq mac-version
+					       (1+ index)
+					       (+ index 1 (aref mac-version index)))))
+		    stream)))
+
+(define-mac-structure (size-resource :default-index 0 :alignment nil)
+  (+ ((bits integer-16))
+     ((accept-suspend-resume-events (boolean-bit integer-16 14)))
+     ((can-background (boolean-bit integer-16 12)))
+     ((multifinder-aware (boolean-bit integer-16 11)))
+     ((only-background (boolean-bit integer-16 10)))
+     ((get-front-clicks (boolean-bit integer-16 9)))
+     ((accept-child-died-events (boolean-bit integer-16 8)))
+     ((32bit-compatible (boolean-bit integer-16 7))))
+  (recommended-size integer-32)
+  (minimum-size integer-32))
+
+(defflavor fake-emb-agent () ())
+
+(defmethod (rpc:embedded-agent-p fake-emb-agent) () t)
+
+(define-presentation-type emb-application-command ((&key application))
+   :printer ((command-line stream) (write-string command-line stream))
+   :parser
+     ((stream)
+      (let ((start (send stream :read-location)))
+	(let* ((dw:*program*
+		 (or (find application *rpc-programs* :test #'(lambda (x y)
+								(typep y x)))
+		     (let ((rpc:*default-transport-agent* (make-instance 'fake-emb-agent)))
+		       (make-instance (dw::find-remote-program application
+							       :remote-system-type :mac)
+				      :remote-system-type :mac))))
+	       (type `((cp:command :command-table ,(dw:program-command-table dw:*program*)))))
+	  (accept type :stream stream :prompt nil)
+	  ;; Take what was typed, not all the extra defaults.
+	  (send stream :copy-input-since start))))
+   :describer ((stream)
+	       (format stream "a ~A command" application)))
+
+(cp:define-command (com-configure-MacIvory-application :name "Configure MacIvory Application"
+						       :command-table "World Building"
+						       :provide-output-destination-keyword nil)
+    ()
+   (let ((from-file #+imach (sys:system-case
+			      (:MacIvory
+				(multiple-value-bind (ignore frefnum ignore)
+				    (_GetAppParms)
+				  (fs:parse-pathname (pathname-from-frefnum frefnum) "HOST")))
+			      (otherwise nil))
+		    #-imach nil)
+	 (to-file nil)
+	 (saved-from-file nil)
+	 (application nil)
+	 (saved-application nil)
+	 (version nil)
+	 (size nil)
+	 (memory-sizes (list 256 750))
+	 (agent :emb)
+	 (host :server)
+	 (initial-command nil)
+	 (description nil))
+     (dw:accepting-values ()
+       (setq from-file (accept 'fs:pathname :prompt "From file" :default from-file
+					    :ensure-object t)
+	     to-file (accept 'fs:pathname :default to-file :prompt "To file"
+					  :ensure-object t)
+	     application (accept '((null-or-type ((dw::remote-program-name
+						    :remote-system-type :mac))))
+				 :default (or application
+					      (when to-file
+						(condition-case ()
+						     (accept-from-string
+						       '((dw::remote-program-name
+							   :remote-system-type :mac))
+						       (send to-file :raw-name))
+						   (sys:parse-error nil))))
+				 :prompt "Application"))
+       (unless (eql from-file saved-from-file)
+	 (when from-file
+	   (setq version (condition-case ()
+			      (mtb:with-resource (version-resource "vers" 1
+						   :sole-file (send from-file :string-for-host)
+						   )
+				(copy-seq version-resource))
+			    ((fs:file-error macintosh-internals:mac-os-error-resnotfound)
+			     nil))
+		 size (condition-case ()
+			   (mtb:with-resource (size "SIZE" -1
+						:sole-file (send from-file :string-for-host))
+				(copy-seq size))
+			    ((fs:file-error macintosh-internals:mac-os-error-resnotfound)
+			     nil))))
+	 (when size
+	   (let* ((minimum (max (ceiling (size-resource-minimum-size size) 1024) 128))
+		  (recommended (max (ceiling (size-resource-recommended-size size) 1024)
+				    minimum)))
+	     (setq memory-sizes (list minimum recommended))))
+	 (setq saved-from-file from-file))
+       (unless (eql application saved-application)
+	 (when from-file
+	   (let* ((application-name (present-to-string application 'dw::remote-program-name))
+		  (desc (condition-case ()
+			     (mtb:with-resource (desc "IVRY" application-name
+						  :sole-file (send from-file :string-for-host))
+			       (copy-seq desc))
+			   ((fs:file-error macintosh-internals:mac-os-error-resnotfound)
+			    nil))))
+	     (setq description (and desc
+				    (ascii-to-string (subseq desc 1 (1+ (aref desc 0))))))))
+	 (setq saved-application application))
+       (setq version (accept 'mac-version :default version :prompt "Version"
+					  :ensure-object t)
+	     memory-sizes (accept '((and
+				      ((sequence-enumerated ((integer 128)) ((integer 128))))
+				      ((satisfies (lambda (ms)
+						    ( (first ms) (second ms))))))
+				    :description #.(format nil "this application's Macintosh ~
+							        memory requirements~@
+								~2T(i.e., the minimum and ~
+								recommended memory sizes in ~
+								kilobytes, separated by ~
+								commas)"))
+				  :prompt "Minimum and recommended memory (KB)"
+				  :default memory-sizes)
+	     agent (accept '((alist-member :alist (("Embedded"  :emb) ("TCP"  :tcp)
+						   ("Serial"  :serial)
+						   ("Reliable Serial" :reliable-serial))))
+			   :prompt "Agent" :default agent))
+       (case agent
+	 (:tcp
+	   (setq host (accept '((token-or-type (("Listen for connection" :server)) net:host))
+			      :prompt "Remote host" :default host))))
+       (when application
+	 (setq description (accept '((and string ((satisfies (lambda (s)
+							       (< (string-length s) 256)))))
+				     :description
+				       "a Pascal string (i.e., no more than 255 characters)")
+				   :default description :prompt "About box description")
+	       initial-command (accept `((null-or-type
+					   ((emb-application-command
+					      :application ,application))))
+					 :default initial-command
+					 :prompt "Initial application command"))))
+     (let (data-fork resource-fork file-type file-author application-name old-description-id)
+       (map-over-mac-file from-file
+			  #'(lambda (class &key array start end name type author id
+					   &allow-other-keys)
+			      (flet ((nsubseq (array start end)
+				       (make-array (- end start)
+						   :element-type (array-element-type array)
+						   :displaced-to array
+						   :displaced-index-offset start)))
+				(ecase class
+				  (:header
+				    (setq file-type (copy-seq type)
+					  file-author (copy-seq author)))
+				  (:data
+				    (setq data-fork (nsubseq array start end)))
+				  (:resource
+				    (push (make-resource-elem :data (nsubseq array start end)
+							      :type (copy-seq type) :id id
+							      :name (copy-seq name))
+					  resource-fork)))))
+			  :progress-note (format nil "Parsing ~A" from-file))
+       (when application
+	 (setq application-name (present-to-string application 'dw::remote-program-name)))
+       (setq resource-fork (delete-if #'(lambda (elem)
+					  (selector (resource-elem-type elem) equal
+					    ("ivrI" t)
+					    ("IVRY" (or (= (resource-elem-id elem) 0)
+							(and application
+							     description
+							     (equal (resource-elem-name elem)
+								    application-name)
+							     (progn
+							       (setq old-description-id
+								     (resource-elem-id elem))
+							       t))))
+					    ("SIZE" t)
+					    ("vers" (= (resource-elem-id elem) 1))))
+				      resource-fork))
+       (push (make-resource-elem :data (let* ((desc (string-append
+						      (if application
+							  (present-to-string
+							    application
+							    'dw::remote-program-name)
+							  "Unassigned")
+						      " application, version "
+						      (present-to-string version
+									 'mac-version)))
+					      (result (make-array (1+ (string-length desc))
+						        :element-type '(unsigned-byte 8))))
+					 (add-pascal-string desc result 0)
+					 result)
+				 :type "IVRY" :id 0)
+	     resource-fork)
+       (push (make-resource-elem :data version :type "vers" :id 1) resource-fork)
+       (push (make-resource-elem :type "SIZE" :id -1
+	       :data (make-size-resource :accept-suspend-resume-events t
+					 :can-background t
+					 :multifinder-aware t
+					 :32bit-compatible t
+					 :recommended-size (* (second memory-sizes) 1024)
+					 :minimum-size (* (first memory-sizes) 1024)))
+	     resource-fork)
+       (when application
+	 (push (make-resource-elem
+		 :data (let ((result (make-array (+ 1
+						    (if (and (eq agent :tcp)
+							     (not (eq host :server)))
+							(1+ (string-length host))
+							1)
+						    (1+ (string-length application-name)))
+						 :element-type '(unsigned-byte 8)))
+			     (index 0))
+			 (setf (aref result index)
+			       (1+ (position agent '(:tcp :serial :reliable-serial :emb))))
+			 (incf index)
+			 (if (and (eq agent :tcp) (not (eq host :server)))
+			     (setq index (add-pascal-string (string host) result index))
+			     (incf index))
+			 (setq index (add-pascal-string application-name result index))
+			 result)
+		 :type "ivrI" :id 0)
+	       resource-fork)
+	   (when initial-command
+	     (push (make-resource-elem :data (string-to-ascii initial-command)
+				       :type "ivrI" :id 1 :name application-name)
+		   resource-fork))
+	   (when description
+	     (let ((id (or old-description-id
+			   (loop for id = (random 16383)
+				 unless (loop for elem in resource-fork
+					      thereis
+						(and (eql (resource-elem-type elem) "IVRY")
+						     (= (resource-elem-id elem) id)))
+				   return id))))
+	       (push (make-resource-elem :type "IVRY" :id id :name application-name
+		       :data (let ((result (make-array (+ 1 (string-length description))
+						       :element-type '(unsigned-byte 8))))
+			       (add-pascal-string description result 0)
+			       result))
+		       resource-fork))))
+       (setq resource-fork (make-resource-fork (nreverse resource-fork)))
+       (write-mac-file to-file data-fork resource-fork :type file-type :author file-author))))

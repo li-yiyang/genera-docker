@@ -1,0 +1,1805 @@
+;;; -*- Mode: LISP; Package: Debugger; Base: 8; Lowercase: Yes -*- 
+
+;;; Debugger routines for the all machine architectures
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;; Address of FRAME relative to the base of the stack.  For display purposes only.
+(defun frame-relative-address (frame)
+  (%pointer-difference frame %control-stack-low))
+
+;; Get the pc from which the next frame was called, as an address in the function
+(defun frame-relative-exit-pc (frame &optional next-frame)
+  (let ((function (frame-function frame)))
+    (and (typep function :compiled-function)
+	 (let ((next (or next-frame (frame-next-open-frame frame))))
+	   (and next
+		;; First guess is the return pc of the next frame
+		(or (function-relative-pc (frame-return-pc next) function)
+		    ;; Next look on the stack after the frame for pc's into its function.
+		    ;; PCLSR from the microcode will set the CDR-code on a PC.
+		    #+3600
+		    (loop with lim = (frame-previous-top next) and pc
+			  for pp = frame then (%pointer-plus pp 1)
+			  when (and (= (%p-cdr-code pp) cdr-normal)
+				    (or (= (%p-data-type pp) dtp-odd-pc)
+					(= (%p-data-type pp) dtp-even-pc))
+				    (let ((ppc (cdr pp)))
+				      (if (eq ppc restart-trapped-call-escape-pc)
+					  (setq pc 0)
+					(setq pc (function-relative-pc ppc function)))))
+			    return pc
+			  while (%pointer-lessp pp lim))))))))
+
+;; Value and location of ARG-NOth argument to FRAME.
+;; CALLEE-CONTEXT means give the possibly modified argument, rather than the original copy
+;;  in the caller's frame.
+(defun frame-arg-value (frame arg-name-or-number &optional callee-context no-error-p)
+  (declare (values value location))
+  #+imach (ignore callee-context)
+  #+imach
+  (let ((arg-n (canonicalize-local-name frame arg-name-or-number)))
+    (if (numberp arg-n)
+	(if (< arg-n (+ (frame-number-of-args frame)
+			(ldb %%cr.apply (frame-own-control-register frame))))
+	    (let ((location (%pointer-plus frame (+ arg-n (defstorage-size stack-frame)))))
+	      (values
+		(sys:%memory-read location :cycle-type %memory-scavenge)
+		location))
+	  (unless no-error-p
+	    (ferror "Argument ~D not found; ~
+		       there ~[~0;are no~1;is only one~:;~:*are only ~D~] argument~:P"
+	      arg-n (frame-number-of-args frame))))
+      (ferror "~S is not the name of an argument" arg-name-or-number)))
+  #+3600
+  (multiple-value-bind (arg-n was-symbol)
+      (canonicalize-local-name frame arg-name-or-number)
+    ;; If arg-name is a symbol referring to the &rest arg, he probably wants
+    ;; to be shown the whole &rest argument
+    (when (and was-symbol (= arg-n (frame-number-of-spread-args frame :supplied)))
+      (setq callee-context t))
+    (unless callee-context
+      (let ((extra-arguments (cond ((and (not (zerop (frame-instance-called frame)))
+					 (not (instancep (frame-function frame)))) 2)
+				   ((not (zerop (frame-lexical-called frame))) 1)
+				   (t 0)))
+	    (lexpr-called (not (zerop (frame-lexpr-called frame)))))
+	(cond ((< arg-n extra-arguments)
+	       (setq callee-context t)		;SELF and S-M-T only in local block
+	       ;; Recover SELF-MAPPING-TABLE's original value, before a whopper setqed it,
+	       ;; when callee-context is nil
+	       (when (and (= arg-n #+3600 1)
+			  (not (zerop (frame-instance-called frame))))
+		 (let ((self (frame-local-value frame #+3600 0))
+		       (function (function-name (frame-function frame))))
+		   (when (and (instancep self)
+			      (listp function)
+			      (memq (car function) flavor:*fdefinable-method-types*))
+		     (multiple-value-bind (nil mapping-table)
+			 (without-interrupts
+			   (flavor::handler-table-function-and-parameter
+			     (%instance-flavor self)
+			     (generic-function-selector
+			       (flavor:find-generic-function
+				 (flavor:method-generic
+				   function)))))
+		       (return-from frame-arg-value
+			 (values mapping-table
+				 (multiple-value-bind (nil location)
+				     (frame-local-value frame arg-n no-error-p)
+				   location))))))))
+	      ((and (not lexpr-called)
+		    ( arg-n (frame-number-of-spread-args frame :supplied))
+		    (< arg-n (frame-number-of-spread-args frame :expected)))
+	       (setq callee-context t))		;OPTIONAL args only in local block
+	      (t
+	       (decf arg-n extra-arguments)))));Make all others appear offset in caller
+    (if callee-context
+	(frame-local-value frame arg-n no-error-p)
+      (let* ((arg-top (%pointer-plus (frame-previous-top frame)
+				     (if (not (zerop (frame-funcalled frame))) 2 1)))
+	     (nspread (frame-number-of-args frame))
+	     (lexpr-called (not (zerop (frame-lexpr-called frame))))
+	     (location nil))
+	(and lexpr-called (decf nspread))
+	(if ( arg-n nspread)
+	    (and lexpr-called
+		 (let ((rest-arg (%p-contents-offset arg-top nspread)))
+		   (setq location (and (< arg-n (+ (length rest-arg) nspread))
+				       (locf (nth (- arg-n nspread) rest-arg))))))
+	  (setq location (%pointer-plus arg-top arg-n)))
+	(cond (location
+	       (values (location-contents location) location))
+	      (no-error-p
+	       nil)
+	      ((symbolp arg-name-or-number)
+	       (ferror "~S is not the name of an argument" arg-name-or-number))
+	      (t
+	       (ferror "Argument ~D not found; ~
+			there ~[~0;are no~1;is only one~:;~:*are only ~D~] argument~:P"
+		   arg-n
+		   (+ nspread (if lexpr-called
+				  (length (%p-contents-offset arg-top nspread))
+				0)))))))))
+
+;; Value and location of LOCAL-NOth local variable in FRAME.
+(defun frame-local-value (frame local-name-or-number &optional no-error-p)
+  (declare (values value location))
+  (let ((local-n (canonicalize-local-name frame local-name-or-number))
+	(n-locals (frame-number-of-locals frame)))
+    (if (numberp local-n)
+	(if (or (< local-n n-locals)
+		(eq no-error-p :force))
+	    (let ((location (%pointer-plus frame (+ local-n
+						    #+imach (defstorage-size stack-frame)))))
+	      (values
+		(progn
+		  #+3600 (location-contents location)
+		  #+imach (%memory-read location :cycle-type %memory-scavenge))
+		location))
+	  (unless no-error-p
+	    (ferror "Local ~D not found; ~
+	             there ~[~0;are no~1;is only one~:;~:*are only ~D~] local variable~:P"
+	      local-n n-locals)))
+      (ferror "~S is not the name of an argument" local-name-or-number))))
+
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB");;--- This is not right for the I-machine
+0(defun restore-implied-arguments (frame)
+  #+IMach
+  (ignore frame)
+  #+3600
+  (when (not (zerop (frame-instance-called frame)))	;Restore SELF-MAPPING-TABLE
+    (multiple-value-bind (value location)
+	(frame-arg-value frame 1)
+      (setf (location-contents location) value))))
+
+(defun canonicalize-local-name (frame local-name)
+  (let ((was-symbol nil))
+    (cond ((symbolp local-name)
+	   (let* ((function (frame-function frame))
+		  (pc (frame-relative-exit-pc frame)))
+	     (dotimes (i (frame-number-of-locals frame))
+	       (when (string-equal (local-name #+3600 function #+imach frame i pc)
+				   local-name)
+		 (return (prog1 (setq local-name i)
+				(setq was-symbol t)))))
+	     (when (symbolp local-name)
+	       (ferror "No local variable in ~S's frame named ~S"
+		       (function-name function) local-name))))
+	  ((and (fixp local-name) (not (minusp local-name))))
+	  (t (ferror "~S is invalid as the name or number of an argument or local variable"
+		     local-name)))
+    (values local-name was-symbol)))
+
+(defun lframe-captive-info (frame)
+  (declare (values captive-block captive-map))
+  (let* ((debug-info (debugging-info (frame-function frame)))
+	 (captive-block-no
+	   #+|3600| (loop for (number . name) in (cdr (assq :local-map debug-info))
+			  when (eq name 'compiler:.lexical-captive-block-pointer.)
+			    do (return number))
+	   #+imach (let ((pos (lisp:position 'compiler:.lexical-captive-block-pointer.
+					     (ilc:cache-local-names-for-debugger frame nil))))
+		     (and pos (- pos (defstorage-size stack-frame))))
+	   ))
+    (values (and captive-block-no (frame-local-value frame captive-block-no))
+	    (cdr (assq :captive-map debug-info)))))
+
+(defun decode-binding (ptr)
+  (declare (values loc val unbound-p #+3600 closure-p #+imach ignore))
+  (let ((cell (binding-stack-cell ptr))
+	(valp (locf (binding-stack-contents ptr)))
+	(binding-stack-pointer %binding-stack-pointer))
+    (if (and #+3600 (not (%pointer-lessp ptr %binding-stack-low))
+	     (not (%pointer-lessp binding-stack-pointer ptr)))
+	;; It's in the current stack group, find where the value is currently
+	(loop with p = ptr do
+	  (setq p (%pointer-plus p (defstorage-size binding-stack-entry)))
+	  (when (%pointer-lessp binding-stack-pointer p)
+	    (return (setq valp cell)))
+	  (when (eq (binding-stack-cell p) cell)
+	    (return (setq valp (locf (binding-stack-contents p)))))))
+    (let ((bound-p (location-boundp valp)))
+      (values cell
+	      (and bound-p (cdr valp))
+	      (not bound-p)
+	      #+3600 (plusp (binding-stack-closure-bit ptr))))))
+
+(defun frame-and-subframes-special-pdl-range (starting-frame)
+  (declare (values start-frame end-frame n-subframes))
+  (let ((start nil)
+	(end nil)
+	(n-subframes 0))
+    (loop for frame = (frame-innermost-subframe starting-frame)
+		    then (frame-previous-frame frame)
+	  do (multiple-value-bind (maybe-start maybe-end)
+		 (frame-special-pdl-range frame)
+	       (or end (setq end maybe-end))
+	       (if maybe-start (setq start maybe-start)))
+	     (incf n-subframes)
+	  until (eq frame starting-frame))
+    (values start end n-subframes)))
+
+(defun map-over-bindings (continuation start end)
+  ;; Calls CONTINUATION with location, value, unbound-p, closure-p (only on L-machine),
+  ;; and the "binding number"
+  (loop for n upfrom 0
+	while (%pointer-lessp start end) do
+    (multiple-value-bind (loc val unbound-p closure-p)
+	(decode-binding start)
+      (funcall continuation loc val unbound-p closure-p n))
+    (setq start (%pointer-plus start (defstorage-size binding-stack-entry)))))
+
+;; NIL or the instance owning an ordinary method, a method called from a combined-method,
+;; a method called by a message to SELF, or a defun-method.
+;; INSTANCE-FRAME-ONLY means only the first of those cases, where this frame really
+;; was created by SEND.
+(defun frame-self-value (frame &optional instance-frame-only)
+  (let ((self-slot #+3600 0 #+imach 1))
+    (cond ((not (zerop (frame-instance-called frame)))
+	   (%p-contents-offset frame (+ self-slot #+imach (defstorage-size stack-frame))))
+	  ((and (not instance-frame-only)
+		(loop for function-spec = (function-name (frame-function frame))
+					then (second function-spec)
+		      while (and (listp function-spec) (eq (first function-spec) ':internal))
+		      finally (return (and (listp function-spec)
+					   (memq (first function-spec)
+						 flavor:*fdefinable-method-types*)))))
+	   (cond ((eq (local-name #+3600 (frame-function frame) #+imach frame self-slot) 'self)
+		  (frame-arg-value frame self-slot))
+		 ((not (zerop (frame-lexical-called frame)))
+		  ;; SELF must be here somewhere, look around in the lexical environment
+		  ;; this code sure could be more modular
+		  (let ((function (frame-function frame)))
+		    (when (typep function :compiled-function)
+		      (let* ((debug-info (si:compiled-function-debugging-info function))
+			     (info (second (assq 'self (cdr (assq :lexical-map debug-info))))))
+			(when info
+			  (let* (;; On the 3600, closures over methods put the environment
+				 ;; into local 2, otherwise local 0 (actually arg 0) is 
+				 ;; the environment
+				 ;;--- This isn't right for (:INTERNAL (:INTERNAL (FLAVOR:METHOD ...)))
+				 ;;--- on either the L- or I-machine.
+
+				 (env-local #+3600 (car (rassq 'compiler:.lexical-environment-pointer.
+							       (cdr (assq :local-map debug-info))))
+					    #+imach 0)
+				 ;; Use NIL for the environment if something went wrong
+				 (env (when env-local (frame-local-value frame env-local))))
+			    (when env
+			      (flet ((lex-env-ref (env nth)
+				       (typecase env
+					 (:null nil)
+					 (:locative (%p-contents-offset env nth))
+					 (:list (nth nth env)))))
+				(lex-env-ref
+				  (loop repeat (lexical-map-variable-generation info)
+					for e = env then (lex-env-ref e 0)
+					finally (return e))
+				  (lexical-map-variable-location info)))))))))))))))
+
+
+;;; Machine independent stack manipulation
+
+;; Find the value of a symbol in the binding environment of a specified stack group.
+;; Note that this cannot get an error even if the sg is in some funny state, unlike
+;; SG-EVAL.  Don't call this if the stack-group could be running in another process
+;; and thus changing its state.  If the variable is unbound, the first value is NIL.
+;; The second value is the location of the binding, i.e. the cell where the value
+;; is currently saved.
+;; If FRAME is specified, we get the value visible in that frame.
+;; If AS-IF-CURRENT is non-nil, we return a LOCATION for where
+;; the value WOULD be when that SG is running.
+;; The VALUE, however, is the current value -- not what is now stored in that location.
+(defun symeval-in-stack-group (sym sg &optional frame as-if-current)
+  (declare (values value location))
+  (check-arg sg (typep sg :stack-group) "a stack group")
+  (multiple-value-bind (location-now location-when-running)
+      (cell-location-in-stack-group (follow-cell-forwarding (value-cell-location sym) nil)
+				    sg frame)
+    (values (and (location-boundp location-now) (cdr location-now))
+	    (if as-if-current location-when-running location-now))))
+
+;; Not a fully general SET-IN-STACK-GROUP, this quite deliberately only allows
+;; you to change the value of a binding extant in that stack group, not the
+;; global value.  Returns T if it succeeds, NIL if it fails.
+;; Don't call this if the stack-group could be running in another process
+;; and thus changing its state.
+(defun rebind-in-stack-group (sym value sg &optional frame)
+  (check-arg sg (typep sg :stack-group) "a stack group")
+  (let* ((cell (follow-cell-forwarding (value-cell-location sym) nil))
+	 (location-now (cell-location-in-stack-group cell sg frame)))
+    (cond ((eq location-now cell) nil)
+	  (t (rplaca location-now value)
+	     t))))
+
+;; Given a cell that might be bound, find where the value of that cell is now
+;; and where it would be when the stack group was running.  If no frame is
+;; specified the innermost binding in the stack group is used, otherwise
+;; the binding visible from that frame is used.
+(defun cell-location-in-stack-group (cell sg &optional frame)
+  (declare (safeguarded-function)
+	   (values location-now location-when-running))
+  (let* ((stack-pointer (if (eq sg %current-stack-group)
+			    %binding-stack-pointer
+			  (sg-binding-stack-pointer sg)))
+	 (stack-boundary (cond ((null frame) stack-pointer)
+			       ((eq frame :bottom) (sg-binding-stack-low sg))
+			       (t (frame-special-pdl-top frame sg))))
+	 (stack-low (%pointer-plus
+		      (if (eq sg %current-stack-group)
+			  stack-boundary
+			(sg-binding-stack-low sg))
+		      #+3600 0 #+imach 1))
+	 (inside-boundary cell)
+	 (outside-boundary nil))
+    ;; Find two binding stack entries: the outermost inside the boundary and
+    ;; the innermost outside the boundary.  The former is the re-binding that
+    ;; shadows the one we are looking for, while the latter is the one we want.
+    ;; Do this with monitoring off, so that we don't blow off the scheduler.
+    (loop with *printing-monitor-message* = t
+	  while (%pointer-lessp stack-low stack-pointer) do
+      (if (eq (follow-cell-forwarding (binding-stack-cell stack-pointer) nil) cell)
+	  (let ((p (locf (binding-stack-contents stack-pointer))))
+	    (if (%pointer-lessp stack-boundary stack-pointer)
+		(setq inside-boundary p)
+	      (return (setq outside-boundary p)))))
+      (setq stack-pointer (%pointer-plus stack-pointer
+					 (- (defstorage-size binding-stack-entry)))))
+    (cond ((eq sg %current-stack-group)
+	   ;; Current SG: use the current environment as modified by inside-boundary
+	   (values inside-boundary inside-boundary))
+	  (outside-boundary
+	   ;; It's bound in the SG
+	   (values outside-boundary inside-boundary))
+	  (t ;; It's not bound in the SG, so find the global value, which might
+	   ;; be shadowed by a binding in the current SG
+	   (setq stack-pointer %binding-stack-pointer
+		 stack-low #+3600 %binding-stack-low
+		           #+imach (%pointer-plus
+				     (sg-binding-stack-low %current-stack-group)
+				     (defstorage-size binding-stack-entry)))
+	   (do () ((%pointer-lessp stack-pointer stack-low))
+	     (if (eq (binding-stack-cell stack-pointer) cell)
+		 (setq outside-boundary  (locf (binding-stack-contents stack-pointer))))
+	     (setq stack-pointer (%pointer-plus stack-pointer
+						(- (defstorage-size binding-stack-entry)))))
+	   (values (or outside-boundary cell) inside-boundary)))))
+
+
+;; Collect all the currently bound specials for a frame
+(defun collect-frame-bindings (frame)
+  (multiple-value-bind (start end)
+      (frame-special-pdl-range frame)
+    (let ((bindings nil))
+      (when start
+	(map-over-bindings
+	  (lambda (loc val unbound-p ignore ignore)
+	    (let ((sym (symbol-from-value-cell-location loc)))
+	      (push `(,sym ,val ,unbound-p) bindings)))
+	  start end))
+      bindings)))
+
+;; Find all the special variables used by FUNCTION
+(defun find-all-special-usages (function &aux specials)
+  (when (typep function :compiled-function)
+    (si:do-function-references (type ref) function
+      (when (eq type :variable)
+	(cl:pushnew ref specials)))
+    (nreverse specials)))
+
+
+;; Needed by the below, but I don't want to move the defvars from DEBUGGER.LISP
+(declare (special *debugger-open-coded-bindings* *debugger-bindings*))
+
+;; Complete magic, but it does generate useful warnings
+(defun warn-about-specially-handled-variables (form)
+  (when (variable-boundp #'lt:mapforms)
+    (multiple-value-bind (free-sets free-refs)
+	(condition-case ()
+	     (collect-free-references form)
+	   ;; Assume no free references if the form has no MAPFORMS template
+	   (lt:form-not-understood nil))
+      (flet ((print-vars (vars)
+	       (format-textual-list vars
+				    #'(lambda (name ignore) (format t "~S" name))
+				    :conjunction "and")
+	       (format t "~&~%")))
+	(loop for free-set in free-sets
+	      when (or (and (memq free-set *variables-not-to-inherit*)
+			    (not (memq free-set *special-variables-not-to-inherit*)))
+		       (assq free-set *debugger-open-coded-bindings*)
+		       (assq free-set *debugger-bindings*))
+		collect free-set into special-sets
+	      finally (when special-sets
+			(format t "~&The following variables are treated specially; ~
+				   setting them probably won't work:~%  ")
+			(print-vars special-sets)))
+	(loop for free-ref in free-refs
+	      when (or (and (memq free-ref *variables-not-to-inherit*)
+			    (not (memq free-ref *special-variables-not-to-inherit*)))
+		       (assq free-ref *debugger-open-coded-bindings*)
+		       (assq free-ref *debugger-bindings*))
+		collect free-ref into special-refs
+	      finally (when special-refs
+			(format t "~&The following variables are treated specially; you ~
+				   may want to use the ~V:Show Special~ command:~%  "
+			  *deemphasis-character-style*)
+			(print-vars special-refs)))
+	(loop for free-set in free-sets
+	      when (ass #'(lambda (s1 s2)
+			    (eq (locf (symeval s1)) (locf (symeval s2))))
+			free-set si:*standard-bindings*)
+		collect free-set into standard-sets
+	      finally (when standard-sets
+			(format t "~&The following variables are standard variables; ~
+				   setting them probably won't work:~%  ")
+			(print-vars standard-sets)))))))
+
+;; For a form, find any variables which are set without having been bound.
+;; This can be used to discover whether a form sets either an argument or a
+;; local, so that the debugger can ensure that both get updated.
+(defun collect-free-references (form)
+  (declare (values sets refs))
+  (with-stack-array (lets 40.)
+    (with-stack-array (prev-forms 40.)
+      (let ((sets ())
+	    (refs ())
+	    (prev-level 0))
+	(flet ((outer-binding-p (name level)
+		 (loop for i below level
+		       thereis (memq name (aref lets i)))))
+	  (lt:mapforms
+	    #'(lambda (form kind ignore ignore)	
+		(let ((level lt:*mapforms-level*))
+		  (setf (aref prev-forms level) form)
+		  (setq prev-level level)
+		  (selectq kind
+		    (let
+		     ;; Record a LET at this level
+		     (push form (aref lets level)))
+		    (set
+		     ;; Record a SET iff there is no previous binding
+		     (unless (outer-binding-p form level)
+		       (push form sets)))
+		    (lt:symeval
+		     ;; Record a REF iff there is no previous binding
+		     (unless (outer-binding-p form (1+ level))
+		       (push form refs))))
+		  ;; "Decache" bindings if we moved back a level
+		  (when (< level prev-level)
+		    (setf (aref lets level) nil))))
+	    form :initial-state lets))
+	(values sets refs)))))
+
+
+;;; Previous context (lexical environment) stuff
+
+;;--- Someday, clean up all the duplicated %PUSH-ish code in here
+(defun frame-lexical-environment (frame)
+  (when (not (zerop (frame-lexical-called frame)))
+    (let ((function (frame-function frame)))
+      (typecase function
+	(:compiled-function
+	  (let* (#+3600 (local-map
+			  (assq :local-map (si:compiled-function-debugging-info function)))
+		 ;; On the 3600, closures over methods put the environment into local 2,
+		 ;; otherwise local 0 (actually arg 0) is the environment
+		 ;;--- This isn't right for (:INTERNAL (:INTERNAL (FLAVOR:METHOD ...)))
+		 ;;--- on either the L- or I-machine.
+		 (env-local #+3600 (car (rassq 'compiler:.lexical-environment-pointer.
+					       (cdr local-map)))
+			    #+imach
+			    (let ((locals (i-lisp-compiler:compute-local-names-for-debugger
+					    frame (frame-relative-exit-pc frame))))
+			      (- (or (cl:position 'compiler:.lexical-environment-pointer.
+						   locals)
+				     (defstorage-size stack-frame))
+				 (defstorage-size stack-frame))))			      
+		 ;; Use NIL for the environment if something went wrong
+		 (env (when env-local (frame-local-value frame env-local))))
+	    ;;pulled this out of lower level functions -- Kalman
+	    (when (cl::typep env 'sys::lexical-closure)
+	      (setq env (sys::lexical-closure-environment env)))
+	    ;;I've seen this get here with an integer, be more paranoid -- Kalman
+	    (unless (typecase env
+		      ((:null :locative :list) t))
+	      (setq env nil))
+	    (when env
+	      (labels ((lex-env-ref (env nth)
+		       (typecase env
+			 (:null nil)
+			 (:locative (%p-contents-offset env nth))
+			 (:list (nth nth env))
+			 (otherwise
+			   (ferror "Unrecognized datatype for a compiled environment"))))
+		     (lex-env-locf (env nth)
+		       (typecase env
+			 (:locative (%pointer-plus env nth))
+			 (:list (locf (nth nth env)))
+			 (otherwise
+			   (ferror "Unrecognized datatype for a compiled environment")))))
+		(ncons
+		  (loop for (name info) in
+			    (cdr (assq :lexical-map
+				       (si:compiled-function-debugging-info function)))
+			as sub-env = (loop repeat (lexical-map-variable-generation info)
+					   for e = env then (lex-env-ref e 0)
+					   finally (return e))
+			collect (cons name (lex-env-locf
+					     sub-env
+					     (lexical-map-variable-location info)))))))))
+	(otherwise
+	  ;; If it's really an enclosed interpreted function, extract the lexical environment
+	  (and (listp function)
+	       (eq (car function) 'si:digested-lambda)
+	       (ldb-test si:%%lambda-internal (fourth function))
+	       (frame-local-value frame 0)))))))
+
+(defun symeval-in-error-environment (symbol &optional frame)
+  (symeval-in-stack-group symbol %current-stack-group frame))
+
+;; Easier than computing the environment, and then passing it into prompt-and-read
+(defun prompt-and-read-in-error-environment (type &rest args)
+  (values-list (lexpr-funcall #'funcall-in-error-environment t t
+			      #'prompt-and-read type args)))
+
+;; The next two functions return a multiple-value list, not plain-old
+;; multiple-values.  This behavior is entrenched in the error-system,
+;; which expects to be able to funcall both condition-handlers and the
+;; Debugger, which also return lists.  Yuck.
+(defun funcall-in-error-environment (bind-streams condition-wall function &rest args)
+  (eval-in-error-environment bind-streams condition-wall `(apply ',function ',args)))
+
+(defun eval-in-error-environment (bind-streams condition-wall form)
+  (si:with-process-non-interactive-priority ()
+    (multiple-value-list
+      ;; Make sure *CURRENT-FRAME* points to before any interpreter frames
+      ;; if the current frame is interpreted.
+      (let ((*current-frame* (frame-innermost-subframe *current-frame*)))
+	(cond ((null bind-streams)		;turns off using lexical env, too
+	       (eval form))
+	      ((not *inherit-lexical-environment*)
+	       (let ((frame *current-frame*)
+		     (dbg-terminal-io terminal-io))
+		 ;; This used to bind PACKAGE, but that is obsolete in light of
+		 ;; the new standard-value scheme
+		 (let ((*frame* frame)
+		       (old-terminal-io (symeval-in-error-environment
+					  'terminal-io frame))
+		       (old-standard-output (symeval-in-error-environment
+					      'standard-output frame))
+		       (old-standard-input (symeval-in-error-environment
+					     'standard-input frame))
+		       (evalhook nil)
+		       (terminal-io dbg-terminal-io)
+		       (standard-input syn-terminal-io)
+		       (standard-output syn-terminal-io)
+		       (query-io syn-terminal-io)
+		       (error-output syn-terminal-io)
+		       (debug-io syn-terminal-io))
+		   (let-if condition-wall
+			   ((*bound-handlers* nil)
+			    (*default-handlers* nil))
+		     (with-debugger-handlers
+		       (eval form))))))
+	      (t (eval-in-special-environment
+		   form (frame-lexical-environment *current-frame*) condition-wall)))))))
+
+;; SI:%P-COPY-Q is no good on the 3600, since it binds INHIBIT-SCHEDULING-FLAG.
+(defsubst %p-copy-contents (to from)
+  #+3600
+  (let ((data-type (%p-data-type from)))
+    (%p-store-cdr-type-and-pointer to (%p-cdr-code to) data-type
+				   (if (%pointer-type-p data-type)
+				       (%p-contents-as-locative from)
+				     (%p-pointer from))))
+  #+imach
+  (si:%p-copy-q from to))
+
+(defun eval-in-special-environment (form env condition-wall)
+  ;; Get these all before we start modifying the special pdl, in
+  ;; case they need things like *STACK-FRAME-ARRAY*.
+  (%with-binding-stack-level
+    (let* ((frame *current-frame*)
+	   (dbg-terminal-io terminal-io)
+	   (function (frame-function frame))
+	   (nlocals (frame-number-of-locals frame))
+	   (exit-pc (frame-relative-exit-pc frame))
+	   (fself (frame-self-value frame))
+	   ;; Bind off any special bindings later than this frame.  This
+	   ;; used to work by binding to an EVCP to the higher on the
+	   ;; binding stack.  That puts stuff in the A memory variables
+	   ;; that the microcode doesn't like and tends to leave your
+	   ;; machine trashed when you warm boot.  Instead, bind to
+	   ;; copies of their values and reset after running the form.
+	   (binding-stack-top %binding-stack-pointer)
+	   (binding-stack-bottom (frame-special-pdl-top frame))
+	   (data-stack-pointer-loc (locf (sg-data-stack-pointer %current-stack-group))))
+      ;; Make new bindings for all the specials bound in the error environment
+      (loop for sp first binding-stack-top
+		   then (%pointer-plus sp (- (defstorage-size binding-stack-entry)))
+	    until (eq sp binding-stack-bottom) doing
+	(prog ((cell (follow-cell-forwarding (binding-stack-cell sp) nil))
+	       (loc (locf (binding-stack-contents sp))))
+	      (unless (or (eq cell data-stack-pointer-loc)
+			  (loop for sym in *variables-not-to-inherit*
+				thereis (eq (follow-cell-forwarding
+					      (value-cell-location sym) nil)
+					    cell)))
+		(%bind-location cell (and (location-boundp cell) (cdr cell)))	;Try to avoid window
+		(%p-copy-contents cell loc))))
+      (unwind-protect
+	  (let ((tem env))
+	    (si:with-interpreter-environment
+	      (new-env env (pop tem) (pop tem) (pop tem) (pop tem) (pop tem))
+	      (eval-in-instance-environment fself frame function
+					    nlocals exit-pc dbg-terminal-io
+					    form new-env condition-wall)))
+	;; Unbind all the bindings we created above
+	(loop for psp first binding-stack-bottom then sp
+	      as sp = (%pointer-plus psp (defstorage-size binding-stack-entry))
+	      until (eq psp binding-stack-top) doing
+	  (prog ((cell (follow-cell-forwarding (binding-stack-cell sp) nil))
+		 (loc (locf (binding-stack-contents sp))))
+		(unless (or (eq cell data-stack-pointer-loc)
+			    (loop for sym in *variables-not-to-inherit*
+				  thereis (eq (follow-cell-forwarding
+						(value-cell-location sym) nil)
+					      cell)))
+		  (unless (eq (binding-stack-cell %binding-stack-pointer) cell)
+		    (ferror "Binding stack out of phase -- binding doesn't match"))
+		  (%p-copy-contents loc cell)
+		  (%unbind))))
+	(unless (eq %binding-stack-pointer binding-stack-top)
+	  (ferror "Binding stack out of phase -- didn't end up at start"))))))
+
+;; If FSELF is an instance, add it's instance variables onto the
+;; lexical environment ENV, then enter the environment of FUNCTION.
+(defun eval-in-instance-environment (fself frame function nlocals exit-pc
+				     dbg-terminal-io form env condition-wall)
+  (if (not (and (instancep fself)
+		(flavor-instance-p fself)))
+      (eval-in-function-lexical-environment frame function nlocals exit-pc
+					    dbg-terminal-io form env condition-wall)
+    (let ((all-vars (flavor::flavor-all-instance-variables (%instance-flavor fself)))
+	  (all-funs (flavor::flavor-all-local-functions (%instance-flavor fself))))
+      (eval-in-instance-environment-1 all-vars all-vars all-funs
+				      ;; Follow forwarding after getting all-vars, so that
+				      ;; we have a structure at least large enough.
+				      (follow-structure-forwarding fself)
+				      frame function nlocals exit-pc
+				      dbg-terminal-io form env condition-wall))))
+
+(defconst *maximum-bindings-per-frame* #+3600 50. #+imach 12.)
+
+;; The effect of this code is this, except it doesn't cons:
+;;   (LOOP FOR OFFSET FROM 1
+;;	   FOR NAME IN (FLAVOR:FLAVOR-ALL-INSTANCE-VARIABLES (%INSTANCE-FLAVOR FSELF))
+;;	   DO (PUSH (CONS NAME (%MAKE-POINTER-OFFSET DTP-LOCATIVE FSELF OFFSET))
+;;		    (SI:ENV-VARIABLES ENV))))
+(defun eval-in-instance-environment-1 (vars all-vars all-funs fself
+				       frame function nlocals exit-pc
+				       dbg-terminal-io form env condition-wall)
+  ;; Mostly copied from SI:APPLY-LAMBDA-METHOD (there can't be any deleted instance
+  ;; variables here of course, but keep the code the same for simplicity).
+  ;; Allocate all locals right away so that the %PUSHes below work
+  (let* ((n (min (length vars) *maximum-bindings-per-frame*))
+	 (tem n)
+	 pos bp lp)
+    (when (plusp n)				;Allow Fortran DO-loops
+      ;; No %ASSURE-PDL-ROOM needed because of above MIN check
+      ;; Allocate the stack slots for the list of binding descriptors
+      ;; LP points at the list, BP points just before it
+      (setq bp (compiler:%stack-location-internal 0))
+      (%push nil)
+      (setq lp (%make-pointer dtp-list (compiler:%stack-location-internal 0)))
+      (loop do (%push nil)
+	       (decf tem)
+	    until (zerop tem))
+      ;; Build the binding descriptors, pairs of (name . value-cell-location)
+      (loop do (setq tem (pop vars))
+	       (setq pos (find-position-in-list tem all-vars))
+	       (when pos
+		 ;; Bind this instance variable lexically to its instance slot, but
+		 ;; only if it has not been deleted.  If it has been deleted, which
+		 ;; can actually happen, omit it from the environment.
+		 (%push tem)
+		 (%push (%make-pointer-offset dtp-locative fself (1+ pos)))
+		 (%p-store-cdr-code (compiler:%stack-location-internal 2) cdr-normal)
+		 (%p-store-contents-increment-pointer
+		   (%make-pointer dtp-list
+				  (compiler:%stack-location-internal #+3600 1 #+imach 2))
+		   bp))
+	       (decf n)
+	    until (zerop n))
+      ;; Hook onto the other bindings already pushed, if there were any
+      (unless (eq bp (%make-pointer-offset dtp-locative lp -1))
+	(%p-store-cdr-code bp cdr-normal)
+	(%p-store-contents-increment-pointer (si:env-variables env) bp)
+	(setf (si:env-variables env) lp)))
+    ;; Recurse to do the rest of the job
+    (if vars
+	(eval-in-instance-environment-1 vars all-vars all-funs fself
+					frame function nlocals exit-pc
+					dbg-terminal-io form env condition-wall)	
+      (eval-in-instance-environment-2 all-funs all-funs frame function nlocals exit-pc
+				      dbg-terminal-io form env condition-wall))))
+
+(defun eval-in-instance-environment-2 (funs all-funs frame function nlocals exit-pc
+				       dbg-terminal-io form env condition-wall)
+  ;; Mostly copied from SI:APPLY-LAMBDA-METHOD (there can't be any deleted instance
+  ;; variables here of course, but keep the code the same for simplicity).
+  ;; Allocate all locals right away so that the %PUSHes below work
+  (let* ((n (min (length funs) *maximum-bindings-per-frame*))
+	 (tem n)
+	 bp lp)
+    (when (plusp n)				;Allow Fortran DO-loops
+      ;; No %ASSURE-PDL-ROOM needed because of above MIN check
+      ;; Allocate the stack slots for the list of binding descriptors
+      ;; LP points at the list, BP points just before it
+      (setq bp (compiler:%stack-location-internal 0))
+      (%push nil)
+      (setq lp (%make-pointer dtp-list (compiler:%stack-location-internal 0)))
+      (loop do (%push nil)
+	       (decf tem)
+	    until (zerop tem))
+      ;; Build the binding descriptors, pairs of (name . function-cell-location)
+      (loop do (setq tem (pop funs))
+	       (%push (car tem))
+	       (%push (cdr tem))
+	       (%p-store-cdr-code (compiler:%stack-location-internal 2) cdr-normal)
+	       (%p-store-contents-increment-pointer
+		 (%make-pointer dtp-list
+				(compiler:%stack-location-internal #+3600 1 #+imach 2))
+		 bp)
+	       (decf n)
+	    until (zerop n))
+      ;; Hook onto the other bindings already pushed, if there were any
+      (unless (eq bp (%make-pointer-offset dtp-locative lp -1))
+	(%p-store-cdr-code bp cdr-normal)
+	(%p-store-contents-increment-pointer (si:env-functions env) bp)
+	(setf (si:env-functions env) lp)))
+    ;; Recurse to do the rest of the job
+    (if funs
+	(eval-in-instance-environment-2 funs all-funs
+					frame function nlocals exit-pc
+					dbg-terminal-io form env condition-wall)	
+      (eval-in-function-lexical-environment frame function nlocals exit-pc
+					    dbg-terminal-io form env
+					    condition-wall))))
+
+;; If FUNCTION is a compiled function, add its current local variables
+;; to the lexical environment ENV, then eval FORM in that environment.
+(defun eval-in-function-lexical-environment (frame function nlocals exit-pc
+					     dbg-terminal-io form env condition-wall)
+  (cond ((and (eq function #'si:*eval)
+	      (frame-arg-value frame 1))
+	 ;; Probably evaluating a top-level form
+	 (let ((eval-env (frame-arg-value frame 1)))
+	   (si:with-interpreter-environment
+	       (new-env env (pop eval-env) (pop eval-env)
+			    (pop eval-env) (pop eval-env) (pop eval-env))
+	     (eval-in-error-lexical-environment frame function dbg-terminal-io form
+						new-env condition-wall))))
+	((si:interpreted-function-p function)
+	 ;; Probably evaluating a digested function
+	 ;; Walk up the stack until we find the call to SI:*EVAL which contains
+	 ;; an environment which is useful for this call.
+	 (loop for eval-frame = *innermost-interesting-frame*
+			      then (frame-previous-frame eval-frame)
+	       until (or (null eval-frame)
+			 (and (eq (frame-function eval-frame) #'si:*eval)
+			      (%pointer-lessp frame eval-frame)))
+	       finally
+		 (let ((eval-env (if (null eval-frame)
+				     nil (frame-arg-value eval-frame 1))))
+		   (si:with-interpreter-environment
+		       (new-env env (pop eval-env) (pop eval-env)
+				    (pop eval-env) (pop eval-env) (pop eval-env))
+		     (return
+		       (eval-in-error-lexical-environment frame function dbg-terminal-io form
+							  new-env condition-wall))))))
+	((typep function :compiled-function)
+	 ;; Executing a compiled function, get its locals
+	 (let ((number-with-names
+		 (loop for i below nlocals
+		       count (local-name #+3600 function #+imach frame i exit-pc))))
+	   (eval-in-function-lexical-environment-1 (1- nlocals) number-with-names nlocals
+						   frame function exit-pc dbg-terminal-io
+						   form env condition-wall)))
+	(t
+	 (eval-in-error-lexical-environment frame function dbg-terminal-io form
+					    env condition-wall))))
+
+;; The effect of this code is this, except it doesn't cons:
+;;   (LOOP FOR I BELOW NLOCALS
+;;	   DO (LET ((NAME (LOCAL-NAME FUNCTION I EXIT-PC)))
+;;	      (WHEN NAME
+;;		(PUSH (CONS NAME (%MAKE-POINTER-OFFSET DTP-LOCATIVE FRAME I))
+;;		      (SI:ENV-VARIABLES ENV))))))
+;; That is, it creates entries for all of the normal (stack allocated) lexical
+;; variables in the current frame
+(defun eval-in-function-lexical-environment-1 (local-no number-with-names nlocals
+					       frame function exit-pc
+					       dbg-terminal-io form env condition-wall)
+  ;; Allocate all locals right away so that the %PUSHes below work
+  (let* ((n (min number-with-names *maximum-bindings-per-frame*))
+	 (tem n)
+	 name bp lp)
+    (multiple-value-bind (captive-block captive-map)
+	(lframe-captive-info frame)
+      (when (plusp n)				;Allow Fortran DO-loops
+	;; No %ASSURE-PDL-ROOM needed because of above MIN check
+	;; Allocate the stack slots for the list of binding descriptors
+	;; LP points at the list, BP points just before it
+	(setq bp (compiler:%stack-location-internal 0))
+	(%push nil)
+	(setq lp (%make-pointer dtp-list (compiler:%stack-location-internal 0)))
+	(loop do (%push nil)
+		 (decf tem)
+	      until (zerop tem))
+	;; Build the binding descriptors, pairs of (name . value-cell-location)
+	;; Note that we count backwards in case there are nested locals with the same name
+	(loop do (setq name (local-name #+3600 function #+imach frame local-no exit-pc))
+		 (when name
+		   (decf number-with-names)
+		   ;; Bind this local variable lexically if it has a name from the local map.
+		   (%push name)
+		   (%push (%pointer-plus frame
+					 (+ local-no #+imach (defstorage-size stack-frame))))
+		   (%p-store-cdr-code (compiler:%stack-location-internal 2) cdr-normal)
+		   (%p-store-contents-increment-pointer
+		     (%make-pointer dtp-list
+				    (compiler:%stack-location-internal #+3600 1 #+imach 2))
+		     bp)
+		   (decf n))
+		 (decf local-no)
+	      until (or (zerop n) (< local-no 0)))
+	;; Hook onto the other bindings already pushed, if there were any
+	(unless (eq bp (%make-pointer-offset dtp-locative lp -1))
+	  (%p-store-cdr-code bp cdr-normal)
+	  (%p-store-contents-increment-pointer (si:env-variables env) bp)
+	  (setf (si:env-variables env) lp)))
+      ;; Recurse to do the rest of the job
+      (if (plusp number-with-names)
+	  (eval-in-function-lexical-environment-1 local-no number-with-names nlocals
+						  frame function exit-pc
+						  dbg-terminal-io form env condition-wall)
+	  (if (and captive-map captive-block)
+	      (eval-in-function-lexical-environment-2 captive-map captive-block
+						      frame function dbg-terminal-io
+						      form env condition-wall)
+	      (eval-in-error-lexical-environment frame function dbg-terminal-io form env
+						 condition-wall))))))
+
+;; This creates entries for all of the captive (heap allocated) lexical variables
+;; in the current frame
+(defun eval-in-function-lexical-environment-2 (captive-map captive-block
+					       frame function dbg-terminal-io form env
+					       condition-wall)
+  ;; Allocate all locals right away so that the %PUSHes below work
+  (let* ((n (min (length captive-map) *maximum-bindings-per-frame*))
+	 (tem n)
+	 name pos bp lp)
+    (when (plusp n)				;Allow Fortran DO-loops
+      ;; No %ASSURE-PDL-ROOM needed because of above MIN check
+      ;; Allocate the stack slots for the list of binding descriptors
+      ;; LP points at the list, BP points just before it
+      (setq bp (compiler:%stack-location-internal 0))
+      (%push nil)
+      (setq lp (%make-pointer dtp-list (compiler:%stack-location-internal 0)))
+      (loop do (%push nil)
+	       (decf tem)
+	    until (zerop tem))
+      ;; Build the binding descriptors, pairs of (name . value-cell-location)
+      ;; Note that we count backwards in case there are nested locals with the same name
+      (loop do (setq tem (pop captive-map))
+	       (setq name (first tem))
+	       (setq pos (second tem))
+	       (when pos
+		 ;; Bind this captive variable lexically
+		 (%push name)
+		 (%push (%make-pointer-offset dtp-locative captive-block pos))
+		 (%p-store-cdr-code (compiler:%stack-location-internal 2) cdr-normal)
+		 (%p-store-contents-increment-pointer
+		   (%make-pointer dtp-list
+				  (compiler:%stack-location-internal #+3600 1 #+imach 2))
+		   bp)
+		 (decf n))
+	    until (zerop n))
+      ;; Hook onto the other bindings already pushed, if there were any
+      (unless (eq bp (%make-pointer-offset dtp-locative lp -1))
+	(%p-store-cdr-code bp cdr-normal)
+	(%p-store-contents-increment-pointer (si:env-variables env) bp)
+	(setf (si:env-variables env) lp)))
+    ;; Recurse to do the rest of the job
+    (if captive-map
+	(eval-in-function-lexical-environment-2 captive-map captive-block
+						frame function dbg-terminal-io
+						form env condition-wall)
+      (eval-in-error-lexical-environment frame function dbg-terminal-io form env
+					 condition-wall))))
+
+(defun eval-in-error-lexical-environment (frame function
+					  dbg-terminal-io form env condition-wall)
+  #+imach (ignore function)
+  (let ((*frame* frame)
+	(old-terminal-io terminal-io)
+	(old-standard-output standard-output)
+	(old-standard-input standard-input)
+	(evalhook nil)
+	(terminal-io dbg-terminal-io)
+	(standard-input syn-terminal-io)
+	(standard-output syn-terminal-io)
+	(query-io syn-terminal-io)
+	(error-output syn-terminal-io)
+	(debug-io syn-terminal-io)
+	(si:*remembered-binding-warnings* nil))
+    (let ((tem env)
+	  ;; Here we scan the local map, looking for (active) internal function
+	  ;; cells, and then modify the function part of the environment.
+	  (fletted-functions
+	    #+3600
+	    (loop with result = nil
+		  with pc = (frame-relative-exit-pc frame)
+		  for (number . stuff) in (cdr (assq :local-map (debugging-info function)))
+		  ;; STUFF is a list for locals, but not arguments
+		  when (listp stuff)
+		    do (let ((local-name (local-name function number pc)))
+			 ;; LOCAL-NAME will be NIL if this local is not active now
+			 (when local-name
+			   (multiple-value-bind (nil nil nil function-cell-p)
+			       (llc:decode-one-local-description (assq local-name stuff))
+			     (when function-cell-p
+			       ;; FUNCTION-CELL-P is the name of the local function
+			       (push `(,function-cell-p
+				       ,(frame-local-value frame number)) result)))))
+		  finally (return result))
+	    #+imach
+	    (let* ((pc (frame-relative-exit-pc frame))
+		   (local-names (ilc:cache-local-names-for-debugger frame pc)))
+	      (when local-names
+		(loop for name being the array-elements of local-names using (index index)
+		      when (and (cl:consp name)
+				(null (cdr name)))
+			collect (list (car name)
+				      (frame-local-value frame
+							 (- index (defstorage-size stack-frame)))))))))
+      (si:with-interpreter-environment
+	  (new-env env (pop tem) (append fletted-functions (pop tem))
+		       (pop tem) (pop tem) (pop tem))
+	;; This is a kludge so that the IE inherits the function's environment
+	(let ((si:*read-form-environment* new-env))
+	  ;;--- Really, the environment hacking functions should just not bind over
+	  ;;--- anything which was bound as a standard value
+	  (multiple-value-bind (vars vals)	;this is WITH-INTERACTIVE-VALUES-BOUND
+	      (si:get-interactive-bindings)	; without the warning messages
+	    (progv vars vals
+	      (let-if condition-wall
+		      ((*bound-handlers* nil)
+		       (*default-handlers* nil))
+		(with-debugger-handlers
+		  (eval form new-env))))))))))
+
+(defun locate-in-error-environment (loc)
+  loc)
+
+(defun throw-from-error-environment (tag values)
+  (let* (#+3600 (error-handler-base-frame
+		  (si:validate-frame *innermost-visible-frame* (sys:%stack-frame-pointer)))
+	 #+3600 (catch-block-list
+		  (loop for cb = %catch-block-list
+			       then (catch-block-previous cb)
+			until (null cb)
+			when (%pointer-lessp cb error-handler-base-frame)
+			  return cb)))
+    #+3600
+    (cl:loop
+       (sys:general-throw tag values catch-block-list)
+       (setf tag (cl:apply #'sys:throw-error tag values)))
+    #+imach
+    (cl:loop
+       (cl:apply #'sys:%throw tag values)
+       (setf tag (sys:throw-error tag values)))))
+
+
+(defprop error-reporter t si:debug-info)
+(defun error-reporter-frame-p (frame)
+  ;; An error here would probably cause an infinite recursion of errors, so just return NIL
+  ;; so we can get into the Debugger.  I realize this might paper over problems.
+  (ignore-errors
+    (let ((function (frame-function frame)))
+      (or (si:debugging-info-user-entry function 'error-reporter)
+	  (let ((fspec (function-name function)))
+	    (loop while (and (listp fspec)
+			     (eq (first fspec) ':internal)) doing
+	      (setq fspec (second fspec)))
+	    (or (si:debugging-info-user-entry fspec 'error-reporter)
+		(typecase fspec
+		  (:symbol (get fspec :error-reporter))
+		  (:list (and (validate-function-spec fspec)
+			      (or (si:function-spec-get fspec :error-reporter)
+				  #+imach (eq (third fspec) 'si:interpreter-function)
+				  (selectq (car fspec)
+				    (flavor:(method whopper ncwhopper combined shared-combined)
+				     ;; There must be a better way to do this
+				     (eq (flavor:method-generic fspec) 'signal-condition))
+				    (otherwise nil))))))))))))
+
+(defun innermost-interesting-frame (start-frame)
+  (ignore-errors
+    (loop for frame = start-frame then (frame-previous-active-frame frame)
+	  until (null frame)
+	  as name = (function-name (frame-function frame))
+	  do (unless (cl:typecase name
+		       (cons
+			 (and (memq (car name)
+				    'flavor:(method whopper ncwhopper combined shared-combined))
+			      (eq (flavor:method-generic name) 'signal-condition)))
+		       (symbol
+			 (eq name 'enter-debugger)))
+	       (return-from innermost-interesting-frame frame))))
+  start-frame)
+
+;; Decide whether an error break loop is useful for this error.
+;; It is unless the error was a simple error in the form immediately
+;; typed in to the debugger (not inside any functions).
+;;--- Should this be modularized in terms of messages to the condition?
+;;--- There are other errors that could be trivial, e.g. bad arg to EH-ARG.
+(defun error-is-trivial (frame condition)
+  (let ((prev (frame-previous-active-frame frame)))
+    (and prev
+	 (or (eq (frame-function prev) #'eval-in-error-lexical-environment)
+	     (eq (frame-function prev) #'eval-in-error-environment))
+	 (or (typep condition 'unbound-variable)
+	     (typep condition 'undefined-function)))))
+
+;; Decache locative frame pointers in case the stack group grew.
+;; This is necessary because various parts of the debugger use EQ on these locatives.
+(defun relocate-debugger-frame-pointers ()
+  (when (and (variable-boundp *stack-frame-array*)
+	     (variable-boundp *innermost-visible-frame*)
+	     (or (= (%p-data-type *innermost-visible-frame*) dtp-element-forward)
+		 (and ( (fill-pointer *stack-frame-array*) 0)
+		      (= (%p-data-type (aref *stack-frame-array* 0)) dtp-element-forward))))
+    (setf (fill-pointer *stack-frame-array*) 0)
+    #+imach (setq *frame-array-index-cached-frame* nil)
+    #+imach (setq *frame-array-index-cached-index* nil))
+  (loop for var in '(*innermost-visible-frame* *innermost-interesting-frame* *current-frame*)
+	when (and (boundp var)
+		  (not (null (symeval var))))
+	  do (set var (follow-cell-forwarding (symeval var) nil)))
+  (and (variable-boundp *error*)
+       (relocate-frame-pointers *error*)))
+
+
+;;; Complex stack-frame motion
+
+;; Scan several open frames up or down from a given one.
+;; We return two values; the first is the offset of the frame found,
+;; and the second is non-NIL if the specified number of frames were found
+;; before the top or bottom of the stack.
+(defun frame-next-nth-open-frame (frame &optional (count 1) skip-invisible)
+  (macrolet ((successor (successor-function frame)
+	       `(loop for f = (,successor-function ,frame)
+			    then (,successor-function f)
+		      until (or (not skip-invisible)
+				(not (frame-invisible-p f)))
+		      finally (return f))))
+    (cond ((= count 0) frame)
+	  ((minusp count)
+	   (loop repeat (1+ (- count))
+		 for pf = nil then fr
+		 for fr = frame then (successor frame-previous-open-frame fr)
+		 until (null fr)
+		 finally (return (values (or fr pf) fr))))
+	  (t
+	   (loop repeat (1+ count)
+		 for pf = nil then fr
+		 for fr = frame then (successor frame-next-open-frame fr)
+		 until (null fr)
+		 finally (return (values (or fr pf) fr)))))))
+
+;; Scan several active frames up or down from a given one.
+;; We return two values; the first is the offset of the frame found,
+;; and the second is non-NIL if the specified number of frames were found
+;; before the top or bottom of the stack.
+(defun frame-next-nth-active-frame (frame &optional (count 1) skip-invisible)
+  (macrolet ((successor (successor-function frame)
+	       `(loop for f = (,successor-function ,frame)
+			    then (,successor-function f)
+		      until (or (not skip-invisible)
+				(not (frame-invisible-p f)))
+		      finally (return f))))
+    (cond ((= count 0) frame)
+	  ((minusp count)
+	   (loop repeat (1+ (- count))
+		 for pf = nil then fr
+		 for fr = frame then (successor frame-previous-active-frame fr)
+		 until (null fr)
+		 finally (return (values (or fr pf) fr))))
+	  (t
+	   (loop repeat (1+ count)
+		 for pf = nil then fr
+		 for fr = frame then (successor frame-next-active-frame fr)
+		 until (null fr)
+		 finally (return (values (or fr pf) fr)))))))
+
+;; Given a frame, find out if it is one of the frames of a call to an interpreted function.
+;; If so, return the outermost frame of this call to the interpreted function.
+;; If not, return the original frame.
+(defun frame-out-to-interesting-frame (frame &optional skip-invisible #+imach active-only)
+  (cond ((null frame) nil)
+	((frame-interesting-p frame skip-invisible) frame)
+	(t
+	 (loop for new-frame = frame
+			     then #+3600 (frame-previous-active-frame new-frame)
+				  #+imach (if active-only
+					      (frame-previous-active-frame new-frame)
+					    (frame-previous-open-frame new-frame))
+	       doing
+	   (cond ((null new-frame)
+		  (return frame))
+		 ((not (frame-interesting-p new-frame skip-invisible)))	;Keep looping
+		 (t (return new-frame)))))))
+(deff frame-out-to-interesting-active-frame #'frame-out-to-interesting-frame)
+
+(defun frame-previous-interesting-frame (frame &optional skip-invisible
+							 #+imach active-only
+							 force-interesting)
+  (macrolet ((previous (frame)
+	       #+3600
+	       `(if (or force-interesting (frame-interesting-p ,frame))
+		    (frame-out-to-interesting-frame (frame-previous-active-frame ,frame))
+		  (frame-previous-active-frame ,frame))
+	       #+imach
+	       `(if (or force-interesting (frame-interesting-p ,frame))
+		    (frame-out-to-interesting-frame
+		      (if active-only
+			  (frame-previous-active-frame ,frame)
+			(frame-previous-open-frame ,frame))
+		      active-only)
+		  (if active-only
+		      (frame-previous-active-frame ,frame)
+		    (frame-previous-open-frame ,frame)))))
+    (loop for fr = (previous frame) then (previous fr)
+	  until (or (null fr)
+		    (not skip-invisible)
+		    (not (frame-invisible-p fr)))
+	  finally (return fr))))
+(deff frame-previous-interesting-active-frame #'frame-previous-interesting-frame)
+
+;; Return the next frame, counting all the actual frames of parts of an
+;; interpreted function as if they were one frame.
+(defun frame-next-interesting-frame (frame &optional skip-invisible #+imach active-only)
+  (macrolet ((next-internal (frame)
+	       #+3600 `(frame-next-active-frame ,frame)
+	       #+imach `(if active-only
+			    (frame-next-active-frame ,frame)
+			  (frame-next-open-frame ,frame)))
+	     (next (frame)
+	       `(if (atom (frame-function ,frame))
+		    (next-internal ,frame)
+		  (loop for new-frame = (next-internal ,frame)
+				      then (next-internal new-frame)
+			do (when (or (null new-frame)
+				     (frame-interesting-p new-frame))
+			     (return new-frame))
+			   (when (eq new-frame *innermost-interesting-frame*)
+			     (return (next-internal ,frame)))))))
+    (loop for fr = (next frame) then (next fr)
+	  until (or (null fr)
+		    (not skip-invisible)
+		    (not (frame-invisible-p fr)))
+	  finally (return fr))))
+(deff frame-next-interesting-active-frame #'frame-next-interesting-frame)
+
+;; Scan several active frames up or down from a given one,
+;; being smart about calls to interpreted functions.
+;; We return two values; the first is the offset of the frame found,
+;; and the second is non-NIL if the specified number of frames were found
+;; before the top or bottom of the stack.
+(defun frame-next-nth-interesting-frame (frame &optional (count 1) 
+							 skip-invisible #+imach active-only)
+  (cond ((= count 0) (values frame t))
+	((minusp count)
+	 (loop repeat (1+ (- count))
+	       for pf = nil then f
+	       for f = frame then (frame-previous-interesting-frame
+				    f skip-invisible #+imach active-only)
+	       until (null f)
+	       finally (return (values (or f pf) f))))
+	(t
+	 (loop repeat (1+ count)
+	       for pf = nil then f
+	       for f = frame then (frame-next-interesting-frame
+				    f skip-invisible #+imach active-only)
+	       until (null f)
+	       finally (return (values (or f pf) f))))))
+(deff frame-next-nth-interesting-active-frame #'frame-next-nth-interesting-frame)
+
+;; Given a frame, if it is the call to an interpreted function find
+;; the innermost frame of that function
+(defun frame-innermost-subframe (frame)
+  (if (atom (frame-function frame))
+      frame
+    (do ((frame (frame-next-active-frame frame) (frame-next-active-frame frame))
+	 (frame1 frame frame))
+	((or (null frame) (frame-interesting-p frame))
+	 frame1))))
+
+(defun bootstrap-*uninteresting-functions* ()
+  (let ((table (cl:make-hash-table :size (* 2 (length *uninteresting-functions*)))))
+    (loop for function in *uninteresting-functions*
+	  do (setf (cl:gethash function table) function)
+	  finally (setq *uninteresting-functions* table))))
+
+(add-initialization "Bootstrap *UNINTERESTING-FUNCTIONS*"
+   '(bootstrap-*uninteresting-functions*)
+   '(:once))
+
+;; True if frame is not just an internal frame of an interpreted function
+(defun frame-interesting-p (frame
+			    &optional (censor-invisible-frames *censor-invisible-frames*))
+  (if (variable-boundp *lisp-language-debugging-instance*)
+      (with-language-for-frame (frame language)
+	(lframe-interesting-p language frame censor-invisible-frames))
+    t))
+
+(defprop invisible-frame t si:debug-info)
+
+(defun frame-invisible-p (frame)
+  (if (variable-boundp *lisp-language-debugging-instance*)
+      (with-language-for-frame (frame language)
+	(lframe-invisible-p language frame))
+    nil))
+
+
+;; Return list of the function and args that were invoked (as best as it can).
+;; Note that this tries to get the original name of the function so that
+;; if it has been redefined and you are doing c-m-R the new version will be called.
+;; On the a machine doesn't work for functions which modify their arguments.
+(defun get-frame-function-and-args (frame)
+  (let* ((*printing-monitor-message* t)
+	 (function-name (function-name (frame-function frame)))
+	 (n-non-rest-args (frame-number-of-visible-args frame))
+	 (args (loop for i from 0 below n-non-rest-args
+		     collect (frame-arg-value frame i))))
+    #+3600 (multiple-value-bind (nil rest-arg-value nil lexpr-call)
+	       (decode-frame-rest-arg frame)
+	     ;; NCONC the rest arg if any was supplied separately from the regular args
+	     (and lexpr-call (setq args (nconc (nbutlast args) (copylist rest-arg-value)))))
+    (if (or (special-form-p function-name)
+	    (macro-function function-name))
+	;; The real form given to the special form or macro, second arg is ENV
+	(car args)
+      #+3600 (cons function-name args)
+      #+imach (cons function-name
+                    (nconc args (when (ldb-test %%cr.apply (frame-own-control-register frame))
+				  (frame-arg-value frame n-non-rest-args)))))))
+
+;;; Given a FRAME, return the function it corresponds to.
+(defun frame-real-function (frame)
+  (declare (values real-function first-interesting-local))
+  (let ((function (frame-function frame))
+	(object (frame-self-value frame t)))
+    (if (and (instancep object)
+	     (let* ((operation (frame-arg-value frame 2))
+		    (handler (unless (functionp operation)
+			       (get-handler-for object operation))))
+	       (if handler
+		   (eq function (if (symbolp handler) (fsymeval handler) handler))
+		   (or (eq function #'flavor::handle-real-unclaimed-message)
+		       (eq function #'flavor::handle-unclaimed-message)))))
+	(values object 2)
+	(values function 0))))
+
+;; T if things like ARGS-INFO will work for this function.
+(defun legitimate-function-p (function)
+  (or (typep function :compiled-function)
+      (si:interpreted-function-p function)))
+
+;; Given a locative to a local (or argument) slot in an active stack-frame,
+;; this returns the function and the name of the local in that function at
+;; the PC at which the function is currently.  If the locative in question
+;; doesn't point into the current control stack, you must pass a stack-group.
+;; If the locative is not in a control stack at all, then punt.
+;;--- If the locative points to a lexical or a captive variable, it would
+;;--- be nice if we could figure this out, but that's much harder.
+(defun function-and-local-name-from-locative (locative &optional sg)
+  (declare (values function local-name))
+  (let ((control-stack-low
+	  (if sg (sg-control-stack-low sg) %control-stack-low))
+	(control-stack-limit
+	  (if sg (sg-control-stack-limit sg) #+3600 %control-stack-limit
+					     #+imach (%read-internal-register
+						       %register-control-stack-limit)))
+	(stack-frame-pointer
+	  (if sg (sg-frame-pointer sg) (%stack-frame-pointer))))
+    (if (or (%pointer-lessp locative control-stack-low)
+	    (%pointer-lessp control-stack-limit locative))
+	(values nil nil)
+      ;;--- This loop is slow on the I-machine, use 1map-over-frames-in-stack
+0      (loop for frame = (frame-previous-frame stack-frame-pointer)
+		      then (frame-previous-frame frame)
+	    for next = stack-frame-pointer then (frame-previous-frame next)
+	    until (null frame)
+	    do (when (and (not (%pointer-lessp locative frame))
+			  (%pointer-lessp locative next))
+		 ;; We have found the frame which owns the locative in question,
+		 ;; so now find the PC we are at, and get the local name
+		 (let* ((function (frame-function frame))
+			(pc #+3600 (frame-relative-exit-pc frame next)
+			    ;; Do this the hard way so that this can be
+			    ;; called from outside of the Debugger.
+			    #+imach (let ((pc (block find-frame
+						(map-over-frames-in-stack
+						  (or sg %current-stack-group)
+						  #'(lambda (frame ignore pc)
+						      (when (%pointer-lessp frame locative)
+							(return-from find-frame pc)))
+						  t))))
+				      (+ (* (%pointer-difference pc function) 2)
+					 (if (type-member pc dtp-even-pc) 0 1))))
+			(local-number (- (%pointer-difference locative frame)
+					 #+3600 0 #+imach (defstorage-size stack-frame))))
+		   (return-from function-and-local-name-from-locative
+		     (values function
+			     #+3600 (llc:disassemble-local-name function local-number pc)
+			     #+imach (ilc:disassemble-local-name frame local-number pc nil)))))
+	    finally (return (values nil nil))))))
+
+(format:defformat format:vma (:one-arg) (vma parameters)
+  (ignore parameters)
+  (multiple-value-bind (object type slot)
+      (decode-locative-for-printing vma)
+    (format format:*format-output*
+	"location #o~\SI:ADDRESS\ ~:[(the ~*~(~A~) ~S)~;(the ~S slot of ~*~S)~]"
+      (%pointer vma) (not (null slot)) slot type object)))
+
+;; First try to get the compiler to decode a locative with respect to a function
+;; (also handles forwarded symbols), and, failing that, just return the structure
+;; header and the type of the structure.
+(defun decode-locative-for-printing (pointer &optional function)
+  (declare (values object type slot-name))
+  (let ((*printing-monitor-message* t))
+    (multiple-value-bind (object type)
+	(compiler:disassemble-decode-locative pointer function)
+      (when (eq type :random)
+	;; Try harder...
+	(setq object (%find-structure-header pointer))
+	(setq type (typep object)))
+      (let ((slot-name nil))
+	(cond ((instancep object)
+	       (let* ((flavor (%instance-flavor object))
+		      (ivs (flavor:flavor-all-instance-variables flavor))
+		      (slot-number (1- (%pointer-difference pointer object))))
+		 (when ( slot-number 0)
+		   (setq slot-name (nth slot-number ivs)))))
+	      ((named-structure-p object)
+	       (let* ((name (named-structure-symbol object))
+		      (defstruct-desc (get name 'si:defstruct-description))
+		      (defstruct-type (and defstruct-desc
+					   (si:defstruct-description-type defstruct-desc)))
+		      (slot-number (selectq defstruct-type
+				     (:named-array
+				       (- (%pointer-difference pointer object)
+					  (si:array-prefix-length object)
+					  (or (si:array-leader-length object) 0)))
+				     (:named-array-leader
+				       (- (%pointer-difference pointer object)
+					  (si:array-prefix-length object)))
+				     (otherwise nil))))
+		 (when (and slot-number ( slot-number 0))
+		   (setq slot-name
+			 (let* ((slot-alist (si:defstruct-description-slot-alist
+					      defstruct-desc))
+				;; Extra 1- because of the named-structure symbol
+				(slot-desc (scl:find (1- slot-number) slot-alist
+					     :key (lambda (x)
+						    (si:defstruct-slot-description-number
+						      (cdr x))))))
+			   (car slot-desc)))))))
+	(values object type slot-name)))))
+
+
+;;; Trap-on-call support
+;;; The actual trap-handlers are in SYS:DEBUGGER;FUNCTION-TRAP
+
+(defsubst sg-call-trace-handlers (stack-group)
+  (sg-foothold-data stack-group))
+
+(defflavor call-trace-handler () ()
+  (:required-methods :call-trace))
+
+(defmethod (:trap-on-call-for-frame-p call-trace-handler) (ignore) nil)
+
+(defun delete-call-trace-handler (handler)
+  (setf (sg-call-trace-handlers %current-stack-group)
+	(delq handler (sg-call-trace-handlers %current-stack-group))))
+
+(defflavor trap-on-call-handler (outermost-frame) (call-trace-handler)
+  :settable-instance-variables)
+
+(defmethod (:call-trace trap-on-call-handler) (frame)
+  (unless (%pointer-lessp outermost-frame (frame-previous-frame frame))
+    (delete-call-trace-handler self)
+    ;; METER-FUNCTION-ENTRY escape routine has already done a %METER-OFF
+    (signal 'breakon-trap :function (frame-function frame)
+			  :breakon-this-time-frame frame)))
+
+(defmethod (:trap-on-call-for-frame-p trap-on-call-handler) (frame)
+  (eq frame outermost-frame))
+
+(defun set-trap-on-call (frame trap-p)
+  (let ((handler (get-trap-on-call frame)))
+    (if trap-p
+	(unless handler
+	  (push (make-instance 'trap-on-call-handler :outermost-frame frame)
+		(sg-call-trace-handlers %current-stack-group))
+	  #+3600 (%meter-on)
+	  #+imach (let ((mark nil))
+		    ;; Mark all the frames in the stack after the one we
+		    ;; are interested in.  METER-FUNCTION-ENTRY is robust
+		    ;; to turn ignore all of the extra traps we will take.
+		    (map-over-frames-in-stack %current-stack-group
+		      #'(lambda (fp cr-loc ignore)
+			  (when (eq fp frame)
+			    (setq mark t))
+			  (when mark
+			    (si:%p-dpb 1 sys:%%cr.call-trace cr-loc)))
+		      :none)))
+      (when handler
+	(delete-call-trace-handler handler))))
+  trap-p)
+
+(defun get-trap-on-call (frame)
+  (loop for handler in (sg-call-trace-handlers %current-stack-group)
+	do (when (send handler :trap-on-call-for-frame-p frame)
+	     (return handler))))
+
+(defun relocate-call-trace-handlers ()
+  (loop for handler in (sg-call-trace-handlers %current-stack-group)
+	do (send handler :relocate-call-trace-handler)))
+
+(defmethod (:relocate-call-trace-handler call-trace-handler) ()
+  )
+
+(defmethod (:relocate-call-trace-handler trap-on-call-handler) ()
+  (setq outermost-frame (follow-cell-forwarding outermost-frame t)))
+
+
+;;; Stack overflow support
+
+#+3600
+(defvar-safeguarded pdl-grow-ratio 1.3)	;Amount to crank up the limit
+#+imach
+(defvar-wired pdl-grow-ratio 1.3)	;Amount to crank up the limit
+(defvar pdl-allocation-ratio 1.7)	;Amount to crank up the actual memory = (expt 1.3 2)
+
+(defvar-safeguarded stack-grower (make-stack-group "Stack grower"))
+
+#+3600
+(defun stack-grower ()
+  (without-interrupts
+    (loop do (stack-group-return nil)
+	  as sg = (sg-previous-stack-group %current-stack-group)
+	  as (stack amount) = (sg-arglist %current-stack-group)
+	  do ;; Flush pointer to stack about to be moved
+      (setf (sg-arglist %current-stack-group) nil)
+      (selectq stack
+	((:control) (sg-grow-pdls sg amount nil nil))
+	((:bind) (sg-grow-pdls sg nil amount nil))
+	((:data) (sg-grow-pdls sg nil nil amount))
+	(otherwise
+	 (ferror "Bad stack specification ~S passed to stack-grower" stack))))))
+
+#+imach
+;; This doesn't have to be safeguarded.  It is only called in it's own stack group,
+;; so even if it takes transport traps, we know the stack won't overflow.
+(defun stack-grower ()
+  (without-interrupts
+    (loop doing
+      (multiple-value-bind (stack amount) (stack-group-return nil)
+	(let ((sg (sg-previous-stack-group %current-stack-group)))
+	  (selectq stack
+	    ((:control) (sg-grow-pdls sg amount nil nil))
+	    ((:bind) (sg-grow-pdls sg nil amount nil))
+	    ((:data) (sg-grow-pdls sg nil nil amount))
+	    (otherwise
+	     (ferror "Bad stack specification ~S passed to stack-grower" stack))))))))
+
+(defun stack-grower-preset ()
+  (stack-group-preset stack-grower 'stack-grower)
+  (funcall stack-grower))
+
+;; Initialize on every boot in case crashed while in the stack-grower and warm-booted
+(add-initialization "Stack grower preset" '(stack-grower-preset) '(:warm))
+
+#+3600 (cl:proclaim '(cl:inline call-stack-grower))
+
+(defun call-stack-grower (which amount)
+  ;; Use STACK-GROUP-CALL rather than FUNCALL to avoid the extra consumption
+  ;; of stack space required for type-checking in CALL-FUNNY-FUNCTION.
+  (process:without-preemption
+    #+3600 (with-stack-list (args which amount)
+	     (si:stack-group-call stack-grower args))
+    #+imach (si:stack-group-call stack-grower which amount))
+  (when (eq which :control)
+    (without-interrupts
+      (relocate-exit-trap-frame-actions)
+      (relocate-call-trace-handlers)
+      (metering:relocate-metering-stack-pointers))
+    (signal 'control-stack-grown))
+  nil)
+
+;; Most of the time, this does not need to be inline
+#+3600 (cl:proclaim '(cl:notinline call-stack-grower))
+
+;; Called by microcode escape when binding stack is full or control stack
+;; is nearly full.  Escape to another stack group to do the work, with
+;; scheduling inhibited until it has been completed.  After we have usable 
+;; stacks, signal a condition, which normally will enter the debugger.
+;; This does not get called for data-stack overflows, SI:GROW-DATA-STACK 
+;; handles that.
+;; On the Imach, this function exists for the WITHOUT-INTERRUPTS-OR-STACK-OVERFLOWS
+;; macro; someday this could be changed to be less kludgy.
+(defun sys:stack-overflow (bind-p old-inhibit-scheduling-flag)
+  (declare (dbg:error-reporter)
+	   #+3600 (safeguarded-function disable-reference-validation))
+  #+3600 (declare (cl:inline call-stack-grower))
+  (call-stack-grower (if bind-p :bind :control) pdl-grow-ratio)
+  #+imach (storage::unwire-control-stack-pages stack-grower)
+  (setq inhibit-scheduling-flag old-inhibit-scheduling-flag)
+  #+3600 (%check-preempt-pending)
+  (let* ((sg %current-stack-group)
+	 (absolute-limit (if bind-p
+			     (sg-absolute-binding-stack-limit sg)
+			   (sg-absolute-control-stack-limit sg)))
+	 (new-size (if bind-p
+		       (%pointer-difference (sg-binding-stack-limit sg)
+					    (sg-binding-stack-low sg))
+		     (%pointer-difference (sg-control-stack-limit sg)
+					  (sg-control-stack-low sg)))))
+    (when (or (null absolute-limit)
+	      (> new-size absolute-limit))
+      ;; Don't enter the Debugger if we haven't exceeded the absolute limit
+      (signal 'pdl-overflow :pdl-name (if bind-p "binding" "control")))))
+
+;; The AMT arguments or NIL to leave that stack alone, a fixnum to make it
+;; at least that much bigger, or a flonum to increase its size by at least
+;; that ratio.
+;; On the Imach, this must be called in TRAP-MODE-EXTRA-STACK or with the
+;; scheduler locked.  The former is preferrable, but the latter works.
+(defun sg-grow-pdls (sg control-amt bind-amt data-amt)
+  (#+3600 without-interrupts #+imach progn
+    (si:with-metering-disabled
+      (when control-amt
+	(sg-grow-pdl sg (sg-control-stack-low sg) 'control control-amt
+		     (+ control-stack-overflow-margin control-stack-max-frame-size)
+		     %region-representation-type-list
+		     #+imach %region-space-control-stack))
+      (when bind-amt
+	(sg-grow-pdl sg (sg-binding-stack-low sg) 'bind bind-amt
+		     2
+		     %region-representation-type-list
+		     #+imach %region-space-binding-stack))
+      (when data-amt
+	(sg-grow-pdl sg (sg-data-stack-low sg) 'data data-amt
+		     2
+		     %region-representation-type-structure
+		     #+imach %region-space-stack)))))
+
+;; This has the same restriction.
+(defun sg-grow-pdl (sg low type amt extra rep-type #+imach space-type)
+  (unless (memq type '(control bind data))
+    (ferror "~S bad stack type symbol" type))
+  (macrolet ((relocate-pointer-at (read-loc &optional write-loc)
+	       (if (null write-loc)		;Write back to same address
+		   (once-only (read-loc)
+		     `(when (%pointer-type-p (%p-data-type ,read-loc))
+			(let ((off (%pointer-difference (%p-contents-as-locative ,read-loc)
+							ostack)))
+			  (when (and ( 0 off) (< off osize))
+			    (%p-store-tag-and-pointer
+			      ,read-loc
+			      (%p-ldb %%q-all-but-pointer ,read-loc)
+			      (%make-pointer-offset dtp-locative nstack off))))))
+		 (once-only (read-loc write-loc)
+		   `(if (%pointer-type-p (%p-data-type ,read-loc))
+			(let* ((p (%p-contents-as-locative ,read-loc))
+			       (off (%pointer-difference p ostack)))
+			  (when (and ( 0 off) (< off osize))
+			    (setq p (%make-pointer-offset dtp-locative nstack off)))
+			  (%p-store-tag-and-pointer
+			    ,write-loc
+			    (%p-ldb %%q-all-but-pointer ,read-loc)
+			    p))
+		      (%p-store-tag-and-pointer ,write-loc
+						(%p-ldb %%q-all-but-pointer ,read-loc)
+						(%p-ldb %%q-pointer ,read-loc)))))))
+    ;; Unwire controls stacks before forwarding them, since the stack-wiring
+    ;; substrate doesn't understand forwarded stacks, and since we don't
+    ;; want to keep the pages wired anymore anyway.
+    ;; We have to do this unconditionally, even when simply growing the stack in place,
+    ;; in order to force proper wiring when switching back to the grown stack group.
+    #+imach
+    (when (eq type 'control)
+      (storage::unwire-control-stack-pages sg))
+    ;; OSTACK is the base of the stack
+    ;; OSIZE is the number of words actually used (before the stack pointer)
+    ;; RSIZE is the number of words of address space available to expand into
+    (multiple-value-bind (ostack osize rsize sn)
+	(si:decode-stack-address low)
+      (let* (;; Current number of words before the stack limit
+	     (limit (%pointer-difference (selectq type
+					   (control (sg-control-stack-limit sg))
+					   (bind (sg-binding-stack-limit sg))
+					   (data (sg-data-stack-limit sg)))
+					 ostack))
+	     ;; New number of words before the stack limit
+             ;; Make this be an integral number of pages
+	     (nsize (logand (+ extra
+			       (if (floatp amt)
+				   ;; Grow it by a factor (and by at least one page).
+				   (max (+ limit page-size) (fix (* amt limit)))
+				   ;; Grow it by desired amount
+				   (+ amt limit))
+			       (1- page-size))
+			    (- page-size)))
+	     (nstack ostack)
+	     cons-work-done)
+	(unless ( nsize rsize)
+	  ;; Can't just crank up the limit, but maybe we can grow the stack in place
+	  (cond ((setq cons-work-done (si:grow-stack-if-possible sn nsize))
+		 ;; Grown in place.  Tell the garbage collector what just happened.
+		 ;; Unfortunately this has to be done with interrupts inhibited, just
+		 ;; because we are not in a position to uninhibit them and it is
+		 ;; inconvenient to pass CONS-WORK-DONE back through several levels
+		 ;; of caller to place that could uninhibit interrupts, especially
+		 ;; in the case where the cons work was done by SI:%MAKE-STACK.
+		 (si:note-cons-work-done cons-work-done))
+		(t
+		 ;; We can't just crank up the limit, make a new stack
+		 (setq nstack (si:%make-stack (%area-number ostack)
+					      (max nsize (fix (* rsize pdl-allocation-ratio)))
+					      sg rep-type #+imach space-type))
+		 ;; Copy the contents from old stack to new, relocating internal pointers and
+		 ;; being careful about invisible and null data types
+		 (loop as rp = ostack then (%pointer-plus rp 1)
+		       as wp = nstack then (%pointer-plus wp 1)
+		       repeat osize
+		       do (relocate-pointer-at rp wp))
+		 ;; Forward the old stack to the new
+		 (if (neq type 'data)
+		     ;; Control and binding stacks contain lists.  Use DTP-ELEMENT-FORWARD
+		     ;; so that CDR will follow the forwarding pointer to find the cdr-code.
+		     (%block-store-tag-and-pointer ostack osize dtp-element-forward nstack 1)
+		   ;; Data stack contains structures
+		   (loop as rp = ostack then (%pointer-plus rp 1)
+			 as wp = nstack then (%pointer-plus wp 1)
+			 repeat osize
+			 as dtp = (%p-data-type rp)
+			 do (%p-store-tag-and-pointer rp
+						      (if (or (= dtp dtp-header-i)
+							      (= dtp dtp-header-p)
+							      (= dtp dtp-header-forward))
+							  dtp-header-forward
+							dtp-element-forward)
+						      wp)))
+		 ;; Relocate pointers from the stack group itself
+		 (selectq type
+		   (control (relocate-pointer-at (locf (sg-control-stack-low sg)))
+			    (relocate-pointer-at (locf (sg-frame-pointer sg)))
+			    (relocate-pointer-at (locf (sg-stack-pointer sg)))
+			    (relocate-pointer-at (locf (sg-catch-block-list sg))))
+		   (bind (relocate-pointer-at (locf (sg-binding-stack-low sg)))
+			 (relocate-pointer-at (locf (sg-binding-stack-pointer sg))))
+		   (data (relocate-pointer-at (locf (sg-data-stack-low sg)))
+			 (relocate-pointer-at (locf (sg-data-stack-pointer sg)))))
+		 ;; Relocate any pointers from other stacks of this stack group.
+		 ;; Note that an "empty" stack contains one word.
+		 ;; The pointers to a stack's bounds are inclusive, to avoid illegal pointers.
+		 (unless (eq type 'control)
+		   (loop for sp first (sg-control-stack-low sg)
+				then (%pointer-plus sp 1)
+			 do (relocate-pointer-at sp)
+			 until (eq sp (sg-stack-pointer sg))))
+		 (unless (eq type 'bind)
+		   ;; Contrary to comment above, stack can be empty, sp=low-1
+		   (when (%pointer-lessp (sg-binding-stack-low sg)
+					 (sg-binding-stack-pointer sg))
+		     (loop for sp first (sg-binding-stack-low sg)
+				  then (%pointer-plus sp 1)
+			   do (relocate-pointer-at sp)
+			   until (eq sp (sg-binding-stack-pointer sg)))))
+		 (unless (eq type 'data)
+		   (when (sg-data-stack-low sg)	;Data stack can be nonexistent
+		     (loop for sp first (sg-data-stack-low sg)
+				  then (%pointer-plus sp 1)
+			   with limit = (si:sg-real-data-stack-pointer sg)
+			   do (relocate-pointer-at sp)
+			   until (eq sp limit))))
+		 ;; We are done with the old stack now
+		 ;; Cannot free the space by calling SI:PURGE-STACK-TABLE, because there are
+		 ;; still pointers into it in many cases, and certainly it cannot be proven
+		 ;; that there no pointers into it.
+		 ;;--- In a future release, perhaps some games can be played that involve
+		 ;;--- changing the quanta occupied by old stack into oldspace.
+		 ;; The value of SN may have changed, as allocating the new stack moved
+		 ;; entries around in the stack table, so recompute it.
+		 (setf (aref si:*stack-stack-group* (si:stack-table-extant-index ostack))
+		       nil))))
+	;; Adjust the limit upwards
+	(setq rsize (%pointer-plus nstack (- nsize extra)))
+	(selectq type
+	  (control (setf (sg-control-stack-limit sg) rsize))
+	  (bind (setf (sg-binding-stack-limit sg) rsize))
+	  (data (setf (sg-data-stack-limit sg) rsize)))))))
+
+(defun sg-ensure-control-stack-space (sg space)
+  (if (< (%pointer-difference (sg-control-stack-limit sg) (sg-stack-pointer sg))
+	 space)
+      (sg-grow-pdls sg space nil nil)))
+
+(defun sg-ensure-control-and-binding-stack-space (sg control-space binding-space)
+  (unless (< (%pointer-difference (sg-control-stack-limit sg) (sg-stack-pointer sg))
+	     control-space)
+    (setq control-space nil))
+  (unless (< (%pointer-difference (sg-binding-stack-limit sg) (sg-binding-stack-pointer sg))
+	     binding-space)
+    (setq binding-space nil))
+  (when (or control-space binding-space)
+    (sg-grow-pdls sg control-space binding-space nil)))
+

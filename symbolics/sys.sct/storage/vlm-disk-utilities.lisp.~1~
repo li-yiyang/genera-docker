@@ -1,0 +1,365 @@
+;;; -*- Mode:Lisp; Syntax:Common-Lisp; Package:STORAGE; Base:10; Lowercase:T; -*-
+
+;;; A set of utilities to allow block-level disk I/O to be performed on files in
+;;; our host's filesystem.  I/O can be accomplished either through SYS:DISK-READ
+;;; and SYS:DISK-WRITE or using a stream that implements the block I/O protocol
+;;; defined by the FEP-STREAM flavor on 3600 and Ivory systems.
+
+;;; Errors
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+(defflavor no-available-disk-units
+	()
+	(disk-error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (dbg:report no-available-disk-units) (stream)
+  (format stream "No available disk channels"))
+
+(defflavor attach-disk-channel-error
+	(filename
+	 error-code
+	 error-msg)
+	(disk-error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (dbg:report attach-disk-channel-error) (stream)
+  (format stream "Unable to attach a disk channel to ~A.~%Host error code ~D~@[: ~A~]"
+	  filename error-code error-msg))
+
+(defflavor grow-disk-partition-error
+	(new-length
+	 error-code
+	 error-msg)
+	(disk-error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (dbg:report grow-disk-partition-error) (stream)
+  (format stream "Unable to grow the disk partition attached to unit ~D to ~D bytes.~@
+		  Host error code ~D~@[: ~A~]"
+	  dbg:unit new-length error-code error-msg))
+
+(defflavor io-on-nonexistant-block
+	(operation 
+	 block
+	 n-blocks-requested
+	 n-blocks-available)
+	(disk-error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (dbg:report io-on-nonexistant-block) (stream)
+  (let ((operation-name (case operation
+			  (:block-in "read")
+			  (:block-out "write")
+			  (otherwise operation))))
+    (if (null n-blocks-available)
+	(format stream "Attempt to ~A block ~D on unit ~D which does not exist"
+		operation-name block dbg:unit)
+	(format stream "Attempt to ~A ~D block~:P starting with block ~D on unit ~D but ~
+		        only ~D block~:P ~:[are~;is~] available"
+		operation-name
+		n-blocks-requested
+		block
+		dbg:unit
+		n-blocks-available
+		(= n-blocks-available 1)))))
+
+(compile-flavor-methods no-available-disk-units attach-disk-channel-error
+			grow-disk-partition-error io-on-nonexistant-block)
+
+
+
+;;; Low-Level User Interface
+
+;;; Attaches the specified file in our host's fileystem to an embedded disk channel
+;;; (The disk channel is created dynamically by this function.)  The value returned
+;;; by this function is the disk unit number to be used when creating disk addresses
+;;; for subsequent calls to SYS:DISK-READ and SYS:DISK-WRITE.
+(defun attach-disk-channel (filename &key (if-does-not-exist :create)
+					  read-only-p
+					  minimum-length)
+  (declare (values unit-number))
+  (check-type filename (and pathname
+			    (satisfies (lambda (x)
+					 (neti:ns-eq (send x :host)
+						     (send (pathname "HOST:") :host)))))
+	      "the pathname of a file in the host's filesystem")
+  (check-type if-does-not-exist (member :create :error))
+  (check-type minimum-length (or null (integer si:disk-block-length-in-bytes (1_31)))
+	      "NIL or the minimum length, in bytes, of the partition")
+  (with-master-lock ()
+    (let ((unit (cl:position nil *unit-table*)))
+      (when (null unit)
+	(error 'no-available-disk-units))
+      (let* ((attach-request (make-array (defstorage-size coprocessor-attach-disk-channel)
+					 :initial-element 0))
+	     (request (locf (aref attach-request 0)))
+	     (handle (allocate-emb-buffer (defstorage-size emb-disk-channel)))
+	     (channel (emb-buf-pma handle))
+	     (queue-handle (allocate-emb-buffer (* 2 32)))
+	     (command-queue (emb-buf-pma queue-handle))
+	     (status-queue (%pointer-plus command-queue 32)))
+	(flet ((initialize-queue (queue)
+		 (setf (emb-queue-element-size queue) 4
+		       (emb-queue-queue-size queue) (- 32 (defstorage-size emb-queue))
+		       (emb-queue-put-index queue) 0
+		       (emb-queue-take-index queue) 0
+		       (emb-queue-signal queue) -1)
+		 (pma-to-emb-pointer queue)))
+	  (setf (emb-disk-type channel) %emb-channel-type-disk
+		(emb-disk-unit channel) unit
+		(emb-disk-next channel) -1
+		(emb-disk-number-of-pages channel) 0
+		(emb-disk-command-queue channel) (initialize-queue command-queue)
+		(emb-disk-status-queue channel) (initialize-queue status-queue)
+		(emb-disk-flags channel) 0
+		(emb-disk-read-only-p channel) (if read-only-p 1 0)
+		(emb-disk-host-state-0 channel) 0
+		(emb-disk-host-state-1 channel) 0))
+	(setf (coprocessor-attach-disk-channel-channel request) (pma-to-emb-pointer channel))
+	(setf (coprocessor-attach-disk-channel-filename request)
+	      (send filename :string-for-host))
+	(setf (coprocessor-attach-disk-channel-if-not-found-action request)
+	      (ecase if-does-not-exist
+		(:create %coprocessor-attach-disk-channel-if-not-found-create)
+		(:error %coprocessor-attach-disk-channel-if-not-found-error)))
+	(setf (coprocessor-attach-disk-channel-minimum-length request) (or minimum-length 0))
+	(%coprocessor-write request %coprocessor-register-attach-disk-channel)
+	(unless (zerop (coprocessor-attach-disk-channel-result request))
+	  (error 'attach-disk-channel-error
+		 :filename filename
+		 :error-code (coprocessor-attach-disk-channel-result request)
+		 :error-msg (copy-emb-string (coprocessor-attach-disk-channel-error-msg
+					       request))))
+	(initialize-embedded-disk unit channel)
+	(initialize-unit-list))
+      unit)))
+
+;;; Ensures that the file in our host's filesystem attached to the embedded disk channel
+;;; identified by UNIT-NUMBER holds at least NEW-LENGTH bytes.  This function will grow
+;;; the file if needed.
+(defun grow-disk-partition (unit-number new-length)
+  (check-type unit-number (integer 0 (32)))
+  (check-type new-length (integer si:disk-block-length-in-bytes (1_31))
+	      "the new length, in bytes, of the partition")
+  (let ((channel (aref *embedded-disk-channels* unit-number)))
+    (when (null channel)
+      (error 'disk-not-mounted-error :unit unit-number))
+    (let ((current-length (* (sys:emb-disk-number-of-pages channel)
+			     si:disk-block-length-in-bytes)))
+      (when (> new-length current-length)
+	(let* ((grow-request (make-array (defstorage-size coprocessor-grow-disk-partition)
+					 :initial-element 0))
+	       (request (locf (aref grow-request 0))))
+	  (setf (coprocessor-grow-disk-partition-channel request) (pma-to-emb-pointer channel)
+		(coprocessor-grow-disk-partition-new-length request) new-length)
+	  (%coprocessor-write request %coprocessor-register-grow-disk-partition)
+	  (unless (zerop (coprocessor-grow-disk-partition-result request))
+	    (error 'grow-disk-partition-error
+		   :unit unit-number
+		   :error-code (coprocessor-grow-disk-partition-result request)
+		   :error-msg (copy-emb-string (coprocessor-grow-disk-partition-error-msg
+						 request)))))))))
+
+;;; Detaches the embedded disk channel identified by UNIT-NUMBER from the file in our
+;;; host's filesystem.  The disk channel data structure is then destroyed.
+(defun detach-disk-channel (unit-number)
+  (check-type unit-number (integer 0 (32)))
+  (with-master-lock ()
+    (let ((channel (aref *embedded-disk-channels* unit-number)))
+      (when (null channel)
+	(return-from detach-disk-channel nil))
+      (let* ((q (emb-pointer-to-pma (emb-disk-status-queue channel)))
+	     (signal (emb-queue-signal q)))
+	(when (< -1 signal 32)
+	  (remove-wired-emb-signal-handler #'unit-wakeup nil signal)
+	  (setf (emb-queue-signal q) -1)))
+      ;; Life support will remove the channel from the chain of active channels.
+      (%coprocessor-write (pma-to-emb-pointer channel)
+			  %coprocessor-register-detach-disk-channel)
+      ;; Command and status queues are allocated in a single embedded buffer.
+      (deallocate-emb-buffer (emb-buf-handle
+			       (emb-pointer-to-pma (emb-disk-command-queue channel))))
+      (setf (emb-disk-type channel) -1)
+      (deallocate-emb-buffer (emb-buf-handle channel))
+      (setf (aref *unit-table* unit-number) nil
+	    (aref *embedded-disk-channels* unit-number) nil)
+      (initialize-unit-list)
+      t)))
+
+
+
+;;; Pseudo-Stream Interface
+
+;;; Attaches a file in our host's filesystem to an embedded disk channel and returns
+;;; a stream object which implements the block I/O interface as defined by the
+;;; FEP-STREAM flavor on 3600 and Ivory systems.
+(defun open-disk-stream (filename &key (if-exists :overwrite)
+				       (if-does-not-exist :error)
+				       (if-locked :share)
+				       (direction :block-input))
+  (check-type filename (and pathname
+			    (satisfies (lambda (x)
+					 (neti:ns-eq (send x :host)
+						     (send (pathname "HOST:") :host)))))
+	      "the pathname of a file in the host's filesystem")
+  (check-type if-exists (member :overwrite))
+  (check-type if-does-not-exist (member :create :error))
+  (check-type if-locked (member :share))
+  (check-type direction (member :block-input :block))
+  (multiple-value-bind (unit-number)
+      (attach-disk-channel filename :if-does-not-exist if-does-not-exist
+				    :read-only-p (eq direction :block-input))
+    (make-instance 'vlm-disk-stream
+		   :pathname filename
+		   :unit-number unit-number
+		   :channel (aref *embedded-disk-channels* unit-number))))
+
+(defflavor vlm-disk-stream
+	(pathname
+	 unit-number
+	 channel)
+	(si:stream)
+  :initable-instance-variables
+  (:gettable-instance-variables pathname))
+
+(defmethod (print-self vlm-disk-stream) (stream print-depth slashify-p)
+  (declare (ignore print-depth slashify-p))
+  (printing-random-object (self stream :typep)
+    (format stream "~A~@[ (read-only)~]" pathname (eq (send self :direction) :block-input))))
+
+(defmethod (:element-type vlm-disk-stream) ()
+  '(cl:unsigned-byte 8))
+
+(defmethod (:direction vlm-disk-stream) ()
+  (cond ((null channel) nil)
+	((zerop (emb-disk-read-only-p channel)) :block)
+	(t :block-input)))
+
+(defun-in-flavor (check-if-closed vlm-disk-stream) (operation)
+  (when (null channel)
+    (error 'stream-closed :attempt operation :stream self)))
+		 
+(defmethod (:fast-map-block-no vlm-disk-stream) (block-no)
+  (declare (values real-dpn n-blocks))
+  (check-if-closed :fast-map-block-no)
+  (when (< block-no (emb-disk-number-of-pages channel))
+    (values (sys:%logdpb unit-number %%dpn-unit block-no)
+	    (- (emb-disk-number-of-pages channel) block-no))))
+
+(defmethod (:allocate vlm-disk-stream) (n-blocks &key (map-area default-cons-area)
+						      (zero-p nil))
+  (declare (values data-map)
+	   (ignore zero-p))
+  (check-if-closed :allocate)
+  (when (< (emb-disk-number-of-pages channel) n-blocks)
+    (grow-disk-partition unit-number (* n-blocks si:disk-block-length-in-bytes)))
+  (multiple-value-bind (dpn n-blocks)
+      (send self :fast-map-block-no 0)
+    (make-array 2 :element-type 'fixnum :area map-area :initial-contents (list n-blocks dpn))))
+
+(defmethod (:block-length vlm-disk-stream) ()
+  (check-if-closed :block-length)
+  (emb-disk-number-of-pages channel))
+
+(defmethod (:block-in vlm-disk-stream) (block n-blocks disk-arrays
+					      &key (hang-p t)
+						   (disk-event nil disk-event-supplied-p)
+						   (block-offset 0))
+  (when (and (null hang-p) (not disk-event-supplied-p))
+    (error "A DISK-EVENT must be supplied and wired when HANG-P is NIL."))
+  (check-if-closed :block-in)
+  (multiple-value-bind (dpn n-blocks-available)
+      (send self :fast-map-block-no block)
+    (when (or (null dpn)
+	      (> n-blocks n-blocks-available))
+      (error 'io-on-nonexistant-block
+	     :unit unit-number
+	     :operation :block-in
+	     :block block
+	     :n-blocks-requested n-blocks
+	     :n-blocks-available n-blocks-available))
+    (disk-read disk-arrays disk-event dpn n-blocks hang-p block-offset)))
+
+(defmethod (:block-out vlm-disk-stream) (block n-blocks disk-arrays
+					       &key (hang-p t)
+						    (disk-event nil disk-event-supplied-p)
+						    (block-offset 0))
+  (when (and (null hang-p) (not disk-event-supplied-p))
+    (error "A DISK-EVENT must be supplied and wired when HANG-P is NIL."))
+  (check-if-closed :block-out)
+  (multiple-value-bind (dpn n-blocks-available)
+      (send self :fast-map-block-no block)
+    (when (or (null dpn)
+	      (> n-blocks n-blocks-available))
+      (error 'io-on-nonexistant-block
+	     :unit unit-number
+	     :operation :block-out
+	     :block block
+	     :n-blocks-requested n-blocks
+	     :n-blocks-available n-blocks-available))
+    (disk-write disk-arrays disk-event dpn n-blocks hang-p block-offset)))
+
+(defmethod (:close vlm-disk-stream) (&optional abort-p)
+  (declare (ignore abort-p))
+  (unless (null channel)
+    (prog1
+      (detach-disk-channel unit-number)
+      (setq channel nil))))
+
+(compile-flavor-methods vlm-disk-stream)

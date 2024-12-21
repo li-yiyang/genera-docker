@@ -1,0 +1,2660 @@
+;;; -*- Mode: LISP; Package: Common-lisp-internals; Syntax:Common-Lisp; Lowercase:T -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+(defmacro default-read-stream (variable)
+  `(cond ((null ,variable)
+	  (setq ,variable *standard-input*))
+	 ((eq ,variable t)
+	  (setq ,variable *terminal-io*))))
+
+(defmacro default-write-stream (variable)
+  `(cond ((null ,variable)
+	  (setq ,variable *standard-output*))
+	 ((eq ,variable t)
+	  (setq ,variable *terminal-io*))))
+
+;;; Chapter 21 spill-over
+
+(defun input-stream-p (stream)
+  (check-type stream stream)
+  (not (null (member :tyi (funcall stream :which-operations)))))
+
+(defun output-stream-p (stream)
+  (check-type stream stream)
+  (not (null (member :tyo (funcall stream :which-operations)))))
+
+;The type returned may be "larger" than what the stream really supports.
+(defun stream-element-type (stream)
+  (declare lt:(side-effects reader))
+  (check-type stream stream)
+  (cond ((send-if-handles stream :element-type))
+	((eq (send-if-handles stream :characters) t) 'character)
+	((eq (send-if-handles stream :characters) :without-fonts) 'character)
+	((send-if-handles stream :byte-size)
+	 `(unsigned-byte ,(send stream :byte-size)))))
+
+(defun close (stream &key abort)
+  (send stream :close abort))
+
+;;; Efficient string I/O streams
+
+;;; Environment structure for the pseudo lexical closures of string-input-stream
+(defstruct (string-input-environment (:conc-name "SIS-") (:type list) (:copier nil))
+  string
+  index
+  end
+  start)
+
+(defun make-string-input-stream (string &optional (start 0) end)
+  (make-lexical-closure (make-string-input-environment :string string :index start
+						       :start start
+						       :end (or end (string-length string)))
+			#'string-input-stream))
+
+(defmacro with-input-from-string ((stream string &key index (start 0) end)
+				  &body body
+				  &environment env)
+  (let ((environment (gensym))
+	(stream1 (gensym))
+	(length (gensym)))
+    (once-only (string start end &environment env)
+      `(let ((,length (string-length ,string)))
+	 (unless ( 0 ,start ,length)
+	   (error ":START (~S) is out of range for ~S" ,start ,string))
+	 (unless (or (null ,end) ( 0 ,end ,length))
+	   (error ":END (~S) is out of range for ~S" ,end ,string))
+	 (stack-let* ((,environment (make-string-input-environment
+				      :string ,string :index ,start
+				      :start ,start :end (or ,end ,length)))
+		      (,stream1 (make-lexical-closure ,environment #'string-input-stream)))
+	   (multiple-value-prog1
+	     (let ((,stream ,stream1))
+	       ,@body)
+	     ,(when index
+		`(setf ,index (sis-index ,environment)))))))))
+
+(defun string-input-stream (environment op &optional arg1 &rest args)
+  (when (eq op :send-if-handles)
+    (if (member arg1
+		'(:tyi :untyi :read-input-buffer :advance-input-buffer
+		       :length :element-type :read-location :set-location
+		       :read-pointer :set-pointer))
+	(setq op arg1 arg1 (car args) args (cdr args))
+	(return-from string-input-stream nil)))
+  (case op
+    ((:tyi :any-tyi :tyi-no-hang)
+      (if (< (sis-index environment) (sis-end environment))
+	  (prog1 (aref (sis-string environment) (sis-index environment))
+		 (incf (sis-index environment)))
+	  (when arg1
+	    (error 'end-of-file
+		   :stream (make-lexical-closure environment #'string-input-stream)
+		   :format-string arg1))))
+    (:untyi
+      (when arg1
+	(decf (sis-index environment))))
+    (:read-input-buffer
+      (if (< (sis-index environment) (sis-end environment))
+	  (values (sis-string environment) (sis-index environment) (sis-end environment))
+	  (when arg1
+	    (error 'end-of-file
+		   :stream (make-lexical-closure environment #'string-input-stream)
+		   :format-string arg1))))
+    (:advance-input-buffer
+      (setf (sis-index environment) (or arg1 (sis-end environment))))
+    (:interactive nil)
+    (:which-operations
+      '(:tyi :untyi :read-input-buffer :advance-input-buffer
+	:length :element-type :read-location :set-location
+	:read-pointer :set-pointer))
+    (:operation-handled-p
+      (not (null (member arg1
+			 '(:tyi :untyi :read-input-buffer :advance-input-buffer
+				:length :element-type :read-location :set-location
+				:read-pointer :set-pointer)))))
+    (:length (- (sis-end environment) (sis-start environment)))
+    (:element-type (array-element-type (sis-string environment)))
+    ((:read-location :read-pointer) (sis-index environment))
+    (:read-location-before (1- (sis-index environment)))
+    ((:set-location :set-pointer) (setf (sis-index environment) arg1))
+    (otherwise
+      (stack-let ((stream (make-lexical-closure environment #'string-input-stream)))
+	(sys:stream-default-handler stream op arg1 args)))))
+
+;;; Environment structure for the pseudo lexical closures of string-output-stream
+(defstruct (string-output-environment (:conc-name "SOS-") (:type list) (:copier nil))
+  string
+  index
+  end
+  (character-style nil))
+
+(defun make-string-output-stream ()
+  (make-lexical-closure (make-string-output-environment :string (make-string 100)
+							:index 0 :end 100)
+			#'string-output-stream))
+
+(defun get-output-stream-string (stream)
+  (funcall stream 'get-string))
+
+(defmacro with-output-to-string ((stream &optional string &key index)
+				 &body body
+				 &environment env)
+  (with-output-to-string-expander stream string body env :index index))
+
+(defun with-output-to-string-expander (stream string body env &key index element-type)
+  (let ((environment (gensym))
+	(stream1 (gensym)))
+    (cond ((null string)
+	   `(stack-let* ((,environment (make-string-output-environment
+					 :string (make-string 100
+						   ,@(when element-type
+						       `(:element-type ,element-type)))
+					 :index 0 :end 100))
+			 (,stream1 (make-lexical-closure ,environment #'string-output-stream))
+			 )
+	      (let ((,stream ,stream1))
+		,@body)
+	      (zl:adjust-array-size (sos-string ,environment) (sos-index ,environment))))
+	  ((null index)
+	   (once-only (string &environment env)
+	     `(stack-let* ((,environment (make-string-output-environment
+					   :string ,string :end (array-total-size ,string)))
+			   (,stream1 (make-lexical-closure ,environment #'string-output-stream
+							   )))
+		;; Make sure the string's fill-pointer stays up to date
+		(%p-store-cdr-type-and-pointer (locf (sos-index ,environment))
+					       cdr-next dtp-external-value-cell-pointer
+					       (locf (fill-pointer ,string)))
+		(let ((,stream ,stream1))
+		  ,@body))))
+	  (t
+	   (once-only (string &environment env)
+	     `(stack-let* ((,environment (make-string-output-environment
+					   :string ,string :index ,index
+					   :end (array-total-size ,string)))
+			   (,stream1 (make-lexical-closure ,environment #'string-output-stream
+							   )))
+		(multiple-value-prog1 (let ((,stream ,stream1))
+					,@body)
+				      (setf ,index (sos-index ,environment)))))))))
+
+(defun string-output-stream (environment op &optional arg1 &rest args)
+  (case op
+    (:tyo
+      (let ((index (sos-index environment)))
+	;; Make the string longer if necessary
+	(unless (< index (sos-end environment))
+	  (setf (sos-string environment)
+		(zl:adjust-array-size (sos-string environment)
+				      (setf (sos-end environment)
+					    (string-output-expansion-size
+					      (sos-string environment)
+					      (1+ index))))))
+	;; Merge the character with the stream's default-character-style
+	(when (sos-character-style environment)
+	  (setq arg1 (string-output-merge-character-style arg1 environment)))
+	;; Fatten the string if necessary
+	(when (and (char-fat-p arg1)
+		   (not (string-fat-p (sos-string environment))))
+	  (string-output-fatten environment))
+	;; Append the character to the string
+	(setf (aref (sos-string environment) index) arg1)
+	(setf (sos-index environment) (1+ index))
+	arg1))
+    ((:string-out :line-out)
+      (let* ((start (or (first args) 0))
+	     (arg1 (string arg1))
+	     (end (or (second args) (string-length arg1)))
+	     (index (sos-index environment))
+	     (newline-index (+ (- end start) index))
+	     (final-index (if (eq op :line-out) (1+ newline-index) newline-index))
+	     (style (sos-character-style environment)))
+	;; Make the string longer if necessary
+	(unless ( final-index (sos-end environment))
+	  (setf (sos-string environment)
+		(zl:adjust-array-size (sos-string environment)
+				      (setf (sos-end environment)
+					    (string-output-expansion-size
+					      (sos-string environment)
+					      final-index)))))
+	;; Fatten the string if necessary
+	(unless (string-fat-p (sos-string environment))
+	  (when (or style
+		    (and (string-fat-p arg1)
+			 (loop for i from start below end
+			       thereis (char-fat-p (aref arg1 i)))))
+	    (string-output-fatten environment)))
+	;; Append the argument to the string, altering character styles if required
+	(if style
+	    (string-output-string-with-style environment arg1 start end)
+	    (copy-array-portion arg1 start end (sos-string environment) index newline-index))
+	(when (eq op :line-out)
+	  (setf (aref (sos-string environment) newline-index) #\Newline))
+	(setf (sos-index environment) final-index)))
+    (:fresh-line
+      (let ((index (sos-index environment)))
+	(when (and (plusp index)
+		   (char-not-equal (aref (sos-string environment) (1- index)) #\Newline))
+	  (string-output-stream environment :tyo #\Newline)
+	  t)))
+    (:which-operations
+      '(:tyo :string-out :line-out :fresh-line :read-pointer :set-pointer
+	:read-cursorpos :set-cursorpos :increment-cursorpos :with-character-style
+	:element-type))
+    (:element-type 'character)
+    (:read-pointer
+      (sos-index environment))
+    (:set-pointer
+      (let ((index (sos-index environment)))
+	(if (< arg1 index)
+	    (setf (sos-index environment) (max arg1 0))
+	    (dotimes (ignore (- arg1 index))
+	      (string-output-stream environment :tyo #\Space)))))
+    ;; The Y coordinate is always zero.  Tabs have width 8.
+    (:read-cursorpos
+      (let ((string (sos-string environment))
+	    (end (sos-index environment)))
+	(declare (sys:array-register string))
+	(values (loop for index from (string-output-stream-last-newline string end) below end
+		      as char = (char-code (aref string index))
+		      unless ( #o300 char #o317)	; accent characters
+			sum 1 into x
+		      do (when (= char (char-code #\Tab))
+			   (setq x (* (ceiling x 8) 8)))
+		      finally (return x))
+		0)))
+    ;; The Y coordinate is ignored.  The X coordinate must be positive.
+    (:set-cursorpos
+      (let* ((string (sos-string environment))
+	     (end (sos-index environment)))
+	(declare (sys:array-register string))
+	(loop for index from (string-output-stream-last-newline string end) below end
+	      as last-x first 0 then x
+	      as char = (char-code (aref string index))
+	      unless ( #o300 char #o317)		; accent characters
+		sum 1 into x
+	      do (when (= char (char-code #\Tab))
+		   (setq x (* (ceiling x 8) 8)))
+		 (cond ((= x arg1)
+			(return (setf (sos-index environment) (1+ index))))
+		       ((> x arg1)
+			(setf (sos-index environment) index)
+			(setq x last-x)
+			(loop-finish)))
+	      finally
+		(dotimes (ignore (- arg1 x))
+		  (string-output-stream environment :tyo #\Space)))))
+    ;; The Y coordinate is ignored.
+    (:increment-cursorpos
+      (if (minusp arg1)
+	  (string-output-stream environment :set-cursorpos
+				(max (+ (string-output-stream environment :read-cursorpos)
+					arg1)
+				     0))
+	(dotimes (ignore arg1)
+	  (string-output-stream environment :tyo #\Space))))
+    (:with-character-style			;style continuation xstream
+      ;; Postpone generating a style index until output time
+      (letf (((sos-character-style environment)
+	      (si:merge-character-styles (si:parse-character-style arg1)
+					 (let ((style (sos-character-style environment)))
+					   (if (numberp style)
+					       (si:index-character-style style)
+					       style)))))
+	(funcall (first args) (second args))))
+    (get-string
+      (prog1 (subseq (sos-string environment) 0 (sos-index environment))
+	     (setf (sos-index environment) 0)))
+    (:inside-size array-total-size-limit)
+    (otherwise
+      (stack-let ((stream (make-lexical-closure environment #'string-output-stream)))
+	(sys:stream-default-handler stream op arg1 args)))))
+
+;;; Choose a reasonable new size for the string (same algorithm as zl:array-push-extend)
+(defun string-output-expansion-size (string minimum)
+  (when (array-displaced-p string)
+    (error "The string is a displaced or indirect array.  It cannot be extended."))
+  (let ((length (array-total-size string)))
+    (max (+ length
+	    (if (< (%structure-total-size (follow-structure-forwarding string)) sys:page-size)
+		(max length 100)		;Grow rapidly when less than a page
+		(floor length 4)))		;After that, grow in 25% increments
+	 minimum)))
+
+;;; Fatten the string, sort of like adjust-array-size at right angles
+(defun string-output-fatten (environment)
+  (let ((thin-string (sos-string environment)))
+    (when (array-displaced-p thin-string)
+      (error "The string is a displaced or indirect array.  It cannot be fattened."))
+    (let ((fat-string (make-array (sos-end environment)
+				  :element-type 'character
+				  :leader-length (array-leader-length thin-string))))
+      (copy-array-contents-and-leader thin-string fat-string)
+      (si:without-interrupts-and-stack-overflows (200.)
+	(setq thin-string (follow-structure-forwarding thin-string))
+	(structure-forward thin-string fat-string
+			   (si:array-prefix-length thin-string)
+			   (si:array-prefix-length fat-string))
+	(setf (sos-string environment) fat-string)))))
+
+;; Find index of last newline in string.
+;; For short strings, the cost of not using the microcode is small. For long strings,
+;; working backwards is an incredible win.
+(defun string-output-stream-last-newline (string end)
+  (1+ (or (string-search-char #\Newline string :end end :from-end t) -1)))
+
+(defun string-output-merge-character-style (char environment)
+  (let ((style (sos-character-style environment)))
+    (unless (numberp style)			;make style index when first needed
+      (setf (sos-character-style environment) (setq style (si:style-index style t))))
+    (cond ((char= char #\Return))
+	  ((char-fat-p char)
+	   ;; merge with existing style of char
+	   (setf (si:char-style-index char)
+		 (si:style-index
+		   (si:merge-character-styles (si:char-style char)
+					      (si:index-character-style style))
+		   t)))
+	  (t
+	   (setf (si:char-style-index char) style)))
+    char))
+
+(defun string-output-string-with-style (environment source start end)
+  (when (> end start)
+    (let ((source source)
+	  (target (sos-string environment))
+	  (style (sos-character-style environment)))
+      (declare (sys:array-register source target))
+      (unless (numberp style)			;make style index when first needed
+	(setf (sos-character-style environment) (setq style (si:style-index style t))))
+      (if (string-fat-p source)
+	  ;; source string is fat, merge against styles of chars
+	  (let ((default-style (si:index-character-style style)))
+	    (loop for i1 from start below end
+		  and i2 from (sos-index environment)
+		  as char = (aref source i1)
+		  as char-style = (si:char-style char)
+		  as new-style-index = (si:style-index
+					 (si:merge-character-styles char-style default-style)
+					 t)
+		  unless (char= char #\Return)
+		    do (setf (si:char-style-index char) new-style-index)
+		  do (setf (aref target i2) char)))
+	  ;; source string is thin
+	  (loop for i1 from start below end
+		and i2 from (sos-index environment)
+		as char = (aref source i1)
+		unless (char= char #\Return)
+		  do (setf (si:char-style-index char) style)
+		do (setf (aref target i2) char))))))
+
+;--- Support routines for older versions, saved temporarily to support
+;--- code compiled in systems older than 337.455.
+;--- This whole page can be deleted before Release 7.0.
+
+(defun input-from-string-stream (op thing stream &optional arg1 &rest args)
+  (case op
+    (:tyi
+      (if (< (sis-index thing) (sis-end thing))
+	  (prog1 (aref (sis-string thing) (sis-index thing))
+		 (incf (sis-index thing)))
+	  (when arg1
+	    (error 'end-of-file :stream stream :format-string arg1))))
+    (:untyi
+      (when arg1
+	(decf (sis-index thing))))
+    (:read-input-buffer
+      (if (< (sis-index thing) (sis-end thing))
+	  (values (sis-string thing) (sis-index thing) (sis-end thing))
+	  (when arg1 (error 'end-of-file :stream stream :format-string arg1))))
+    (:advance-input-buffer
+      (setf (sis-index thing) (or arg1 (sis-end thing))))
+    (:which-operations
+      '(:tyi :untyi :read-input-buffer :advance-input-buffer :length :element-type
+	     :read-location :set-location))
+    (:length
+      (- (sis-end thing) (sis-start thing)))
+    (:element-type (array-element-type (sis-string thing)))
+    (:read-location (sis-index thing))
+    (:set-location (setf (sis-index thing) arg1))
+    (otherwise (stream-default-handler stream op arg1 args))))
+
+(defun output-to-string-stream (op thing stream &optional arg1 &rest args)
+  (case op
+    (:tyo
+      (when (>= (sos-index thing) (sos-end thing))
+	(setf (sos-string thing)
+	      (zl:adjust-array-size
+		(sos-string thing)
+		(setf (sos-end thing) (+ (* 2 (sos-index thing)) 100)))))
+      (when (sos-character-style thing)
+	(setq arg1 (with-output-to-string-fat-tyo-aux arg1 thing)))
+      ;; fatten the string if necessary
+      (when (and (char-fat-p arg1)
+		 (not (string-fat-p (sos-string thing))))
+	(with-output-to-string-fatten thing nil))
+      (setf (aref (sos-string thing) (sos-index thing)) arg1)
+      (incf (sos-index thing))
+      arg1)
+    ((:string-out :line-out)
+     (let ((start (or (first args) 0))
+	   (end (or (second args) (length arg1)))
+	   (fatp (string-fat-p arg1))
+	   (style (sos-character-style thing)))
+       (let ((rest (+ (- end start) (sos-index thing))))
+	 (when (> rest (sos-end thing))
+	   (setf (sos-string thing)
+		 (zl:adjust-array-size (sos-string thing)
+				       (setf (sos-end thing) (+ (* 2 rest) 100)))))
+	 (when (and (or fatp style)
+		    (not (string-fat-p (sos-string thing))))
+	   (with-output-to-string-fatten thing nil))
+	 (if style
+	     (with-output-to-string-fat-string-out thing rest arg1 start end)
+	     (copy-array-portion arg1 start end (sos-string thing) (sos-index thing) rest))
+	 (setf (sos-index thing) rest)
+	 (when (eq op :line-out)
+	   (funcall stream :tyo #\newline)))))
+    (:set-pointer
+     (if (< arg1 (sos-index thing))
+	 (setf (sos-index thing) (max arg1 0))
+	 (dotimes (i (- arg1 (sos-index thing)))
+	   (declare (ignore i))
+	   (funcall stream :tyo #\space))))
+    (get-string
+      (prog1 (subseq (sos-string thing) 0 (sos-index thing))
+	     (setf (sos-index thing) 0)))
+    (otherwise
+      (apply #'output-to-string-default-stream op thing stream arg1 args))))
+
+(defun output-to-user-supplied-fill-pointer-string-stream
+       (op thing stream &optional arg1 &rest args)
+  (case op
+    (:tyo
+      (let ((fp (sos-index thing)))
+	(unless (< fp (sos-end thing))
+	  (setf (sos-string thing)
+		(zl:adjust-array-size (sos-string thing)
+				      (setf (sos-end thing) (+ (* 2 fp) 100)))))
+	(when (and (sos-character-style thing) (string-fat-p (sos-string thing)))
+	  (setq arg1 (with-output-to-string-fat-tyo-aux arg1 thing)))
+	;; fatten the string if necessary
+	(when (and (char-fat-p arg1)
+		   (not (string-fat-p (sos-string thing))))
+	  (with-output-to-string-fatten thing t))
+	(setf (aref (sos-string thing) fp) arg1)
+	(incf fp)
+	(setf (sos-index thing) fp)
+	(setf (fill-pointer (sos-string thing)) fp))
+      arg1)
+    ((:string-out :line-out)
+     (let ((start (or (first args) 0))
+	   (end (or (second args) (length arg1)))
+	   (fp (sos-index thing))
+	   (fatp (string-fat-p arg1))
+	   (style (sos-character-style thing)))
+       (let ((rest (+ (- end start) fp)))
+	 (unless ( rest (sos-end thing))
+	   (setf (sos-string thing)
+		 (zl:adjust-array-size (sos-string thing)
+				       (setf (sos-end thing) (+ (* 2 rest) 100)))))
+	 ;; fatten the string if necessary
+	 (when (and (or fatp style)
+		    (not (string-fat-p (sos-string thing))))
+	   (with-output-to-string-fatten thing t))
+	 (if style
+	     (with-output-to-string-fat-string-out thing rest arg1 start end)
+	     (copy-array-portion arg1 start end (sos-string thing) fp rest))
+	 (setf (sos-index thing) rest)
+	 (setf (fill-pointer (sos-string thing)) rest)))
+     (when (eq op :line-out)
+       (funcall stream :tyo #\Newline)))
+    (:set-pointer
+      (let ((fp (sos-index thing)))
+	(if (< arg1 fp)
+	    (setf (fill-pointer (sos-string thing)) (setf (sos-index thing) (max arg1 0)))
+	    (dotimes (i (- arg1 fp))
+	      (declare (ignore i))
+	      (funcall stream :tyo #\Space)))))
+    (otherwise
+      (apply #'output-to-string-default-stream op thing stream arg1 args))))
+
+(defun output-to-user-supplied-no-fill-pointer-string-stream
+       (op thing stream &optional arg1 &rest args)
+  (case op
+    (:tyo
+      (let ((fp (sos-index thing)))
+	(unless (< fp (sos-end thing))
+	  (setf (sos-string thing)
+		(zl:adjust-array-size (sos-string thing)
+				      (setf (sos-end thing) (+ (* 2 fp) 100)))))
+	(when (and (sos-character-style thing) (string-fat-p (sos-string thing)))
+	  (setq arg1 (with-output-to-string-fat-tyo-aux arg1 thing)))
+	;; fatten the string if necessary
+	(when (and (char-fat-p arg1)
+		   (not (string-fat-p (sos-string thing))))
+	  (with-output-to-string-fatten thing t))
+	(setf (aref (sos-string thing) fp) arg1)
+	(setf (sos-index thing) (1+ fp)))
+      arg1)
+    ((:string-out :line-out)
+     (let ((start (or (first args) 0))
+	   (end (or (second args) (length arg1)))
+	   (fp (sos-index thing))
+	   (fatp (string-fat-p arg1))
+	   (style (sos-character-style thing)))
+       (let ((rest (+ (- end start) fp)))
+	 (unless ( rest (sos-end thing))
+	   (setf (sos-string thing)
+		 (zl:adjust-array-size (sos-string thing)
+				       (setf (sos-end thing) (+ (* 2 rest) 100)))))
+	 ;; fatten the string if necessary
+	 (when (and (or fatp style)
+		    (not (string-fat-p (sos-string thing))))
+	   (with-output-to-string-fatten thing t))
+	 (if style
+	     (with-output-to-string-fat-string-out thing rest arg1 start end)
+	     (copy-array-portion arg1 start end (sos-string thing) (sos-index thing) rest))
+	 (setf (sos-index thing) rest)))
+     (when (eq op :line-out)
+       (funcall stream :tyo #\Newline)))
+    (:set-pointer
+      (let ((fp (sos-index thing)))
+	(if (< arg1 fp)
+	    (setf (sos-index thing) (max arg1 0))
+	    (dotimes (i (- arg1 fp))
+	      (declare (ignore i))
+	      (funcall stream :tyo #\Space)))))
+    (otherwise
+      (apply #'output-to-string-default-stream op thing stream arg1 args))))
+
+(defun output-to-string-default-stream (op thing stream &optional arg1 &rest args)
+  (case op
+    (:read-pointer
+     (sos-index thing))
+    (:fresh-line
+     (when (and (plusp (sos-index thing))
+		(char-not-equal (aref (sos-string thing) (1- (sos-index thing))) #\Newline))
+       (funcall stream :tyo #\newline)
+       t))
+    ;; The Y coordinate is always zero.  Tabs have width 1.
+    (:read-cursorpos
+     (values (- (sos-index thing)
+		(string-output-stream-last-newline (sos-string thing) (sos-index thing)))
+	     0))
+    ;; The Y coordinate is ignored.  The X coordinate must be positive.
+    (:set-cursorpos
+     (funcall stream :set-pointer (+ (string-output-stream-last-newline (sos-string thing)
+									(sos-index thing))
+				     (max arg1 0))))
+    ;; The Y coordinate is ignored.
+    (:increment-cursorpos
+     (let ((newline (string-output-stream-last-newline (sos-string thing) (sos-index thing))))
+       (funcall stream :set-pointer (+ newline
+				       (max (+ (- (sos-index thing) newline) arg1)
+					    0)))))
+    (:with-character-style			;style continuation xstream
+      ;; postpone generating a style index until output time
+      (letf (((sos-character-style thing)
+	      (si:merge-character-styles (si:parse-character-style arg1)
+			       (let ((style (sos-character-style thing)))
+				 (if (numberp style)
+				     (si:index-character-style style)
+				     style)))))
+	(funcall (first args) (second args))))
+    (:which-operations
+     '(:tyo
+       :string-out :line-out :fresh-line :read-pointer :set-pointer
+       :read-cursorpos :set-cursorpos :increment-cursorpos :finish :with-character-style))
+    (otherwise
+      (sys:stream-default-handler stream op arg1 args))))
+
+(defun with-output-to-string-fat-tyo-aux (char thing)
+  (let ((style (sos-character-style thing)))
+    (when style
+      (unless (numberp style)			; style index	
+	(setf (sos-character-style thing) (setq style (si:style-index style t)))))
+    ;; merge styles if a default style is in effect
+    (when style
+      (if (char-fat-p char)
+	  ;; merge with existing style of char
+	  (setf (si:char-style-index char)
+		(si:style-index
+		  (si:merge-character-styles (si:char-style char)
+					     (si:index-character-style style))
+		  t))
+	  (setf (si:char-style-index char) style))))    
+  char)
+
+(defun with-output-to-string-fat-string-out (thing tend source start end)
+  (let ((style (sos-character-style thing)))
+    ;; convert style to number
+    (when (and style (not (numberp style)) (> end start))
+      (setf (sos-character-style thing) (setq style (si:style-index style t))))
+    (cond ((null style)
+	   ;; no default style, just blast the chars
+	   (copy-array-portion source start end (sos-string thing) (sos-index thing) tend))
+	  ((string-fat-p source)
+	   ;; old string was fat, merge against styles of chars
+	   (let ((default-style (si:index-character-style style))
+		 (target (sos-string thing)))
+	     (loop for i1 from start below end
+		   and i2 from (sos-index thing) below tend
+		   for char = (aref source i1)
+		   for char-style = (si:char-style char)
+		   for new-style-index
+		       = (si:style-index
+			   (si:merge-character-styles char-style default-style) t)
+		   do (setf (si:char-style-index char) new-style-index)
+		      (setf (aref target i2) char))))
+	  (t
+	   (let ((target (sos-string thing)))
+	     (loop for i1 from start below end
+		   and i2 from (sos-index thing) below tend
+		   as char = (aref source i1)
+		   do (setf (si:char-style-index char) style)
+		      (setf (aref target i2) char)))))))
+
+;;; Fatten the string, sort of like adjust-array-size at right angles
+(defun with-output-to-string-fatten (thing forward)
+  (let* ((thin-string (sos-string thing))
+	 (fat-string (make-array (sos-end thing)
+				 :element-type 'character
+				 :leader-length (array-leader-length thin-string))))
+    (copy-array-contents-and-leader thin-string fat-string)
+    ;; D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")presentation-recording-strings0 may be made fat too.
+    (setf (array-named-structure-bit fat-string)
+	  (array-named-structure-bit thin-string))
+    (si:without-interrupts-and-stack-overflows (200.)
+      (when forward
+	(setq thin-string (follow-structure-forwarding thin-string))
+	(structure-forward thin-string fat-string
+			   (si:array-prefix-length thin-string)
+			   (si:array-prefix-length fat-string)))
+      (setf (sos-string thing) fat-string))))
+
+;; This is here for compatibility with [even] older versions of code.
+(defun output-to-user-supplied-string-stream (op thing stream &optional arg1 &rest args)
+  (case op
+    (:tyo
+      (let ((fp (fill-pointer (first thing))))
+	(unless (< fp (second thing))
+	  (setf (first thing)
+		(zl:adjust-array-size (first thing)
+				      (setf (second thing) (+ (* 2 fp) 100)))))
+	(setf (aref (first thing) fp) arg1)
+	(setf (fill-pointer (first thing)) (1+ fp)))
+      arg1)
+    ((:string-out :line-out)
+     (let ((start (or (first args) 0))
+	   (end (or (second args) (length arg1)))
+	   (fp (fill-pointer (first thing))))
+       (let ((rest (+ (- end start) fp)))
+	 (unless ( rest (second thing))
+	   (setf (first thing)
+		 (zl:adjust-array-size (first thing)
+				       (setf (second thing) (+ (* 2 rest) 100)))))
+	 (copy-array-portion arg1 start end (first thing) fp rest)
+	 (setf (fill-pointer (first thing)) rest)))
+     (when (eq op :line-out)
+       (funcall stream :tyo #\Newline)))
+    (:fresh-line
+      (let ((fp (fill-pointer (first thing))))
+	(when (and (plusp fp)
+		   (char-not-equal (aref (first thing) (1- fp)) #\Newline))
+	  (funcall stream :tyo #\Newline))
+	t))
+    (:read-pointer
+      (fill-pointer (first thing)))
+    (:set-pointer
+      (let ((fp (fill-pointer (first thing))))
+	(if (< arg1 fp)
+	    (setf (fill-pointer (first thing)) (max arg1 0))
+	    (dotimes (i (- arg1 fp))
+	      (declare (ignore i))
+	      (funcall stream :tyo #\Space)))))
+    ;; The Y coordinate is always zero.  Tabs have width 1.
+    (:read-cursorpos
+      (let ((fp (fill-pointer (first thing))))
+	(values (- fp (string-output-stream-last-newline (first thing) fp))
+		0)))
+    ;; The Y coordinate is ignored.  The X coordinate must be positive.
+    (:set-cursorpos
+      (funcall stream :set-pointer (+ (string-output-stream-last-newline
+					(first thing) (fill-pointer (first thing)))
+				      (max arg1 0))))
+    ;; The Y coordinate is ignored.
+    (:increment-cursorpos
+      (let* ((fp (fill-pointer (first thing)))
+	     (newline (string-output-stream-last-newline (first thing) fp)))
+	(funcall stream :set-pointer (+ newline
+					(max (+ (- fp newline) arg1)
+					     0)))))
+    (:element-type (array-element-type (first thing)))
+    (:which-operations
+      '(:tyo
+	 :string-out :line-out :fresh-line :read-pointer :set-pointer
+	 :read-cursorpos :set-cursorpos :increment-cursorpos :finish :element-type))
+    (otherwise
+      (sys:stream-default-handler stream op arg1 args))))
+
+(defun string-stream-p (stream)
+  (and (sys:lexical-closure-p stream)
+       (let ((fcn (sys:lexical-closure-function stream)))
+	 (or (eq fcn #'string-input-stream)
+	     (eq fcn #'string-output-stream)))))
+
+(deftype future-common-lisp:string-stream () `(satisfies string-stream-p))
+
+;;;
+;;;  Input functions (21.2.1, p. 243)
+;;;
+
+;A concatenation of kludges simulating the past...
+(defun read (&optional input-stream (eof-errorp t) eof-value recursive-p)
+  (default-read-stream input-stream)
+  (let ((function (if recursive-p 'si:read-recursive 'zl:read)))
+    (values
+      (if eof-errorp
+	  (si:read-internal-1 input-stream
+			      :function function)
+	  (si:read-internal-1 input-stream
+			      :function function
+			      :eof-option eof-value)))))
+
+(defun read-preserving-whitespace (&optional input-stream (eof-errorp t)
+					     eof-value recursive-p)
+  (default-read-stream input-stream)
+  (let ((si:read-preserve-delimiters t)
+	(function (if recursive-p 'si:read-recursive 'zl:read)))
+    (values
+      (if eof-errorp
+	  (si:read-internal-1 input-stream
+			      :function function)
+	  (si:read-internal-1 input-stream
+			      :function function
+			      :eof-option eof-value)))))
+
+(defun read-line (&optional input-stream (eof-errorp t) eof-value recursive-p)
+  (declare (values string eof delimiter delimiter-arg))
+  (default-read-stream input-stream)
+  (multiple-value-bind (string eof delimiter delimiter-arg)
+      ;; READ-DELIMITED-STRING-INTERNAL is called instead
+      ;; of READ-DELIMITED-STRING when invoking the input editor from this
+      ;; function so that the buffer won't be reconsed each time a rescan
+      ;; occurs.  The input editor must be invoked from this function, rather
+      ;; than inside READ-DELIMITED-STRING, so that echoing the newline works
+      ;; correctly.
+      (cond
+	;; If already inside the input editor, then return a string delimited by a newline.
+	(rubout-handler
+	 (si:read-delimited-string #\Return input-stream))
+	;; If the stream is interactive, then invoke the input editor.
+	;; Echo a newline after reading the string, but not if the input was preempted.
+	;; (:PREEMPTABLE or :FULL-RUBOUT)
+	((send input-stream :interactive)
+	 (let ((buffer nil))
+	   (unwind-protect
+	       (progn
+		 (setq buffer (zl:make-array 100. :type 'art-string))
+		 (multiple-value-prog1
+		   (si:with-clim-compatible-input-editing (input-stream)
+		     (with-input-editing-options ((:activation
+						    #'member '(#\End #\Return #\Line)))
+		       (multiple-value-prog1
+			 (si:read-delimited-string-internal nil input-stream nil buffer)
+			 (terpri input-stream)		;for correct interaction with
+			 )))				; preemptable reading.
+		   (setq buffer nil)))
+	     (if buffer (return-array buffer)))))
+	;; If the stream does line-reading and is not an interactive stream, let it do the work.
+	((operation-handled-p input-stream :line-in)
+	 (send input-stream :line-in t))
+	;; If we see an immediate EOF, return EOF to the caller.
+	;; Otherwise, take the characters up to EOF as a line, but return a second value of T.
+	(t 
+	 (let ((char (send input-stream :tyi)))
+	   (cond ((null char)
+		  (values nil 't nil nil))
+		 (t
+		  (send input-stream :untyi char)
+		  (si:read-delimited-string #\Return input-stream))))))
+    (cond ((and string (not (and eof (string-equal "" string))))
+	   (values string
+		   eof
+		   delimiter
+		   delimiter-arg))
+	  ((not eof-errorp) eof-value)
+	  (t (error 'end-of-file
+		    :stream input-stream
+		    :format-string
+		    (if recursive-p
+			"EOF detected by READ-LINE in the middle of an expression in ~S"
+			"READ-LINE encountered an EOF in ~S"))))))
+
+(defun read-line-trim (&optional input-stream (eof-errorp t) eof-value recursive-p)
+  (declare (values string eof delimiter delimiter-arg))
+  (default-read-stream input-stream)
+  (multiple-value-bind (string eof delimiter delimiter-arg)
+      (read-line input-stream nil nil)
+    (cond (string (values (if (stringp string) (si:string-trim-whitespace string) string)
+			  eof
+			  delimiter
+			  delimiter-arg))
+	  ((not eof-errorp) eof-value)
+	  (t (error 'end-of-file
+		    :stream input-stream
+		    :format-string
+		    (if recursive-p
+			"EOF detected by READ-LINE-TRIM in the middle of an expression in ~S"
+			"READ-LINE-TRIM encountered an EOF in ~S"))))))
+
+;;; It's not clear from the Laser edition whether this function is supposed to
+;;; echo, but Moon thinks it should and Fahlman says his group thinks it should.
+(defun read-char (&optional input-stream (eof-errorp t) eof-value recursive-p)
+  (default-read-stream input-stream)
+  (let ((char (send input-stream :tyi)))
+    (cond (char
+	   ;; If inside the input editor, or reading from a non-interactive
+	   ;; stream, don't echo.
+	   (unless (or rubout-handler
+		       (not (send input-stream :interactive)))
+	     ;; Echo all characters, even control and meta characters.
+	     (format input-stream "~C" char))
+	   char)
+	  ((not eof-errorp) eof-value)
+	  (t (error 'end-of-file
+		    :stream input-stream
+		    :format-string
+		    (if recursive-p
+			"EOF detected by READ-CHAR in the middle of an expression in ~S"
+			"READ-CHAR encountered an EOF in ~S"))))))
+
+(defun unread-char (character &optional input-stream)
+  (default-read-stream input-stream)
+  (send input-stream :untyi character)
+  nil)
+
+(defun peek-char (&optional peek-type input-stream (eof-errorp t) eof-value recursive-p)
+  (default-read-stream input-stream)
+  ;; If inside the input editor, or reading from a non-interactive
+  ;; stream, don't echo.
+  ;; Pass over characters until termination condition reached or EOF
+  (etypecase peek-type
+    (null
+      (let ((ch (send input-stream :tyi)))
+	(when ch
+	  (send input-stream :untyi ch)
+	  (return-from peek-char ch))))
+    ((member t)
+     (loop with (echoing echoing-valid)
+	   for ch = (send input-stream :tyi)
+	   until (null ch) do
+       (let ((code (char-code ch)))
+	 (if (if ( code si:rdtbl-array-size)
+		 ;; Break on non-standard, printing, characters
+		 (graphic-char-p ch)
+		 ;; Skip whitespace
+		 (not (si:white-space-char? (si:rdtbl-bits *readtable* code))))
+	     (progn
+	       (send input-stream :untyi ch)
+	       (return-from peek-char ch))
+	     (when (progn (unless echoing-valid
+			    (setq echoing-valid t)
+			    (setq echoing (and (not rubout-handler)
+					       (send input-stream :interactive))))
+			  echoing)
+	       (format input-stream "~C" ch))))))
+    (character
+      (loop with (echoing echoing-valid)
+	    for ch = (send input-stream :tyi)
+	    until (null ch) do
+	(if (char-equal ch peek-type)
+	    (progn
+	      (send input-stream :untyi ch)
+	      (return-from peek-char ch))
+	    (when (progn (unless echoing-valid
+			   (setq echoing-valid t)
+			   (setq echoing (and (not rubout-handler)
+					      (send input-stream :interactive))))
+			 echoing)
+	      (format input-stream "~C" ch))))))
+  ;; hit an EOF
+  (if (not eof-errorp)
+      eof-value
+      (error 'end-of-file
+	     :stream input-stream
+	     :format-string
+	     (if recursive-p
+		 "EOF detected by PEEK-CHAR in the middle of an expression in ~S"
+		 "PEEK-CHAR encountered an EOF in ~S"))))
+
+(defun listen (&optional input-stream)
+  (default-read-stream input-stream)
+  (send input-stream :listen))
+
+(defun read-char-no-hang (&optional input-stream (eof-errorp t) eof-value recursive-p)
+  recursive-p					;nonsense argument
+  (default-read-stream input-stream)
+  (let ((char (condition-case ()
+		   (send input-stream :tyi-no-hang)
+		 (end-of-file t))))
+    (cond ((null char) nil)
+	  ((not (eq char t)) char)
+	  ((not eof-errorp) eof-value)
+	  (t (error 'end-of-file
+		    :stream input-stream
+		    :format-string "READ-CHAR-NO-HANG encountered an EOF in ~S")))))
+
+(defun clear-input (&optional input-stream) 
+  (default-read-stream input-stream)
+  (send input-stream :clear-input)
+  nil)
+
+(defun read-from-string (string &optional (eof-errorp t) eof-value
+			 &key (start 0) end preserve-whitespace)
+  (declare (values form index))
+  (let ((index nil))
+    (values (with-input-from-string (stream string :start start :end (or end (length string))
+					    :index index)
+	      (let ((si:read-preserve-delimiters preserve-whitespace))
+		(read stream eof-errorp eof-value)))
+	    index)))
+
+(defun parse-integer (string &key (start 0) (end nil) (radix 10) (junk-allowed nil)
+		      (sign-allowed t))
+  (loop with sign = nil
+	with num = nil
+	with done = nil
+	with weight
+	for i from start below (or end (string-length string))
+	for ch = (aref string i)
+	do (cond ((and (null sign) (null num) sign-allowed
+		       (or (char-equal ch #\+) (char-equal ch #\-)))
+		  (if (char-equal ch #\-)
+		      (setq sign -1)
+		      (setq sign 1)))
+		 ((and (not done) (setq weight (digit-char-p ch radix)))
+		  (setq num (+ (* (or num 0) radix) weight)))
+		 ((whitespace-char-p ch)
+		  (cond ((and (null sign) (null num)))	;leading whitespace
+			(junk-allowed (loop-finish))	;trailing whitespace + junk
+			(t (setq done t))))	;skip trailing whitespace
+		 (junk-allowed
+		  (loop-finish))		 
+		 (t
+		  (error "Garbage character ~C seen while parsing integer in ~S" ch
+			 (substring string start end))))
+	finally (return (cond (num (values (* num (or sign 1)) i))
+			      (junk-allowed (values nil i))
+			      (t (error "No integer found in ~S"
+					(substring string start end)))))))
+
+(defun whitespace-char-p (char)
+  (let ((code (char-code char)))
+    (and (< code si:rdtbl-array-size)		;(si:char-standard char)
+	 (logtest 1 (si:rdtbl-bits *readtable* code)))))
+
+(defun read-byte (binary-input-stream &optional (eof-errorp t) eof-value)
+  (or (send binary-input-stream :tyi)
+      (if eof-errorp
+	  (si:read-eof binary-input-stream)
+	  eof-value)))
+
+;;; Printer
+
+;;; List of keyword variable-name presentation-type standard-io-value
+;;;
+(2 0 (NIL 0) (NIL :BOLD :LARGER) "BIGFNTB");;; *****(3 0 (NIL 0) (NIL NIL :LARGER) "BIGFNT") If you add more write keywords, you must recompile
+2;;; *****3 2si:print-object-presentation-type3, and redo the default
+2;;; *****3 cache initialization.
+0;;; Try not to gratuitously change the order of the print-flag definitions below.
+;;; See the comment on 1si:*initial-print-object-presentation-types*.
+0;;; --RWK
+
+(defvar *write-keywords* ()
+  "Alist of keyword to variable")
+(defvar *io-variables* ()
+  "Alist of variables, standard value, and CL default value")
+
+(defvar *standard-io-environment-variables* nil)
+(defvar *standard-io-environment-values* nil)
+
+(defstruct (write-keyword
+	     (:type list))
+  keyword
+  variable
+  presentation-type
+  standard-value)  
+
+(defstruct (io-variable
+	     (:type list))
+  variable
+  standard-value
+  cl-default-value)
+
+(eval-when (compile load eval)
+(defun add-write-keyword (keyword variable presentation-type standard-value)
+  (let ((elem (assoc keyword *write-keywords*)))
+    (if (null elem)
+	(setq elem (make-write-keyword :keyword keyword
+				       :variable variable
+				       :presentation-type presentation-type
+				       :standard-value standard-value)
+	      *write-keywords* (nconc *write-keywords* (ncons elem)))
+      (setf (write-keyword-variable elem) variable)
+      (setf (write-keyword-presentation-type elem) presentation-type)
+      (setf (write-keyword-standard-value elem) standard-value)))
+  (setq *write-keywords* (localize-tree *write-keywords* 2)))
+)
+
+(eval-when (compile load eval)
+(defun add-io-variable (variable standard-value cl-default-value)
+  (let ((elem (assoc variable *io-variables*)))
+    (if (null elem)
+	(setq elem (make-io-variable :variable variable
+				     :standard-value standard-value
+				     :cl-default-value cl-default-value)
+	      *io-variables* (nconc *io-variables* (ncons elem)))
+      (setf (io-variable-standard-value elem) standard-value)
+      (setf (io-variable-cl-default-value elem) cl-default-value)))
+  ;; Clear cache
+  (setq *standard-io-environment-variables* nil)
+  (setq *io-variables* (localize-tree *io-variables* 2)))
+)
+
+(defprop define-io-flag defvar zwei:definition-function-spec-type)
+(defmacro define-io-flag (variable-name default-value
+			  &key (validation-type t)
+			  validation-predicate
+			  type
+			  zetalisp-name
+			  (write-keyword nil)
+			  documentation
+			  (standard-io-value default-value)
+			  (cl-default-value default-value)
+			  )
+  (when (and (null validation-predicate)
+	     (neq validation-type 't))
+    (setq validation-predicate `(typep ,variable-name ',validation-type)))
+  (when (null type)
+    (labels ((type-into-presentation-type (type)
+	       (cond ((atom type)
+		      type)
+		     ((member (first type) '(member))
+		      (list type))
+		     ((member (first type) '(and or sequence))
+		      `((,(first type) . ,(mapcar #'type-into-presentation-type
+						  (rest type)))))
+		     (t
+		      (list (list type))))))
+      (setq type (type-into-presentation-type validation-type))))
+  (when (eq write-keyword t)
+    (setq write-keyword (let* ((string (symbol-name variable-name))
+			       (start 0)
+			       (end (length string)))
+			  (when (string-equal string "*" :start1 start :end1 1)
+			    (incf start))
+			  (when (string-equal string "PRINT-" :start1 start
+					      :end1 (+ start 6))
+			    (incf start 6))
+			  (when (string-equal string "*" :start1 (- end 1) :end1 end)
+			    (decf end))
+			  (intern (substring string start end) ""))))
+  `(progn
+     (zl:defvar-standard ,variable-name ,default-value ,default-value ,default-value
+			 ,validation-predicate ,documentation)
+     (add-io-variable ',variable-name ,standard-io-value ,cl-default-value)
+     ,(when zetalisp-name
+	`(make-cl-value-link ,variable-name ,zetalisp-name))
+     ,(when write-keyword
+	`(add-write-keyword ',write-keyword ',variable-name ',type ,standard-io-value))))
+
+(defprop define-print-flag defvar zwei:definition-function-spec-type)
+(defmacro define-print-flag (name default &rest args &key (write-keyword t) &allow-other-keys)
+  (si:with-rem-keywords (args args '(:write-keyword))
+    `(define-io-flag ,name ,default :write-keyword ,write-keyword ,@args)))
+
+
+2;;; *****3 If you add more write keywords, you must recompile
+2;;; *****3 2si:print-object-presentation-type3, and redo the default
+2;;; *****3 cache initialization.
+0;;; Try not to gratuitously change the order of the print-flag definitions below.
+;;; See the comment on 1si:*initial-print-object-presentation-types*.
+0;;; --RWK
+
+;;; Standard CL variables
+(define-print-flag *print-escape* t
+  :type boolean)
+
+(define-print-flag *print-pretty* t
+  :standard-io-value nil
+  :type ((dw:menu-choose :alist (("No" . nil)
+				 ("Code" . t)
+				 ("Data" . :data)
+				 ("Property list" . :plist)
+				 ("Association list" . :alist))))
+  :validation-type (or boolean (member :code :data :plist :alist) function))
+
+(define-print-flag *print-abbreviate-quote* nil
+  :validation-type boolean)
+
+(define-print-flag *print-radix* nil
+  :type boolean
+  :zetalisp-name si:prinradix)
+
+(define-print-flag *print-base* 10
+  :type ((integer 2 36))
+  :validation-type (integer 2 36)
+  :zetalisp-name zl:base)
+
+(define-print-flag *print-circle* nil
+  :type boolean)
+
+(define-print-flag *print-level* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum)
+  :zetalisp-name zl:prinlevel)
+
+(define-print-flag *print-length* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum)
+  :zetalisp-name zl:prinlength)
+
+(define-print-flag *print-case* :upcase
+  :validation-type (member :upcase :downcase :capitalize)
+  :zetalisp-name si:*princase*)
+
+(define-print-flag *print-gensym* t
+  :type boolean)
+
+(define-print-flag *print-array* nil
+  :type boolean
+  :zetalisp-name si:*prinarray*
+  :standard-io-value t)
+
+;;; SCL extensions
+(define-print-flag *print-readably* nil
+  :type boolean
+  :zetalisp-name si:print-readably
+  :standard-io-value t)
+
+(define-print-flag *print-integer-length* nil
+  :type ((null-or-type (integer 2 *)))
+  :validation-type (or null (integer 2 *)))
+
+(define-print-flag *print-array-length* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum))
+
+(define-print-flag *print-string-length* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum))
+
+(define-print-flag *print-bit-vector-length* nil
+  :type ((token-or-type (("Always" . t) ("Like Arrays" . nil)) fixnum))
+  :validation-type (or scl:boolean fixnum))
+
+(define-print-flag *print-exact-float-value* nil
+  :type boolean)
+
+(define-print-flag *print-structure-contents* t
+  :type boolean)
+
+(define-print-flag *print-pretty-printer* 'gprint:print-object
+  :write-keyword nil)
+
+(define-print-flag future-common-lisp:*print-lines* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum))
+
+(define-print-flag future-common-lisp:*print-miser-width* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum))
+
+(define-print-flag future-common-lisp:*print-pprint-dispatch* nil)
+
+(define-print-flag future-common-lisp:*print-right-margin* nil
+  :type ((null-or-type fixnum))
+  :validation-type (or null fixnum))
+
+2;;; *****3 If you add more write keywords, you must recompile
+2;;; *****3 2si:print-object-presentation-type3, and redo the default
+2;;; *****3 cache initialization.
+0;;; Try not to gratuitously change the order of the print-flag definitions below.
+;;; See the comment on 1si:*initial-print-object-presentation-types*.
+0;;; --RWK
+
+
+;; Don't bash this without bashing *STANDARD-IO-ENVIRONMENT-VARIABLES*, too
+(eval-when (compile load eval)
+(defvar *other-environment-vars-and-vals*
+	'(*read-base* 10
+	  *readtable* si:*initial-common-lisp-readtable*
+	  *package* si:pkg-user-package
+	  si:*suppress-read-eval* t
+	  si:*reader-intern* 'intern))
+);End eval-when
+
+(defun standard-io-environment-vars-and-vals ()
+  (unless *standard-io-environment-variables*
+    (macrolet ((other-environment-vars-and-vals (vars-and-vals)
+		 (loop for (var val) on (symbol-value vars-and-vals) by 'cddr
+		       collect `',var into vars
+		       collect val into vals
+		       finally (return `(setq vars (list* ,@vars vars)
+					      vals (list* ,@vals vals))))))
+      (multiple-value-bind (vars vals)
+	  (loop for iov in *io-variables*
+		collect (io-variable-variable iov) into vars
+		collect (io-variable-standard-value iov) into vals
+		finally (return (values vars vals)))
+	(other-environment-vars-and-vals *other-environment-vars-and-vals*)
+	(setq *standard-io-environment-values* vals
+	      *standard-io-environment-variables* vars))))
+  (values *standard-io-environment-variables* *standard-io-environment-values*))
+
+(defun with-standard-io-syntax-1 (continuation)
+  (declare (sys:downward-funarg continuation))
+  (with-standard-io-environment
+    (let ((si:*suppress-read-eval* nil)
+	  (future-common-lisp:*read-eval* t)
+	  (*package* *fcl-user-package*)
+	  (*readtable* si:*initial-ansi-common-lisp-readtable*))
+      (funcall continuation))))
+
+(defmacro process-write-args (args-var &optional stream-var)
+  `(let ((allow-other-keys nil)
+	 (already-seen (make-stack-array (length *write-keywords*) :fill-pointer 0)))
+     (loop
+       (when (endp ,args-var) (return))
+       (let ((key (pop ,args-var)))
+	 (when (endp ,args-var) (error "Odd number of arguments."))
+	 (let ((val (pop ,args-var)))
+	   (cond ((eq key :allow-other-keys)
+		  (setf allow-other-keys val))
+		 (,(and stream-var `(eq key :stream))
+		  ,(and stream-var `(setq ,stream-var val)))
+		 (t
+		  (let ((tem (assoc key *write-keywords*)))
+		    (cond (tem
+			   (unless (find key already-seen)
+			     (vector-push key already-seen)
+			     (%bind-location
+			       (locf (symbol-value (write-keyword-variable tem)))
+			       val)))
+			  ((not allow-other-keys)
+			   (error "Unknown keyword to WRITE: ~S" key)))))))))))
+
+;This doesn't use &KEY in order to avoid binding special variables for
+;keyword arguments not supplied.
+(defun write (object &rest keyword-args &key stream &allow-other-keys)
+  (declare (arglist object
+		    &key stream escape radix base circle pretty level length case gensym array
+		    ;; SCL args start here
+		    integer-length array-length string-length bit-vector-length
+		    abbreviate-quote readably structure-contents
+		    exact-float-value
+		    ))
+  (with-data-stack				;For 1process-write-args
+0    (%with-binding-stack-level
+      (let ((ignore-this nil))
+	(process-write-args keyword-args ignore-this)
+	ignore-this
+	(default-write-stream stream)
+	(si:write-internal object stream)
+	object))))
+
+;This doesn't use &KEY in order to avoid binding special variables for
+;keyword arguments not supplied.
+(defun write-to-string (object &rest keyword-args)
+  (declare (arglist object
+		    &key escape radix base circle pretty level length case gensym array
+		    ;; SCL args start here
+		    integer-length array-length string-length bit-vector-length
+		    abbreviate-quote readably structure-contents
+		    exact-float-value
+		    ))
+  (with-data-stack				;For 1process-write-args
+0    (%with-binding-stack-level
+      (process-write-args keyword-args)
+      (with-output-to-string (stream)
+	(si:write-internal object stream)))))
+
+(defun prin1-to-string (object)
+  (with-output-to-string (stream)
+    (prin1 object stream)))
+
+(defun princ-to-string (object)
+  (with-output-to-string (stream)
+    (princ object stream)))
+
+(defun write-char (character &optional output-stream)
+  (default-write-stream output-stream)
+  (send output-stream :tyo character)
+  character)
+
+;;; No optimization for now, due to character-object incompatibility
+(defun write-string (string &optional output-stream &key (start 0) end)
+  (default-write-stream output-stream)
+  (let ((str (cond ((arrayp string) string)
+		   (t (string string)))))
+    (send output-stream :string-out str start end))
+  string)
+
+(defun write-line (string &optional output-stream &key (start 0) end)
+  (default-write-stream output-stream)
+  (let ((str (cond ((arrayp string) string)
+		   (t (string string)))))
+    (send output-stream :line-out str start end)
+    string))
+
+(defun terpri (&optional output-stream)
+  (default-write-stream output-stream)
+  (send output-stream :tyo #\Newline)
+  nil)
+
+(defun fresh-line (&optional output-stream)
+  (default-write-stream output-stream)
+  (send output-stream :fresh-line)
+  ;;*****Return value is supposed to be predicate of whether we terpri'd or not.
+  ;;Should fix whole system.
+  )
+
+(defun finish-output (&optional output-stream)
+  (default-write-stream output-stream)		;defaulting this is pretty flaky
+  (send output-stream :finish)
+  nil)
+
+(defun force-output (&optional output-stream)
+  (default-write-stream output-stream)
+  (send output-stream :force-output)
+  nil)
+
+;;;Most Lispm I/O is synchronous, anyway.
+(defun clear-output (&optional output-stream)
+  (default-write-stream output-stream)
+  (send output-stream :send-if-handles :clear-output)	;good luck.
+  nil)
+
+(defun write-byte (integer binary-output-stream)
+  (send binary-output-stream :tyo integer)
+  integer)
+
+(defun format (destination control-string &rest args)
+  (si:check-string-arg control-string)
+  (let ((result (let ((format:*common-lisp-format* t))
+		  (apply #'format:format-internal destination control-string args))))
+    (and (null destination) result)))
+
+
+;;;Chapter 20.
+
+;;;This can never really work, as it violates the modularity of the messages.
+(defun make-two-way-stream (input-stream output-stream)
+  (let ((which-operations nil))
+    (labels ((stream (operation &rest args)
+	       (ccase operation
+		 ((:tyi :tyi-no-hang :any-tyi :clear-eof :string-in :string-line-in :line-in
+			:clear-input :listen :untyi :interactive :input-editor)
+		  (lexpr-send input-stream operation args))
+		 ((:tyo :eof :string-out :line-out :fresh-line :force-output :clear-output
+			:finish)
+		  (lexpr-send output-stream operation args))
+		 ((:close :send-if-handles)
+		  (lexpr-send input-stream operation args)
+		  (unless (eq input-stream output-stream)
+		    (lexpr-send output-stream operation args)))
+		 (:which-operations
+		   (which-operations))
+		 (:operation-handled-p
+		   (member (first args) (which-operations)))))
+	     (which-operations ()
+	       (or which-operations
+		   (setq which-operations
+			 (union '(:close :send-if-handles :which-operations
+					 :operation-handled-p)
+				(union
+				  (intersection
+				    '(:tyi :tyi-no-hang :any-tyi
+					   :clear-eof :string-in :string-line-in
+					   :line-in :clear-input :listen :untyi
+					   :interactive :input-editor)
+				    (send input-stream :which-operations))
+				  (intersection
+				    '(:tyo :eof :string-out :line-out :fresh-line :force-output
+					   :clear-output :finish)
+				    (send output-stream :which-operations))))))))
+      #'stream)))
+
+(defun two-way-stream-p (stream)
+  (and (sys:lexical-closure-p stream)
+       (eq (sys:lexical-closure-function stream)
+	   #'(:internal make-two-way-stream 0))))
+
+(deftype future-common-lisp:two-way-stream () `(satisfies two-way-stream-p))
+
+(defun future-common-lisp:two-way-stream-input-stream (stream)
+  (check-type stream future-common-lisp:two-way-stream)
+  (first (sys:lexical-closure-environment stream)))
+
+(defun future-common-lisp:two-way-stream-output-stream (stream)
+  (check-type stream future-common-lisp:two-way-stream)
+  (second (sys:lexical-closure-environment stream)))
+
+;;;
+
+(defparameter *make-broadcast-stream-specially-combined-operations*
+	      '((:or    :size-in-characters :char-width :read-cursorpos :cursor-x :cursor-y
+			:output-as-presentation :output-as-presentation-1 :gprint)
+		(:progn )))
+
+;;; Under control of the *MAKE-BROADCAST-STREAM-SPECIALLY-COMBINED-OPERATIONS* special
+;;; variable, MAKE-BROADCAST-STREAM makes a stream which forwards the messages it receives
+;;; to all of the streams given.
+;;;
+;;; *MAKE-BROADCAST-STREAM-SPECIALLY-COMBINED-OPERATIONS* is a list of the form:
+;;;      ((<combination-type> . <operations>)...)
+;;; For each sublist all the <operations> are combined according to <combination-type>.
+;;; There are 2 types of combination:
+;;;
+;;;   :OR     the first stream which handles the operation will get it. The value(s)
+;;;           returned will be whatever is returned by that stream. If no stream
+;;;           handles the operation nil will be returned.
+;;;   :PROGN  all the streams which handle the operation will get it. The value(s)
+;;;           returned will be the value returned by the last of those streams. If
+;;;           no stream handles the operation nil will be returned.
+;;;
+;;; Any operation which is handled by all the streams (in the intersection of all the
+;;; streams :which-operations) and which is not a specially combined operation is sent
+;;; to all of the streams. The value(s) returned will be whatever is returned by the
+;;; last stream.
+;;;
+;;; :SEND-IF-HANDLES message to a broadcast stream
+;;;   When a broadcast stream receives a :send-if-handles <operation> <arg1>...
+;;;   message it does on-the-fly :progn or :or combination as directed by
+;;;   *MAKE-BROADCAST-STREAM-SPECIALLY-COMBINED-OPERATIONS*, that is to
+;;;   say that all the streams that handle <operation> get it, and the value(s)
+;;;   returned will be whatever is returned by the last stream that handled the
+;;;   operation.
+
+(defun make-broadcast-stream (&rest streams)
+  (cond ((null streams)
+	 'null-stream)
+	(t
+	 (setf streams (copy-list streams))	;stack-consed
+	 (let* ((special-operations
+		  (loop for (type  . ops)
+			    in *make-broadcast-stream-specially-combined-operations*
+			append (loop for op in ops
+				     for strs = (case type
+						  (:or
+						    (loop for str in streams
+							  when (send str :operation-handled-p op)
+							    return (ncons str)))
+						  (:progn
+						    (loop for str in streams
+							  when (send str :operation-handled-p op)
+							    collect str)))
+				     when strs
+				       collect `(,op . ,strs))))
+		(which-operations
+;Don't call REDUCE, so thiswill work in the cold load, because QLD calls it.
+;		  (union (reduce #'intersection (loop for str in streams
+;						      collect (send str :which-operations))
+;				 :initial-value nil)
+;			 (mapcar #'first special-operations))
+		  (let ((intersection (send (first streams) :which-operations)))
+		    (dolist (str (rest streams))
+		      (let ((ops (send str :which-operations)))
+			(setq intersection (zl:rem-if-not (lambda (op) (member op ops))
+							  intersection))))
+		    (loop for (op) in special-operations do
+		      (unless (member op intersection)
+			(push op intersection)))
+		    intersection)
+		  ))
+	   #'(lambda (op &rest args &aux temp)
+	       (case op
+		 (:with-character-style
+		   (4 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; wait till you see this ...
+0		   (labels ((with-character-style-continuation (remaining-streams xs)
+			      (declare (sys:downward-function))
+			      (if remaining-streams
+				  (funcall (car remaining-streams)
+					   :with-character-style
+					   (first args)
+					   #'(lambda (xs)
+					       (with-character-style-continuation
+						 (cdr remaining-streams)
+						 xs))
+					   xs
+					   (third args))
+				  (funcall (second args) (third args)))))
+		     (with-character-style-continuation streams (second args))))
+		 (:which-operations which-operations)
+		 (:operation-handled-p (member (first args) which-operations))
+		 (:send-if-handles
+		   (loop with old-stream = nil
+			 for new-stream in (if (setq temp (assoc (first args)
+								 special-operations))
+					       (cdr temp)
+					       streams)
+			 do (when (member (first args) (send new-stream :which-operations))
+			      (when old-stream (apply old-stream args))
+			      (setq old-stream new-stream))
+			 finally (return (when old-stream (apply old-stream args)))))
+		 ((:output-as-presentation :output-as-presentation-1)
+		  (let ((stream (assoc op special-operations)))
+		    (cond (stream
+			   (apply (cadr stream) op args))
+			  ((eq op :output-as-presentation)
+			   (funcall (first args) (second args)))
+			  (t (apply (first args) (second args))))))
+		 (otherwise
+		   (do ((l (if (setq temp (assoc op special-operations))
+			       (cdr temp)
+			       streams)
+			   (cdr l)))
+		       ((null (cdr l))		;Last one gets to return multiple values
+			(apply (car l) op args))
+		     (apply (car l) op args)))))))))
+
+(defun broadcast-stream-p (stream)
+  (or (eq stream 'null-stream)
+      (and (sys:lexical-closure-p stream)
+	   (eq (sys:lexical-closure-function stream)
+	       #'(:internal make-broadcast-stream 0)))))
+
+(deftype future-common-lisp:broadcast-stream () `(satisfies broadcast-stream-p))
+
+(defun future-common-lisp:broadcast-stream-streams (stream)
+  (check-type stream future-common-lisp:broadcast-stream)
+  (if (eq stream 'null-stream)
+      nil
+      (first (sys:lexical-closure-environment stream))))
+
+;;;
+
+(defun make-concatenated-stream (&rest streams)
+  (let ((streams (copy-list streams))
+	(cur-stream nil))
+    (flet ((get-next-stream ()
+	     (setq cur-stream (pop streams))))
+      (make-concatenated-stream-from-generator #'get-next-stream :pass-close nil))))
+
+(defun make-concatenated-stream-from-generator (stream-generator &key (pass-close t))
+  (let ((cur-stream)
+	(pass-close pass-close))
+    (macrolet 
+      ((next-stream () `(and stream-generator
+			     (setq cur-stream (funcall stream-generator)))))
+      (labels 
+	((stream (op &rest stream-args)
+	   (loop named done
+		 do
+	     (if (null cur-stream)
+		 (return-from done
+		   (apply #'null-stream op stream-args))
+		 (block eof-next-stream
+		   (condition-case (error)
+			(return-from done
+			  (case op
+				((:close)	;don't pass on close unless requested.
+						;the generator dosen't get a chance to
+						;close the last one, so the keyword
+						;lets it ask us to do so.
+				 (when pass-close (close cur-stream))
+				 (return-from done t))
+				((:read-input-buffer)
+				 (let ((results (multiple-value-list
+						  (apply cur-stream op stream-args))))
+				   (if (car results)
+				       (values-list results)
+				       (return-from eof-next-stream))))
+				((:string-in)	;lie, and force signal
+				 (apply cur-stream op t (cdr stream-args)))
+				((:line-in)
+				 ;; this is pretty unusual ...
+				 (return-from done
+				   (multiple-value-bind (result eof-p)
+				       (apply cur-stream :line-in stream-args)
+				     (if (null eof-p)
+					 (values result nil)
+					 (next-stream)
+					 (if cur-stream
+					     (multiple-value-bind (more-result more-eof-p)
+						 (apply #'stream :line-in stream-args)
+					       (let ((final-result
+						       (make-array
+							 (+ (length result) (length more-result))
+							 :element-type (array-element-type
+									 more-result))))
+						 (copy-array-portion
+						   result 0 (length result)
+						   final-result 0 (length result))
+						 (copy-array-portion
+						   more-result 0 (length more-result)
+						   final-result (length result)
+						   (+ (length result)
+						      (length more-result)))
+						 (values final-result more-eof-p)))
+					     (values result eof-p))))))
+				((:string-line-in)
+				 (return-from done
+				   (multiple-value-bind (n-read eof-p overflow)
+				       ;; explicit forbid signalling. We will do that as needed.
+				       (apply cur-stream :string-line-in nil (cdr stream-args))
+				     (if (null eof-p)
+					 (values n-read eof-p overflow)
+					 ;; N.B.: overflow T ==> eof-p nil
+					 (next-stream)
+					 (if cur-stream
+					     (funcall #'stream :string-line-in
+						      (first stream-args)	;signal, eventually
+						      (second stream-args)	; same string
+						      ;; note, contrary to doc,
+						      ;; n-read is total in buffer, not the
+						      ;; number just read
+						      n-read	;advance buf
+						      (fourth stream-args))	; end remains
+					     ;; no more input to read
+					     (if (first stream-args)	;eof signal?
+						 (return-from eof-next-stream)	;let the null stream
+						 (values n-read t nil)))))))
+				(otherwise
+				  (apply cur-stream op stream-args))))
+		      (sys:end-of-file (return-from eof-next-stream))))	
+		 (next-stream)))))
+	(next-stream)
+	#'stream))))
+
+(defun concatenated-stream-p (stream)
+  (and (sys:lexical-closure-p stream)
+       (eq (sys:lexical-closure-function stream)
+	   #'(:internal make-concatenated-stream-from-generator 0))))
+
+(deftype future-common-lisp:concatenated-stream () `(satisfies concatenated-stream-p))
+
+(defun future-common-lisp:concatenated-stream-streams (stream)
+  (check-type stream future-common-lisp:concatenated-stream)
+  (let ((env (sys:lexical-closure-environment
+	       (first (sys:lexical-closure-environment stream)))))
+    (list* (second env) (third env))))
+
+#| Test function for the above.
+(defun test (s1 s2 s3)
+  (with-input-from-string (ss1 s1)
+    (with-input-from-string (ss2 s2)
+      (with-input-from-string (ss3 s3)
+	(with-open-stream (s (make-concatenated-stream ss1 ss2 ss3))
+	  (let ((string (make-string 20)))
+	    (multiple-value-bind (n e o) (funcall s :string-line-in t string)
+	      (format t "~&~S ~S ~S ~S~%" string n e o))))))))
+ |#
+
+;;;
+
+(defun null-streamp (stream)
+  (and (not (instancep stream))
+       (or (eql (fdefinition'si:null-stream) stream)
+	   (eql 'si:null-stream stream))))
+
+(defprop null-stream t si:io-stream-p)
+
+(defun null-stream (op &rest args)
+  (case op
+    ;; These operations signal EOF.
+    ((:tyi :tyi-no-hang :tyipeek :get-input-buffer :read-input-buffer)
+     (when (first args)
+       (error 'end-of-file :format-string (first args) :stream 'null-stream)))
+    ;; Signals EOF differently.
+    (:string-in
+     (if (first args)
+	 (error 'end-of-file :format-string (first args) :stream 'null-stream)
+	 (values (third args) t)))
+    ;; similiar, but not identical.
+    (:string-line-in
+      (if (first args)
+	 (error 'end-of-file :format-string (first args) :stream 'null-stream)
+	 (values 0 t)))
+    ;; Signals EOF still differently.
+    (:line-in
+      (if (and (numberp (first args))
+	       (plusp (first args)))
+	  (let ((tem (zl:make-array 0 :type 'art-string
+				    :leader-length (first args))))
+	    (setf (fill-pointer tem) 0)
+	    (values tem t))
+	  (let ((tem (zl:make-array 0 :type 'art-string)))
+	    (values tem t))))
+    ;; These operations should all return their argument.
+    ((:tyo :string-out :line-out :untyi)
+     (first args))
+    ;; These operations should always return T.
+    ((:characters :beep) t)
+    ;; Supports nothing in both directions.
+    (:direction :bidirectional)
+    ;; Takes these, too.
+    (:eof nil)
+    ;; Takes anything, ignores it.
+    (:element-type t)
+    (:which-operations
+      '(:tyi :tyi-no-hang :tyipeek :get-input-buffer :read-input-buffer
+	     :string-in :line-in
+	     :tyo :string-out :line-out :untyi :characters :beep :direction :eof
+	     :element-type :which-operations))
+    ;; Handle obscure operations.
+    (otherwise
+      (sys:stream-default-handler 'null-stream op (first args) (rest args)))))
+
+;;;
+
+(defun make-echo-stream (input-stream output-stream)
+  (let ((input-editing nil)
+	(untyi-buffer nil))
+    (labels ((handler (op &optional (arg1 nil arg1-p) &rest args)
+	       (flet ((pass-through ()
+			(if arg1-p
+			    (apply input-stream op arg1 args)
+			    (funcall input-stream op))))
+		 (if input-editing
+		     (pass-through)
+		     (case op
+		       (:which-operations
+			 '(:tyi :untyi :tyipeek))
+		       (:tyi
+			 (if untyi-buffer
+			     (pop untyi-buffer)
+			     (let ((char (pass-through)))
+			       (if (characterp char) (send output-stream :tyo char))
+			       char)))
+		       (:untyi
+			 (push arg1 untyi-buffer))
+		       (:tyipeek
+			 (if untyi-buffer
+			     (car untyi-buffer)
+			     (pass-through)))
+		       ((:input-editor)
+			(let ((old-input-editing input-editing))
+			  (unwind-protect
+			      (progn
+				(setq input-editing t)
+				(multiple-value-prog1
+				  (pass-through)
+				  (write-string (send input-stream :last-input)
+						output-stream)))
+			    (setq input-editing old-input-editing))))
+		       ((:interactive :close)
+			(pass-through))
+		       (otherwise
+			 (sys:stream-default-handler #'handler op arg1 args)))))))
+      #'handler)))
+
+(defun echo-stream-p (stream)
+  (and (sys:lexical-closure-p stream)
+       (eq (sys:lexical-closure-function stream)
+	   #'(:internal make-echo-stream 0))))
+
+(deftype future-common-lisp:echo-stream () `(satisfies echo-stream-p))
+
+(defun future-common-lisp:echo-stream-input-stream (stream)
+  (check-type stream future-common-lisp:echo-stream)
+  (first (sys:lexical-closure-environment stream)))
+
+(defun future-common-lisp:echo-stream-output-stream (stream)
+  (check-type stream future-common-lisp:echo-stream)
+  (second (sys:lexical-closure-environment stream)))
+
+;;;
+
+(defun flatsize (x)
+  (flat-operation #'prin1 x))
+
+(defun flatc (x)
+  (flat-operation #'princ x))
+
+(defun flat-operation (fcn x)
+  (declare (sys:downward-funarg fcn))
+  (let ((ioch 0))
+    (labels ((flat-stream (op &rest args)
+	       (declare (sys:downward-function))
+	       (case op
+		 (:tyo (incf ioch))
+		 (:string-out (destructuring-bind (string &optional from to) args
+				(incf ioch (- (or to (string-length string))
+					      (or from 0)))))
+		 (:string-length (destructuring-bind (string
+						      &optional (from 0)
+								(to (string-length string)))
+						     args
+				   (- to from)))
+		 (:which-operations '(:tyo :string-out))
+		 (otherwise
+		   (sys:stream-default-handler #'flat-stream op (first args) (rest args))))))
+      (funcall fcn x #'flat-stream))
+    ioch))
+
+
+;;; Chapter 23 -- Pathnames
+
+(defvar *default-pathname-defaults*)
+
+;The optional defaults argument is not standard Common Lisp, but you cannot
+;sensibly parse a string without a default to supply the host.
+(defun pathname (x &optional (defaults *default-pathname-defaults*))
+  (declare (inline pathnamep))
+  (ctypecase x
+    (pathname x)
+    ((or string symbol)
+     (values (fs:parse-pathname x nil defaults)))
+    (stream
+     (funcall x :pathname))
+    ;; Not all streams are STREAMP, so specially check for them
+    ((and instance (satisfies (lambda (x) (operation-handled-p x :pathname))))
+     (send x :pathname))))
+
+(defun truename (x)
+  (ctypecase x
+    ((or pathname string symbol)
+     (send (open (pathname x) :direction :probe :if-does-not-exist :error) :truename))
+    (stream
+     (funcall x :truename))
+    ;; Not all streams are STREAMP, so specially check for them
+    ((and instance (satisfies (lambda (x) (operation-handled-p x :truename))))
+     (send x :truename))))
+
+(defun parse-namestring (thing &optional host (defaults *default-pathname-defaults*)
+			 &key (start 0) end junk-allowed)
+  (declare (inline pathnamep))
+  (ctypecase host
+    (null)
+    ((or string symbol)
+     (setq host (fs:get-pathname-host host)))
+    ((instance net:host)))  
+  (when (symbolp thing) (setf thing (string thing)))
+  (ctypecase thing
+    (string
+      (unless end
+	(setq end (length thing)))
+      (unless (and (zerop start) (= end (length thing)))
+	(setq thing (substring thing start end)))
+      (when junk-allowed
+	(cerror "Proceed assuming no junk is present"
+		"Sorry, :junk-allowed argument to parse-namestring is not implemented"))
+      (values (fs:parse-pathname thing host (parse-defaults defaults t)) end))
+    (pathname (values thing start))
+    (stream (values (funcall thing :pathname) start))))
+
+;Returns either a pathname or a ZL defaults-alist (if second arg of t)
+(defun parse-defaults (defaults &optional allow-alist)
+  (if (listp defaults)
+      (if allow-alist
+	  defaults
+	  (fs:default-pathname defaults))
+      (pathname defaults)))
+
+;; Same as ZL version except that a stream is acceptable as the pathname argument
+(defun merge-pathnames (pathname &optional (defaults *default-pathname-defaults*)
+			(default-version :newest))
+  (setq defaults (parse-defaults defaults t))
+  (fs:merge-pathnames (parse-namestring pathname nil defaults) defaults default-version))
+
+(defun make-pathname (&rest keywords &key defaults &allow-other-keys)
+  (declare (arglist &key host device directory name type version defaults))
+  (apply #'send
+	 (if defaults
+	     (parse-defaults defaults)
+	     (send (fs:default-pathname *default-pathname-defaults* nil nil nil t)
+		   :new-pathname :device nil :directory nil :name nil :type nil :version nil))
+	 :new-pathname keywords))
+
+;; Cannot share the FS: versions of these because they don't call PARSE-PATHNAME
+(defun pathname-host (pathname)
+  (fs:pathname-host (pathname pathname)))
+
+(defun pathname-device (pathname)
+  (fs:pathname-device (pathname pathname)))
+
+(defun pathname-directory (pathname)
+  (fs:pathname-directory (pathname pathname)))
+
+(defun pathname-name (pathname)
+  (fs:pathname-name (pathname pathname)))
+
+(defun pathname-type (pathname)
+  (fs:pathname-type (pathname pathname)))
+
+(defun pathname-version (pathname)
+  (fs:pathname-version (pathname pathname)))
+
+#||
+;;--- CLtL completely ignores the issues of "interchange case", so
+;;--- someday (Release 8), the following functions should be used
+;;--- so that the intuitive (but incorrect) results occur, namely,
+;;--- that 1(cl:make-pathname :host 4unix-host1 :name "4lowercase-name1")
+0;;--- really produces a lowercase pathname on the Unix host instead
+;;--- of an uppercase name.  We can't do this in 7.2, because that
+;;--- would break 7.1 programs.  Of course, if CLtL is ever unwedged,
+;;--- then the above code is fine.
+
+;; NOT the same as the ZL function by the same name!
+(defun make-pathname (&rest keywords
+		      &key (device nil device-p)
+			   (directory nil directory-p)
+			   (name nil name-p)
+			   (type nil type-p)
+			   defaults
+		      &allow-other-keys)
+  (declare (arglist &key host device directory name type version defaults))
+  (si:with-rem-keywords (keywords keywords '(:device :directory :name :type))
+    (let ((default (if defaults
+		       (parse-defaults defaults)
+		     (send (fs:default-pathname *default-pathname-defaults* nil nil nil t)
+			   :new-pathname
+			   :device nil :directory nil :name nil :type nil :version nil))))
+      ;; Sorry about these subprimitives, but we want to get the right answer --SWM
+      (let ((nargs (1+ (length keywords))))
+	(when device-p (incf nargs 2))
+	(when directory-p (incf nargs 2))
+	(when name-p (incf nargs 2))
+	(when type-p (incf nargs 2))
+	(%start-function-call default return nargs nil)
+	(%push :new-pathname)
+	(when device-p (%push :raw-device) (%push device))
+	(when directory-p (%push :raw-directory) (%push directory))
+	(when name-p (%push :raw-name) (%push name))
+	(when type-p
+	  (if (keywordp type) (%push :canonical-type) (%push :raw-type))
+	  (%push type))
+	(do () ((null keywords))
+	  (%push (pop keywords)))
+	(%finish-function-call default return nargs nil)))))
+
+(defun pathname-device (pathname)
+  (send (pathname pathname) :raw-device))
+
+(defun pathname-directory (pathname)
+  (send (pathname pathname) :raw-directory))
+
+(defun pathname-name (pathname)
+  (send (pathname pathname) :raw-name))
+
+(defun pathname-type (pathname)
+  (send (pathname pathname) :raw-type))
+
+||#
+
+(defun namestring (pathname)
+  (string (send (pathname pathname) :string-for-printing)))
+
+(defun file-namestring (pathname)
+  (string (send (pathname pathname) :string-for-dired)))
+  
+(defun directory-namestring (pathname)
+  (string (send (pathname pathname) :string-for-directory)))
+
+(defun host-namestring (pathname)
+  (string (send (send (pathname pathname) :host) :name-as-file-computer)))
+
+(defun enough-namestring (pathname &optional (defaults *default-pathname-defaults*))
+  (setq pathname (pathname pathname)
+	defaults (parse-defaults defaults))
+  (let ((host (send pathname :host))
+	(device (send pathname :device))
+	(directory (send pathname :directory))
+	(name (send pathname :name))
+	(type (send pathname :type))
+	(version (send pathname :version))
+	(same-host t))
+    (unless (eq host (send defaults :host))
+      (setq defaults (fs:default-pathname defaults host)
+	    same-host nil))
+    (let ((same-device (equal (send defaults :device) device))
+	  (same-directory (equal (send defaults :directory) directory))
+	  (same-name (equal (send defaults :name) name))
+	  (same-type (equal (send defaults :type) type))
+	  (same-version (equal (send defaults :version) version)))
+      (let ((string (string (send (send pathname :new-pathname
+					:device (if same-device nil device)
+					:directory (if same-directory nil directory)
+					:name (if same-name nil name)
+					:type (if (and same-version same-type) nil type)
+					:version (if same-version nil version))
+				  :string-for-printing))))
+	(if same-host
+	    (subseq string (1+ (position #\: string)))
+	    string)))))
+
+;Different from ZL:PROBEF because it accepts a stream
+(defun probe-file (file)
+  (if (streamp file)
+      (funcall file :truename)
+      (zl:probef (pathname file))))
+
+(defun file-write-date (file)
+  (if (streamp file)
+      (funcall file :creation-date)
+      (getf (cdr (fs:file-properties (pathname file))) :creation-date)))
+
+(defun file-author (file)
+  (if (streamp file)
+      (funcall file :author)
+      (getf (cdr (fs:file-properties (pathname file))) :author)))
+
+(defun file-length (stream)
+  (funcall stream :length))
+
+(defun file-position (stream &optional position)
+  (cond ((null position)
+	 (funcall stream :read-pointer))
+	((funcall stream :operation-handled-p :set-pointer)
+	 (funcall stream :set-pointer (case position
+					(:start 0)
+					(:end (funcall stream :length))
+					(otherwise position)))
+	 t)))
+
+(defun directory (pathname &key deleted)
+  (mapcar #'first (rest (apply #'fs:directory-list (pathname pathname) :fast
+			       (if deleted '(:deleted) nil)))))
+
+;;;; Syn Stream Protocol (new-style--still experimental)
+
+#||
+(defflavor synonym-stream (symbol) (si:stream)
+  :initable-instance-variables
+  :writable-instance-variables
+  (:required-init-keywords :symbol)
+  (:constructor make-synonym-stream-instance (symbol)))
+
+(defwhopper (:operation-handled-p synonym-stream) (operation)
+  (if (boundp symbol)
+      (send (symbol-value symbol) :operation-handled-p operation)
+      (continue-whopper operation)))
+
+(defwhopper (:which-operations synonym-stream) ()
+  (if (boundp symbol)
+      (send (symbol-value symbol) :which-operations)
+      (continue-whopper)))
+
+(defmethod (:describe synonym-stream) ()
+  (format t "~&~S is a synonym stream for ~S," self symbol)
+  (if (boundp symbol)
+      (format t "~%which has a value of: ~S~%" (symbol-value symbol))
+      (format t " which is unbound."))
+  self)
+
+(defwhopper (:send-if-handles synonym-stream) (message &rest args)
+  (if (boundp symbol)
+      (lexpr-send (symbol-value symbol) :send-if-handles message args)
+      (lexpr-continue-whopper message args)))
+
+(defwhopper (get-handler-for synonym-stream) (operation)
+  (if (boundp symbol)
+      (get-handler-for (symbol-value symbol) operation)
+      (continue-whopper operation)))
+
+(defmethod (:unclaimed-message synonym-stream) (op &rest arguments)
+  (if (boundp symbol)
+      (lexpr-send (symbol-value symbol) op arguments)
+      (error 'sys:unclaimed-message
+	     :object self
+	     :message op
+	     :arguments arguments)))
+
+(defmethod (sys:print-self synonym-stream) (stream print-depth slashify-p)
+  (declare (ignore print-depth slashify-p))
+  (si:printing-random-object (self stream :typep)
+    (prin1 symbol stream)))
+
+;; Overrides of methods provided by SI:STREAM
+
+(defmethod (fs:%file-stream-file-element-type synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (fs:%file-stream-file-element-type (symbol-value symbol)))
+
+(defmethod (:characters synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (send (symbol-value symbol) :characters))
+
+(defmethod (:close synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (send (symbol-value symbol) :close))
+
+(defmethod (:close-with-reason synonym-stream) (&rest arguments)
+  (declare (arglist reason &optional mode))
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (lexpr-send (symbol-value symbol) :close-with-reason arguments))
+
+(defmethod (:direction synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (send (symbol-value symbol) :direction))
+
+(defmethod (:element-type synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (send (symbol-value symbol) :element-type))
+
+(defmethod (:interactive synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (send (symbol-value symbol) :interactive))
+
+(defmethod (si:standard-value-environment-p synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (si:standard-value-environment-p (symbol-value symbol)))
+
+(defmethod (si:stream-supports-set-pointer-0 synonym-stream) ()
+  (check-type symbol (satisfies boundp) "a variable holding a stream")
+  (si:stream-supports-set-pointer-0 (symbol-value symbol)))
+
+;; Avoid embarrassing runtime pauses
+
+(compile-flavor-methods synonym-stream)
+||#
+
+;;;; Syn Stream Protocol (old-style):
+;;;
+;;;  A syn stream is created with respect to a symbol which is bound to a stream,
+;;;  the "target stream."  The symbol is called the "target stream symbol."
+;;;
+;;;  The syn stream is an object with the property that calls through its function cell
+;;;  have the same effect as funcalls of the target stream.
+;;;
+;;;  Various programs in the system need to get their hands on the eventual target stream
+;;;  of a chain of syn streams.  The function follow-syn-stream does this.
+
+;;; This is implemented by having an uninterned symbol which has the
+;;; target stream symbol's value cell with EVCP data type in the syn
+;;; streams functions cell.  This accomplishes the function call
+;;; trampolining.  For follow-syn-stream to do the right thing, the
+;;; symbol must meet the following criteria:
+;;;	It must have a home package of NIL
+;;;	It must be unbound, with an unboundness of SYN-STREAM-SYMBOL
+;;;	It must have an EVCP in the function cell
+;;;	It must be fbound.
+;;; --->>>  Warning  <<<---
+;;; If you implement this in a different way (e.g., lexical closures),
+;;; you better make it as fast as, if not faster than, the above described
+;;; implementation.
+
+;;; --->>>  Defense of Violating the Above Warning  <<<---
+;;; We're pretty much forced into a corner by dpANS CL, which mandates that streams
+;;; and symbols be disjoint, and which therefore makes this implementation invalid.
+;;; Also, if there are places where synonym streams are not fast enough, the solution 
+;;; is probably to do a follow-synonym-stream at an outer level and to work with the
+;;; inner stream. -kmp 27-Sep-92
+
+(defsubst old-style-synonym-stream-p (stream)
+  (and (symbolp stream)
+       (null (symbol-package stream))
+       (not (boundp stream))
+       (zerop (%pointer-difference
+		(%p-contents-as-locative
+		  (follow-cell-forwarding (locf (symbol-value-cell stream)) t))
+		'syn-stream-symbol))
+       (= (%p-data-type (locf (symbol-function-cell stream)))
+	  sys:dtp-external-value-cell-pointer)
+       (fboundp stream)))
+
+(defun make-old-style-synonym-stream (stream-symbol)
+  ;; This used to be the definition of MAKE-SYNONYM-STREAM.
+  (let ((location (etypecase stream-symbol
+		    (symbol
+		      (sys:follow-cell-forwarding (sys:value-cell-location stream-symbol)
+						  nil))))
+	(new-symbol (make-symbol (string-append (symbol-name stream-symbol) "-SYN-STREAM")
+				 t)))
+    ;; fixup value cell
+    (location-makunbound (locf (symbol-value-cell new-symbol)) 'syn-stream-symbol)
+    ;; fixup function cell
+    (%p-store-tag-and-pointer (locf (symbol-function-cell new-symbol))
+			      sys:dtp-external-value-cell-pointer
+			      location)
+    ;; is this still needed?
+    (setf (get new-symbol 'si:io-stream-p) t)
+    new-symbol))
+
+
+;;;; Synonym Streams (unified old-style and new-style)
+
+;;; ***** NOTE: expressions like 1(typep stream 'synonym-stream)0 caused trouble in
+;;;             the cold load, because 1typep0 doesn't work that early in the life of
+;;;             a new system.  Four instances of these have been commented out and
+;;;             replaced with explicit NIL below, until they can be either removed
+;;;             or fixed in a more appropriate way.  -- Hornig & Dodds, 10/09/92
+
+(defvar *make-old-style-synonym-streams* t
+  "New-style synonym streams are instances so you can write methods on them.
+This variable should be T if you want the old ones, and NIL otherwise.")
+
+(defun make-synonym-stream (stream-symbol)
+  (if *make-old-style-synonym-streams*
+      (make-old-style-synonym-stream stream-symbol)
+      (make-synonym-stream-instance stream-symbol)))
+
+(defun synonym-stream-p (x)
+  (or (old-style-synonym-stream-p x)
+      1NIL0					; (typep x 'synonym-stream)
+      ))
+
+(deftype future-common-lisp:synonym-stream () '(satisfies synonym-stream-p))
+
+(defun future-common-lisp:synonym-stream-symbol (stream)
+  (cond ((old-style-synonym-stream-p stream)
+	 (multiple-value-bind (symbol type)
+	     (compiler:disassemble-decode-locative
+	       (%p-contents-as-locative (locf (symbol-function-cell stream))))
+	   (when (eq type :variable)
+	     (return-from future-common-lisp:synonym-stream-symbol symbol))))
+	(1NIL0					; (typep stream 'synonym-stream)
+	 (synonym-stream-symbol stream))
+	(t
+	  (error "~S is not a synonym stream." stream))))
+
+(defun follow-synonym-stream (stream)
+  (loop
+    (cond ((old-style-synonym-stream-p stream)
+	   (setq stream (symbol-function stream)))
+	  ((and 1NIL0				; (typep stream 'synonym-stream)
+		(boundp-in-instance stream 'symbol))
+	   ;; New style synonym streams as instances
+	   (let ((symbol (synonym-stream-symbol stream)))
+	     (if (boundp symbol)
+		 (setq stream (symbol-value symbol))
+		 (return stream))))
+	  (t (return stream)))))
+
+#||
+
+() ;Magic
+
+(defun describe-synonym-stream (stream)
+  (format t "~&~S" stream) 
+  (loop
+    (cond ((old-style-synonym-stream-p stream)
+	   (setq stream (symbol-function stream)))
+	  ((and 1NIL0				; (typep stream 'synonym-stream)
+		(boundp-in-instance stream 'symbol))
+	   ;; New style synonym streams as instances
+	   (let ((symbol (synonym-stream-symbol stream)))
+	     (if (boundp symbol)
+		 (setq stream (symbol-value symbol))
+		 (return stream))))
+	  (t (return stream)))
+    (format t "~% ~S" stream))
+  (values))
+
+||#
+
+
+
+
+(defun stream-default-handler (fctn op arg1 args &aux tem)
+  (case op
+    (:listen
+      (cond ((setq tem (funcall fctn :tyi nil))
+	     (funcall fctn :untyi tem)
+	     tem)))
+    (:any-tyi
+      (send fctn :tyi arg1))
+    (:any-tyi-no-hang
+      (send fctn :tyi-no-hang arg1))
+    ((:clear-output :clear-input :clear-eof :force-output :finish :close
+		    :clear-window :clear-rest-of-line :clear-rest-of-window)
+     nil)
+    (:fresh-line
+      (funcall fctn :tyo #\return)
+      t)
+    (:string-out
+      (setq tem (string arg1))
+      (do ((len (or (second args) (length tem)))
+	   (i (or (first args) 0) (1+ i)))
+	  ((>= i len) nil)
+	(funcall fctn :tyo (aref tem i))))
+    (:line-out
+      (apply #'send fctn :string-out arg1 args)
+      (send fctn :tyo #\Newline))
+    (:display-lozenged-string
+      (send fctn :tyo #\<)
+      (send fctn :string-out arg1)
+      (send fctn :tyo #\>))
+    (:lozenged-string-width
+      (+ (send fctn :string-length arg1)
+	 (send fctn :string-length "<>")))
+    ((:character-width :char-width)
+      1)
+    (:line-in
+      ;; ARG1 = LEADER
+      (multiple-value-bind (string eof)
+	  (si:read-delimited-string #\Return fctn nil nil
+				    nil :leader-length (if (numberp arg1) arg1))
+	(values string eof)))
+    (:string-in
+      ;; ARG1 = EOF, (CAR ARGS) = STRING
+      (multiple-value-bind (nil eof nil nil index)
+	  (si:read-delimited-string-internal
+	    nil fctn arg1 (car args) (cadr args)
+	    (or (caddr args) (array-total-size (car args))))
+	(values index eof)))
+    (:string-line-in
+      ;; ARG1 = EOF, (CAR ARGS) = STRING
+      (multiple-value-bind (nil eof delimiter nil index)
+	  (si:read-delimited-string-internal
+	    '(#\Return) fctn arg1 (car args) (cadr args)
+	    (or (caddr args) (array-total-size (car args))))
+	(values index eof (not (or eof delimiter)))))
+    ;; The next two are obsolete
+    (:clear-screen
+      (send fctn :clear-window))
+    (:clear-eol
+      (send fctn :clear-rest-of-line))
+    (:operation-handled-p
+      (not (null (member arg1 (funcall fctn :which-operations)))))
+    (:send-if-handles
+      (if (member arg1 (funcall fctn :which-operations))
+	  (apply fctn arg1 args)))
+    (:notification-cell nil)
+    (:receive-notification nil)
+    (:interactive nil)
+    (:beep nil)
+    (:string-length (apply #'cli::simulated-string-length fctn arg1 args))
+    (:vsp 0)
+    (:line-height 1)
+    (:output-as-presentation
+      (funcall arg1 (first args))
+      nil)
+    (:output-as-presentation-1
+      (apply arg1 (first args))
+      nil)
+    (:with-character-style
+      ;; (funcall continuation xstream)
+      (funcall (first args) (second args)))
+    (:item
+      ;; ARG1 is the TYPE, and is ignored.
+      ;; (CAR ARGS) is the ITEM.
+      ;; (CADR ARGS) is the format string.
+      ;; (CDDR ARGS) are the format args.
+      (if (cadr args)
+	  (apply #'format fctn (cdr args))
+	  (princ (car args) fctn)))
+    (:element-type 'character)
+    (:visible-cursorpos-limits
+      (multiple-value-call #'values 0 0 (send fctn :inside-size)))
+    (otherwise
+      (error 'sys:unclaimed-message
+	     :object fctn
+	     :message op
+	     :arguments (cons arg1 args)))))
+
+
+
+(defun simulated-string-length (stream string
+				&optional (start 0) end stop-x style (start-x 0) (max-x 0))
+  (declare (values final-x index max-x final-y total-height baseline))
+  (let* ((x start-x)
+	 (final-index (or end (string-length string)))
+	 (y 0)
+	 (cache  (funcall stream :send-if-handles :charset&stylefont-cache))
+	 (device (funcall stream :send-if-handles :display-device-type))
+	 (vsp    (funcall stream :vsp))
+	 (baseline 0)
+	 (default-line-height (funcall stream :line-height))
+	 (default-baseline (- default-line-height vsp))
+	 (line-height nil)
+	 (style (if (funcall stream :operation-handled-p :merged-current-style)
+		    (if style
+			(si:merge-character-styles style
+						   (funcall stream :merged-current-style))
+			(funcall stream :merged-current-style))
+		    (si:parse-character-style style))))
+    (labels ((line-height ()
+	       (or line-height default-line-height))
+	     (baseline ()
+	       (or baseline default-baseline))
+	     (update-line-height (char-baseline char-line-height)
+	       (setq baseline    (max (or baseline    0) char-baseline))
+	       (setq line-height (max (or line-height 0) char-line-height)))
+	     (translate-font (char style)
+	       (when (and cache device)
+		 (si:lookup-font-cached cache char device style nil))))
+      (do ((index start (1+ index)))
+	  ((= index final-index))
+	(let ((char (aref string index)))
+	  (cond ((char= char #\Newline)
+		 (incf y (line-height))
+		 (setq baseline nil line-height nil)
+		 (setq x 0))
+		(t
+		 (let* ((font             (translate-font char style))
+			(char-baseline    (if font (tv:font-baseline font) 1))
+			(char-line-height (+ (if font (tv:font-char-height font) 1) vsp))
+			(char-width       (funcall stream :character-width char font x style)))
+		   (let ((next-x (+ x char-width)))
+		     (update-line-height char-baseline char-line-height)
+		     (when (and stop-x (> next-x stop-x))
+		       (setq final-index index)
+		       ;; It's just plain weird that this next line is needed at all.
+		       ;; It doesn't make any sense to me, but I put it in because
+		       ;; it makes this work the same as TV:SHEET's string length handler.
+		       ;;  -kmp 10-May-90
+		       (setq max-x (max max-x next-x))
+		       (return))
+		     (setq x next-x)
+		     (when (> x max-x) (setq max-x x))))))))   ;Bum: (SETQ X (MAX X MAX-X)) 
+      (values x final-index max-x y (+ (line-height) y) (baseline)))))
+
+
+
+#|| ;Testing Routines for SIMULATED-STRING-LENGTH. -kmp
+
+(defun test-simulated-string-length-1 (&key (string (format nil "x~%FOO~VM~BAR"
+							    '(:FIX :ROMAN :LARGE)))
+				            (stream *terminal-io*)
+					    (start 0)
+					    (end nil)
+					    (stop-x nil)
+					    (style nil)
+					    (start-x 0) 
+					    (max-x 0))
+  (let ((r1 (multiple-value-list
+	      (send stream :string-length string     start end stop-x style start-x max-x)))
+	(r2 (multiple-value-list
+	      (simulated-string-length stream string start end stop-x style start-x max-x))))
+    (values (equal r1 r2)
+	    (mapcar #'(lambda (name good test)
+			(list name :good good :test test))
+		    '(:final-x  :index :max-x :final-y :total-height :baseline)
+		    r1 r2))))
+
+(defun test-simulated-string-length ()
+  (let ((win :win))
+    (dolist (arguments '(()
+			 (:stop-x 4)
+			 (:stop-x 20)
+			 (:stop-x 20 :start 1)
+			 (:stop-x 20 :start 3)
+			 (:max-x 5)
+			 (:style (:fix :roman :large))
+			 (:max-x 1000)))
+      (multiple-value-bind (ok values)
+	  (apply #'test-simulated-string-length-1 arguments)
+	(unless ok
+	  (format t "~&~S~% ~S~%" arguments values)
+	  (setq win :fail))))
+    win))
+
+||#
+
+
+;; Input Editor support needed at runtime.  Corresponding macros are in SYS: SYS2; LMMAC.
+;; INPUT-EDITOR-OPTION and INPUT-EDITOR-FLAG are used by the cold load stream.
+;; WITH-INPUT-EDITING-INTERNAL is used by READ in the cold load.
+
+;; *INPUT-EDITOR-OPTIONS* is bound to a list of options.  Each option is a list whose car is a
+;; keyword and whose cdr is the value of the option.  Eventually, there should be a
+;; DEFINE-INPUT-EDITOR-OPTION form and INPUT-EDITOR-OPTION, INPUT-EDITOR-FLAG, and
+;; WITH-INPUT-EDITING-OPTIONS should check that their arguments are valid options.
+
+(defun si:input-editor-option (option)
+  (cdr (assoc option si:*input-editor-options*)))
+
+(defun si:input-editor-flag (option)
+  (cadr (assoc option si:*input-editor-options*)))
+
+;; When LINE-P is T, the newline must be printed -before- returning from the :INPUT-EDITOR
+;; method in order for a non-normal return from the input editor to work properly.  This can
+;; occur if any of the :FULL-RUBOUT, :PREEMPTABLE, or :COMMAND input editor options are
+;; specified.  The newline must only be printed when the input editor returns normally.  See
+;; the message of January 16, 1985 00:24-EST from CWH to BUG-LISPM for further discussion of
+;; this issue.
+
+(defun si:with-input-editing-internal (stream continuation activators line-p)
+  (declare (downward-funarg continuation)
+	   (dbg:invisible-frame :accept-internals))
+  (unless stream (setq stream *standard-input*))
+  (labels ((body ()
+	     (dw:with-presentation-input-context ('si:input-editor :stream stream) ()
+		  (dw::with-dynamic-input-editor-options (stream)
+		    (if (or si:rubout-handler
+			    (not (send stream :interactive)))
+			(funcall continuation)
+		      (zl:with-input-editing-options-if activators
+							((:activation 'si:memq activators))
+			(send stream :input-editor
+			      (if line-p
+				  #'(lambda ()
+				      (declare (downward-function))
+				      (multiple-value-prog1
+					(funcall continuation)
+					(send stream :tyo #\Newline)))
+				continuation))))))))
+    (if (and (send stream :interactive) (not (si:cold-load-stream-p stream)))
+	(si:with-process-interactive-priority () (body))
+      (body))))
+
+(defun si:with-clim-compatible-input-editing-internal (stream continuation)
+  (declare (downward-funarg continuation)
+	   (dbg:invisible-frame :accept-internals))
+  (if (and (instancep stream) (clos-instance-p stream))
+      ;; CLIM stream
+      ;;--- do we need to worry about making blips?
+      (si:stream-compatible-input-editing stream continuation
+	#'(lambda (character)			;activation-character-p
+	    (declare (sys:downward-function))
+	    (and (characterp character)
+		 (let ((activation (si:input-editor-option :activation)))
+		   (and activation
+			(apply (car activation) character (cdr activation))))))
+	#'(lambda (character)			;blip-character-p
+	    (declare (sys:downward-function))
+	    (and (characterp character)
+		 (let ((blip-character (si:input-editor-option :blip-character)))
+		   (and blip-character
+			(apply (car blip-character) character (cdr blip-character)))))))
+      ;; Genera stream
+      (si:with-input-editing-internal stream #'(lambda () (funcall continuation stream))
+				      nil nil)))
+
+
+(defvar *load-verbose* t)
+(defvar future-common-lisp:*load-print* nil)
+(defvar *load-set-default-pathname* t)
+
+;Modified from SI:IO-STREAM-P to be less trusting of instances
+;also to delve inside closures and to assume that compiled functions aren't
+;streams since I don't think we use them (as opposed to symbols) any more.
+;We don't look inside closures any more, as we don't gain anything from it.
+;--- fix this better when protocols are implemented ---
+(defun streamp (x)
+  (declare lt:(side-effects simple))
+  (typecase x
+    (instance
+      (let ((w-o (send x :which-operations)))
+	(not (not (or (member :tyi w-o) (member :tyo w-o))))))
+    ((or lexical-closure dynamic-closure) t)
+    (symbol (get x 'si:io-stream-p))
+    (otherwise nil)))
+
+(defun load (filename &key (verbose *load-verbose*) (print future-common-lisp:*load-print*)
+	     (if-does-not-exist :error)
+	     package default-package
+	     (set-default-pathname *load-set-default-pathname*)
+	     (reprompt nil))
+  (declare (arglist filename &key (verbose *load-verbose*) print (if-does-not-exist :error)
+		    package default-package
+		    (set-default-pathname *load-set-default-pathname*)))
+  (flet ((load-from-stream (stream)
+	   (when print
+	     (warn "LOAD's :PRINT option is not yet implemented; it will be ignored."))
+	   (let ((*package*
+		   (if default-package
+		       (sys:pkg-find-package default-package :error si:*lisp-package*)
+		       *package*)))
+	     (fs:load-stream stream package (not verbose)))))
+    (when (streamp filename)
+      (catch-error-restart (error "Skip loading from stream ~S" filename)
+	(load-from-stream filename))
+      (return-from load t))
+    (when (eq if-does-not-exist :reprompt)
+      (setf reprompt t)
+      (setf if-does-not-exist :error))
+    (catch-error-restart (error "Skip loading ~A" filename)
+      (error-restart (error "Retry loading ~A" filename)
+	(with-open-stream (stream (fs:load-open (pathname filename *load-pathname-defaults*)
+						nil (not set-default-pathname)
+						if-does-not-exist
+						reprompt))
+	  (when stream
+	    (load-from-stream stream)
+	    (truename stream)))))))

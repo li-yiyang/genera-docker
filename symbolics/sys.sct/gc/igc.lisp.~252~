@@ -1,0 +1,1436 @@
+;;; -*- Syntax: Zetalisp; Mode: Lisp; Base: 10; Package: System-internals -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;					+---------------------------------------+
+;;					|       SATISFACTION GUARANTEED		|
+;;;					|     OR DOUBLE YOUR GARBAGE BACK	|
+;;;; Symbolics Garbage Collector	|		       			|
+;;;;					|  	   Cape Cod Refuse Co.		|
+;;;;					|	Wellfleet, Massachusetts	|
+;;;; Remodularized March 1987 by DLA	|					|
+;;;					|	    Inventors of the		|
+;;					|	Copying Garbage Collector	|
+;					+---------------------------------------+
+
+
+;;; This file contains the I-machine-dependent part of the Garbage Collector
+;;; which are not in the cold load.
+
+;;; Flipping
+
+(DEFCONSTANT %ILLEGAL-ZONE-FLIP-MASK (LOGIOR (ROT 1 %SAFEGUARDED-ZONE)
+					     (ROT 1 %EPHEMERAL-ZONE)
+					     (ROT 1 %WIRED-ZONE)))
+
+;; This meter counts false oldspace traps.
+(DEFVAR-SAFEGUARDED *COUNT-FALSE-OLDSPACE-TRAPS* 0)
+
+;; This is set up by the cold load generator to contain
+;; a (safeguarded) list of fixnum addresses to transport explicitly after flipping.
+;; For example, any wired location which can point to dynamic space such as the 
+;; plist of NIL and T must be on this list.
+;;--- This concept needs to be fixed.
+(DEFVAR-SAFEGUARDED *SAFEGUARDED-ADDRESSES-TO-TRANSPORT* NIL)
+
+#+VLM
+(defun set-pht-transport-enables ()
+  (declare (wired-function))
+  (%set-min-trap-mode trap-mode-extra-stack)	;--- Somewhere else?
+  (let* ((control-low (chunk-base-address
+			(%pointer 
+			  (sg-control-stack-low %current-stack-group))))
+	 (control-limit (round-to-chunk
+			  (%pointer 
+			    (sg-control-stack-limit %current-stack-group)))))
+    (dotimes (region (n-regions))
+      ;; --- Like the rest of Genera, this knows that each of these
+      ;; "special" areas consists of only one region and that they have
+      ;; fixed region numbers. (What a lose!)
+      (unless (or
+		;; Non-object areas
+		(eq region 0)	;FEP-AREA
+		)
+	(let* ((bits (region-bits region))
+	       (type (ldb %%region-space-type bits))
+	       (faultp (not (or
+			      ;; Machine state areas
+			      (eq region 1)	;WIRED-CONTROL-TABLES
+			      (do-area-regions (reg 2)
+				(when (eq region reg) (return t)))
+			      ;; Regions that the VLM must treat as machine-state
+			      ;; since they are touched by io-mode
+			      (eq region storage::%wired-dynamic-area-region)
+			      #+VLM ;; +++---+++ temp kludge
+			      (eq region neti:%ether-buffer-area-region)
+			      #+VLM  ;; +++---+++ temp kludge
+			      (eq region si:disk-array-area-region)
+			      ))))
+	  (unless (or (not (ldb-test %%region-scavenge-enable bits))
+		      (eq type %region-space-free)
+		      (eq type %region-space-old))
+	    (let* ((region-origin (region-origin region))
+		   (region-extent (region-free-pointer region))
+		   (region-limit (%pointer-plus region-origin region-extent)))
+	      (if (and (eq type %region-space-control-stack)
+		       (not (%unsigned-lessp control-low region-origin))
+		       (%unsigned-lessp control-low region-limit))
+		  (progn
+		    ;; Stacks must be enabled since another process may poke at the
+		    ;; stack before it has been run (and scavenged), but we can't
+		    ;; fault on our own stack!
+		    (when (%unsigned-lessp region-origin control-low)
+		      (storage::vm-enable region-origin
+					  (%pointer-difference control-low region-origin)
+					  faultp))
+		    ;; Enable, but don't fault, our stack
+		    (storage::vm-enable control-low
+					(%pointer-difference control-limit control-low)
+					nil)
+		    (when (%unsigned-lessp control-limit region-limit)
+		      (storage::vm-enable control-limit
+					  (%pointer-difference region-limit control-limit)
+					  faultp)))
+		  (storage::vm-enable region-origin region-extent faultp))))))
+	nil)))
+
+#-VLM
+(DEFUN SET-PHT-TRANSPORT-ENABLES ()
+  (DECLARE (WIRED-FUNCTION))
+  (%SET-MIN-TRAP-MODE TRAP-MODE-EXTRA-STACK) ;--- Somewhere else?
+  (WITH-SYSTEM-BLOCK-REGISTERS (1 2)
+    ;; Set the transport trap bits of all pages.
+    (SETF (%BLOCK-REGISTER 1) STORAGE::*PHT-BASE*)
+    (SETF (%BLOCK-REGISTER 2) STORAGE::*PHT-BASE*)
+    (PREPARE-FOR-BLOCK-WRITE)
+    ;; This reads/writes PHT entries, which could undo a modification by a completion routine.
+    (STORAGE::WITH-STORAGE-LOCK
+      ;; Fast loop.  The PHT is always a multiple of 8 long!
+      ;; 8 cycles per entry, plus loop overhead, plus block-read lossage,
+      ;; equals about 9 cycles per entry.
+      (DO ((COUNT (%FIXNUM-FLOOR STORAGE::*PHT-SIZE* 4) (1- COUNT)))
+	  (( COUNT 0))
+	(LET ((PHT10 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	      (PHT11 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	      (PHT20 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	      (PHT21 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	      (PHT30 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	      (PHT31 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	      (PHT40 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL :PREFETCH NIL))
+	      (PHT41 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL :PREFETCH NIL)))
+	  ;; --- Note that these do not preserve the cdr-code of PHT1
+	  ;; --- This is okay for now because they are currently unused.
+	  ;; (This PROG1 garbage is for the usual reason -- BLOCK-WRITEs 
+	  ;; need two cycles on the VSBC, so I might as well be using
+	  ;; the odd cycles in parallel.)
+	  (%BLOCK-WRITE 2 (LOGIOR (PROG1 (%LOGDPB 1 %%PHT1-TRANSPORT-TRAP 0)
+					 (%BLOCK-WRITE 2 PHT10))
+				  PHT11))
+	  (%BLOCK-WRITE 2 (LOGIOR (PROG1 (%LOGDPB 1 %%PHT1-TRANSPORT-TRAP 0)
+					 (%BLOCK-WRITE 2 PHT20))
+				  PHT21))
+	  (%BLOCK-WRITE 2 (LOGIOR (PROG1 (%LOGDPB 1 %%PHT1-TRANSPORT-TRAP 0)
+					 (%BLOCK-WRITE 2 PHT30))
+				  PHT31))
+	  (%BLOCK-WRITE 2 (LOGIOR (PROG1 (%LOGDPB 1 %%PHT1-TRANSPORT-TRAP 0)
+					 (%BLOCK-WRITE 2 PHT40))
+				  PHT41))))))
+  (STORAGE::%CLEAR-MAP-CACHE)
+  NIL)
+
+(DEFUN %TRANSPORT-MACHINE-STATE ()
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  #+VLM
+  ;; Flush the stack-cache (once more), to update the VLM scan logic
+  (%coprocessor-write (compiler:%stack-location-internal 0) #o1201)
+  ;; The 1+ below is very important!  FP|0 contains the caller's caller, which is
+  ;; unsafeguarded.  It therefore must be scavenged as well as all of the calling frames.
+  (let ((length (1+ (%POINTER-DIFFERENCE (%STACK-FRAME-POINTER) %CONTROL-STACK-LOW))))
+    (incf* *scav-work-done* length)
+    (%BLOCK-TRANSPORT %CONTROL-STACK-LOW length T))
+  ;; Evacuate dynamic references from WIRED-CONTROL-TABLES, since transport traps don't
+  ;; hapen on locations in %WIRED-ZONE.
+  (let ((length (REGION-FREE-POINTER 1)))
+    (incf* *scav-work-done* length)
+    (%BLOCK-TRANSPORT (REGION-ORIGIN 1) length T))
+  #+VLM
+  ;; Bleah.  Because of the way the VLM implements transport traps, we
+  ;; have to scavenge this now to avoid io-mode traps later.  Thank-you
+  ;; %khs for making us need to do this!
+  (let ((length (region-free-pointer storage::%wired-dynamic-area-region)))
+    (incf* *scav-work-done* length)
+    (%block-transport (region-origin storage::%wired-dynamic-area-region) length t))
+  #+VLM ;; +++---+++ temp kludge
+  (let ((length (region-free-pointer neti:%ether-buffer-area-region)))
+    (incf* *scav-work-done* length)
+    (%block-transport (region-origin neti:%ether-buffer-area-region) length t))
+  #+VLM ;; +++---+++ temp kludge
+  (let ((length (region-free-pointer si:disk-array-area-region)))
+    (incf* *scav-work-done* length)
+    (%block-transport (region-origin si:disk-array-area-region) length t))
+  #+VLM
+  ;; On the VLM, we have to do ALL the regions of
+  ;; SAFEGUARDED-OBJECTS-AREA.  By serendipity, you appear not to need
+  ;; to do this on real machine.
+  (do-area-regions (region 2)
+    (LET* ((FIRST (REGION-ORIGIN region))
+	   (N-WORDS (REGION-FREE-POINTER region)))
+      ;; Page in the stuff we are about to transport, but don't wait for it.
+      ;; Normalize the pages, since %BLOCK-TRANSPORT will immediately access them.
+      (%FUNCALL-IN-AUX-STACK #'USER-PREFETCH-PAGES FIRST (%FIXNUM-CEILING N-WORDS PAGE-SIZE)
+			     NIL T)
+      (incf* *scav-work-done* N-WORDS)
+      (%BLOCK-TRANSPORT FIRST N-WORDS T)
+      ;; I don't think postpurging will buy us anything here.
+      ))
+  #-VLM
+  ;; Evacuate some pages in SAFEGUARDED-OBJECTS-AREA.
+  (LET* ((FIRST (REGION-ORIGIN 2))
+	 (N-WORDS (REGION-FREE-POINTER 2)))
+    ;; Page in the stuff we are about to transport, but don't wait for it.
+    ;; Normalize the pages, since %BLOCK-TRANSPORT will immediately access them.
+    (%FUNCALL-IN-AUX-STACK #'USER-PREFETCH-PAGES FIRST (%FIXNUM-CEILING N-WORDS PAGE-SIZE)
+			   NIL T)
+    (incf* *scav-work-done* N-WORDS)
+    (%BLOCK-TRANSPORT FIRST N-WORDS T)
+    ;; I don't think postpurging will buy us anything here.
+    )
+  ;; Carefully transport the BARs.  I think they might contain hyperspace pointers.
+  ;; We should really figure out how this is going to work...
+  (MACROLET ((TRANSPORT-REGISTER (REGISTER &OPTIONAL TYPE)
+	       `(LET ((COPY (%READ-INTERNAL-REGISTER ,REGISTER)))
+		  (WHEN ,(IF TYPE `(TYPE-MEMBER COPY ,TYPE) T)
+		    (TRANSPORT-TRAP (LOCF COPY) (DPBS 1 %%TRANSPORT-IGNORE-FALSE-OLDSPACE
+						      1 %%TRANSPORT-SNAP-OUT 0))
+		    (SETF (%READ-INTERNAL-REGISTER ,REGISTER) COPY)))))
+    ;; Only transport these if they contain locatives.  (No DTP-PHYSICAL-ADDRESSes, please.)
+    ;; In future processors, these might contain other kinds of pointers, beware.
+    (TRANSPORT-REGISTER %REGISTER-BAR-1 DTP-LOCATIVE)
+    (TRANSPORT-REGISTER %REGISTER-BAR-2 DTP-LOCATIVE)
+    (TRANSPORT-REGISTER %REGISTER-BAR-3 DTP-LOCATIVE)
+    ;; I don't think this can contain an oldspace pointer, since we're always called
+    ;; from a safeguarded function (GC-FLIP-INTERNAL).
+    ;; (TRANSPORT-REGISTER %REGISTER-CONTINUATION)
+    ;; (COMPILER:NO-OP)
+    ;; (COMPILER:NO-OP)
+    ;; Transport of registers may have left copyspace disabled.  Fix that.
+    #+VLM
+    (adjust-copyspace-transport-enables nil nil)
+    NIL))
+
+;;; Snap-out cache
+
+;; An array of <old, new> pairs
+(DEFCONSTANT *SNAP-OUT-CACHE-SIZE* 256)
+(DEFVAR-SAFEGUARDED *SNAP-OUT-CACHE*
+		    (LOCF
+		      (AREF (MAKE-ARRAY (* 2 *SNAP-OUT-CACHE-SIZE*)
+					:INITIAL-VALUE NIL
+					:AREA SAFEGUARDED-OBJECTS-AREA) 0)))
+(DEFVAR-SAFEGUARDED *SNAP-OUT-CACHE-PROBES* 0)
+(DEFVAR-SAFEGUARDED *SNAP-OUT-CACHE-HITS* 0)
+(DEFVAR-SAFEGUARDED *SNAP-OUT-CACHE-COLLISIONS* 0)
+(DEFVAR-SAFEGUARDED *SNAP-OUT-CACHE-MISSES* 0)
+
+(DEFMACRO WITH-SNAP-OUT-CACHE (&BODY BODY)
+  `(LET ((*SNAP-OUT-CACHE* *SNAP-OUT-CACHE*))
+     (DECLARE (UNSPECIAL *SNAP-OUT-CACHE*))
+     ,@BODY))
+
+(DEFMACRO SNAP-OUT-CACHE-INDEX (TRAPPING-POINTER)
+  `(LSH (LOGAND ,TRAPPING-POINTER (1- *SNAP-OUT-CACHE-SIZE*)) 1))
+
+(DEFMACRO SNAP-OUT-CACHE-KEY (INDEX)
+  `(%MEMORY-READ (%POINTER-PLUS *SNAP-OUT-CACHE* ,INDEX)))
+
+(CL:DEFSETF SNAP-OUT-CACHE-KEY (INDEX) (KEY)
+  `(%MEMORY-WRITE (%POINTER-PLUS *SNAP-OUT-CACHE* ,INDEX) ,KEY))
+
+(DEFMACRO SNAP-OUT-CACHE-VALUE  (INDEX)
+  `(%MEMORY-READ (%POINTER-PLUS *SNAP-OUT-CACHE* (1+ ,INDEX))
+		 :FIXNUM-ONLY T))
+
+(CL:DEFSETF SNAP-OUT-CACHE-VALUE (INDEX) (VALUE)
+  `(%MEMORY-WRITE (%POINTER-PLUS *SNAP-OUT-CACHE* (1+ ,INDEX)) ,VALUE))
+
+(DEFMACRO CLEAR-SNAP-OUT-CACHE ()
+  `(LET ((INIT NIL))
+     (%BLOCK-STORE-TAG-AND-POINTER *SNAP-OUT-CACHE* (* 2 *SNAP-OUT-CACHE-SIZE*)
+				   (%TAG INIT) (%POINTER INIT) 0)))
+
+
+;;; Transporter
+
+;; The MODE argument to TRANSPORT-TRAP is a bit-mask of the following fields
+
+;; If this bit is set, then an unexpected false oldspace trap causes an error.
+;; This is set for transport traps signalled by the hardware.
+(DEFCONSTANT %%TRANSPORT-UNEXPECTED-FALSE-OLDSPACE-IS-ERROR (BYTE 1 0))
+
+;; If this bit is set, then no action should be taken for expected false oldspace traps.
+;; This is set by %BLOCK-TRANSPORT.
+(DEFCONSTANT %%TRANSPORT-IGNORE-FALSE-OLDSPACE (BYTE 1 1))
+
+;; If this bit is set, then TRANSPORT-TRAP is expected to snap out as well as trasnport.
+;; This is just a convenience for %TRANSPORT-MACHINE-STATE.
+(DEFCONSTANT %%TRANSPORT-SNAP-OUT (BYTE 1 2))
+
+(DEFVAR-SAFEGUARDED *HALT-ON-INVALID-POINTER* NIL)
+
+;;---INHIBIT-CONSING-FLAG
+;;---Check for pointer arithmetic
+;;---I have to do something like PEEK-AT-OLDSPACE!
+;;---The RETURN-FROMs are wrong; there needs to be an internal block.
+;; Must be called with either preemption disabled or in extra-stack mode.
+(DEFUN TRANSPORT-TRAP (ADDRESS MODE)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE TRANSPORT-ERROR-INTERNAL TRANSPORT-ERROR-ADDITIONAL-INFO))
+  (METER-MS-AND-PF (TRANSPORTER (SCAVENGE-TRANSPORTER *SCAVENGE-IN-PROGRESS*))
+    (BLOCK TRANSPORT-TRAP
+      (SET-RUN-LIGHT TRANSPORT-RUN-LIGHT)
+      (SETQ %TRANSPORT-IN-PROGRESS T)
+      (TAGBODY RETRY-TRAP
+	;; Read the cell, and get all the region information.
+	(LET* ((TRAPPING-CELL (%MEMORY-READ ADDRESS :CYCLE-TYPE %MEMORY-RAW))
+	       (TRAPPING-POINTER (%POINTER TRAPPING-CELL))
+	       (REGION (%REGION-NUMBER TRAPPING-POINTER))
+	       (BITS (IF REGION (REGION-BITS REGION)
+		       ;; Here we cannot signal an error, since a block register can
+		       ;; increment to a bogus value and subsequently be stored in memory.
+		       (IF (= (LDB %%VMA-OBLAST-NUM TRAPPING-POINTER)
+			      (DPB %BOUNDARY-ZONE %%OBLAST-ZONE-NUM
+				   (LDB %%VMA-OBLAST-NUM -1)))
+			   ;; Don't bash pointers to this portion of address space,
+			   ;; which is reserved for nonexistent memory.  Instead just make
+			   ;; sure we don't get the trap again.
+			   (UNLESS (LDB-TEST %%TRANSPORT-IGNORE-FALSE-OLDSPACE MODE)
+			     (FALSE-OLDSPACE-CLEAR-PAGE (%POINTER ADDRESS) NIL))
+			 (WHEN (AND (< (LDB %%VMA-ZONE-NUM (%POINTER ADDRESS)) %SAFEGUARDED-ZONE)
+				    *HALT-ON-INVALID-POINTER*)
+			   (%FUNCALL-IN-AUX-STACK #'WIRED-FERROR :PROCEEDABLE-HALT
+						  "Invalid pointer found."))
+			 ;; Preserve the existing cdr-code.
+			 (%P-STORE-CONTENTS ADDRESS
+			   'INVALID-POINTER-REMOVED-BY-GARBAGE-COLLECTOR)
+			 (INCF* TRANSPORTER-INVALID-POINTERS))
+		       (RETURN-FROM TRANSPORT-TRAP NIL))))
+	  ;; Check for a false trap.
+	  (COMPILER:%ERROR-WHEN ( (%LOGLDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-OLD)
+	    (IF (BIT-MEMBER (%LOGLDB %%VMA-ZONE-NUM TRAPPING-POINTER) *FALSE-OLDSPACE-MASK*)
+		;; This was expected.  If appropriate, clear the page of
+		;; oldspace pointers, then disable further transport traps.
+		(UNLESS (LDB-TEST %%TRANSPORT-IGNORE-FALSE-OLDSPACE MODE)
+		  (INCF* *COUNT-FALSE-OLDSPACE-TRAPS*)
+		  (FALSE-OLDSPACE-CLEAR-PAGE (%POINTER ADDRESS)
+		    (LDB-TEST %%TRANSPORT-UNEXPECTED-FALSE-OLDSPACE-IS-ERROR MODE)))
+	      ;; This was unexpected.  Issue an error if appropriate.
+	      (WHEN (LDB-TEST %%TRANSPORT-UNEXPECTED-FALSE-OLDSPACE-IS-ERROR MODE)
+		;; Assume that any false traps out of the current control stack are really
+		;; just programs reading off the top of the stack, and that the trap
+		;; handler has clobbered the original oldspace pointer.
+		(UNLESS (AND (NOT (%POINTER-LESSP ADDRESS
+						  (SG-CONTROL-STACK-LOW %CURRENT-STACK-GROUP)))
+			     (%POINTER-LESSP ADDRESS
+					     (SG-CONTROL-STACK-LIMIT %CURRENT-STACK-GROUP)))
+		  (TRANSPORT-ERROR "False transport trap on pointer ~\SI:ADDRESS\~%~v,v,v,vQ"
+				   TRAPPING-POINTER (%POINTER ADDRESS)
+				   TRAPPING-POINTER TRAPPING-POINTER NIL
+				   #'TRANSPORT-ERROR-ADDITIONAL-INFO))))
+	    (RETURN-FROM TRANSPORT-TRAP NIL))
+	  (LET* ((REGION-ORIGIN (REGION-ORIGIN REGION))
+		 (REGION-LIMIT (+ (REGION-FREE-POINTER REGION) REGION-ORIGIN)))
+	    ;; Check for a pointer to free space.
+	    (COMPILER:%ERROR-WHEN ( TRAPPING-POINTER REGION-LIMIT)
+	      (WHEN (AND (< (LDB %%VMA-ZONE-NUM (%POINTER ADDRESS)) %SAFEGUARDED-ZONE)
+			 *HALT-ON-INVALID-POINTER*)
+		(%FUNCALL-IN-AUX-STACK #'WIRED-FERROR :PROCEEDABLE-HALT
+				       "Invalid pointer found."))
+	      ;; This used to bash to NIL, but I think it is better to bash it to something
+	      ;; which can be tracked down a little easier.
+	      ;; (%P-STORE-CONTENTS ADDRESS NIL)
+	      (%P-STORE-CONTENTS ADDRESS 'INVALID-POINTER-REMOVED-BY-GARBAGE-COLLECTOR)
+	      (INCF* TRANSPORTER-INVALID-POINTERS)
+	      (RETURN-FROM TRANSPORT-TRAP NIL))
+	    ;; Get the word from oldspace
+	     (WITH-SNAP-OUT-CACHE
+	      (LET* ((CACHE-INDEX (SNAP-OUT-CACHE-INDEX TRAPPING-POINTER))
+		     (CELL-CONTENTS )
+		     (CACHE-KEY (SNAP-OUT-CACHE-KEY CACHE-INDEX)))
+		(INCF* *SNAP-OUT-CACHE-PROBES*)
+		;; If we've already evacuated oldspace, just snap the pointer and return.
+		(COND ((IF (EQ TRAPPING-POINTER CACHE-KEY)
+			   (PROGN
+			     (INCF* *SNAP-OUT-CACHE-HITS*)
+			     T)
+			   (PROGN
+			     (WHEN CACHE-KEY
+			       (INCF* *SNAP-OUT-CACHE-COLLISIONS*))
+			     NIL))
+		       ;; compatibility
+		       (UNLESS (LDB-TEST %%TRANSPORT-SNAP-OUT MODE)
+			 (TRANSPORT-ERROR "Transport caller failed to snap forwarding"))
+		       (%P-DPB (SNAP-OUT-CACHE-VALUE CACHE-INDEX) %%Q-POINTER ADDRESS) 
+		       (RETURN-FROM TRANSPORT-TRAP NIL))
+		      ((TYPE-MEMBER
+			 (SETQ CELL-CONTENTS (%MEMORY-READ TRAPPING-POINTER
+							   :CYCLE-TYPE %MEMORY-RAW))
+			 DTP-GC-FORWARD)
+		       ;; Should get here once a year or so.
+		       (UNLESS (LDB-TEST %%TRANSPORT-SNAP-OUT MODE)
+			 (TRANSPORT-ERROR "Transport caller failed to snap forwarding"))
+		       (INCF* *SNAP-OUT-CACHE-MISSES*)
+		       (CL:PSETF (SNAP-OUT-CACHE-KEY CACHE-INDEX) TRAPPING-POINTER
+				 (SNAP-OUT-CACHE-VALUE CACHE-INDEX) (%POINTER CELL-CONTENTS))
+		       (%P-DPB (%POINTER CELL-CONTENTS) %%Q-POINTER ADDRESS) 
+		       (RETURN-FROM TRANSPORT-TRAP NIL))
+		      ((TYPE-MEMBER CELL-CONTENTS DTP-ELEMENT-FORWARD DTP-HEADER-FORWARD)
+		       ;; Shouldn't get here often.
+		       (UNLESS (OR (LDB-TEST %%TRANSPORT-SNAP-OUT MODE)
+				   (BIT-MEMBER (%LDB %%VMA-ZONE-NUM ADDRESS)
+					       *FALSE-OLDSPACE-MASK*))
+			 (TRANSPORT-ERROR "Transport caller failed to snap forwarding"))
+		       ;; Don't put header-forward snap-outs in the
+		       ;; cache, as they are not complete (may point to
+		       ;; oldspace) and a cache-hit is assumed to be
+		       ;; complete!
+		       (%P-DPB (%POINTER CELL-CONTENTS) %%Q-POINTER ADDRESS) 
+		       ;; The forwarding pointer may still point to oldspace.  Since we weren't
+		       ;; called via a hardware trap, it is the contract of this
+		       ;; function to ensure that ADDRESS doesn't point to oldspace.  We must
+		       ;; therefore retry.
+		       (SETQ MODE (DPBS 0 %%TRANSPORT-UNEXPECTED-FALSE-OLDSPACE-IS-ERROR
+					1 %%TRANSPORT-SNAP-OUT MODE))
+		       (GO RETRY-TRAP))
+		      (*TRANSPORTER-BREAK-WEAK-LINKS*
+		       (LET ((REGION (%REGION-NUMBER ADDRESS)))
+			 ;; This check should be redundant.
+			 (COMPILER:%ERROR-UNLESS
+			   (AND REGION (= (LDB %%REGION-SPACE-TYPE (REGION-BITS REGION))
+					  %REGION-SPACE-WEAK))
+			   (TRANSPORT-ERROR "Transport trap while breaking weak links"))
+			 (%MEMORY-WRITE ADDRESS
+					(%SET-TAG ADDRESS
+						  (DPB DTP-NULL %%Q-TYPE-WITHIN-TAG
+						       (%TAG TRAPPING-CELL))))
+			 (RETURN-FROM TRANSPORT-TRAP NIL))))
+	      ;; Oh, well.  Looks like we're going to have to do some real work.
+	      ;; Dispatch on representation type to determine how to copy the object,
+	      ;; relocate the original pointer, and retry the operation.
+	      (MULTIPLE-VALUE-BIND (UPDATED-POINTER MAY-BE-OLDSPACE)
+		  (SELECTOR (%LOGLDB %%REGION-REPRESENTATION-TYPE BITS) =
+		    (%REGION-REPRESENTATION-TYPE-STRUCTURE
+		      (FIND-AND-TRANSPORT-STRUCTURE-BLOCK
+			ADDRESS TRAPPING-POINTER REGION REGION-ORIGIN REGION-LIMIT))
+		    (%REGION-REPRESENTATION-TYPE-LIST
+		      (FIND-AND-TRANSPORT-LIST-BLOCK
+			TRAPPING-POINTER REGION-ORIGIN REGION))
+		    (OTHERWISE (TRANSPORT-ERROR "Unrecognized representation-type")))
+		;; Don't put possible oldspace pointers in the cache
+		(UNLESS MAY-BE-OLDSPACE
+		  (CL:PSETF (SNAP-OUT-CACHE-KEY CACHE-INDEX) TRAPPING-POINTER
+			    (SNAP-OUT-CACHE-VALUE CACHE-INDEX) (%POINTER UPDATED-POINTER)))
+		(%P-DPB UPDATED-POINTER %%Q-POINTER ADDRESS)
+		(WHEN MAY-BE-OLDSPACE
+		  (SETQ MODE (DPBS 0 %%TRANSPORT-UNEXPECTED-FALSE-OLDSPACE-IS-ERROR
+				   1 %%TRANSPORT-SNAP-OUT MODE))
+		  (GO RETRY-TRAP))))))))))
+  (CLEAR-RUN-LIGHT TRANSPORT-RUN-LIGHT)
+  (SETQ %TRANSPORT-IN-PROGRESS NIL)
+  (COMPILER:%ERROR-WHEN STORAGE::*TRANSPORTER-READ-ONLY-VPN*
+    (%FUNCALL-IN-AUX-STACK #'STORAGE::CLEAR-TRANSPORTER-READ-ONLY-VPN))
+  NIL)
+
+;; Assumes that MD contains a pointer to hardware oldspace.
+;; Returns true if a snap-out occurred.
+;;--- At some future date, we could inline this function back into its callers,
+;;--- and remove the call to %REGION-NUMBER.  The trade-off would then be that
+;;--- PAGE-FAULT-HANDLER would have to be kludged up to recognize when MD points
+;;--- to nonexistent memory, and recover appropriately.
+(DEFUN TRANSPORT-SNAP-OUT (VMA &OPTIONAL (MD (%MEMORY-READ VMA :CYCLE-TYPE %MEMORY-RAW
+							   :SET-CDR-NEXT NIL)))
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  (WHEN (%REGION-NUMBER MD)
+    (WITH-SNAP-OUT-CACHE
+      (LET* ((MD-POINTER (%POINTER MD))
+	     (CACHE-INDEX (SNAP-OUT-CACHE-INDEX MD-POINTER))
+	     (CACHE-KEY (SNAP-OUT-CACHE-KEY CACHE-INDEX)))
+	(INCF* *SNAP-OUT-CACHE-PROBES*)
+	(IF (EQ MD-POINTER CACHE-KEY)
+	    (WHEN (NOT (BIT-MEMBER (%LDB %%VMA-ZONE-NUM MD) *FALSE-OLDSPACE-MASK*))
+	      (SETQ %TRANSPORT-IN-PROGRESS T)
+	      (INCF* *SNAP-OUT-CACHE-HITS*)
+	      (%MEMORY-WRITE VMA (%SET-TAG (SNAP-OUT-CACHE-VALUE CACHE-INDEX) (%TAG MD)))
+	      (SETQ %TRANSPORT-IN-PROGRESS NIL)
+	      (COMPILER:%ERROR-WHEN STORAGE::*TRANSPORTER-READ-ONLY-VPN*
+		  (%FUNCALL-IN-AUX-STACK #'STORAGE::CLEAR-TRANSPORTER-READ-ONLY-VPN))
+	      T)
+	    (LET ((PTR (%MEMORY-READ MD :CYCLE-TYPE %MEMORY-RAW)))
+	      (WHEN (OR (TYPE-MEMBER PTR DTP-GC-FORWARD)
+			(AND (TYPE-MEMBER PTR DTP-HEADER-FORWARD DTP-ELEMENT-FORWARD)
+			     (NOT (BIT-MEMBER (%LDB %%VMA-ZONE-NUM MD)
+					      *FALSE-OLDSPACE-MASK*))))
+		(SETQ %TRANSPORT-IN-PROGRESS T)
+		;; Only put real gc-forwards in cache.  Header/element
+		;; may still be old
+		(WHEN (TYPE-MEMBER PTR DTP-GC-FORWARD)
+		  (WHEN CACHE-KEY
+		    (INCF* *SNAP-OUT-CACHE-COLLISIONS*))
+		  (INCF* *SNAP-OUT-CACHE-MISSES*)
+		  (CL:SETF (SNAP-OUT-CACHE-KEY CACHE-INDEX) MD-POINTER
+			   (SNAP-OUT-CACHE-VALUE CACHE-INDEX) (%POINTER PTR)))
+		(%MEMORY-WRITE VMA (%SET-TAG PTR (%TAG MD)))
+		(SETQ %TRANSPORT-IN-PROGRESS NIL)
+		(COMPILER:%ERROR-WHEN STORAGE::*TRANSPORTER-READ-ONLY-VPN*
+		  (%FUNCALL-IN-AUX-STACK #'STORAGE::CLEAR-TRANSPORTER-READ-ONLY-VPN))
+		T)))))))
+
+;; Note:  This will cause pointers in weakspace to be transported even if there are no
+;; other references to the transported objects.  This means that weakspace doesn't work
+;; if it is false oldspace.  Therefore weakspace is generally safeguarded.
+(DEFUN FALSE-OLDSPACE-CLEAR-PAGE (ADDRESS ERROR-P)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE TRANSPORT-ERROR-INTERNAL))
+  #+VLM (DECLARE (IGNORE ERROR-P))
+  (LET ((REGION (%REGION-NUMBER ADDRESS))
+	;; For VLM "page" means a protection unit, which is a chunk
+	(TRANSPORT-ORIGIN (%LOGDPB 0 #-VLM %%WORD-WITHIN-PAGE #+VLM %%WORD-WITHIN-CHUNK ADDRESS))
+	(SIZE #-VLM PAGE-SIZE #+VLM %ADDRESS-SPACE-CHUNK-SIZE))
+    (WHEN (LDB-TEST %%REGION-STACK (REGION-BITS REGION))
+      (MULTIPLE-VALUE-BIND (ORIGIN ACTIVE-SIZE)
+	  (DECODE-STACK-ADDRESS ADDRESS)
+	(SETQ SIZE
+	      (IF ORIGIN
+		  (MIN (%POINTER-DIFFERENCE (%POINTER-PLUS ORIGIN ACTIVE-SIZE)
+					    TRANSPORT-ORIGIN)
+		       SIZE)
+		  0))))
+    (IF (PLUSP SIZE)
+	(%BLOCK-TRANSPORT TRANSPORT-ORIGIN SIZE T)
+	#+VLM
+	;; a forwarded stack may get enabled, but never needs scavenging
+	(LET ((PHT-INDEX (PHT-LOOKUP (STORAGE::EXTRACT-VPN TRANSPORT-ORIGIN))))
+	  (STORAGE::VM-WRITE-ATTRIBUTE TRANSPORT-DISABLE PHT-INDEX T)))
+    #-VLM
+    (UNLESS (%FUNCALL-IN-AUX-STACK #'CLEAR-VPN-TRANSPORT-TRAP (LDB %%VMA-PAGE-NUM ADDRESS))
+      (WHEN ERROR-P
+	(TRANSPORT-ERROR "False transport trap from location ~\SI:ADDRESS\" ADDRESS)))))
+
+;; (CEILING ARG1 (LSH 1 ARG2))
+(DEFMACRO POSITIVE-FIXNUM-CEILING-LSH (ARG1 ARG2)
+  `(LSH (1- (+ (ROT 1 ,ARG2) ,ARG1)) (- ,ARG2)))
+
+(DEFUN FIND-AND-TRANSPORT-STRUCTURE-BLOCK
+       (ADDRESS TRAPPING-POINTER REGION REGION-ORIGIN REGION-LIMIT)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE TRANSPORT-ERROR-INTERNAL TRANSPORT-ERROR-ADDITIONAL-INFO)
+	   (VALUES UPDATED-ADDRESS MAY-BE-OLDSPACE))
+  (MULTIPLE-VALUE-BIND (LEADER SIZE)
+      (TRANSPORT-FIND-STRUCTURE-EXTENT ADDRESS TRAPPING-POINTER REGION-ORIGIN)
+
+    (LET ((LIMIT (+ (%POINTER LEADER) SIZE)))
+
+      ;; Consistency check
+      (COMPILER:%ERROR-UNLESS (AND ( (%POINTER LEADER) TRAPPING-POINTER)
+				   (< TRAPPING-POINTER LIMIT))
+	(TRANSPORT-ERROR
+	  "Found non-enclosing structure (~\SI:ADDRESS\-~\SI:ADDRESS\) starting from ~\SI:ADDRESS\~%~v,v,vQ"
+	  (%POINTER LEADER) LIMIT TRAPPING-POINTER
+	  ADDRESS (%POINTER LEADER) TRAPPING-POINTER
+	  #'TRANSPORT-ERROR-ADDITIONAL-INFO))
+
+      ;; If the old copy of the structure occupies more than two pages,
+      ;; prefetch it.  There isn't much computation overlapped with the
+      ;; prefetch, but this decreases disk rotational delays compared
+      ;; to faulting in the pages one at a time.  The CPU cost of
+      ;; prefetching things that may already be in main memory is not
+      ;; insignificant, but this prefetching seems to decrease the
+      ;; maximum impairment of real-time response.
+      (WHEN (> SIZE #o100)
+	;; The N-PAGES here includes one extra word to do the
+	;; consistency check below.
+	(LET ((N-PAGES (- (LDB %%VMA-PAGE-NUM LIMIT)
+			  (LDB %%VMA-PAGE-NUM (+ LEADER PAGE-SIZE)))))
+	  (WHEN (> N-PAGES 1)
+	    (GC-PREFETCH-PAGES (+ LEADER PAGE-SIZE) N-PAGES))))
+
+      ;; Another consistency check.
+      (COMPILER:%ERROR-WHEN
+	   (OR (AND (< LIMIT REGION-LIMIT)
+		    (NOT (TYPE-MEMBER
+			   (%MEMORY-READ LIMIT :CYCLE-TYPE %MEMORY-RAW)
+			   DTP-HEADER-I DTP-HEADER-P DTP-HEADER-FORWARD
+			   DTP-GC-FORWARD)))
+	       (> LIMIT REGION-LIMIT))
+	(TRANSPORT-ERROR "About to transport malformed object at ~\SI:ADDRESS\~%~v,v,vQ"
+			 (%POINTER LEADER) ADDRESS (%POINTER LEADER) LIMIT
+			 #'TRANSPORT-ERROR-ADDITIONAL-INFO)))
+
+    ;; Transport the structure block.
+    (LET ((COPY (%ALLOCATE-TRANSPORT-BLOCK SIZE REGION)))
+      (%BLOCK-GC-COPY-AND-FORWARD LEADER COPY SIZE)
+      ;; Return the updated pointer.  For structures this is guaranteed to always be copyspace.
+      (VALUES (%32-BIT-PLUS TRAPPING-POINTER (%32-BIT-DIFFERENCE COPY LEADER)) NIL))))
+
+;; VLM has page-based transport traps (which disallow all access), so we
+;; need this to do "raw" reads
+(defmacro peek-at-copyspace ((vma &optional pht-index) &body body &environment env)
+  #-VLM
+  `(progn ,@body)
+  #+VLM
+  (let ((fault (gensym))
+	(index (gensym)))
+    (once-only (vma &environment env)
+      `(let* ((,index (or ,pht-index (pht-lookup (storage::extract-vpn ,vma))))
+	      (,fault (storage::vm-read-attribute transport-fault ,index)))
+	 (when ,fault
+	   (storage::vm-write-attribute transport-fault ,index nil))
+	 (multiple-value-prog1
+	   ,@body
+	   (when ,fault
+	     (storage::vm-write-attribute transport-fault ,index t))))))) 
+
+;; The two arguments and the two results are all represented as fixnums.
+(DEFUN TRANSPORT-FIND-STRUCTURE-EXTENT (TRANSPORT-TRAP-ADDRESS TRAPPING-ADDRESS ORIGIN)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE TRANSPORT-ERROR-INTERNAL TRANSPORT-ERROR-ADDITIONAL-INFO)
+	   (VALUES LEADER SIZE))
+  (LET ((ADDRESS TRAPPING-ADDRESS)
+	(CONTENTS NIL))
+    (DO ((COUNT (%32-BIT-PLUS (%POINTER-DIFFERENCE ADDRESS ORIGIN) 1) (1- COUNT)))
+	(( COUNT 0))
+      (SETQ CONTENTS (%MEMORY-READ ADDRESS :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL))
+      (COMPILER:%ERROR-WHEN (TYPE-MEMBER CONTENTS DTP-HEADER-I DTP-HEADER-P)
+	(LET* ((CONTENTS-TAG (%TAG CONTENTS))
+	       (CONTENTS-POINTER (%POINTER CONTENTS))
+	       (HEADER-TYPE (LDB %%HEADER-TYPE-FIELD-WITHIN-TAG CONTENTS-TAG)))
+	  (IF (TYPE-MEMBER CONTENTS DTP-HEADER-I)
+	      (SELECTOR HEADER-TYPE =
+		(%HEADER-TYPE-ARRAY ; drop through
+		  )
+		(%HEADER-TYPE-NUMBER
+		  (RETURN-FROM TRANSPORT-FIND-STRUCTURE-EXTENT
+		    ;;--- Ignore bignum subtype for now.
+		    (VALUES ADDRESS (1+ (%LOGLDB %%BIGNUM-LENGTH CONTENTS-POINTER)))))
+		(%HEADER-TYPE-COMPILED-FUNCTION
+		  (RETURN-FROM TRANSPORT-FIND-STRUCTURE-EXTENT
+		    (VALUES ADDRESS (%LOGLDB CCA-TOTAL-SIZE CONTENTS-POINTER))))
+		(OTHERWISE (TRANSPORT-ERROR "Illegal HEADER-I subtype at ~\SI:ADDRESS\" ADDRESS)))
+	      ;; HEADER-P
+	      (SELECTOR HEADER-TYPE =
+		(%HEADER-TYPE-LEADER
+		  (SETQ ADDRESS CONTENTS-POINTER
+			CONTENTS (%MEMORY-READ ADDRESS :CYCLE-TYPE %MEMORY-RAW)
+			CONTENTS-POINTER (%POINTER CONTENTS))
+		  ;; drop through
+		  )
+		(%HEADER-TYPE-SYMBOL
+		  (RETURN-FROM TRANSPORT-FIND-STRUCTURE-EXTENT
+		    (VALUES ADDRESS (DEFSTORAGE-SIZE SYMBOL))))
+		(%HEADER-TYPE-INSTANCE
+		  ;;--- Need to use symbolic constants rather than numbers here.
+		  (RETURN-FROM TRANSPORT-FIND-STRUCTURE-EXTENT
+		    (LOOP WITH SIZE-PTR = (%POINTER-PLUS CONTENTS-POINTER -1)
+			  AS WORD = (peek-at-copyspace ((%pointer size-ptr))
+				      (%MEMORY-READ SIZE-PTR :CYCLE-TYPE %MEMORY-RAW))
+			  do
+		      (cond ((TYPE-MEMBER WORD DTP-FIXNUM)
+			     (RETURN (VALUES ADDRESS WORD)))
+			    ((TYPE-MEMBER WORD DTP-ELEMENT-FORWARD #-VLM DTP-GC-FORWARD)
+			     (SETQ SIZE-PTR (%POINTER WORD)))
+			    #+VLM
+			    ;; VLM can't blithely look at copyspace
+			    ((type-member word dtp-gc-forward)
+			     ;; We know we are done on gc-forward
+			     (return
+			       (values
+				 address
+				 (peek-at-copyspace ((%pointer word))
+				   (%memory-read word
+						 :cycle-type %memory-raw
+						 :fixnum-only t)))))
+			    (t (TRANSPORT-ERROR "Instance's flavor clobbered"))))))
+		(OTHERWISE (TRANSPORT-ERROR "Illegal HEADER-P subtype at ~\SI:ADDRESS\" ADDRESS))))
+	  ;; Dropped through for arrays.
+	  (LET* ((LEADER-LENGTH (%LOGLDB ARRAY-LEADER-LENGTH-FIELD CONTENTS-POINTER))
+		 (BYTE-PACKING (%LOGLDB ARRAY-BYTE-PACKING CONTENTS-POINTER))
+		 (LENGTH (IF (ZEROP (%LOGLDB ARRAY-LONG-PREFIX-BIT CONTENTS-POINTER))
+			     (+ (POSITIVE-FIXNUM-CEILING-LSH
+				  (%LOGLDB ARRAY-SHORT-LENGTH-FIELD CONTENTS-POINTER)
+				  BYTE-PACKING)
+				1)
+			     (+ 4
+				(* 2 (%LOGLDB ARRAY-LONG-DIMENSIONS-FIELD CONTENTS-POINTER))
+				(IF (ZEROP (%LOGLDB ARRAY-DISPLACED-BIT CONTENTS-POINTER))
+				    (POSITIVE-FIXNUM-CEILING-LSH
+				      ;;--- LONG-LENGTH-FIELD
+				      (%MEMORY-READ (1+ ADDRESS)
+						    :CYCLE-TYPE %MEMORY-RAW
+						    :FIXNUM-ONLY T
+						    :SET-CDR-NEXT T)
+				      BYTE-PACKING)
+				    0)))))
+	    (UNLESS (ZEROP LEADER-LENGTH)
+	      (SETQ LENGTH (+ LENGTH LEADER-LENGTH 1))
+	      (SETQ ADDRESS (- ADDRESS LEADER-LENGTH 1)))
+	    (RETURN-FROM TRANSPORT-FIND-STRUCTURE-EXTENT
+	      (VALUES ADDRESS LENGTH)))))
+      (COMPILER:%ERROR-WHEN (TYPE-MEMBER CONTENTS DTP-GC-FORWARD
+						  DTP-ELEMENT-FORWARD
+						  DTP-HEADER-FORWARD)
+	(TRANSPORT-ERROR "Ran into a ~A at location ~\SI:ADDRESS\ while scanning~@
+		backwards from ~\SI:ADDRESS\ looking for a DTP-HEADER-I or DTP-HEADER-P.~@
+		~v,v,vQ"
+			 (DATA-TYPE-NAME (%DATA-TYPE CONTENTS)) ADDRESS TRAPPING-ADDRESS
+			 TRANSPORT-TRAP-ADDRESS ADDRESS TRAPPING-ADDRESS
+			 #'TRANSPORT-ERROR-ADDITIONAL-INFO))
+      (DECF ADDRESS))
+    ;; Dropped off of the DO loop or returned.
+    (TRANSPORT-ERROR "Cannot find structure header of address ~\SI:ADDRESS\" TRAPPING-ADDRESS)))
+
+;; This modularity should be easily extendable to a cdr-coding GC.
+;; Keep chasing the CDRs in oldspace as long as they're in the same area
+;; as REGION.  Then allocate the copyspace block and repeatedly apply
+;; %BLOCK-GC-COPY-AND-FORWARD.  The special CDR-NORMAL marker on the
+;; GC-FORWARD in oldspace will have to be inserted manually for each chunk
+;; with %P-TAG-LDB.
+;; 
+;; For now, this only duplicates the functionality of KHS's transport trap.
+;; The arguments are all fixnums.
+(DEFUN FIND-AND-TRANSPORT-LIST-BLOCK (TRAPPING-ADDRESS ORIGIN REGION)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE TRANSPORT-ERROR-INTERNAL)
+	   (VALUES UPDATED-ADDRESS MAY-BE-OLDSPACE))
+  ;; Find the address of the first word of cdr-coded list structure chained
+  ;; together with cdr-next or cdr-normal.  An rplacd-forwarded cell is always
+  ;; the end of such a structure (its cdr code is cdr-nil).  A gc-forwarded cell
+  ;; is necessarily part of some other list, it's cdr-code is cdr-nil so we can
+  ;; easily detect it.
+  (LET* ((ORIGINAL
+	   ;; Quick check to see if we point to the top of a list, which is the usual case.
+	   (IF (OR (= TRAPPING-ADDRESS ORIGIN)
+		   (= (%P-CDR-CODE (1- TRAPPING-ADDRESS)) CDR-NIL))
+	       TRAPPING-ADDRESS
+	       ;; Scan backwards for the head of the list.  Use %BLOCK-READ to help a little.
+	       ;; Ensure that we don't fault on an unnecessary page by aligning the backward
+	       ;; scan first.
+	       (MACROLET ((BLOCK-READ (BAR PREFETCH)
+			    `(%BLOCK-READ ,BAR :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL
+					       :PREFETCH ,PREFETCH))
+			  (CDR-ODD () `(DPB CDR-NIL %%Q-CDR-CODE-WITHIN-TAG 0)))
+		 (PROG ((P (- TRAPPING-ADDRESS 1)))
+		       (SELECTOR (LDB (BYTE 2 0) P) =
+			 (0 (GO C))
+			 (1 (GO B))
+			 (2 (GO A)))
+		       (WHEN (= (%P-CDR-CODE (DECF P)) CDR-NIL) (GO R))
+		    A  (WHEN (= (%P-CDR-CODE (DECF P)) CDR-NIL) (GO R))
+		    B  (WHEN (= (%P-CDR-CODE (DECF P)) CDR-NIL) (GO R))
+		    C  (SELECTOR (%POINTER-DIFFERENCE P ORIGIN) >
+			 (3 (WITH-SYSTEM-BLOCK-REGISTERS (1)
+			      (SETF (%BLOCK-REGISTER 1) (%POINTER-PLUS P -4))
+			      (LET ((A (BLOCK-READ 1 T))
+				    (B (BLOCK-READ 1 T))
+				    (C (BLOCK-READ 1 NIL))
+				    (D (BLOCK-READ 1 NIL)))
+				(WHEN (OR (CL:LOGTEST (%TAG D) (CDR-ODD))
+					  (PROGN (DECF P) (CL:LOGTEST (%TAG C) (CDR-ODD)))
+					  (PROGN (DECF P) (CL:LOGTEST (%TAG B) (CDR-ODD)))
+					  (PROGN (DECF P) (CL:LOGTEST (%TAG A) (CDR-ODD))))
+				  (GO R1)))))
+			 (0 (WHEN (= (%P-CDR-CODE (DECF P)) CDR-NIL) (GO R)))
+			 (OTHERWISE (GO R1)))
+		       (DECF P)
+		       (GO C)
+		    R  (INCF P)
+		    R1 (RETURN P)))))
+	 ;; Find the size, not allowing for rplacd-forwarding
+	 (ORIGINAL-LAST
+	   (WITH-SYSTEM-BLOCK-REGISTERS (1)
+	     (SETF (%BLOCK-REGISTER 1) TRAPPING-ADDRESS)
+	     (SET-ALU-AND-ROTATE-CONTROL :CONDITION %ALU-CONDITION-RESULT-CDR-LOW
+					 :CONDITION-SENSE %ALU-CONDITION-SENSE-TRUE
+					 :ENABLE-CONDITION-EXCEPTION 0)
+	     ;; This loop should run at full memory bandwidth!!
+	     ;; A clever compiler optimizer could even do this loop entirely with
+	     ;; sequencing!  Not that it matters.
+	     ;;    odd-pc  sequence-pc+1 %BLOCK-READ-TEST %MEMORY-RAW
+	     ;;    even-pc sequence-pc-1 %BLOCK-READ-TEST %MEMORY-RAW
+	     (%BLOCK-READ-TEST-TAGBODY (FOUND)
+	       LOOP (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW :SET-CDR-NEXT NIL)
+		    (GO LOOP)
+	       FOUND)
+	     (%POINTER (%BLOCK-REGISTER 1))))
+	 (SIZE (- (1+ ORIGINAL-LAST) ORIGINAL))
+	 (NEW-SIZE SIZE)
+	 (HFWD NIL))
+    
+    ;; If the last cell was rplacd-forwarded to a pair in the same oldspace,
+    ;; we can reattach that pair to the structure, making it one word bigger.
+    ;; If it was rplacd-forwarded to some other region, or has already been
+    ;; evacuated, we have to replace the forwarding pointer with a normal cdr.
+    (LET ((ORIGINAL-LAST-CONTENTS (%MEMORY-READ ORIGINAL-LAST :CYCLE-TYPE %MEMORY-GC-COPY)))
+      (WHEN (TYPE-MEMBER ORIGINAL-LAST-CONTENTS DTP-HEADER-FORWARD)
+	(SETQ HFWD (%POINTER ORIGINAL-LAST-CONTENTS))
+	(IF (AND (= (%REGION-NUMBER HFWD) REGION)
+		 ( (%P-DATA-TYPE HFWD) DTP-GC-FORWARD))
+	    (INCF NEW-SIZE)
+	    ;; Special case: a single cell that was rplacd-forwarded; there is nothing
+	    ;; to reattach the pair to.  We don't allocate anything, but simply substitute
+	    ;; the pair.  TRANSPORT-TRAP should have handled this already.
+	    (COMPILER:%ERROR-WHEN (= NEW-SIZE 1)
+	      (TRANSPORT-ERROR "TRANSPORT-TRAP failed to snap out header-forward")))))
+    
+    ;; Having found the address and size of the list, copy it.
+    (LET* ((COPY (%ALLOCATE-TRANSPORT-BLOCK NEW-SIZE REGION))
+	   (COPY-LAST (+ COPY SIZE -1)))
+      (%BLOCK-GC-COPY-AND-FORWARD ORIGINAL COPY SIZE)
+      (SETQ TRAPPING-ADDRESS
+	    (%32-BIT-PLUS TRAPPING-ADDRESS (%32-BIT-DIFFERENCE COPY ORIGINAL)))
+      ;; TRAPPING-ADDRESS now is the updated pointer
+
+      ;; Now if the original ended with rplacd-forwarding, fix things up.
+      (WHEN (NOT (NULL HFWD))
+	(COND (( NEW-SIZE SIZE)
+	       ;; Reattach cdr-normal pair that replaced cdr-nil/cdr-next singleton
+	       (%BLOCK-GC-COPY-AND-FORWARD HFWD COPY-LAST 2))
+	      (T
+		;; Couldn't absorb forwarded cons, but we can at least replace the
+		;; forwarding pointer with a normal dtp-list style cdr.
+	        (LET ((X (%MEMORY-READ HFWD :CYCLE-TYPE %MEMORY-RAW)))
+		  (WHEN (TYPE-MEMBER X DTP-GC-FORWARD)
+		    (SETQ HFWD (%POINTER X))))
+		(%P-STORE-CDR-CODE (1- COPY-LAST) CDR-NORMAL)
+		(%P-STORE-CDR-TYPE-AND-POINTER COPY-LAST CDR-NIL DTP-LIST HFWD)
+		;; The original car is gc-forwarded to what is now the new cdr pointer.
+		;; Forward it to its evacuated clone.
+		(%P-STORE-TAG-AND-POINTER
+		  ORIGINAL-LAST
+		  (DPB CDR-NIL %%Q-CDR-CODE-WITHIN-TAG DTP-HEADER-FORWARD) HFWD)
+		(WHEN (= TRAPPING-ADDRESS COPY-LAST)
+		  (RETURN-FROM FIND-AND-TRANSPORT-LIST-BLOCK
+		    ;; HFWD might be in oldspace, so cue in our caller.
+		    (VALUES HFWD T))))))
+      ;; Return the updated pointer.  This is guaranteed to be a copyspace pointer.
+      (VALUES TRAPPING-ADDRESS NIL))))
+
+;; This allocates a block of storage in the appropriate region for a transport-trap
+;; in FROM-REGION, and returns the address.  Unlike the non-transporter allocation
+;; functions, we don't mess with BARs or caches.
+(DEFUN %ALLOCATE-TRANSPORT-BLOCK (SIZE FROM-REGION)
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  ;; In oldspace regions, the GC-POINTER is a word containing the level number and
+  ;; the cached copyspace region number.  
+  (LET* ((GC-POINTER (REGION-GC-POINTER FROM-REGION))
+	 (TO-REGION  (LDB %%GC-POINTER-COPYSPACE-REGION GC-POINTER))
+	 OLD-FREE-POINTER
+	 NEW-FREE-POINTER)
+    (COMPILER:%ERROR-WHEN
+	(OR (NOT (REGION-VALID-P TO-REGION))
+	    (%POINTER-LESSP (REGION-LENGTH TO-REGION)
+			    (SETQ NEW-FREE-POINTER
+				  (%POINTER-PLUS (SETQ OLD-FREE-POINTER
+						       (REGION-FREE-POINTER TO-REGION))
+						 SIZE))))
+      ;; Copyspace region hasn't been computed yet, or there's no room left in
+      ;; the computed region.  We have to find another one which can accomodate this size.
+      (SETQ TO-REGION (ALLOCATE-OR-EXTEND-REGION (REGION-AREA FROM-REGION) SIZE
+			;;--- This read-only business for copyspace has to be thought out...
+			(%LOGDPBS -1 %%REGION-READ-ONLY
+				  -1 %%REGION-REPRESENTATION-TYPE
+				  -1 %%REGION-LEVEL
+				  -1 %%REGION-SPACE-TYPE
+				  -1 %%REGION-NO-CONS 0)
+			(LET ((BITS (REGION-BITS FROM-REGION)))
+			 (%LOGDPBS (%LOGLDB %%REGION-REPRESENTATION-TYPE BITS)
+				   %%REGION-REPRESENTATION-TYPE
+				   ;; This is the level number for oldspace
+				   (LDB %%GC-POINTER-COPYSPACE-LEVEL GC-POINTER) %%REGION-LEVEL
+				   (LDB %%REGION-READ-ONLY BITS) %%REGION-READ-ONLY
+				   %REGION-SPACE-COPY %%REGION-SPACE-TYPE
+				   0 %%REGION-NO-CONS 0)))
+	    OLD-FREE-POINTER (REGION-FREE-POINTER TO-REGION)
+	    NEW-FREE-POINTER (%POINTER-PLUS OLD-FREE-POINTER SIZE))
+      (SETF (REGION-GC-POINTER FROM-REGION)
+	    (DPB TO-REGION %%GC-POINTER-COPYSPACE-REGION GC-POINTER)))
+    (LET* ((ORIGIN (REGION-ORIGIN TO-REGION))
+	   (FIRST-ADDRESS-TO-CREATE (%POINTER-PLUS (REGION-CREATED-PAGES TO-REGION) ORIGIN))
+	   (NEW-END (ROUND-TO-CHUNK (%POINTER-PLUS ORIGIN NEW-FREE-POINTER)))
+	   (NEW-PAGES (%POINTER-DIFFERENCE NEW-END FIRST-ADDRESS-TO-CREATE)))
+      (WHEN (PLUSP NEW-PAGES)
+	;;--- This should create the pages, but not necessarily page them in.
+	;;--- Think some more about this.
+	(CREATE-PAGES FIRST-ADDRESS-TO-CREATE NEW-PAGES)
+	(SETF (REGION-CREATED-PAGES TO-REGION) (%POINTER-DIFFERENCE NEW-END ORIGIN)))
+      (SETF (REGION-FREE-POINTER TO-REGION) NEW-FREE-POINTER)
+      (INCF *SCAV-WORK-DONE* SIZE)
+      (INCF* TRANSPORTER-WORDS SIZE)
+      (SETQ *SCAVENGE-REGION* TO-REGION)
+      (PUSH-*GC-HYSTERESIS* TO-REGION)
+      (LET ((BLOCK (%POINTER-PLUS ORIGIN OLD-FREE-POINTER)))
+	#-VLM
+	(WHEN (AND (PLUSP %COPYSPACE-TRANSPORT-TRAP-CLEARED)
+		   (PLUSP (LDB %%WORD-WITHIN-PAGE (%POINTER BLOCK))))
+	  ;; The last partially-full page in the region may have had pht.transport-trap
+	  ;; disabled.  Ensure that it is now enabled, since oldspace pointers may be
+	  ;; copied onto the page.
+	  (%FUNCALL-IN-AUX-STACK #'SET-VPN-TRANSPORT-TRAP
+				 (LDB %%VMA-PAGE-NUM (%POINTER BLOCK))))
+	#+VLM
+	(adjust-copyspace-transport-enables to-region block)
+	BLOCK))))
+
+;; Copying and plunking down forwarding pointers in parallel gives better paging performance.
+;;--- This should cue in the paging system to prefetch somehow.
+(DEFUN %BLOCK-GC-COPY-AND-FORWARD (FROM-ADDRESS TO-ADDRESS SIZE)
+  (DECLARE (SAFEGUARDED-FUNCTION) (VALUES UPDATED-TO-ADDRESS))
+  #+VLM
+  ;; Try the fast way first, if that encounters an error, use the slow
+  ;; code for compatibility (--- could just wired-ferror).
+  (when (storage::vm-copy-and-forward from-address to-address size)
+    (return-from %block-gc-copy-and-forward to-address))
+  (SAVING-REGISTERS-FOR-EFFECT (%REGISTER-BAR-2 %REGISTER-BAR-3)
+    (SETF (%BLOCK-REGISTER 1) FROM-ADDRESS) ;read pointer
+    (SETF (%BLOCK-REGISTER 2) FROM-ADDRESS) ;write gc-forwards pointer
+    (SETF (%BLOCK-REGISTER 3) TO-ADDRESS)   ;copy pointer
+    (LET ((GC-FORWARD (%SET-TAG TO-ADDRESS
+				(DPB CDR-NIL %%Q-CDR-CODE-WITHIN-TAG DTP-GC-FORWARD))))
+      (PREPARE-FOR-BLOCK-WRITE)
+      (UNROLL-BLOCK-FORMS (SIZE 8)
+	(%BLOCK-WRITE 3 (%BLOCK-READ 1 :CYCLE-TYPE %MEMORY-GC-COPY :SET-CDR-NEXT NIL))
+	(%BLOCK-WRITE 2 GC-FORWARD)
+	(SETF GC-FORWARD (%POINTER-PLUS GC-FORWARD 1)))))
+  TO-ADDRESS)
+
+;; Scavenging
+
+;; There is no transport-cons-cache on the I machine, so this is the
+;; same as *SCAV-WORK-DONE*.
+(DEFMACRO REAL-SCAV-WORK-DONE ()
+  '*SCAV-WORK-DONE*)
+
+
+
+#-VLM
+;; "%SCAN-GC-TAGS"
+;; Returns the VMA of a resident page and a new index, or NIL.
+;; Assumes that pht1.ephemeral-reference is zero for unused pages.
+(DEFUN %SCAV-SCAN-PHT (START-INDEX LIMIT-INDEX EPHEMERAL-GROUP-MASK OLDSPACE-MAP)
+  (DECLARE (WIRED-FUNCTION))
+  (%SET-MIN-TRAP-MODE TRAP-MODE-EXTRA-STACK)
+  (WITH-SYSTEM-BLOCK-REGISTERS (1)
+    (LET* ((GARBAGE 0)
+	   (START-ADDRESS (%POINTER-PLUS STORAGE::*PHT-BASE* START-INDEX))
+	   (LIMIT-ADDRESS (%POINTER-PLUS STORAGE::*PHT-BASE* LIMIT-INDEX))
+	   (COUNT (%POINTER-DIFFERENCE LIMIT-ADDRESS START-ADDRESS))
+	   (OFFSET (%FIXNUM-MOD COUNT 8))
+	   (OLDSPACE-MAP OLDSPACE-MAP))
+      (DECLARE (ARRAY-REGISTER OLDSPACE-MAP))
+      (SETF (%BLOCK-REGISTER 1) START-ADDRESS)
+      (SET-ALU-AND-ROTATE-CONTROL :CONDITION %ALU-CONDITION-ZERO
+				  :CONDITION-SENSE %ALU-CONDITION-SENSE-FALSE
+				  :ENABLE-CONDITION-EXCEPTION 0
+				  :FUNCTION-CLASS %ALU-FUNCTION-CLASS-BOOLEAN
+				  :FUNCTION-BITS CL:BOOLE-AND)
+      (BLOCK SEARCH
+	(%BLOCK-READ-TEST-TAGBODY (SUCCESS :OPERAND-2 EPHEMERAL-GROUP-MASK)
+	      (UNLESS (PLUSP COUNT) (GO RETURN-NIL))
+	      (SETQ COUNT (%FIXNUM-CEILING COUNT 8))
+	  RETRY
+	      (UNLESS (PLUSP COUNT) (GO RETURN-NIL))
+	      (SELECTOR OFFSET =
+		(0 (GO LOOP-0))
+		(2 (GO LOOP-6))
+		(4 (GO LOOP-4))
+		(OTHERWISE (GO LOOP-2)))
+	  LOOP-0
+	      (%BLOCK-READ-ALU  1 GARBAGE)
+	      (%BLOCK-READ-TEST 1 :FIXNUM-ONLY T :SET-CDR-NEXT T)
+	  LOOP-2
+	      (%BLOCK-READ-ALU  1 GARBAGE)
+	      (%BLOCK-READ-TEST 1 :FIXNUM-ONLY T :SET-CDR-NEXT T)
+	  LOOP-4
+	      (%BLOCK-READ-ALU  1 GARBAGE)
+	      (%BLOCK-READ-TEST 1 :FIXNUM-ONLY T :SET-CDR-NEXT T)
+	  LOOP-6
+	      (%BLOCK-READ-ALU  1 GARBAGE)
+	      (%BLOCK-READ-TEST 1 :FIXNUM-ONLY T :SET-CDR-NEXT T)
+	      (DECF COUNT)
+	      (WHEN (PLUSP COUNT) (GO LOOP-0))
+	  RETURN-NIL
+	      (RETURN-FROM SEARCH NIL)
+	  SUCCESS
+	      ;; BAR-1 points to the PHT1 entry which matched.
+	      ;; Reread PHT0 to see if it is oldspace.
+	      (LET* ((CURRENT-POINTER (%BLOCK-REGISTER 1))
+		     (PHT0 (%MEMORY-READ (%POINTER-PLUS CURRENT-POINTER -1) :FIXNUM-ONLY T)))
+		;; The AREF below bashes the %REGISTER-ALU-AND-ROTATE-CONTROL register.
+		(SAVING-REGISTERS-FOR-EFFECT (%REGISTER-ALU-AND-ROTATE-CONTROL)
+		  (COND ((AREF OLDSPACE-MAP (%LOGLDB %%VMA-ZONE-AND-DEMILEVEL PHT0))
+			 ;; It is oldspace.  Continue on our scan.
+			 (SETF (%BLOCK-REGISTER 1)
+			       (SETQ CURRENT-POINTER (%POINTER-PLUS CURRENT-POINTER 1)))
+			 (SETQ OFFSET
+			       (%FIXNUM-MOD (%POINTER-DIFFERENCE LIMIT-ADDRESS CURRENT-POINTER)
+					    8))
+			 (WHEN (ZEROP OFFSET) (DECF COUNT)))
+			(T ;; It is not oldspace.  Return to our caller.
+			  (RETURN-FROM SEARCH
+			    (VALUES
+			      (%LOGDPB 0 %%VMA-WORD-OFFSET PHT0)
+			      (%POINTER-DIFFERENCE (%POINTER-PLUS CURRENT-POINTER 1)
+						   STORAGE::*PHT-BASE*))))))
+		(GO RETRY)))))))
+
+;Scavenge some resident pages, as directed by the PHT
+(DEFUN SCAVENGE-RESIDENT-PAGES (WORK-UNITS MAX-TIME)
+  #+VLM (declare (ignore work-units max-time))
+  #+VLM
+  (progn
+    ;; VLM skips this for now.  If there were better communication with
+    ;; the host, perhaps it could visit the pages in a better order, but
+    ;; the VLM "PHT" is really more of an ESRT...
+    (setq *esrt-scan-index* 0)
+    (setq *scavenger-state* 'esrt)
+    nil)
+  #-VLM
+  (LET* ((START-TIME (%MICROSECOND-CLOCK))	;Metering
+	 (START-FETCHES *COUNT-PAGE-FETCHES*)	;Metering
+	 (PAGES-DONE 0)				;Metering
+	 (OLDSPACE-MAP *OLDSPACE-MAP*)
+	 (PHT-POINTER NIL)
+	 (NEXT-PHT-POINTER NIL)
+	 (PHT-LIMIT (%FIXNUM-MULTIPLY 2 STORAGE::*PHT-SIZE*))
+	 (MASK *EPHEMERAL-GROUP-OLDSPACE-MASK*)
+	 ADDRESS)
+    (LOOP NAMED LOOP
+	  DO (SETQ PHT-POINTER *SCAVENGER-RESIDENT-PAGES-STATE*)
+	     (MULTIPLE-VALUE (ADDRESS NEXT-PHT-POINTER)
+	       (%SCAV-SCAN-PHT (MAX PHT-POINTER 0) PHT-LIMIT MASK OLDSPACE-MAP))
+	  ;; The STORE-CONDITIONAL is for interlocking with PHT-REHASH.
+	  UNTIL (AND (STORE-CONDITIONAL (LOCF *SCAVENGER-RESIDENT-PAGES-STATE*)
+					PHT-POINTER NEXT-PHT-POINTER)
+		     (NULL ADDRESS))
+	  AS BASE-WORK = (REAL-SCAV-WORK-DONE)
+	  DO (UNLESS (NULL ADDRESS)
+	       (INCF PAGES-DONE)
+	       #+IGNORE (ENTER-SCAVENGE-TRACE %SCAV-OP-PHT (EXTRACT-VPN ADDRESS))
+	       (SCAVENGE-PAGE ADDRESS)
+	       (WHEN (OR *SCAVENGE-REGION*
+			 *GC-HYSTERESIS*
+			 (MINUSP (DECF WORK-UNITS
+				       (- (REAL-SCAV-WORK-DONE) BASE-WORK)))
+			 (< MAX-TIME (%32-BIT-DIFFERENCE (%MICROSECOND-CLOCK)
+							 START-TIME)))
+		 (RETURN-FROM LOOP)))
+	  FINALLY
+	    ;; Also scavenge the stack buffer.  If there has not been a stack-group
+	    ;; switch since a reference to an ephemeral object that is now in oldspace
+	    ;; got into the stack buffer, the PHT bit might never have gotten set.
+	    (%BLOCK-TRANSPORT (%READ-INTERNAL-REGISTER %REGISTER-STACK-CACHE-LOWER-BOUND)
+			      (%POINTER-DIFFERENCE
+				(%STACK-FRAME-POINTER)
+				(%READ-INTERNAL-REGISTER %REGISTER-STACK-CACHE-LOWER-BOUND))
+			      T)
+	    ;; If we get here, the entire GCPT has been processed, so advance to next phase
+	    (SETQ *ESRT-SCAN-NODE* NIL)
+	    (SETQ *SCAVENGER-STATE* 'ESRT))
+    ;; Metering
+    (UPDATE-MS-METER SCAVENGER-RESIDENT-PAGES-MILLISECONDS START-TIME)
+    (INCF SCAVENGER-RESIDENT-PAGES-PAGE-FETCHES (- *COUNT-PAGE-FETCHES* START-FETCHES))
+    (INCF SCAVENGER-RESIDENT-PAGES-WORDS (%FIXNUM-MULTIPLY PAGES-DONE PAGE-SIZE))
+    (INCF SCAVENGER-RESIDENT-PAGES-TIMES)
+    NIL))
+
+(DEFUN RESIDENT-PAGES-PROGRESS ()
+  (DECLARE (VALUES NUMERATOR DENOMINATOR))
+  #-VLM
+  (VALUES (MAX *SCAVENGER-RESIDENT-PAGES-STATE* 0) (%FIXNUM-MULTIPLY 2 STORAGE::*PHT-SIZE*))
+  #+VLM
+  (VALUES 1 1))
+
+;; VLM version of these functions otherwise in STORAGE;WIRED-ESRT
+#+VLM
+(defvar *esrt-scan-index* 0)
+
+#+VLM
+(defun esrt-scan (mask vma n-pages)
+  (declare (ignore mask) (values vma n-pages))
+  
+  (when (%unsigned-lessp vma *esrt-scan-index*)
+    (setq vma *esrt-scan-index*))
+
+  ;; skip non-existent regions --- skip old regions
+  (unless (%region-number vma)
+;;    #+ignore
+    ;; we know this vma is non-existent, try the next:
+    (incf* vma (dpb 1 %%vma-address-space-map-offset 0))
+    (loop named search
+	  with row
+	  with last = (%pointer-plus *address-space-map-address*
+				     (lsh 1 (byte-size %%vma-address-space-map-high)))
+	  as high = (%pointer-plus *address-space-map-address*
+				   (ldb %%vma-address-space-map-high vma))
+		  then (%pointer-plus high 1)
+	  as row-offset = (ldb %%vma-address-space-map-low vma) then 0
+	  while (%pointer-lessp high last)
+	  finally (return-from esrt-scan (values nil nil))
+	  when (setq row (%memory-read high :cycle-type %memory-raw))
+	    do (loop with word
+		     with region
+		     with end = (%pointer-plus row
+					       (lsh 1 (byte-size %%vma-address-space-map-low)))
+		     as low = (%pointer-plus row row-offset)
+			    then (%pointer-plus low 1)
+		     while (%pointer-lessp low end)
+		     do
+		 (when ( -1 (setq word (%memory-read low :cycle-type %memory-raw
+						      :fixnum-only t)))
+		   (when (cond
+			   ((region-valid-p (setq region (ldb (byte #o20 #o0) word)))
+			    (setq vma (dpb 0 %%vma-address-space-map-offset 0))
+			    t)
+			   ((region-valid-p (setq region (ldb (byte #o20 #o20) word)))
+			    (setq vma (dpb 1 %%vma-address-space-map-offset 0))
+			    t))
+		     (let* ((bits (region-bits region))
+			    (space (ldb %%region-space-type bits)))
+		       (unless (or (= space %region-space-old)	;Ignore oldspace
+				   (if *transporter-break-weak-links*
+				       ( space %region-space-weak)	;Do only weakspace
+				       (= space %region-space-weak)))	;Do only strongspace
+			 (when (ldb-test %%region-scavenge-enable bits)
+			   (setq vma (%logdpbs
+				       (%pointer-difference high *address-space-map-address*)
+				       %%vma-address-space-map-high
+				       (%pointer-difference low row)
+				       %%vma-address-space-map-low
+				       vma))
+			   (return-from search)))))))))
+
+  ;; always do whole chunks
+  (setq n-pages (%logdpb 0 %%page-within-chunk
+			 (+ n-pages
+			    (dpb -1 %%page-within-chunk 0))))
+  
+  (let ((address nil))
+    (if (setq address (storage::vm-pht-scan
+			vma
+			;; Don't scan wired space, that is handled specially
+			(storage::address-difference
+			  (%logdpb %wired-zone %%vma-zone-num 0)
+			  vma)
+			;; search for any pages with ephemeral references that are
+			;; transport-enabled
+			storage::(%logdpbs 1 vm-attribute-transport-fault
+					   1 vm-attribute-ephemeral-reference
+					   0)
+			t)) 
+	(let ((end nil))
+	  (setq address (%set-tag address (%tag vma)))
+	  (setq *esrt-scan-index* address)
+	  ;; Now search for next page that does not match
+	  (if (setq end (storage::vm-pht-scan
+			  address
+			  (%logdpb n-pages %%vma-page-num 0)
+			  storage::(%logdpbs 1 vm-attribute-transport-fault
+					     1 vm-attribute-ephemeral-reference
+					     0)
+			  nil))
+	      (values address
+		      (%logldb %%vma-page-num (%pointer-difference end address)))
+	      (values address n-pages)))
+	(values nil nil))))
+
+#+VLM
+(defun aux-esrt-progress ()
+  (values
+    (lsh *esrt-scan-index* -1)
+    cl:most-positive-fixnum))
+
+;; All arguments here must be fixnums, otherwise oldspace pointer will transport.
+(DEFUN %SCAN-FOR-OLDSPACE (ADDRESS LIMIT-ADDRESS
+			   &AUX #-VLM (COUNT (%POINTER-DIFFERENCE LIMIT-ADDRESS ADDRESS))
+				#-VLM UNROLLED-COUNT)
+  (DECLARE (VALUES NEW-NEXT-ADDRESS OLDSPACE-POINTER)
+	   #+VLM (declare (ignore address)))
+  #+VLM
+  ;; Not worthwhile (or allowed!) on VLM, as scanning clears faults!
+  (values limit-address nil)	
+  #-VLM
+  (WITH-SYSTEM-BLOCK-REGISTERS (1)
+    (SETF (%BLOCK-REGISTER 1) ADDRESS)
+    (SET-ALU-AND-ROTATE-CONTROL :CONDITION %ALU-CONDITION-OP1-OLDSPACEP
+				:CONDITION-SENSE %ALU-CONDITION-SENSE-TRUE
+				:ENABLE-CONDITION-EXCEPTION 0)
+    (BLOCK NIL
+      (%BLOCK-READ-TEST-TAGBODY (SUCCESS)
+	    (UNLESS (PLUSP COUNT) (GO FAIL))
+	    (WHEN (< COUNT 8) (GO SLOW-LOOP))
+	    (SETQ UNROLLED-COUNT (LDB (BYTE 29. 3) COUNT))
+	FAST-LOOP
+	    (PROGN . #.(LOOP REPEAT 8 COLLECT '(%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)))
+	    ;; Sigh.  No LOOP-DECREMENT-TOS here, since TOS is used.
+	    (WHEN (PLUSP (DECF UNROLLED-COUNT)) (GO FAST-LOOP))
+	    (WHEN (ZEROP (SETQ COUNT (LDB (BYTE 3 0) COUNT))) (GO FAIL))
+	SLOW-LOOP
+	    (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+	    (WHEN (PLUSP (DECF COUNT)) (GO SLOW-LOOP))
+	FAIL
+	    (RETURN (VALUES LIMIT-ADDRESS NIL))
+	SUCCESS
+	    (RETURN (VALUES (%POINTER-PLUS (%SET-TAG (%BLOCK-REGISTER 1) (%TAG ADDRESS)) 1)
+			    (%SET-TAG (%BLOCK-REGISTER 1) (%TAG ADDRESS))))))))
+
+;; Debugging
+
+(DEFWIREDVAR *VERIFY-NO-RESIDENT-OLDSPACE* NIL)
+
+(DEFWIREDVAR *COUNT-IGNORED-OLDSPACE-REFERENCES* 0)
+(DEFWIREDVAR *LAST-IGNORED-OLDSPACE-REFERENCE-VPN*)
+
+;; Scan for hardware oldspace in any resident page and halt if there is any.
+;; Must be called on the aux stack.
+;; This is called only when *VERIFY-NO-RESIDENT-OLDSPACE* is set.
+#+VLM
+(defun verify-no-resident-oldspace ()
+  (declare (wired-function))
+  (when (zerop *false-oldspace-mask*)
+    (dotimes (region (n-regions))
+      (unless (or
+		;; Non-object areas
+		(eq region 0)			;FEP-AREA
+		)
+	(block scan-region
+	  (let* ((bits (region-bits region))
+		 (type (ldb %%region-space-type bits))
+		 (address nil))
+	    (unless (or (not (ldb-test %%region-scavenge-enable bits))
+			(eq type %region-space-free)
+			(eq type %region-space-old))
+	      (let ((region-origin (region-origin region))
+		    (region-extent (real-region-free-pointer region)))
+		(when (eq type %region-space-control-stack)
+		  ;; Flush the stack-cache, to update the VLM scan logic
+		  (%coprocessor-write (compiler:%stack-location-internal 0) #o1201))
+		#+ignore
+		(when (setq address (storage::vm-pht-scan
+				      region-origin
+				      region-extent
+				      storage::(%logdpbs 1 vm-attribute-transport-fault
+							 1 vm-attribute-ephemeral-reference
+							 0)
+				      t))
+		  (when (ldb-test %%region-stack bits)
+		    (incf* *count-ignored-oldspace-references*)
+		    (setq *last-ignored-oldspace-reference-vpn*
+			  (%pointer address))
+		    (return-from scan-region nil))
+		  (wired-ferror :proceedable-halt "Incomplete PHT scan at ~S"
+				(%pointer address))
+		  (return-from scan-region nil))
+		(when (setq address (storage::vm-scan region-origin region-extent t))
+		  (when (ldb-test %%region-stack bits)
+		    (incf* *count-ignored-oldspace-references*)
+		    (setq *last-ignored-oldspace-reference-vpn*
+			  (%pointer address))
+		    (return-from scan-region nil))
+		  (wired-ferror :proceedable-halt "Unexpected oldspace at ~S"
+				(%pointer address))
+		  (return-from scan-region nil))))))
+	nil)))
+  nil)
+
+#-VLM
+(DEFUN VERIFY-NO-RESIDENT-OLDSPACE ()
+  (DECLARE (WIRED-FUNCTION))
+  (WHEN (ZEROP *FALSE-OLDSPACE-MASK*)
+    (WITH-SYSTEM-BLOCK-REGISTERS (1 2)
+      (FLET ((SCAN-PAGE (PHT0 PHT1)
+	       (WHEN (AND (NOT (= (LDB %%PHT0-VPN PHT0) (LDB %%PHT0-VPN -1)))
+			  (ZEROP (LDB %%PHT0-PENDING PHT0))
+			  ;; Don't scan the page if it's oldspace.
+			  (NOT (AREF *OLDSPACE-MAP* (LDB %%VMA-ZONE-AND-DEMILEVEL PHT0))))
+		 (SETF (%BLOCK-REGISTER 1)
+		       (%MAKE-POINTER DTP-PHYSICAL-ADDRESS
+				      (DEPOSIT-PPN (LDB %%PHT1-PPN PHT1) 0)))
+		 (SET-ALU-AND-ROTATE-CONTROL :CONDITION %ALU-CONDITION-OP1-OLDSPACEP
+					     :CONDITION-SENSE %ALU-CONDITION-SENSE-TRUE
+					     :ENABLE-CONDITION-EXCEPTION 0)
+		 (LET ((COUNT (FLOOR PAGE-SIZE 8)))
+		   (%BLOCK-READ-TEST-TAGBODY (FOUND-OLDSPACE)
+		     LOOP (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (%BLOCK-READ-TEST 1 :CYCLE-TYPE %MEMORY-RAW)
+			  (WHEN (PLUSP (DECF COUNT)) (GO LOOP))
+			  (RETURN-FROM SCAN-PAGE NIL)
+		     FOUND-OLDSPACE
+		          ;; Page might have I/O in progress.
+		          (LET ((MMPT-INDEX (STORAGE::MMPT-LOOKUP (LDB %%PHT1-PPN PHT1))))
+			    (WHEN MMPT-INDEX
+			      (LET ((STATUS (STORAGE::MMPT-STATUS MMPT-INDEX)))
+				(WHEN (OR (= STATUS STORAGE::%MMPT-STATUS-READING)
+					  (= STATUS STORAGE::%MMPT-STATUS-WRITING))
+				  (RETURN-FROM SCAN-PAGE NIL)))))
+			  ;; There can be unscavenged oldspace references from off
+			  ;; the top of stacks.  It's hard to tell if something's off the
+			  ;; top of a stack from wired code, so for the time being just punt
+			  ;; all references from stacks.
+			  (LET ((REGION (%REGION-NUMBER
+					  (DEPOSIT-VPN (LDB %%PHT0-VPN PHT0) 0))))
+			    (WHEN REGION
+			      (LET ((BITS (REGION-BITS REGION)))
+				(WHEN (OR (LDB-TEST %%REGION-STACK BITS)
+					  (NOT (LDB-TEST %%REGION-SCAVENGE-ENABLE BITS)))
+				  (INCF* *COUNT-IGNORED-OLDSPACE-REFERENCES*)
+				  (SETQ *LAST-IGNORED-OLDSPACE-REFERENCE-VPN*
+					(LDB %%PHT0-VPN PHT0))
+				  (RETURN-FROM SCAN-PAGE NIL)))))
+			  (WIRED-FERROR :PROCEEDABLE-HALT "Unexpected oldspace at ~S"
+					(%BLOCK-REGISTER 1))
+			  (RETURN-FROM SCAN-PAGE NIL))))))
+	(SETF (%BLOCK-REGISTER 2) STORAGE::*PHT-BASE*)
+	(DO ((COUNT (%FIXNUM-FLOOR STORAGE::*PHT-SIZE* 4) (1- COUNT)))
+	    (( COUNT 0))
+	  (LET ((PHT10 (%BLOCK-READ 2 :FIXNUM-ONLY T))
+		(PHT11 (%BLOCK-READ 2 :FIXNUM-ONLY T))
+		(PHT20 (%BLOCK-READ 2 :FIXNUM-ONLY T))
+		(PHT21 (%BLOCK-READ 2 :FIXNUM-ONLY T))
+		(PHT30 (%BLOCK-READ 2 :FIXNUM-ONLY T))
+		(PHT31 (%BLOCK-READ 2 :FIXNUM-ONLY T))
+		(PHT40 (%BLOCK-READ 2 :FIXNUM-ONLY T :PREFETCH NIL))
+		(PHT41 (%BLOCK-READ 2 :FIXNUM-ONLY T :PREFETCH NIL)))
+	    (SCAN-PAGE PHT10 PHT11)
+	    (SCAN-PAGE PHT20 PHT21)
+	    (SCAN-PAGE PHT30 PHT31)
+	    (SCAN-PAGE PHT40 PHT41))))))
+  NIL)
+
+#| Debugging tool remenants |
+
+(DEFCONSTANT %SCAVENGE-TRACE-SIZE 16384.)
+
+(DEFCONSTANT %%SCAVENGE-TRACE-OPERAND (BYTE 3 24.))
+(DEFCONSTANT %%SCAVENGE-TRACE-VPN (BYTE 24. 0))
+(DEFCONSTANT %SCAV-OP-PHT 0)
+(DEFCONSTANT %SCAV-OP-ESRT 1)
+(DEFCONSTANT %SCAV-OP-FLIP 2)
+(DEFCONSTANT %SCAV-OP-ESRT-INSERT 3)
+(DEFCONSTANT %SCAV-OP-ESRT-DELETE 4)
+
+(DEFVAR-WIRED *SCAVENGE-TRACE*
+	      (MAKE-ARRAY %SCAVENGE-TRACE-SIZE :AREA SAFEGUARDED-OBJECTS-AREA))
+
+(ADD-INITIALIZATION '*SCAVENGE-TRACE* '(WIRE-STRUCTURE *SCAVENGE-TRACE*) '(:ONCE))
+
+(DEFVAR-WIRED *SCAVENGE-TRACE-POINTER* 0)
+
+;; A bit-mask of scav-ops which get recorded.
+(DEFVAR-WIRED *SCAVENGE-TRACE-ENABLES* -1)
+
+(DEFUN ENTER-SCAVENGE-TRACE (OP VPN)
+  (DECLARE (WIRED-FUNCTION))
+  (WHEN (BIT-MEMBER OP *SCAVENGE-TRACE-ENABLES*)
+    (LET ((POINTER *SCAVENGE-TRACE-POINTER*))
+      (SETF (AREF *SCAVENGE-TRACE* POINTER)
+	    (%LOGDPB OP %%SCAVENGE-TRACE-OPERAND VPN))
+      (INCF POINTER)
+      (WHEN ( POINTER %SCAVENGE-TRACE-SIZE) (SETQ POINTER 0))
+      (SETQ *SCAVENGE-TRACE-POINTER* POINTER)))
+  NIL)
+
+(DEFUN CLEAR-EPHEMERAL-REFERENCE-BITS ()
+  (DECLARE (WIRED-FUNCTION))
+  (%SET-MIN-TRAP-MODE TRAP-MODE-EXTRA-STACK) ;--- Somewhere else?
+  (WITH-SYSTEM-BLOCK-REGISTERS (1 2)
+    ;; Set the transport trap bits of all pages.
+    (SETF (%BLOCK-REGISTER 1) STORAGE::*PHT-BASE*)
+    (SETF (%BLOCK-REGISTER 2) STORAGE::*PHT-BASE*)
+    ;; Fast loop.  The PHT is always a multiple of 8 long!
+    ;; 8 cycles per entry, plus loop overhead, plus block-read lossage,
+    ;; equals about 9 cycles per entry.
+    (DO ((COUNT (%FIXNUM-FLOOR STORAGE::*PHT-SIZE* 4) (1- COUNT)))
+	(( COUNT 0))
+      (LET ((PHT10 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	    (PHT11 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	    (PHT20 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	    (PHT21 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	    (PHT30 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	    (PHT31 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL))
+	    (PHT40 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL :PREFETCH NIL))
+	    (PHT41 (%BLOCK-READ 1 :FIXNUM-ONLY T :SET-CDR-NEXT NIL :PREFETCH NIL)))
+	;; --- Note that these do not preserve the cdr-code of PHT1
+	;; --- This is okay for now because they are currently unused.
+	(%BLOCK-WRITE 2 PHT10)
+	(%BLOCK-WRITE 2 (%LOGDPB 0 %%PHT1-EPHEMERAL-REFERENCE PHT11))
+	(%BLOCK-WRITE 2 PHT20)
+	(%BLOCK-WRITE 2 (%LOGDPB 0 %%PHT1-EPHEMERAL-REFERENCE PHT21))
+	(%BLOCK-WRITE 2 PHT30)
+	(%BLOCK-WRITE 2 (%LOGDPB 0 %%PHT1-EPHEMERAL-REFERENCE PHT31))
+	(%BLOCK-WRITE 2 PHT40)
+	(%BLOCK-WRITE 2 (%LOGDPB 0 %%PHT1-EPHEMERAL-REFERENCE PHT41)))))
+  (%INVALIDATE-MAP-CACHE)
+  NIL)
+
+||#

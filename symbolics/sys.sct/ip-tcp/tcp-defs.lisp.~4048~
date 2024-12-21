@@ -1,0 +1,631 @@
+;;; -*- Mode: Lisp; Syntax: Common-Lisp; Package: TCP; Base: 10; Lowercase: Yes; -*-
+;; Transmission Control Protocol -- definitions
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+#|  To do:
+
+What exactly is tcb-send-window?  Is it always snd.lim-snd.nxt?
+In whatever case, fixup get-output-segment.
+
+|#
+
+;;; debugging defvars
+
+(defvar |Someday: hack verbose segment printing|)
+(defvar |Someday: make security and compartment work|)
+
+  ;;
+;;;;;;  Definitions for TCP segments
+  ;;
+
+(defstruct (tcp-segment-leader (:include neti:sub-packet)
+			          (:alterant nil)
+				  (:conc-name seg-)
+				  :size-symbol)
+  
+  link					;link to next segment in chain, or T if
+					;segment not on a chain.
+  source-address			;source (IP) address
+  destination-address			;destination (IP) address
+  start					;byte offset to start of segment data
+  length				;seg.len: data bytes + SYN and FIN usage, if present
+  bound					;highest array index allowed (including header)
+  time-transmitted			;the time this segment was last transmitted
+  times-transmitted			;number of times this segment was transmitted
+  allocated				;for debugging.  set to T when
+					;allocated, NIL when deallocated.
+  output-state				;NIL (not output), :TCB-ONLY, :USER-ONLY or
+				       	; :TCB-AND-USER
+  leader-spare-1
+  )
+
+;;; The following could obviously be done more generally. Too Bad.
+
+(defmacro alter-tcp-segment-leader
+	  (item &rest keys-and-values)
+  `(progn
+     ,@(loop for (key value . nil) on keys-and-values by #'cddr
+	     collect `(setf (,(intern
+				(string-append "SEG-" key))
+			     ,item)
+			    ,value))))
+
+(defstruct (tcp-recent-segment :array-leader (:conc-name seg-recent-) :size-symbol)
+  length			;reserved for fill-pointer
+  direction			;direction packet was going (:in or :out)
+  from				;source host
+  to				;destination host
+  recorded			;time recorded
+  )
+
+
+;;; The following could obviously be done more generally. Too Bad.
+
+(defmacro alter-tcp-recent-segment
+	  (item &rest keys-and-values)
+  `(progn
+     ,@(loop for (key value . nil) on keys-and-values by #'cddr
+	     collect `(setf (,(intern
+				(string-append "SEG-RECENT-" key))
+			     ,item)
+			    ,value))))
+
+;;; viewed as an art-8b array
+
+#| tcp-segment-header's are a bizarre hybrid.  They are named
+   structures that CANNOT be expressed with defstruct.  They 
+   have a named structure symbol in their LEADER, but their
+   slots are in the body of the array.  There is no option to
+   defstruct that asks for one of these.
+
+   Code elsewhere wants to use 'tcp-segment-header as the second
+   argument to typep.  Unfortunately, the only clean way to have
+   a structure name be legitimate as the second typep argument is
+   for the defstruct to include :named as an option.  However,
+   if you add :named, defstruct assumes that the named structure
+   symbol is going to be in slot zero of the array BODY, and bumps
+   the accessor array offsets appropriately.  There is no way to
+   express :named-with-the-name-in-the-leader-and-the-contents-in-the-body.
+   
+   Thus, the following peculiar deftype to define this as a type.
+   If the defstruct is converted to common lisp, beware the fact that
+   it will define a useless tcp-segment-header-p.
+
+   Also note that cl:defstruct chokes on field specs, which is why this is
+   a setalisp defstruct. 
+|#
+
+(deftype tcp-segment-header () '(satisfies tcp-segment-header-p))
+
+(zl:defstruct
+  (tcp-segment-header :array
+		      (:alterant nil)
+		      (:conc-name seg-)
+		      (:constructor nil)
+		      :size-symbol)
+  source-port-high		;source ...
+  source-port-low		;...	port
+  destination-port-high		;destination ...
+  destination-port-low		;...	     port
+  sequence-1			;start ... 
+  sequence-2			;...   segment ...
+  sequence-3			;      ...     octet
+  sequence-4			;	       ...   number
+  acknowledge-1			;foreign ...
+  acknowledge-2			;...	 acking ...
+  acknowledge-3			;	 ...	this ...
+  acknowledge-4			;		...  octet
+  ((data-offset #o0404))	;offset (in 32bit words) to data portion
+  ((flags nil)			;segment flags, the following bits are defined
+   (urg #o0501)			;  bit: urgent field is valid
+   (ack #o0401)			;  bit: ack field is valid
+   (psh #o0301)			;  bit: push data through to user
+   (rst #o0201)			;  bit: reset the connection
+   (syn #o0101)			;  bit: synchronize sequence numbers
+   (fin #o0001))		;  bit: no more data from sender
+  window-high			;available window ...
+  window-low			;...		  above ack field
+  checksum-high			;header ...
+  checksum-low			;...	checksum
+  urgent-high			;urgent data offset ...
+  urgent-low			;...		    above seq number
+  )
+
+(defun tcp-segment-header-p (x)
+  (and
+    (arrayp x)
+    (zl:array-has-leader-p x)
+    ( (zl:array-leader-length x) 2)
+    (eq (zl:array-leader x 1) 'tcp-segment-header)))
+
+(defmacro alter-tcp-segment-header
+	  (item &rest keys-and-values)
+  `(progn
+     ,@(loop for (key value . nil) on keys-and-values by #'cddr
+	     collect `(setf (,(intern
+				(string-append "SEG-" key))
+			     ,item)
+			    ,value))))
+
+(define-structure-substs tcp-segment-header
+  (seg-checksum		checksum-high		2)
+  (seg-source-port      source-port-high	2)
+  (seg-destination-port destination-port-high	2)
+  (seg-sequence	   	sequence-1		4)
+  (seg-acknowledge	acknowledge-1		4)
+  (seg-window		window-high		2)
+  (seg-urgent	   	urgent-high		2))
+
+(defsubst seg-length-data-only (seg)
+  (- (seg-length seg) (seg-syn seg) (seg-fin seg)))
+
+(defparameter min-data-offset (ceiling tcp-segment-header-size 4))
+
+
+
+  ;;
+;;;;;;  Some helpers for dealing with the flags
+  ;;
+
+(defconstant seg-flag-urg-bit 1_5)
+(defconstant seg-flag-ack-bit 1_4)
+(defconstant seg-flag-psh-bit 1_3)
+(defconstant seg-flag-rst-bit 1_2)
+(defconstant seg-flag-syn-bit 1_1)
+(defconstant seg-flag-fin-bit 1_0)
+
+(defconstant seg-flag-urg-field (byte 1 5))
+(defconstant seg-flag-ack-field (byte 1 4))
+(defconstant seg-flag-psh-field (byte 1 3))
+(defconstant seg-flag-rst-field (byte 1 2))
+(defconstant seg-flag-syn-field (byte 1 1))
+(defconstant seg-flag-fin-field (byte 1 0))
+
+  ;;
+;;;;;;  Segment number comparison helpers
+  ;;
+
+(define-modify-macro seq-num-incf (&optional (amount 1)) seq-num-sum)
+
+(defmacro seq-num-compare (&rest items &environment env)
+  (declare (arglist seq1 relop1 seq2 relop2 etc...))
+  (unless (and (oddp (length items))
+	       (> (length items) 1))
+    (error "SEQ-NUM-COMPARE called improperly."))
+  (multiple-value-bind (clauses symbols gensyms)
+      (loop for (var1 rel var2) on items by 'cddr
+	    for sym1 first (gensym) then sym2
+	    for sym2 = (gensym)
+	    when rel
+	      collect `(,(or (cadr (assoc rel '((< seq-num-<) ( seq-num-) (=< seq-num-=<)
+						(= =) ( )
+						( seq-num-) (> seq-num->))))
+			     (error "Unknown relation ~S in seq-num-compare" rel))
+			,sym1 ,sym2) into clauses
+	    collect var1 into symbols
+	    collect sym1 into gensyms
+	    finally (return (values clauses symbols gensyms)))
+;    (break)
+    (lt:let*-subst gensyms symbols `(and ,@clauses) env)))
+
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");;; Allow printing of 32 bit fixnums as positive numbers (bignums)
+0(defsubst seq-num-abnormalize (a)
+  (when a
+    (ldb (byte 32. 0) a))) 
+
+(defsubst seq-num-normalize (a)
+  (let ((.a. a))
+    (sys:%logdpb (ldb (byte 16. 16.) .a.)
+		 (byte 16. 16.)
+		 (ldb (byte 16. 00.) .a.))))
+
+(defsubst seq-num-sum (a b)
+  (sys:%32-bit-plus a b))
+
+(defsubst seq-num-difference (a b)
+  (sys:%32-bit-difference a b))
+
+(defsubst seq-num-< (a b)
+  (minusp (seq-num-difference a b)))
+
+(defsubst seq-num-> (a b)
+  (plusp (seq-num-difference a b)))
+
+(defsubst seq-num- (a b)
+  (not (seq-num-< a b)))
+(defsubst seq-num- (a b)
+  (not (seq-num-> a b)))
+
+(defsubst seq-num-=< (a b) (seq-num- a b))
+
+
+;;; Make things readable for poor user.
+
+(defselect ((tcp-segment-header named-structure-invoke))
+  (:print-self (seg stream ignore ignore)
+   (si:printing-random-object (seg stream)
+     (princ "TCP Segment" stream)))
+  (:describe (seg)
+   ;; not (describe-defstruct seg 'tcp-segment-header), but instead
+   (describe-tcp-segment-header seg)
+   (describe-defstruct seg 'tcp-segment-leader)))
+
+(defun describe-tcp-segment-header (seg)
+  (format t "~&~S is a ~S~%" seg 'tcp-segment-header)
+  (format t "   ~S:~33T~D.~@[ (~S)~]~%"
+	  'source-port (seg-source-port seg) (tcp-port-protocol-name (seg-source-port seg)))
+  (format t "   ~S:~33T~D.~@[ (~S)~]~%"
+	  'destination-port (seg-destination-port seg) (tcp-port-protocol-name
+						     (seg-destination-port seg)))
+  (format t "   ~S:~33T~D.~%" 'sequence (seq-num-abnormalize (seg-sequence seg)))
+  (format t "   ~S:~33T~D.~%" 'acknowledge (seq-num-abnormalize (seg-acknowledge seg)))
+  (format t "   ~S:~33T~D.~%" 'data-offset (seg-data-offset seg))
+  (let* ((flags (seg-flags seg))
+	 (list (loop for bit first 1_8 then (lsh bit -1)
+		     for name in '(??? ??? ??? urg ack psh rst syn fin)
+		     when (logtest bit flags) collect name)))
+    (format t "   ~S:~33T~2R~@[ ~A~]~%" 'flags flags list))
+  (format t "   ~S:~33T~D.~%" 'window (seg-window seg))
+  (format t "   ~S:~33T~D.~%" 'checksum (seg-checksum seg))
+  (format t "   ~S:~33T~D.~%" 'urgent (seg-urgent seg)))
+
+  ;;
+;;;;;;  Connections
+  ;;
+
+;;; Per connection data data kept in a transmission control block (TCB)
+
+(defstruct (tcb :array :named
+		(:conc-name tcb-)
+		(:constructor make-tcb-internal-1)
+		(:make-array (:area neti:network-cons-area)))
+  (state :closed)		;state of the connection (a keyword).
+  (substate :inactive)		;substate
+  protocol			;of which TCP protocol this is a member
+  network			;to which IP network this is talking
+  (route nil)			;IP route information (ask Hornig)
+  (2MSL-timer nil)		;when in :time-wait, this is set to (time)
+
+  ;; local side of the connection
+  local-address
+  (local-port 0)		;local port number (contact name/connection index)
+  (local-window-size 0)		;number of bytes prepared to receive at a time
+
+  ;; foreign side of the connection
+  (foreign-host nil)		;foreign host (or NIL if not yet required)
+  foreign-address		;internet address of foreign host
+  (foreign-port 0)		;foriegn port number (contact name/connection index)
+  (max-seg-size)		;default amount
+
+  ;; receive side
+  (read-segs nil)		;in order segments
+  (read-segs-last nil)		;last in chain
+  (read-segs-length 0)		;length of chain
+  (received-segs nil)		;chain of out of order segments
+  (initial-receive-seq nil)	;sequence of other side's SYN
+  (seq-num-read nil)		;sequence number delivered to the user
+  (seq-num-received nil)	;sequence number received and guarenteed to give to the user
+  (seq-num-acked nil)		;sequence number have acked
+  (seq-num-limit nil)		;sequence number other side allowed to send up until
+  (time-last-received 0)	;last time a useful ACK for this TCB was received
+  (advance-window-threshold 0)	;when seq-num-read advances beyond this, update limit
+  (read-urgent-pointer NIL)	;NIL or sequence number of highest urgent pointer received
+
+  ;; output side
+  (send-segs nil)		;start of send segments
+  (send-segs-last nil)		;last seg in chain
+  (send-segs-length 0)		;length of chain
+  (initial-send-seq nil)	;sequence number of local SYN
+  (send-seq-acked nil)		;highest sequence number other side has acknowledged
+  (next-send-seq nil)		;next sequence number to send (highest so far + 1)
+  (send-seq-limit nil)		;highest allowed to send, to avoid silly window
+  (send-seq-advert nil)		;highest allowed to send as advertised (seg.ack + seg.wnd)
+  (send-window 0)		;number of bytes allowed to send
+  (last-retransmit-time 0)	;last time retransmission for this TCB was done.
+  (send-urgent-pointer NIL)	;NIL or the urgent pointer to advertise
+
+  (needs-acking nil)		;T if background should generate an ack
+				;for this TCB even if seq-num-acked = seq-num-received. 
+  
+  (user-stream nil)
+  retransmit-immediately			1;Don't wait, retransmit today!
+0  current-retransmission-delay
+  (reading-process nil)
+  (writing-process nil)
+  (congestion-window 0)
+  slow-start-threshold
+  average*8-round-trip-time
+  deviation*4-round-trip-time
+  (retransmissions 0)
+  spare-1
+  spare-2
+  spare-3
+  spare-4
+  ) 
+
+(defmacro alter-tcb
+	  (item &rest keys-and-values)
+  `(progn
+     ,@(loop for (key value . nil) on keys-and-values by #'cddr
+	     collect `(setf (,(intern
+				(string-append "TCB-" key))
+			     ,item)
+			    ,value))))
+
+
+
+(defun make-tcb-internal ()
+  (make-tcb-internal-1))	;expand the macro
+
+(defvar *prototype-tcb* (make-tcb-internal))
+
+(defvar *last-gensym-port-number* 1_10.)
+
+(defun tcb-foreign-host-or-address (tcb)
+  (or (tcb-foreign-host tcb)
+      (tcb-foreign-address tcb)))
+
+(defun tcb-foreign-host-object (tcb)
+  (or (tcb-foreign-host tcb)
+      (let* ((addr (tcb-foreign-address tcb))
+	     (host (and addr
+			(net:get-host-from-address addr (send (tcb-network tcb) :network)))))
+	(when host
+	  (setf (tcb-foreign-host tcb) host))	;in case somebody else found it
+	host)))
+
+(defselect ((tcb named-structure-invoke))
+  (:print-self (tcb stream ignore slashify)
+   (if slashify
+       (si:printing-random-object (tcb stream)
+	 (princ tcb stream))
+     (format stream "TCP connection to ~A ~D~@[ (~S)~], local port ~D~@[ (~S)~]"
+	     (tcb-foreign-host-object tcb)
+	     (tcb-foreign-port tcb)
+	     (tcp-port-protocol-name (tcb-foreign-port tcb))
+	     (tcb-local-port tcb)
+	     (tcp-port-protocol-name (tcb-local-port tcb))))))
+
+
+  ;;
+;;;;;;  Variables
+  ;;
+
+(defvar *tcp-protocol* nil)	;THE (A, actually) tcp protocol
+
+(defvar *tcp-enable* nil)	;gets enabled by the :enable message
+;;; In the next system build, these three forms go away and
+;;; receive-syn-segment uses *services-enabled* instead.  For now, try
+;;; and figure out what value to use by what the rest of the system
+;;; appears to be doing.
+
+(defvar *pending-passive-syns* nil)	;list of TCBs that are passively SYNing
+(defvar *pending-received-syns* nil)	;chain of segs that are awaiting a server
+
+(defparameter (2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")*max-segs-outstanding* 015.
+  "The maximum number of segements in the TCP window")
+
+;(export '*default-window-size*)
+(defparameter *default-window-size* nil
+  "Set to a specific value in bytes for TCP window size.
+  If nil, value is computed from interface max-packet-size")	;in bytes
+
+;(export '*max-window-size*)
+(defparameter *max-window-size* (1- 1_16)
+				#+ignore 20000.)
+
+;;; packets
+
+;;; tcbs
+
+(defun make-initial-tcbs (n)
+  (loop repeat n collect (make-tcb-internal)))
+
+(defvar *free-tcb-list* (make-initial-tcbs 10.))	;get them on the same page
+(defvar *tcb-list* nil)
+
+;;; background process
+
+(defvar *some-tcb-needs-acking* nil)		;NIL or time when 100msec counter started
+(defvar *tcp-next-retransmission-time* nil)
+
+(defvar *last-tcp-retransmit-time*)
+(defvar *last-tcp-idle-probe-time* nil)
+(defvar *tcp-background-bedtime*)
+(defvar *tcp-background* (process:make-process "TCP Background"
+					       :priority
+					       (process:make-process-priority
+						 :deadline 50000.
+						 :preemptive t)
+					       :initial-function 'tcp-background
+					       :verify-function 'tcp-background-predicate
+					       :top-level-whostate "TCP Background"
+					       :run-reasons nil :simple-p t :system-process t))
+(defvar *tcp-background-timer*
+	(process:create-timer-wakeup *tcp-background* :name "TCP Background wakeup"))
+
+;;; user options / adjustments
+(defparameter *tcp-congestion-avoidance-enabled*2 0t)
+
+(defparameter *adaptive-tcp-retransmission-enabled* t)
+(defparameter *min-retransmission-time*2 020	1; 1/3 second
+0  "The minimum time between retransmissions in adaptive retransmission mode (in 60ths)")
+(defparameter *max-retransmission-time*2 0(* 60 60)1	;60 seconds
+0  "The maximum time between retransmissions in adaptive retransmission mode (in 60ths)") 
+
+(defparameter *tcp-segment-combination-disabled* nil)
+
+;(export '*tcp-retransmit-interval*)
+(defparameter *tcp-retransmit-interval*       120.)	;2 seconds
+
+;(export '*tcp-idle-probe-interval*)
+(defparameter *tcp-idle-probe-interval*      (* 2 60. 60. 60.))	;120 1hours
+
+0(defparameter *tcp-response-timeout*         (* 6. 60. 60. 60.))	1;6 hours
+
+0;(export '*tcp-zero-window-probe-timeout*)
+(defparameter *tcp-zero-window-probe-timeout* (* 30. 60.))	;30 seconds
+(defparameter *tcp-connect-timeout*  (* 60. 20.)	;20 seconds
+  "The time to wait for a TCP connection")
+
+;;; debugging
+
+;(export '*record-tcp-debugging-info*)
+(defvar *record-tcp-debugging-info* t)
+
+(defun make-recent-tcp-headers (n)
+  (loop with recent-headers = (make-array n
+					  :leader-list (list n 0)
+					  :area neti:network-cons-area)
+	for i below n
+	do (setf (aref recent-headers i)
+		 (make-array tcp-segment-header-size
+			     :element-type '(unsigned-byte 8)
+			     :leader-length tcp-recent-segment-size
+			     :area neti:network-cons-area))
+	finally (return recent-headers)))
+
+(defvar *recent-tcp-headers* (make-recent-tcp-headers 64.))
+
+(defvar *recent-tcp-send-ack-reasons* (make-array 40 :leader-list '(40 0)))
+
+
+  ;;
+;;;;;;  Metering
+  ;;
+
+(neti:define-meters
+
+  *tcp-meters*
+
+  *segs-given-out*
+  *segs-given-back*
+
+  *segs-in*
+  *segs-in-bad-data-offset*
+  *segs-in-bad-checksum*
+  *segs-in-with-options*
+  *syns-with-bad-options*	;sinning syns?
+
+  *segs-in-no-tcb*
+  *segs-in-tcb-bad-state*
+  *segs-in-ack-out-of-range*
+
+  *segs-transmitted*
+  *segs-retransmitted*
+  *retransmissions-signalled*
+  *retransmissions-actual*
+
+  *tcbs-made*
+  *tcbs-released*
+  *tcbs-returned*
+
+  *abnormal-tcb-aborts*
+
+  )
+
+(defun reset-tcp-meters ()
+  (dolist (sym *tcp-meters*)
+    (setf (symbol-value sym) 0)))
+
+
+;;; Protocol stuff
+
+;(export 'tcp-port-protocol-name)
+(defun tcp-port-protocol-name (tcp-port-number &optional errorp)
+  (or (cdr (assoc tcp-port-number *tcp-protocol-alist*))
+      (and errorp (error "TCP port ~D does not have a protocol name." tcp-port-number))))
+
+;(export 'protocol-name-tcp-port)
+(defun protocol-name-tcp-port (protocol-name &optional errorp)
+  (or (car (rassoc protocol-name *tcp-protocol-alist*))
+      (and errorp (error "Protocol ~S does not have a TCP port number." protocol-name))))
+
+  ;;
+;;;;;;  TCP interface with IP
+  ;;
+
+;;; There are various TCP-PROTOCOLS which know how to interact with the
+;;; various possible IP networks.  This will be redesigned slightly for
+;;; better modularity in a later release.
+
+(defconstant tcp-protocol-number 6)
+
+(defflavor tcp-protocol
+	(network
+	 (checksum-errors 0))	;needed to track on which network the checksum error occured
+	(ip-protocol-mixin)
+  :gettable-instance-variables
+  (:initable-instance-variables network))
+
+(defmethod (:protocol-name tcp-protocol) () "TCP")
+
+(defmethod (:packet-leader-size tcp-protocol) () tcp-segment-leader-size)
+
+(defmethod (:packet-structure-symbol tcp-protocol) () 'tcp-segment-header)
+
+(defmethod (:tcp-protocol tcp-protocol) ()
+  "get tcp-protocol corresponding to an Internet network.  Fixed by a
+   remodularization in a later release."
+  self)
+(defmethod 2(reset-meters tcp-protocol)0 ()
+  (setf checksum-errors 0)
+  (reset-tcp-meters))
+(defun tcp-possible-media (protocol-name base-medium)
+  (when (and (neti:medium-can-implement-base-medium :tcp base-medium)
+	     (protocol-name-tcp-port protocol-name))
+    '(:tcp)))
+
+(define-ip-protocol tcp-protocol-number tcp-protocol (:tcp-protocol) tcp-possible-media)

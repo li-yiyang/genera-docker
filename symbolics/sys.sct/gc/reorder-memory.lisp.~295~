@@ -1,0 +1,3146 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SYSTEM-INTERNALS; Base: 8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+ ;;
+;;;; Memory Optimization Stuff
+ ;;
+
+
+;;; Object Reordering Substrate.
+
+;; This structure is known about specially by REORDER-MEMORY.
+(DEFSTRUCT (REORDERING :LIST :CONC-NAME)
+  NAME				;The name of the reordering
+  AREA				;The area (a number) in which we go
+				;Currently, all objects in OBJECT-LIST must be in this area
+  (REGION-BITS 0)		;Some region bits of the target region
+  (REGION-BITS-MASK 0)		;Which bits are important in the above
+  NO-TRANSPORT-OKAY		;True if the caller doesn't care about mistakes.
+  DONT-EXTEND-REGIONS		;True if we always want to create new regions for
+				;reordered objects.
+  OBJECT-LIST)			;A list of objects in the order they're
+
+;; Debugging.
+;; After a flip, contains any objects erroneously transported before reordered.
+(DEFVAR-SAFEGUARDED *REORDER-DIDNT-TRANSPORT* (MAKE-ARRAY 64 :FILL-POINTER 0 :AREA SYS:SAFEGUARDED-OBJECTS-AREA))
+
+(DEFINE-GC-OPTIMIZATION COLLAPSE-REORDERINGS :LAYERED-IDS-RELEASE
+  (:ORDER :LAST)				;After everything which hacks *REORDERINGS*
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (UNLESS *REORDERINGS* (RETURN-FROM COLLAPSE-REORDERINGS NIL))
+
+    ;; Collapse reorderings to minimize the number of generated regions
+    (LET ((COLLAPSED-REORDERINGS NIL)
+	  (DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+      (LOOP FOR REORDERING IN *REORDERINGS*
+	    ;;--- There should be a real way to extract structure fields like this.
+	    AS (NAME AREA BITS REGION-BITS-MASK
+		NO-TRANSPORT-OKAY DONT-EXTEND-REGIONS OBJECT-LIST)
+	       = REORDERING
+	    DO (IGNORE NO-TRANSPORT-OKAY)
+	       (LOOP FOR NEW IN COLLAPSED-REORDERINGS
+		     WHEN (AND (= AREA (REORDERING-AREA NEW))
+			       (EQ DONT-EXTEND-REGIONS
+				   (REORDERING-DONT-EXTEND-REGIONS NEW))
+			       (= (LOGAND BITS REGION-BITS-MASK)
+				  (LOGAND (REORDERING-REGION-BITS NEW)
+					  (REORDERING-REGION-BITS-MASK NEW))))
+		       DO (SETF (REORDERING-OBJECT-LIST NEW)
+				(NCONC OBJECT-LIST (REORDERING-OBJECT-LIST NEW)))
+			  (SETF (REORDERING-NAME NEW)
+				(IF (ATOM (REORDERING-NAME NEW))
+				    (LIST NAME (REORDERING-NAME NEW))
+				    (CONS NAME (REORDERING-NAME NEW))))
+			  (RETURN NIL)
+		     FINALLY (PUSH REORDERING COLLAPSED-REORDERINGS)))
+      (SETQ *REORDERINGS* COLLAPSED-REORDERINGS))
+
+    (FLET ((CHECK (THING)
+	     (UNLESS (EQL (%AREA-NUMBER THING) REORDERING-LIST-AREA)
+	       (ERROR "Some reordering list is not in ~S" 'REORDERING-LIST-AREA))))
+      (STACK-LET ((REGION-MASK (MAKE-ARRAY NUMBER-OF-REGIONS :TYPE ART-BOOLEAN)))
+
+	;; Verify that everything on *REORDERINGS* is in the proper area.
+	;; It is the responsibility of the individual optimizations to do this right.
+	(DO ((R *REORDERINGS* (CDR R)))
+	    ((NULL R))
+	  (CHECK R)
+	  (LET ((REORDERING (CAR R)) (WARNED NIL))
+	    (CHECK REORDERING)
+	    (DO ((O (REORDERING-OBJECT-LIST REORDERING) (CDR O)))
+		((NULL O))
+	      (CHECK O)
+	      (LET* ((REGION (%REGION-NUMBER (CAR O)))
+		     (LEVEL-TYPE (LEVEL-TYPE (LDB %%REGION-LEVEL (REGION-BITS REGION)))))
+		(WHEN (AND (NOT WARNED) (<= LEVEL-TYPE %LEVEL-TYPE-SAFEGUARDED))
+		  (GC-OPTIMIZATION-REPORT-FORCE
+		    "~%Warning:  Reordering ~S is trying to relocate a safeguarded object."
+		    (REORDERING-NAME REORDERING))
+		  (SETQ WARNED T))
+		(SETF (AREF REGION-MASK REGION) T)))))
+
+	;; Ensure that everything being reordered gets flipped.
+	(DOTIMES (REGION (N-REGIONS))
+	  (WHEN (AREF REGION-MASK REGION)
+	    (LET* ((BITS (REGION-BITS REGION))
+		   (LEVEL (LDB %%REGION-LEVEL BITS))
+		   (TYPE (LEVEL-TYPE LEVEL)))
+	      (IF ( TYPE %LEVEL-TYPE-SAFEGUARDED)
+		  (GC-OPTIMIZATION-REPORT-FORCE
+		    "~%Warning:  Cannot flip region ~O in ~S for reordering."
+		    REGION (AREA-NAME (REGION-AREA REGION)))
+		(UNLESS (AREF *IMMEDIATE-GC-LEVEL-MASK* LEVEL)
+		  (SETF (AREF *IMMEDIATE-GC-LEVEL-MASK* LEVEL) T)
+		  (DOTIMES (REGION (N-REGIONS))
+		    (WHEN (= (LDB %%REGION-LEVEL (REGION-BITS REGION)) LEVEL)
+		      (SETF (AREF *IMMEDIATE-GC-REGION-MASK* REGION) NIL))))
+		(SETF (AREF *IMMEDIATE-GC-REGION-MASK* REGION) T)
+		(WHEN INCREMENTAL-P
+		  (WHEN (= %PERMANENT-LEVEL LEVEL)
+		    (GC-OPTIMIZATION-REPORT-FORCE
+		      "~%Warning:  Reordering will flip permanent region ~O in ~S."
+		      REGION (AREA-NAME (REGION-AREA REGION))))
+		  (WHEN (LDB-TEST %%REGION-NO-CONS BITS)
+		    (GC-OPTIMIZATION-REPORT-FORCE
+		      "~%Warning:  Reordering is flipping region ~O in ~S, ~
+				   which is already reordered."
+		      REGION (AREA-NAME (REGION-AREA REGION)))))))))))))
+
+;; This is called by GC-FLIP-INTERNAL.
+;; It and all its callees have to be safeguarded since it runs immediately after flipping.
+;; No consing allowed since it runs before safeguarded-objects-area is scavenged.
+(DEFUN TRANSPORT-REORDERINGS (REORDERINGS INCREMENTAL-P)
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  (SETF (FILL-POINTER *REORDER-DIDNT-TRANSPORT*) 0)
+  ;; Now transport everything and setup the region bits
+  (DOLIST (REORDERING REORDERINGS)
+    (FIX-REGIONS-BEFORE-TRANSPORT REORDERING INCREMENTAL-P)
+    (IF (REORDERING-NO-TRANSPORT-OKAY REORDERING)
+	(DO ((L (REORDERING-OBJECT-LIST REORDERING) (CDR L)))
+	    ((NULL L))
+	  (COMPILER:FOR-EFFECT (CAR L)))
+      (DO ((L (REORDERING-OBJECT-LIST REORDERING) (CDR L)))
+	  ((NULL L))
+	(WHEN (= (%P-DATA-TYPE (%P-POINTER L)) DTP-GC-FORWARD)
+	  #+IGNORE
+	  (SI:%FUNCALL-IN-AUX-STACK #'WIRED-FERROR :PROCEEDABLE-HALT
+	    "Reordered object didn't transport.  Address=~\si:address\, Area=~O"
+	    (%POINTER (CAR L))
+	    (LET ((REGION (%REGION-NUMBER (CAR L))))
+	      (AND REGION (REGION-AREA REGION))))
+	  ;; Record the erroneous object for debugging, without consing.
+	  (WHEN (AND (< (FILL-POINTER *REORDER-DIDNT-TRANSPORT*)
+			(ARRAY-LENGTH *REORDER-DIDNT-TRANSPORT*))
+		     (CL:DOTIMES (I (FILL-POINTER *REORDER-DIDNT-TRANSPORT*) T)
+		       (WHEN (EQ (AREF *REORDER-DIDNT-TRANSPORT* I) (CAR L))
+			 (RETURN NIL))))		       
+	    (SETF (AREF *REORDER-DIDNT-TRANSPORT*
+			(CL:SHIFTF (FILL-POINTER *REORDER-DIDNT-TRANSPORT*)
+				   (1+ (FILL-POINTER *REORDER-DIDNT-TRANSPORT*))))
+		  (CAR L))))
+	(COMPILER:FOR-EFFECT (CAR L))))
+    (FIX-REGIONS-AFTER-TRANSPORT REORDERING INCREMENTAL-P)))
+
+(DEFUN FIX-REGIONS-BEFORE-TRANSPORT (REORDERING INCREMENTAL-P)
+  (DECLARE (SAFEGUARDED-FUNCTION))
+  (CLEAR-CONS-CACHES)
+  (DO-AREA-REGIONS (REGION (REORDERING-AREA REORDERING))
+    (LET ((BITS (REGION-BITS REGION)))
+      ;; All reordered objects should go into %PERMANENT-LEVEL
+      (SELECTOR (LDB %%REGION-SPACE-TYPE BITS) =
+	(%REGION-SPACE-OLD
+	  (SETF (REGION-GC-POINTER REGION)
+		(%LOGDPBS (LDB %%GC-POINTER-COPYSPACE-LEVEL (REGION-GC-POINTER REGION))
+			  %%GC-POINTER-REORDERING-LEVEL
+			  %PERMANENT-LEVEL %%GC-POINTER-COPYSPACE-LEVEL
+			  #+IMach -1 #+IMach %%GC-POINTER-COPYSPACE-REGION 0)))
+	((%REGION-SPACE-COPY %REGION-SPACE-NEW)
+	 (WHEN (AND INCREMENTAL-P		;Try to append to an existing region
+		    (NOT (REORDERING-DONT-EXTEND-REGIONS REORDERING))
+		    (= (LDB %%REGION-LEVEL BITS) %PERMANENT-LEVEL)
+		    (LDB-TEST %%REGION-NO-CONS BITS)
+		    (ZEROP (LOGAND (REORDERING-REGION-BITS-MASK REORDERING)
+				   (LOGXOR (REORDERING-REGION-BITS REORDERING) BITS))))
+	   ;; By changing the type from NEW to COPY, we cause some extra scavenging
+	   ;; to occur.  No big deal.
+	   (SETF (REGION-BITS REGION)
+		 (DPBS %REGION-SPACE-COPY %%REGION-SPACE-TYPE
+		       0 %%REGION-NO-CONS BITS))))))))
+
+(DEFUN FIX-REGIONS-AFTER-TRANSPORT (REORDERING INCREMENTAL-P)
+  (DECLARE (SAFEGUARDED-FUNCTION) (IGNORE INCREMENTAL-P))
+  (CLEAR-CONS-CACHES)
+  (DO-AREA-REGIONS (REGION (REORDERING-AREA REORDERING))
+    (LET ((BITS (REGION-BITS REGION)))
+      ;; Nonreordered objects should go wherever they were previously directed.
+      (WHEN (= (LDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-OLD)
+	(SETF (REGION-GC-POINTER REGION)
+	      (%LOGDPBS (LDB %%GC-POINTER-REORDERING-LEVEL (REGION-GC-POINTER REGION))
+			%%GC-POINTER-COPYSPACE-LEVEL
+			#+IMach -1 #+IMach %%GC-POINTER-COPYSPACE-REGION 0)))
+      (WHEN (AND (= (LDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-COPY)
+		 (ZEROP (LDB %%REGION-NO-CONS BITS)))
+	(SETF (REGION-BITS REGION)
+	      (DPBS 1 %%REGION-NO-CONS
+		    (LOGIOR (LOGAND (REORDERING-REGION-BITS-MASK REORDERING)
+				    (REORDERING-REGION-BITS REORDERING))
+			    (LOGAND BITS (LOGNOT (REORDERING-REGION-BITS-MASK REORDERING))))))
+	;; Don't change the space type from COPY to NEW, since that will screw up the
+	;; scavenger into not scavenging the region.
+	(SHORTEN-REGION REGION)))))
+
+;; True unless this object is in a region that has already been reordered
+(DEFUN REORDERABLE (OBJECT &OPTIONAL (INCREMENTAL-P *INCREMENTAL-IMMEDIATE-GC*))
+  (OR (NOT INCREMENTAL-P)
+      (LET ((BITS (REGION-BITS (%REGION-NUMBER OBJECT))))
+	(NOT (OR (LDB-TEST %%REGION-NO-CONS BITS)
+		 (CL:MEMBER (LDB %%REGION-LEVEL BITS)
+			    '#,(LIST %PERMANENT-LEVEL %SAFEGUARDED-LEVEL %WIRED-LEVEL)))))))
+
+(DEFUN REGION-PREDICATE-REORDERABLE-STRUCTURE (REGION)
+  (AND (REGION-PREDICATE-STRUCTURE REGION)
+       (OR (NOT *INCREMENTAL-IMMEDIATE-GC*)
+	   (LET ((BITS (REGION-BITS REGION)))
+	     (NOT (OR (LDB-TEST %%REGION-NO-CONS BITS)
+		      (CL:MEMBER (LDB %%REGION-LEVEL BITS)
+			'#,(LIST %PERMANENT-LEVEL %SAFEGUARDED-LEVEL %WIRED-LEVEL))))))))
+
+(DEFUN REGION-PREDICATE-NONREORDERABLE-STRUCTURE (REGION)
+  (WHEN *INCREMENTAL-IMMEDIATE-GC* ;nothing is nonreorderable otherwise
+    (AND (REGION-PREDICATE-STRUCTURE REGION)
+	 (LET ((BITS (REGION-BITS REGION)))
+	   (OR (LDB-TEST %%REGION-NO-CONS BITS)
+	       (CL:MEMBER (LDB %%REGION-LEVEL BITS)
+			  '#,(LIST %PERMANENT-LEVEL %SAFEGUARDED-LEVEL %WIRED-LEVEL)))))))
+
+;;; Page Packing
+;;; This stuff is used by the flavor and compiled-function optimizer.  It could
+;;; conceivably be used for lots of other stuff.
+
+;;; The basic problem is this.  Suppose you have a bunch of objects of different sizes
+;;; which you want to place in memory so that the entire object will be paged in when
+;;; its header is touched.  You pass the objects to PAGE-PACKER, and it comes up with
+;;; some placement which it thinks is good.  (The actual problem is NP-complete, so we
+;;; can't really get an optimal ordering.)
+
+;;; What we do is recognize that the problem for any particular swapin can be reduced
+;;; to bin-packing using modulo arithmetic for the weights.  The algorithm used here
+;;; is first-fit, and when that doesn't work well enough, we shuffle things around a
+;;; bit.
+
+;; This is the main page-packing function.
+;; The argument is an alist of (size . object-list)
+;; The (first) returned argument is an alist of (swapin . bins), where
+;; bins is a list of (bin-size-mod-page-size bin-size . alist-elements).
+;; The second value is the total size of the elements = sum of all size's
+;; The third value is the total wasted space in this packing
+(DEFUN PAGE-PACK (ALIST &KEY (MAXIMUM-SWAPIN (LDB %%REGION-SWAPIN-QUANTUM -1)))
+  (LET ((LIST (SORT (COPYLIST ALIST) #'CAR-LESSP)))
+    (WITH-STACK-ARRAY (ARRAY (1+ PAGE-SIZE))
+      (DECLARE (ARRAY-REGISTER ARRAY))
+      (LOOP WITH TOTAL-SIZE = 0
+	    WITH WASTED-SPACE = 0
+	    FOR SWAPIN FROM 0 TO MAXIMUM-SWAPIN
+	    FOR BIN FROM 0 BY PAGE-SIZE
+	    DO (%BLOCK-STORE-TAG-AND-POINTER (ALOC ARRAY 1) PAGE-SIZE DTP-NIL NIL 0)
+	    WHEN (LOOP WITH SOMETHING-DONE = NIL
+		       AS SIZE = (CAAR LIST)
+		       WHILE (AND (NOT (NULL LIST))
+				  ( (1- (CEILING SIZE PAGE-SIZE)) SWAPIN))
+		       DO (PUSH (POP LIST) (AREF ARRAY (- SIZE BIN)))
+			  (SETQ SOMETHING-DONE T)
+		       FINALLY
+			 (WHEN SOMETHING-DONE
+			   (MULTIPLE-VALUE-BIND (BUNDLE BUNDLE-SIZE BUNDLE-WASTED-SPACE)
+			       (PAGE-PACK-SWAPIN SWAPIN ARRAY)
+			     (INCF TOTAL-SIZE BUNDLE-SIZE)
+			     (INCF WASTED-SPACE BUNDLE-WASTED-SPACE)
+			     (RETURN BUNDLE))))
+	      COLLECT IT INTO RESULT
+	    FINALLY (WHEN LIST			;Objects bigger than maximum quantum
+		      (LET ((ELEMENT (OR (ASSQ MAXIMUM-SWAPIN RESULT)
+					 (LET ((CONS (NCONS MAXIMUM-SWAPIN)))
+					   (SETQ RESULT (NCONC RESULT (LIST CONS)))
+					   CONS))))
+			(SETF (CDR (LAST ELEMENT))
+			      (LET* ((BUNDLE-SIZE (LOOP FOR ELEMENT IN LIST
+							SUM (CAR ELEMENT)))
+				     (BUNDLE-WASTED-SPACE (1+ (MOD (1- BUNDLE-SIZE)
+								   PAGE-SIZE))))
+				(INCF TOTAL-SIZE BUNDLE-SIZE)
+				(INCF WASTED-SPACE BUNDLE-WASTED-SPACE)
+				(LIST (LIST* BUNDLE-WASTED-SPACE BUNDLE-SIZE LIST))))))
+		    (LOOP FOR ENTRY IN RESULT DO
+		      (SETF (CDR ENTRY) (SORT (CDR ENTRY) #'CAR-LESSP)))
+		    (RETURN (VALUES RESULT TOTAL-SIZE WASTED-SPACE))))))
+
+;; Pack a swapin group -- first-fit algorithm
+(DEFUN PAGE-PACK-SWAPIN (SWAPIN ARRAY)
+  (LET ((ARRAY ARRAY))
+    (DECLARE (ARRAY-REGISTER ARRAY))
+    (LOOP WITH FLOOR = (* SWAPIN PAGE-SIZE)
+	  WITH LARGEST-SIZE = PAGE-SIZE
+	  AS BUNDLE =
+	     (LOOP WITH FETCH-SIZE = LARGEST-SIZE
+		   AS ELEMENT = (LOOP AS ELEMENT = (AREF ARRAY FETCH-SIZE)
+				      WHEN ELEMENT
+					RETURN (PROG1 (CAR ELEMENT)
+						      (SETF (AREF ARRAY FETCH-SIZE)
+							    (CDR ELEMENT)))
+				      WHEN (= FETCH-SIZE LARGEST-SIZE)
+					DO (DECF LARGEST-SIZE)
+				      UNLESS (PLUSP (DECF FETCH-SIZE))
+					RETURN NIL)
+		   WHILE ELEMENT
+		   COLLECT ELEMENT INTO BUNDLE
+		   SUM (- (CAR ELEMENT) FLOOR) INTO BUNDLE-SIZE-MOD-PAGE-SIZE
+		   SUM (CAR ELEMENT) INTO BUNDLE-SIZE
+		   UNTIL (= BUNDLE-SIZE-MOD-PAGE-SIZE PAGE-SIZE)
+		   DO (SETQ FETCH-SIZE (MIN (- PAGE-SIZE BUNDLE-SIZE-MOD-PAGE-SIZE)
+					    LARGEST-SIZE))
+		   FINALLY (WHEN BUNDLE
+			     (RETURN (LIST* BUNDLE-SIZE-MOD-PAGE-SIZE
+					    BUNDLE-SIZE
+					    BUNDLE))))
+	  WHILE BUNDLE
+	  SUM (- PAGE-SIZE (CAR BUNDLE)) INTO WASTED-SPACE
+	  SUM (CADR BUNDLE) INTO TOTAL-SPACE
+	  COLLECT BUNDLE INTO BUNDLES
+	  FINALLY (WHEN BUNDLES
+		    (RETURN (VALUES (CONS SWAPIN BUNDLES)
+				    TOTAL-SPACE
+				    WASTED-SPACE))))))
+
+(DEFUN CONVERT-PACKING-TO-REORDERINGS (PACKING &KEY NAME AREA
+				       ((:REGION-BITS BITS) 0) (REGION-BITS-MASK 0))
+  (POOR-MAN/'S-WITH-COLLECTION (REORDERINGS)
+    (LOOP WITH LAST-OBJECT
+	  FOR (SWAPIN . BUNDLE) IN PACKING
+	  AS THIS-REGION-BITS-MASK = (%LOGDPB -1 %%REGION-SWAPIN-QUANTUM REGION-BITS-MASK)
+	  AS THIS-REGION-BITS = (%LOGDPB SWAPIN %%REGION-SWAPIN-QUANTUM BITS)
+	  DO (POOR-MAN/'S-WITH-COLLECTION (OBJECT-LIST)
+	       (LOOP FOR (MOD NIL . BINS) IN BUNDLE DO
+		 (LOOP FOR (SIZE . OBJECTS) IN BINS DO
+		   (IGNORE SIZE)
+		   (LOOP FOR OBJECT IN OBJECTS DO
+		     (SETQ LAST-OBJECT OBJECT)
+		     (COLLECT-OBJECT-LIST OBJECT)))
+		 (WHEN (< MOD PAGE-SIZE)
+		   (COLLECT-OBJECT-LIST
+		     (MAKE-PLACEHOLDER-OBJECT (- PAGE-SIZE MOD) LAST-OBJECT))))
+	       ;; Now we're guaranteed to have some objects, so deduce some more region bits.
+	       (UNLESS (LDB-TEST %%REGION-REPRESENTATION-TYPE THIS-REGION-BITS-MASK)
+		 (SETF THIS-REGION-BITS-MASK
+		       (%LOGDPB -1 %%REGION-REPRESENTATION-TYPE THIS-REGION-BITS-MASK))
+		 (SETF THIS-REGION-BITS
+		       (%LOGDPB (IF (CL:CONSP (CAR OBJECT-LIST))
+				    %REGION-REPRESENTATION-TYPE-LIST
+				    %REGION-REPRESENTATION-TYPE-STRUCTURE)
+				%%REGION-REPRESENTATION-TYPE THIS-REGION-BITS)))
+	       (COLLECT-REORDERINGS
+		 (MAKE-REORDERING NAME (LIST NAME SWAPIN)
+				  AREA (COND ((NULL AREA) (%AREA-NUMBER (CAR OBJECT-LIST)))
+					     ((SYMBOLP AREA) (SYMEVAL AREA))
+					     (T AREA))
+				  REGION-BITS THIS-REGION-BITS
+				  REGION-BITS-MASK THIS-REGION-BITS-MASK
+				  OBJECT-LIST OBJECT-LIST)))
+	  FINALLY (RETURN REORDERINGS))))
+
+(DEFUN MAKE-PLACEHOLDER-OBJECT (SIZE PROTOTYPE)
+  (LET ((RESULT (IF (CL:CONSP PROTOTYPE)
+		    (%MAKE-LIST NIL (%AREA-NUMBER PROTOTYPE) SIZE)
+		    (MAKE-ARRAY (1- SIZE) :AREA (%AREA-NUMBER PROTOTYPE)))))
+    (UNLESS (= (%STRUCTURE-TOTAL-SIZE RESULT) SIZE)
+      (FERROR "Placeholder object didn't come out the right size."))
+    ;; Install a back pointer for debugging, if possible.
+    (IF (CL:CONSP PROTOTYPE)
+	(SETF (CAR RESULT) PROTOTYPE)
+	(IF (> SIZE 1) (SETF (AREF RESULT 0) PROTOTYPE)))
+    RESULT))
+
+;;; Flavor structure reordering
+
+;; Flavors, Mapping Tables, and Message Hash Tables all get referenced by method calls.
+;; Since this is the case we're optimizing for, we want to place these in bins such that
+;; when the call faults on the method, everything it could want is prefetched by the
+;; memory reference.  So the structures are ordered:
+;;	(1) Flavor
+;;	(2) Mapping tables, in :METHOD-ORDER when specified
+;;	(3) Hash Table
+;;	(4) mapping-table-variable-p vector
+;;	(5) template instance
+;; Note that there are other references we don't worry about:
+;;	(1) The instance (these are created dynamically, we can't hack them)
+;;	(2) The compiled function which implements the method (but see compiled-function
+;;	    reordering).
+;; We also compactify the lists associated with the flavor, but not on the same pages.
+;; I didn't attempt to separate them into run-time, compile-time, and make-instance-time.
+;; I didn't bother reporting any metering for the lists.
+;; We also sort *ALL-FLAVOR-NAMES* so future operations will be faster.
+(DEFINE-GC-OPTIMIZATION REORDER-FLAVORS :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "Reorder internal flavor data structures to improve paging performance")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (USING-SYSTEM-TEMPORARY-AREA
+      (LET ((LISTS NIL)
+	    (START-TIME (TIME))
+	    (COUNT-REORDERABLE-FLAVORS
+	      (LOOP FOR FLAVOR-NAME IN FLAVOR:*ALL-FLAVOR-NAMES*
+		    AS FLAVOR = (FLAVOR:FIND-FLAVOR FLAVOR-NAME NIL)
+		    COUNT (AND FLAVOR (REORDERABLE FLAVOR INCREMENTAL-P))))
+	    (COUNT 0))
+	(MULTIPLE-VALUE-BIND (PACKING TOTAL-SIZE WASTED-SPACE)
+	    (LET* ((DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA)
+		   (FLAVOR::*CDR-CODE-FLAVOR-LISTS-HASH-TABLE*
+		     (CL:MAKE-HASH-TABLE
+		       :TEST #'CL:EQUAL :LOCKING NIL
+		       :NUMBER-OF-VALUES 0 :STORE-HASH-CODE T
+		       ;; Estimate per system 407:  3847 flavors required 197000 entries, or
+		       ;; 52 entries per flavor.  The 50000. is a safety fudge.
+		       :SIZE (+ 50000. (* 52. COUNT-REORDERABLE-FLAVORS))))
+		   (ORIGINAL-SIZE (SCL:TABLE-SIZE FLAVOR::*CDR-CODE-FLAVOR-LISTS-HASH-TABLE*)))
+	      (SETQ LISTS (FLAVOR::INITIALIZE-COMPACT-FLAVOR-LISTS))
+	      (LET ((ORDERING-ALIST
+		      (TV:NOTING-PROGRESS ("Compacting flavor lists and composing orderings")
+			(LOOP FOR FLAVOR-NAME IN FLAVOR:*ALL-FLAVOR-NAMES*
+			      AS FLAVOR = (FLAVOR:FIND-FLAVOR FLAVOR-NAME NIL)
+			      WHEN (AND FLAVOR (REORDERABLE FLAVOR INCREMENTAL-P))
+				DO (TV:NOTE-PROGRESS (INCF COUNT) COUNT-REORDERABLE-FLAVORS)
+				   ;; All flavors get their lists compactified
+				   (SETQ LISTS (NCONC (FLAVOR::COMPACT-FLAVOR-LISTS FLAVOR)
+						      LISTS))
+				AND WHEN (FLAVOR:FLAVOR-HANDLER-TABLE FLAVOR)
+				      UNLESS (EQ (FLAVOR:FLAVOR-HANDLER-TABLE FLAVOR)
+						 FLAVOR::*INSTANCE-TRANSFORMING-HANDLER-TABLE*)
+					;; Only instantiable flavors get page-packed
+					COLLECT (COMPOSE-ORDERING-FOR-FLAVOR FLAVOR)))))
+		(GC-OPTIMIZATION-REPORT
+		  "~%Compacting flavor lists and composing orderings took ~\time-interval\ ~@
+		     for ~D//~D reorderable flavors.  Final hash table size was ~D."
+		  (ROUND (TIME-DIFFERENCE (TIME) START-TIME) 60.)
+		  COUNT-REORDERABLE-FLAVORS (LENGTH FLAVOR:*ALL-FLAVOR-NAMES*)
+		  (CL:HASH-TABLE-COUNT FLAVOR::*CDR-CODE-FLAVOR-LISTS-HASH-TABLE*))
+		(WHEN (> (SCL:TABLE-SIZE FLAVOR::*CDR-CODE-FLAVOR-LISTS-HASH-TABLE*)
+			 ORIGINAL-SIZE)
+		  (GC-OPTIMIZATION-REPORT "~%Hash table grew from ~D to ~D entries."
+		    ORIGINAL-SIZE (SCL:TABLE-SIZE FLAVOR::*CDR-CODE-FLAVOR-LISTS-HASH-TABLE*)))
+		(SETQ START-TIME (TIME))
+		(PAGE-PACK ORDERING-ALIST)))
+	  (GC-OPTIMIZATION-REPORT "~&Page packing took ~\time-interval\.~@
+	      Total Size of reordered flavor data structures is ~D words.~@
+	      ~D words were wasted in flavor reordering due to page packing."
+	    (ROUND (TIME-DIFFERENCE (TIME) START-TIME) 60.) TOTAL-SIZE WASTED-SPACE)
+	  ;; Cdr-code, but don't share, generic-function-flavors lists.  Can't share because
+	  ;; DELETE is applied to these lists sometimes.
+	  (LOOP FOR GENERIC-FUNCTION-NAME IN *ALL-GENERIC-FUNCTION-NAMES*
+		AS GF = (FLAVOR:FIND-GENERIC-FUNCTION GENERIC-FUNCTION-NAME NIL)
+		AS FLAVORS = (AND GF (GENERIC-FUNCTION-FLAVORS GF))
+		DO (WHEN (AND FLAVORS (REORDERABLE FLAVORS INCREMENTAL-P))
+		     (CL:PUSH (SETF (GENERIC-FUNCTION-FLAVORS GF)
+				 (COPYLIST FLAVORS FLAVOR::*FLAVOR-AREA*))
+			      LISTS :AREA SYSTEM-TEMPORARY-AREA)))
+	  ;; Flavor lists may have nonreorderable objects (such as local-function-specs).
+	  (WHEN INCREMENTAL-P
+	    (SETQ START-TIME (TIME))
+	    (SETQ LISTS (CL:DELETE-IF-NOT #'REORDERABLE LISTS))
+	    (GC-OPTIMIZATION-REPORT
+	      "~&Deleting nonreorderable flavor lists took ~\time-interval\."
+	      (ROUND (TIME-DIFFERENCE (TIME) START-TIME) 60.)))
+	  (SETQ *REORDERINGS*
+		(LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+		  (APPEND (CONVERT-PACKING-TO-REORDERINGS PACKING :NAME 'FLAVOR)
+			  (LIST (MAKE-REORDERING NAME 'FLAVOR-LISTS
+						 AREA FLAVOR::*FLAVOR-AREA*
+						 NO-TRANSPORT-OKAY T	;due to sharing
+						 OBJECT-LIST (COPYLIST LISTS
+								       REORDERING-LIST-AREA)))
+			  *REORDERINGS*)))
+	  ;; All of *FLAVOR-AREA* should get flipped, to make sure the old copies of the stuff
+	  ;; that FLAVOR::COMPACT-FLAVOR-LISTS copied get reclaimed.  But don't flip stuff
+	  ;; that was reordered once and isn't being reordered again.
+;This should be obsolete
+;	  (LET ((DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA))
+;	    (DO-AREA-REGIONS (REGION FLAVOR::*FLAVOR-AREA*)
+;	      (WHEN (OR (NOT *INCREMENTAL-IMMEDIATE-GC*)
+;			(LET ((BITS (REGION-BITS REGION)))
+;			  (AND (= (LDB %%REGION-SPACE-TYPE BITS) %REGION-SPACE-NEW)
+;			       (> (LEVEL-TYPE (LDB %%REGION-LEVEL BITS)) %LEVEL-TYPE-STATIC))))
+;		(PUSH REGION *OTHER-REGIONS-TO-FLIP*))))
+	  ;; Cdr-code *ALL-FLAVOR-NAMES* so future operations will be faster.
+	  (SETQ FLAVOR:*ALL-FLAVOR-NAMES*
+		(COPYLIST FLAVOR:*ALL-FLAVOR-NAMES* FLAVOR::*FLAVOR-AREA*))
+	  ;; Cdr-code *ALL-GENERIC-FUNCTION-NAMES* so future operations will be faster.
+	  (SETQ FLAVOR:*ALL-GENERIC-FUNCTION-NAMES*
+		(COPYLIST FLAVOR:*ALL-GENERIC-FUNCTION-NAMES* FLAVOR::*FLAVOR-AREA*))
+	  ))))
+  (:AFTER-RECLAIM-OLDSPACE (IGNORE)
+    (SETQ FLAVOR:*ALL-FLAVOR-NAMES*
+	  (CL:SORT FLAVOR:*ALL-FLAVOR-NAMES* #'<
+		   :KEY #'(LAMBDA (FLAVOR)
+			    (%POINTER (FLAVOR:FIND-FLAVOR FLAVOR NIL)))))
+    (SETQ FLAVOR:*ALL-GENERIC-FUNCTION-NAMES*
+	  (CL:SORT FLAVOR:*ALL-GENERIC-FUNCTION-NAMES* #'<
+		   :KEY #'(LAMBDA (GENERIC-FUNCTION)
+			    (%POINTER (FLAVOR:FIND-GENERIC-FUNCTION
+					GENERIC-FUNCTION NIL)))))))
+
+;; This creates the following ordering:
+;;    1.  Flavor Object
+;;    2.  Flavor Mapping Tables
+;;    3.  Flavor Handler Table
+;;    4.  Flavor Mapping Table Variable-P
+;;    5.  Flavor Template Instance
+(DEFUN COMPOSE-ORDERING-FOR-FLAVOR (FLAVOR &AUX TEM)
+  (LET ((LIST (CONS FLAVOR
+		    (NCONC (FLAVOR-MAPPING-TABLE-ORDERING FLAVOR)
+			   (NCONS (FLAVOR:FLAVOR-HANDLER-TABLE FLAVOR))
+			   (COND ((SETQ TEM (FLAVOR::FLAVOR-MAPPING-TABLE-VARIABLE-P FLAVOR))
+				  ;; If there are not yet any mapping tables -to- this flavor
+				  ;; it might not have been finalized yet, do so now.
+				  ;; Also if the flavor has been redefined with different
+				  ;; instance variables, the old mapping-table-variable-p
+				  ;; shouldn't be retained if that would cause a region
+				  ;; to be flipped that otherwise should not be flipped
+				  (UNLESS (AND (= (%AREA-NUMBER TEM) FLAVOR::*FLAVOR-AREA*)
+					       (REORDERABLE TEM))
+				    (SETF (FLAVOR::FLAVOR-MAPPING-TABLE-VARIABLE-P FLAVOR)
+					  (SETQ TEM (CL:COPY-SEQ TEM FLAVOR::*FLAVOR-AREA*))))
+				  (NCONS TEM)))
+			   (AND (SETQ TEM (FLAVOR::FLAVOR-TEMPLATE-INSTANCE FLAVOR))
+				(NCONS TEM))))))
+    (CONS (LOOP FOR ELEM IN LIST SUM (%STRUCTURE-TOTAL-SIZE ELEM)) LIST)))
+
+(DEFUN FLAVOR-MAPPING-TABLE-ORDERING (FLAVOR)
+  (WITHOUT-INTERRUPTS ;Don't rehash hash table
+    (LET ((ORDERING (COPYLIST (FLAVOR::FLAVOR-MAPPING-TABLES FLAVOR) DEFAULT-CONS-AREA T))
+	  (HT (FLAVOR:FLAVOR-HANDLER-TABLE FLAVOR)))
+      ;; Pick up extra-arg vectors for pseudo-combined methods
+      (LOOP FOR P = (FLAVOR::HANDLER-TABLE-ADDRESS HT)
+		  THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE P 3)
+	    UNTIL (EQ P LIMIT)
+	    WITH LIMIT = (FLAVOR::HANDLER-TABLE-LAST-ADDRESS HT)
+	    AS MT = (FLAVOR::HANDLER-TABLE-MAPPING-TABLE P)
+	    WHEN (FLAVOR::HANDLER-TABLE-SELECTOR P)
+	      WHEN (ARRAYP MT)
+		UNLESS (MEMQ MT ORDERING)
+		  DO (SETQ ORDERING (NCONC ORDERING (NCONS MT))))
+      ;; Move the "fast" ones to the front
+      (DOLIST (GENERIC (REVERSE (FLAVOR::HANDLER-TABLE-METHOD-ORDER HT)))
+	(WHEN (SETQ GENERIC (FLAVOR:FIND-GENERIC-FUNCTION GENERIC NIL))
+	  (MULTIPLE-VALUE-BIND (IGNORE MT)
+	      (FLAVOR::HANDLER-TABLE-FUNCTION-AND-PARAMETER
+		FLAVOR (GENERIC-FUNCTION-SELECTOR GENERIC))
+	    (WHEN (ARRAYP MT)
+	      (SETQ ORDERING (FS:PULL MT ORDERING))))))
+      ORDERING)))
+
+;; Debugging Function
+#||
+(DEFUN CHECK-FLAVOR-REORDERINGS (&OPTIONAL (VERBOSE T)
+				 &AUX (SWAPIN-VERBOSE (MEMQ VERBOSE '(T :SWAPIN-ONLY)))
+				      (REGION-VERBOSE (MEMQ VERBOSE '(T :REGION-ONLY))))
+  (FLET ((TATTLE (FLAVOR REGION SWAPIN)
+	   (FORMAT T "~%For Flavor ~S, region ~O, swapin ~O" FLAVOR REGION SWAPIN))
+	 (PRIN1-OBJECT-SAFELY (OBJECT)
+	   (TYPECASE OBJECT
+	     ;; Placeholder objects don't print well.
+	     (:INSTANCE (FORMAT T "#<Template Instance for ~S ~O>"
+				(FLAVOR-NAME (%INSTANCE-FLAVOR OBJECT))
+				(%POINTER OBJECT)))
+	     (OTHERWISE (PRIN1 OBJECT)))))
+    (LOOP WITH *INCREMENTAL-IMMEDIATE-GC* = NIL ;braindamage
+	  WITH COUNT-BAD-FLAVORS = 0
+	  WITH COUNT-REORDERABLE-FLAVORS = 0
+	  FOR FLAVOR-NAME IN *ALL-FLAVOR-NAMES*
+	  AS FLAVOR = (FLAVOR:FIND-FLAVOR FLAVOR-NAME NIL)
+	  WHEN (AND FLAVOR
+		    (LET ((HANDLER-TABLE (FLAVOR:FLAVOR-HANDLER-TABLE FLAVOR)))
+		      (AND HANDLER-TABLE
+			   (NEQ HANDLER-TABLE
+				FLAVOR::*INSTANCE-TRANSFORMING-HANDLER-TABLE*))))
+	    DO (INCF COUNT-REORDERABLE-FLAVORS)
+	       (LOOP WITH (TATTLED LOW-ADDRESS HIGH-ADDRESS OBJECT-SIZE)
+		     WITH ORDERING = (CDR (COMPOSE-ORDERING-FOR-FLAVOR FLAVOR))
+		     WITH REGION = (%REGION-NUMBER FLAVOR)
+		     WITH SWAPIN = (LDB %%REGION-SWAPIN-QUANTUM (REGION-BITS REGION))
+		     WITH FIRST-PAGE = (LDB %%VMA-PAGE-NUM (%POINTER FLAVOR))
+		     FOR OBJECT IN ORDERING
+		     WHEN ( (%REGION-NUMBER OBJECT) REGION)
+		       DO (UNLESS TATTLED
+			    (WHEN REGION-VERBOSE (TATTLE FLAVOR-NAME REGION SWAPIN))
+			    (SETQ TATTLED T)
+			    (INCF COUNT-BAD-FLAVORS))
+			  (WHEN REGION-VERBOSE
+			    (FORMAT T "~%  Wrong region ~9<(~O):  ~>"
+				    (%REGION-NUMBER OBJECT))
+			    (PRIN1-OBJECT-SAFELY OBJECT))
+		     ELSE
+		       DO (MULTIPLE-VALUE (NIL LOW-ADDRESS OBJECT-SIZE)
+			    (%FIND-STRUCTURE-EXTENT OBJECT))
+			  (SETQ HIGH-ADDRESS (+ (%POINTER LOW-ADDRESS) OBJECT-SIZE -1))
+			  (WHEN (> (- (LDB %%VMA-PAGE-NUM HIGH-ADDRESS) FIRST-PAGE) SWAPIN)
+			    (UNLESS TATTLED
+			      (WHEN SWAPIN-VERBOSE (TATTLE FLAVOR-NAME REGION SWAPIN))
+			      (SETQ TATTLED T)
+			      (INCF COUNT-BAD-FLAVORS))
+			    (WHEN SWAPIN-VERBOSE
+			      (FORMAT T "~%  Wrong swapin ~9<(~O):  ~>"
+				      (- (LDB %%VMA-PAGE-NUM HIGH-ADDRESS) FIRST-PAGE))
+			      (PRIN1-OBJECT-SAFELY OBJECT))))
+	  FINALLY (WHEN (PLUSP COUNT-BAD-FLAVORS)
+		    (FORMAT T "~2%~D//~D flavors (~D%) were misordered."
+			    COUNT-BAD-FLAVORS COUNT-REORDERABLE-FLAVORS
+			    (ROUND (* 100.0 COUNT-BAD-FLAVORS) COUNT-REORDERABLE-FLAVORS))))))
+||#
+
+;;; Sheet reordering
+
+;;; Try to keep SHEET structures in load order, since that seems to be better than
+;;; the semi-randomized order the garbage collector comes up with.  The set of sheets
+;;; used by a given application usually occupies much more than one page, and isn't
+;;; necessarily tied together by direct object references that the GC can follow.
+;;; Depth-first traversal of the SHEET-INFERIORS tree is not as good, since there
+;;; are many sheets that are deactivated now, but will be activated and used when
+;;; somebody runs a program.
+;;; Note that we assume that there is no significant amount of garbage to be reclaimed.
+(DEFINE-GC-OPTIMIZATION REORDER-SHEETS :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "Reorder sheets to improve paging performance")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (IGNORE)
+   (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA)
+	 (IO-BUFFERS NIL))
+     (FLET ((COLLECT-SHEETS (AREA)
+	      (POOR-MAN/'S-WITH-COLLECTION (OBJECT-LIST)
+		(MAP-OVER-OBJECTS-IN-AREA AREA #'REGION-PREDICATE-REORDERABLE-STRUCTURE
+		  #'(LAMBDA (IGNORE IGNORE SHEET IGNORE IGNORE)
+		      (WHEN (TYPEP SHEET 'TV:SHEET)
+			(COLLECT-OBJECT-LIST SHEET)
+			(WHEN (TYPEP SHEET 'TV:STREAM-MIXIN)
+			  (WHEN (BOUNDP-IN-INSTANCE SHEET 'TV:IO-BUFFER)
+			    (LET ((IOB (SYMEVAL-IN-INSTANCE SHEET 'TV:IO-BUFFER)))
+			      (WHEN (AND IOB
+					 (= (%AREA-NUMBER IOB) WORKING-STORAGE-AREA)
+					 (NOT (ASSQ IOB IO-BUFFERS)))
+				(PUSH (CONS IOB SHEET) IO-BUFFERS)))))
+			;; Keep CLIPPING-REGION right next to the sheet
+			(LET ((CLIPPING-REGION
+				(%FIND-STRUCTURE-HEADER (TV:SHEET-CLIPPING-REGION SHEET))))
+			  (UNLESS (AND (ARRAYP CLIPPING-REGION)
+				       (= (%AREA-NUMBER CLIPPING-REGION) AREA)
+				       (REORDERABLE CLIPPING-REGION))
+			    (SETQ CLIPPING-REGION (MAKE-ARRAY 4 :TYPE ART-Q-LIST :AREA AREA))
+			    (CL:REPLACE CLIPPING-REGION (TV:SHEET-CLIPPING-REGION SHEET))
+			    (SETF (TV:SHEET-CLIPPING-REGION SHEET) (G-L-P CLIPPING-REGION)))
+			  (COLLECT-OBJECT-LIST CLIPPING-REGION)))))
+		OBJECT-LIST)))
+       (SETQ *REORDERINGS*
+	     (LIST* (MAKE-REORDERING NAME 'TV:SHEET-AREA
+				     AREA TV:SHEET-AREA
+				     NO-TRANSPORT-OKAY T
+				     OBJECT-LIST (COLLECT-SHEETS TV:SHEET-AREA))
+		    (MAKE-REORDERING NAME 'TV:WHO-LINE-AREA
+				     AREA TV:WHO-LINE-AREA
+				     NO-TRANSPORT-OKAY T
+				     OBJECT-LIST (COLLECT-SHEETS TV:WHO-LINE-AREA))
+		    ;; All I/O buffers that have processes listening to them are going
+		    ;; to get referenced by the scheduler, so pack these into as few
+		    ;; pages as possible.  Sort by window order to try to get the
+		    ;; irrelevant ones away from the ones that are really used.
+		    (MAKE-REORDERING NAME 'IO-BUFFERS
+				     AREA WORKING-STORAGE-AREA
+				     NO-TRANSPORT-OKAY T
+				     OBJECT-LIST (MAPCAR #'CAR (CL:SORT IO-BUFFERS
+									#'%POINTER-LESSP
+									:KEY #'CDR)))
+		    *REORDERINGS*))))))
+
+;; Put all CHARACTER-STYLE objects in adjacent pages
+;; Sort first by family, that seems to put related ones together
+(DEFINE-GC-OPTIMIZATION REORDER-CHARACTER-STYLES :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "Reorder character styles to improve paging performance")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (IGNORE)
+    (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+      (SETQ *REORDERINGS*
+	    (LIST* (MAKE-REORDERING NAME 'REORDER-CHARACTER-STYLES
+				    AREA PERMANENT-STORAGE-AREA
+				    OBJECT-LIST
+				      (CL:DELETE-IF-NOT #'REORDERABLE
+							(SORT (LIST-ALL-CHARACTER-STYLES)
+							      #'CHARACTER-STYLE-LESSP)))
+		   *REORDERINGS*)))))
+
+
+;;; Put all D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")print-object0 presentation types together.
+(DEFINE-GC-OPTIMIZATION REORDER-PRINT-OBJECT-PRESENTATION-TYPES :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "Reorder print-object presentation-types to improve paging performance")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (IGNORE)
+    ;; Make sure the table system doesn't need to change-instance-flavor or
+    ;; anything else that might cons while we bind 1default-cons-area0.
+    ;; Yow, am I paranoid, or what?  (2 0 (NIL 0) (NIL NIL :SMALL) "TVFONT")Yes, Bob.
+0    (MAPHASH #'IGNORE *PRINT-OBJECT-PRESENTATION-TYPES-TABLE*)
+    (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+      (LET ((TYPES (LIST-OBJECT-PRESENTATION-TYPES)))
+	(PUSH (MAKE-REORDERING NAME 'REORDER-PRINT-OBJECT-PRESENTATION-TYPES
+			       AREA PERMANENT-STORAGE-AREA
+			       OBJECT-LIST (CL:DELETE-IF-NOT #'REORDERABLE TYPES))
+	      *REORDERINGS*)))))
+
+
+;;; SCT System reordering
+
+;; To do --
+;;   Stop using symbols as names of systems and modules, since looking up pnames pages badly.
+
+(DEFINE-GC-OPTIMIZATION REORDER-SYSTEMS :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "Reorder SCT data structures to improve paging performance")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (IGNORE)
+    (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+      (PUSH (MAKE-REORDERING
+	      NAME 'REORDER-SYSTEMS
+	      AREA WORKING-STORAGE-AREA
+	      REGION-BITS (%LOGDPBS 4 %%REGION-SWAPIN-QUANTUM
+				    %PAGING-TYPE-SEQUENTIAL %%REGION-PAGING-TYPE 0)
+	      REGION-BITS-MASK (%LOGDPBS -1 %%REGION-SWAPIN-QUANTUM
+					 -1 %%REGION-PAGING-TYPE 0)
+	      OBJECT-LIST (CREATE-SYSTEM-ORDERING))
+	    *REORDERINGS*))))
+
+(DEFUN CREATE-SYSTEM-ORDERING (&AUX (WSA WORKING-STORAGE-AREA))
+  ;; Do some minimal sharing, and get some strings out of pname-area.
+  (LOOP FOR LIST ON SCT:*ALL-SYSTEMS*
+	AS SYSTEM = (FOLLOW-STRUCTURE-FORWARDING (CAR LIST))
+	WHEN (REORDERABLE SYSTEM)
+	  DO (SETF (CAR LIST) SYSTEM)
+	     (LET ((NAME (SUBSTRING (SCT:SYSTEM-SHORT-NAME SYSTEM) 0 NIL WSA)))
+	       (SETF (SCT:SYSTEM-SHORT-NAME SYSTEM) NAME)
+	       (SETF (SCT:SYSTEM-PRETTY-NAME SYSTEM)
+		     (COND ((CL:EQUAL (SCT:SYSTEM-PRETTY-NAME SYSTEM) NAME) NAME)
+			   (T (SUBSTRING (SCT:SYSTEM-PRETTY-NAME SYSTEM) 0 NIL WSA))))
+	       (WHEN (TYPEP SYSTEM 'SCT:SYSTEM)
+		 (WHEN (SCT:SYSTEM-PATCHABLE SYSTEM)
+		   (LET ((PLAN (SCT:SYSTEM-LOAD-PATCHES-PLAN SYSTEM)))
+		     (WHEN PLAN
+		       (SETF (SCT:SYSTEM-LOAD-PATCHES-PLAN SYSTEM) (COPYLIST PLAN WSA))))
+		   (LET ((ATOM (SCT:SYSTEM-PATCH-ATOM SYSTEM)))
+		     (WHEN ATOM
+		       (SETF (SCT:SYSTEM-PATCH-ATOM SYSTEM)
+			     (COND ((CL:EQUAL ATOM NAME) NAME)
+				   (T (SUBSTRING ATOM 0 NIL WSA))))))
+		   (LET ((PATCH (SCT:SYSTEM-LOADED-PATCHES SYSTEM)))
+		     (WHEN PATCH
+		       (LET ((NAMES (CAR PATCH)))
+			 (CL:ETYPECASE NAMES
+			   (SCT:SYSTEM
+			     (CL:ASSERT (EQUAL (SCT:SYSTEM-NAME NAMES)
+					       (SCT:SYSTEM-NAME SYSTEM)))
+			     SYSTEM)
+			   (STRING
+			     (SETF (CAR PATCH)
+				   (COND ((CL:EQUAL NAMES NAME) NAME)
+					 ((CL:EQUAL NAMES (SCT:SYSTEM-PRETTY-NAME SYSTEM))
+					  (SCT:SYSTEM-PRETTY-NAME SYSTEM))
+					 (T (SUBSTRING NAMES 0 NIL WSA)))))
+			   (LIST
+			     (SETF (CAR PATCH) (SETQ NAMES (COPYLIST NAMES WSA)))
+			     (LOOP FOR LIST ON NAMES DO
+			       (SETF (CAR LIST)
+				     (COND ((CL:EQUAL (CAR LIST) NAME) NAME)
+					   ((CL:EQUAL (CAR LIST)
+						      (SCT:SYSTEM-PRETTY-NAME SYSTEM))
+					    (SCT:SYSTEM-PRETTY-NAME SYSTEM))
+					   ((AND (TYPEP (CAR LIST) 'SCT:BASIC-SYSTEM)
+						 (EQUAL (SCT:SYSTEM-NAME (CAR LIST))
+							(SCT:SYSTEM-NAME SYSTEM)))
+					    SYSTEM)					    
+					   (T (SUBSTRING (CAR LIST) 0 NIL WSA))))))))))))))
+  ;; Collect the system objects in standard traversal order.
+  (POOR-MAN/'S-WITH-COLLECTION (SYSTEMS MODULES PATCH-LISTS LISTS)
+    (DOLIST (SYSTEM SCT:*ALL-SYSTEMS*)
+      (WHEN (REORDERABLE SYSTEM)
+	(COLLECT-SYSTEMS SYSTEM)
+	(COLLECT-SYSTEMS (SCT:SYSTEM-SHORT-NAME SYSTEM))
+	(COLLECT-SYSTEMS (SCT:SYSTEM-PRETTY-NAME SYSTEM))
+	(WHEN (TYPEP SYSTEM 'SCT:SYSTEM)
+	  (WHEN (SCT:SYSTEM-PATCHABLE SYSTEM)
+	    (LET ((PATCH (SCT:SYSTEM-LOADED-PATCHES SYSTEM)))
+	      (WHEN PATCH
+		(COLLECT-PATCH-LISTS PATCH)
+		(IF (ATOM (CAR PATCH))
+		    (COLLECT-SYSTEMS (CAR PATCH))
+		  (COLLECT-PATCH-LISTS (CAR PATCH))
+		  (DOLIST (NAME (CAR PATCH))
+		    (COLLECT-SYSTEMS NAME)))))
+	    (LET ((ATOM (SCT:SYSTEM-PATCH-ATOM SYSTEM)))
+	      (WHEN ATOM (COLLECT-SYSTEMS ATOM)))
+	    (LET ((PLAN (SCT:SYSTEM-LOAD-PATCHES-PLAN SYSTEM)))
+	      (WHEN PLAN (COLLECT-PATCH-LISTS PLAN)))))
+	(UNLESS (TYPEP SYSTEM 'SCT:UNDEFINED-SYSTEM)
+	  (LET ((TABLE (SCT:SYSTEM-MODULE-NAMES SYSTEM)))
+	    (UNLESS (SYMBOLP TABLE)
+	      (COLLECT-MODULES TABLE)
+	      (LET ((REPRESENTATION (CLI::BASIC-TABLE-INTERNAL-REPRESENTATION TABLE)))
+		(IF (ATOM REPRESENTATION)
+		    (COLLECT-MODULES (CLI::BASIC-TABLE-INTERNAL-REPRESENTATION TABLE))
+		    (SETF (CLI::BASIC-TABLE-INTERNAL-REPRESENTATION TABLE)
+			  (SETQ REPRESENTATION (COPYLIST REPRESENTATION WSA)))
+		    (COLLECT-LISTS REPRESENTATION)
+		    (LOOP FOR CONS IN REPRESENTATION DO
+		      (COLLECT-LISTS CONS))))))
+	  (LET ((MODULES (SCT:SYSTEM-MODULES SYSTEM)))
+	    (UNLESS (SYMBOLP MODULES)
+	      (SETF (SCT:SYSTEM-MODULES SYSTEM)
+		    (SETQ MODULES (COPYLIST MODULES WSA)))
+	      (COLLECT-LISTS MODULES)
+	      (DOLIST (MODULE MODULES)
+		(COLLECT-MODULES MODULE)
+		;; These can't be reordered since they're symbols and apparently need to be.
+		;; (COLLECT-MODULES (SCT:MODULE-NAME MODULE))
+		(LET ((INPUTS (SCT:MODULE-INPUTS MODULE)))
+		  (WHEN INPUTS
+		    (SETF (SCT:MODULE-INPUTS MODULE)
+			  (SETQ INPUTS (COPYLIST INPUTS WSA)))
+		    (COLLECT-LISTS INPUTS)
+		    (LOOP FOR LIST ON INPUTS
+			  AS ELEMENT = (COPYLIST (CAR LIST) WSA)
+			  DO (SETF (CAR LIST) ELEMENT)
+			     (COLLECT-LISTS ELEMENT))))
+		(LET ((DEPENDENCIES (SCT:MODULE-DEPENDENCIES MODULE)))
+		  (WHEN DEPENDENCIES
+		    (SETF (SCT:MODULE-DEPENDENCIES MODULE)
+			  (SETQ DEPENDENCIES (COPYLIST DEPENDENCIES WSA)))
+		    (COLLECT-LISTS DEPENDENCIES)
+		    (LOOP FOR LIST ON DEPENDENCIES
+			  AS ELEMENT = (COPYLIST (CAR LIST) WSA)
+			  DO (SETF (CAR LIST) ELEMENT)
+			     (COLLECT-LISTS ELEMENT)
+			     (LOOP FOR LIST ON (CDR ELEMENT)
+				   AS ELEMENT = (COPYLIST (CAR LIST) WSA)
+				   DO (SETF (CAR LIST) ELEMENT)
+				      (COLLECT-LISTS ELEMENT)))))
+		(LET ((LIST (SCT:MODULE-USES-DEFINITIONS-FROM MODULE)))
+		  (WHEN LIST
+		    (SETF (SCT:MODULE-USES-DEFINITIONS-FROM MODULE)
+			  (SETQ LIST (COPYLIST LIST WSA)))
+		    (COLLECT-LISTS LIST)))))))))
+    (LET ((ORDERING (NCONC (ELIMINATE-DUPLICATES SYSTEMS)
+			   (ELIMINATE-DUPLICATES MODULES)
+			   PATCH-LISTS
+			   LISTS)))
+      ;; Even though we didn't hack nonreorderable systems, nonreorderable objects
+      ;; may have snuck in due to structure-forwarding of the system objects.
+      ;; So stomp on 'em!
+      (WHEN *INCREMENTAL-IMMEDIATE-GC*
+	(SETQ ORDERING (CL:DELETE-IF-NOT #'REORDERABLE ORDERING)))
+      ORDERING)))
+
+;;; Symbol reordering
+
+;; Symbols are something we don't really want to worry about, but due to
+;; some programming styles we have to.  The worst use of symbols from a
+;; paging point of view is as a table; you look up the symbol in table
+;; foo by getting some property off of the symbol.  For instance, Sage
+;; and the Compiler do lots of this.  It's therefore to our advantage to
+;; group symbols and their plists by properties when possible.
+
+;; Another common misuse of symbols is as a function.  For instance, all
+;; editor commands are invoked by funcalling a symbol.  Sometimes
+;; symbols which are really functions are stored in property lists,
+;; structures SI:CLOCK-FUNCTION-LIST, etc, etc.  What people really
+;; should be doing is defining function specs for every place a function
+;; is stored, but this is often a pain.  Since we can't really know which symbols
+;; are going to be abused this way, we do two things:
+;;   (1) Sort symbols by pname within package.  This catches most ZWEI:COM-* type
+;;	 commands, and helps completion too.  (For completion, we also sort pnames.)
+;;   (2) Provide a facility (DEFINE-SYMBOL-REORDERING-TASK) which programs
+;;       can cons up a list of symbols which they want to be local.  For instance;
+;;	 everything on SI:CLOCK-FUNCTION-LIST can be put on one page in this manner.
+
+;; Many symbols are not used at all, except by "debugging" type
+;; operations.  Most special variables and functions are not used (!)
+;; since their values or functions are forwarded somewhere else.
+;; Symbols which only serve to name variables in debugging-info lists
+;; and keywords are other examples; they're there mostly so unique
+;; pnames are there.  Such symbols, since they are rarely referenced,
+;; are partitioned from other symbols to increase the other symbols'
+;; locality.
+
+;; The full-blown symbol-reordering algorithm is:
+;;   (1) Reorder system symbols first.
+;;   (2) Out of the remainder, partition symbols into worthless and useful symbols.
+;;   (3) Within each partition, sort symbols by package.  Place packages which
+;;       are used by other packages together, since they'll probably get referenced
+;;       more often.
+;;   (4) Within each package, group symbols with other symbols with the same properties.
+;;       This cannot be done in general, of course, since properties overlap.  But try.
+;;   (5) Finally, sort by PNAME.
+;;   (6) From this final ordering of symbols, order PNAMEs and PLISTs the same way.
+
+(DEFVAR *PROPERTIES-NOT-TO-WORRY-ABOUT*
+	'(:SOURCE-FILE-NAME
+	  :PREVIOUS-DEFINITION
+	  FUNCTION-CELL-STORAGE-CATEGORY
+	  VARIABLE-STORAGE-CATEGORY))
+
+(DEFINE-GC-OPTIMIZATION REORDER-SYMBOLS :LAYERED-IDS-RELEASE
+  (:ORDER :LATE (:AFTER REORDER-FLAVORS))
+  (:DOCUMENTATION
+    "Reorder symbols, pnames, and property lists for improved paging performance")
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (USING-SYSTEM-TEMPORARY-AREA
+      (LET ((DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA))
+	(MULTIPLE-VALUE-BIND (USEFUL-SYMBOLS WORTHLESS-SYMBOLS)
+	    (MAKE-USEFUL-AND-WORTHLESS-SYMBOL-ALISTS)
+	  (GC-OPTIMIZATION-REPORT "~2%Symbol Reordering Summary (by package)")
+	  (LOOP FOR P IN (NCONC (CL:SORT (DELQ NIL
+					       (ELIMINATE-DUPLICATES
+						 (NCONC (MAPCAR #'CAR WORTHLESS-SYMBOLS)
+							(MAPCAR #'CAR USEFUL-SYMBOLS))))
+					 #'STRING-LESSP :KEY #'PKG-NAME)
+				(LIST NIL))
+		AS WORTHLESS = (OR (CADR (ASSQ P WORTHLESS-SYMBOLS)) 0)
+		AS USEFUL = (OR (CADR (ASSQ P USEFUL-SYMBOLS)) 0)
+		SUM WORTHLESS INTO WORTHLESS-TOTAL
+		SUM USEFUL INTO USEFUL-TOTAL
+		DO (GC-OPTIMIZATION-REPORT "~%  ~25A -- ~6D Useful, ~6D Worthless Symbols"
+					   (OR P "(no package)") USEFUL WORTHLESS)
+		FINALLY
+		  (GC-OPTIMIZATION-REPORT "~%  ~25A -- ~6D Useful, ~6D Worthless Symbols"
+					  "Total" USEFUL-TOTAL WORTHLESS-TOTAL))
+	  ;; Order symbols by property and pname
+	  (SETQ WORTHLESS-SYMBOLS
+		(LOOP FOR ALIST IN WORTHLESS-SYMBOLS
+		      COLLECT (ORDER-SYMBOL-ALIST ALIST NIL)))
+	  (SETQ USEFUL-SYMBOLS
+		(LOOP FOR ALIST IN USEFUL-SYMBOLS
+		      COLLECT (ORDER-SYMBOL-ALIST ALIST *PROPERTIES-NOT-TO-WORRY-ABOUT*)))
+	  ;; Put packages in canonical order for reordering the symbols within them.
+	  ;; First all packages which are used by other packages, in creation order.
+	  ;; Then follow other packages, in creation order.
+	  ;; Then symbols without packages and undefined packages.
+	  ;; Rationale:  Packages used by other packages are more likely to be referenced.
+	  (FLET ((REORDER-PACKAGE-ALIST (ALIST)
+		   (LOOP FOR P IN *ALL-PACKAGES*
+			 AS ENTRY = (ASSQ P ALIST)
+			 WHEN ENTRY
+			   COLLECT ENTRY INTO NEW-LIST
+			 FINALLY
+			   (LOOP FOR P IN (%REVERSE-AND-CDR-CODE *ALL-PACKAGES*)
+				 WHEN (PACKAGE-USED-BY-LIST P)
+				   DO (LET ((ENTRY (ASSQ P ALIST)))
+					(WHEN ENTRY
+					  (SETQ NEW-LIST (FS:PULL ENTRY NEW-LIST)))))
+			   (DOLIST (ENTRY ALIST)
+			     (UNLESS (MEMQ ENTRY NEW-LIST)
+			       (SETQ NEW-LIST (NCONC NEW-LIST (NCONS ENTRY)))))
+			   (RETURN NEW-LIST))))
+	    (SETQ USEFUL-SYMBOLS (REORDER-PACKAGE-ALIST USEFUL-SYMBOLS))
+	    (SETQ WORTHLESS-SYMBOLS (REORDER-PACKAGE-ALIST WORTHLESS-SYMBOLS)))
+	  ;; Do not hang onto any symbols which might be GC'd.
+	  ;; Some symbols we consider "worthless" won't be GC'd because they have
+	  ;; properties.  So keep them for reordering.
+	  (LOOP FOR ELEMENT IN WORTHLESS-SYMBOLS DO
+	    (SETF (CDDR ELEMENT) (CL:DELETE-IF #'WORTHLESS-SYMBOL-P (CDDR ELEMENT))))
+	  (LET* ((SYSTEM-SYMBOLS (REORDER-SOME-SYSTEM-SYMBOLS))
+		 (SYMBOL-LIST (NCONC (IF INCREMENTAL-P
+					 (DEL-IF-NOT #'REORDERABLE SYSTEM-SYMBOLS)
+					 SYSTEM-SYMBOLS)
+				     (MAPCAN #'CDDR USEFUL-SYMBOLS)
+				     (MAPCAN #'CDDR WORTHLESS-SYMBOLS)))
+		 (ALL-SYMBOLS SYMBOL-LIST))
+	    (UNLESS INCREMENTAL-P
+	      #+IMach (PUSH NIL ALL-SYMBOLS)
+	      #+IMach (PUSH T   ALL-SYMBOLS)
+	      (DO-OBJECTS ((SYMBOL) :AREA SAFEGUARDED-OBJECTS-AREA
+				    :REGION-PREDICATE #'REGION-PREDICATE-STRUCTURE)
+		(WHEN (SYMBOLP SYMBOL)
+		  (PUSH SYMBOL ALL-SYMBOLS))))
+	    (SETQ *REORDERINGS*
+		  (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+		    (LIST* (MAKE-REORDERING NAME 'SYMBOL
+					    AREA SYMBOL-AREA
+					    NO-TRANSPORT-OKAY T
+					    OBJECT-LIST (COPYLIST SYMBOL-LIST
+								  REORDERING-LIST-AREA))
+			   (MAKE-REORDERING NAME 'PNAME
+					    AREA PNAME-AREA
+					    NO-TRANSPORT-OKAY T
+					    OBJECT-LIST
+			     (LOOP FOR SYMBOL IN ALL-SYMBOLS
+				   AS STRING = (GET-PNAME SYMBOL)
+				   WHEN (AND (= (%AREA-NUMBER STRING) PNAME-AREA)
+					     (REORDERABLE STRING INCREMENTAL-P))
+				     COLLECT STRING))
+			   (MAKE-REORDERING NAME 'PLIST
+					    AREA PROPERTY-LIST-AREA
+					    NO-TRANSPORT-OKAY T
+					    OBJECT-LIST
+			     ;; Copy plists as necessary to cdr-code the reorderable parts.
+			     ;; Make sure to grovel over all symbols, including
+			     ;; nonreorderable ones and safeguarded ones.
+			     (NCONC
+			       ;; This loops over all reorderable, safeguarded,
+			       ;; and wired symbols.
+			       (LOOP FOR SYMBOL IN ALL-SYMBOLS
+				     WHEN (MAYBE-CDR-CODE-SYMBOL-PLIST SYMBOL INCREMENTAL-P)
+				       COLLECT IT)
+			       ;; This loops over all nonreorderable unsafeguarded symbols.
+			       ;; This is a disjoint set from the above symbols, and 
+			       ;; together we have now iterated over all symbols.
+			       (WHEN INCREMENTAL-P
+				 (POOR-MAN/'S-WITH-COLLECTION (LISTS)
+				   (MAP-OVER-OBJECTS-IN-AREA SYMBOL-AREA
+				     #'REGION-PREDICATE-NONREORDERABLE-STRUCTURE
+				     #'(LAMBDA (REGION ADDRESS SYMBOL LEADER SIZE)
+					 (DECLARE (IGNORE REGION ADDRESS LEADER SIZE))
+					 (WHEN (SYMBOLP SYMBOL)
+					   (LET ((PLIST (MAYBE-CDR-CODE-SYMBOL-PLIST
+							  SYMBOL INCREMENTAL-P)))
+					     (WHEN PLIST
+					       (COLLECT-LISTS PLIST))))))))))
+		     *REORDERINGS*)))))))))
+
+;; Copy the symbol's plist as appropriate.
+;; In incremental mode, only copies the new properties on the symbol's plist since
+;; the last nonincremental system-release GC.
+;; Returns a newly consed plist or NIL.
+(DEFUN MAYBE-CDR-CODE-SYMBOL-PLIST (SYMBOL INCREMENTAL-P &AUX PLIST)
+  (WHEN (AND ;; Don't copy plists if they're forwarded elsewhere.
+	     (= (%P-DATA-TYPE (PROPERTY-CELL-LOCATION SYMBOL)) DTP-LIST)
+	     ;; Only copy plists in PROPERTY-LIST-AREA (I think this is bogus.)
+	     (= (%AREA-NUMBER (SETQ PLIST (CL:SYMBOL-PLIST SYMBOL))) PROPERTY-LIST-AREA))
+    (IF (NOT INCREMENTAL-P)
+	(SETF (CL:SYMBOL-PLIST SYMBOL) (COPYLIST PLIST PROPERTY-LIST-AREA))
+      (LOOP FOR I FROM 0 BY 2
+	    FOR SUBLIST ON PLIST BY 'CDDR
+	    WHILE (REORDERABLE SUBLIST INCREMENTAL-P)
+	    FINALLY
+	      (RETURN
+		(COND (SUBLIST
+		       (COND ((= I 0) NIL)
+			     ((= I 2) PLIST)	; Already a cdr-coded block
+			     (T (LET* ((LIST (MAKE-LIST (1+ I) :AREA PROPERTY-LIST-AREA))
+				       (LAST (NTHCDR (1- I) LIST)))
+				  (CL:REPLACE LIST PLIST :END1 I)
+				  (%CHANGE-LIST-TO-CONS LAST)
+				  (SETF (CDR LAST) SUBLIST)
+				  (SETF (CL:SYMBOL-PLIST SYMBOL) LIST)))))
+		      (PLIST
+		       (SETF (CL:SYMBOL-PLIST SYMBOL)
+			     (COPYLIST PLIST PROPERTY-LIST-AREA)))))))))
+
+;; The definition of "worthless" here is from a paging perspective.
+(DEFUN MAKE-USEFUL-AND-WORTHLESS-SYMBOL-ALISTS ()
+  (LET (USEFUL-SYMBOLS WORTHLESS-SYMBOLS)
+    (MAP-OVER-OBJECTS-IN-AREA SYMBOL-AREA #'REGION-PREDICATE-REORDERABLE-STRUCTURE
+      #'(LAMBDA (REGION ADDRESS SYMBOL LEADER SIZE)
+	  REGION ADDRESS LEADER SIZE
+	  (WHEN (SYMBOLP SYMBOL)
+	    (LET* ((PACKAGE (SYMBOL-PACKAGE SYMBOL))
+		   (WORTHLESS
+		     (AND (LOOP FOR PROPERTY IN (PLIST SYMBOL) BY #'CDDR
+				ALWAYS (MEMQ PROPERTY *PROPERTIES-NOT-TO-WORRY-ABOUT*))
+			  (OR (KEYWORDP SYMBOL)
+			      (AND (LET ((DTP (%P-DATA-TYPE (VALUE-CELL-LOCATION SYMBOL))))
+				     (OR (= DTP DTP-NULL)
+					 (= DTP DTP-ONE-Q-FORWARD)))
+				   (LET ((DTP (%P-DATA-TYPE (FUNCTION-CELL-LOCATION SYMBOL))))
+				     (OR (= DTP DTP-NULL)
+					 (= DTP DTP-ONE-Q-FORWARD)))))))
+		   (ALIST (IF WORTHLESS WORTHLESS-SYMBOLS USEFUL-SYMBOLS))
+		   (ELEM (ASSQ PACKAGE ALIST)))
+	      (DECLARE (UNSPECIAL PACKAGE))
+	      (COND ((NOT (NULL ELEM))
+		     (INCF (CADR ELEM))
+		     (PUSH SYMBOL (CDDR ELEM)))
+		    (T
+		     (SETQ ELEM (LIST* PACKAGE 1 (LIST SYMBOL)))
+		     (IF WORTHLESS
+			 (PUSH ELEM WORTHLESS-SYMBOLS)
+			 (PUSH ELEM USEFUL-SYMBOLS))))))))
+    (VALUES USEFUL-SYMBOLS WORTHLESS-SYMBOLS)))
+
+;; Generate an alist of (property-name count . symbols-which-have-this-property)
+;; Second value is symbols with no interesting properties.
+(DEFUN MAKE-PROPERTY-ALIST (SYMBOL-LIST IGNORED-PROPERTIES)
+  (DECLARE (VALUES PROPERTY-ALIST WORTHLESS-SYMBOLS))
+  (LET ((PROPERTY-ALIST NIL))
+    (LOOP FOR SYMBOL IN SYMBOL-LIST
+	  AS PLIST = (PLIST SYMBOL)
+	  AS COLLECTED = NIL
+	  DO (LOOP FOR PROPERTY IN PLIST BY #'CDDR
+		   UNLESS (MEMQ PROPERTY IGNORED-PROPERTIES)
+		     DO (LET ((ELEM (ASSQ PROPERTY PROPERTY-ALIST)))
+			  (IF (NULL ELEM)
+			      (PUSH (LIST* PROPERTY 1 (LIST SYMBOL))
+				    PROPERTY-ALIST)
+			    (PUSH SYMBOL (CDDR ELEM))
+			    (INCF (CADR ELEM)))
+			  (SETQ COLLECTED T)))
+	  UNLESS COLLECTED
+	    COLLECT SYMBOL INTO WORTHLESS-SYMBOLS
+	  FINALLY
+	    (RETURN (VALUES (SORT PROPERTY-ALIST #'CADR-GREATERP)
+			    WORTHLESS-SYMBOLS)))))
+
+;; Orders by property, then by pname
+;; Only works if all symbols have interesting properties.
+;; This creates lots of duplicates.
+;;--- It could avoid this by having make-property-alist only return symbols on their most
+;;--- popular property.
+;;--- I don't know how close to right this is; oh, well.
+(DEFUN ORDER-SYMBOL-ALIST (SYMBOL-ALIST IGNORED-PROPERTIES)
+  (MULTIPLE-VALUE-BIND (PROPERTY-ALIST WORTHLESS-SYMBOLS)
+      (MAKE-PROPERTY-ALIST (CDDR SYMBOL-ALIST) IGNORED-PROPERTIES)
+    (POOR-MAN/'S-WITH-COLLECTION (RESULT-LIST)
+      (LOOP FOR SUBLIST ON PROPERTY-ALIST
+	    AS (PROPERTY COUNT . SYMBOLS) = (CAR SUBLIST)
+	    AS NEXT-PROPERTY = (CAADR SUBLIST)
+	    DO (IGNORE PROPERTY COUNT)
+	       (LOOP FOR SYMBOL IN SYMBOLS
+		     WHEN (AND NEXT-PROPERTY (GET SYMBOL NEXT-PROPERTY))
+		       COLLECT SYMBOL INTO SYMBOLS-WITH-NEXT-PROPERTY
+		     ELSE
+		       COLLECT SYMBOL INTO SYMBOLS-WITH-PROPERTY
+		     FINALLY
+		       (LOOP FOR SYMBOL IN (SORT SYMBOLS-WITH-PROPERTY #'STRING-LESSP) DO
+			 (COLLECT-RESULT-LIST SYMBOL))
+		       (LOOP FOR SYMBOL IN (SORT SYMBOLS-WITH-NEXT-PROPERTY #'STRING-LESSP) DO
+			 (COLLECT-RESULT-LIST SYMBOL))))
+      (LIST* (CAR SYMBOL-ALIST) (CADR SYMBOL-ALIST) (NCONC RESULT-LIST WORTHLESS-SYMBOLS)))))
+
+#||
+(DEFUN TEST-SYMBOL-ORDERING ()
+  (MULTIPLE-VALUE-BIND (USEFUL-SYMBOLS WORTHLESS-SYMBOLS)
+      (MAKE-USEFUL-AND-WORTHLESS-SYMBOL-ALISTS)
+    (SETQ USEFUL-SYMBOLS
+	  (LOOP FOR ALIST IN USEFUL-SYMBOLS COLLECT (ORDER-SYMBOL-ALIST ALIST)))
+    (LOOP FOR FROB IN USEFUL-SYMBOLS
+	  DO (FORMAT T "~%~D useful symbols in package ~A" (CADR FROB) (CAR FROB))
+	     (LOOP FOR SYMBOL IN (CDDR FROB) DO
+	       (FORMAT T "~%~S~{ ~S~*~}" SYMBOL (PLIST SYMBOL))))
+    (LOOP FOR FROB IN WORTHLESS-SYMBOLS DO
+      (SETF (CDDR FROB) (SORT (CDDR FROB) #'STRING-LESSP)))
+    (LOOP FOR FROB IN WORTHLESS-SYMBOLS
+	  DO (FORMAT T "~%~D worthless symbols in package ~A" (CADR FROB) (CAR FROB))
+	     (LOOP FOR SYMBOL IN (CDDR FROB) DO (PRINT SYMBOL)))))
+||#
+
+;; Just for fun.
+;; Add symbols here when you find them with page-tracing.
+(DEFUN REORDER-SOME-SYSTEM-SYMBOLS ()
+ ;; This is a pretty random collection of symbols touched a lot by the system,
+ ;; generated by looking at page traces of (page-trace-system-overhead).
+ (LET ((DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA))
+  (COPYLIST ;; Caller will destruct the list.
+   (CL:REMOVE-IF-NOT #'(LAMBDA (SYMBOL) (= (%AREA-NUMBER SYMBOL) SYMBOL-AREA))	;T, NIL
+     (APPEND '(;; Symbols touched by the wholine
+               TV:WHO-LINE-RUN-STATE
+	       TV:WHO-LINE-PACKAGE
+	       TV:WHO-LINE-USER-OR-PROCESS
+	       TV:WHO-LINE-SHEET
+	       TV:WHO-LINE-DOCUMENTATION-FUNCTION
+	       TV:WWATCH-WHO-FUNCTION
+	       TV:NWATCH-WHO-FUNCTION
+	       TV:SELECTED-IO-BUFFER	;value cell is not forwarded
+	       )
+
+	     ;; Scheduler
+	     PROCESS::*OPTIMIZED-TIMER-FUNCTIONS*
+	     '(PROCESS::RECORD-PROCESS-SWITCH	;*policy-hook-process-switch-occurred*
+	       PROCESS::VERIFY-FUNCTION		;see IE-INPUT-WAIT-1
+	       PROCESS::TOP-LEVEL-FOR-OLD-SIMPLE-PROCESS
+	       PROCESS::TIMER-ARGS		;not always inline, and function cell
+						;can't be forwarded, since not
+						;function-same-as-function-from-name
+
+	       ;; Miscellaneous things observed at one time or another in page traces
+	       LOCATE-IN-INSTANCE
+	       SYMEVAL-IN-INSTANCE
+	       DERIVED-FUNCTION-SPEC-HANDLER
+	       FLAVOR::HANDLE-REAL-UNCLAIMED-MESSAGE
+
+	       ;; Property lists touched by frequent GET-HANDLER-FOR via FIND-GENERIC-FUNCTION
+	       :HANDLE-MOUSE :MOUSE-MOVES		  ;Mouse process
+	       :MOUSE-MOVES-SCROLL :MOUSE-SELECT :SELECT  ;..
+	       :LABEL					  ;(:NAME-FOR-SELECTION SELECT-MIXIN)
+	       :TYI :MORE-TYI				  ;TV:SHEET-MORE-HANDLER
+	       :DEEXPOSE				  ;SHEET-FREE-TEMPORARY-LOCKS
+
+	       ;; Symbols frequently touched by networks
+	       FS:HOST-CHAOS-INTERRUPT-FUNCTION
+	       FS:NFILE-INPUT-INTERRUPT-FUNCTION
+	       NETI:TIME-SIMPLE-SERVER-FUNCTION-INTERNAL
+	       NETI:WHO-AM-I-SERVER-FUNCTION-INTERNAL
+	       NETI:NAMESPACE-TIMESTAMP-SERVER-FUNCTION-INTERNAL
+	       NETI:BUFFERED-MARK-STREAM-PASS-THROUGH
+	       :DATAGRAM
+	       :CHAOS-SIMPLE
+	       CHAOS:CHAOS-BACKGROUND
+	       TCP::TCP-BACKGROUND TCP::TCP-BACKGROUND-PREDICATE
+	       TCP::UDP-CONN
+	       TCP::UNIX-RWHO-SERVER-FUNCTION-INTERNAL
+	       FS:FILE-CONNECTION-SCAVENGER-TOP-LEVEL
+	       FS:FILE-CONNECTION-SCAVENGE-CONDITION
+	 
+	       ;; Symbols touched by user input or output
+	       TRUE					;Presentation tester
+	       DW:PRESENTATION-TYPE-DESCRIPTOR		;SI:TYPEP-FLAVOR
+	       DW::PARSER SYS:PRINTER			;DW::NEW-GET-SYMBOL-TYPE-PROPERTY
+	       DW::VIEWPORT				;FLAVOR:FIND-FLAVOR
+	       TV:KBD-DEFAULT-OUTPUT-FUNCTION		;TV:IO-BUFFER-PUT
+	 
+	       ;; Names of fonts used by the wholine and/or typical interactions on B&W screen
+	       FONTS:CPTFONT FONTS:CPTFONTCC FONTS:SWISS12B-CCAPS
+	       FONTS:CPTFONTI FONTS:CPTFONTCB)
+
+	     ;; Symbols abused by SI:BASIC-CACHE
+	     (LOOP FOR X IN *CHARACTER-STYLE-GLOBAL-TICK-SYMBOLS*
+		   WHEN (SYMBOLP X) COLLECT X)	;Weed out spurious 0
+
+	     (LOOP FOR SYMBOL IN *ARRAY-TYPE-CODES*
+		   WHEN (STRING-EQUAL SYMBOL "ART-" 0 0 4 4)
+		     COLLECT SYMBOL)
+
+	     (CLI::TABLE-SYSTEM-SYMBOLS-TO-REORDER)
+
+	     ;; I/O-related symbols that get touched frequently
+	     (LIST SYN-TERMINAL-IO)
+	     (CLI::STANDARD-IO-ENVIRONMENT-VARS-AND-VALS)
+	     ;; This is defined in the NFILE server, which may not be loaded.
+	     (AND (FUNCTION-DEFINED-P FS:NFILE-SYMBOLS) (FS:NFILE-SYMBOLS))
+
+	     ;; Symbols whose property lists are accessed at run time by
+	     ;; the namespace system
+	     NETI:*ALL-CLASSES*
+
+	     ;; Symbols touched when a condition is signalled (and debugger is reached)
+	     DBG:*CONDITION-HANDLER-LISTS*
+	     '(DBG:DEBUGGER-HANDLER)
+	     DBG:*MENU-PROCEED-CONDITIONS*
+	     (MAPCAR #'CAR *STANDARD-BINDINGS*)
+	     DBG:*VARIABLES-NOT-TO-INHERIT*
+	     '(DEBUG-IO TERMINAL-IO STANDARD-INPUT STANDARD-OUTPUT INHIBIT-SCHEDULING-FLAG
+	       DBG:FRAME-PREVIOUS-OPEN-FRAME	;see frame-previous-active-frame !
+
+	       ;; GC-AFTER-FLIP-LIST
+	       GC-DAEMON-REQUEUE WHO-CALLS-GC-EVERY-FLIP)
+
+	     ;; When a GC daemon goes off, its symbol's name string is used as a process name
+	     (MAPCAR #'FIRST GC-DAEMON-QUEUE)
+
+	     ;; Data type and presentation type names
+	     ;; The property lists of these are frequently referenced
+	     CLI::*TYPEP-TERMINAL-TYPES*
+	     (CL:SORT (COPYLIST (CL:SET-DIFFERENCE DW::*ALL-PRESENTATION-TYPES*
+						   CLI::*TYPEP-TERMINAL-TYPES*))
+		      #'STRING-LESSP
+		      :KEY #'(LAMBDA (X)
+			       (SETQ X (SYMBOL-PACKAGE X))
+			       (COND ((EQ X *LISP-PACKAGE*) "")	;move these to front
+				     ((EQ X *SCL-PACKAGE*) "")	;..
+				     (T (PKG-NAME X)))))
+
+	     FLAVOR:*ALL-FLAVOR-NAMES*))
+   SYSTEM-TEMPORARY-AREA T)))
+
+;; Note:  This can't really reorder packages themselves, since they're being handled
+;; specially by by GC-SYMBOLS.  But by changing the order of the packages in *ALL-PACKAGES*
+;; we can control the order in which GC-SYMBOLS re-creates them later.
+(DEFINE-GC-OPTIMIZATION REORDER-PACKAGES :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION "Reorder package data structures for improved paging performance")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (USING-SYSTEM-TEMPORARY-AREA
+      (LET ((DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA))
+	(UNLESS INCREMENTAL-P
+	  (SETF *ALL-PACKAGES*
+		(STABLE-SORT *ALL-PACKAGES* #'(LAMBDA (P1 P2)
+						(AND (PKG-USED-BY-LIST P1)
+						     (NULL (PKG-USED-BY-LIST P2)))))))
+	(LET ((STRUCTURE-ORDER
+		`(,@(AND (NOT INCREMENTAL-P)
+			 (LIST *PACKAGE-NAME-TABLE*))
+		  ,@(LOOP FOR I BELOW (* 2 *PACKAGE-NAME-TABLE-MODULUS*) BY 2
+			  FOR NAME = (AREF *PACKAGE-NAME-TABLE* I)
+			  WHEN (AND (NOT (SYMBOLP NAME))
+				    (REORDERABLE NAME INCREMENTAL-P))
+			    COLLECT NAME)
+		  ,@(UNLESS (MEMQ 'GC-SYMBOLS *IMMEDIATE-GC-OPTIMIZATIONS*)
+		      (LOOP FOR P IN *ALL-PACKAGES*
+			    WHEN (REORDERABLE P INCREMENTAL-P)
+			      APPEND `(,@(LOOP FOR RELATIVE IN (PKG-RELATIVE-NAMES P)
+					       WHEN (REORDERABLE (CAR RELATIVE) INCREMENTAL-P)
+						 COLLECT (CAR RELATIVE))
+				       ,P))))))
+	  (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+	    (PUSH (MAKE-REORDERING NAME 'REORDER-PACKAGES
+				   AREA PKG-AREA
+				   NO-TRANSPORT-OKAY T
+				   OBJECT-LIST (COPYLIST STRUCTURE-ORDER REORDERING-LIST-AREA))
+		  *REORDERINGS*)))))))
+
+#||
+(DEFUN TEST-REORDER-PACKAGE ()
+  (SI:USING-SYSTEM-TEMPORARY-AREA
+    (LET ((*REORDERINGS* NIL)
+	  (*INCREMENTAL-IMMEDIATE-GC* NIL))
+      (REORDER-PACKAGES)
+      (CL:BREAK))))
+||#
+
+;;; This function is used by patches that correspond to source updates of
+;;; *SAFEGUARDED-SYMBOLS* in SYS:L-COLD;COLDVM.
+;;; It moves symbols into SAFEGUARDED-OBJECTS-AREA in a way that usually works,
+;;; to prevent crashes due to transport-trap on the aux stack inside REORDER-MEMORY.
+#+IGNORE ;;--- This is totally broken, I think.
+(DEFUN SAFEGUARD-SYMBOLS (SYMBOLS)
+  (LET* ((OLD-INHIBIT-SCHEDULING-FLAG INHIBIT-SCHEDULING-FLAG)
+	 (INHIBIT-SCHEDULING-FLAG T)
+	 (INHIBIT-SCAVENGING-FLAG T)
+	 (GC-REPORT-STREAM NIL)
+	 (GC-WARNINGS-ENABLE NIL)
+	 (GC-REPORTS-ENABLE NIL)
+	 (GC-AREA-RECLAIM-REPORT NIL)
+	 (GC-RECLAIM-IMMEDIATELY T)
+	 (TV:MORE-PROCESSING-GLOBAL-ENABLE NIL)
+	 (REGIONS NIL))
+    ;; We don't want to have any interrupts once we start reordering, so ensure
+    ;; that this gets done first.
+    (LOOP UNLESS %GC-FLIP-READY DO (GC-RECLAIM-OLDSPACE)
+	  UNTIL (ZEROP GC-FLIP-INHIBIT)
+	  DO (GC-WAIT-UNTIL-FLIP-OKAY))
+    ;; Find the regions containing these symbols
+    (SETQ SYMBOLS (CL:REMOVE SAFEGUARDED-OBJECTS-AREA SYMBOLS :KEY #'%AREA-NUMBER))
+    (DOLIST (SYMBOL SYMBOLS)
+      (CL:PUSHNEW (%REGION-NUMBER SYMBOL) REGIONS))
+    (WHEN (MEMQ (%REGION-NUMBER REGIONS) REGIONS)
+      ;; Better than dying.
+      (SETQ REGIONS (COPYLIST REGIONS SAFEGUARDED-OBJECTS-AREA)))
+    ;; Make new versions of the symbols in the correct area
+    (DOLIST (SYMBOL SYMBOLS)
+      (LET ((NEW (LET ((DEFAULT-CONS-AREA SAFEGUARDED-OBJECTS-AREA))
+		   (MAKE-SYMBOL (GET-PNAME SYMBOL) NIL))))
+	(LOOP FOR I FROM 1 TO 4 DO
+	  (%P-COPY-Q (%MAKE-POINTER-OFFSET DTP-LOCATIVE SYMBOL I)
+		     (%MAKE-POINTER-OFFSET DTP-LOCATIVE NEW I)))
+	(STRUCTURE-FORWARD SYMBOL NEW)))
+    (LET ((GC-AFTER-FLIP-LIST NIL))
+      (MAPC #'MAKE-REGION-DYNAMIC REGIONS)
+      (GC-FLIP-SUBSET :NO-QUERY T
+	:REGION-PREDICATE #'(LAMBDA (REGION)
+			      (DECLARE (SAFEGUARDED-FUNCTION) (DOWNWARD-FUNCTION))
+			      (MEMQ REGION REGIONS))))
+    ;; With interrupts still inhibited, scavenge the wired system to
+    ;; relocate its references before unpredictable things start happening
+    (LOOP WITH REGION = (AREA-REGION-LIST WIRED-CONTROL-TABLES)
+	  WITH LIMIT = (+ (REGION-ORIGIN REGION)
+			  (* (CEILING (REGION-FREE-POINTER REGION) PAGE-SIZE) PAGE-SIZE))
+	  FOR ADDRESS FROM (REGION-ORIGIN REGION) BY PAGE-SIZE BELOW LIMIT
+	  DO (SCAVENGE-PAGE ADDRESS))
+    ;; Allow this to touch things after we've transported
+    (MAPC #'EVAL GC-AFTER-FLIP-LIST)
+    ;; No reason for this anymore.
+    (SETQ INHIBIT-SCHEDULING-FLAG OLD-INHIBIT-SCHEDULING-FLAG)
+    ;; Get rid of the rest of oldspace
+    (GC-RECLAIM-OLDSPACE)
+    T))
+
+;;; Compiled function reordering.
+
+;;; (This is a hard problem.  Some things here in the comments may not
+;;; be done yet because I haven't figured out how to do them.  Other
+;;; things may only be half implemented.  Unfortunately, metering shows
+;;; that most page faults come from compiled functions, so it's worth
+;;; thinking about this a lot.)
+
+;;; Compiled Function Reordering Strategy (not in any order):
+;;; 1. Collect groups of functions which are only referenced by their parent function,
+;;;    and ensure they are placed after their parent.  The algorithm currently used
+;;;    does not work when any more than one of the functions in this "lump" are mutually
+;;;    recursive.  I don't think there are many examples of this in the system.  (Note that
+;;;    it will work for LABELS which are mutually recursive, since they only reference a
+;;;    lexical variable, not the other function.)
+;;; 2. Pull forward backward references.
+;;; 3. Reconstruct original function ordering after patching, where possible.
+;;; 4. Augment the graph with "virtual callers" for groups of functions:
+;;;	 LOAD-BIN-OP-*, ZWEI:COM-ZMAIL-*, ZWEI:COM-*, (:FORMAT *), (:PROPERTY * x)...
+;;; 5. Dynamic metering of functions referenced in the scheduler (SYS:SYS;LOCALIZED-FUNCTIONS)
+;;; 6. Separation of compile-time and run-time functions.
+
+;;; What could be done:
+;;; 1. Order strings, lists, and extended numbers immediately after the calling function.
+;;;    This is currently under the control of *ORDER-COMPILED-FUNCTION-CONSTANTS*, since
+;;;    it has the annoying side effect that compiled function constants can no longer be
+;;;    read only.
+;;; 2. Compile-time and run-time functions could be split at load-time, rather than
+;;;    at reorder time.  This wouldn't be completely successful, however, since the
+;;;    properties and debugging-info used to determine whether a function is compile-time
+;;;    may not exist when the function is defined.  It's also a pain to modify the
+;;;    cold-load bin loader.
+;;; 3. Similarly, constants could be loaded right after the calling compiled function...
+;;; 4. People have different ideas for ordering methods.  Some say order by message
+;;;    (generic function), others say order by flavor.  We get a speedup in combined
+;;;    methods anyway due to the lumping algorithm.  Both ideas and compromises should
+;;;    be metered.
+;;; 5. Similarly for :PROPERTY function specs.  Should these functions be ordered by
+;;;    by property or left alone?
+
+;;; What is not done:
+;;; 1. Bin packing and swapin hacking.  Bin packing is difficult for compiled functions
+;;;    under the current scheme of creating placeholder objects, since an unknown number
+;;;    of compiled functions will get transported from the stack buffer immediately upon
+;;;    flipping.  Instead hope that the reordering has made enough references forward and
+;;;    make the reordered functions all have a swapin of 1.
+;;; 2. We need a special microcode or something which can increment a number in every
+;;;    compiled function called
+
+;; Map over all compiled functions referenced by this function.
+;; By calling DO-FUNCTION-REFERENCES, we remain machine-independent here.
+(DEFMACRO DO-FUNCTIONS-REFERENCED ((FUNCTION-VAR) FUNCTION &BODY BODY)
+  (LET ((TYPE (GENSYM)))
+    `(DO-FUNCTION-REFERENCES (,TYPE ,FUNCTION-VAR) ,FUNCTION
+       (WHEN (AND (EQ ,TYPE :FUNCTION)
+		  (FDEFINEDP ,FUNCTION-VAR))
+	 (SETQ ,FUNCTION-VAR (FDEFINITION ,FUNCTION-VAR)))
+       (WHEN (TYPEP ,FUNCTION-VAR :COMPILED-FUNCTION)
+	 . ,BODY))))
+
+;; A tree which we can traverse quickly.
+(DEFSTRUCT (F-NODE :LIST :CONC-NAME)
+  FUNCTION			;A list of functions which are this node.
+  REFERENCE-LIST
+  REFERENCED-BY-LIST
+  SIZE				;%STRUCTURE-TOTAL-SIZE of this function and its constants
+  CONSTANTS-LIST		;Copied constants
+
+  ;; The following are set by COMPUTE-COMPILED-FUNCTION-BLOCKS
+  BLOCK-NODES			;If this is a parent node, a list of all nodes in this block
+  BLOCK-ROOT			;A pointer to the root node
+
+  ;; The following is used by REORDER-COMPILED-FUNCTIONS
+  PARTITION
+  MARK)
+
+#+3600
+(DEFUN COMPILED-FUNCTION-CONSTANTS-FOR-REORDERING (FUNCTION)
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (DO-COMPILED-FUNCTION-CONSTANT-TABLE (CONST) FUNCTION
+      (UNLESS (LOCATIVEP CONST)
+	(MAP-OVER-REFERENCE CONST NIL
+	  (LAMBDA (TYPE CONST IGNORE)
+	    (WHEN (AND (EQ TYPE :CONSTANT)
+		       (OR (CL:CONSP CONST)
+			   (STRINGP CONST)
+			   (TYPEP CONST :EXTENDED-NUMBER)
+			   (AND (ARRAYP CONST)
+				(MEMQ (ARRAY-TYPE CONST) '(ART-Q ART-Q-LIST))))
+		       (= (%AREA-NUMBER CONST) COMPILED-FUNCTION-AREA))
+	      (LET ((HEADER (%FIND-STRUCTURE-HEADER CONST)))
+		(UNLESS (MEMQ HEADER RESULT)
+		  (COLLECT-RESULT HEADER))))))))
+    RESULT))
+
+;; On Ivory, don't hack list-format constants, since they should be embedded already.
+#+IMach
+(DEFUN COMPILED-FUNCTION-CONSTANTS-FOR-REORDERING (FUNCTION)
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (DO-COMPILED-FUNCTION-INSTRUCTIONS (CONST) FUNCTION
+      (UNLESS (LOCATIVEP CONST)
+	(MAP-OVER-REFERENCE CONST NIL
+	  (LAMBDA (TYPE CONST IGNORE)
+	    (WHEN (AND (EQ TYPE :CONSTANT)
+		       (OR (STRINGP CONST)
+			   (TYPEP CONST :EXTENDED-NUMBER)
+			   (AND (ARRAYP CONST)
+				(MEMQ (ARRAY-TYPE CONST) '(ART-Q ART-Q-LIST))))
+		       (= (%AREA-NUMBER CONST) COMPILED-FUNCTION-AREA))
+	      (UNLESS (MEMQ CONST RESULT)
+		(COLLECT-RESULT CONST)))))))
+    RESULT))
+
+(DEFUN CREATE-COMPILED-FUNCTION-REFERENCE-TREE (REDUCE PARTITION COPY-CONSTANTS)
+  (MACROLET ((?FORMAT (&REST ARGS) `(WHEN *ENABLE-GC-OPTIMIZATION-REPORTS* (FORMAT . ,ARGS))))
+    (LET* ((HASH (CL:MAKE-HASH-TABLE :SIZE 60000.))
+	   (ORIGINAL-SIZE (SCL:TABLE-SIZE HASH))
+	   (COUNT 0) (ERRORS 0) (REDEFINITIONS 0) (RECURSIONS 0)
+	   (TIME1 (TIME)) TIME2 TIME3 TIME4)
+      (?FORMAT T "~&Creating compiled function reference table entries ...")
+      (MAP-COMPILED-FUNCTIONS '(:UNSAFEGUARDED) #'REGION-PREDICATE-REORDERABLE-STRUCTURE
+			      "Collecting compiled functions into a reference tree"
+	#'(LAMBDA (FUNCTION IGNORE)
+	    (MULTIPLE-VALUE-BIND (ANSWER ERROR)
+		(FUNCTION-SAME-AS-FUNCTION-FROM-NAME FUNCTION)
+	      (IF ANSWER
+		  (LET ((NODE (MAKE-F-NODE FUNCTION FUNCTION
+					   SIZE (%STRUCTURE-TOTAL-SIZE FUNCTION))))
+		    (PUTHASH FUNCTION NODE HASH)
+		    (WHEN PARTITION
+		      (COND ((FUNCTION-IS-COMPILE-TIME-P (COMPILED-FUNCTION-NAME FUNCTION))
+			     (SETF (F-NODE-PARTITION NODE) :COMPILE-TIME))))
+		    (INCF COUNT)
+		    (WHEN (ZEROP (MOD COUNT 1000.)) (?FORMAT T " ~D" COUNT)))
+		  (PROGN (INCF REDEFINITIONS)
+			 (WHEN ERROR (INCF ERRORS)))))))
+      (?FORMAT T "~%Found ~D functions, ~D redefinitions, ~D caused errors."
+	       COUNT REDEFINITIONS ERRORS)
+      (WHEN ( (SCL:TABLE-SIZE HASH) ORIGINAL-SIZE)
+	(?FORMAT T "~%Hash table grew from ~D to ~D elements."
+		 ORIGINAL-SIZE (SCL:TABLE-SIZE HASH)))
+      (SETQ TIME2 (TIME))
+      (?FORMAT T "~%Took ~\TIME-INTERVAL\" (ROUND (TIME-DIFFERENCE TIME2 TIME1) 60.))
+      (?FORMAT T "~&Building reference links ...")
+      (SETQ COUNT 0)
+      (MAP-COMPILED-FUNCTIONS '(:UNSAFEGUARDED) #'REGION-PREDICATE-REORDERABLE-STRUCTURE
+			      "Building compiled-function reference links"
+	#'(LAMBDA (FUNCTION IGNORE)
+	    (LET ((FUNCTION-ENTRY (GETHASH FUNCTION HASH)))
+	      (WHEN FUNCTION-ENTRY
+		(INCF COUNT)
+		(WHEN (ZEROP (MOD COUNT 1000.)) (?FORMAT T " ~D" COUNT))
+		(LET (ENTRY)
+		  (POOR-MAN/'S-WITH-COLLECTION (LIST)
+		    (DO-FUNCTIONS-REFERENCED (REF) FUNCTION
+		      (SETQ ENTRY (GETHASH REF HASH))
+		      (WHEN ENTRY
+			;; ENTRY can be NIL when REF is a :INTERNAL of FUNCTION and
+			;; FUNCTION is something that was FUNDEFINED, but still has
+			;; a pointer to itself sitting in its function cell.  This means
+			;; that FUNCTION-SAME-AS-FUNCTION-FROM-NAME is broken, but
+			;; I think we can just ignore the problem here. --- Moon 9/26/85
+			(COND ((EQ REF FUNCTION)
+			       (INCF RECURSIONS))
+			      (T
+			       (COLLECT-LIST ENTRY)
+			       (PUSH FUNCTION-ENTRY (F-NODE-REFERENCED-BY-LIST ENTRY))))))
+		    (SETF (F-NODE-REFERENCE-LIST FUNCTION-ENTRY) LIST)))
+		(WHEN (AND COPY-CONSTANTS
+			   ;; Only copy the constants of functions in
+			   ;; COMPILED-FUNCTION-AREA, since they're the
+			   ;; only ones being reordered.
+			   (= (%AREA-NUMBER FUNCTION) COMPILED-FUNCTION-AREA))
+		  (SETF (F-NODE-CONSTANTS-LIST FUNCTION-ENTRY)
+			(COMPILED-FUNCTION-CONSTANTS-FOR-REORDERING FUNCTION)))))))
+      (SETQ TIME3 (TIME))
+      (?FORMAT T "~%Ignored ~D direct recursion~:P" RECURSIONS)
+      (?FORMAT T "~%Took ~\TIME-INTERVAL\" (ROUND (TIME-DIFFERENCE TIME3 TIME2) 60.))
+      (?FORMAT T "~&Collecting functions in original order ...")
+      (SETQ COUNT 0)
+      (LET* ((LIST (MAKE-LIST (CL:HASH-TABLE-COUNT HASH)))
+	     (TAIL LIST))
+	(CLI::PAGE-IN-TABLE HASH :HANG-P NIL)
+	;; This assumes that MAP-COMPILED-FUNCTIONS scans files
+	;; in their original order.  This is pretty much true, since the oldest regions
+	;; are scanned first, and within a region the oldest objects are scanned first.
+	;; This allows us to try to place redefined functions where they were originally
+	;; placed without too much effort, because the original definition is seen first.
+	(MAP-COMPILED-FUNCTIONS '(:UNSAFEGUARDED) #'REGION-PREDICATE-REORDERABLE-STRUCTURE
+				"Collecting compiled functions in original order"
+	  #'(LAMBDA (FUNCTION IGNORE)
+	      (LET ((NODE (GETHASH FUNCTION HASH))
+		    NEW)
+		(UNLESS NODE
+		  (CONDITION-CASE ()
+		       (SETQ NEW (FDEFINITION (COMPILED-FUNCTION-NAME FUNCTION)))
+		     (ERROR)
+		     (:NO-ERROR (SETQ NODE (GETHASH NEW HASH)))))
+		(WHEN (AND NODE (NOT (F-NODE-MARK NODE)))
+		  (INCF COUNT)
+		  (WHEN (ZEROP (MOD COUNT 1000.)) (?FORMAT T " ~D" COUNT))
+		  (SETF (F-NODE-REFERENCED-BY-LIST NODE)
+			(NREVERSE (F-NODE-REFERENCED-BY-LIST NODE)))
+		  (SETF (F-NODE-MARK NODE) T)
+		  (SETF (CAR TAIL) NODE)
+		  (SETQ TAIL (CDR TAIL))))))
+	(SETQ TIME4 (TIME))
+	(?FORMAT T "~%Took ~\TIME-INTERVAL\" (ROUND (TIME-DIFFERENCE TIME4 TIME3) 60.))
+	(WHEN REDUCE (REDUCE-REFERENCE-TREE LIST))
+	(?FORMAT T "~%Total time ~\TIME-INTERVAL\" (ROUND (TIME-DIFFERENCE (TIME) TIME1) 60.))
+	LIST))))
+
+;; This only reduces the reference tree once, and doesn't catch mutual recursion.
+;; Single recursion is caught by CREATE-COMPILED-FUNCTION-REFERENCE-TREE, which
+;; doesn't store reference pointers in that case (a minor kludge).
+(DEFUN REDUCE-REFERENCE-TREE (REFERENCE-TREE &AUX TIME)
+  (MACROLET ((?FORMAT (&REST ARGS) `(WHEN *ENABLE-GC-OPTIMIZATION-REPORTS* (FORMAT . ,ARGS))))
+    (SETQ TIME (TIME))
+    (?FORMAT T "~%Reducing reference tree once ...")
+    (LOOP FOR NODE1 IN REFERENCE-TREE
+	  FOR COUNT FROM 1
+	  AS CALLERS = (F-NODE-REFERENCED-BY-LIST NODE1)
+	  WHEN (ZEROP (MOD COUNT 1000.))
+	    DO (?FORMAT T " ~D" COUNT)
+	  WHEN (OR (NULL CALLERS) (NOT (NULL (CDR CALLERS))))	;Length  1
+	    DO (POOR-MAN/'S-WITH-COLLECTION (BLOCK-NODES)
+		 (LABELS ((MAPPER (NODE2)
+			    (LET ((CALLERS (F-NODE-REFERENCED-BY-LIST NODE2)))
+			      (UNLESS (CDR CALLERS)	;Length = 1 (must be  1)
+				(UNLESS (EQ NODE2 NODE1);Recursed
+				  (COLLECT-BLOCK-NODES NODE2)
+				  (SETF (F-NODE-BLOCK-ROOT NODE2) NODE1)
+				  (MAPC #'MAPPER (F-NODE-REFERENCE-LIST NODE2)))))))
+		   (MAPC #'MAPPER (F-NODE-REFERENCE-LIST NODE1))
+		   (SETF (F-NODE-BLOCK-NODES NODE1) BLOCK-NODES)
+		   (SETF (F-NODE-BLOCK-ROOT NODE1) NODE1))))
+    (?FORMAT T "~%Took ~\TIME-INTERVAL\" (ROUND (TIME-DIFFERENCE (TIME) TIME) 60.))))
+
+;(DEFUN RELOCATE-NONLOCAL-REFERENCES (REFERENCE-TREE)
+;  ;; Eventually this will loop through the reference tree, and when it finds a block
+;  ;; which is not locally called by anyone it will relocate the block to the nearest
+;  ;; caller block forward in memory.  I guess I need to hack block size here.
+;  REFERENCE-TREE
+;  NIL)
+
+;(DEFUN RELOCATE-NONLOCAL-REFERENCES (REFERENCE-TREE)
+;  ;; Eventually this will loop through the reference tree, and when it finds a block
+;  ;; which is not locally called by anyone it will relocate the block to the nearest
+;  ;; caller block forward in memory.  I guess I need to hack block size here.
+;  REFERENCE-TREE
+;  NIL)
+
+(DEFUN FUNCTION-IS-COMPILE-TIME-P (NAME)
+  ;; Kludge
+  (LOOP WHILE (AND (LISTP NAME) (EQ (CAR NAME) :INTERNAL))
+	DO (SETQ NAME (SECOND NAME)))
+  (CONDITION-CASE ()
+       (OR (LISTP (FDEFINITION NAME))
+	   (AND (SYMBOLP NAME)
+		(LOOP FOR (INDICATOR VALUE) ON (PLIST NAME) BY #'CDDR
+		      THEREIS (OR (MEMQ INDICATOR '(COMPILER:TRANSFORMERS
+					     #+3600 L-LISP-COMPILER:TRANSFORMERS
+					     #+3600 L-LISP-COMPILER:BUILT-IN
+					     #+3600 L-LISP-COMPILER:ASSEMBLE-FUNCTION
+					    #+IMach I-LISP-COMPILER:TRANSFORMERS
+					    #+IMach I-LISP-COMPILER:BUILT-IN
+					    #+IMach I-LISP-COMPILER:ASSEMBLE-FUNCTION
+					            ))
+				  (AND (EQ INDICATOR 'CL:INLINE)
+				       (NEQ VALUE 'CL:NOTINLINE))))))
+     (ERROR NIL)))
+
+(DEFUN TREE-SIZE (TREE &AUX (SIZE 0))
+  (DO ((SUBLIST TREE (CDR SUBLIST)))
+      ((ATOM SUBLIST)
+       (WHEN SUBLIST
+	 (INCF SIZE))
+       SIZE)
+    (INCF SIZE)
+    (WHEN (LISTP (CAR SUBLIST))
+      (INCF SIZE (TREE-SIZE (CAR SUBLIST))))))
+
+(DEFVAR *REORDER-CONSTANTS* T)
+
+;;--- Meter this (using summarize-page-trace to get an idea of # hits).
+(DEFVAR *REORDERED-COMPILED-FUNCTION-SWAPIN* 2)
+
+(DEFUN UNMARK-ALL-NODES (LIST)
+  (LOOP FOR NODE IN LIST DO (SETF (F-NODE-MARK NODE) NIL)))
+
+;; This pages like hell.
+(DEFINE-GC-OPTIMIZATION REORDER-COMPILED-FUNCTIONS :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION
+    "Reorder compiled functions to localize the working set of executing them")
+  (:ORDER :LATE)
+  (:BEFORE-FLIP (IGNORE)
+    (USING-SYSTEM-TEMPORARY-AREA
+      (LET ((CF-AREA COMPILED-FUNCTION-AREA)
+	    (DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA))
+	;; Assume this maps over the functions in creation order.  That's mostly correct.
+	;; Collect definitions in order, partitioning into run/compile time.
+	(LET ((REFERENCE-TREE
+		(CREATE-COMPILED-FUNCTION-REFERENCE-TREE T T *REORDER-CONSTANTS*))
+	      ORDERING-ALIST)
+;NYI
+;         (RELOCATE-NONLOCAL-REFERENCES REFERENCE-TREE)
+	  (GC-OPTIMIZATION-REPORT "~&Composing ordering for functions and constants ...")
+	  (UNMARK-ALL-NODES REFERENCE-TREE)
+	  (LABELS ((ADD-FUNCTION (NODE)
+		     (LET ((FUNCTION (F-NODE-FUNCTION NODE)))
+		       (WHEN (AND (NULL (F-NODE-MARK NODE))
+				  (= (%AREA-NUMBER FUNCTION) CF-AREA))
+			 (LET* ((PARTITION (F-NODE-PARTITION NODE))
+				(ELEM (ASSQ PARTITION ORDERING-ALIST)))
+			   (UNLESS ELEM
+			     (PUSH (SETQ ELEM (NCONS PARTITION)) ORDERING-ALIST))
+			   (PUSH (F-NODE-FUNCTION NODE) (CDR ELEM))
+			   (LOOP FOR CONSTANT IN (F-NODE-CONSTANTS-LIST NODE)
+				 DO (PUSH CONSTANT (CDR ELEM)))
+			   (SETF (F-NODE-MARK NODE) T)))))
+		   (COLLECT-BLOCK (NODE)
+		     (ADD-FUNCTION NODE)
+		     (LOOP FOR NODE IN (F-NODE-BLOCK-NODES NODE) DO (ADD-FUNCTION NODE))))
+	    (LOOP WITH ROOT
+		  FOR NODE1 IN REFERENCE-TREE
+		  UNLESS (F-NODE-MARK NODE1)	;Already processed
+		    WHEN (AND (NEQ (SETQ ROOT (F-NODE-BLOCK-ROOT NODE1)) NODE1)
+			      (EQ (F-NODE-PARTITION ROOT) (F-NODE-PARTITION NODE1)))
+		      DO (COLLECT-BLOCK (F-NODE-BLOCK-ROOT NODE1)) ;Pull block root backward
+		      ELSE DO (COLLECT-BLOCK NODE1))
+	    ;; Now make a pass to group all of the p-t functions together
+	    (LET* ((FUNCTION-ORDERING (GROUP-PRESENTATION-FUNCTIONS ORDERING-ALIST))
+		   (DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+	      ;; Now make the reordering
+	      (PUSH (MAKE-REORDERING NAME 'COMPILED-FUNCTIONS
+				     AREA COMPILED-FUNCTION-AREA
+				     NO-TRANSPORT-OKAY T
+				     REGION-BITS-MASK (DPB -1 %%REGION-SWAPIN-QUANTUM 0)
+				     REGION-BITS (DPB *REORDERED-COMPILED-FUNCTION-SWAPIN*
+						      %%REGION-SWAPIN-QUANTUM 0)
+				     OBJECT-LIST (COPYLIST FUNCTION-ORDERING
+							   REORDERING-LIST-AREA))
+		    *REORDERINGS*))))))))
+
+;; For grouping all function specs of the form (DW::PRESENTATION-FUNCTION xxx type)
+(DEFVAR *PRESENTATION-FUNCTION-GROUPINGS*
+	'((DW::PARSER SYS:PRINTER DW::PRESENTATION-TYPE-PRINTER
+		      DW::WITH-FULL-CACHE-KEY)	;Used to find printer, parser, etc.  --RWK
+	  (DW:PRESENTATION-SUBTYPEP DW::TYPEP-FUNCTION)
+	  (DW::MAP-OVER-SUBTYPES DW::MAP-OVER-SUPERTYPES
+	   DW::DATA-TYPE-GENERATOR-STACK DW::DATA-TYPE-EQUIVALENT-STACK)
+	  (DW::DATA-TYPE-GENERATOR DW::DATA-TYPE-EQUIVALENT)
+	  (DW::KEY-GENERATOR DW::WITH-CACHE-KEY)
+	  (DW::INPUT-HISTORY-EXPANDER)
+	  (DW::DEFAULT-PREPROCESSOR)
+	  (GRAPHICS::BINARY-GRAPHICS)
+	  (DW::CHOOSE-DISPLAYER)
+	  (DW::ACCEPT-VALUES-DISPLAYER)
+	  (DW::MENU-DISPLAYER)
+	  (DW::VIEWSPEC-CHOICES)
+	  (DW::DO-COMPILER-WARNINGS DW::OLD-ARGLIST-TRANSFORMER)
+	  (DW::TYPEP-EXPANDER DW::TYPE-EXPANDER)))
+
+(DEFUN GROUP-PRESENTATION-FUNCTIONS (ORDERING-ALIST)
+  (GC-OPTIMIZATION-REPORT "~&Grouping presentation functions ...")
+  ;; First, flatten out the ordering alist
+  (LET* ((TIME (TIME))
+	 (ORDERING-ALIST (LOOP FOR ENTRY IN ORDERING-ALIST
+			       NCONC (%REVERSE-AND-CDR-CODE (CDR ENTRY))))
+	 (N-BUCKETS (1+ (LENGTH *PRESENTATION-FUNCTION-GROUPINGS*)))
+	 (BUCKETS (MAKE-ARRAY N-BUCKETS)))
+    ;; Allocate the initial buckets
+    (LOOP FOR I BELOW N-BUCKETS
+	  DO (SETF (AREF BUCKETS I) (MAKE-ARRAY 100 :FILL-POINTER 0)))
+    (LABELS ((FIND-BUCKET (P-T-TYPE)
+	       (LOOP FOR I UPFROM 0
+		     FOR TYPE IN *PRESENTATION-FUNCTION-GROUPINGS*
+		     DO (WHEN (MEMQ P-T-TYPE TYPE) (RETURN I))
+		     FINALLY (RETURN (1- N-BUCKETS))))
+	     (UNINTERNALIZE-FSPEC (FSPEC)
+	       (IF (AND (LISTP FSPEC) (EQ (FIRST FSPEC) :INTERNAL))
+		   (UNINTERNALIZE-FSPEC (SECOND FSPEC))
+		 FSPEC)))
+      ;; You might think that it would be nice to do this reordering on the reference
+      ;; tree, but that doesn't work well enough because we want to keep functions
+      ;; of the same class together for the same presentation-type, i.e., the parser,
+      ;; printer, and p-t printer for a particular p-t should all be together.
+      (LOOP FOR ELT-L ON ORDERING-ALIST
+	    AS ELT = (CAR ELT-L)
+	    ;; What's a little more paging here among friends?  The effect of this
+	    ;; is to group all the internals of the presentation functions with
+	    ;; their parents.
+	    AS FSPEC = (UNINTERNALIZE-FSPEC (AND (TYPEP ELT :COMPILED-FUNCTION)
+						 (COMPILED-FUNCTION-NAME ELT)))
+	    DO (WHEN (AND (LISTP FSPEC)
+			  (EQ (FIRST FSPEC) 'DW::PRESENTATION-FUNCTION))
+		 ;; If this is a presentation-function, shove it into the
+		 ;; appropriate bucket and remove it from the original ordering 
+		 ;; alist.  This can delocalize the p-t function with respect
+		 ;; to its callees, but the paging behavior by the CP and the
+		 ;; handler search stuff more than pays this debt.
+		 (LET ((BUCKET (FIND-BUCKET (THIRD FSPEC))))
+		   ;; We'll sort based only on the presentation-type's name
+		   (ARRAY-PUSH-EXTEND (AREF BUCKETS BUCKET) `(,(SECOND FSPEC) ,ELT) 100.)
+		   (SETF (CAR ELT-L) NIL)))))
+    ;; Rebuild the ordering list to reflect the p-t extractions
+    (SETQ ORDERING-ALIST
+	  (APPEND (DELQ NIL ORDERING-ALIST)
+		  (LOOP FOR BUCKET BEING THE ARRAY-ELEMENTS OF BUCKETS
+			;; Stable sorting will maintain the ordering of internal
+			;; functions with respect to their parents
+			AS SORTED-BUCKET =
+			   (STABLE-SORT
+			     BUCKET #'(LAMBDA (X Y) (STRING< (FIRST X) (FIRST Y))))
+			APPEND (LET ((SORTED-LIST (MAKE-LIST (FILL-POINTER BUCKET))))
+				 (LOOP FOR (NIL FUNCTION)
+					   BEING THE ARRAY-ELEMENTS OF SORTED-BUCKET
+				       FOR LL ON SORTED-LIST
+				       DOING (SETF (CAR LL) FUNCTION))
+				 SORTED-LIST))))
+    (WHEN *ENABLE-GC-OPTIMIZATION-REPORTS*
+      (FORMAT T "~&Grouping presentation functions took ")
+      (TIME:PRINT-INTERVAL-OR-NEVER (ROUND (TIME-DIFFERENCE (TIME) TIME) 60.))
+      (FORMAT T "."))
+    ORDERING-ALIST))
+
+;;; Generic Function Reordering and associated metering.
+;;;
+;;; Generic Function Reordering is a reordering task for generic functions and
+;;; symbols which are used in method tables.  The purpose of the reordering
+;;; is to minimize the number of hash misses in existing method tables.
+
+;; We assume that before reordering no probe length exceeds this value.
+(DEFVAR *MAX-PROBE-LENGTH* 512.)
+
+;;; Metering.  This function collects and prints statistics on the probe lengths
+;;; for flavors in the existing world.
+
+;;; In ISG System 362.226, the average probe length is 0.666 and the max is 62.
+;;; In ISG System 369.209, after fixing handler tables, the average
+;;; probe length is 0.546 and the max is 102.
+
+(DEFUN COLLECT-FLAVOR-HASH-STATISTICS (&OPTIONAL (ARRAY-SIZE *MAX-PROBE-LENGTH*)
+						 (PRINT-PROTOTYPES T))
+  (LET ((PROBE-LENGTH-ARRAY (MAKE-ARRAY ARRAY-SIZE :TYPE ART-FIXNUM))
+        (PROTOTYPE-ARRAY (MAKE-ARRAY ARRAY-SIZE)))
+    (DECLARE (ARRAY-REGISTER PROBE-LENGTH-ARRAY PROTOTYPE-ARRAY))
+    (LOOP WITH (FLAVOR HANDLER MASK START-ADDRESS FINISH-ADDRESS MISS-LENGTH)
+          WITH TRANSFORMER = FLAVOR::*INSTANCE-TRANSFORMING-HANDLER-TABLE*
+          FOR FLAVOR-NAME IN *ALL-FLAVOR-NAMES*
+          FOR COUNT-FLAVOR-NAMES FROM 1
+          DO (WHEN (ZEROP (MOD COUNT-FLAVOR-NAMES 100.))
+               (FORMAT T " ~D" COUNT-FLAVOR-NAMES))
+             (WHEN (AND (SETQ FLAVOR (FLAVOR:FIND-FLAVOR FLAVOR-NAME NIL))
+                        (SETQ HANDLER (FLAVOR::FLAVOR-HANDLER-TABLE FLAVOR))
+                        (NEQ HANDLER TRANSFORMER))
+               ;; Make sure it's really rehashed.
+               (WHEN (WITHOUT-INTERRUPTS (FLAVOR::REHASH-HANDLER-TABLE FLAVOR))
+                 (SETQ HANDLER (FLAVOR::FLAVOR-HANDLER-TABLE FLAVOR)))
+               (SETQ MASK (FLAVOR::HANDLER-TABLE-MASK HANDLER)
+                     START-ADDRESS (FLAVOR::HANDLER-TABLE-ADDRESS HANDLER)
+                     FINISH-ADDRESS (FLAVOR::HANDLER-TABLE-LAST-ADDRESS HANDLER))
+               (LOOP FOR ADDRESS = START-ADDRESS
+                                 THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE ADDRESS 3)
+                     FOR I FROM 0
+                     UNTIL (EQ ADDRESS FINISH-ADDRESS)
+                     AS PROBE = (LOCATION-CONTENTS ADDRESS)
+                     WHEN PROBE
+                       DO (SETQ MISS-LENGTH (- I (LOGAND MASK (%POINTER PROBE))))
+                          (INCF (AREF PROBE-LENGTH-ARRAY MISS-LENGTH))
+                          (UNLESS (AREF PROTOTYPE-ARRAY MISS-LENGTH)
+                            (SETF (AREF PROTOTYPE-ARRAY MISS-LENGTH)
+                                  (LIST FLAVOR-NAME PROBE))))))
+    (PRINT-PROBE-LENGTH-ARRAY PROBE-LENGTH-ARRAY (AND PRINT-PROTOTYPES PROTOTYPE-ARRAY))
+    (VALUES PROBE-LENGTH-ARRAY PROTOTYPE-ARRAY)))
+
+(DEFUN PRINT-PROBE-LENGTH-ARRAY (PROBE-LENGTH-ARRAY &OPTIONAL PROTOTYPE-ARRAY)
+  (LOOP FOR I BELOW (ARRAY-ACTIVE-LENGTH PROBE-LENGTH-ARRAY)
+        AS N = (AREF PROBE-LENGTH-ARRAY I)
+        WHEN (PLUSP N)
+          DO (FORMAT T "~&~8D entr~:@P ~\has-have\ a probe length of ~D." N N I)
+             (WHEN PROTOTYPE-ARRAY
+               (FORMAT T "~50T~S" (AREF PROTOTYPE-ARRAY I)))
+          AND SUM (* I N) INTO SUM
+          AND SUM N INTO TOTAL
+        FINALLY
+	  (IF (PLUSP TOTAL)
+	      (FORMAT T "~&Average probe length:  ~S" (// (FLOAT SUM) TOTAL))
+	      (FORMAT T "~&Probe length array is empty."))))
+
+;;; The algorithm for reordering generic functions.
+;;;
+;;; We assume that the symbols and generic functions found will be put at the
+;;; beginning of their regions, and therefore we know the addresses, modulo the quantum
+;;; size.  Knowing that, we know the hashes.
+;;;
+;;; 1.  Map over all flavors and find out the set of gf's (the term gf this includes
+;;; symbols if not otherwise specified) and their mapping to flavors.  This is what
+;;; MAKE-GENERIC-FUNCTION-FLAVOR-TABLE does.
+;;;
+;;; 2.  Turn this into a data structure we can use efficiently, and at the same time
+;;; create fake copies of the handler tables to play with.  This is what MAKE-GF-QUEUE
+;;; does.  I call this a GF queue.
+;;;
+;;; 3.  Now sort this in decreasing order of the number of flavors spanned by each
+;;; generic function.  This is fairly fast due to the data structure.  We want to be
+;;; able to hack the gf's which span lots of flavors first, because we may have a hard
+;;; time finding a good slot for them if we don't.
+;;;
+;;; The GF queue is now processed by two different algorithms, which perform
+;;; better in the early processing and late processing respectively.  (Figuring out
+;;; why is an exercise for the reader.)  Where (4a) leaves off and (4b) begins
+;;; is controlled by *REORDER-GENERIC-FUNCTION-TWEAK*.
+;;;
+;;; Also, a definition:  The cost function of placing a generic function in slot (address)
+;;; x is the sum of the squares of the probe lengths which would result from placing
+;;; that generic function into all flavor handler tables which handle it.  This function
+;;; seems to be a good trade-off between (1) the maximum of the probe lengths and
+;;; (2) the sum of the probe lengths.  The problem with (1) is that it concentrates
+;;; too hard on the tails (longest probes), and the problem with (2) is that it ignores
+;;; the tails.
+;;;
+;;; 4a.  During this part we process the queue in the order it was sorted.  What
+;;; we do is to take a generic function, and find an open slot into which it can
+;;; be placed with zero cost.  If no such slot exists, then it is put into the slot with
+;;; minimum cost.
+;;;
+;;; 4b.  During this part we process things one slot at a time.  We look at the type
+;;; of the next gf on the queue (symbol or gf), and consider the next free slot of that
+;;; type.  We search for a gf of the proper type that could go into that slot with
+;;; cost zero, and if there isn't one, then the gf which would go with minimum cost.
+;;; When we find a gf, we rotate the queue to the new position, because
+;;; the gf's just considered are probably not good for the next position either.
+;;; (This may not be as a good an assumption as it was when the algorithm was a
+;;; little different.  It should be metered with PULL substituted for ROTATE-TO-CAR.)
+;;;
+;;; Abbreviated results (for full results see reorder-generic-functions.results):
+;;;   ISG 362.228
+;;;      Probe Length               0.68764526   avg, 62 max
+;;;      Reordering (gf-size = 8)   0.1626104    avg,  8 max  (50 minutes, 45 seconds)
+;;;      Reordering (gf-size = 7)   0.0030722541 avg, 21 max  ( 5 minutes,  9 seconds)
+;;;
+;;; Times were taken before the short-circuit was put into SCORE-ENTRY, and should
+;;; improve due to it.
+
+(DEFSTRUCT (GF-QUEUE-ENTRY :LIST*
+			   (:CONC-NAME QUEUE-)
+			   (:CONSTRUCTOR NIL)
+			   (:ALTERANT NIL)
+			   (:SIZE-MACRO GF-QUEUE-ENTRY-SIZE))
+  GF
+  GF-CLASS-INDEX
+  N-FLAVORS
+  FLAVOR-PLIST)
+
+;; A debugging switch, currently debugging is disabled.
+(DEFVAR *VERIFY-HASH-ASSIGNMENTS* NIL)
+
+(DEFVAR *HASH-ASSIGNMENTS*)
+
+(DEFUN HASH-ASSIGNMENT-ERROR (&REST ARGS)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (CL:APPLY #'CL:CERROR "Proceed, taking no action" ARGS))
+
+(DEFUN REGISTER-GENERIC-FUNCTIONS (GF-QUEUE)
+  (WHEN *VERIFY-HASH-ASSIGNMENTS*
+    (SETQ *HASH-ASSIGNMENTS* (CL:MAKE-HASH-TABLE :SIZE (LENGTH GF-QUEUE)))
+    (LOOP FOR (GF) IN GF-QUEUE DO
+      (SCL:MODIFY-HASH *HASH-ASSIGNMENTS* GF
+	(LAMBDA (KEY VALUE FOUND)
+	  (DECLARE (IGNORE VALUE))
+	  (WHEN FOUND
+	    (HASH-ASSIGNMENT-ERROR "Registering generic function ~S twice?" KEY))
+	  NIL)))))
+
+(DEFUN ASSIGN-HASH (OBJECT HASH)
+  (WHEN *VERIFY-HASH-ASSIGNMENTS*
+    (SCL:MODIFY-HASH *HASH-ASSIGNMENTS* OBJECT
+      (LAMBDA (KEY VALUE FOUND)
+	(UNLESS FOUND
+	  (HASH-ASSIGNMENT-ERROR
+	    "Assigning a hash value to ~S, which is not a registered generic function." KEY))
+	(WHEN VALUE
+	  (HASH-ASSIGNMENT-ERROR
+	    "Assigning hash value ~O to ~S, which previously was assigned ~O." HASH KEY VALUE))
+	HASH))))
+
+;; Could do further, I guess, and validate the actual hash values after the flip.
+(DEFUN VERIFY-HASH-ASSIGNMENTS ()
+  (WHEN *VERIFY-HASH-ASSIGNMENTS*
+    (CL:MAPHASH (LAMBDA (KEY VALUE)
+		  (DECLARE (IGNORE KEY))
+		  (WHEN (NULL VALUE)
+		    (HASH-ASSIGNMENT-ERROR
+		      "Generic function ~S was not assigned a hash value."))
+		  NIL)
+		*HASH-ASSIGNMENTS*)))
+
+;; GF "classes" -- Each generic function class must be reordered separately.
+;; GF's must be in different classes because their object sizes differ,
+;; or because their areas differ.  For example, symbols and generic functions
+;; must be in different classes.  Generic Functions which occupy 9 words (including
+;; their function spec) must be in a different class from generic functions which
+;; occupy 7 words.  Each class is represented by an fixnum index, defined below.
+
+(DEFCONSTANT %GF-CLASS-SYMBOL 0)
+(DEFCONSTANT %GF-CLASS-GENERIC-FUNCTION 1)
+(DEFCONSTANT %GF-CLASS-CLOS-GENERIC-FUNCTION 2)
+(DEFCONSTANT %GF-CLASS-CLOS-LIST 3)
+(DEFCONSTANT %%GF-INDEX-SIZE  (BYTE 5 0))
+(DEFCONSTANT %%GF-INDEX-CLASS (BYTE 2 5))
+(DEFCONSTANT %MAX-GF-SIZE (1- (^ 2 (BYTE-SIZE %%GF-INDEX-SIZE))))
+(DEFCONSTANT %NUMBER-OF-GF-CLASSES (^ 2 (BYTE-SIZE %%GF-INDEX-CLASS)))
+(DEFCONSTANT %NUMBER-OF-GF-CLASS-INDICES (^ 2 (+ (BYTE-SIZE %%GF-INDEX-SIZE)
+						 (BYTE-SIZE %%GF-INDEX-CLASS))))
+
+(DEFSUBST CLASS-INDEX-OFFSET (INDEX)
+  (IF (= (LDB %%GF-INDEX-CLASS INDEX) %GF-CLASS-CLOS-GENERIC-FUNCTION)
+      2
+      0))
+
+(DEFUN GF-CLASS-INDEX (GF)
+  (MULTIPLE-VALUE-BIND (CLASS SIZE)
+      (CL:ETYPECASE GF
+	(SYMBOL (VALUES %GF-CLASS-SYMBOL (DEFSTORAGE-SIZE SYMBOL)))
+	(GENERIC-FUNCTION
+	  (IF (CLOS-INTERNALS::GENERIC-FUNCTION-CLOS GF)
+	      (LET ((REAL-GF (FOLLOW-CELL-FORWARDING (%MAKE-POINTER DTP-LOCATIVE GF) NIL)))
+		(MULTIPLE-VALUE-BIND (NIL NIL TOTAL-SIZE)
+		    (%FIND-STRUCTURE-EXTENT REAL-GF)
+		  (VALUES %GF-CLASS-CLOS-GENERIC-FUNCTION
+			  TOTAL-SIZE)))
+	      (VALUES %GF-CLASS-GENERIC-FUNCTION
+		      (+ (DEFSTORAGE-SIZE GENERIC-FUNCTION)
+			 (LET ((NAME (GENERIC-FUNCTION-NAME GF)))
+			   (CL:ETYPECASE NAME
+			     (SYMBOL 0)
+			     (CONS (LENGTH NAME))))))))
+	(CL:CONS
+	  (VALUES %GF-CLASS-CLOS-LIST
+		  (%STRUCTURE-TOTAL-SIZE GF))))
+    (WHEN (> SIZE %MAX-GF-SIZE)
+      (ERROR "Cannot accomodate a generic function of size ~D" SIZE))
+    (WHEN (EVENP SIZE)
+      (ERROR "Reordering doesn't work with generic functions whose size is even."))
+    (DPB CLASS %%GF-INDEX-CLASS SIZE)))
+
+(DEFVAR *REORDER-GENERIC-FUNCTION-TWEAK* 0.5) ;magic number to tweak for performance 0x1.
+
+(DEFUN CREATE-ORDERING-FOR-GENERIC-FUNCTIONS ()
+  (GC-OPTIMIZATION-REPORT "~%Collecting all message and generic function names...")
+  (MULTIPLE-VALUE-BIND (TABLE INSTANTIABLE-FLAVORS CLASS-COUNTS)
+      (MAKE-GENERIC-FUNCTION-FLAVOR-TABLE)
+    (LET* ((TOTAL-COUNT (CL:REDUCE #'+ CLASS-COUNTS))
+	   (COUNT TOTAL-COUNT))
+      (GC-OPTIMIZATION-REPORT "~%Creating queue...")
+      (LET ((GF-QUEUE (MAKE-GF-QUEUE INSTANTIABLE-FLAVORS TABLE)))
+	;; Sort so that the messages in most flavors are done first.
+	(GC-OPTIMIZATION-REPORT "~%Sorting queue...")
+	(SETQ GF-QUEUE (CL:SORT GF-QUEUE #'> :KEY #'QUEUE-N-FLAVORS))
+	(LET ((PROBE-LENGTH-ARRAY (MAKE-ARRAY *MAX-PROBE-LENGTH* :TYPE ART-FIXNUM))
+	      (GF-QUEUE-POINTER GF-QUEUE)
+	      (CLASS-POINTERS (MAKE-ARRAY %NUMBER-OF-GF-CLASS-INDICES :INITIAL-VALUE 0))
+	      (*HASH-ASSIGNMENTS* NIL))
+	  (REGISTER-GENERIC-FUNCTIONS GF-QUEUE)
+	  ;; Zeroth part:  Take what we can get for nonreorderable objects.
+	  (GC-OPTIMIZATION-REPORT "~%Placing non-reorderable objects...")
+	  (LOOP WITH SOA = SAFEGUARDED-OBJECTS-AREA
+		WITH WCT = WIRED-CONTROL-TABLES
+		WITH L = GF-QUEUE-POINTER
+		WHILE L
+		AS QUEUE-ENTRY = (POP L)
+		AS GF = (QUEUE-GF QUEUE-ENTRY)
+		AS AREA = (%AREA-NUMBER GF)
+		WHEN (OR (= AREA SOA) (= AREA WCT) (NOT (REORDERABLE GF)))
+		  DO (PLACE-GF-AT-ADDRESS QUEUE-ENTRY (%POINTER GF) PROBE-LENGTH-ARRAY)
+		     (DECF (AREF CLASS-COUNTS (QUEUE-GF-CLASS-INDEX QUEUE-ENTRY)))
+		     (DECF COUNT)
+		     (SETQ GF-QUEUE-POINTER (CDR (PULL QUEUE-ENTRY GF-QUEUE-POINTER))))
+	  (GC-OPTIMIZATION-REPORT "~%~D out of ~D hash keys ~0G~\is-are\ reorderable."
+			  COUNT TOTAL-COUNT)
+	  ;; This is the guts of the algorithm.  
+	  (LET ((CLASS-ARRAYS (MAKE-ARRAY %NUMBER-OF-GF-CLASS-INDICES))
+		(CLASS-HASH-BASES (MAKE-ARRAY %NUMBER-OF-GF-CLASS-INDICES))
+		(PROBE-LENGTH-ARRAY (MAKE-ARRAY *MAX-PROBE-LENGTH* :TYPE ART-FIXNUM))
+		(THRESHOLD (ROUND (* COUNT *REORDER-GENERIC-FUNCTION-TWEAK*))))
+	    ;; Allocate the class arrays.
+	    (LOOP FOR I BELOW %NUMBER-OF-GF-CLASS-INDICES
+		  AS INDEX-COUNT = (AREF CLASS-COUNTS I)
+		  WHEN (PLUSP INDEX-COUNT)
+		    DO (SETF (AREF CLASS-ARRAYS I) (MAKE-ARRAY INDEX-COUNT)))
+	    ;; Allocate the base hash numbers.  All this does is allow us to
+	    ;; place all GF's of the same class in one region, regardless of size.
+	    (LOOP FOR CLASS BELOW %NUMBER-OF-GF-CLASSES AS ADDRESS = 0 DO
+	      (LOOP FOR SIZE BELOW %MAX-GF-SIZE
+		    AS INDEX = (DPB CLASS %%GF-INDEX-CLASS SIZE)
+		    AS COUNT = (AREF CLASS-COUNTS INDEX)
+		    DO (SETF (AREF CLASS-HASH-BASES INDEX) ADDRESS)
+		       (INCF ADDRESS (* COUNT SIZE))))
+	    ;; First part:  Put whatever we get out of the queue into an optimal position.
+	    (GC-OPTIMIZATION-REPORT "~%Reorder Generic Functions Phase 1...")
+	    (LOOP REPEAT THRESHOLD
+		  AS QUEUE-ENTRY = (POP GF-QUEUE-POINTER)
+		  AS INDEX = (QUEUE-GF-CLASS-INDEX QUEUE-ENTRY)
+		  DO (SETF (AREF CLASS-POINTERS INDEX)
+			   (MINIMALLY-PLACE-GF QUEUE-ENTRY
+					       (LDB %%GF-INDEX-SIZE INDEX)
+					       (AREF CLASS-ARRAYS INDEX)
+					       (AREF CLASS-POINTERS INDEX)
+					       (+ (AREF CLASS-HASH-BASES INDEX)
+						  (CLASS-INDEX-OFFSET INDEX))
+					       PROBE-LENGTH-ARRAY)))
+	    ;; Second part: Go through available positions and fill them with optimal GF's.
+	    (GC-OPTIMIZATION-REPORT "~%Reorder Generic Functions Phase 2...")
+	    (LOOP INITIALLY ;; Reset the indices to the first available slots.
+			    (LOOP FOR INDEX BELOW %NUMBER-OF-GF-CLASS-INDICES
+				  AS ARRAY = (AREF CLASS-ARRAYS INDEX)
+				  AS ARRAY-INDEX = 0
+				  WHEN ARRAY
+				    DO (LOOP WITH LENGTH = (AREF CLASS-COUNTS INDEX)
+					     UNLESS (< ARRAY-INDEX LENGTH)
+					       ;; No positions left; better not be referenced.
+					       RETURN (SETF (AREF CLASS-POINTERS INDEX) NIL)
+					     WHEN (NULL (AREF ARRAY ARRAY-INDEX))
+					       RETURN (SETF (AREF CLASS-POINTERS INDEX)
+							    ARRAY-INDEX)
+					     DO (INCF ARRAY-INDEX)))
+		  WHILE GF-QUEUE-POINTER
+		  AS QUEUE-ENTRY = (MINIMALLY-PLACE-INTO-POSITION
+				     GF-QUEUE-POINTER CLASS-POINTERS CLASS-HASH-BASES
+				     PROBE-LENGTH-ARRAY)
+		  UNLESS (EQ QUEUE-ENTRY (CAR GF-QUEUE-POINTER))
+		    DO (PULL QUEUE-ENTRY GF-QUEUE-POINTER)
+		  DO (SETQ GF-QUEUE-POINTER (CDR GF-QUEUE-POINTER))
+		     (LET* ((INDEX (QUEUE-GF-CLASS-INDEX QUEUE-ENTRY))
+			    (ARRAY (AREF CLASS-ARRAYS INDEX))
+			    (LENGTH (ARRAY-ACTIVE-LENGTH ARRAY))
+			    (POINTER (AREF CLASS-POINTERS INDEX)))
+		       (SETF (AREF ARRAY POINTER) QUEUE-ENTRY)
+		       (LOOP DO (INCF POINTER)
+			     UNTIL (OR ( POINTER LENGTH) (NULL (AREF ARRAY POINTER))))
+		       (SETF (AREF CLASS-POINTERS INDEX) POINTER)))
+	    (VERIFY-HASH-ASSIGNMENTS)
+	    ;; How anticlimactic.  Now I have the arrays.  What do they mean?
+	    (WHEN *ENABLE-GC-OPTIMIZATION-REPORTS*
+	      (PRINT-PROBE-LENGTH-ARRAY PROBE-LENGTH-ARRAY))
+	    (VALUES CLASS-ARRAYS PROBE-LENGTH-ARRAY)))))))
+
+;; GF Queue is an alist of (gf n_flavors . list)
+;; list is a plist of (flavor fake-handler-table), n-flavors long
+(DEFUN MAKE-GF-QUEUE (FLAVORS TABLE)
+  (LET ((FAKE-HANDLER-TABLE-TABLE (CL:MAKE-HASH-TABLE :SIZE (* 2 (LENGTH FLAVORS)))))
+    (LOOP FOR FLAVOR IN FLAVORS
+          AS HANDLER = (FLAVOR:FLAVOR-HANDLER-TABLE FLAVOR)
+          DO (SETF (CL:GETHASH FLAVOR FAKE-HANDLER-TABLE-TABLE)
+                   (MAKE-ARRAY (FLAVOR::HANDLER-TABLE-N-SLOTS-FOR-SIZE
+				 (ARRAY-TOTAL-SIZE HANDLER))
+                               :TYPE ART-BOOLEAN)))
+    (LET* ((SIZE (CL:HASH-TABLE-COUNT TABLE))
+           (LIST (MAKE-LIST SIZE))
+           (TAIL LIST))
+      (CL:MAPHASH #'(LAMBDA (KEY VALUE)
+                      (LET* ((LENGTH (LENGTH VALUE))
+                             (ELEMENT (MAKE-LIST (+ (1- (GF-QUEUE-ENTRY-SIZE))
+						    (* 2 LENGTH)))))
+                        (SETF (QUEUE-GF ELEMENT) KEY)
+			(SETF (QUEUE-GF-CLASS-INDEX ELEMENT) (GF-CLASS-INDEX KEY))
+                        (SETF (QUEUE-N-FLAVORS ELEMENT) LENGTH)
+                        (LOOP FOR SUBELEMENT ON (QUEUE-FLAVOR-PLIST ELEMENT) BY #'CDDR
+                              FOR FLAVOR IN VALUE
+                              DO (SETF (CAR SUBELEMENT) FLAVOR)
+                                 (SETF (CADR SUBELEMENT)
+                                       (GETHASH FLAVOR FAKE-HANDLER-TABLE-TABLE)))
+                        (SETF (CAR TAIL) ELEMENT)
+                        (SETF TAIL (CDR TAIL))))
+                  TABLE)
+      LIST)))
+
+;;---Different from FS:PULL, in that the item must be in the list.
+;;---Shouldn't be in this file.
+(DEFUN PULL (ITEM LIST)
+  (DO ((LS LIST (CDR LS))
+       (IT ITEM))
+      ((NULL LS) (FERROR "Item not found in list for ~S" 'PULL))
+    (SETF (CAR LS) (PROG1 IT (SETQ IT (CAR LS))))
+    (AND (EQ ITEM IT) (RETURN LIST))))
+
+#+IGNORE
+;;---Different from FS:PULL, in that the list is rotated rather than shuffled.
+;;---Shouldn't be in this file.
+(DEFUN ROTATE-TO-CAR (ITEM LIST)
+  (LOOP FOR POSITION FROM 0
+        FOR SUBLIST = LIST THEN (CDR SUBLIST)
+        WHEN (NULL SUBLIST)
+          DO (FERROR "Item not found in list for ~S" 'ROTATE-TO-CAR)
+        UNTIL (EQ (CAR SUBLIST) ITEM)
+        FINALLY
+    (UNLESS (ZEROP POSITION)
+      (WITH-STACK-ARRAY (ARRAY POSITION :TYPE ART-Q-LIST)
+        (LET* ((SUBLIST1 LIST)
+               (SUBLIST2 LIST)
+               (SUBTEMP1 (G-L-P ARRAY))
+               (SUBTEMP2 SUBTEMP1))
+          (LOOP WHILE SUBTEMP1 DO
+            (SETF (CAR SUBTEMP1) (POP SUBLIST1))
+            (SETQ SUBTEMP1 (CDR SUBTEMP1)))
+          (LOOP UNTIL (NULL SUBLIST1) DO
+            (SETF (CAR SUBLIST2) (POP SUBLIST1))
+            (SETF SUBLIST2 (CDR SUBLIST2)))
+          (LOOP WHILE SUBTEMP2 DO
+            (SETF (CAR SUBLIST2) (POP SUBTEMP2))
+            (SETF SUBLIST2 (CDR SUBLIST2)))))))
+  LIST)
+
+;; Returns a table which maps handler table key to a list of all instantiable flavors
+;; which use it.
+(DEFUN MAKE-GENERIC-FUNCTION-FLAVOR-TABLE ()
+  (DECLARE (VALUES TABLE INSTANTIABLE-FLAVORS CLASS-COUNTS))
+  (LOOP WITH TABLE = (CL:MAKE-HASH-TABLE :SIZE 40000.)
+	WITH CLASS-COUNTS = (MAKE-ARRAY %NUMBER-OF-GF-CLASS-INDICES :INITIAL-VALUE 0)
+        WITH (INSTANTIABLE-FLAVORS FLAVOR HANDLER START-ADDRESS FINISH-ADDRESS)
+        WITH TRANSFORMER = FLAVOR::*INSTANCE-TRANSFORMING-HANDLER-TABLE*
+        FOR FLAVOR-NAME IN *ALL-FLAVOR-NAMES*
+        DO (WHEN (AND (SETQ FLAVOR (FLAVOR:FIND-FLAVOR FLAVOR-NAME NIL))
+                      (SETQ HANDLER (FLAVOR::FLAVOR-HANDLER-TABLE FLAVOR))
+                      (NEQ HANDLER TRANSFORMER))
+             ;; Make sure it's really rehashed this time around.
+             (WHEN (WITHOUT-INTERRUPTS (FLAVOR::REHASH-HANDLER-TABLE FLAVOR))
+               (SETQ HANDLER (FLAVOR::FLAVOR-HANDLER-TABLE FLAVOR)))
+             (PUSH FLAVOR INSTANTIABLE-FLAVORS)
+             (SETQ START-ADDRESS (FLAVOR::HANDLER-TABLE-ADDRESS HANDLER)
+                   FINISH-ADDRESS (FLAVOR::HANDLER-TABLE-LAST-ADDRESS HANDLER))
+             (LOOP FOR ADDRESS = START-ADDRESS
+                               THEN (%MAKE-POINTER-OFFSET DTP-LOCATIVE ADDRESS 3)
+                   UNTIL (EQ ADDRESS FINISH-ADDRESS)
+                   AS PROBE = (LOCATION-CONTENTS ADDRESS)
+                   WHEN PROBE
+                     DO (SCL:MODIFY-HASH TABLE PROBE
+                          #'(LAMBDA (KEY VALUE FOUND)
+			      (WHEN (NOT FOUND)
+				(LET ((INDEX (GF-CLASS-INDEX KEY)))
+				  (INCF (AREF CLASS-COUNTS INDEX))))
+			      (IF VALUE
+				  (CONS FLAVOR VALUE)
+				  (LIST FLAVOR))))))
+        FINALLY
+          (RETURN (VALUES TABLE INSTANTIABLE-FLAVORS CLASS-COUNTS))))
+
+(DEFUN LONGEST-PROBE-FOR-GF-IN-TABLE (HASH-VALUE FLAVOR FAKE-HANDLER-TABLE)
+  (LET ((FAKE-HANDLER-TABLE FAKE-HANDLER-TABLE))
+    (DECLARE (ARRAY-REGISTER FAKE-HANDLER-TABLE))
+    (LOOP WITH MASK = (FLAVOR::FLAVOR-HASH-MASK FLAVOR)
+          WITH MASKED-HASH = (LOGAND HASH-VALUE MASK)
+          FOR INDEX FROM MASKED-HASH            ;error on overflow
+          WHILE (AREF FAKE-HANDLER-TABLE INDEX)
+          FINALLY (RETURN (- INDEX MASKED-HASH)))))
+
+(DEFUN INSERT-GF-IN-TABLE (GF HASH-VALUE FLAVOR FAKE-HANDLER-TABLE
+                           &OPTIONAL PROBE-LENGTH-ARRAY)
+  (LET ((FAKE-HANDLER-TABLE FAKE-HANDLER-TABLE))
+    (DECLARE (ARRAY-REGISTER FAKE-HANDLER-TABLE))
+    (LOOP WITH MASK = (FLAVOR::FLAVOR-HASH-MASK FLAVOR)
+          WITH MASKED-HASH = (LOGAND HASH-VALUE MASK)
+          FOR INDEX FROM MASKED-HASH
+          WHEN (NULL (AREF FAKE-HANDLER-TABLE INDEX))
+            DO (SETF (AREF FAKE-HANDLER-TABLE INDEX) GF)
+               (WHEN PROBE-LENGTH-ARRAY
+                 (INCF (AREF PROBE-LENGTH-ARRAY (- INDEX MASKED-HASH))))
+	       ;; If we filled the last slot, we have to grow the table and put
+	       ;; an empty slot at the end.
+	       (WHEN (= INDEX (1- (ARRAY-LENGTH FAKE-HANDLER-TABLE)))
+		 (GC-OPTIMIZATION-REPORT-FORCE
+		   "~%[Warning:  Growing handler table from ~D to ~D slots.~@
+				 Flavor ~S, Key ~S]"
+			 (+ INDEX 1) (+ INDEX 2) (FLAVOR-NAME FLAVOR) (QUEUE-GF GF))
+		 (ADJUST-ARRAY-SIZE FAKE-HANDLER-TABLE (+ INDEX 2)))
+               (RETURN NIL))))
+
+;; This score function sums the squares of the probes.  This seems to be
+;; a good compromise between just taking the longest probe and summing
+;; the probes.
+(DEFUN SCORE-ENTRY (QUEUE-ENTRY HASH GIVE-UP)
+  (DO ((L (QUEUE-FLAVOR-PLIST QUEUE-ENTRY))
+       (RESULT 0))
+      ((NULL L) RESULT)
+    (INCF RESULT (^ (LONGEST-PROBE-FOR-GF-IN-TABLE HASH (POP L) (POP L)) 2))
+    (WHEN (AND GIVE-UP ( RESULT GIVE-UP))
+      (RETURN RESULT))))
+
+;; Place a GF at any index
+(DEFUN MINIMALLY-PLACE-GF (QUEUE-ENTRY SIZE ARRAY INDEX HASH-BASE PROBE-LENGTH-ARRAY)
+  (DECLARE (VALUES NEW-INDEX))
+  (LET ((ARRAY ARRAY)
+	(ARRAY-LENGTH (ARRAY-ACTIVE-LENGTH ARRAY)))
+    (DECLARE (ARRAY-REGISTER ARRAY))
+    (LOOP WITH I = INDEX
+          WITH MIN-SCORE = +1e
+          WITH MIN-INDEX = NIL
+          AS HASH = (+ HASH-BASE (* SIZE I))
+          AS SCORE = (SCORE-ENTRY QUEUE-ENTRY HASH MIN-SCORE)
+          WHEN (ZEROP SCORE)
+            DO (SETQ MIN-INDEX I)
+               (LOOP-FINISH)
+          WHEN (< SCORE MIN-SCORE)
+            DO (SETQ MIN-SCORE SCORE MIN-INDEX I)
+          DO (LOOP WHEN ( (INCF I) ARRAY-LENGTH)
+                     DO (SETQ I 0)
+                   UNTIL (NULL (AREF ARRAY I)))
+          UNTIL (= I INDEX)
+          FINALLY
+            (SETQ HASH (+ HASH-BASE (* SIZE MIN-INDEX)))
+	    (ASSIGN-HASH (QUEUE-GF QUEUE-ENTRY) HASH)
+            (DO ((L (QUEUE-FLAVOR-PLIST QUEUE-ENTRY)))
+                ((NULL L))
+              (INSERT-GF-IN-TABLE QUEUE-ENTRY HASH (POP L) (POP L) PROBE-LENGTH-ARRAY))
+            (SETF (AREF ARRAY MIN-INDEX) QUEUE-ENTRY)
+            ;; Return a free index, if there is one.  (If there isn't, return NIL to be safe.)
+            (RETURN
+              (IF ( I MIN-INDEX)
+                  I ;In this case we know I is free.
+                  (LOOP WHEN ( (INCF I) ARRAY-LENGTH)
+                          DO (SETQ I 0)
+                        WHEN (= I MIN-INDEX)
+                          RETURN NIL
+                        WHEN (NULL (AREF ARRAY I))
+                          RETURN I))))))
+
+;; Place any GF at this index.
+(DEFUN MINIMALLY-PLACE-INTO-POSITION (GF-QUEUE-POINTER CLASS-POINTERS CLASS-HASH-BASES
+                                      PROBE-LENGTH-ARRAY)
+  (DECLARE (VALUES QUEUE-ENTRY))
+  (LOOP WITH MIN-QUEUE-ENTRY = NIL
+        WITH MIN-SCORE = +1e
+        FOR QUEUE-ENTRY IN GF-QUEUE-POINTER
+	AS INDEX = (QUEUE-GF-CLASS-INDEX QUEUE-ENTRY)
+        AS HASH = (+ (AREF CLASS-HASH-BASES INDEX)
+		     (CLASS-INDEX-OFFSET INDEX)
+		     (* (LDB %%GF-INDEX-SIZE INDEX)
+			(AREF CLASS-POINTERS INDEX)))
+        AS SCORE = (SCORE-ENTRY QUEUE-ENTRY HASH MIN-SCORE)
+        WHEN (ZEROP SCORE)
+          DO (SETQ MIN-QUEUE-ENTRY QUEUE-ENTRY)
+             (LOOP-FINISH)
+        WHEN (< SCORE MIN-SCORE)
+          DO (SETQ MIN-SCORE SCORE MIN-QUEUE-ENTRY QUEUE-ENTRY)
+        FINALLY
+          (SETQ INDEX (QUEUE-GF-CLASS-INDEX MIN-QUEUE-ENTRY)
+		HASH (+ (AREF CLASS-HASH-BASES INDEX)
+			(* (LDB %%GF-INDEX-SIZE INDEX)
+			   (AREF CLASS-POINTERS INDEX))))
+	  (ASSIGN-HASH (QUEUE-GF MIN-QUEUE-ENTRY) HASH)
+          (DO ((L (QUEUE-FLAVOR-PLIST MIN-QUEUE-ENTRY)))
+              ((NULL L))
+            (INSERT-GF-IN-TABLE MIN-QUEUE-ENTRY HASH (POP L) (POP L) PROBE-LENGTH-ARRAY))
+          (RETURN MIN-QUEUE-ENTRY)))
+
+;; Place a GF at a virtual memory address.
+;; This is only done because the GF can't be relocated (due to safeguarding).
+(DEFUN PLACE-GF-AT-ADDRESS (QUEUE-ENTRY ADDRESS PROBE-LENGTH-ARRAY)
+  (ASSIGN-HASH (QUEUE-GF QUEUE-ENTRY) ADDRESS)
+  (DO ((L (QUEUE-FLAVOR-PLIST QUEUE-ENTRY)))
+      ((NULL L))
+    (INSERT-GF-IN-TABLE QUEUE-ENTRY ADDRESS (POP L) (POP L) PROBE-LENGTH-ARRAY)))
+
+;;; Interface to REORDER-MEMORY
+
+(DEFINE-GC-OPTIMIZATION REORDER-GENERIC-FUNCTIONS :LAYERED-IDS-RELEASE
+  (:DOCUMENTATION
+    "Reorder generic functions so method lookup has a miminal number of hash probes")
+  (:ORDER :LATE (:AFTER REORDER-SYMBOLS))
+  (:BEFORE-FLIP (INCREMENTAL-P)
+    (LABELS ((OBJECTS (CLASS CLASS-ARRAYS)
+	       (COPYLIST
+		 (LOOP FOR SIZE BELOW %MAX-GF-SIZE
+		       AS INDEX = (DPB CLASS %%GF-INDEX-CLASS SIZE)
+		       AS ARRAY = (AREF CLASS-ARRAYS INDEX)
+		       WHEN ARRAY
+			 APPEND (LOOP FOR GF BEING THE ARRAY-ELEMENTS OF ARRAY
+				      AS OBJECT = (CAR GF)
+				      COLLECT OBJECT
+				      WHEN (AND (TYPEP OBJECT :GENERIC-FUNCTION)
+						(LISTP (GENERIC-FUNCTION-NAME OBJECT)))
+					COLLECT (GENERIC-FUNCTION-NAME OBJECT)))
+		 REORDERING-LIST-AREA)))
+      (USING-SYSTEM-TEMPORARY-AREA
+	(LET* ((START-TIME (TIME))
+	       (DEFAULT-CONS-AREA SYSTEM-TEMPORARY-AREA)
+	       (CLASS-ARRAYS (CREATE-ORDERING-FOR-GENERIC-FUNCTIONS))
+	       (SYMBOL-LIST (OBJECTS %GF-CLASS-SYMBOL CLASS-ARRAYS))
+	       (GENERIC-FUNCTION-LIST (OBJECTS %GF-CLASS-GENERIC-FUNCTION CLASS-ARRAYS))
+	       (CLOS-GENERIC-FUNCTION-LIST (OBJECTS %GF-CLASS-CLOS-GENERIC-FUNCTION
+						    CLASS-ARRAYS))
+	       (CLOS-LIST-LIST (OBJECTS %GF-CLASS-CLOS-LIST CLASS-ARRAYS))
+	       (SYMBOL-REORDERING (CL:FIND 'SYMBOL *REORDERINGS* :KEY #'REORDERING-NAME))
+	       (PNAME-REORDERING (CL:FIND 'PNAME *REORDERINGS* :KEY #'REORDERING-NAME))
+	       (PLIST-REORDERING (CL:FIND 'PLIST *REORDERINGS* :KEY #'REORDERING-NAME)))
+	  ;; If there is nothing to reorder, simply punt now.
+	  (WHEN (AND (NULL SYMBOL-LIST)
+		     (NULL GENERIC-FUNCTION-LIST)
+		     (NULL CLOS-GENERIC-FUNCTION-LIST)
+		     (NULL CLOS-LIST-LIST))
+	    (RETURN-FROM REORDER-GENERIC-FUNCTIONS NIL))
+	  ;; Override any reordering which was done by symbol-reordering by removing the symbols.
+	  (IF (OR (NULL SYMBOL-REORDERING) (NULL PLIST-REORDERING) (NULL PNAME-REORDERING))
+	      (GC-OPTIMIZATION-REPORT-FORCE
+	       "~&Warning:  Generic Function couldn't mung symbol reordering for some reason.")
+	    (LET ((START-TIME (TIME))
+		  (SYMBOL-TABLE (CL:MAKE-HASH-TABLE :SIZE (LENGTH SYMBOL-LIST)
+				  :NUMBER-OF-VALUES 0 :MUTATING NIL :LOCKING NIL)))
+	      (MULTIPLE-VALUE-BIND (PNAMES PLISTS)
+		  (LOOP FOR SYMBOL IN SYMBOL-LIST
+			DO (SETF (CL:GETHASH SYMBOL SYMBOL-TABLE) T)
+			COLLECT (CL:SYMBOL-NAME SYMBOL) INTO PNAMES
+			WHEN (CL:SYMBOL-PLIST SYMBOL) COLLECT IT INTO PLISTS
+			FINALLY (RETURN (VALUES PNAMES PLISTS)))
+		(SETF (REORDERING-OBJECT-LIST SYMBOL-REORDERING)
+		      (CL:DELETE-IF #'(LAMBDA (X) (CL:GETHASH X SYMBOL-TABLE))
+				    (REORDERING-OBJECT-LIST SYMBOL-REORDERING)))
+		(SETF (REORDERING-OBJECT-LIST PNAME-REORDERING)
+		      (NCONC (COPYLIST (CL:DELETE-IF-NOT #'REORDERABLE PNAMES)
+				       REORDERING-LIST-AREA T)
+			     (REORDERING-OBJECT-LIST PNAME-REORDERING)))
+		(SETF (REORDERING-OBJECT-LIST PLIST-REORDERING)
+		      (NCONC (COPYLIST (CL:DELETE-IF-NOT #'REORDERABLE PLISTS)
+				       REORDERING-LIST-AREA T)
+			     (REORDERING-OBJECT-LIST PLIST-REORDERING)))
+		(GC-OPTIMIZATION-REPORT "~&Fixing up symbol reorderings took ~\TIME-INTERVAL\."
+				(ROUND (TIME-DIFFERENCE (TIME) START-TIME) 60.)))))
+	  ;; Add all reorderable but not referenced generic functions in a pseudo-random order.
+	  (LET ((START-TIME (TIME))
+		(GENERIC-FUNCTION-TABLE (CL:MAKE-HASH-TABLE
+					  :SIZE (LENGTH GENERIC-FUNCTION-LIST)
+					  :NUMBER-OF-VALUES 0 :MUTATING NIL :LOCKING NIL))
+		(UNREFERENCED-LIST NIL))
+	    (LOOP FOR GENERIC-FUNCTION IN GENERIC-FUNCTION-LIST
+		  WHEN (TYPEP GENERIC-FUNCTION :GENERIC-FUNCTION)
+		    DO (SETF (CL:GETHASH GENERIC-FUNCTION GENERIC-FUNCTION-TABLE) T))
+	    (LOOP FOR GENERIC-FUNCTION-NAME IN FLAVOR::*ALL-GENERIC-FUNCTION-NAMES*
+		  AS GENERIC-FUNCTION = (FLAVOR:FIND-GENERIC-FUNCTION GENERIC-FUNCTION-NAME ())
+		  WHEN (AND GENERIC-FUNCTION
+			    (REORDERABLE GENERIC-FUNCTION INCREMENTAL-P)
+			    (NOT (CL:GETHASH GENERIC-FUNCTION GENERIC-FUNCTION-TABLE)))
+		    DO (PUSH GENERIC-FUNCTION UNREFERENCED-LIST))
+	    (LET ((COUNT (LENGTH UNREFERENCED-LIST)))
+	      (GC-OPTIMIZATION-REPORT
+		"~&Found ~D unreferenced reorderable generic function~:P." COUNT)
+	      (STACK-LET ((UNREFERENCED-ARRAY (CL:MAKE-ARRAY COUNT
+						:INITIAL-CONTENTS UNREFERENCED-LIST)))
+		(DECLARE (ARRAY-REGISTER UNREFERENCED-ARRAY))
+		(LOOP WHILE (PLUSP COUNT)
+		      AS INDEX = (RANDOM (PROG1 COUNT (DECF COUNT)))
+		      AS GENERIC-FUNCTION = (CL:SHIFTF (AREF UNREFERENCED-ARRAY INDEX)
+						       (AREF UNREFERENCED-ARRAY COUNT))
+		      COLLECT GENERIC-FUNCTION INTO GENERIC-FUNCTIONS
+		      WHEN (CL:CONSP (GENERIC-FUNCTION-NAME GENERIC-FUNCTION))
+			COLLECT (GENERIC-FUNCTION-NAME GENERIC-FUNCTION) INTO GENERIC-FUNCTIONS
+		      FINALLY
+			(SETQ GENERIC-FUNCTION-LIST
+			      (NCONC GENERIC-FUNCTION-LIST
+				     (COPYLIST GENERIC-FUNCTIONS REORDERING-LIST-AREA)))))
+	      (GC-OPTIMIZATION-REPORT "~&Randomly collecting unreferenced generic functions ~
+			       took ~\TIME-INTERVAL\."
+				      (ROUND (TIME-DIFFERENCE (TIME) START-TIME) 60.))))
+	  ;; Add our own reorderings.
+	  (LET ((DEFAULT-CONS-AREA REORDERING-LIST-AREA))
+	    (SETQ *REORDERINGS*
+		  (LIST* (MAKE-REORDERING NAME 'GF-SYMBOLS
+					  AREA SYMBOL-AREA
+					  DONT-EXTEND-REGIONS T ;That would screw hash values
+					  OBJECT-LIST SYMBOL-LIST)
+			 (MAKE-REORDERING NAME 'GF-GENERIC-FUNCTIONS
+					  AREA FLAVOR::*FLAVOR-STATIC-AREA*
+					  DONT-EXTEND-REGIONS T ;That would screw hash values
+					  OBJECT-LIST GENERIC-FUNCTION-LIST)
+			 (MAKE-REORDERING NAME 'GF-CLOS-GENERIC-FUNCTION-SELECTORS
+					  AREA CLOS-INTERNALS::*CLOS-STATIC-AREA*
+					  DONT-EXTEND-REGIONS T ;That would screw hash valus
+					  OBJECT-LIST CLOS-GENERIC-FUNCTION-LIST)
+			 (MAKE-REORDERING NAME 'GF-CLOS-LIST-SELECTORS
+					  AREA CLOS-INTERNALS::*CLOS-STATIC-AREA*
+					  DONT-EXTEND-REGIONS T ;That would screw hash valus
+					  OBJECT-LIST CLOS-LIST-LIST)
+			 *REORDERINGS*)))
+	  (GC-OPTIMIZATION-REPORT
+	    "~&Total time for REORDER-GENERIC-FUNCTIONS is ~\TIME-INTERVAL\."
+	    (ROUND (TIME-DIFFERENCE (TIME) START-TIME) 60.)))))))
+
+#+IGNORE
+(DEFUN TEST-REORDER-GENERIC-FUNCTIONS (&KEY (RUN-WITHOUT-INTERRUPTS NIL)
+					    (REORDER-SYMBOLS T))
+  (LET ((*REORDERING-TASKS* '(REORDER-SYMBOLS REORDER-GENERIC-FUNCTIONS)))
+    (UNLESS REORDER-SYMBOLS (POP *REORDERING-TASKS*))
+    (GC-OPTIMIZATION-REPORT "~&Before reordering:")
+    (COLLECT-FLAVOR-HASH-STATISTICS *MAX-PROBE-LENGTH* NIL)
+    (REORDER-MEMORY :INCREMENTAL NIL :RUN-WITHOUT-INTERRUPTS RUN-WITHOUT-INTERRUPTS)
+    (FLAVOR::OPTIMIZE-HANDLER-TABLES)
+    (GC-OPTIMIZATION-REPORT "~2&After reordering:")
+    (COLLECT-FLAVOR-HASH-STATISTICS *MAX-PROBE-LENGTH* NIL)))
+
+#||
+;;; Here are some artifacts of compiled function metering which I don't
+;;; use any more for various reasons, but which I didn't feel like throwing away.
+
+;These are too slow for reordering use.
+(DEFUN MAP-OVER-FUNCTIONS-REFERENCED-BY (COMPILED-FUNCTION MAPPER)
+  (DECLARE (DOWNWARD-FUNARG MAPPER))
+  (CHECK-ARG-TYPE COMPILED-FUNCTION :COMPILED-FUNCTION)
+  (LOOP WITH CCA = (COMPILED-FUNCTION-CCA COMPILED-FUNCTION)
+	FOR I BELOW (CCA-N-OBJECTS CCA)
+	AS OBJECT = (CCA-OBJECT CCA I)
+	DO (TYPECASE OBJECT
+	     (:LOCATIVE
+	       (MULTIPLE-VALUE-BIND (THING TYPE)
+		   (COMPILER:DISASSEMBLE-DECODE-LOCATIVE OBJECT)
+		 THING ;ignored
+		 (WHEN (AND (EQ TYPE :FUNCTION)
+			    (LOCATION-BOUNDP OBJECT))
+		   (LET ((TARGET (LOCATION-CONTENTS OBJECT)))
+		     (WHEN (TYPEP TARGET :COMPILED-FUNCTION)
+		       (FUNCALL MAPPER TARGET))))))
+	     (:COMPILED-FUNCTION
+	       (FUNCALL MAPPER OBJECT)))))
+
+(DEFUN MAP-OVER-FUNCTIONS-WHICH-REFERENCE (COMPILED-FUNCTION MAPPER)
+  (DECLARE (DOWNWARD-FUNARG MAPPER))
+  (CHECK-ARG-TYPE COMPILED-FUNCTION :COMPILED-FUNCTION)
+  (ENSURE-CALLERS-DATABASE)
+  (LOOP WITH COMPILED-FUNCTION-NAME = (COMPILED-FUNCTION-NAME COMPILED-FUNCTION)
+	FOR (HOW HASH) IN *ALL-CALLERS*
+	WHEN (EQ HOW :FUNCTION)
+	  DO (MULTIPLE-VALUE-BIND (LIST FOUNDP)
+		 (SEND HASH :GET-HASH COMPILED-FUNCTION-NAME)
+	       (WHEN FOUNDP
+		 (MAPC MAPPER LIST)))))
+
+(DEFUN COLLECT-FUNCTIONS-WHICH-REFERENCE (COMPILED-FUNCTION)
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (MAP-OVER-FUNCTIONS-WHICH-REFERENCE COMPILED-FUNCTION
+      #'(LAMBDA (F) (COLLECT-RESULT F)))
+    RESULT))
+
+(DEFUN COLLECT-FUNCTIONS-REFERENCED-BY (COMPILED-FUNCTION)
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (DO-FUNCTIONS-REFERENCED (F) COMPILED-FUNCTION
+      (COLLECT-RESULT F))
+    RESULT))
+
+;; These two are not too useful.
+(DEFUN TRANSITIVE-CLOSURE-REFERENCED-BY (COMPILED-FUNCTION)
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (LABELS ((MAPPER (FUNCTION)
+	       (UNLESS (MEMQ FUNCTION RESULT)
+		 (COLLECT-RESULT FUNCTION)
+		 (DO-FUNCTIONS-REFERENCED (REF) FUNCTION
+		   (MAPPER REF)))))
+      (MAPPER COMPILED-FUNCTION)
+      RESULT)))
+
+(DEFUN TRANSITIVE-CLOSURE-WHICH-REFERENCE (COMPILED-FUNCTION)
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (LABELS ((MAPPER (FUNCTION)
+	       (UNLESS (MEMQ FUNCTION RESULT)
+		 (COLLECT-RESULT FUNCTION)
+		 (MAP-OVER-FUNCTIONS-WHICH-REFERENCE FUNCTION #'MAPPER))))
+      (MAPPER COMPILED-FUNCTION)
+      RESULT)))
+||#
+
+;;; Metering of compiled function call graphs
+
+(DEFVAR *REFERENCE-TREE*)
+
+(DEFUN CREATE-REFERENCE-TREE ()
+  (LET ((OLD-GC-ON GC-ON)
+	(*INCREMENTAL-IMMEDIATE-GC* NIL))
+    (UNWIND-PROTECT
+	(PROGN (GC-OFF)
+	       (SETQ *REFERENCE-TREE* (CREATE-COMPILED-FUNCTION-REFERENCE-TREE T NIL NIL)))
+      (WHEN OLD-GC-ON
+	(APPLY #'GC-ON OLD-GC-ON)))
+    T))
+
+(DEFUN PRINT-REFERENCE-TREE-REDUCTIONS (&OPTIONAL (REFERENCE-TREE *REFERENCE-TREE*))
+  (TV:NOTING-PROGRESS ("Print reference tree reductions")
+    (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	  FOR NUMERATOR UPFROM 1
+	  FOR NODE IN REFERENCE-TREE
+	  AS BLOCK = (F-NODE-BLOCK-NODES NODE)
+	  DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	  WHEN BLOCK
+	    DO (FORMAT T "~2&~S" (COMPILED-FUNCTION-NAME (F-NODE-FUNCTION NODE)))
+	       (LOOP FOR NODE IN BLOCK
+		     DO (FORMAT T "~%  ~S"
+			  (COMPILED-FUNCTION-NAME (F-NODE-FUNCTION NODE)))))))
+
+(DEFUN SUMMARIZE-REFERENCE-TREE-REDUCTIONS (&OPTIONAL (SPAN 40.)
+						      (REFERENCE-TREE *REFERENCE-TREE*))
+  (WITH-STACK-ARRAY (ARRAY SPAN :INITIAL-VALUE 0)
+    (DECLARE (ARRAY-REGISTER ARRAY))
+    (TV:NOTING-PROGRESS ("Compute spanning pages from reference tree")
+      (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	    FOR NUMERATOR UPFROM 1
+	    FOR NODE IN REFERENCE-TREE
+	    AS PAGES = (LIST (LDB %%VMA-PAGE-NUM (%POINTER (F-NODE-FUNCTION NODE))))
+	    DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	    WHEN (F-NODE-BLOCK-NODES NODE)
+	      DO (LOOP FOR NODE2 IN (F-NODE-BLOCK-NODES NODE)
+		       DO (PUSH* (LDB %%VMA-PAGE-NUM (%POINTER (F-NODE-FUNCTION NODE2)))
+				 PAGES))
+		 (CL:INCF (AREF ARRAY (1- (MIN (LENGTH PAGES) SPAN))))))
+    (LOOP FOR I BELOW SPAN
+	  WHEN (PLUSP (AREF ARRAY I))
+	    DO (FORMAT T "~&~6D block~:P currently span ~D page~:P~:[ or more~]."
+		 (AREF ARRAY I) (1+ I) ( (1+ I) SPAN)))))
+
+(DEFUN SUMMARIZE-CALLER-CALLEE-RELATIONSHIPS (&OPTIONAL (IGNORE-COMPILE-TIME NIL)
+							(CALLERS 40.) (CALLEES 20.)
+							(REFERENCE-TREE *REFERENCE-TREE*))
+  (WITH-STACK-ARRAY (ARRAY (LIST (1+ CALLERS) (1+ CALLEES)) :INITIAL-VALUE 0)
+    (TV:NOTING-PROGRESS ("Count caller-callee relationships in reference tree")
+      (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	    FOR NUMERATOR UPFROM 1
+	    FOR NODE IN REFERENCE-TREE
+	    DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	    UNLESS (AND IGNORE-COMPILE-TIME
+			(FUNCTION-IS-COMPILE-TIME-P
+			  (COMPILED-FUNCTION-NAME (F-NODE-FUNCTION NODE))))
+	      DO (CL:INCF (AREF ARRAY (MIN (LENGTH (F-NODE-REFERENCED-BY-LIST NODE)) CALLERS)
+				      (MIN (LENGTH (F-NODE-REFERENCE-LIST NODE)) CALLEES)))
+	    FINALLY
+	      (FORMAT T "~&# Callers \ # Called~%     ")
+	      (LOOP FOR I FROM 0 TO CALLEES DOING
+		(FORMAT T " ~4D" I))
+	      (FORMAT T "  Total~%")
+	      (WITH-STACK-ARRAY (ARRAY2 (1+ CALLEES) :INITIAL-VALUE 0)
+		(LOOP FOR I FROM 0 TO CALLERS DO
+		  (FORMAT T " ~4D" I)
+		  (LOOP FOR J FROM 0 TO CALLEES
+			AS COUNT = (AREF ARRAY I J)
+			SUM COUNT INTO TOTAL
+			WHEN (PLUSP COUNT)
+			  DO (INCF (AREF ARRAY2 J) COUNT)
+			     (FORMAT T " ~4D" COUNT)
+			ELSE
+			  DO (FORMAT T "     ")
+			FINALLY (FORMAT T " ~6D~%" TOTAL))
+		      FINALLY
+			(FORMAT T "Total")
+			(LOOP FOR J FROM 0 TO CALLEES
+			      AS COUNT = (AREF ARRAY2 J)
+			      SUM COUNT INTO TOTAL
+			      DO (FORMAT T " ~4D" COUNT)
+			      FINALLY (FORMAT T " ~6D" TOTAL))))))))
+
+(DEFUN PRINT-FUNCTIONS-IN-CLASS (CALLERS CALLEES
+				 &OPTIONAL PRINT (REFERENCE-TREE *REFERENCE-TREE*))
+  (TV:NOTING-PROGRESS ("Print functions in class")
+    (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	  FOR NUMERATOR UPFROM 1
+	  FOR NODE IN REFERENCE-TREE
+	  DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	  WHEN (AND (OR (EQ CALLERS T)
+			(= (LENGTH (F-NODE-REFERENCED-BY-LIST NODE)) CALLERS))
+		    (OR (EQ CALLEES T)
+			(= (LENGTH (F-NODE-REFERENCE-LIST NODE)) CALLEES)))
+	    DO (FORMAT T "~%~S" (COMPILED-FUNCTION-NAME (F-NODE-FUNCTION NODE)))
+	       (LOOP FOR NODE IN (SELECTQ PRINT
+				   (:BLOCK (F-NODE-BLOCK-NODES NODE))
+				   (:CALLERS (F-NODE-REFERENCED-BY-LIST NODE))
+				   (:CALLEES (F-NODE-REFERENCE-LIST NODE)))
+		     DO (FORMAT T "~%  ~S"
+			  (COMPILED-FUNCTION-NAME (F-NODE-FUNCTION NODE)))))))
+
+(DEFUN SUMMARIZE-COMPILED-FUNCTION-LOCALITY (&OPTIONAL (SPAN 20.)
+						       (REFERENCE-TREE *REFERENCE-TREE*)
+					     &AUX (2SPAN (* SPAN 2)))
+  (WITH-STACK-ARRAY (ARRAY (1+ (* SPAN 2)) :INITIAL-VALUE 0)
+    (DECLARE (ARRAY-REGISTER ARRAY))
+    (TV:NOTING-PROGRESS ("Compute compiled function locality")
+      (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	    FOR NUMERATOR UPFROM 1
+	    FOR NODE1 IN REFERENCE-TREE
+	    AS CALLER = (F-NODE-FUNCTION NODE1)
+	    DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	    DO (LOOP FOR NODE2 IN (F-NODE-REFERENCE-LIST NODE1)
+		     AS CALLEE = (F-NODE-FUNCTION NODE2)
+		     AS DIFF = (FLOOR (%POINTER-DIFFERENCE CALLEE CALLER) PAGE-SIZE)
+		     AS INDEX = (MAX (MIN (+ DIFF SPAN) 2SPAN) 0.)
+		     DO (INCF (AREF ARRAY INDEX)))))
+    (LOOP FOR INDEX TO 2SPAN
+	  FOR REAL FROM (- SPAN)
+	  FOR COUNT = (AREF ARRAY INDEX)
+	  DO (FORMAT T "~%~D reference~:P ~:[forward~;backward~] ~D page~:P~:[~; or more~]."
+	       COUNT (MINUSP REAL) (ABS REAL) (= (ABS REAL) SPAN)))))
+
+#+3600
+(DEFUN FUNCTION-IS-CALLED-BY-MICROCODE-P (FUNCTION NAME)
+  (OR (AND (SYMBOLP NAME)
+	   (LET ((CELL (FOLLOW-CELL-FORWARDING (FUNCTION-CELL-LOCATION NAME) NIL)))
+	     (OR (%POINTER-LESSP CELL 1000)
+		 (%POINTER-LESSP A-MEMORY-VIRTUAL-ADDRESS CELL))))
+      (LABELS ((IN-TABLE (FUNCTION TABLE)
+		 (LOOP NAMED TOP
+		       FOR I BELOW (ARRAY-DIMENSION-N 1 TABLE) DO
+		   (LOOP FOR J BELOW (ARRAY-DIMENSION-N 2 TABLE)
+			 WHEN (EQ (AREF TABLE I J) FUNCTION)
+			   DO (RETURN-FROM TOP T)))))
+	(OR (IN-TABLE FUNCTION ARITHMETIC-UNARY-OPERATION-DISPATCH)
+	    (LOOP FOR TABLE BEING THE ARRAY-ELEMENTS OF ARITHMETIC-BINARY-OPERATION-DISPATCH
+		  THEREIS (IN-TABLE FUNCTION TABLE))))))
+
+(DEFUN SUMMARIZE-N-CALLERS (&OPTIONAL GROK-FUNCTIONS-WITH-NO-CALLERS
+				      PRINT-FILTER
+				      (REFERENCE-TREE *REFERENCE-TREE*))
+  (TV:NOTING-PROGRESS ("Summarize number of callers")
+    (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	  WITH (ALIST ALIST2 TYPE2 FUNCTION2 NAME2 ELEM2)
+	  FOR NUMERATOR UPFROM 1
+	  FOR NODE IN REFERENCE-TREE
+	  AS LENGTH = (LENGTH (F-NODE-REFERENCED-BY-LIST NODE))
+	  AS ELEM = (ASSQ LENGTH ALIST)
+	  DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	  WHEN ELEM
+	    DO (INCF (CADR ELEM))
+	  ELSE
+	    DO (PUSH (LIST LENGTH 1 (F-NODE-FUNCTION NODE)) ALIST)
+	  WHEN (AND GROK-FUNCTIONS-WITH-NO-CALLERS (ZEROP LENGTH))
+	    DO (SETQ FUNCTION2 (F-NODE-FUNCTION NODE))
+	       (SETQ NAME2 (COMPILED-FUNCTION-NAME FUNCTION2))
+	       (SETQ TYPE2 (COND ((FUNCTION-IS-COMPILE-TIME-P NAME2) :COMPILE-TIME)
+				 #+3600
+				 ((AND (SYMBOLP NAME2)
+				       (FUNCTION-IS-CALLED-BY-MICROCODE-P FUNCTION2 NAME2))
+				  :CALLED-BY-MICROCODE)
+				 ((SYMBOLP NAME2) :SYMBOL)
+				 (T (CAR NAME2))))
+	       (WHEN PRINT-FILTER
+		 (UNLESS (MEMQ TYPE2 '(:COMPILE-TIME #+3600 :CALLED-BY-MICROCODE))
+		   (WHEN (FUNCALL PRINT-FILTER NAME2)
+		     (PRINT NAME2))))
+	       (IF (SETQ ELEM2 (ASSQ TYPE2 ALIST2))
+		   (INCF (CADR ELEM2))
+		 (PUSH (LIST TYPE2 1) ALIST2))
+	  FINALLY
+	    (LOOP FOR (LENGTH COUNT FUNCTION) IN (SETQ ALIST (SORT ALIST #'CAR-GREATERP))
+		  DO (FORMAT T "~%~6D function~:P ~:[have~;has~] ~D caller~:P.~50T(~S)"
+		       COUNT (= COUNT 1) LENGTH (COMPILED-FUNCTION-NAME FUNCTION)))
+	    (WHEN GROK-FUNCTIONS-WITH-NO-CALLERS
+	      (FORMAT T "~2%Classification of functions with no callers:")
+	      (LOOP FOR (TYPE COUNT) IN (SETQ ALIST2 (SORT ALIST2 #'CADR-GREATERP))
+		    DO (FORMAT T "~%~6D ~S" COUNT TYPE))))))
+
+;; We really want to know other things about the callers such as
+;; whether they're between the references, or right before the referenced function.
+(DEFUN ANALYZE-BACKWARD-REFERENCES (&OPTIONAL (N-PAGES-TO-SEARCH-BACK 20.)
+					      (SUMMARY-LENGTH 10.)
+					      (OTHER-CALLER-NEARNESS 2.)
+					      (REFERENCE-TREE *REFERENCE-TREE*))
+ (LET ((WORD-LIMIT (- (* N-PAGES-TO-SEARCH-BACK PAGE-SIZE))))
+  (WITH-STACK-ARRAY (OTHER-REFERENCES-ARRAY SUMMARY-LENGTH :INITIAL-VALUE 0)
+   (WITH-STACK-ARRAY (CANT-MOVE-ARRAY SUMMARY-LENGTH :INITIAL-VALUE 0)
+    (DECLARE (ARRAY-REGISTER OTHER-REFERENCES-ARRAY))
+    (TV:NOTING-PROGRESS ("Analyze backward references")
+      (LOOP WITH DENOMINATOR = (LENGTH REFERENCE-TREE)
+	    WITH REF
+	    FOR NUMERATOR UPFROM 1
+	    FOR NODE1 IN REFERENCE-TREE
+	    AS CALLER = (F-NODE-FUNCTION NODE1)
+	    DO (TV:NOTE-PROGRESS NUMERATOR DENOMINATOR)
+	    DO (LOOP FOR NODE2 IN (F-NODE-REFERENCE-LIST NODE1)
+		     AS CALLEE = (F-NODE-FUNCTION NODE2)
+		     AS DIFF = (%POINTER-DIFFERENCE CALLEE CALLER)
+		     WHEN ( 0 DIFF WORD-LIMIT)
+		       DO (SETQ REF (MIN (MAX (1- (LENGTH (F-NODE-REFERENCED-BY-LIST NODE2)))
+					      0.) (1- SUMMARY-LENGTH)))
+			  (INCF (AREF OTHER-REFERENCES-ARRAY REF))
+		       AND WHEN (LOOP FOR NODE3 IN (F-NODE-REFERENCED-BY-LIST NODE2)
+				      AS OTHER-CALLER = (F-NODE-FUNCTION NODE3)
+				      THEREIS ( 0. (%POINTER-DIFFERENCE CALLEE OTHER-CALLER)
+						 (- (* OTHER-CALLER-NEARNESS PAGE-SIZE))))
+			     DO (INCF (AREF CANT-MOVE-ARRAY REF)))))
+    (LOOP FOR I BELOW SUMMARY-LENGTH DO
+      (FORMAT T
+	  "~%~6D backwardly referenced function~:P are called by ~D caller~:P~:[ or more~].  ~
+             ~D of these can be moved without affecting another reference."
+	(AREF OTHER-REFERENCES-ARRAY I) (1+ I) ( (1+ I) SUMMARY-LENGTH)
+	(- (AREF OTHER-REFERENCES-ARRAY I) (AREF CANT-MOVE-ARRAY I))))))))
+
+(DEFUN ANALYZE-COMPILED-FUNCTION-TRANSPORTED-CONSTANTS (&OPTIONAL VERBOSE)
+  (LET* ((TOTAL-LISTS 0)
+	 (TOTAL-LISTS-SIZE 0)
+	 (TOTAL-STRINGS 0)
+	 (TOTAL-STRINGS-SIZE 0)
+	 (TOTAL-EXTENDED-NUMBERS 0)
+	 (TOTAL-EXTENDED-NUMBERS-SIZE 0)
+	 (GOOD-CONSTANTS NIL)
+	 (TOTAL-MISPLACED-CONSTANTS 0)
+	 (LAST-FUNCTION NIL))
+    (MAP-OVER-OBJECTS-IN-AREA COMPILED-FUNCTION-AREA
+      #'REGION-PREDICATE-STRUCTURE
+      #'(LAMBDA (REGION ADDRESS HEADER LEADER SIZE)
+	  REGION ADDRESS LEADER
+	  (TYPECASE HEADER
+	    (:COMPILED-FUNCTION
+	      (LOOP FOR CONSTANT IN GOOD-CONSTANTS
+		    DO (INCF TOTAL-MISPLACED-CONSTANTS)
+		       (WHEN VERBOSE
+			 (FORMAT T "~&~40S doens't have ~S"
+				 (FUNCTION-NAME LAST-FUNCTION) CONSTANT)))
+	      (SETQ GOOD-CONSTANTS NIL)
+	      (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+		(DO-FUNCTION-CONSTANTS (CONSTANT NIL :READ-ONLY READ-ONLY) HEADER
+		  (WHEN (AND READ-ONLY
+			     (OR (TYPEP CONSTANT :LIST)
+				 (TYPEP CONSTANT :STRING)
+				 (TYPEP CONSTANT :EXTENDED-NUMBER)))
+		    (LET ((FOO (%FIND-STRUCTURE-HEADER CONSTANT)))
+		      (UNLESS (MEMQ FOO RESULT)
+			(COLLECT-RESULT FOO)))))
+		(SETQ GOOD-CONSTANTS RESULT)
+		(SETQ LAST-FUNCTION HEADER)))
+	    (:ARRAY (UNLESS (MEMQ HEADER GOOD-CONSTANTS)
+		      (UNLESS (FUNCTION-SAME-AS-FUNCTION-FROM-NAME LAST-FUNCTION)
+			(WHEN VERBOSE
+			  (FORMAT T "~&~40S ~S" (FUNCTION-NAME LAST-FUNCTION)  HEADER))
+			(INCF TOTAL-MISPLACED-CONSTANTS)))
+		    (SETQ GOOD-CONSTANTS (DELQ HEADER GOOD-CONSTANTS))
+		    (COND ((STRINGP HEADER)
+			   (INCF TOTAL-STRINGS)
+			   (INCF TOTAL-STRINGS-SIZE))
+			  ((= (ARRAY-TYPE-FIELD HEADER) ART-Q-LIST)
+			   (INCF TOTAL-LISTS)
+			   (INCF TOTAL-LISTS-SIZE SIZE))))
+	    (:EXTENDED-NUMBER
+	      (UNLESS (MEMQ HEADER GOOD-CONSTANTS)
+		(UNLESS (FUNCTION-SAME-AS-FUNCTION-FROM-NAME LAST-FUNCTION)
+		  (WHEN VERBOSE (FORMAT T "~&~40S ~S" (FUNCTION-NAME LAST-FUNCTION) HEADER))
+		  (INCF TOTAL-MISPLACED-CONSTANTS)))
+	      (SETQ GOOD-CONSTANTS (DELQ HEADER GOOD-CONSTANTS))
+	      (INCF TOTAL-EXTENDED-NUMBERS)
+	      (INCF TOTAL-EXTENDED-NUMBERS-SIZE SIZE)))))
+    (FORMAT T "~&~D lists take up ~D words (~D pages)"
+	    TOTAL-LISTS TOTAL-LISTS-SIZE (CEILING TOTAL-LISTS-SIZE PAGE-SIZE))
+    (FORMAT T "~&~D strings take up ~D words (~D pages)"
+	    TOTAL-STRINGS TOTAL-STRINGS-SIZE (CEILING TOTAL-STRINGS-SIZE PAGE-SIZE))
+    (FORMAT T "~&~D extended numbers take up ~D words (~D page~:P)"
+	    TOTAL-EXTENDED-NUMBERS TOTAL-EXTENDED-NUMBERS-SIZE
+	    (CEILING TOTAL-EXTENDED-NUMBERS-SIZE PAGE-SIZE))
+    (FORMAT T "~&~D constant~:P seem to be misplaced." TOTAL-MISPLACED-CONSTANTS)
+    (FORMAT T "~&Misplaced constants may be counted twice.")
+    NIL))
+
+(DEFUN FIND-SYMBOLS-REFERENCED-BY-WIRED-FUNCTIONS-AND-TRANSPORTER ()
+  (POOR-MAN/'S-WITH-COLLECTION (RESULT)
+    (MAP-OVER-OBJECTS
+      #'(LAMBDA (AREA) (OR (= AREA WIRED-CONTROL-TABLES) (= AREA SAFEGUARDED-OBJECTS-AREA)))
+      #'REGION-PREDICATE-STRUCTURE
+      #'(LAMBDA (AREA REGION ADDRESS HEADER LEADER SIZE)
+	  AREA REGION ADDRESS LEADER SIZE
+	  (WHEN (TYPEP HEADER :COMPILED-FUNCTION)
+	    (DO-FUNCTION-CONSTANTS (CONST) HEADER
+	      (WHEN (AND (SYMBOLP CONST)
+			 (NOT (KEYWORDP CONST)))	;---
+		(UNLESS (MEMQ CONST RESULT)
+		  (COLLECT-RESULT CONST))
+		(FORMAT T "~%~45S references ~S"
+			(COMPILED-FUNCTION-NAME HEADER)
+			CONST))))))
+    RESULT))
+
+;;; More general metering functions
+
+(DEFUN SUMMARIZE-FORWARDING (&OPTIONAL PRINT-DISCREPENCIES)
+  (LOOP	WITH FORWARDED = 0
+	WITH VALUE = 0
+	WITH VALUE-BOUND = 0
+	WITH FUNCTION = 0
+	WITH FUNCTION-BOUND = 0
+	WITH FUNCTION-ARRAY = 0
+	WITH FUNCTION-LIST = 0
+	WITH FUNCTION-SPECIAL-FORM = 0
+	WITH FUNCTION-LAMBDA = 0
+	WITH FUNCTION-SYMBOL = 0
+	WITH FUNCTION-GENERIC = 0
+	WITH FUNCTION-OTHER = 0
+	WITH FUNCTION-SPEC = 0
+	WITH NOT-VALUE-OR-FUNCTION = 0
+	WITH TOTAL = 0
+	FOR ARRAY IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+	AS BACK = (FORWARDED-SYMBOL-CELL-TABLE-BACK-POINTERS ARRAY)
+	DO (LOOP FOR I BELOW (ARRAY-ACTIVE-LENGTH ARRAY)
+		 AS LOC = (ALOC ARRAY I)
+		 AS THING = (AREF BACK I)
+		 DO (COND ((= (%P-DATA-TYPE LOC) DTP-ONE-Q-FORWARD)
+			   (INCF FORWARDED)
+			   (WHEN PRINT-DISCREPENCIES
+			     (FORMAT T "~&Superseded: ~S" THING)))
+			  ((SYMBOLP THING)
+			   (COND ((EQ (FOLLOW-CELL-FORWARDING
+					(LOCF (SYMBOL-VALUE-CELL THING)) NIL)
+				      LOC)
+				  (INCF VALUE)
+				  (WHEN (LOCATION-BOUNDP LOC)
+				    (INCF VALUE-BOUND)))
+				 ((EQ (FOLLOW-CELL-FORWARDING
+					(LOCF (SYMBOL-FUNCTION-CELL THING)) NIL)
+				      LOC)
+				  (INCF FUNCTION)
+				  (WHEN (LOCATION-BOUNDP LOC)
+				    (INCF FUNCTION-BOUND)
+				    (TYPECASE (LOCATION-CONTENTS LOC)
+				      (:ARRAY (INCF FUNCTION-ARRAY))
+				      (:LIST (INCF FUNCTION-LIST)
+				       (SELECTQ (CAR (LOCATION-CONTENTS LOC))
+					 (SPECIAL (INCF FUNCTION-SPECIAL-FORM))
+					 (LAMBDA (INCF FUNCTION-LAMBDA))))
+				      (:SYMBOL (INCF FUNCTION-SYMBOL))
+				      (:GENERIC-FUNCTION (INCF FUNCTION-GENERIC))
+				      (OTHERWISE (INCF FUNCTION-OTHER)))))
+				 (T (INCF NOT-VALUE-OR-FUNCTION)
+				    (WHEN PRINT-DISCREPENCIES
+				      (FORMAT T "~&Neither value nor function:  ~S" THING)))))
+			  (T (INCF FUNCTION)
+			     (INCF FUNCTION-SPEC)
+			     (WHEN (LOCATION-BOUNDP LOC)
+			       (INCF FUNCTION-BOUND)
+			       (TYPECASE (LOCATION-CONTENTS LOC)
+				 (:ARRAY (INCF FUNCTION-ARRAY))
+				 (:LIST (INCF FUNCTION-LIST)
+				  (SELECTQ (CAR (LOCATION-CONTENTS LOC))
+				    (SPECIAL (INCF FUNCTION-SPECIAL-FORM))
+				    (LAMBDA (INCF FUNCTION-LAMBDA))))
+				 (:SYMBOL (INCF FUNCTION-SYMBOL))
+				 (OTHERWISE (INCF FUNCTION-OTHER))))))
+		    (INCF TOTAL))
+	FINALLY
+	  (FORMAT T "
+Number of tables~50T~6D
+Total forwarded cells~50T~6D
+   Symbol Value Cells~50T~6D
+      Bound~50T~6D
+         Self Evaluating~50T~6D
+   Function Cells~50T~6D
+      Non-Symbols~50T~6D
+      Bound~50T~6D
+         Arrays~50T~6D
+         Lists~50T~6D
+            Special Forms~50T~6D
+            Lambda Expressions~50T~6D
+            Other~50T~6D
+         Symbols~50T~6D
+         Generic Functions~50T~6D
+         Other~50T~6D
+   Neither Value nor Function~50T~6D
+   Doubly Forwarded~50T~6D
+   Wired Cells~50T~6D
+"
+		  (LENGTH *ALL-FORWARDED-SYMBOL-CELL-TABLES*)
+		  TOTAL VALUE VALUE-BOUND
+		  (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+			WHEN (= (%AREA-NUMBER TABLE) CONSTANTS-AREA)
+			  SUM (FILL-POINTER TABLE))
+		  FUNCTION FUNCTION-SPEC FUNCTION-BOUND
+		  FUNCTION-ARRAY FUNCTION-LIST
+		  FUNCTION-SPECIAL-FORM FUNCTION-LAMBDA
+		  (- FUNCTION-LIST FUNCTION-SPECIAL-FORM FUNCTION-LAMBDA)
+		  FUNCTION-SYMBOL FUNCTION-GENERIC FUNCTION-OTHER
+		  NOT-VALUE-OR-FUNCTION FORWARDED
+		  (LOOP FOR TABLE IN *ALL-FORWARDED-SYMBOL-CELL-TABLES*
+			WHEN (= (%AREA-NUMBER TABLE) WIRED-CONTROL-TABLES)
+			  SUM (FILL-POINTER TABLE)))))
+
+(DEFUN SHOW-UNDEFINED-FUNCTIONS ()
+  (RATIONALIZE-WAYWARD-FUNCTION-CELLS T)
+  ;; ESAD.  This is WITH-STACK-LIST rather than LET so that we can have side-effects
+  ;; inside DW:FORMATTING-TABLE.
+  (WITH-STACK-LIST (SOMETHING-FDEFINED NIL)
+    (CL:FRESH-LINE)
+    (DW:FORMATTING-TABLE ()
+      (DW:FORMATTING-COLUMN-HEADINGS ()
+	(DW:FORMATTING-CELL ())
+	(DW:FORMATTING-CELL ()
+	  (CL:WRITE-STRING "Function"))
+	(DW:FORMATTING-CELL ()
+	  (CL:WRITE-STRING "Callers")))
+      (LOOP FOR (FUNCTION . CALLERS) IN *HOME-FOR-WAYWARD-FUNCTION-CELLS*
+	    AS FDEFINED = (FDEFINEDP FUNCTION)
+	    DO (DW:FORMATTING-ROW ()
+		 (DW:FORMATTING-CELL ()
+		   (WHEN FDEFINED
+		     (SETF (CAR SOMETHING-FDEFINED) T)
+		     (CL:WRITE-CHAR #/*)))
+		 (DW:FORMATTING-CELL ()
+		   (PRIN1 FUNCTION))
+		 (DW:FORMATTING-CELL ()
+		   (FORMAT T "~{~S~^, ~}"
+			   (MAPCAR #'(LAMBDA (CALLER)
+				       (LET ((FUNC (%FIND-STRUCTURE-HEADER CALLER)))
+					 (CL:TYPECASE FUNC
+					   (COMPILED-FUNCTION
+					     (COMPILED-FUNCTION-NAME FUNC))
+					   (OTHERWISE
+					     FUNC))))
+				   CALLERS))))))
+    (WHEN (CAR SOMETHING-FDEFINED)
+      (FORMAT T "~2%* means that the function appears to be defined,~@
+		   ~2@Teven though the database believes that it is not."))))
+
+(DEFUN CREATE-LOCALIZED-VALUE-CELLS-FILE (&AUX (FILE "SYS:SYS;LOCAL-VALUES.LISP"))
+  (SETQ *VALUE-CELLS-TO-LOCALIZE-FIRST* NIL)
+  (LOAD FILE PKG-SYSTEM-INTERNALS-PACKAGE T T T)
+  (UNLESS *VALUE-CELLS-TO-LOCALIZE-FIRST*
+    (FORMAT T "~&Warning:  Building value cell localization table from scratch.~@
+		 You may want to review the list of symbols and add more."))
+  (FORMAT T "~&Building *VALUE-CELLS-TO-LOCALIZE-FIRST* ...")
+  (LET ((OLD-SYMBOLS *VALUE-CELLS-TO-LOCALIZE-FIRST*)
+	(NEW-SYMBOLS NIL)
+	(SOMETHING-CHANGED NIL))
+    (SETQ *VALUE-CELLS-TO-LOCALIZE-FIRST* NIL)
+    (MAP-OVER-STACK-GROUP-SPECIAL-BINDINGS
+      #'(LAMBDA (SG SYMBOL TYPE LOCATION)
+	  (IGNORE LOCATION)
+	  (IF (EQ TYPE :VARIABLE)
+	      (WHEN (NOT (MEMQ SYMBOL NEW-SYMBOLS))
+		(PUSH SYMBOL NEW-SYMBOLS)
+		(IF (MEMQ SYMBOL OLD-SYMBOLS)
+		    (SETQ OLD-SYMBOLS (DELQ SYMBOL OLD-SYMBOLS))
+		    (FORMAT T "~%Adding ~S" SYMBOL)
+		    (SETQ SOMETHING-CHANGED T)))
+	      (FORMAT T "~%Warning:  Ignoring ~S ~S, found in ~S" TYPE SYMBOL SG))))
+    (LOOP WITH (REAL-TYPE REAL-SYMBOL)
+	  FOR SYMBOL IN OLD-SYMBOLS
+	  DO (FORMAT T "~%~S not found this time." SYMBOL)
+	     (MULTIPLE-VALUE (REAL-SYMBOL REAL-TYPE)
+	       (COMPILER:DISASSEMBLE-DECODE-LOCATIVE
+		 (FOLLOW-CELL-FORWARDING (VALUE-CELL-LOCATION SYMBOL) NIL)))
+	  WHEN (AND (EQ REAL-TYPE :VARIABLE) (NEQ REAL-SYMBOL SYMBOL))
+	    DO (FORMAT T "~%  It's cell is forwarded to ~S." REAL-SYMBOL)
+	  WHEN (GET REAL-SYMBOL 'SPECIAL)
+	    DO (FORMAT T "~%  It is declared special.")
+	  DO (LET ((COUNT 0))
+	       (CATCH 'ENOUGH-ALREADY
+		 (MAP-OVER-CALLERS SYMBOL
+		   #'(LAMBDA (CALLER IGNORE)
+		       (WHEN (ZEROP COUNT)
+			 (FORMAT T "~%  It is called by:"))
+		       (INCF COUNT)
+		       (IF ( COUNT 5)
+			   (FORMAT T "~%    ~S" CALLER)
+			 (FORMAT T "~%    ...")
+			 (THROW 'ENOUGH-ALREADY NIL)))
+		   :CALLED-HOW :VARIABLE)))
+	  WHEN (FQUERY NIL "Keep it? " SYMBOL)
+	    DO (SETQ SOMETHING-CHANGED T)
+	       (PUSH SYMBOL NEW-SYMBOLS))
+    (IF (NOT SOMETHING-CHANGED)
+	(FORMAT T "~%No changes to file.")
+      (SETQ NEW-SYMBOLS (NREVERSE NEW-SYMBOLS))
+      (WHEN (Y-OR-N-P "Write out the new file? ")
+	(WITH-OPEN-FILE (STREAM FILE :DIRECTION :OUTPUT)
+	  (FORMAT STREAM "~
+;;; -*- Mode: Lisp; Package: System-Internals; Syntax: Zetalisp -*-
+;;; This file was generated automatically by CREATE-LOCALIZED-VALUE-CELLS-FILE.
+~%(SETQ SI:*VALUE-CELLS-TO-LOCALIZE-FIRST* '(")
+	  (LOOP WITH PACKAGE = PKG-SYSTEM-INTERNALS-PACKAGE
+		FOR SYMBOL IN NEW-SYMBOLS
+		DO (FORMAT STREAM "~%  ~S" SYMBOL))
+	  (FORMAT STREAM "~%  ))"))))))
+
+;; Works even after symbol cells get forwarded.
+;; Only groks variable bindings.
+(DEFUN MAP-OVER-STACK-GROUP-SPECIAL-BINDINGS (FUNCTION)
+  "Function gets applied to (sg thing type location)"
+  (DECLARE (SYS:DOWNWARD-FUNARG FUNCTION))
+  (LOOP FOR PROCESS IN PROCESS:*ALL-PROCESSES* DO
+    (LET ((SG (PROCESS-STACK-GROUP PROCESS)))
+      (WHEN SG
+	(LET ((BS-LOW (SG-BINDING-STACK-LOW SG))
+	      (BS-PTR (IF (EQ SG %CURRENT-STACK-GROUP)
+			  %BINDING-STACK-POINTER
+			  (SG-BINDING-STACK-POINTER SG))))
+	  (LOOP WITH (THING TYPE)
+		FOR PTR = (%POINTER-PLUS BS-LOW #+imach 3 #+3600 1)
+			THEN (%POINTER-PLUS PTR 2)
+		UNTIL (%POINTER-LESSP BS-PTR PTR)
+		DO (MULTIPLE-VALUE (THING TYPE)
+		     (COMPILER:DISASSEMBLE-DECODE-LOCATIVE (BINDING-STACK-CELL PTR)))
+		   (FUNCALL FUNCTION SG THING TYPE (LOCF (BINDING-STACK-CONTENTS PTR)))))))))
+
+;; A metering function only.
+(DEFUN SUMMARIZE-SYMBOL-PROPERTIES ()
+  (LET ((PROPERTY-TABLE (CL:MAKE-HASH-TABLE)))
+    (MAP-OVER-OBJECTS-IN-AREA SYMBOL-AREA #'REGION-PREDICATE-STRUCTURE
+      #'(LAMBDA (REGION ADDRESS SYMBOL LEADER SIZE)
+	  REGION ADDRESS LEADER SIZE
+	  (WHEN (SYMBOLP SYMBOL)
+	    (LOOP FOR PROPERTY IN (PLIST SYMBOL) BY #'CDDR
+		  DO (SCL:MODIFY-HASH PROPERTY-TABLE PROPERTY
+				      #'(LAMBDA (IGNORE VALUE FOUND)
+					  (IF FOUND
+					      (1+ VALUE)
+					      1)))))))
+    (LET ((PROPERTY-ALIST NIL))
+      (MAPHASH #'(LAMBDA (KEY VALUE) (PUSH (CONS VALUE KEY) PROPERTY-ALIST)) PROPERTY-TABLE)
+      (SETQ PROPERTY-ALIST (SORTCAR PROPERTY-ALIST #'>))
+      (CL:FRESH-LINE)
+      (DW:FORMATTING-TABLE ()
+	(DW:FORMATTING-COLUMN-HEADINGS ()
+	  (DW:FORMATTING-CELL ()
+	    (CL:WRITE-STRING "Property"))
+	  (DW:FORMATTING-CELL ()
+	    (CL:WRITE-STRING "Count")))
+	(LOOP FOR (COUNT . PROPERTY) IN PROPERTY-ALIST
+	      DO (DW:FORMATTING-ROW ()
+		   (DW:FORMATTING-CELL ()
+		     (PRIN1 PROPERTY))
+		   (DW:FORMATTING-CELL ()
+		     (FORMAT T "~D" COUNT))))))))
+
+;;; Compatibility stub
+
+;;--- Still need to restrict flipping to regions which need it.
+
+(DEFVAR *REORDER-MEMORY-OPTIMIZATIONS*
+	'(PROCESS::LOCALIZE-SCHEDULER-TABLES
+	  OPTIMIZE-COMPILED-FUNCTIONS
+	  REORDER-FLAVORS
+	  REORDER-SHEETS
+	  REORDER-CHARACTER-STYLES
+	  REORDER-PRINT-OBJECT-PRESENTATION-TYPES
+	  REORDER-SYSTEMS
+	  REORDER-SYMBOLS
+	  REORDER-PACKAGES
+	  REORDER-COMPILED-FUNCTIONS
+	  REORDER-GENERIC-FUNCTIONS
+	  COLLAPSE-REORDERINGS
+	  MAKE-SURVIVING-REGIONS-STATIC
+	  ))
+
+(DEFUN REORDER-MEMORY (&KEY (INCREMENTAL T) (RUN-WITHOUT-INTERRUPTS T))
+  (LET-IF RUN-WITHOUT-INTERRUPTS ((INHIBIT-SCHEDULING-FLAG T))
+    (IMMEDIATE-GC :MODE (IF INCREMENTAL :LAYERED-IDS-RELEASE :LAYERED-SYSTEM-RELEASE)
+		  :OPTIMIZE *REORDER-MEMORY-OPTIMIZATIONS*
+		  :INCREMENTAL-OPTIMIZE INCREMENTAL)))

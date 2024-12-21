@@ -1,0 +1,410 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: JOSHUA-INTERNALS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Support for unification and backtracking
+
+(defvar *variable-binding-trail*)
+
+(defun unwind-trail ()
+  (loop for locative in *variable-binding-trail*
+	doing (%p-store-unbound-logic-variable locative)))
+
+(defmacro with-unification (&body body)
+  `(let ((*variable-binding-trail* nil))
+     (unwind-protect
+	 (catch 'failure-exit ,@body)
+       (unwind-trail))))
+
+(defsubst unify-fail ()
+  ;; throw out of the extension computation, returning NIL
+  ;; the unwind-protect in the caller ensures the trail gets unwound.
+  (throw 'failure-exit nil))
+;;;
+;;; Unification "instructions", or what would be microcoded if we were up to that.
+;;;
+
+(defun %unify-variable (from to)
+  ;; From is always an unbound logic variable.  First make a locative to it.
+  (let ((from-locative (logic-variable-contents-locative from)))
+    ;; push that locative onto the trail
+    (push from-locative *variable-binding-trail*)
+    ;; then clobber the variable to make it point at to
+    (sys:%p-store-contents from-locative to)
+    ;; (setf (location-contents from-locative) to)
+    t))
+
+(defun variable-occurs-in (variable value)
+  ;; Returns T if the variable occurs somewhere in the value
+  ;; for example, unifying [foo x (f x)] with [foo y y] should fail,
+  ;; 'cause you can't unify x with (f x) and stay sane.
+  (typecase value ;don't know this type at compile time.  Sigh.
+    (unbound-logic-variable
+      ;; if value is a logic variable, this is just a simple EQ-test
+      (eq variable value))
+    (cons
+      ;; if value is a list, we've gotta grovel over it
+      (loop for value-cons = value then (cdr value-cons)
+	    while (consp value-cons)
+	    thereis (variable-occurs-in variable (car value-cons))
+	    finally (return (variable-occurs-in variable value-cons))))
+    (predication
+      (loop for p-cons = (predication-statement value) then (cdr p-cons)
+	    while (consp p-cons)
+	    thereis (variable-occurs-in variable (car p-cons))
+	    finally (return (variable-occurs-in variable p-cons))))
+    (otherwise
+      ;; anything else can't possibly contain variable
+      nil)))
+
+(defun unify-variable-with-occur-check (from to)
+  ;; like unify-variable, but does an occur-check first.
+  (when (variable-occurs-in from to) (unify-fail))
+  (%unify-variable from to))
+
+(defun unify-constant (data pattern)
+  ;; unification of constants (or structures which have no variables)
+  (cond ((eql data pattern))
+	((sys:unbound-logic-variable-p data)
+	 ;; if there's a variable in the data, clobber it
+	 (%unify-variable data pattern))
+	(t (unify-fail))))
+
+(defun unify-string (data pattern)
+  ;; unification of strings
+  (cond ((and (stringp data) (string= data pattern)))
+	((sys:unbound-logic-variable-p data)
+	 ;; if there's a variable in the data, clobber it
+	 (%unify-variable data pattern))
+	(t (unify-fail))))
+
+;;;
+;;; Structures that usually have to be copied.  (Unless they're variable-free.)
+;;;
+
+(defun unify-list (list1 list2)
+  ;; unify two lists component-wise
+  (loop for list1-cons = list1 then (cdr list1-cons)
+	for list2-cons = list2 then (cdr list2-cons)
+	while (and (consp list1-cons) (consp list2-cons))
+	;; above is a fancy way of iterating over dotted lists.
+	do (unify (car list1-cons) (car list2-cons))
+	finally
+	  (unify list1-cons list2-cons)
+	  ;; success
+	  (return t)))
+
+(defsubst unify-predication (predication1 predication2)
+  ;; unify predications by taking their argument map and unifying the lists
+  (unify-list (predication-statement predication1)
+	      (predication-statement predication2)))
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")
+0;;;
+;;; Main entrypoint to the unifier
+;;;
+
+(defun unify (object1 object2)
+  ;; unify two objects or fail trying -- this is basically a fancy type-dispatch!
+  (cond ;; if they're eql, they unify with no special provision
+	((eql object1 object2))
+	((sys:unbound-logic-variable-p object1)
+	 (cond ((sys:unbound-logic-variable-p object2)
+		;; both object1 and object2 are variables, so make object2 point to object1 & trail.
+		(%unify-variable object2 object1))
+	       (t
+		 ;; object1 is a variable & object2 is a value, so make object1 point to value & trail it.
+		 (unify-variable-with-occur-check object1 object2))))
+	((sys:unbound-logic-variable-p object2)
+	 ;; object1 is a value & object2 is a variable, so make object2 point to the value & trail it.
+	 (unify-variable-with-occur-check object2 object1))
+	((consp object1)
+	 (if (consp object2)
+	     ;; both are lists, so treat them component-wise
+	     (unify-list object1 object2)
+	     (unify-fail)))
+	((predicationp object1)
+	 (if (predicationp object2)
+	     ;; both are predications, so treat them component-wise
+	     (unify-predication object1 object2)
+	     (unify-fail)))
+	((stringp object1)
+	 ;; check if they match as strings, comparing with string=
+	 (unless (and (stringp object2) (string= object1 object2))
+	   (unify-fail)))
+	(t
+	  ;; can't win for losing
+	  (unify-fail))))
+
+(defun unify-constants-p (object1 object2)
+  ;; unify two objects or return nil -- this is basically a fancy type-dispatch!
+  ;; neither object contains any variables
+  ;; this is called by the semi-matchers
+  (cond ;; if they're eql, they unify with no special provision
+	((eql object1 object2))
+	((consp object1)
+	 (and (consp object2)
+	      ;; both are lists, so treat them component-wise
+	      (loop for list1-cons = object1 then (cdr list1-cons)
+		    for list2-cons = object2 then (cdr list2-cons)
+		    while (and (consp list1-cons) (consp list2-cons))
+		    always (unify-constants-p (car list1-cons) (car list2-cons))
+		    finally (return (unify-constants-p list1-cons list2-cons)))))
+	((predicationp object1)
+	 (and (predicationp object2)
+	      ;; both are predications, so treat them component-wise
+	      (loop for list1-cons = (predication-statement object1) then (cdr list1-cons)
+		    for list2-cons = (predication-statement object2) then (cdr list2-cons)
+		    while list1-cons
+		    always (unify-constants-p (car list1-cons) (car list2-cons)))))
+	((stringp object1)
+	 (and (stringp object2) (string= object1 object2)))
+	(t
+	 nil)))
+
+
+(defun variant (object1 object2)
+  ;; the overhead of unification (including unwinding the bindings) makes this
+  ;; faster than the old method
+  ;; furthermore it doesn't side-effect anything so it doesn't cause problems for || Joshua
+  (let ((variables nil))
+    (labels ((variant-internal (object1 object2)
+	       (typecase object1
+		 (unbound-logic-variable
+		   (typecase object2
+		     (unbound-logic-variable
+		       (let ((entry (loop for entry in variables
+					  ;; assoc can't handle logic variables without help
+					  ;; so this is faster -- (car and cdr handle lvs)
+					  do (when (eql object1 (car entry))
+					       (return entry)))))
+			 (if entry
+			     (eql object2 (cdr entry))
+			     (and (loop for entry in variables
+					never (eql object2 (cdr entry)))
+				  (progn (push (cons object1 object2) variables)
+					 t)))))
+		     (otherwise nil)))
+		 (otherwise
+		   (or (eql object1 object2)
+		       (typecase object1
+			 (cons
+			   (when (consp object2)
+			     (loop for list1-cons = object1 then (cdr list1-cons)
+				   for list2-cons = object2 then (cdr list2-cons)
+				   while (and (consp list1-cons) (consp list2-cons))
+				   ;; above is a fancy way of iterating over dotted lists.
+				   always (variant-internal (car list1-cons) (car list2-cons))
+				   finally
+				     ;; check the thing in the tails of both lists
+				     (return (or (and (null list1-cons)
+						      (null list2-cons))
+						 (variant-internal list1-cons list2-cons))))))
+			 (predication
+			   (and (predicationp object2)
+				(variant-internal (predication-statement object1)
+						  (predication-statement object2))))
+			 (string
+			   (and (stringp object2)
+				(string= object1 object2)))
+			 (otherwise nil)))))))
+      (variant-internal object1 object2))))
+
+(defun variant-hash (object)
+  ;; a variant of cli::xequal-hash with a sprinkling of xeqlhash
+  (let* ((variables nil)
+	 (variable-count 0))
+    (labels ((hash (object)
+	       (typecase object
+		 (unbound-logic-variable
+		   (let ((n (position object variables)))
+		     (cond (n
+			    (values (* (- variable-count n) -131) sys:%gc-dependence-none))
+			   (t
+			    (push object variables)
+			    (values (* (incf variable-count) -131) sys:%gc-dependence-none)))))
+		 (cons
+		   (do ((x object) (rot 4) (hash 0) (val sys:%gc-dependence-none))
+		       ((atom x)
+			(unless (null x)
+			  (setq hash (logxor (rot (multiple-value-bind (hash flag)
+						      (hash x)
+						    (when (and flag (> flag val))
+						      (setq val flag))
+						    hash)
+						  (- rot 4))
+					     hash)))
+			(values hash val))
+		     (setq rot (ldb (byte 5 0) (+ rot 7)))	;rot = mod(rot+7,32)
+		     (setq hash (logxor (rot (multiple-value-bind (hash flag)
+						 (hash (pop x))
+					       (when (and flag (> flag val))
+						 (setq val flag))
+					       hash)
+					     rot)
+					hash))))
+		 (predication
+		   (multiple-value-bind (hash flag)
+		       (hash (predication-statement object))
+		     (values (sys:%32-bit-plus 1001 hash) flag)))
+		 (string
+		   (cli::string-hash object))
+		 (otherwise
+		   (cli::xeqlhash object)))))
+      (hash object))))
+
+(cli::add-test-function-hash-function 'variant 'variant-hash)
+
+(defun matcher-variant (object1 object2)
+  ;; the overhead of unification (including unwinding the bindings) makes this
+  ;; faster than the old method
+  ;; furthermore it doesn't side-effect anything so it doesn't cause problems for || Joshua
+  (let ((variables nil))
+    (labels ((variant-internal (object1 object2)
+	       (typecase object1
+		 (logic-variable-maker
+		   (typecase object2
+		     (logic-variable-maker
+		       (let ((entry (assoc object1 variables :test #'(lambda (a b)
+								       (eql (logic-variable-maker-name a)
+									    (logic-variable-maker-name b))))))
+			 (if entry
+			     (eql (logic-variable-maker-name object2)
+				  (logic-variable-maker-name (cdr entry)))
+			     (and (loop for entry in variables
+					never (eql (logic-variable-maker-name object2)
+						   (logic-variable-maker-name (cdr entry))))
+				  (progn (push (cons object1 object2) variables)
+					 t)))))
+		     (otherwise nil)))
+		 (otherwise
+		   (or (eql object1 object2)
+		       (typecase object1
+			 ;; Predication-maker must come first since it's also a cons
+			 (predication-maker
+			   (and (predication-maker-p object2)
+				(variant-internal (predication-maker-statement object1)
+						  (predication-maker-statement object2))))
+			 (cons
+			   (when (consp object2)
+			     (loop for list1-cons = object1 then (cdr list1-cons)
+				   for list2-cons = object2 then (cdr list2-cons)
+				   while (and (consp list1-cons) (consp list2-cons)
+					      (not (logic-variable-maker-p list1-cons))
+					      (not (logic-variable-maker-p list2-cons)))
+				   ;; above is a fancy way of iterating over dotted lists.
+				   always (variant-internal (car list1-cons) (car list2-cons))
+				   finally
+				     ;; check the thing in the tails of both lists
+				     (return (or (and (null list1-cons)
+						      (null list2-cons))
+						 (variant-internal list1-cons list2-cons))))))
+			 (string
+			   (and (stringp object2)
+				(string= object1 object2)))
+			 (otherwise nil)))))))
+      (variant-internal object1 object2))))
+
+(defun semi-matcher-variant (object1 object2)
+  ;; the overhead of unification (including unwinding the bindings) makes this
+  ;; faster than the old method
+  ;; furthermore it doesn't side-effect anything so it doesn't cause problems for || Joshua
+  (let ((variables nil)
+	(skip1 (positions-forward-rule-matcher-can-skip object1))
+	(skip2 (positions-forward-rule-matcher-can-skip object2)))
+    (labels ((variant-internal (object1 object2)
+	       (if (and (member object1 skip1) (member object2 skip2))
+		   (variant-internal (cdr object1) (cdr object2))
+		   (typecase object1
+		     (logic-variable-maker
+		       (typecase object2
+			 (logic-variable-maker
+			   (let ((entry (assoc object1 variables :test #'(lambda (a b)
+									   (eql (logic-variable-maker-name a)
+										(logic-variable-maker-name b))))))
+			     (if entry
+				 (eql (logic-variable-maker-name object2)
+				      (logic-variable-maker-name (cdr entry)))
+				 (and (loop for entry in variables
+					    never (eql (logic-variable-maker-name object2)
+						       (logic-variable-maker-name (cdr entry))))
+				      (progn (push (cons object1 object2) variables)
+					     t)))))
+			 (otherwise nil)))
+		     (otherwise
+		       (or (eql object1 object2)
+			   (typecase object1
+			     ;; Predication Maker has to come first since it's sub-typep cons
+			     (predication-maker
+			       (and (predication-maker-p object2)
+				    (variant-internal (predication-maker-statement object1)
+						      (predication-maker-statement object2))))
+			     (cons
+			       (when (consp object2)
+				 (loop for list1-cons = object1 then (cdr list1-cons)
+				       for list2-cons = object2 then (cdr list2-cons)
+				       while (and (consp list1-cons) (consp list2-cons)
+						  (not (logic-variable-maker-p list1-cons))
+						  (not (logic-variable-maker-p list2-cons)))
+				       ;; above is a fancy way of iterating over dotted lists.
+				       always (or (and (member list1-cons skip1) (member list2-cons skip2))
+						  (variant-internal (car list1-cons) (car list2-cons)))
+				       finally
+					 ;; check the thing in the tails of both lists
+					 (return (or (and (null list1-cons)
+							  (null list2-cons))
+						     (variant-internal list1-cons list2-cons))))))
+			     (string
+			       (and (stringp object2)
+				    (string= object1 object2)))
+			     (otherwise nil))))))))
+      (variant-internal object1 object2))))

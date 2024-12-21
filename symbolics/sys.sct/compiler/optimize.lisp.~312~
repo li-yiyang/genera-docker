@@ -1,0 +1,2520 @@
+;;; -*- Mode: Lisp; Package: COMPILER; Lowercase: T; Base: 8 -*-
+;;; This file is l-compiler;optimize.
+;;; This file contains the optimizers (called by phase-1)
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; These are the source-to-source optimizers for the L-machine compiler.
+;;;
+;;; Optimization of an atomic form consists of the following steps only affects symbols.
+;;; It consists of the following steps:
+;;;
+;;; 1. If symbol is a symbol macro, expand it and restart optimization.
+;;; 2. If symbol is the name of a constant (DEFCONSTANT) which can be substituted in-line
+;;;    (all copies are EQL), then substitute it.
+;;;
+;;; Optimization of list forms goes this way.  Any time a step changes a form, 
+;;; the optimization process is restarted from the beginning.
+;;;
+;;; 1. Forms with first element not a symbol are returned.
+;;; 2. If the symbol names a macro of which the compiler has no special knowledge
+;;;    (PHASE-1 or TRANSFORMERS property), then the macro is expanded.
+;;; 3. If the symbol does not name a special function and it appears that this form can be 
+;;;    optimized, then its arguments are pre-optimized.
+;;; 4. If the symbol names a reducible function, then the constant folder is run.
+;;; 5. If any optimizers are defined on the symbol, they are run.
+;;; 6. If the symbol names a function which should be expanded in line, it is expanded.
+
+;;; For improved performance, forms which have already been optimized may be remembered
+;;; so that they will not be optimized again.
+
+
+(defconst *trace-optimize-form* nil "Set to trace transformations made during optimization.")
+
+;;; A way for optimizers to see the environment
+(defvar *optimizer-environment*)
+(defvar *optimizer-destination*)
+;;;
+;;; Added by jrd.  Analogous to *optimizer-destination*, for
+;;; declarations which apply to the target destination, eg (declare
+;;; (dynamic-extent foo)) of a local.
+;;;
+(defvar *optimizer-target-declarations*)
+
+;;; A place for the PROGN optimizer to pass the things it doesn't want up to a higher level
+(defvar *optimizer-ignored-forms*)
+
+(defun optimize-form (form env &key (compile t compile-supplied)
+		      repeat for-compiler use-cache
+		      do-style-checking do-macro-expansion do-named-constants do-inline-forms
+		      do-optimizers do-compile-only-optimizers
+		      do-constant-folding do-function-args
+		      compile-function context
+		      ;; see comments above *optimizer-destination* for the format
+		      (destination *destination-multiple*)
+		      (target-declarations nil))
+
+  ;; Deal with old argument for compatibility.
+  (when compile-supplied
+    (setf repeat t)
+    (setf for-compiler t)
+    (setf do-macro-expansion t)
+    (if compile
+	(progn (setf use-cache t)
+	       (setf do-named-constants t)
+	       (setf do-inline-forms t)
+	       (setf do-optimizers t)
+	       (setf do-constant-folding t)
+	       (setf do-function-args t))
+	(progn (setf use-cache nil)
+	       (setf do-named-constants nil)
+	       (setf do-inline-forms nil)
+	       (setf do-optimizers nil)
+	       (setf do-constant-folding nil)
+	       (setf do-function-args nil))))
+
+  (when use-cache
+    (setf use-cache *use-optimize-form-cache*))
+
+  (labels
+    ((optimize-form (form destination target-declarations &rest context)
+
+       ;; Return as quickly as possible for the easy cases.
+       (when (and (atom form)
+		  (not (symbolp form)))
+	 (return-from optimize-form form))
+
+       (let ((original-form form)
+	     (*optimizer-destination* destination)
+	     (*optimizer-target-declarations* target-declarations))
+
+	 (unless (atom form)
+	   ;; Check to see if we've seen this before.
+	   (when (and use-cache (gethash form *optimize-form-cache*))
+	     (return-from optimize-form form))
+	   ;; Run the style checkers
+	   (setf form (style-check-form form env :check-style do-style-checking)))
+
+	 ;; Now optimize it
+	 (tagbody
+
+	   restart
+
+      (flet ((new-form (new &optional (note-macroexpansion-type nil type-supplied))
+	       (when (not (eq new form))
+		 (when type-supplied
+		   (note-macroexpansion form new note-macroexpansion-type))
+		 (setf form new)
+		 (setf do-style-checking nil)
+		 (if repeat
+		     (go restart)
+		     (go done)))))
+	(declare (cl:inline new-form))
+
+;;	      (macrolet ((new-form (new &optional (note-macroexpansion-type nil type-supplied)
+;;					&environment env)
+;;			   (once-only (new &environment env)
+;;			     `(when (not (eq ,new form))
+;;				,(when type-supplied
+;;				   `(note-macroexpansion form ,new ,note-macroexpansion-type))
+;;				(setf form ,new)
+;;				(setf do-style-checking nil)
+;;				(if repeat
+;;				    (go restart)
+;;				    (go done))))))
+	 
+		(if (atom form)
+	     
+		    ;; Atomic form
+		    (when (symbolp form)
+	       
+		      (when do-macro-expansion
+			(multiple-value-bind (macro-p value)
+			    (lt:symbol-macro-p form env)
+			  (when macro-p
+			    (new-form value))))
+	       
+		      (when do-named-constants
+			(multiple-value-bind (constant-p value)
+			    (lt:named-constant-p form env)
+			  (when (and constant-p
+				     (si:effectively-defconstantable-evalled value))
+			    (new-form `',value 'defconstant)))))
+	     
+		    ;; A list
+		    (let* ((function (first form))
+			   (local-def (and (symbolp function)
+					   (si:local-function-definition function env))))
+	       
+		      (when (and do-macro-expansion
+				 (cl:typecase function
+				   (cl:symbol
+				     (not
+				       (if for-compiler
+					   (and (not local-def)
+						(or (get-phase-1-handler *compiler* function)
+						    (get-transformers *compiler* function)))
+					   (special-form-p (declared-definition function)))))
+				   (cl:cons
+				     (lambda-macro-call-p function))))
+			(condition-case-if compile-supplied (error)
+			     (new-form (macroexpand-1 form env))	;check for macro
+			   (error
+			     (phase-1-bad-form
+			       "An error occurred while macro expanding the form ~S.~%~A"
+			       form error))))
+	       
+		      (let ((lambda-c (si:interpreted-lambda-p function)))
+			(when (or lambda-c (symbolp function))
+			  (let ((inline t)
+				(special nil)
+				side-effects replicability reducibility
+				(ignored-result nil))
+			    (ignore replicability)
+
+			    ;; Correct for normal function calls
+			    (when (not lambda-c)
+			      (setf inline (si:env-declarations-inline-p function env))
+			      (setf special (and (null local-def)
+						 (let ((def (declared-definition function)))
+						   (or (special-form-p def)
+						       (macro-function def)))))
+			      (when (and (null local-def) inline)
+				(cl:multiple-value-setq (side-effects replicability reducibility)
+				  (lt::function-annotation-class function))
+
+				(setf ignored-result (and do-optimizers
+							  (eql 0 (destination-n-values destination))
+							  (cl:member side-effects
+								     'lt:(simple reader))))))
+			      
+			    ;; Form is to be optimized.
+			    ;; Optimizers on functions (but not special forms)
+			    ;; should see the arguments pre-optimized (but not transformed).
+			    ;; If optimizing an argument changes it, must cons a new form.
+			    (when (and do-function-args
+				       (or (not special)
+					   (and (not local-def)
+						(cl:member function '(multiple-value-call)))))
+			      (do ((l (cdr form) (cdr l))
+				   (i 1 (1+ i))
+				   (copyflag nil))
+				  ((null l))
+				(let* ((arg-destination
+					 (cond (ignored-result *destination-ignore*)
+					       (local-def *destination-stack*)
+					       (t (cl:case function
+						    ((not null)
+						     *destination-stack-predicate*)
+						    ((multiple-value-call)
+						      ;; first arg is the function
+						      (if (eql i 1)
+							  *destination-stack*
+							  *destination-multiple*))
+						    (otherwise *destination-stack*)))))
+				       (old (car l))
+				       (new (condition-case (error)
+						 (cl:apply #'optimize-form old
+							   arg-destination
+							   ;; need to clarify whether dynamic-extent implies
+							   ;; the same thing for subforms.  If it does, pass 
+							   ;; the declaration along here.  for now, just send
+							   ;; NIL, so inner forms are NOT dynamic-extent
+							   nil
+							   (1- i) form context)
+					       (error
+						 (warn "An error occurred while optimizing ~
+                                                        subform ~S of ~S:~%~A"
+						       old form error)
+						 old))))
+				  (unless (eq new old)	;If it changed, insert into form
+				    (unless copyflag
+				      (setq form (copylist form))
+				      (setq l (nthcdr i form))
+				      (setq copyflag t))
+				    (setf (car l) new)))))
+
+			    (when ignored-result
+			      (new-form `(progn ,@(cdr form) nil)))
+
+			    ;; Do constant folding
+			    (when (and (not special) (not local-def) (not lambda-c) inline
+				       do-constant-folding (eq reducibility 'lt:reducible))
+			      (condition-case (error)
+				   (new-form (constant-fold-optimizer form) t)
+				 (error
+				   (unless (and (cl:typep error '(or sys:too-few-arguments
+								     sys:too-many-arguments))
+						inhibit-wrong-number-of-arguments-warning-switch)
+				     (warn "An error occurred while folding constants in ~S:~%~A" form error)))))
+			    ;; Run optimizers.
+			    (when (and (null local-def) (not lambda-c) inline do-optimizers)
+
+			      (when do-compile-only-optimizers
+				(let ((opt (future-common-lisp:compiler-macro-function
+					     function env)))
+				  (when opt
+				    (condition-case (error)
+					 (new-form (si:macroexpand-hook opt form env))
+				       (error
+					 (warn "An error occurred while running optimizer ~S on ~S:~%~A" opt form error))))))
+
+			      (dolist (opt (get-optimizers *compiler* function))
+				(condition-case (error)
+				     (new-form (funcall opt form) t)
+				   (error
+				     (warn "An error occurred while running optimizer ~S on ~S:~%~A" opt form error))))
+
+			      (when do-compile-only-optimizers
+				(dolist (opt (get function 'compiler:compile-only-optimizers))
+				  (condition-case (error)
+				       (new-form (funcall opt form) t)
+				     (error
+				       (warn "An error occurred while running optimizer ~S on ~S:~%~A" opt form error)))))
+
+			      (dolist (opt (get function 'compiler:optimizers))
+				(condition-case (error)
+				     (new-form (funcall opt form) t)
+				   (error
+				     (warn "An error occurred while running optimizer ~S on ~S:~%~A" opt form error)))))
+		     
+			    ;; Expand inline forms
+			    (let ((method (and (not special) inline do-inline-forms
+					       (if lambda-c
+						   (inline-form-method-from-lambda function env)
+						   (lt:find-inline-form-method function env)))))
+			      (when method
+				(new-form (lt:expand-inline-form
+					    method form env
+					    :suppress-warnings-for-legal-lisp t))))
+			    (when (and compile-function
+				       (eq function 'function))
+			      (let ((function
+				      (let ((second (second form)))
+					(if (listp second)
+					    (lambda-macro-expand (second form) env)
+					    second))))
+				(when (and (si:interpreted-lambda-p function)
+					   (or (si:null-environment-p env)
+					       (null (lt:form-references-environment-p
+						       form env))))
+				  (let ((arg (first context))
+					(caller (second context)))
+				    (when (and arg caller
+					       (optimizer-downward-argument-p
+						 (first caller) arg))
+				      ;; Stick an area declaration in the form
+				      (multiple-value-bind (declarations real-body)
+					  (si:find-body-declarations
+					    (cddr function) env (second function))
+					(setq function
+					      `(,(first function) ,(second function)
+						 (declare (area *default-cons-area*))
+						 ,@declarations
+						 ,@real-body)))))
+				  (new-form
+				    (funcall compile-function function env)))))
+			    )))
+	       
+		      (when use-cache
+			(setf (gethash form *optimize-form-cache*) t)))))
+	   
+
+	   done)
+
+	 (when (and (not (eq original-form form))
+		    *trace-optimize-form*)
+	   (let ((cl:*print-pretty* t))
+	     (format trace-output "~&~S -> ~S" original-form form)))
+
+	 form)))
+
+    (let* ((*optimizer-ignored-forms* nil)
+	   (*optimizer-environment* env)
+	   (new-form (cl:apply #'optimize-form form destination target-declarations context)))
+      (if (null *optimizer-ignored-forms*)
+	  new-form
+	  (let ((ignored-forms (nreverse *optimizer-ignored-forms*)))
+	    (if (and (cl:consp form)
+		     (eq (first form) 'progn)
+		     (loop with form-cons = (cl:rest form)
+			   for ignored-form in ignored-forms
+			   always (and (cl:consp form-cons)
+				       (eq ignored-form (pop form-cons)))
+			   finally (return (and (cl:consp form-cons)
+						(eq (pop form-cons) new-form)
+						(null form-cons)))))
+		form				;return the original
+		`(progn ,@ignored-forms ,new-form)))))))
+
+(defun optimizer-downward-argument-p (function argument)
+  (unless (cl:typep function 'sys:generic-function)
+    (when (si:local-function-definition function lt::*mapforms-lexical-function-environment*)
+      ;; Mapforms doesn't record this information
+      (return-from optimizer-downward-argument-p nil))
+    (when (and (cl:member function '(funcall cl:apply cl:multiple-value-call))
+	       (= argument 0))
+      (return-from optimizer-downward-argument-p t)))
+  (let ((info
+	  (or (car (compiler:file-declaration function 'sys:downward-funarg))
+	      (multiple-value-bind (definition found)
+		  (file-declaration function 'fdefinition)
+		(cond (found
+		       (unless (funcallable-instance-p definition)
+			 (return-from optimizer-downward-argument-p nil))
+		       (second (cl:assoc 'sys:downward-funarg (debugging-info definition))))
+		      ((multiple-value-bind (nil found)
+			   (file-declaration function 'def)
+			 found)
+		       ;; In the compilation environment without downward information
+		       (return-from optimizer-downward-argument-p nil))
+		      (t
+		       ;; Go with the global information
+		       (cl:typecase function
+			 ((sys:generic-function)
+			  (second (cl:assoc 'sys:downward-funarg (debugging-info function))))
+			 (otherwise
+			   (if (fdefinedp function)
+			       (second (si:debugging-info-user-entry
+					 (fdefinition function)
+					 'sys:downward-funarg))
+			       (return-from optimizer-downward-argument-p nil))))))))))
+    (when info
+      (or (minusp (car info))
+	  (cl:member argument info)))))
+
+(defun optimize-top-level-form (form &rest args &key (environment nil) &allow-other-keys)
+  (lt:copyforms
+    #'(lambda (form kind usage)
+	(if (or (cl:listp kind)
+		(and (eq kind 'quote) (eq usage 'eval)))
+	    (cl:apply #'optimize-form form lt::*mapforms-lexical-function-environment*
+		      :allow-other-keys t args)
+	    form))
+    form :environment environment))
+
+(defun inline-form-method-from-lambda (lambda-exp env)
+  (let ((lambda-list-and-body (si:interpreted-lambda-lambda-list-and-body lambda-exp)))
+    (condition-case ()
+	 (lt:construct-inline-form
+	   nil (first lambda-list-and-body) (rest1 lambda-list-and-body) env)
+       (error nil))))
+
+(defun function-reducible-p (function)
+  (let ((info (si:debugging-info-user-entry function 'lt:side-effects)))
+    (and info
+	 (memq 'lt:reducible info))))
+
+(defun si:env-declarations-inline-p (fn env)
+  (let ((entry (cl:assoc fn (si:env-functions env) :test #'cl:equal)))
+    (when entry
+      (return-from si:env-declarations-inline-p
+	(eq (cl:getf (cddr entry) 'cl:inline) 'cl:inline))))
+  (let ((i (or (and (clos-internals:compile-file-environment-p env)
+		    (compiler:file-declaration fn 'cl:inline))
+	       (si:function-spec-get fn 'cl:inline))))
+    (when i
+      (return-from si:env-declarations-inline-p (eq i 'cl:inline))))
+  t)
+
+;;;; Random optimizers.
+(defoptimizer (progn move-progn-ignores-out) (form)
+  (loop for subform-cons = (cdr form) then next-cons
+	as next-cons = (cdr subform-cons)
+	as subform = (car subform-cons)
+	while (and (not (null next-cons))
+		   (or (cl:constantp subform *optimizer-environment*)
+		       (and (symbolp subform)
+			    (not (lt:symbol-macro-p subform *optimizer-environment*))
+			    (progn (cl:pushnew subform *optimizer-ignored-forms*) t))))
+	finally (return (cond ((null (cdr subform-cons))
+			       ;; the hope, of course, is that we remove everything
+			       ;; this also makes (progn) => nil
+			       (car subform-cons))
+			      ((eq subform-cons (cdr form))
+			       form)
+			      (t
+			       `(progn ,@subform-cons))))))
+
+(defun move-prog1-ignores-out (form)
+  (loop with function = (first form)
+	with value = (second form)
+	for subform-cons on (cdr (cdr form))
+	as subform = (car subform-cons)
+	while (or (cl:constantp subform *optimizer-environment*)
+		  (and (symbolp subform)
+		       (not (lt:symbol-macro-p subform *optimizer-environment*))
+		       (progn (cl:pushnew subform *optimizer-ignored-forms*) t)))
+	finally (return (cond ((null subform-cons)
+			       ;; 
+			       (cl:ecase function
+				 (prog1 `(values ,value))
+				 (multiple-value-prog1 value)))
+			      ((eq subform-cons (cdr (cdr form)))
+			       form)
+			      (t
+			       `(,function ,value ,@subform-cons))))))
+
+(add-optimizer prog1 move-prog1-ignores-out)
+(add-optimizer multiple-value-prog1 move-prog1-ignores-out)
+
+(defoptimizer (if if-constant-test) (form)
+  (matchp form
+    (('if test then . elses)
+     (if (cl:constantp test *optimizer-environment*)
+	 (if (lt:evaluate-constant test *optimizer-environment*)
+	     then
+	     `(progn ,@elses))
+	 form))
+    (* form)))
+
+(defoptimizer (cl:case case-constant-test) (form)
+  (matchp form
+    (('cl:case test-object . clauses)
+     (if (cl:constantp test-object compiler:*optimizer-environment*)
+	 (let ((test-object (lt:evaluate-constant test-object
+						  compiler:*optimizer-environment*)))
+	   (loop for (key . stuff) in clauses doing
+	     (when (cond ((cl:member key '(otherwise t)) t)
+			 ((cl:listp key) (cl:member test-object key))
+			 (t (eql test-object key)))
+	       (return `(progn ,@stuff)))))
+	 form))
+    (* form)))
+
+(defoptimizer (cond cond-constant-test) (form)
+  (matchp form
+    (('cond . clauses)
+     (loop for (test . rest) in clauses doing
+       (if (cl:constantp test *optimizer-environment*)
+	   (let ((test (lt:evaluate-constant test *optimizer-environment*)))
+	     (when test
+	       (return (if rest
+			   `(progn ,@rest)
+			   ;; must return a single value -- so quote the evaluated test
+			   `',test))))
+	   (return form))))
+    (* form)))
+
+
+(defoptimizer (or or-constants) (form)
+  (block optimizer
+    (let ((args (cdr form)))
+      (when (null args)
+	;; (or) => nil
+	(return-from optimizer nil))
+      (loop as arg-cons = args
+	    as arg = (pop args)
+	    do (when (null args)
+		 ;; (or <x>) => <x>
+		 (return-from optimizer arg))
+	       (unless (cl:constantp arg *optimizer-environment*)
+		 (return-from optimizer
+		   ;; might remove other constants
+		   (if (eq arg-cons (cdr form))
+		       ;; if we didn't remove anything, return the original
+		       form
+		       `(or ,@arg-cons))))
+	       (let ((arg-value (lt:evaluate-constant arg *optimizer-environment*)))
+		 (when arg-value
+		   ;; since this isn't the last value, must ensure that we only
+		   ;; return one value
+		   (return-from optimizer `',arg-value)))))))
+
+(defoptimizer (and and-constants) (form)
+  (block optimizer
+    (let ((args (cdr form)))
+      (when (null args)
+	;; (and) => t
+	(return-from optimizer t))
+      (loop as arg-cons = args
+	    as arg = (pop args)
+	    do (when (null args)
+		 ;; (and <x>) => <x>
+		 (return-from optimizer arg))
+	       (unless (cl:constantp arg *optimizer-environment*)
+		 (return-from optimizer
+		   ;; might remove other constants
+		   (if (eq arg-cons (cdr form))
+		       ;; if we didn't remove anything, return the original
+		       form
+		       `(and ,@arg-cons))))
+	       (let ((arg-value (lt:evaluate-constant arg *optimizer-environment*)))
+		 (unless arg-value
+		   (return-from optimizer nil)))))))
+
+(defoptimizer (not not-not-optimizer) (form)
+  (labels ((returns-boolean (form)
+	     (cl:typecase form
+	       (cl:symbol (cl:member form '(nil t)))
+	       (cl:cons
+		 (let ((function (first form)))
+		   (and (symbolp function)
+			;; Don't collapse when the function is (lexically) shadowed.
+			(not (si:local-function-definition function *optimizer-environment*))
+			(cl:case function
+			  ((or and)
+			   (cl:every #'returns-boolean (cdr form)))
+			  ((let let* multiple-value-bind progn)
+			   (returns-boolean (first (last form))))
+			  ((values prog1)
+			    (returns-boolean (first (cdr form))))
+			  (otherwise
+			    (eql (compiler:function-return-type function) 'scl:boolean))))))
+	       (cl:otherwise nil))))
+    (matchp form
+      (('not ('not sub-form))
+       (cond ((eq (destination-usage *optimizer-destination* 0) 'boolean)
+	      `(values ,sub-form))
+	     ((returns-boolean sub-form)
+	      `(values ,sub-form))
+	     (t form)))
+      (* form))))
+
+;; Optimize (FUNCALL #'(LAMBDA ...) ...)
+;; For 7.2, optimize (FUNCALL #'FOO ...) into (FOO ...)
+;; Remaining undone optimizations:
+;;   (FUNCALL #'(RANDOM-FSPEC-WITH-LOCATION) ...) should generate a CALL instruction.
+;;   (FUNCALL 'FOO ...) should optimize into a magic version of (FOO ...)
+;;   which doesn't get shadowed by internal functions.
+(defoptimizer (funcall funcall-function) (form)
+  (matchp form
+    (('funcall ((*or* constant-type function quote) fcn) . arguments)
+     (let ((new-form (list* fcn arguments)))
+       (cond ((atom fcn)
+	      (when (and (symbolp fcn)
+			 (not (and (eq constant-type 'quote)
+				   ;;
+				   ;;        If it has a lexical definition then we can't
+				   ;;        optimize (FUNCALL 'FOO ...) to (FOO ...) in the
+				   ;;        current (4/28/89 20:07:06) compiler. --DySak
+				   ;;
+				   (si:local-function-definition fcn
+								 *optimizer-environment*))))
+		(return-from funcall-function new-form)))
+	     ((functionp fcn)
+	      (return-from funcall-function
+		(if (and (eq constant-type 'quote)
+			 (eq (car fcn) 'future-common-lisp:lambda))
+		    form
+		    new-form)))
+	     ((validate-function-spec fcn)
+	      (when (si:env-declarations-inline-p fcn *optimizer-environment*)
+		(unless (si:local-function-definition fcn *optimizer-environment*)
+		  (dolist (opt (si:function-spec-get fcn 'optimizers))
+		    (let ((newform (funcall opt (rest1 form))))
+		      (when (not (eq (rest1 form) newform))
+			(return-from funcall-function newform)))))
+		(let ((meth (lt:find-inline-form-method fcn *optimizer-environment*)))
+		  (when meth
+		    (let ((exp (lt:expand-inline-form meth new-form
+						      *optimizer-environment*
+						      :suppress-warnings-for-legal-lisp t)))
+		      (unless (eq exp new-form)
+			(return-from funcall-function exp)))))))))))
+  form)
+
+(define-compile-only-optimizer (funcall funcall-function-spec) (form)
+  (matchp form
+    (('funcall ('function fcn) . ignore)
+     (let ((env *optimizer-environment*))
+       (when (and (validate-function-spec fcn)
+		  (si:env-declarations-inline-p fcn env)
+		  (not (si:local-function-definition fcn env)))
+	 (let ((opt (future-common-lisp:compiler-macro-function fcn env)))
+	   (when opt
+	     (let ((new-form (si:macroexpand-hook opt form env)))
+	       (when (not (eq form new-form))
+		 (return-from funcall-function-spec new-form)))))
+	 (dolist (opt (si:function-spec-get fcn 'compile-only-optimizers))
+	   (let ((newform (funcall opt (cdr form))))
+	     (when (not (eq (cdr form) newform))
+	       (return-from funcall-function-spec newform))))))))
+  form)
+
+(defun mv-call-of-funcall (form)
+  ;; remove extra FUNCALL or SEND, if possible
+  (block optimizer
+    (matchp form
+      ((mv-call (quote-type function) argument . arguments)
+       (when (and (cl:member function '(funcall send cl:apply))
+		  (or (eq quote-type 'quote)
+		      (and (eq quote-type 'function)
+			   (not (si:local-function-definition function
+							      *optimizer-environment*))))
+		  (produces-single-value argument))
+	 (unless (and (eq mv-call 'multiple-value-apply)
+		      (eq function 'cl:apply))
+	   (return-from optimizer
+	     `(,(if (eq function 'cl:apply)
+		    'multiple-value-apply
+		    mv-call)
+	       ,argument ,@arguments))))))
+    form))
+
+(define-compile-only-optimizer (multiple-value-call multiple-value-call-optimizer) (form)
+  (block optimizer
+    (matchp form
+      (('multiple-value-call function . arguments)
+       ;; remove VALUES forms, to make other lives easier
+       (unless (si:local-function-definition 'values *optimizer-environment*)
+	 (when (loop for argument in arguments
+		     thereis (and (cl:consp argument)
+				  (eq (car argument) 'values)
+				  ;; not a single value
+				  (or (null (cdr argument))
+				      (and (cl:consp (cdr argument))
+					   (cl:consp (cddr argument))))))
+	   (return-from optimizer
+	     `(multiple-value-call ,function
+				   ,@(loop with result for argument in arguments do
+				       (if (and (cl:consp argument)
+						(eq (car argument) 'values)
+						;; not a single value
+						(or (null (cdr argument))
+						    (and (cl:consp (cdr argument))
+							 (cl:consp (cddr argument)))))
+					   (loop for expression in (cdr argument) do
+					     (push `(values ,expression) result))
+					   (push argument result))
+					   finally (return (nreverse result)))))))
+       ;; This optimizer gives degenerate cases of multiple-value-call a
+       ;; chance of getting the FUNCALL optimizer run on them.  This can
+       ;; save a little consing of lexical closures.
+       (when (loop for argument in arguments
+		   always (produces-single-value argument))
+	 (return-from optimizer
+	   `(funcall ,function ,@arguments)))))
+    (mv-call-of-funcall form)))
+
+(define-compile-only-optimizer (multiple-value-apply multiple-value-apply-optimizer) (form)
+  (block optimizer
+    ;; first try to expand the arg list
+    (let ((last-arg (first (last form))))
+      (when (cl:constantp last-arg *optimizer-environment*)
+	(let* ((last-arg-values
+		 (multiple-value-list (lt:evaluate-constant last-arg *optimizer-environment*)))
+	       (last-arg-value (first (last last-arg-values))))
+	  ;; make sure the constant list we're expanding is well-formed
+	  (when (and (cl:listp last-arg-value)
+		     (null (last last-arg-value 0)))
+	    (return-from optimizer
+	      `(multiple-value-call ,@(butlast (cdr form))
+				    ,@(mapcar #'(lambda (x) `',x)
+					      (butlast last-arg-values))
+				    ,@(mapcar #'(lambda (x) `',x)
+					      last-arg-value))))))
+      (setq last-arg (undo-list-optimization last-arg))
+      (matchp last-arg
+	(('list . args)
+	 (return-from optimizer
+	   `(multiple-value-call ,@(butlast (cdr form)) ,@(mapcar #'(lambda (x) `(values ,x))
+								  args))))
+	(('list* . args)
+	 (return-from optimizer
+	   `(multiple-value-apply ,@(butlast (cdr form)) ,@(mapcar #'(lambda (x) `(values ,x))
+								  args))))))
+    (mv-call-of-funcall form)))
+
+(defoptimizer (multiple-value-bind multiple-value-bind-to-let let)
+	      (form)
+  (matchp form
+    (('multiple-value-bind variables ('values-list values) . body)
+     (cond ((every variables #'symbolp)
+	    (let ((temp (gensym)))
+	      `(let ((,temp ,values))
+		 ,temp				; in case there are no variables
+		 (let (,@(let ((result)
+			       (cdrs 0))
+			   (loop for variable-cons on variables
+				 as variable = (first variable-cons)
+				 doing
+			     (cond ((and variable (neq variable 'ignore))
+				    (push `(,variable
+					    (car ,(if (zerop cdrs)
+						      temp
+						      (if (null (cl:rest variable-cons))
+							  `(nthcdr ,cdrs ,temp)
+							  `(setq ,temp
+								 (nthcdr ,cdrs ,temp))))))
+					  result)
+				    (setq cdrs 1))
+				   (t (incf cdrs))))
+			   (nreverse result)))
+		   ,@body))))
+	   (t form)))
+    (* form)))
+
+(defoptimizer (cl:apply apply-of-send) (form)
+  (matchp form
+    (('cl:apply ('function (*or* ignore funcall send)) fcn argument . arguments)
+     `(cl:apply ,fcn ,argument ,@arguments))
+    (* form)))
+
+(defoptimizer (cl:apply apply-optimizer) (form)
+  (block optimizer
+
+    ;; first try to expand the arg list
+    (let ((last-arg (first (last form))))
+      (when (cl:constantp last-arg *optimizer-environment*)
+	(let* ((last-arg-value (lt:evaluate-constant last-arg *optimizer-environment*))
+	       (last-last-arg-value (last last-arg-value)))
+	  ;; make sure the constant list we're expanding is well-formed
+	  (when (and (cl:listp last-last-arg-value)
+		     (null (cdr last-last-arg-value)))
+	    (return-from optimizer
+	      ;; If function to be called is constant, optimize out the "funcall"
+	      ;; in case the symbol is a subst function.
+	      (funcall-function `(funcall ,@(butlast (cdr form))
+					  ,@(mapcar #'(lambda (x) `',x)
+						    last-arg-value)))))))
+      (setq last-arg (undo-list-optimization last-arg))
+      (matchp last-arg
+	(('list . args)
+	 (return-from optimizer
+	   (funcall-function `(funcall ,@(butlast (cdr form)) ,@args))))
+	(('list* . args)
+	 (return-from optimizer
+	   `(cl:apply ,@(butlast (cdr form)) ,@args)))))
+
+    ;; now try to inline the call
+    (matchp form
+      ((* ('function function) argument . arguments)
+       (ignore argument arguments)
+       (let ((method (if (si:interpreted-lambda-p function)
+			 (inline-form-method-from-lambda function *optimizer-environment*)
+			 (and (validate-function-spec function)
+			      (si:env-declarations-inline-p function *optimizer-environment*)
+			      (lt:find-inline-form-method function *optimizer-environment*)))))
+	 (when method
+	   (let* ((old-form (cdr form))
+		  (new-form (lt:expand-inline-form method old-form
+						   *optimizer-environment*
+						   :apply t
+						   :suppress-warnings-for-legal-lisp t)))
+	     (unless (eq old-form new-form)
+	       (return-from optimizer new-form)))))))
+    form))
+
+(defun undo-list-optimization (original-form)
+  (let* ((form (if (and (listp original-form)
+			(eq (car original-form) 'values)
+			(null (cddr original-form)))
+		   (cadr original-form)
+		   original-form))
+	 (assoc (and (listp form)
+		     (assq (car form) '((system-internals:%list-1 global:list)
+					(system-internals:%list-2 global:list)
+					(system-internals:%list-3 global:list)
+					(system-internals:%list-4 global:list)
+					(system-internals:%list-n global:list t)
+					(system-internals:%list*-n global:list* t)
+					(cons global:list*))))))
+    (if assoc
+	(cons (second assoc) (if (third assoc) (cddr form) (cdr form)))
+	form)))
+
+;;;
+
+(defun object-equal-same-as-eq (object)
+  ;; there are others, but these are the ones likely to occur
+  (or (symbolp object)
+      (fixnump object)
+      (single-float-p object)
+      (characterp object)))
+
+(defun equal-same-as-eq (form)
+  (and (constant-form-p form)
+       (object-equal-same-as-eq (constant-evaluator form))))
+
+(defun object-equal-same-as-eql (object)
+  ;; there are others, but these are the ones likely to occur
+  (or (object-equal-same-as-eq object)
+      (numberp object)))			;extended numbers
+
+(defun equal-same-as-eql (form)
+  (and (constant-form-p form)
+       (object-equal-same-as-eql (constant-evaluator form))))
+
+(defun list-equal-same-as-eq (form)
+  (and (constant-form-p form)
+       (loop for object-cons on (constant-evaluator form)
+	     while (cl:consp object-cons)
+	     always (object-equal-same-as-eq (car object-cons))
+	     finally (return (null object-cons)))))
+
+(defun list-equal-same-as-eql (form)
+  (and (constant-form-p form)
+       (loop for object-cons on (constant-evaluator form)
+	     while (cl:consp object-cons)
+	     always (object-equal-same-as-eql (car object-cons))
+	     finally (return (null object-cons)))))
+
+(defun alist-equal-same-as-eq (form)
+  (and (constant-form-p form)
+       (loop for object-cons on (constant-evaluator form)
+	     while (cl:consp object-cons)
+	     always (and (cl:consp (car object-cons))
+			 (object-equal-same-as-eq (caar object-cons)))
+	     finally (return (null object-cons)))))
+
+(defun alist-equal-same-as-eql (form)
+  (and (constant-form-p form)
+       (loop for object-cons on (constant-evaluator form)
+	     while (cl:consp object-cons)
+	     always (and (cl:consp (car object-cons))
+			 (object-equal-same-as-eql (caar object-cons)))
+	     finally (return (null object-cons)))))
+
+(defoptimizer (eq eq-nil) (form)
+  (matchp form
+    (('eq arg1 arg2)
+     (cond ((null arg1)
+	    `(not ,arg2))
+	   ((null arg2)
+	    `(not ,arg1))
+	   (t form)))
+    (* form)))
+
+(defun equal-to-eq-or-eql (form)
+  (matchp form
+    ((* arg1 arg2)
+     (cond ((null arg1)
+	    `(not ,arg2))
+	   ((null arg2)
+	    `(not ,arg1))
+	   ((or (equal-same-as-eq arg1) (equal-same-as-eq arg2))
+	    `(eq ,arg1 ,arg2))
+	   ((or (equal-same-as-eql arg1) (equal-same-as-eql arg2))
+	    `(eql ,arg1 ,arg2))
+	   (t form)))
+    (* form)))
+
+(add-optimizer equal equal-to-eq-or-eql eql eq)
+(add-optimizer cl:equal equal-to-eq-or-eql eql eq)
+
+(defoptimizer (cl:equalp equalp-to-eq) (form)
+  (flet ((equalp-same-as-eq (form)
+	   (and (constant-form-p form)
+		(symbolp (constant-evaluator form)))))
+    (matchp form
+      (('cl:equalp arg1 arg2)
+       (cond ((null arg1)
+	      `(not ,arg2))
+	     ((null arg2)
+	      `(not ,arg1))
+	     ((or (equalp-same-as-eq arg1) (equalp-same-as-eq arg2))
+	      `(eq ,arg1 ,arg2))
+	     (t form)))
+      (* form))))
+
+;;;; Type optimizers
+
+#+3600
+(progn 'compile
+
+(defoptimizer (eq eq-typep) (form)
+  (matchp form
+    (('eq ('typep typed-form) type)
+     (eq-typep-1 typed-form type form))
+    (('eq type ('typep typed-form))
+     (eq-typep-1 typed-form type form))
+    (* form)))
+
+(defun eq-typep-1 (form type top-form &aux temp)
+  (cond ((not (constant-form-p type)) top-form)
+	((memq (setq type (constant-evaluator type))
+	       '(:string :symbol))	;Do not include :list until common lisp (see below).
+	 `(,(get type 'typep) ,form))
+	((setq temp (rassq type si:typep-alist))
+	 `(= (%data-type ,form) ,(car temp)))
+	(t top-form)))
+)
+
+;;; Optimize TYPEP with two arguments so that TYPECASE compiles reasonably
+
+(defoptimizer (zl:typep typep-two-args) (form)
+  (matchp form
+    (('zl:typep typed-form type-form)
+     (when (constant-form-p type-form)		;constant type
+       (let ((type (constant-evaluator type-form)))
+	 (when (symbolp type)
+	   (let ((pred (get type 'zl:typep)))
+	     (when pred
+	       (return-from typep-two-args
+		 `(,pred ,typed-form))))
+	   (when (flavor:find-flavor type nil 'compile)
+	     (return-from typep-two-args
+	       `(si:typep-flavor ,typed-form ,type-form)))
+	   (when (get type 'si:defstruct-description)
+	     (return-from typep-two-args
+	       `(si:typep-structure ,typed-form ,type-form))))))))
+  form)
+
+;;;; More random optimizers
+
+(defoptimizer (global:list list-known-length
+			   system-internals:%list-1
+			   system-internals:%list-2
+			   system-internals:%list-3
+			   system-internals:%list-4
+			   system-internals:%list-n)
+	      (form)
+  (matchp form
+    (('global:list . args)
+     ;;
+     ;; observe dynamic-extent declaration; if target is dynamic-extent,
+     ;; generate the equivalent of (with-stack-list foo ...)
+     ;;
+     ;; due to the general kludgey nature of this thing, we get into
+     ;; trouble with stack-consed lists, when the pointer to the list
+     ;; lives in the local block.  the problem arises because the list
+     ;; gets built on the top of the stack, but the compiler then pops
+     ;; the pointer to it down into the local block, and flushes the
+     ;; stuff on top of the stack, ie the list we just built.  avoid the
+     ;; problem by seeing if we're about to get into trouble, by doing
+     ;; the same tests as COMPILER:VARIABLE-STACK-RESIDENT-P; if there
+     ;; are multiple-groups on the stack, so we'll have to put this one
+     ;; in the local-block, skip doing the optimization.
+     ;;
+     ;; the real right way to do this is probably to generate a pframe
+     ;; for each LET, so that when leaving the scope of the LET, we can
+     ;; know to pop things off the stack, and when cementing NAMEs,
+     ;; observe which variables are in this state, so that they can be
+     ;; left alone, and popped later.
+     ;;
+     (if (and (cdr (assoc 'future-common-lisp:dynamic-extent *optimizer-target-declarations*))
+	      (not (or (plusp *multiple-count*)
+		       (and (boundp '*control-stack-state*)
+			    *control-stack-state*
+			    (plusp (control-stack-state-unknown-group-count
+				     *control-stack-state*))))))
+	 `(make-stack-list ,@args)
+	 (selectq (length args)
+	   (0 ''nil)
+	   (1 `(system-internals:%list-1 . ,args))
+	   (2 `(system-internals:%list-2 . ,args))
+	   (3 `(system-internals:%list-3 . ,args))
+	   (4 `(system-internals:%list-4 . ,args))
+	   (otherwise `(system-internals:%list-n ,(length args) . ,args)))))
+    (* form)))
+
+(defoptimizer (global:list-in-area list-in-area-known-length
+				     system-internals:%list-1-in-area
+				     system-internals:%list-2-in-area
+				     system-internals:%list-3-in-area
+				     system-internals:%list-n-in-area)
+	      (form)
+  (matchp form
+    (('global:list-in-area area . args)
+     (selectq (length args)
+       (0 ''nil)
+       (1 `(system-internals:%list-1-in-area ,area . ,args))
+       (2 `(system-internals:%list-2-in-area ,area . ,args))
+       (3 `(system-internals:%list-3-in-area ,area . ,args))
+       (otherwise `(system-internals:%list-n-in-area ,(length args) ,area . ,args))))
+    (* form)))
+
+(defoptimizer (global:list* list*-known-length
+			    system-internals:%list*-n)
+	      (form)
+  ;;
+  ;; observe dynamic-extent declaration; if target is dynamic-extent,
+  ;; generate the equivalent of (with-stack-list foo ...)
+  ;;
+  ;; see above comment about multiple-groups.
+  ;;
+  (if (and (cdr (assoc 'future-common-lisp:dynamic-extent *optimizer-target-declarations*))
+	   (not (or (plusp *multiple-count*)
+		    (and (boundp '*control-stack-state*)
+			 *control-stack-state*
+			 (plusp (control-stack-state-unknown-group-count
+				  *control-stack-state*))))))
+      (matchp form				; yuck.  duplicated code...
+	(('global:list*) form)			;maybe generate a warning?
+	(('global:list* foo) foo)
+	(('global:list* . args) `(make-stack-list* ,@args))
+	(* form))
+      (matchp form
+	(('global:list*) form)			;maybe generate a warning?
+	(('global:list* foo) foo)
+	(('global:list* foo bar) `(global:cons ,foo ,bar))
+	(('global:list* . args) `(system-internals:%list*-n ,(length args)
+							    . ,args))
+	(* form))))
+
+(defoptimizer (global:list*-in-area list*-in-area-known-length
+				      system-internals:%list*-n-in-area)
+	      (form)
+  (matchp form
+    (('global:list*-in-area ignore) form)	;maybe generate a warning?
+    (('global:list*-in-area ignore foo) foo)
+    (('global:list*-in-area area foo bar) `(global:cons-in-area ,foo ,bar ,area))
+    (('global:list*-in-area area . args) `(system-internals:%list*-n-in-area
+					      ,(length args) ,area . ,args))
+    (* form)))
+
+(defoptimizer (si:make-structure-vector-n make-structure-vector-n-short) (form)
+  (block optimizer
+    (matchp form
+      (('si:make-structure-vector-n vector-length-form . slots)
+       (when (cl:constantp vector-length-form *optimizer-environment*)
+	 (let* ((vector-length (lt:evaluate-constant vector-length-form
+						     *optimizer-environment*))
+		(n-slots vector-length))
+	   (when (and ( 1 n-slots si:*make-structure-optimized-function-max-slots*)
+		      (= n-slots (length slots)))
+	     (return-from optimizer
+	       `(,(intern (format nil "MAKE-STRUCTURE-VECTOR-~D" vector-length) "SI")
+		 ,@slots)))))))
+    form))
+
+(defoptimizer (si:make-named-structure-vector-n make-named-structure-vector-n-short)
+		       (form)
+  (block optimizer
+    (matchp form
+      (('si:make-named-structure-vector-n
+	vector-length-form named-structure-symbol-form . slots)
+       (when (cl:constantp vector-length-form *optimizer-environment*)
+	 (let* ((vector-length (lt:evaluate-constant vector-length-form
+						     *optimizer-environment*))
+		(n-slots (1- vector-length)))
+	   (when (and ( 1 n-slots si:*make-structure-optimized-function-max-slots*)
+		      (= n-slots (length slots)))
+	     (return-from optimizer
+	       `(,(intern (format nil "MAKE-NAMED-STRUCTURE-VECTOR-~D" vector-length) "SI")
+		 ,named-structure-symbol-form
+		 ,@slots)))))))
+    form))
+
+;;;; Transformer for map functions.
+
+(add-optimizer cl:mapl map-expand)
+(add-optimizer mapc map-expand)
+(add-optimizer mapcar map-expand)
+(add-optimizer maplist map-expand)
+(add-optimizer mapcan map-expand)
+(add-optimizer mapcon map-expand)
+
+(defun mapping-function-p (mapper mapper-list)
+  (or (memq mapper mapper-list)
+      (loop for m in mapper-list
+	    as other-mappers = (get m 'optimized-into)
+	    thereis (memq mapper other-mappers))))
+
+(defun map-expand (form)
+  (matchp form					; else just return form.
+    ((mapper function . arguments)
+     (when (null arguments)
+       (return-from map-expand form))
+     (let ((take-cars-p (mapping-function-p mapper '(mapc mapcar mapcan)))
+	   (function-var (generate-symbol "FUNCTION")))
+       ;; Do the expansion.
+       (loop with cl-arg-0-p = nil
+	     for argument in arguments
+	     for argno from 0
+		 ;; var-name is a variable that holds the tail of the list.
+	     for var-name = (generate-symbol "TAIL")
+		 ;; do-clauses are clauses to step these variables.
+	     for cl-argument-p = (matchp argument
+				   (('circular-list ignore)
+				    take-cars-p))
+	     when (and cl-argument-p (= argno 0)) do (setq cl-arg-0-p t)
+	     collect (if cl-argument-p
+			 `(,var-name ,(second argument))
+			 (if take-cars-p
+			     `(,var-name ,argument)	;use pop, for efficiency
+			     `(,var-name ,argument (cdr ,var-name)))) into do-clauses
+	       ;; end-test tests whether any of the lists have become NIL.
+	     when (not cl-argument-p)
+	       collect `(null ,var-name) into end-tests
+		 ;; cars-or-tails is what to pass to the specified function:
+		 ;;  either (g0001 g0002 ...) or ((car g0001) (car g0002) ...)
+	     collect (if cl-argument-p
+			 var-name
+			 (if take-cars-p
+			     `(pop ,var-name)
+			     var-name)) into cars-or-tails
+	     finally
+	       (return-from map-expand
+		 (let ((call-function `(funcall ,function-var . ,cars-or-tails))
+		       (end-test (if (null (cdr end-tests))
+				     (first end-tests)
+				     `(or . ,end-tests))))
+		   (cond ((mapping-function-p mapper '(cl:mapl mapc))
+			  ;; Compile a mapper with no result.
+			  (let ((form `(do-named t ,do-clauses
+						 (,end-test)
+					 ,call-function)))
+			    (lt:let-subst
+			      `(,function-var map-result)
+			      `(,function ,(prog1 (cadar do-clauses)
+						  (setf (cadar do-clauses)
+							'map-result)))
+			      `(progn 
+				 ,form
+				 ,(if cl-arg-0-p
+				      `(circular-list map-result)
+				      'map-result))
+			      *optimizer-environment*)))
+			 ((mapping-function-p mapper '(mapcar maplist))
+			  ;; Compile a mapper that conses up results.
+			  (lt:let-subst
+			    `(,function-var)
+			    `(,function)
+			    `(let ((map-result))
+			       (do-named t ((map-temp (variable-location map-result))
+					    . ,do-clauses)
+					 (,end-test)
+				 (rplacd map-temp
+					 (setq map-temp
+					       (ncons ,call-function))))
+			       map-result)
+			    *optimizer-environment*))
+			 ((mapping-function-p mapper '(mapcan mapcon))
+			  ;; Compile a mapper that nconcs up results.
+			  (lt:let-subst
+			    `(,function-var)
+			    `(,function)
+			    `(do-named t ((map-tem)
+					  (map-result)
+					  . ,do-clauses)
+				       (,end-test map-result)
+			       (setq map-tem (nconc map-tem ,call-function))
+			       (if (null map-result) (setq map-result map-tem))
+			       (setq map-tem (last map-tem)))
+			    *optimizer-environment*))
+			 (t (llc-error "Unknown mapper ~S" mapper)))))))))
+  form)
+
+;;;; Transformer for subset and subset-not.
+
+(add-optimizer subset subset-expand)
+(add-optimizer subset-not subset-expand)
+
+;;; Note: since subset is a function, argument forms are already transformed.
+(defun subset-expand (form)
+  (matchp form
+    (((*or* form-name subset subset-not) function list . other-lists)
+     ;; Expand the form.
+     (loop for element in (cons list other-lists)
+	   for var-name = (generate-symbol "SUBSET-VAR")
+	   collect `(,var-name ,element (cdr ,var-name)) into do-clauses
+	   collect `(car ,var-name) into arguments
+	   finally
+	     (return-from subset-expand
+	       `(let (map-result)
+		  (do-named t
+			    ((map-temp (variable-location map-result))
+			     . ,do-clauses)
+			    ((null ,(caar do-clauses)))
+		    (,(if (eq form-name 'subset) 'and 'or)
+		     (funcall ,function . ,arguments)
+		     (rplacd map-temp (setq map-temp (ncons ,(car arguments))))))
+		  map-result)))))
+  form)
+
+;Do the type translation for cl:make-array at compile time, so we don't need
+;to have the type system loaded to make an array.  Needed so flavors can
+;be loaded in the inner system.
+(defoptimizer (cl:make-array cl-make-array-optimizer) (form)
+  (matchp form
+    (('cl:make-array dimensions . options)
+     ;; Check that the options are done by ZL:MAKE-ARRAY
+     (loop for (key val) on options by 'cddr do
+       (when (or (not (keywordp key))
+		 (selectq key
+		   (:initial-contents
+		    t)
+		   (:element-type
+		    (not (constant-form-p val)))
+		   (:fill-pointer
+		    (or (not (constant-form-p val))
+			(eq (constant-evaluator val) t)))))
+	 (return-from cl-make-array-optimizer form)))
+     ;; Mung the options
+     (setq options (cl:copy-list options))
+     (loop for l on options by 'cddr do
+       (selectq (car l)
+	 (:initial-element
+	  (setf (car l) :initial-value))
+	 (:element-type
+	  (setf (car l) :type)
+	  (setf (cadr l)
+		`',(sys:type-array-element-type (constant-evaluator (cadr l)))))
+	 ))
+     `(zl:make-array ,dimensions ,@options))
+    (* form)))
+
+(defoptimizer (cl:make-string cl-make-string-optimizer) (form)
+  (let ((length (cadr form))
+	(options (cddr form)))
+    (loop for (key val) on options by 'cddr do
+      (ignore val)
+      (unless (and (keywordp key) (memq key '(:area)))
+	(return-from cl-make-string-optimizer form)))
+    (destructuring-bind (&key (area nil area-p)) options
+      `(values (zl:make-array ,length :type art-string ,@(and area-p `(:area ,area)))))))
+
+
+;; This is not always right... (though maybe it is now?)
+(defoptimizer (cons cons-ncons-list) (form)
+  (matchp form
+    (('cons x (*or* ignore nil 'nil))
+     `(ncons ,x))
+    ;; Don't do these, since it changes the cdr-coding from what the
+    ;; programmer expects.  -- DCP 2-Dec-84
+    #+ignore
+    (('cons x ((*or* fun cons ncons list list*) . body))
+     `(,(selectq fun
+	  ((list ncons) 'list)
+	  (otherwise 'list*))
+       ,x . ,body))
+    (* form)))
+
+(defoptimizer (append append-optimizer append-2) (form)
+  (selector (length form) =
+    (1 'nil)
+    (2 (second form))
+    (3 `(si:append-2 ,@(rest1 form)))
+    (otherwise form)))
+
+(defoptimizer (nconc nconc-zero-or-one-arg) (form)
+  (selectq (length form)
+    (1 ''nil)					;(nconc) => 'NIL
+    (2 (second form))				;(nconc x) => x
+    (otherwise
+     `(si:*nconc ,(cadr form)
+		 ,(if (null (cdddr form))
+		      (caddr form)
+		      `(nconc ,@(cddr form)))))))
+
+(defoptimizer (nth nth-cxr) (form)
+  (matchp form
+    (('nth number list)
+     (when (constant-form-p number)
+       (let ((nth (constant-evaluator number)))
+	 (when (and (fixp nth) ( 0 number 9))
+	   (loop repeat nth do
+	     (setf list `(cdr ,list)))
+	   (return-from nth-cxr
+	     `(car ,list)))))))
+  form)
+
+(defoptimizer (nthcdr nthcdr-cxr) (form)
+  (matchp form
+    (('nthcdr number list)
+     (when (constant-form-p number)
+       (let ((nth (constant-evaluator number)))
+	 (when (fixp nth)
+	   (cond ((zerop nth)
+		  (return-from nthcdr-cxr
+		    `(values ,list)))
+		 (( 1 nth 10)
+		  (loop repeat nth do
+		    (setf list `(cdr ,list)))
+		  (return-from nthcdr-cxr
+		    list))))))))
+  form)
+
+(defoptimizer (string-search string-search-string-search-char string-search-char) (form)
+  (let ((key (second form)) quotep)
+    (if (and (listp key)
+	     (eq (car key) 'quote))
+	(setq key (second key)
+	      quotep t))
+    (if (or (and (or (stringp key)
+		     (and quotep (symbolp key)))
+		 (= (string-length key) 1))
+	    (and (fixp key) (not (minusp key)) (< key 400)))
+	`(string-search-char ,(character key) . ,(cddr form))
+      form)))
+
+;; Optimize (FERROR NIL "You lose" ...) into (FERROR "You lose" ...)
+(defoptimizer (ferror ferror-nil) (form)
+  (matchp form
+    (('ferror 'nil . body) `(ferror . ,body))
+    (* form)))
+
+(defoptimizer (si:encapsulation-let encapsulation-let-fix let) (form)
+  `(let . ,(cdr form)))
+
+(defoptimizer (si:encapsulation-list* encapsulation-list*-fix list*) (form)
+  `(list* . ,(cdr form)))
+
+(defoptimizer (si:status-internal status-optimizer) (form)
+  (let ((status-function (cadr form)))
+    (if (constant-form-p status-function)
+	(let ((status-function (constant-evaluator status-function)))
+	  (selector status-function string-equal
+	    (('feature 'features) (if (cddr form) form `si:status-feature-list))
+	    (('tabsize) `8)
+	    (('userid) `user-id)
+	    (('site) `si:local-host-name)
+	    (('opsys) `':lispm)
+	    (otherwise form)))
+	form)))
+
+;;; Arithmetic optimizing department. 
+
+;;; Optimize '7 into 7.  This allows other optimizers to check more easily
+;;; for numbers, specific kinds of numbers, other self-quoting data...
+(defoptimizer (quote self-evaluating-quoted-datum) (form)
+  (matchp form
+    (('quote datum)
+     (typecase datum
+       (:symbol (if (or (eq datum nil) (eq datum t) (keywordp datum))
+		    datum
+		    form))
+       (:atom datum)
+       (otherwise form)))
+    (* form)))
+
+;;; It is not permissible to reorder (+ u (+ v w)) into (+ u v w) because
+;;; of floating-point accuracy propagation.
+(defconst *reordering-optimization-impermissible*
+	  '(+ *)
+  "Functions for which floating point accuracy propagation precludes reordering.")
+
+;;; Collects all variables and reduces all constants in calls to a wide variety of 
+;;; functions.  Looks inside inner forms for calls to the same function, unless
+;;; prevented by the above list.  What a shame we cannot optimize 
+;;; (+ 3 (+ u 2)), which macros might easily generate, because of floating point.
+;;; This optimizer can also reduce a completely-constant expression, even if 
+;;; floating point is involved.  (Normally, floating constants discourage it.)
+(defun commutative-constant-folder (form)
+  (let* ((function (car form))
+	 (identity (get function 'arithmetic-identity-element)))
+    (if (loop with constant-seen = nil
+	      with var-seen = nil
+	      for arg in (rest1 form)
+	      if (constant-form-p arg)
+		do (if (or constant-seen
+			   (equal (constant-evaluator arg) identity))
+		       (return t)
+		       (setf constant-seen t))
+	      else if (and (listp arg) (eq (car arg) function))
+		     return t
+	      else do (if constant-seen
+			  (return t)
+			  (setf var-seen t))
+	      finally (return (not var-seen)))
+	(multiple-value-bind (variable constant punt)
+	    (commutative-constant-folder-recurse
+	      function (cdr form) (memq function *reordering-optimization-impermissible*))
+	  (cond (punt form)
+		((null variable) constant)
+		(t (let ((new-form
+			   (if (equal constant identity)
+			       `(,function ,@variable)
+			       `(,function ,@variable ,constant))))
+		     (if (equal new-form form)	;this can happen!
+			 form
+			 new-form)))))
+	form)))
+
+(defun commutative-constant-folder-recurse (function args do-not-reorder)
+  (let ((variables nil)
+	(constants nil)
+	(non-rational-passed nil))
+    (loop for arg in args
+	  if (constant-form-p arg)
+	    do (let ((arg (constant-evaluator arg)))
+		 (unless (or (fixp arg) (rationalp arg))
+		   (setq non-rational-passed t))	;probably have to punt...
+		 (push arg constants))
+	  else if (and (not do-not-reorder)
+		       (listp arg)
+		       (eq (car arg) function))
+		 do (multiple-value-bind (variable constant punt)
+			(commutative-constant-folder-recurse function (cdr arg) do-not-reorder)
+		      (if punt
+			  (push arg variables)
+			  (progn
+			    (dolist (v variable) (push v variables))
+			    (push constant constants))))
+	  else do (push arg variables)
+	  finally
+	    (return
+	      (if (and non-rational-passed variables)
+		  (values nil nil t)
+		  (values
+		    (nreverse variables)
+		    (let ((identity (get function 'arithmetic-identity-element)))
+		      (if constants
+			  (condition-case (error-object)
+			      (apply function (setq constants (nreverse constants)))
+			    (error
+			      (warn "Could not apply ~S to ~S:~%~A~@
+						      ~S was substituted instead."
+					       function constants error-object identity)
+			      identity))
+			  identity))))))))
+
+(defmacro do-constant-collection-for (&rest specs)
+  `(progn
+     ,@(loop for (function identity) in specs
+	     collect `(putprop ',function ',identity 'arithmetic-identity-element)
+	     collect `(add-optimizer-internal ',function 'commutative-constant-folder nil))))
+
+(do-constant-collection-for (+ 0) (* 1))
+
+(do-constant-collection-for (logand -1) (logxor 0) (logior 0))
+
+(do-constant-collection-for (cl:logand -1) (cl:logior 0) (cl:logxor 0))
+
+(defoptimizer (cl:logeqv logeqv-optimizer) (form)
+  (if (oddp (length form))
+      `(cl:logxor -1 ,@(rest1 form))
+      `(cl:logxor ,@(rest1 form))))
+
+;;; This reduces all cases of BOOLE to LOGAND, LOGIOR, and LOGXOR.
+(defoptimizer (boole boole-optimizer) (form)
+  (matchp form
+    (('boole spec only-argument)
+     (return-from boole-optimizer
+       `(progn ,spec ,only-argument)))
+    (('boole spec arg1 arg2)
+     (when (constant-form-p spec)
+       (select (constant-evaluator spec)
+	 (cl:boole-clr
+	  (return-from boole-optimizer
+	    `(progn ,arg1 ,arg2 0)))
+	 (cl:boole-set
+	  (return-from boole-optimizer
+	    `(progn ,arg1 ,arg2 -1)))
+	 (cl:boole-1
+	  (return-from boole-optimizer
+	    `(prog1 ,arg1 ,arg2)))
+	 (cl:boole-2
+	  (return-from boole-optimizer
+	    `(prog2 ,arg1 ,arg2)))
+	 (cl:boole-c1
+	  (return-from boole-optimizer
+	    `(prog1 (logxor ,arg1 -1) ,arg2)))
+	 (cl:boole-c2
+	  (return-from boole-optimizer
+	    `(prog2 ,arg1 (logxor ,arg2 -1))))
+	 (cl:boole-and
+	  (return-from boole-optimizer
+	    `(logand ,arg1 ,arg2)))
+	 (cl:boole-ior
+	  (return-from boole-optimizer
+	    `(logior ,arg1 ,arg2)))
+	 (cl:boole-xor
+	  (return-from boole-optimizer
+	    `(logxor ,arg1 ,arg2)))
+	 (cl:boole-eqv
+	  (return-from boole-optimizer
+	    `(logxor (logxor ,arg1 ,arg2) -1)))
+	 (cl:boole-nand
+	  (return-from boole-optimizer
+	    `(logxor (logand ,arg1 ,arg2) -1)))
+	 (cl:boole-nor
+	  (return-from boole-optimizer
+	    `(logxor (logior ,arg1 ,arg2) -1)))
+	 (cl:boole-andc1
+	  (return-from boole-optimizer
+	    `(logand (logxor ,arg1 -1) ,arg2)))
+	 (cl:boole-andc2
+	  (return-from boole-optimizer
+	    `(logand ,arg1 (logxor ,arg2 -1))))
+	 (cl:boole-orc1
+	  (return-from boole-optimizer
+	    `(logior (logxor ,arg1 -1) ,arg2)))
+	 (cl:boole-orc2
+	  (return-from boole-optimizer
+	    `(logior ,arg1 (logxor ,arg2 -1))))))
+     (return-from boole-optimizer
+       `(boole-internal ,spec ,arg1 ,arg2)))
+    (('boole spec . arguments) 
+     (when (constant-form-p spec)
+       (select (constant-evaluator spec)
+	 (cl:boole-and
+	  (return-from boole-optimizer
+	    `(logand ,@arguments)))
+	 (cl:boole-ior
+	  (return-from boole-optimizer
+	    `(logior ,@arguments)))
+	 (cl:boole-xor
+	  (return-from boole-optimizer
+	    `(logxor ,@arguments)))
+	 (cl:boole-eqv
+	  (return-from boole-optimizer
+	    `(cl:logeqv ,@arguments)))))))
+  form)
+
+(defun optimize-nullpotent (form)
+  (destructuring-bind (operator . arguments) form
+    (let ((nullpotent (get operator 'nullpotent)))
+      (if (and nullpotent (cl:find nullpotent arguments))
+	  `(progn ,@arguments ,nullpotent)
+	  form))))
+
+(defmacro define-nullpotent (operator nullpotent)
+  `(progn
+     (defprop ,operator ,nullpotent nullpotent)
+     (add-optimizer ,operator optimize-nullpotent)))
+
+(define-nullpotent cl:logand 0) 
+(define-nullpotent cl:logior -1)
+(define-nullpotent zl:logand 0) 
+(define-nullpotent zl:logior -1)
+
+(defun optimize-subtract-into-add (form)
+  (when (> (length form) 2)
+    (let ((last-val (first (last form))))
+      (when (constant-form-p last-val)
+	(return-from optimize-subtract-into-add
+	  `(+ ,(if (= (length form) 3)
+		   (second form)
+		   (butlast form))
+	      ,(- (constant-evaluator last-val)))))))
+  form)
+
+(add-optimizer - optimize-subtract-into-add +)
+(add-optimizer difference optimize-subtract-into-add +)
+
+;;; Does simple constant folding.  This works for everything that doesn't have side-effects
+;;; ALL operands must be constant.  Note that commutative-constant-folder
+;;; can hack this case perfectly well by himself for the functions he handles.
+(defun constant-fold-optimizer (form)
+  (if (every (cdr form) #'constant-form-p)
+      (stack-let ((values (multiple-value-list (eval form))))
+	(if (= (length values) 1)
+	    `',(first values)
+	    `(values ,@(mapcar #'(lambda (x) `',x) values))))
+      form))
+
+(defoptimizer (cl:the the-just-gets-in-the-way-of-optimizers) (form)
+  (matchp form
+    (('cl:the type subform)
+     (ignore type)
+     ;; in the NLC, we'll actually look at types
+     subform)
+    (* form)))
+
+(defoptimizer (values values-of-simple-form) (form)
+  (matchp form
+    (('values expr)
+     (if (or (selectq (destination-n-values *optimizer-destination*)
+	       ((0 1) t))
+	     (produces-single-value expr))
+	 expr
+	 form))
+    (* form)))
+
+
+;;; LDB/DPB.  There is also a transformer
+
+(add-optimizer cli::deposit-byte-internal dpbs-folder-optimizer)
+(add-optimizer cli::fixnum-deposit-byte-internal dpbs-folder-optimizer)
+(add-optimizer cli::char-deposit-byte-internal dpbs-folder-optimizer)
+
+;;; Combines adjacent (or overlapping) constant deposits for all internal
+;;; dpb functions
+(defun dpbs-folder-optimizer (form)
+  (block optimize
+    (matchp form
+      ((dpb value1 size1 position1 maybe-dpb)
+       (when (and (cl:constantp value1 *optimizer-environment*)
+		  (cl:constantp size1 *optimizer-environment*)
+		  (cl:constantp position1 *optimizer-environment*))
+	 (matchp maybe-dpb
+	   (((compiler:*or* dpb-again
+			    cli::deposit-byte-internal
+			    cli::char-deposit-byte-internal
+			    cli::fixnum-deposit-byte-internal)
+	     value2 size2 position2 background)
+	    (when (and (or (eq dpb dpb-again)
+			   (and (member dpb '(cli::deposit-byte-internal
+					       cli::fixnum-deposit-byte-internal))
+				(member dpb-again '(cli::deposit-byte-internal
+						     cli::fixnum-deposit-byte-internal))))
+		       (cl:constantp size2 *optimizer-environment*)
+		       (cl:constantp position2 *optimizer-environment*))
+	      (let* ((value1 (lt:evaluate-constant value1 *optimizer-environment*))
+		     (position1 (lt:evaluate-constant position1 *optimizer-environment*))
+		     (size1 (lt:evaluate-constant size1 *optimizer-environment*))
+		     (limit1 (+ position1 size1))
+		     (position2 (lt:evaluate-constant position2 *optimizer-environment*))
+		     (size2 (lt:evaluate-constant size2 *optimizer-environment*))
+		     (limit2 (+ position2 size2)))
+		(when (and ( position1 0)
+			   ( size1 0)
+			   ( position2 0)
+			   ( size2 0))
+		  (if (cl:constantp value2 *optimizer-environment*)
+		      (let ((value2 (lt:evaluate-constant value2 *optimizer-environment*)))
+			(when (or (eq dpb dpb-again)
+				  ;; for mixed case merge, dpb must not mung sign
+				  (and (or (eq dpb 'cli::fixnum-deposit-byte-internal)
+					   ( limit1 (1- (byte-size %%q-fixnum))))
+				       (or (eq dpb-again 'cli::fixnum-deposit-byte-internal)
+					   ( limit2 (1- (byte-size %%q-fixnum))))))
+			  #+meter-usage
+			  (incf *folder-calls*)
+			  (cond (( position2 position1 limit2)
+				 #+meter-usage
+				 (progn
+				   (incf *merges*)
+				   (when (eq dpb 'cli::char-deposit-byte-internal)
+				     (incf *char-merges*))
+				   (unless (eq dpb dpb-again)
+				     (incf *mixed-merges*)
+				     (if (eq dpb 'cli::deposit-byte-internal)
+					 (incf *upgrades*)
+					 (incf *downgrades*))))
+				 (let ((shift (- position1 position2)))
+				   (return-from optimize
+				     `(,dpb ,(dpb value1 (byte size1 shift) value2)
+				       ,(- (max limit1 limit2) position2) ,position2
+				       ,background))))
+				(( position1 position2 limit1)
+				 #+meter-usage
+				 (progn
+				   (incf *merges*)
+				   (when (eq dpb 'cli::char-deposit-byte-internal)
+				     (incf *char-merges*))
+				   (unless (eq dpb dpb-again)
+				     (incf *mixed-merges*)
+				     (if (eq dpb 'cli::deposit-byte-internal)
+					 (incf *upgrades*)
+					 (incf *downgrades*))))
+				 (let ((shift (- position2 position1)))
+				   (return-from optimize
+				     `(,dpb ,(dpb value1 (byte size1 0) (ash value2 shift))
+				       ,(- (max limit1 limit2) position1) ,position1
+				       ,background))))
+				;; They don't overlap, so evaluation-order is
+				;; irrelevant.  Sort so further optimization can
+				;; trigger
+				((< limit2 position1)
+				 #+meter-usage
+				 (progn
+				   (incf *sorts*)
+				   (when (eq dpb 'cli::char-deposit-byte-internal)
+				     (incf *char-sorts*))
+				   (unless (eq dpb dpb-again)
+				     (incf *mixed-sorts*)
+				     (if (eq dpb 'cli::deposit-byte-internal)
+					 (incf *sort-ups*)
+					 (incf *sort-downs*))))
+				 (return-from optimize
+				   `(,dpb-again ,value2 ,size2 ,position2
+				     (,dpb ,value1 ,size1 ,position1
+				      ,background)))))))
+		      ;; first value is constant, but second isn't
+		      ;; if they don't overlap, swap the constant down
+		      ;; in hopes it may meet other constants
+		      (when (or ( limit1 position2)
+				( limit2 position1))
+			(return-from optimize
+			  `(,dpb-again ,value2 ,size2 ,position2
+			    (,dpb ,value1 ,size1 ,position1
+			     ,background)))))))))))))
+    form))
+
+;;This ran for 100 000 iterations before I got bored, so I think the
+;;optimizer works
+#||
+(defun test-dpb-optimizers (&optional (verbose nil))
+  (loop with bit-limit = (byte-size sys:%%q-fixnum)
+	with fix-limit = (ash 1 bit-limit)
+	as test = (loop repeat 3
+			as size = (random bit-limit)
+			as position = (min (random bit-limit) (- bit-limit size))
+			with test = 'x
+			as fun = (nth (random 3) '(sys:%logdpb dpb char-dpb-internal))
+			as was-char-p = nil then char-p
+			as char-p = (eq fun 'char-dpb-internal)
+			do (setq test `(,fun
+					,(ldb (byte size position) (random fix-limit))
+					(byte ,size ,position)
+					,(cond ((and char-p (not was-char-p))
+						`(int-char ,test))
+					       ((and was-char-p (not char-p))
+						`(char-int ,test))
+					       (t test))))
+			finally (return `(lambda (x) ,test)))
+	count t
+	until (cl:listen)
+	do
+    (let ((optimized (compile nil test))
+	  (background (random fix-limit))
+	  test-result optimized-result)
+      (when verbose
+	(print test)
+	(disassemble optimized))
+      (unless (and (eql (setq test-result (funcall test background))
+		      (setq optimized-result (funcall optimized background)))
+		   #+test nil)
+	(cl:format t "
+Test result #x~8,'0X does not match optimized result #x~8,'0X.
+Mismatched bits:  #b~32,'0B
+For test:  ~
+~S~
+And code:  ~~VQ~
+" test-result optimized-result (logxor test-result optimized-result)
+test optimized #'disassemble)
+	(zl:dbg)))))
+||#
+
+;;; Character/string stuff
+
+(defoptimizer (char-int simple-char-int) (form)
+  (block optimizer
+    (compiler:matchp form
+      (('char-int char)
+       (when (cl:constantp char *optimizer-environment*)
+	 (let ((char-value (lt:evaluate-constant char *optimizer-environment*)))
+	   (unless (char-fat-p char-value)
+	     (return-from optimizer (char-int char-value)))))))
+    form))
+
+;; Can only fold this for standard character set.
+(defoptimizer (char-code simple-char-code) (form)
+  (if (and (= (length form) 2)
+	   (constant-form-p (second form)))
+      (let ((c (constant-evaluator (second form))))
+	(if (and (characterp c)
+		 (< (char-code c) 256.))
+	    (char-code c)
+	    form))
+      form))
+
+(defoptimizer (code-char simple-code-char) (form)
+  (if (and ( (length form) 2)
+	   (loop for other in (rest2 form)
+		 always (or (equal other '0) (equal other ''0))))
+      (if (constant-form-p (second form))
+	  (let ((c (constant-evaluator (second form))))
+	    (if (< c 256.)
+		(code-char c)
+		form))
+	  `(si:%make-character (ldb (byte (byte-size %%char-code) 0) ,(second form))))      
+      form))
+
+(defoptimizer (make-char simple-make-char) (form)
+  (if (and ( (length form) 2)
+	   (loop for other in (rest2 form)
+		 always (or (equal other '0) (equal other ''0))))
+      `(si:%make-character (char-code ,(second form)))
+      form))
+
+(defun compile-time-parse-character-style (style)
+  (condition-case (error-or-style)
+       (si:parse-character-style style)
+     (error (warn "~S is not a character style:~%  ~~A~" style error-or-style)
+	    ;; Return D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")nil0 to the caller.
+	    nil)
+     (:no-error error-or-style)))
+
+;;; This makes it reasonable to call 1make-character0 in inner loops.
+;;; (at least with constant style)
+(defoptimizer (make-character simple-make-character) (form)
+  (destructuring-bind (char &key (bits 0) (style si:*null-style*)) (cdr form)
+    (let ((constant-char (when (constant-form-p char)
+			   (constant-evaluator char)))
+	  (constant-bits (when (constant-form-p bits)
+			   (constant-evaluator bits)))
+	  (constant-style (typecase style
+			    (si:character-style style)
+			    (otherwise 
+			      (when (constant-form-p style)
+				(constant-evaluator style))))))
+      (when constant-style
+	(setq constant-style
+	      (compile-time-parse-character-style constant-style)))
+      (when constant-char
+	;; Fill in what fields we can at compile time.
+	(when constant-bits
+	  (setf (si:char-bits constant-char) constant-bits))
+	(if (or (char-equal constant-char #\Return)
+		(and constant-bits (not (zerop constant-bits))))
+	    (setf (si:char-style constant-char) '(nil nil nil))
+	  (when constant-style
+	    (setf (si:char-style constant-char) constant-style))))
+      (if constant-char
+	  (cond ((and constant-bits constant-style)
+		 constant-char)
+		((eql constant-bits 0)
+		 (if (char-equal constant-char #\Return)
+		     `(progn ,style #\Return)
+		   `(char-dpb-internal (si:style-index ,style t) %%char-style ,constant-char)))
+		(constant-bits
+		 `(progn ,style ,constant-char))
+		;; Otherwise, it's too hairy and big to open-code.
+		(constant-style
+		 `(si:make-character-internal ,constant-char ,bits ,constant-style))
+		(t form))
+	(if constant-style
+	    ;; This knows that the bits field is immediately to the left of the
+	    ;; style-index field.
+	    (cond ((eql constant-bits 0)
+		   (let ((char-var (gensymbol "CHAR-")))
+		     `(let ((,char-var ,char))
+			;; We use 1char=0, since it's illegal for there to be any #\Return that's
+			;; not.
+			(if (char= ,char-var #\Return)
+			    #\Return
+			  (si:char-dpb-internal (si:style-index ',constant-style t)
+						sys:%%char-style-and-bits ,char-var)))))
+		  (constant-bits
+		   ;; Style is ignored when we have bits.
+		   ;; style is constant, so we can just drop it entirely.
+		   `(si:char-dpb-internal ,(lsh constant-bits (byte-size %%char-style))
+					  sys:%%char-style-and-bits ,char))
+		  (t `(si:make-character-internal ,char ,bits ,constant-style)))
+	  form)))))
+
+(defoptimizer (si:style-index trivial-style-index) (form)
+  (destructuring-bind (style &optional allocate-p) (cdr form)
+    (if (or (and (not (typep style 'si:character-style))
+		 (not (constant-form-p style))))
+	form
+      (typecase style
+	(si:character-style)
+	(otherwise (setq style (constant-evaluator style))))
+      (if (or (null style)
+	      (equal style '(nil nil nil))
+	      (equal style si:*null-style*))
+	  ;; This one's always the same
+	  0
+	(if (or (not allocate-p)
+		(not (constant-form-p allocate-p))
+		(not (constant-evaluator allocate-p)))
+	    form
+	  (let ((nstyle (compile-time-parse-character-style style)))
+	    (if (null nstyle)
+		form
+	      `(or (si:cs-index ',nstyle)
+		   (si:lookup-style-index ',nstyle)))))))))
+
+(defoptimizer (char-bit simple-char-bit) (form)
+  (matchp form
+    (('char-bit char bit-name)
+     (if (constant-form-p bit-name)
+	 `(bit-test ,(si:name-bit (constant-evaluator bit-name)) (char-bits ,char))
+	 form))
+    (* form)))
+
+(defoptimizer (digit-char simple-digit-char) (form)
+  (matchp form
+    (('digit-char weight radix)
+     (if (cl:constantp radix *optimizer-environment*)
+	 (if (cl:constantp weight *optimizer-environment*)
+	     (digit-char (lt:evaluate-constant weight *optimizer-environment*)
+			 (lt:evaluate-constant radix *optimizer-environment*))
+	     (once-only (weight &environment *optimizer-environment*)
+	       `(and (not (minusp ,weight))
+		     (< ,weight ,(lt:evaluate-constant radix *optimizer-environment*))
+		     (aref si:*weight-digits* ,weight))))
+	 form))
+    (('digit-char weight)
+     (if (cl:constantp weight *optimizer-environment*)
+	 (digit-char (lt:evaluate-constant weight *optimizer-environment*))
+	 (once-only (weight &environment *optimizer-environment*)
+	   `(and (not (minusp ,weight))
+		 (< ,weight 10.)
+		 (aref si:*weight-digits* ,weight)))))
+    (* form)))
+
+(defoptimizer (member member-memq memq) (form)
+  (matchp form
+    (('member item list)
+     (cond ((or (equal-same-as-eq item)
+		(list-equal-same-as-eq list))
+	    `(memq ,item ,list))
+	   ((or (equal-same-as-eql item)
+		(list-equal-same-as-eql list))
+	    `(cl:member ,item ,list))
+	 (t form)))
+    (* form)))
+
+(defoptimizer (assoc assoc-assq assq) (form)
+  (matchp form
+    (('assoc item alist)
+     (cond ((or (equal-same-as-eq item)
+		(alist-equal-same-as-eq alist))
+	    `(assq ,item ,alist))
+	   ((or (equal-same-as-eql item)
+		(alist-equal-same-as-eql alist))
+	    `(cl:assoc ,item ,alist))
+	   (t form)))
+    (* form)))
+
+;; These optimizations are not only useful for speed, but also
+;; to keep the working set down by removing a list memory reference.
+;; The ',literal will get optimized out by phase 3 when called for predicateness.
+
+(defun degenerate-mem (test item list)
+  (matchp list
+    ('nil
+     `(progn ,item nil))
+    (('quote literal)
+     (matchp literal
+       ((elem)		`(and (,test ,item ',elem )
+			      ',literal))
+       #+ignore ; until phase-3 can generate good code for this...
+       ((elem1 elem2)	`(or (and (,test ,item ',elem1)
+				  ',literal)
+			     (and (,test ,item ',elem2)
+				  ',(cdr literal))))))))
+
+(defoptimizer (memq memq-eq eq) (form)
+  (matchp form
+    (('memq item list)
+     (or (degenerate-mem 'eq item list) form))
+    (* form)))
+
+(defoptimizer (member member-equal equal) (form)
+  (matchp form
+    (('member item list)
+     (or (degenerate-mem 'equal item list) form))
+    (* form)))
+
+(si:allow-redefinition 'cl:member 'defoptimizer)
+					
+(defoptimizer (cl:member cl-member-equal eql) (form)
+  (matchp form
+    (('cl:member item list)
+     (or (degenerate-mem 'eql item list)
+	 form))
+    (* form)))
+
+;;;
+
+(defun synonym-function (form)
+  (let ((function (get (first form) 'synonym-function)))
+    (if function
+	(list* function (rest1 form))
+	form)))
+
+
+
+(defoptimizer (prog2 prog2-expand) (form)
+  (matchp form
+    (('prog2 first-form second-form . rest-of-forms)
+     `(progn ,first-form (prog1 ,second-form . ,rest-of-forms)))
+    (* form)))
+
+;;;
+
+(defoptimizer (boundp boundp-of-constant) (form)
+  (matchp form
+    (('boundp ('quote var-name))
+     `(location-boundp ',(locf (symeval var-name))))
+    (* form)))
+
+(defoptimizer (makunbound makunbound-of-constant) (form)
+  (matchp form
+    (('makunbound ('quote var-name))
+     `(location-makunbound ',(locf (symeval var-name))))
+    (* form)))
+
+(defoptimizer (fboundp fboundp-of-constant) (form)
+  (matchp form
+    (('fboundp ('quote var-name))
+     `(location-boundp ',(locf (fsymeval var-name))))
+    (* form)))
+
+(defoptimizer (fmakunbound fmakunbound-of-constant) (form)
+  (matchp form
+    (('fmakunbound ('quote var-name))
+     `(location-makunbound ',(locf (fsymeval var-name))))
+    (* form)))
+
+;;;
+
+(add-optimizer ldb ldb-optimizer cli::load-byte-internal)
+(add-optimizer %logldb ldb-optimizer cli::fixnum-load-byte-internal)
+(add-optimizer %p-ldb ldb-optimizer cli::%p-load-byte-internal)
+(add-optimizer char-ldb-internal ldb-optimizer cli::char-load-byte-internal)
+
+(defun ldb-optimizer (form)
+  (matchp form
+    ((fcn ppss . args)
+     (let ((byte-fcn (selectq fcn
+		       (ldb 'cli::load-byte-internal)
+		       (%logldb 'cli::fixnum-load-byte-internal)
+		       (%p-ldb 'cli::%p-load-byte-internal)
+		       (char-ldb-internal 'cli::char-load-byte-internal))))
+       (cond ((constant-form-p ppss)
+	      (let ((ppss (constant-evaluator ppss)))
+		`(,byte-fcn ,(byte-size ppss) ,(byte-position ppss) ,@args)))
+	     ((and (listp ppss)
+		   (= (length ppss) 3)
+		   (eq (first ppss) 'byte))
+	      `(,byte-fcn ,(second ppss) ,(third ppss) ,@args))
+	     (t form))))
+    (* form)))
+
+(add-optimizer dpb dpb-optimizer cli::deposit-byte-internal)
+(add-optimizer %logdpb dpb-optimizer cli::fixnum-deposit-byte-internal)
+(add-optimizer %p-dpb dpb-optimizer cli::%p-deposit-byte-internal)
+(add-optimizer char-dpb-internal compiler:dpb-optimizer cli::char-deposit-byte-internal)
+
+(defun dpb-optimizer (form)
+  (matchp form
+    ((fcn value ppss . args)
+     (let ((byte-fcn (selectq fcn
+		       (dpb 'cli::deposit-byte-internal)
+		       (%logdpb 'cli::fixnum-deposit-byte-internal)
+		       (%p-dpb 'cli::%p-deposit-byte-internal)
+		       (char-dpb-internal 'cli::char-deposit-byte-internal))))
+       (cond ((constant-form-p ppss)
+	      (let ((ppss (constant-evaluator ppss)))
+		`(,byte-fcn ,value ,(byte-size ppss) ,(byte-position ppss)
+		  ,@args)))
+	     ((and (listp ppss)
+		   (= (length ppss) 3)
+		   (eq (first ppss) 'byte))
+	      `(,byte-fcn ,value ,(second ppss) ,(third ppss) ,@args))
+	     (t form))))
+    (* form)))
+
+;;; only need this on the 3600, where extended-number accessors use %p-contents-offset
+#+3600
+(defoptimizer (%p-contents-offset constant-fold-%p-contents-offset) (form)
+  (block optimizer
+    (matchp form
+      (('%p-contents-offset pointer offset)
+       (when (and (si:extended-number-p pointer)
+		  (cl:constantp offset *optimizer-environment*))
+	 (return-from optimizer (eval form *optimizer-environment*)))))
+    form))
+
+(defoptimizer (aref aref-of-constant) (form)
+  (matchp form
+    ((ignore array . indices)
+     (when (and (constant-form-p array)
+		(cl:every #'constant-form-p indices))
+       (let ((array (constant-evaluator array)))
+	 (when (or (stringp array) (cl:bit-vector-p array))
+	   (return-from aref-of-constant
+	     (cl:apply #'aref array (mapcar #'constant-evaluator indices))))))))
+  form)
+
+(defoptimizer (closure closure-over-nothing) (form)
+  (matchp form
+    (('closure symbol-list function)
+     (if (or (null symbol-list)
+	     (and (constant-form-p symbol-list)
+		  (null (constant-evaluator symbol-list))))
+	 function
+	 form))
+    (* form)))
+
+(defoptimizer (%fixnum-floor optimize-%fixnum-floor) (form)
+  (matchp form
+    (('%fixnum-floor x y)
+     (if (and (fixnump y)
+	      (plusp y)
+	      (zerop (logand y (1- y))))
+	 (let ((l (cl:integer-length y)))
+	   `(%logldb (byte ,(- 33. l) ,(- l 1)) ,x))
+       (warn "The divisor for ~S, ~S, is not a constant power of 2." '%fixnum-floor y)
+       `(floor ,x ,y)))
+    (* form)))
+
+(defoptimizer (%fixnum-mod optimize-%fixnum-mod) (form)
+  (matchp form
+    (('%fixnum-mod x y)
+     (if (and (fixnump y)
+	      (plusp y)
+	      (zerop (logand y (1- y))))
+	 (let ((l (cl:integer-length y)))
+	   `(%logldb (byte ,(- l 1) 0) ,x))
+       (warn "The divisor for ~S, ~S, is not a constant power of 2." '%fixnum-mod y)
+       `(mod ,x ,y)))
+    (* form)))
+
+(defoptimizer (%fixnum-ceiling optimize-%fixnum-ceiling) (form)
+  (matchp form
+    (('%fixnum-ceiling x y)
+     (if (and (fixnump y)
+	      (plusp y)
+	      (zerop (logand y (1- y))))
+	 (let ((l (cl:integer-length y)))
+	   `(%logldb (byte ,(- 33. l) ,(- l 1)) (%32-bit-plus ,(1- y) ,x)))
+       (warn "The divisor for ~S, ~S, is not a constant power of 2." '%fixnum-ceiling y)
+       `(ceiling ,x ,y)))
+    (* form)))
+
+(defoptimizer (%fixnum-multiply optimize-%fixnum-multiply) (form)
+  (matchp form
+    (('%fixnum-multiply x y . rest)
+     (when (and (fixnump y)
+		(plusp y)
+		(zerop (logand y (1- y))))
+       (swapf x y))
+     (if (and (fixnump x)
+	      (plusp x)
+	      (zerop (logand x (1- x))))
+	 (if (and (= x 2) (null rest))
+	     `(* ,y 2)				;* optimizer is best for this case.
+	     (let ((l (cl:integer-length x)))
+	       `(%logdpb ,y (byte ,(- 33. l) ,(- l 1))
+			 ,(if rest (car rest) 0))))
+	 (warn "Neither of the arguments to ~S:  ~S or ~S, is a constant power of 2."
+	       '%fixnum-multiply x y)
+	 (if rest
+	     `(+ (* ,x ,y) . ,rest)
+	     `(* ,x ,y))))
+    (* form)))
+
+#||
+(defun test-%fixnum-functions ()
+  (flet ((test (form x y)
+	   (unless (eql x y)
+	     (format t "~%~S returned ~S instead of ~S" form x y))))
+    (let ((ones (lsh -1 -1))
+	  (one 1))
+      ;; These four should generate warnings.
+      (test '(%fixnum-floor ones 3) (%fixnum-floor ones 3) (floor ones 3))
+      (test '(%fixnum-ceiling ones 3) (%fixnum-ceiling ones 3) (ceiling ones 3))
+      (test '(%fixnum-mod ones 3) (%fixnum-mod ones 3) (mod ones 3))
+      (test '(%fixnum-multiply ones 3) (%fixnum-multiply ones 3) (* ones 3))
+      . #.(append (loop for function in '(%fixnum-floor %fixnum-ceiling
+					  %fixnum-mod %fixnum-multiply)
+			for equiv in '(floor ceiling mod *)
+			for x in '(ones ones ones one)
+			append (loop for shift below 31.
+				     as val = (lsh 1 shift)
+				     collect `(test '(,function ,x ,val)
+						    (,function ,x ,val)
+						    (,equiv ,x ,val))))
+		  (let ((function '%fixnum-multiply)
+			(equiv '*)
+			(x 'one))
+		    (loop for shift below 31.
+			  as val = (lsh 1 shift)
+			  collect `(test '(,function ,val ,x)
+					 (,function ,val ,x)
+					 (,equiv ,val ,x))))
+		  (loop for shift below 31.
+			as background = (if (zerop shift) 0 (ldb (byte (1- shift) 0) -1))
+			as val = (lsh 1 shift)
+			collect `(test '(%fixnum-multiply one ,val ,background)
+				       (%fixnum-multiply one ,val ,background)
+				       (+ (* one ,val) ,background)))))))
+||#
+
+;I'm not sure why backquote doesn't do this for me, but it probably has a good reason
+(defun optimize-constant-lists (form)
+  (setq form (optimize-form form nil :do-macro-expansion t
+			    :do-named-constants t
+			    :do-inline-forms t
+			    :do-constant-folding t
+			    :do-function-args nil
+			    :repeat t))
+  (cond ((atom form) form)
+	((eq (car form) 'list)
+	 (loop for elem in (cdr form)
+	       collect (optimize-constant-lists elem) into args
+	       finally (return (if (loop for arg in args
+					 always (constant-form-p arg))
+				   `(quote ,(mapcar #'constant-evaluator args))
+				   `(list ,@args)))))
+	(t form)))
+
+(defun optimize-character-comparison (form)
+  (matchp form
+    ((function . args)
+     (let ((expander (get function 'comparison-expander)))
+       (flet ((expand (x y)
+		(funcall expander x y)))
+	 (if expander
+	     (cl:case (length args)
+	       (2 (expand (first args) (second args)))
+	       ((3 4)
+		(let ((temps (loop for x in args do (ignore x) collect (gensym))))
+		  (lt:let-subst
+		    temps args
+		    `(and ,@(loop for x = (first temps) then y
+				  for y in (rest1 temps)
+				  for x-arg = (first args) then y-arg
+				  for y-arg in (rest1 args)
+				  collect (expand (if (numberp x-arg) x-arg x)
+						  (if (numberp y-arg) y-arg y))))
+				*optimizer-environment*)))
+	       (1 (let ((temp (gensym)))
+		    (lt:let-subst
+		      `(,temp) `(,(car args))
+		      `(progn
+			 (compiler:%error-unless (cl:typep ,temp 'cl:character)
+			   (error "The first argument to ~s, ~s, is not a character."
+				  ',function ,temp))
+			 t)
+		      *optimizer-environment*)))
+	       (otherwise form))
+	     form))))
+    (* form)))
+
+(defun optimize-character-not-equal-comparison (form)
+  (matchp form
+    ((function . args)
+     (let ((expander (get function 'comparison-not-equal-expander)))
+       (flet ((expand (x y)
+		(funcall expander x y)))
+	 (if expander
+	     (cl:case (length args)
+	       (2 (expand (first args) (second args)))
+	       ((3 4)
+		(let ((temps (loop for x in args do (ignore x) collect (gensym))))
+		  (lt:let-subst
+		    temps args
+		    `(and ,@(loop for (x . rest) on temps
+				  while rest
+				  nconc (loop for y in rest
+					      collect (expand x y))))
+		    *optimizer-environment*)))
+	       (1 (let ((temp (gensym)))
+		    (lt:let-subst
+		      `(,temp) `(,(car args))
+		      `(progn
+			 (compiler:%error-unless (cl:typep ,temp 'cl:character)
+			   (error "The first argument to ~s, ~s, is not a character."
+				  ',function ,temp))
+			 t)
+		      *optimizer-environment*)) )
+	       (otherwise form))
+	     form))))
+    (* form)))
+
+(defoptimizer (setq break-up-setq) (form)
+  (matchp form
+    (('setq) nil)
+    (('setq var-name value)
+     (multiple-value-bind (macro-p expansion)
+	 (lt:symbol-macro-p var-name *optimizer-environment*)
+       (if macro-p
+	   `(cl:setf ,expansion ,value)
+	   form)))
+    (('setq . rest-of-body)
+     `(progn
+	,@(loop while rest-of-body
+		collect
+		  (matchp rest-of-body
+		    ((var-name value . more-body)
+		     (multiple-value-bind (macro-p expansion)
+			 (lt:symbol-macro-p var-name *optimizer-environment*)
+		       (setq rest-of-body more-body)
+		       (if macro-p
+			   `(cl:setf ,expansion ,value)
+			   `(setq ,var-name ,value))))
+		    (* (return-from break-up-setq form))))))
+    (* form)))
+
+(defoptimizer (variable-location locf-symbol-macro) (form)
+  (matchp form
+    (('variable-location variable)
+     (multiple-value-bind (macrop expansion)
+	 (lt:symbol-macro-p variable *optimizer-environment*)
+       (when macrop
+	 (return-from locf-symbol-macro
+	   `(locf ,expansion))))))
+  form)
+
+(defoptimizer (multiple-value break-up-multiple-value) (form)
+  (matchp form
+    (('multiple-value original-variables value)
+     (let ((variables	;strip trailing NILs
+	     (let ((rev-variables (reverse original-variables)))
+	       (loop while (and rev-variables (null (car rev-variables))) doing
+		 (setq rev-variables (cdr rev-variables)))
+	       (nreverse rev-variables))))
+       (when (null variables)
+	 (return-from break-up-multiple-value
+	   `(values ,value)))
+       (when (null (cdr variables))
+	 (let ((var (car variables)))
+	   (unless (symbolp var)
+	     (return-from break-up-multiple-value form))
+	   (return-from break-up-multiple-value
+	     `(cl:setf ,var ,value))))
+       (dolist (var variables)
+	 (unless (symbolp var)
+	   (return-from break-up-multiple-value form))
+	 (when var
+	   (when (lt:symbol-macro-p var *optimizer-environment*)
+	     (return-from break-up-multiple-value
+	       (let ((setters
+		       (mapcar #'(lambda (var)
+				   (and var
+					(multiple-value-bind (macrop expansion)
+					    (lt:symbol-macro-p var *optimizer-environment*)
+					  (if macrop
+					      `(cl:setf ,expansion ,(gensym))
+					      `(setq ,var ,(gensym))))))
+			       variables)))
+		 (when (null (first setters))
+		   (setf (first setters) `(ignore nil ,(gensym))))
+		 (return-from break-up-multiple-value
+		   `(multiple-value-bind ,(mapcar #'third setters) ,value
+		      ,@setters
+		      ,(third (first setters)))))))))
+       (unless (equal variables original-variables)
+	 (return-from break-up-multiple-value
+	   `(multiple-value ,variables ,value))))))
+  form)
+
+(define-compile-only-optimizer (sys:initialize-logic-variable initialize-logic-variable-expand)
+			       (form)
+  (matchp form
+    (('sys:initialize-logic-variable location)
+     `(%p-store-contents ,location (%make-pointer dtp-logic-variable (%push-stack-value 0))))
+    (* form)))
+
+(defoptimizer (eval-when turn-into-progn) (form)
+  (matchp form
+    (('eval-when times . body)
+     (multiple-value-bind (ignore ignore eval-p)
+	 (si:check-eval-when-times times :error-function #'phase-1-warning)
+       (if eval-p
+	   `(progn ,@body)
+	   nil)))
+    (* form)))
+
+(define-compile-only-optimizer (si:defconst-1 compiled-defconst-optimizer
+					      si:defconst-1-internal)
+			       (form)
+  (matchp form
+    ((`si:defconst-1 symbol value)
+     `(si:defconst-1-internal ',symbol ,value))
+    ((`si:defconst-1 symbol value documentation)
+     `(si:defconst-1-internal ',symbol ,value ',documentation))
+    (* (phase-1-bad-form))))
+
+(define-compile-only-optimizer (si:defconstant-1 compiled-defconstant-optimizer
+						 lt::defconstant-load-internal)
+			       (form)
+  (matchp form
+    ((`si:defconstant-1 symbol value)
+     `(lt::defconstant-load-internal ',symbol ,value nil))
+    ((`si:defconstant-1 symbol value documentation)
+     `(lt::defconstant-load-internal ',symbol ,value ',documentation))
+    (* (phase-1-bad-form))))
+
+(define-compile-only-optimizer (si:defvar-1 compiled-defvar-optimizer)
+			       (form)
+  (matchp form
+    (('si:defvar-1 symbol)
+     `(progn (lt::defvar-1-internal-1 ',symbol nil nil)
+	     ',symbol))
+    (('si:defvar-1 symbol value . rest)
+     (when (cddr rest) (phase-1-bad-form))
+     `(progn
+	(when (lt::defvar-1-internal-1 ',symbol ',(first rest) ,(second rest))
+	  (when (lt::defvar-1-internal-2 ',symbol)
+	    (cl:locally
+	      (declare (special ,symbol))
+	      (setq ,symbol ,value))))
+	',symbol))
+    (* (phase-1-bad-form))))
+
+(define-compile-only-optimizer (clos:slot-boundp slot-boundp-optimizer)
+			       (form)
+  (matchp form
+    (('clos:slot-boundp instance slot-name)
+     (when (cl:constantp slot-name *optimizer-environment*)
+       ;; Only optimize when SLOT-NAME is constant, since that's the only case we can
+       ;; use a mapping table.
+       (return-from slot-boundp-optimizer
+	 `(location-boundp (locf (clos:slot-value ,instance ,slot-name)))))))
+  form)
+
+(define-compile-only-optimizer (clos:slot-makunbound slot-makunbound-optimizer)
+			       (form)
+  (matchp form
+    (('clos:slot-makunbound instance slot-name)
+     (when (cl:constantp slot-name *optimizer-environment*)
+       (let ((name (lt:evaluate-constant slot-name *optimizer-environment*)))
+	 ;; Only optimize when SLOT-NAME is constant, since that's the only case we can
+	 ;; use a mapping table, and since we need the value twice.
+	 (return-from slot-makunbound-optimizer
+	   `(location-makunbound
+	      (locf (clos:slot-value ,instance ',name))
+	      ',name))))))
+  form)
+
+(defun optimize-fixnum-operation (form replacement)
+  (matchp form
+    ((operation (function . args) divisor-form)
+     operation
+     (when (and (function-return-type-subtypep (function-return-type function)
+					       `(cl:integer 0 ,cl:most-positive-fixnum))
+		(cl:constantp divisor-form *optimizer-environment*))
+       (let ((divisor (lt:evaluate-constant divisor-form *optimizer-environment*)))
+	 (when (and (fixnump divisor)
+		    (plusp divisor)
+		    (zerop (logand divisor (1- divisor)))
+		    (eql 1 (destination-n-values *optimizer-destination*)))
+	   (return-from optimize-fixnum-operation
+	     `(,replacement (,function ,@args) ,divisor))))))
+    (*))
+  form)
+
+(define-compile-only-optimizer (floor floor-to-fixnum-floor-optimizer) (form)
+  (optimize-fixnum-operation form 'si:%fixnum-floor))
+
+(define-compile-only-optimizer (ceiling ceiling-to-fixnum-ceiling-optimizer) (form)
+  (optimize-fixnum-operation form 'si:%fixnum-ceiling))
+
+(defoptimizer (unwind-protect unwind-no-cleanups)
+	      (form)
+  (matchp form
+    (('unwind-protect protected-thing)
+     protected-thing)
+    (* form)))

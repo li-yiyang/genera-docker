@@ -1,0 +1,2704 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: DYNAMIC-WINDOWS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+(defmacro minf-or (place &rest minima)
+  `(if (null ,place)
+       (setf ,place (min . ,minima))
+       (setf ,place (min ,place . ,minima))))
+
+(defmacro maxf-or (place &rest maxima)
+  `(if (null ,place)
+       (setf ,place (max . ,maxima))
+       (setf ,place (max ,place . ,maxima))))
+
+;;; Take an option off of a property list, without destructively modifying the list and
+;;; return it.
+(defmacro option-remf (place option)
+  `(let ((.value. (getf ,place ,option (locf ,place))))
+     (unless (eq .value. (locf ,place))
+       (setf ,place (with-stack-list (.keywords. ,option)
+		      (si:rem-keywords ,place .keywords.)))
+       .value.)))
+
+(compiler:make-obsolete value-snapshot-continuation
+			"Please use NAMED-value-snapshot-continuation instead.")
+(defmacro value-snapshot-continuation (var-list &body body)
+  `(format-output-macro-continuation nil ,var-list . ,body))
+
+(defmacro named-value-snapshot-continuation (name var-list &body body)
+  `(format-output-macro-continuation (:name ,name) ,var-list . ,body))
+
+;;; This is the preferred interface; it gives the programmer to option of controlling all
+;;; snapshotting.
+(defmacro format-output-macro-continuation (options var-list &body body
+							     &environment environment)
+  (declare (arglist (&key name (warn-p t) (dont-snapshot-variables nil))
+		    var-list &body body))
+  (apply #'format-output-macro-continuation-internal var-list body
+	 :environment environment options))
+
+;;; This can only be used if &body doesn't have to be stored away. 
+;;; &body is a STACK-consed closure!
+(defmacro named-continuation (name var-list &body body &environment environment)
+  (declare (compiler:do-not-record-macroexpansions))
+  (named-continuation-internal name var-list body environment t))
+
+;;; The compiler has a tendency to recursively expand things a zillion times.
+;;; Try to keep down the number of warnings.
+(defvar-standard *snapshotted-variables-warned-already* nil)
+(defvar-standard *snapshotted-variables-suppress-warning* nil)
+
+;;; Workhorse of variable formatting.
+;;; :warn-p -- warn if any variables that are being snapshotted are also being set.
+;;; :dont-snapshot-variables -- a list or t, meaning no snapshotting.
+;;; :snapshot-as-arguments -- Instead of producing a closure, produce a
+;;;   function with no free variables and a list of argument forms.
+(defun format-output-macro-continuation-internal (var-list body
+						  &key environment name (warn-p t)
+						       (dont-snapshot-variables nil dsv-p)
+						       (setting-snapshot-variables nil)
+						       (snapshot-as-arguments nil))
+  (declare (values function arguments))
+  (flet ((cant-snapshot-variable? (variable-name)
+	   (or (eql 'self variable-name)
+	       (not (eql :lexical (fcli::variable-information
+				    variable-name environment)))))
+	 (form-free-variables (form)
+	   (let ((*snapshotted-variables-suppress-warning*
+		   (or *snapshotted-variables-suppress-warning* warn-p)))
+	     (lt::form-free-variables-and-symbol-macros form environment)))
+	 (form-variables-set (form)
+	   (let ((*snapshotted-variables-suppress-warning*
+		   (or *snapshotted-variables-suppress-warning* warn-p)))
+	     (lt:mapforms #'(lambda (subform kind usage state)
+			      (ignore usage)	;I think both kind and usage will be set.
+			      (when (and (eq kind 'set)
+					 (symbolp subform)
+					 (not (member subform lt:*mapforms-bound-variables*)))
+				(pushnew subform state))
+			      state)
+			  form :bound-variables nil :environment environment))))
+
+    (let* ((form `#'(zl:named-lambda ,name ,var-list ,@body))
+	   (free-vars (form-free-variables form))
+	   (set-vars (form-variables-set form)))
+
+	(setq free-vars (unless (eq dont-snapshot-variables t)
+			  (set-difference free-vars dont-snapshot-variables)))
+	(when snapshot-as-arguments
+	  (setq var-list (append var-list free-vars)))
+
+	(setq free-vars (remove-if #'cant-snapshot-variable? free-vars))
+
+	(setq set-vars (when (and warn-p (not *snapshotted-variables-suppress-warning*))
+			 (set-difference (intersection set-vars free-vars)
+					 (union setting-snapshot-variables
+						*snapshotted-variables-warned-already*))))
+	(when set-vars
+	  (warn ()
+		;; I'm sorry about this, but warn only talks this language.
+		"The variable~P ~{~S~^, ~} ~:[is~;are~] being set inside a snapshot of ~
+~:[that~;those~] variable~P~@[ 
+  by ~S~]
+This may not produce the desired effect.
+If you do not need to propagate the changed variable outside the snapshotting,
+  make a copy of it with LET inside ~:[~*the formatted output macro~;~S~].~:[~*~*~;
+If you want to suppress the snapshotting so that the setting will work,
+  use the ~S option to ~S.~]
+See the documentation on formatted output macro variable snapshotting for more information."
+		(length set-vars) set-vars (rest set-vars) (rest set-vars) (length set-vars)
+		name name name dsv-p :dont-snapshot-variables name))
+	
+	(setq form (named-continuation-internal name var-list body environment nil))
+	(when (and free-vars (not snapshot-as-arguments))
+	  (setq form `(let ,(loop for var in free-vars
+				  collect `(,var ,var))
+			,form)))
+	(when set-vars
+	  (setq form `(compiler-let ((*snapshotted-variables-warned-already*
+				       (append ',set-vars
+					       *snapshotted-variables-warned-already*)))
+			,form)))
+	
+	(values form var-list))))
+
+(defun named-continuation-internal (name var-list body environment on-stack)
+  (flet ((cant-bind-variable? (variable-name)
+	   (or (eql 'self variable-name)
+	       (eql 'scl:instance
+		    (fcli::variable-information variable-name environment)))))
+    (let* ((list-of-changes nil)
+	   (formal-vars (loop for var in var-list
+			      as var-name = (if (listp var) (car var) var)
+			      collect (if (not (cant-bind-variable? var-name))
+					  var
+					  (let ((new-var-name (gensym)))
+					    (push `(,var-name ,new-var-name)
+						  list-of-changes)
+					    (if (listp var)
+						(cons new-var-name (cdr var))
+						new-var-name)))))
+	   (lambda `#'(zl:named-lambda
+			,name ,formal-vars
+			,@(when on-stack
+			    '((declare (sys:downward-function))))
+			,@body)))
+      (when list-of-changes
+	(setf lambda (lt:copyforms
+		       #'(lambda (subform kind ignore &rest ignore)
+			   (let ((replacement (and (or (eql 'lt:symeval kind)
+						       (eql 'lt:let kind))
+						   (assoc subform list-of-changes))))
+			     (if replacement
+				 (values (second replacement) t)
+				 (values subform nil))))
+		       lambda :environment environment)))
+      lambda)))
+
+(defmacro format-output-macro-default-stream (var)
+  `(case ,var
+     ((t nil) (setq ,var '*standard-output*))
+     ((*terminal-io* tv:selected-window tv:mouse-window)
+      (warn () "It is dangerous to bind ~S to an encapsulated stream.
+Use ~S or a lexical variable instead." ,var '*standard-output*))))
+
+(defmacro with-output-as-presentation ((&rest options
+					&key stream dont-snapshot-variables type
+					&allow-other-keys)
+				       &body body &environment environment)
+  (declare (arglist (&key stream object type form location
+			  (check-type *present-checks-type*)
+			  (single-box nil)
+			  (allow-sensitive-inferiors t) (allow-sensitive-raw-text t)
+			  (redisplay-place-holder nil))
+		    &body body)
+	   (zwei:indentation 0 3 1 1))
+  (check-presentation-type-argument type)
+  (format-output-macro-default-stream stream)
+  (multiple-value-bind (function arguments)
+      (format-output-macro-continuation-internal (list stream) body
+	:environment environment
+	:name 'with-output-as-presentation
+	:dont-snapshot-variables dont-snapshot-variables
+	:snapshot-as-arguments t)
+    `(with-stack-list (continuation-args ,@arguments)
+       (send ,stream :output-as-presentation-1 ,function continuation-args
+	     ,@(si:rem-keywords options '(:stream :dont-snapshot-variables))))))
+
+
+(defmethod (:unclaimed-message encapsulating-output-stream) (op &rest args)
+  (lexpr-send stream op args))
+
+(defmethod (:output-as-presentation encapsulating-output-stream)
+	   (continuation xstream &rest args)
+  (lexpr-send stream :output-as-presentation continuation xstream args))
+
+(defmethod (:output-as-presentation-1 encapsulating-output-stream)
+	   (continuation continuation-args &rest args)
+  (lexpr-send stream :output-as-presentation-1 continuation continuation-args args))
+
+(defmethod (:print encapsulating-output-stream) (&rest args)
+  (apply #'si:print-with-sensitivity self args))
+
+(defmethod (:gprint encapsulating-output-stream) (object suggested-format xstream)
+  (si:gprint-with-sensitivity xstream object suggested-format))
+
+;;; Is this safe?  No.
+(defmethod (:size-in-characters encapsulating-output-stream) ()
+  (if (operation-handled-p stream :size-in-characters)
+      (send stream :size-in-characters)
+      (values 9999 9999)))
+
+(defmethod (:inside-size encapsulating-output-stream) ()
+  (send stream :inside-size))
+
+(defmethod (:inside-width encapsulating-output-stream) ()
+  (send stream :inside-width))
+
+(defmethod (:inside-height encapsulating-output-stream) ()
+  (send stream :inside-height))
+
+(defmethod (:visible-cursorpos-limits encapsulating-output-stream) (&rest args)
+  (lexpr-send stream :visible-cursorpos-limits args))
+
+(defmethod (:more-p encapsulating-output-stream) ()
+  (send-if-handles stream :more-p))
+
+(defmethod (:current-style encapsulating-output-stream) ()
+  (or (send-if-handles stream :current-style) si:*null-style*))
+
+(defmethod (:default-character-style encapsulating-output-stream) (&rest args)
+  (lexpr-send stream :default-character-style args))
+
+(defmethod (:character-width encapsulating-output-stream) (&rest args)
+  (or (lexpr-send-if-handles stream :character-width args) 1))
+
+(defmethod (:string-length encapsulating-output-stream) (&rest args)
+  (if (operation-handled-p stream :string-length)
+      (lexpr-send stream :string-length args)
+      (destructuring-bind (string &optional (start 0) end) args
+	(ignore string)
+	(- (or end (string-length string)) start))))
+
+(defmethod (:line-height encapsulating-output-stream) ()
+  (or (send-if-handles stream :line-height) 1))
+
+(defmethod (:baseline encapsulating-output-stream) ()
+  (or (send-if-handles stream :baseline) 0))
+
+(defmethod (:vsp encapsulating-output-stream) ()
+  (or (send-if-handles stream :vsp) 1))
+
+(defmethod (:char-width encapsulating-output-stream) ()
+  (or (send-if-handles stream :char-width) 1))
+
+(defmethod (:device-char-width encapsulating-output-stream) ()
+  (or (send-if-handles stream :device-char-width)
+      (send-if-handles stream :char-width)
+      1))
+
+(defmethod (:erase-aluf encapsulating-output-stream) ()
+  (or (send-if-handles stream :erase-aluf) :erase))
+
+(defmethod (:char-aluf encapsulating-output-stream) ()
+  (or (send-if-handles stream :char-aluf) :draw))
+
+(defmacro with-output-recording-enabled ((&optional stream (enabled 't)) &body body)
+  (format-output-macro-default-stream stream)
+  `(send ,stream :with-output-recording-enabled
+	 (named-continuation with-output-recording-enabled (,stream) . ,body)
+	 ,stream ,enabled))
+
+(defmacro with-output-recording-disabled ((&optional stream) &body body)
+  `(with-output-recording-enabled (,stream nil)
+     . ,body))
+
+(defmethod (:with-output-recording-enabled encapsulating-output-stream)
+	   (continuation xstream enabled)
+  (send stream :with-output-recording-enabled continuation xstream enabled))
+
+;;; +++ Just for old compiled code.  Can be flushed someday.
+(defmethod (:with-output-recording-disabled si:output-stream) (continuation xstream)
+  (send self :with-output-recording-enabled continuation xstream nil))
+
+(defmethod (:with-output-recording-enabled si:output-stream) (continuation xstream enabled)
+  enabled
+  (funcall continuation xstream))
+
+(defmethod (:add-displayed-presentation encapsulating-output-stream) (&rest args)
+  (lexpr-send stream :add-displayed-presentation args))
+
+(defmethod (:redraw-inside-sets encapsulating-output-stream) (&rest args)
+  (lexpr-send stream :redraw-inside-sets args))
+
+(defmethod (:update-viewport-indices encapsulating-output-stream) ()
+  (send stream :update-viewport-indices))
+
+(defmethod (:window-and-offsets tv:sheet) () (values self 0 0))
+
+(defun stream-window-and-offsets (stream)
+  (multiple-value-bind (window x-offset y-offset)
+      (send-if-handles stream :window-and-offsets)
+    (if window
+	(values window x-offset y-offset)
+	(values stream 0 0))))
+
+(defmethod (:window-and-offsets encapsulating-output-stream) ()
+  (stream-window-and-offsets stream))
+
+(defmethod (:window-and-offsets new-coordinates-stream) ()
+  (multiple-value-bind (window dx dy)
+      (stream-window-and-offsets stream)
+    (values window (+ dx x-offset) (+ dy y-offset))))
+
+(defmethod (:set-mouse-position new-coordinates-stream) (x y &optional (error-p t))
+  (send stream :set-mouse-position (+ x x-offset) (+ y y-offset) error-p))
+
+(defmethod (:mouse-position new-coordinates-stream) ()
+  (multiple-value-bind (x y)
+      (send stream :mouse-position)
+    (values (- x x-offset) (- y y-offset))))
+
+(defmethod (:erase-displayed-presentation encapsulating-output-stream) (&rest args)
+  (lexpr-send stream :erase-displayed-presentation args))
+
+(defmacro with-underlining ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream &key (underline-whitespace t)) &body body))
+  (format-output-macro-default-stream stream)
+  `(with-underlining-internal ,stream (named-continuation with-underlining (,stream)
+					. ,body)
+			      . ,options))
+
+(defmacro with-underlining-internal-1 ((stream) &body body)
+  `(multiple-value-bind (start-x start-y)
+       (send ,stream :read-cursorpos)
+     (multiple-value-prog1 (progn . ,body)
+       (multiple-value-bind (end-x end-y)
+	   (send ,stream :read-cursorpos)  
+	 (send ,stream :underline-between-cursorposes start-x start-y end-x end-y)))))
+
+(defmethod (:underline-between-cursorposes tv:graphics-mixin) (start-x start-y end-x end-y)
+  (underline-between-cursorposes self start-x start-y end-x end-y))
+
+(defun underline-between-cursorposes (window start-x start-y end-x end-y)
+  (let ((line-height (send window :line-height))
+	(baseline (send window :baseline))
+	(right (send window :inside-size)))
+    (loop for y from start-y by line-height to end-y doing
+      (let ((draw-y (+ y baseline)))
+	(send window :draw-line (if (= y start-y) start-x 0) draw-y
+				(if (= y end-y) end-x right) draw-y)))))
+
+(defmethod (:underline-between-cursorposes encapsulating-output-stream)
+	   (start-x start-y end-x end-y)
+  (send-if-handles stream :underline-between-cursorposes start-x start-y end-x end-y))
+
+(defmacro do-delimited-substrings (((string &key (start 0) end)
+				    (char-var start-index-var end-index-var))
+				   substring-form
+				   &body character-clauses
+				   &environment env)
+  (let ((special-characters (loop for (chars) in character-clauses
+				  when (atom chars)
+				    collect chars
+				  else append chars)))
+    (once-only (string &environment env)
+      `(let ((,start-index-var ,start)
+	     (.end. (or ,end (string-length ,string))))
+	 (loop
+        (let ((.next-index. ,(if (null (rest special-characters))
+				 `(sys:%string-search-char ,(first special-characters)
+							   ,string ,start-index-var .end.)
+				 `(string-search-set ,(coerce special-characters 'string)
+						     ,string :start ,start-index-var
+							     :end .end.))))
+	  (let ((,end-index-var (or .next-index. .end.)))
+	    ,substring-form)
+	  (when (null .next-index.)
+	    (return nil))
+	  (let ((,char-var ,(if (null (rest special-characters))
+				(first special-characters)
+				`(aref ,string .next-index.))))
+	    . ,(if (null (rest character-clauses))
+		   (rest (first character-clauses))
+		   `((selector ,char-var char-equal
+		      . ,character-clauses))))
+	  (setq ,start-index-var (1+ .next-index.))))))))
+
+(defflavor underlining-stream (stream (which-operations nil)) ()
+  (:initable-instance-variables stream))
+  
+(defwhopper (:which-operations underlining-stream) ()
+  (or which-operations
+      (setq which-operations (append (continue-whopper)
+				     (send stream :which-operations)))))
+
+(defmethod (:operation-handled-p underlining-stream) (op)
+  (or (member op '(:which-operations :unclaimed-message))
+      (and stream (send stream :operation-handled-p op))
+      (member op (send self :which-operations))))
+
+(defmethod (:send-if-handles underlining-stream) (op &rest args)
+  (when (send self :operation-handled-p op)
+    (lexpr-send self op args)))
+
+(defmethod (:unclaimed-message underlining-stream) (&rest args)
+  (lexpr-send stream args))
+
+(defmethod (:tyo underlining-stream) (char)
+  (if (member char '(#\Space #\BS #\Tab #\Return) :test #'char-equal)
+      (send stream :tyo char)
+      (with-underlining-internal-1 (stream) (send stream :tyo char))))
+
+(defmethod (:string-out underlining-stream) (string &optional (start 0) end)
+  (do-delimited-substrings ((string :start start :end end) (char start-index end-index))
+			   (unless (= start-index end-index)
+			     (with-underlining-internal-1 (stream)
+			       (send stream :string-out string start-index end-index)))
+    ((#\Space #\BS #\Tab #\Return)
+     (send self :tyo char))))
+
+
+(defmacro with-character-family ((family &optional (stream t) &key bind-line-height) &body body)
+  (format-output-macro-default-stream stream)
+  `(with-style-internal
+     ,stream ,family nil nil ,bind-line-height
+     (named-continuation
+       with-character-family (,stream) . ,body)
+     ,stream))
+
+(defmacro with-character-face ((face &optional (stream t) &key bind-line-height) &body body)
+  (format-output-macro-default-stream stream)
+  `(with-style-internal
+     ,stream nil ,face nil ,bind-line-height
+     (named-continuation
+       with-character-face (,stream) . ,body)
+     ,stream))
+
+(defmacro with-character-size ((size &optional (stream t) &key bind-line-height) &body body)
+  (format-output-macro-default-stream stream)
+  `(with-style-internal
+     ,stream nil nil ,size ,bind-line-height
+     (named-continuation
+       with-character-size (,stream) . ,body)
+     ,stream))
+
+(defmacro with-character-style ((style &optional (stream t) &key bind-line-height) &body body)
+  (format-output-macro-default-stream stream)
+  `(with-style-internal-1
+     ,stream ,style ,bind-line-height
+     (named-continuation
+       with-character-style (,stream) . ,body) ,stream))
+
+;;This level of encapsulation is probably unnecessary.  It should just
+;;send :with-character-style to the output stream.
+(defmethod (:with-character-style encapsulating-output-stream)
+	   (style continuation xstream &optional bind-line-height)
+  (send stream :with-character-style style continuation xstream bind-line-height))
+
+(defmethod (:screen encapsulating-output-stream) ()
+  (send-if-handles stream :screen))
+
+;;; Should not know this, really.
+(defmethod (:viewport-position encapsulating-output-stream) ()
+  (send stream :viewport-position))
+
+;;;; Filling
+
+(zl:defstruct (output-buffer-entry :grouped-array :conc-name :size-macro)
+  type						;:string or :presentation
+  character-style
+  bind-line-height
+  start-index-or-continuation
+  end-index-or-args)
+
+(defflavor filling-stream
+	((fill-column nil)
+	 (output-buffer (make-array 10 :fill-pointer 0))
+	 (output-buffer-size 0)
+	 (string-buffer (make-array 100 :element-type 'string-char :fill-pointer 0))
+	 (conditional-string nil)
+	 (special-characters nil)
+	 (special-character-actions nil)
+	 (after-line-break nil)			;Maybe this needs to be a continuation?
+	 (transparent-p nil)
+	 (character-style si:*null-style*)
+	 (style-bind-line-height nil)
+	 (read-cursorpos-operation :read-cursorpos)
+	 (characters-since-newline 0))
+	(encapsulating-output-stream)
+  (:initable-instance-variables fill-column after-line-break)
+  (:init-keywords :fill-on-spaces :fill-characters :after-line-break-initially-too))
+
+(defmethod (:init filling-stream) (plist)
+  (cond (fill-column
+	 (setq fill-column (format-output-standardize-horizontal-spacing stream fill-column)
+	       read-cursorpos-operation (cond ((operation-handled-p stream
+								    :read-cursorpos-for-fill)
+					       :read-cursorpos-for-fill)
+					      ((operation-handled-p stream :read-cursorpos)
+					       :read-cursorpos))))
+	((operation-handled-p stream :visible-cursorpos-limits)
+	 (multiple-value-setq (nil nil fill-column)
+	   (send stream :visible-cursorpos-limits)))
+	((operation-handled-p stream :inside-size)
+	 (setq fill-column (send stream :inside-size)))
+	(t
+	 ;; Assume the stream deals only in characters.  It might in fact support
+	 ;; :READ-CURSORPOS (such as with-output-to-string), but we'd have no way
+	 ;; of knowing what units to have fill-column be in.
+	 (setq fill-column 95
+	       read-cursorpos-operation nil)))
+  (let ((chars (getf (location-contents plist) :fill-characters
+		     (if (getf (location-contents plist) :fill-on-spaces t) '(#\space) nil))))
+    (setq special-characters (coerce (cons #\return (coerce chars 'list)) 'string))
+    ;; Could extend for wider range of actions at some point.
+    (setq special-character-actions (make-array (length special-characters)
+						:element-type 'boolean))
+    (loop for char being the array-elements of special-characters using (index index) do
+      (setf (aref special-character-actions index)
+	    (char-equal char #\space))))
+  (when (getf (location-contents plist) :after-line-break-initially-too)
+    (send self :do-after-line-break)))
+
+;(defmacro-in-flavor (giving-stream-character-style filling-stream) (&body body)
+(defmacro giving-stream-character-style (&body body)
+  `(with-character-style (character-style stream :bind-line-height style-bind-line-height)
+     . ,body))
+
+(defun-in-flavor (open-output-buffer-for-string filling-stream) ()
+  (let ((index (- (fill-pointer output-buffer) (output-buffer-entry-size))))
+    (unless (and (plusp index)
+		 (eq (output-buffer-entry-type index output-buffer) :string))
+      (let ((new-length (+ (fill-pointer output-buffer) (output-buffer-entry-size))))
+	(when (> new-length (array-total-size output-buffer))
+	  (zl:adjust-array-size output-buffer (+ new-length 100)))
+	(setf (fill-pointer output-buffer) new-length)
+	(setq index (- new-length (output-buffer-entry-size)))
+	(setf (output-buffer-entry-type index output-buffer) :string)
+	(setf (output-buffer-entry-character-style index output-buffer) character-style)
+	(setf (output-buffer-entry-bind-line-height index output-buffer)
+	      style-bind-line-height)
+	(setf (output-buffer-entry-start-index-or-continuation index output-buffer)
+	      (fill-pointer string-buffer))
+	(setf (output-buffer-entry-end-index-or-args index output-buffer)
+	      (fill-pointer string-buffer))))
+    (+ index (1- (output-buffer-entry-size)))))
+
+(defmethod (:tyo filling-stream) (char)
+  (flet ((pass-on ()
+	   (giving-stream-character-style
+	     (send stream :tyo char))
+	   (when (null read-cursorpos-operation)
+	     (if (char-equal char #\Newline)
+		 (setq characters-since-newline 0)
+		 (incf characters-since-newline))))
+	 (add-char ()
+	   (setq char (si:make-merged-char char character-style))
+	   (when (char-fat-p char)
+	     (setq string-buffer (make-string-fat string-buffer)))
+	   (let ((end-index (open-output-buffer-for-string)))
+	     (vector-push-extend char string-buffer)
+	     (setf (aref output-buffer end-index) (fill-pointer string-buffer)))
+	   (incf output-buffer-size (send self :character-width char))))
+    (let ((special nil))
+      (cond (transparent-p
+	     (pass-on))
+	    ((and (setq special (string-search-char char special-characters))
+		  (plusp special))
+	     (if (aref special-character-actions special)
+		 (send self :conditional-string-out " ")
+	       (add-char)
+	       (send self :conditional-string-out "")))
+	    ((null conditional-string)
+	     (pass-on))
+	    (special
+	     (send self :force-output-buffer)
+	     (pass-on))
+	    (t
+	     (add-char))))))
+
+(defun string-nconc-portion-merging-style (string add-string
+					   &optional (start 0) end (style si:*null-style*))
+  (if (eq style si:*null-style*)
+      (vector-push-portion-extend string add-string start end)
+      (let* ((copy-start (fill-pointer string))
+	     (new-end (or end (string-length add-string)))
+	     (new-length (- new-end start))
+	     (new-array-length (+ (length string) new-length)))
+	(when (> new-array-length (array-dimension string 0))
+	  (adjust-array string new-array-length))
+	(setf (fill-pointer string) new-array-length)
+	(let ((thin-p (not (string-fat-p add-string))))
+	  (let ((string string)
+		(add-string add-string))
+	    (declare (sys:array-register string add-string))
+	    (loop with style-index = (si:style-index style t)
+		  for from-index from start below new-end
+		  for string-index from copy-start
+		  do
+	      (setf (aref string string-index)
+		    (if thin-p
+			;; setf would store back into the array.
+			;; make-character isn't optimized, and can't be
+			;; because it takes styles, not style indices.
+			;; we need make-character-internal which is optimized.
+			(cli::char-dpb-internal style-index %%char-style 
+						(aref add-string from-index))
+			(si:make-merged-char (aref add-string from-index) style)))))))))
+
+(defmethod (:string-out filling-stream) (string &optional (start 0) end)
+  (unless end
+    (setq end (string-length string)))
+  (cond (transparent-p
+	 (giving-stream-character-style
+	   (send stream :string-out string start end))
+	 (when (null read-cursorpos-operation)
+	   (let ((newline-pos (string-search-char #\Newline string
+						  :start start
+						  :end end
+						  :from-end t)))
+	     (if newline-pos
+		 (setq characters-since-newline (- end newline-pos))
+		 (incf characters-since-newline (- end start))))))
+	(t
+	 (let ((substring-start start))
+	   (loop
+	     (let* ((next-index (string-search-set special-characters string
+						   :start substring-start :end end))
+		    (substring-end (or next-index end)))
+	       (unless (= substring-start substring-end)
+		 (cond ((or transparent-p (null conditional-string))
+			(giving-stream-character-style
+			  (send stream :string-out string substring-start substring-end)
+			  (when (null read-cursorpos-operation)
+			    (incf characters-since-newline
+				  (- substring-end substring-start)))))
+		       (t
+			(when (or (string-fat-p string)
+				  (neq character-style si:*null-style*))
+			  (setq string-buffer (make-string-fat string-buffer)))
+			(let ((string-end-index (open-output-buffer-for-string)))
+			  (string-nconc-portion-merging-style string-buffer string
+							      substring-start substring-end
+							      character-style)
+			  (setf (aref output-buffer string-end-index)
+				(fill-pointer string-buffer)))
+			(incf output-buffer-size
+			      (send self :string-length string
+				    substring-start substring-end)))))
+	       (when (null next-index)
+		 (return))
+	       (send self :tyo (aref string next-index))
+	       (setq substring-start (1+ next-index))))))))
+
+(defmethod (:output-as-presentation filling-stream) (continuation xstream &rest args)
+  (if (or transparent-p (not conditional-string))
+      (giving-stream-character-style
+	(lexpr-send stream :output-as-presentation continuation xstream args))
+    (let ((new-length (+ (fill-pointer output-buffer) (output-buffer-entry-size))))
+      (when (> new-length (array-total-size output-buffer))
+	(zl:adjust-array-size output-buffer (+ new-length 100)))
+      (setf (fill-pointer output-buffer) new-length)
+      (let ((index (- new-length (output-buffer-entry-size))))
+	(setf (output-buffer-entry-type index output-buffer) :presentation)
+	(setf (output-buffer-entry-character-style index output-buffer) character-style)
+	(setf (output-buffer-entry-bind-line-height index output-buffer)
+	      style-bind-line-height)
+	(setf (output-buffer-entry-start-index-or-continuation index output-buffer)
+	      continuation)
+	(setf (output-buffer-entry-end-index-or-args index output-buffer)
+	      (copy-if-necessary args))))
+    (incf output-buffer-size (continuation-output-size continuation xstream))
+    nil))
+
+
+;;; Separate subroutine to avoid consing closure environment unless actually needed
+;;; Used by :output-as-presentation-1 method
+;;;--- for compatibility with old way, put something that works with
+;;;--- :output-as-presentation into output-buffer
+(defun-in-flavor (output-through-buffer-as-presentation filling-stream)
+		 (continuation xstream continuation-args args)
+  (flet ((closure (xstream)
+	   (apply continuation xstream continuation-args)))
+    (let ((new-length (+ (fill-pointer output-buffer) (output-buffer-entry-size))))
+      (when (> new-length (array-total-size output-buffer))
+	(zl:adjust-array-size output-buffer (+ new-length 100)))
+      (setf (fill-pointer output-buffer) new-length)
+      (let ((index (- new-length (output-buffer-entry-size))))
+	(setf (output-buffer-entry-type index output-buffer) :presentation)
+	(setf (output-buffer-entry-character-style index output-buffer) character-style)
+	(setf (output-buffer-entry-bind-line-height index output-buffer)
+	      style-bind-line-height)
+	(setf (output-buffer-entry-start-index-or-continuation index output-buffer)
+	      #'closure)
+	(setf (output-buffer-entry-end-index-or-args index output-buffer)
+	      (copy-if-necessary args))))
+    (incf output-buffer-size (continuation-output-size #'closure xstream))
+    nil))
+
+(defmethod (:output-as-presentation-1 filling-stream)
+	   (continuation continuation-args &rest args)
+  (if (or transparent-p (not conditional-string))
+      (giving-stream-character-style
+	(lexpr-send stream :output-as-presentation-1 continuation continuation-args args))
+      (output-through-buffer-as-presentation continuation
+					     (first continuation-args)
+					     (sys:copy-if-necessary (rest continuation-args))
+					     args)))
+
+;;; Cannot just use the above, since the continuation is likely to
+;;; depend on special variables whose state isn't captured.
+(defmethod (:print filling-stream) (object &rest args)
+  (if (or transparent-p (not conditional-string))
+      (giving-stream-character-style
+	(ignore stream)
+	(apply #'si:print-with-sensitivity self object args))
+    (si:with-sensitivity-flag-internal
+      (let ((type (si:print-object-presentation-type)))
+	(macrolet ((invoke (stream)
+		     `(present object type :stream ,stream :sensitive nil)))
+	  (if (not (si:print-sensitive-p))
+	      (invoke self)
+	    (send self :output-as-presentation
+		  (lambda (xstream)
+		    ;; No need for sensitive at this level too.
+		    (invoke xstream))
+		  self :type nil)))))
+      t))
+
+;--- This method could be smart about the tradeoff between horizontal and vertical space.
+;--- Just because something can be made to fit, that does not mean that cramming it in
+;--- is the best way to format it.  Increasing the horizontal space might save a lot
+;--- of vertical space.  Maybe run the continuation through the pixel-width stream with both
+;--- alternatives, then pick the one that scores best on some weighted combination 
+;--- of vertical and horizontal sizes.
+(defmethod (:gprint filling-stream) (object format xstream)
+  (if (or transparent-p (not conditional-string))
+      (giving-stream-character-style
+	(ignore stream)
+	(si:gprint-with-sensitivity xstream object format))
+
+    (si:with-sensitivity-flag-internal
+      (let ((type (let ((*print-pretty* (or *print-pretty* t)))	;Just in case
+		    (si:print-object-presentation-type))))
+	(macrolet ((invoke ()
+		     `(present object type :stream xstream :sensitive nil)))
+	  (if (not (si:print-sensitive-p))
+	      (invoke)
+	    (send self :output-as-presentation
+		  (lambda (xstream)
+		    ;; No need for sensitive at this level too.
+		    (invoke))
+		  xstream :type nil))))))
+  t)
+
+(defmethod (:conditional-string-out filling-stream) (string)
+  (send self :force-output-buffer)
+  (setq conditional-string string))
+
+;; The conditional-string is stuff which might or might not get printed
+;; (like spaces replaced, in effect, by newlines).
+;; output-buffer and output-buffer-size are stuff printed after a conditional-string-out.
+;; Such stuff in output-buffer is text (as strings) or sensitive-output (as continuations).
+;; Here: if fill-column would be exceeded were we to print the conditional-string and
+;; the output-buffer following it, do a newline and :do-after-line-break and forget
+;; the conditional-string.
+;; Else, do the conditional-string and then forget it.
+;; Then, binding transparent-p to T, send out everything in the output-buffer.
+;; The reason transparent-p is necessary is that when the sensitive-output continuations
+;; get called, that will re-enter the filling-stream code; but all the special processing
+;; has already been done.  All the special processing checks transparent-p first.
+(defmethod (:force-output-buffer filling-stream) ()
+  (when conditional-string
+    (cond ((> (+ (if (null read-cursorpos-operation)
+		     characters-since-newline
+		     (send stream read-cursorpos-operation))
+		 (send self :string-length conditional-string)
+		 output-buffer-size)
+	      fill-column)
+	   (giving-stream-character-style
+	     (send stream :tyo #\Newline))
+	   (when (null read-cursorpos-operation)
+	     (setq characters-since-newline 0))
+	   (send self :do-after-line-break))
+	  (t
+	   (giving-stream-character-style
+	     (send stream :string-out conditional-string))
+	   (when (null read-cursorpos-operation)
+	     (incf characters-since-newline (string-length conditional-string)))))
+    (setq conditional-string nil)
+    (setq output-buffer-size 0)
+    (loop for index below (fill-pointer output-buffer) by (output-buffer-entry-size) do
+      (ecase (output-buffer-entry-type index output-buffer)
+	(:string
+	  (let ((start (output-buffer-entry-start-index-or-continuation index output-buffer))
+		(end (output-buffer-entry-end-index-or-args index output-buffer)))
+	    (if (eq (output-buffer-entry-character-style index output-buffer) si:*null-style*)
+		(send stream :string-out string-buffer start end)
+		(with-character-style ((output-buffer-entry-character-style index
+									    output-buffer)
+				       stream :bind-line-height
+				       (output-buffer-entry-bind-line-height index
+									     output-buffer))
+		  (send stream :string-out string-buffer start end)))
+	    (when (null read-cursorpos-operation)
+	      (incf characters-since-newline (- end start)))))
+	  (:presentation
+	    (letf ((character-style (output-buffer-entry-character-style index output-buffer))
+		   (style-bind-line-height (output-buffer-entry-bind-line-height
+					     index output-buffer))
+		   (transparent-p t))
+	      (lexpr-send stream :output-as-presentation
+			  (output-buffer-entry-start-index-or-continuation index
+									   output-buffer)
+			  self
+			  (output-buffer-entry-end-index-or-args index output-buffer))))))
+    (setf (fill-pointer string-buffer) 0)
+    (setf (fill-pointer output-buffer) 0)))
+
+(defmacro format-output-macro-convert-position (x y from to &optional (stream 'self))
+  `(ecase ,from
+     (:pixel
+       (ecase ,to
+	 (:pixel )
+	 (:character
+	   (when ,x (setq ,x (floor ,x (send ,stream :char-width))))
+	   (when ,y (setq ,y (floor ,y (send ,stream :line-height)))))))
+     (:character
+       (ecase ,to
+	 (:character )
+	 (:pixel
+	   (when ,x (setq ,x (* ,x (send ,stream :char-width))))
+	   (when ,y (setq ,y (* ,y (send ,stream :line-height)))))))))
+
+(defmethod (:read-cursorpos filling-stream) (&optional (unit :pixel))
+  (multiple-value-bind (x y)
+      (if (null read-cursorpos-operation)
+	  (values characters-since-newline 0)
+	  (send stream read-cursorpos-operation))
+    (incf x output-buffer-size)
+    (format-output-macro-convert-position x y :pixel unit)
+    (values x y)))
+
+(defmethod (:do-after-line-break filling-stream) ()
+  (when after-line-break
+    (giving-stream-character-style
+      (send stream :string-out after-line-break))
+    (when (null read-cursorpos-operation)
+      (incf characters-since-newline (string-length after-line-break)))))
+
+(defmethod (:with-character-style filling-stream)
+	   (style continuation xstream &optional bind-line-height)
+  (letf ((character-style (si:merge-character-styles style character-style))
+	 (style-bind-line-height (or style-bind-line-height bind-line-height)))
+    (funcall continuation xstream)))
+
+(defwhopper (:string-length filling-stream) (&rest args)
+  (giving-stream-character-style
+    (ignore stream)
+    (lexpr-continue-whopper args)))
+
+(defwhopper (:character-width filling-stream) (&rest args)
+  (giving-stream-character-style
+    (ignore stream)
+    (lexpr-continue-whopper args)))
+
+(defmethod (:read-cursorpos-for-fill redisplay-helper-stream) ()
+  (- (send self :read-cursorpos) cell-left-margin))
+
+(defmacro filling-output ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream
+		     &key fill-column (fill-characters '(#\space)) after-line-break
+			  after-line-break-initially-too
+			  dont-snapshot-variables)
+		    &body body))
+  (format-output-macro-default-stream stream)
+  `(filling-output-internal
+     ,stream (format-output-macro-continuation (:name filling-output
+						:dont-snapshot-variables
+						 ,(option-remf options
+							       :dont-snapshot-variables))
+					       (,stream) . ,body)
+     . ,options))
+
+(defun filling-output-internal (stream continuation &rest options)
+  (declare (sys:downward-funarg continuation))
+  (multiple-value-prog1
+    (let ((fstream (apply #'make-instance 'filling-stream :stream stream options)))
+      (multiple-value-prog1
+	(funcall continuation fstream)
+	(send fstream :force-output-buffer)))))
+
+;;; Try to make up for the hopeless mess that is the stream protocol.
+;;; In particular, try to guess what the user meant by the number in a way that
+;;; works whether you multiply by char-width before the stream gets encapsulated
+;;; or not.
+(defun format-output-standardize-horizontal-spacing (stream number)
+  (typecase number
+    (number
+      (let* ((char-width (or (send-if-handles stream :char-width) 1))
+	     (device-char-width (or (send-if-handles stream :device-char-width) char-width)))
+	(cond ((and (plusp number) (< number char-width))
+	       ;; A very small number, must mean characters.
+	       (* number char-width))
+	      ((and (= char-width 1) (floatp device-char-width) (floatp number))
+	       ;; A number that was probably gotten from (* n (send stream :char-width))
+	       ;; before encapsulation.
+	       (floor number device-char-width))
+	      (t number))))
+    (string
+      (or (send-if-handles stream :string-length number)
+	  (string-length number)))
+    (cons
+      (if (numberp (first number))
+	  (ecase (second number)
+	    (:character (* (first number) (or (send-if-handles stream :char-width) 1)))
+	    (:pixel (first number)))
+	  (continuation-output-size number stream)))
+    (otherwise
+      (continuation-output-size number stream))))
+
+;;;; Indenting
+
+(defflavor indenting-stream
+	(indentation				;integer (characters), string, or function
+	 indentation-width			;number of pixels in it
+	 (beginning-of-line nil))		;non-NIL => we're at the beginning of a line.
+	(encapsulating-output-stream)
+  (:initable-instance-variables indentation)
+  (:required-init-keywords :indentation))
+
+(defmethod (make-instance indenting-stream) (&rest ignore)
+  (setq indentation-width (format-output-standardize-horizontal-spacing self indentation)))
+
+(defmethod (:tyo indenting-stream) (char)
+  (send stream :tyo char)
+  (if (char-equal char #\Newline)
+      (send self :do-after-line-break)
+    (setq beginning-of-line nil)))
+
+(defmethod (:string-out indenting-stream) (string &optional (start 0) end)
+  (do-delimited-substrings ((string :start start :end end)
+			    (char start-index end-index))
+    (progn
+      (send stream :string-out string start-index end-index)
+      (unless (= start-index end-index)		;Might be called to print a null string.
+	(setq beginning-of-line nil)))
+    (#\Newline (send self :tyo char))))
+
+(defmethod (:fresh-line indenting-stream) ()
+  (unless beginning-of-line
+    (send self :tyo #\Return)
+    t))
+
+(defmethod (:do-after-line-break indenting-stream) ()
+  (typecase indentation
+    (string (send stream :string-out indentation))
+    (integer (send stream :increment-cursorpos indentation-width 0))
+    (cons (if (numberp (first indentation))
+	      (send stream :increment-cursorpos indentation-width 0)
+	      (funcall indentation stream)))
+    (otherwise (funcall indentation stream)))
+  (setq beginning-of-line t))
+
+(defun-in-flavor (indentation-width indenting-stream) (unit)
+  (if (eq unit ':character)
+      (floor indentation-width (or (send-if-handles stream :char-width) 1))
+      indentation-width))
+
+(defwhopper-subst (:size-in-characters indenting-stream) ()
+  (multiple-value-bind (width height) (continue-whopper)
+    (values (- width (indentation-width ':character)) height)))
+
+(defmethod (:inside-size indenting-stream) ()
+  (multiple-value-bind (width height) (send stream :inside-size)
+    (values (- width indentation-width) height)))
+
+(defmethod (:inside-width indenting-stream) ()
+  (- (send stream :inside-width) indentation-width))
+
+(defmethod (:visible-cursorpos-limits indenting-stream) (&optional (unit :pixel))
+  (let ((offset (indentation-width unit)))
+    (multiple-value-bind (left top right bottom)
+	(send stream :visible-cursorpos-limits unit)
+      (values (max 0 (- left offset)) top (- right offset) bottom))))
+
+(defmethod (:read-cursorpos indenting-stream) (&optional (unit :pixel unit-p))
+  (multiple-value-bind (x y) (if unit-p
+				 (send stream :read-cursorpos unit)
+				 (send stream :read-cursorpos))
+    (values (- x (indentation-width unit)) y)))
+
+(defun-in-flavor (set-beginning-of-line-after-cursorpos-op indenting-stream) (unit)
+  (multiple-value-bind (x ignore)
+      (send self :read-cursorpos unit)
+    (setq beginning-of-line (zerop x))))
+
+(defmethod (:set-cursorpos indenting-stream) (x y &optional (unit :pixel))
+  (send stream :set-cursorpos (and x (+ x (indentation-width unit))) y unit)
+  (set-beginning-of-line-after-cursorpos-op unit))
+
+(defmethod (:increment-cursorpos indenting-stream) (x y &optional (unit :pixel))
+  (send stream :increment-cursorpos x y unit)
+  (set-beginning-of-line-after-cursorpos-op unit))
+
+(defmethod (:clear-rest-of-line indenting-stream) ()
+  (send stream :clear-rest-of-line))
+
+(defmethod (:clear-between-cursorposes indenting-stream) (start-x start-y end-x end-y)
+  (send stream :clear-between-cursorposes (+ start-x indentation-width) start-y
+	(+ end-x indentation-width) end-y))
+
+(defmethod (:home-cursor indenting-stream) ()
+  (send self :set-cursorpos 0 0))
+
+(defmethod (:window-and-offsets indenting-stream) ()
+  (multiple-value-bind (window dx dy)
+      (stream-window-and-offsets stream)
+    (values window (+ dx indentation-width) dy)))
+
+(defmethod (:underline-between-cursorposes indenting-stream) (start-x start-y end-x end-y)
+  (send stream
+	:underline-between-cursorposes
+	(+ start-x indentation-width) start-y (+ end-x indentation-width) end-y))
+
+(defmethod (:draw-line indenting-stream)
+	   (from-x from-y to-x to-y &optional (alu :draw) (draw-end-point t))
+  (send stream :draw-line
+	(+ from-x indentation-width) from-y
+	(+ to-x indentation-width) to-y alu draw-end-point))
+
+(defmacro indenting-output ((stream indentation) &body body)
+  (format-output-macro-default-stream stream)
+  `(indenting-output-internal
+     ,stream (named-continuation indenting-output (,stream) . ,body)
+     ,indentation))
+
+(defun indenting-output-internal (stream continuation indentation)
+  (declare (sys:downward-funarg continuation))
+  (funcall continuation
+	   (make-instance 'indenting-stream :stream stream :indentation indentation)))
+
+;;;; Comma separated
+
+(defmacro formatting-textual-list ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream
+		     &key (separator ", ") finally if-two
+			  filled after-line-break conjunction
+			  dont-snapshot-variables)
+		    &body body))
+  (format-output-macro-default-stream stream)
+  `(formatting-textual-list-1
+     ,stream
+     (format-output-macro-continuation (:name formatting-textual-list
+					:dont-snapshot-variables
+					 ,(option-remf options :dont-snapshot-variables))
+				       (,stream) . ,body)
+     . ,options))
+
+(defmacro formatting-textual-list-element ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream &key dont-snapshot-variables) &body body))
+  (format-output-macro-default-stream stream)
+  `(enqueue-formatting-textual-list-element
+     ,stream
+     (format-output-macro-continuation (:name formatting-textual-list-element
+					:dont-snapshot-variables
+					 ,(option-remf options :dont-snapshot-variables))
+				       (,stream) . ,body)
+     . ,options))
+
+(defvar *enqueue-function*)
+
+;FORMAT-TEXTUAL-LIST is in FORMATTED-OUTPUT-COLD
+
+;;;; Multiple columns
+
+(defflavor line-column-stream
+	(width height top-x top-y nlines ncols nrows
+	 (line-no 0) line-x line-y)
+	(encapsulating-output-stream)
+  (:initable-instance-variables width height)
+  (:init-keywords :number-of-columns)
+   )
+
+(defmethod (:init line-column-stream) (plist)
+  (let ((number-of-columns (getf (location-contents plist) :number-of-columns)))
+    (multiple-value-setq (top-x top-y)
+      (send stream :read-cursorpos))
+    (setq line-x top-x line-y top-y)
+    (setq nlines (ceiling height (send stream :line-height)))
+    (let ((space-width (send stream :char-width)))
+      (if (null number-of-columns)
+	  (multiple-value-bind (stream-width stream-height)
+	      (send stream :inside-size)
+	    (ignore stream-height)
+	    (decf stream-width line-x)
+	    (setq ncols (max 1 (floor stream-width (+ width space-width)))
+		  width (floor stream-width ncols)))
+	  (setq width (+ width space-width)
+		ncols number-of-columns)))
+    (setq nrows (ceiling nlines ncols)
+	  height (* nrows (send stream :line-height))
+	  ncols (min ncols nlines))))
+
+(defmethod (:convert-cursorpos line-column-stream) (x y)
+  (let ((y-line-no (floor y (send stream :line-height))))
+    (multiple-value-bind (col row)
+	(floor y-line-no nrows)
+      (values (+ x (* col width))
+	      (+ top-y (* row (send stream :line-height)))))))
+
+(defmethod (:tyo line-column-stream) (char)
+  (cond ((char char #\Return)
+	 (send stream :tyo char))
+	(t (incf line-no)
+	   (if ( line-no nlines)
+	       (setq line-x top-x
+		     line-y (+ top-y height (- line-no nlines)))
+	       (multiple-value-bind (column row)
+		   (sys:floor line-no nrows)
+		 (setq line-x (+ top-x (* column width))
+		       line-y (+ top-y (* row (send stream :line-height))))))
+	   (send stream :set-cursorpos line-x line-y))))
+
+(defmethod (:string-out line-column-stream) (string &optional (start 0) end)
+  (do-delimited-substrings ((string :start start :end end)
+			    (char start-index end-index))
+      (send stream :string-out string start-index end-index)
+    (#\Return
+     (send self :tyo char))))
+
+(defmethod (:set-cursorpos line-column-stream) (x y &optional (unit :pixel))
+  (format-output-macro-convert-position x y unit :pixel)
+  (if (null y)
+      (send stream :set-cursorpos (+ line-x (or x 0)) line-y)
+      (multiple-value-setq (x y)
+	(send self :convert-cursorpos x y))
+      (send stream :set-cursorpos x y)))
+
+(defmethod (:read-cursorpos line-column-stream) (&optional (unit :pixel))
+  (multiple-value-bind (x y)
+      (send stream :read-cursorpos)
+    (decf x line-x)
+    (decf y line-y)
+    (format-output-macro-convert-position x y :pixel unit)
+    (values x y)))
+
+(defmethod (line-column-stream-finish-cursorpos line-column-stream) ()
+  (send stream :set-cursorpos 0 (+ top-y height) :pixel))
+
+(defmethod (:fresh-line line-column-stream) ()
+  (when (plusp (send self :read-cursorpos))
+    (send self :tyo #\Return)
+    t))
+
+(defmethod (:clear-between-cursorposes line-column-stream) (x1 y1 x2 y2
+							    &optional (unit :pixel))
+  (when (operation-handled-p stream :clear-between-cursorposes)
+    (unless (eq unit :pixel)
+      (error "Cannot use ~A unit" unit))
+    (multiple-value-setq (x1 y1)
+      (send self :convert-cursorpos x1 y1))
+    (multiple-value-setq (x2 y2)
+      (send self :convert-cursorpos x2 y2))
+    (send stream :clear-between-cursorposes x1 y1 x2 y2 :pixel)))
+
+(defmethod (:display-on-each-column line-column-stream) (continuation xstream)
+  (letf ((height 1)
+	 (line-no 0)
+	 (nlines ncols))
+    (dotimes (i ncols)
+      (declare (ignore i))
+      (funcall continuation xstream)))
+  (let ((lh (send stream :line-height)))
+    (incf top-y lh)
+    (incf line-y lh))
+  (send xstream :home-cursor)
+  t)
+
+(defmethod (:format-table-contents line-column-stream) (&rest ignore)
+  (error "FORMATTING-TABLE won't work well within FORMATTING-MULTIPLE-COLUMNS.
+You should use the :MULTIPLE-COLUMNS option to FORMATTING-TABLE instead."))
+
+(defmacro formatting-multiple-columns ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream &key number-of-columns) &body body))
+  (format-output-macro-default-stream stream)
+  `(formatting-multiple-columns-internal
+     ,stream
+     (named-continuation formatting-multiple-columns (,stream) . ,body)
+     ,@options))
+
+(defun formatting-multiple-columns-internal (stream continuation &rest options)
+  (when (not (send-if-handles stream :real-set-cursorpos))
+    (return-from formatting-multiple-columns-internal
+      (using-resource (better-stream line-buffering-stream stream)
+	(multiple-value-prog1
+	  (apply #'formatting-multiple-columns-internal better-stream continuation options)
+	  (send better-stream :force-line-buffer)))))
+  (destructuring-bind (&key number-of-columns) options
+    (multiple-value-bind (width height)
+	(continuation-output-size continuation stream)
+      (let ((stream (make-instance 'line-column-stream
+				   :stream stream
+				   :width width
+				   :height height
+				   :number-of-columns number-of-columns)))
+	(with-output-truncation (stream)
+	  (funcall continuation stream))
+	(line-column-stream-finish-cursorpos stream)))))
+
+;;;; Output replaying
+;;---These need stream and dont-snapshot-variables argument
+
+(defmacro with-replayable-output-1 ((&rest parameters) (&key dont-snapshot-variables
+							     setting-snapshot-variables)
+				    &body body)
+  (let ((arguments (mapcar #'car parameters)))
+    `(let ((.output. (format-output-macro-continuation (:name with-replayable-output
+							:dont-snapshot-variables
+							 ,dont-snapshot-variables
+							:setting-snapshot-variables
+							 ,setting-snapshot-variables)
+						       ,arguments
+		       . ,body)))
+       (with-output-as-presentation (:object (list .output.
+					     (list . ,arguments)
+					     ',parameters)
+			       :type 'replayable-output
+			       :single-box t)
+	 (funcall .output. . ,arguments)))))
+
+(defmacro with-replayable-output (parameters &body body)
+  `(with-replayable-output-1 ,parameters () . ,body))
+
+(defmacro with-resortable-output (((list key &key copy-of) &rest sort-clauses)
+				  other-parameters &body body)
+  (let ((possible-keys (loop for clause in sort-clauses
+			     when (listp (car clause))
+			       append (car clause)
+			     else collect (car clause))))
+    `(with-replayable-output-1 ((,key "Sort method" ((member . ,possible-keys)))
+				. ,other-parameters)
+			       (:setting-snapshot-variables (,list))
+       (let ((.sort. (ecase ,key . ,sort-clauses))
+	     ;; If copying, get sequence to operate on.  Else make sure that list variable
+	     ;; to be sorted is lexical one captures in closure.
+	     . ,(when copy-of
+		  `((,list ,copy-of))))
+	 (when .sort.
+	   (setf ,list (sort ,(if copy-of `(copy-seq ,list) list) .sort.)))
+	 . ,body))))
+
+(define-presentation-type replayable-output ()
+   :printer ((replayable-output *standard-output*)
+	     (destructuring-bind (output values ignore) replayable-output
+	       (apply output values)))
+
+   :viewspec-choices ((&key presentation type)
+		      (values type
+			      (destructuring-bind (nil values options)
+						  (presentation-object presentation)
+				(loop for (name . options) in options
+				      for cells on values
+				      do (ignore name)
+				      collect (cons (locf (car cells)) options)))))
+   )
+
+;;;; Abbreviated output
+
+(defflavor abbreviated-output-stream
+	((width nil)
+	 (height nil)
+	 (newline-substitute nil)
+	 (show-abbreviation nil)
+
+	 (output-suppressed? nil)
+	 (line-output-suppressed? nil)
+	 (something-output? nil)
+	 (initial-whitespace? nil)
+	 (initial-return? nil)
+	 (line-index 0)
+	 (line-no 0)
+	 (substitute-width 0)
+	 )
+	(encapsulating-output-stream)
+  (:initable-instance-variables width height newline-substitute show-abbreviation)
+  (:init-keywords :abbreviate-initial-whitespace :lozenge-returns))
+
+(defmethod (:send-if-handles abbreviated-output-stream) (operation &rest args)
+  (and (operation-handled-p stream operation)
+       (lexpr-send self operation args)))
+
+(defmethod (:init abbreviated-output-stream) (plist)
+  (when (getf (location-contents plist) :lozenge-returns)
+    (setq newline-substitute :lozenge))
+  (setq something-output? (not (getf (location-contents plist)
+				     :abbreviate-initial-whitespace)))
+  (when (eq show-abbreviation t)
+    (setq show-abbreviation "..."))
+  (when (or (eq width t) (eq height t))
+    (multiple-value-bind (w h)
+	(send stream :size-in-characters)
+      (when (eq width t)
+	(setq width w))
+      (when (eq height t)
+	(setq height h))))
+  ;; compute-motion would be, but conses a lot
+  (when show-abbreviation
+    (when width
+      (decf width (string-length show-abbreviation)))
+    (when height
+      (decf height 1)))
+  (setq substitute-width
+	(case newline-substitute
+	  ((nil) 0)
+	  ((:lozenge)
+	   (ceiling (send stream :lozenged-string-width "Return")
+	      (send stream :char-width)))
+	  (otherwise
+	    (string-length newline-substitute)))))
+
+(defmacro abbreviating-output ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream
+		     &key width height newline-substitute show-abbreviation
+			  abbreviate-initial-whitespace)
+		    &body body))
+  (format-output-macro-default-stream stream)
+  `(abbreviating-output-internal ,stream (zl:named-lambda abbreviating-output
+					  (,stream) . ,body) . ,options))
+
+(defun abbreviating-output-internal (stream continuation &rest options)
+  (declare (sys:downward-funarg continuation))
+  (funcall continuation (apply #'make-instance 'abbreviated-output-stream
+			       :stream stream options)))
+
+(defmethod (:tyo abbreviated-output-stream) (char)
+  (flet ((...-out ()
+	   (when show-abbreviation
+	     (send stream :string-out show-abbreviation)))
+	 (return-out ()
+	   (case newline-substitute
+	     ((nil)
+	      (send stream :tyo #\Return)
+	      (setq line-index 0
+		    line-output-suppressed? nil))
+	     ((:lozenge)
+	      (send stream :display-lozenged-string "Return"))
+	     (otherwise
+	       (send stream :string-out newline-substitute)))))
+    (unless output-suppressed?
+      (if (and (not something-output?)
+	       (si:mem-char char '(#\Space #\Tab #\Return)))
+	  (if (char-equal char #\Return)
+	      (setq initial-return? t)
+	      (setq initial-whitespace? t))
+	  (unless something-output?
+	    (when initial-whitespace?
+	      (...-out))
+	    (when initial-return?
+	      (return-out))
+	    (setq something-output? t))
+	  (cond ((and (char-equal char #\Return) (not newline-substitute))
+		 (incf line-no 1)
+		 (cond ((and height (> line-no height))
+			(when show-abbreviation
+			  (return-out)
+			  (...-out))
+			(setq output-suppressed? t))
+		       (t
+			(return-out))))
+		(line-output-suppressed?)
+		(t
+		 (incf line-index (selector char char-equal
+				    (#\Tab (- 8 (rem line-index 8)))
+				    (#\Return substitute-width)
+				    (t 1)))
+		 (cond ((and width (> line-index width))
+			(...-out)
+			(setq line-output-suppressed? t))
+		       ((char-equal char #\Return)
+			(return-out))
+		       (t
+			(send stream :tyo char)))))))))
+
+(defmethod (:read-cursorpos abbreviated-output-stream) (&optional (unit :pixel))
+  (send stream :read-cursorpos unit))
+
+(defmethod (:set-cursorpos abbreviated-output-stream) (x y &optional (unit :pixel))
+  (unless (eq unit :character)
+    (error "Cannot set non character"))
+  (unless (null y)
+    (error "Cannot move to another line"))
+  (setq line-index x)
+  (cond ((and width (> line-index width))
+	 (setq line-output-suppressed? t))
+	(t
+	 (send stream :set-cursorpos x y unit))))
+
+(defflavor basic-set-cursorpos-simulating-stream
+	((x-position 0)
+	 (y-position 0))
+	(encapsulating-output-stream))
+
+(defmethod (:read-cursorpos basic-set-cursorpos-simulating-stream) (&optional ignore)
+  (values x-position y-position))
+
+(defmethod (:increment-cursorpos basic-set-cursorpos-simulating-stream)
+	   (dx dy &optional ignore)
+  (send self :set-cursorpos (+ x-position dx) (+ y-position dy)))
+
+(defmethod (:visible-cursorpos-limits basic-set-cursorpos-simulating-stream)
+	   (&optional ignore)
+  (values 0 0 (or (send-if-handles stream :size-in-characters) 95) 100000))
+
+(defmethod (:inside-size basic-set-cursorpos-simulating-stream) ()
+  (values (or (send-if-handles stream :size-in-characters) 95) 100000))
+
+(defmethod (:line-height basic-set-cursorpos-simulating-stream) () 1)
+(defmethod (:char-width basic-set-cursorpos-simulating-stream) () 1)
+(defmethod (:character-width basic-set-cursorpos-simulating-stream) (ignore) 1)
+
+(defmethod (:string-length basic-set-cursorpos-simulating-stream)
+	   (string &optional (start 0) (end (string-length string)))
+  (- end start))
+
+(defmethod (:fresh-line basic-set-cursorpos-simulating-stream) ()
+  (unless (zerop (send self :read-cursorpos))
+    (send self :tyo #\Return)
+    t))
+
+;;; Let inner stream have presentations, but don't return them to caller, since
+;;; they might not be the right kind.
+(defmethod (:output-as-presentation basic-set-cursorpos-simulating-stream)
+	   (continuation xstream &rest args)
+  (lexpr-send stream :output-as-presentation continuation xstream args)
+  nil)
+
+(defmethod (:output-as-presentation-1 basic-set-cursorpos-simulating-stream)
+	   (continuation continuation-args &rest args)
+  (lexpr-send stream :output-as-presentation-1 continuation continuation-args args)
+  nil)
+
+(defmethod (:initialize basic-set-cursorpos-simulating-stream) (new-stream)
+  (setq stream new-stream
+	x-position 0
+	y-position 0))
+
+(defmethod (:draw-line basic-set-cursorpos-simulating-stream) (&rest ignore) )
+
+(defmethod (:real-set-cursorpos basic-set-cursorpos-simulating-stream) () :simulated)
+
+(defflavor set-cursorpos-simulating-stream () (basic-set-cursorpos-simulating-stream))
+
+(defmethod (:tyo set-cursorpos-simulating-stream) (char)
+  (condition-bind ((hardcopy:hardcopy-outside-of-bounding-box
+		     'hardcopy:simple-formatter-exception-interceptor))
+    (send stream :tyo char))
+  (if (char-equal char #\Return)
+      (setq x-position 0
+	    y-position (1+ y-position))
+      (incf x-position)))
+
+(defflavor set-cursorpos-simulating-stream-no-cursor-back
+	(stream (class :cursor-motion))
+	(error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (:report set-cursorpos-simulating-stream-no-cursor-back) (stream)
+  (princ "Cannot move cursor back" stream))
+
+(defmethod (:check-set-cursorpos-simulating-stream-no-cursor-back
+	    set-cursorpos-simulating-stream)
+	   (&optional (class :cursor-motion))
+  (error 'set-cursorpos-simulating-stream-no-cursor-back :class class :stream self))
+
+(defmethod (:check-set-cursorpos-simulating-stream-no-cursor-back redisplay-helper-stream)
+	   (&optional (class :cursor-motion))
+  (send-if-handles stream :check-set-cursorpos-simulating-stream-no-cursor-back class))
+
+(defmethod (:set-cursorpos set-cursorpos-simulating-stream) (x y &optional ignore)
+  (when (null x)
+    (setq x x-position))
+  (when (null y)
+    (setq y y-position))
+  (cond ((< y y-position)
+	 (error 'set-cursorpos-simulating-stream-no-cursor-back :stream self))
+	((= y y-position)
+	 (cond ((< x x-position)
+		(error 'set-cursorpos-simulating-stream-no-cursor-back :stream self))
+	       ((= x x-position))
+	       (t (dotimes (i (- x x-position))
+		    (declare (ignore i))
+		    (send stream :tyo #\Space)))))
+	(t
+	 (dotimes (j (- y y-position))
+	   (declare (ignore j))
+	   (send stream :tyo #\Return))
+	 (dotimes (i x)
+	   (declare (ignore i))
+	   (send stream :tyo #\Space))))
+  (setq x-position x
+	y-position y))
+
+(defmethod (:clear-between-cursorposes set-cursorpos-simulating-stream) (&rest ignore) )
+(defmethod (:clear-region set-cursorpos-simulating-stream) (&rest ignore) )
+
+(defflavor line-buffering-stream
+	(line-buffer
+	 (current-character-style si:*null-style*))
+	(basic-set-cursorpos-simulating-stream))
+
+(defmethod (:tyo line-buffering-stream) (char)
+  (if (char-equal char #\Return)
+      (setq x-position 0 y-position (1+ y-position))
+      (dotimes (j (- (1+ y-position) (fill-pointer line-buffer)))
+	(declare (ignore j))
+	(vector-push-extend (make-array 10 :element-type 'character :fill-pointer 0)
+			    line-buffer))
+      (let ((line (aref line-buffer y-position)))
+	(dotimes (i (- (1+ x-position) (fill-pointer line)))
+	  (declare (ignore i))
+	  (vector-push-extend #\space line))
+	(setf (aref line x-position) (if (eq current-character-style si:*null-style*)
+					 char
+					 (si:make-merged-char char current-character-style)))
+	(incf x-position))))
+
+(defmethod (:set-cursorpos line-buffering-stream) (x y &optional ignore)
+  (when x
+    (setq x-position x))
+  (when y
+    (setq y-position y)))
+
+(defmethod (:with-character-style line-buffering-stream) (new-style continuation xstream
+							  &optional ignore)
+  (letf ((current-character-style
+	   (si:merge-character-styles new-style current-character-style)))
+    (funcall continuation xstream)))
+
+(defmethod (:check-set-cursorpos-simulating-stream-no-cursor-back line-buffering-stream)
+	   (&optional (class :cursor-motion))
+  (when (neq class :cursor-motion)
+    (error 'set-cursorpos-simulating-stream-no-cursor-back :class class :stream self)))
+
+(defmethod (:force-line-buffer line-buffering-stream) ()
+  ;; Horribly unmodular, but this makes a hardcopy stream come closer to
+  ;; implementing the stream protocol.
+  (condition-bind ((hardcopy:hardcopy-outside-of-bounding-box
+		     'hardcopy:simple-formatter-exception-interceptor))
+    (loop for line being the array-elements of line-buffer do
+      (write-line line stream))))
+
+(defmethod (:initialize line-buffering-stream :after) (ignore)
+  (setq line-buffer (make-array 10 :fill-pointer 0)))
+
+;;;; Presentation remembering strings
+
+(defstruct (presentation-recording-string (:type :named-array-leader)
+					  (:make-array (:length 100 :type 'art-string))
+					  (:print-function
+					    print-presentation-recording-string)
+					  :conc-name)
+  (fill-pointer 0)
+  (presentations nil))
+
+(defun print-presentation-recording-string (presentation-recording-string stream ignore)
+  (if *print-escape*
+      (zl:si:print-quoted-string presentation-recording-string t stream)
+      (let ((index 0)
+	    (presentations (presentation-recording-string-presentations
+			     presentation-recording-string))
+	    (*print-escape* t))			;Make sure strings are sensitive again.
+	(labels ((piece (stream end-index)
+		   (loop
+	             (when ( index end-index)
+		       (return nil))
+		     (let ((next-presentation (first presentations)))
+		       (let ((next-index (or (when next-presentation
+					       (let ((next-p-index (first next-presentation)))
+						 (if ( next-p-index end-index)
+						     (setq next-presentation nil)
+						     (pop presentations)
+						     next-p-index)))
+					     end-index)))
+			 (when (> next-index index)
+			   (write-string presentation-recording-string stream :start index
+									      :end next-index)
+			   (setq index next-index)))
+		       (when next-presentation
+			 (apply #'send stream :output-as-presentation
+				(lambda (stream)
+				  (piece stream (second next-presentation)))
+				stream
+				(cddr next-presentation)))))))
+	  (piece stream (presentation-recording-string-fill-pointer
+			  presentation-recording-string)))))
+  presentation-recording-string)
+
+(defmacro with-output-to-presentation-recording-string ((stream &optional string)
+							&body body &environment env)
+  (let ((thing-var (gensym))
+	(the-real-me (gensym)))
+    (flet ((body (string active-length length epilogue)
+	     (multiple-value-bind (declarations body)
+		 (si:find-body-declarations body env)
+	       `(with-stack-list (,thing-var ,string ,active-length ,length nil)
+		  (with-stack-array (.gprint-stack. 5 :fill-pointer 0)
+		    (let (,the-real-me ,stream gprint:*inspecting*)
+		      ,@declarations
+		      (setf ,the-real-me
+			    (setf ,stream
+				  #'(lambda (operation &rest args)
+				      (declare (downward-function))
+				      (apply #'output-to-presentation-recording-string-stream
+					     operation ,thing-var ,the-real-me args)))
+			    gprint:*inspecting* #'(lambda (type &rest args)
+						    (declare (downward-function))
+						    (lexpr-send ,the-real-me :note-print-event
+								type .gprint-stack. args)))
+		      (multiple-value-prog1
+			(progn . ,body)
+			(setf (presentation-recording-string-presentations (first ,thing-var))
+			      (nreverse (presentation-recording-string-presentations
+					  (first ,thing-var)))))
+		      . ,epilogue))))))
+      (if string
+	  (once-only (string &environment env)
+	    (body string `(zl:array-active-length ,string) `(zl:array-length ,string) nil))
+	  (body '(make-presentation-recording-string) 0 100 `((first ,thing-var)))))))
+
+(defun output-to-presentation-recording-string-stream
+       (op thing stream &optional arg1 &rest args)
+  (case op
+    (:output-as-presentation
+     (let ((elem (list* (second thing) () (copy-list (rest args)))))
+       (push elem (presentation-recording-string-presentations (first thing)))
+       (funcall arg1 (first args))
+       (setf (second elem) (second thing))))
+    (:output-as-presentation-1
+     (let ((elem (list* (second thing) () (copy-list (rest args)))))
+       (push elem (presentation-recording-string-presentations (first thing)))
+       (apply arg1 (first args))
+       (setf (second elem) (second thing))))
+    (:print
+      (apply #'si:print-with-sensitivity stream arg1 args))
+    (:gprint	;gprint:*inspecting* is set up by with-output-to-presentation-recording-string
+      (si:gprint-with-sensitivity (second args)		;xstream
+				  arg1			;object
+				  (first args)))	;suggested-format
+    (:note-print-event
+      (ecase arg1
+	(:start 
+	 (let ((elem (destructuring-bind (&key (type 'expression) location) (rest args)
+		       `(,(second thing) ()
+			 :location ,(and (locativep location) location)
+			 :form ,(and (not (locativep location)) `(cdr ',location))
+			 :type ,type))))
+	   (push elem (presentation-recording-string-presentations (first thing)))
+	   (vector-push-extend elem (first args))))
+	(:end
+	 (let ((elem (vector-pop (first args))))
+	   (setf (second elem) (second thing))))))
+    (:which-operations
+     '(:tyo
+       :string-out :line-out :fresh-line :read-pointer :set-pointer
+       :read-cursorpos :set-cursorpos :increment-cursorpos :finish :with-character-style
+       :output-as-presentation :output-as-presentation-1 :print :gprint))
+    (otherwise
+     (apply #'cli::output-to-user-supplied-fill-pointer-string-stream
+	    op thing stream arg1 args))))
+
+;;;; Sizing stream
+
+(defmethod (:init pixel-width-stream :after) (ignore)
+  (when (eq line-width-table 't)
+    (setq line-width-table (make-array 10 :fill-pointer 0)))
+  (setq auto-line-height (send-if-handles stream :auto-line-height)
+	current-line-height (send stream :line-height)))
+
+(defmethod (:reset pixel-width-stream) (&key ((:stream new-stream) *standard-output*)
+					     ((:line-width-table table-p) nil))
+  (setq x-position 0 y-position 0
+	max-width 0 max-height 0
+	min-x-position nil min-y-position nil)
+  (setq stream new-stream
+	line-width-table (and table-p (make-array 10 :fill-pointer 0)))
+  (setq auto-line-height (send-if-handles stream :auto-line-height)
+	current-line-height (send stream :line-height))
+  (when graphics::drawing-state
+    (graphics::drawing-state-initialize graphics::drawing-state)))
+
+(defmethod (:tyo pixel-width-stream) (char)
+  (if (char char #\Return)
+      (if auto-line-height
+	  (multiple-value-bind (dx nil nil nil lh nil)
+	      (stack-let ((string (make-array 1 :element-type 'character
+						:initial-element char)))
+		(send stream :string-length string))
+	    (incf x-position dx)
+	    (maxf current-line-height lh))
+	  (incf x-position (send stream :character-width char)))
+    (when line-width-table
+      (vector-push-extend x-position line-width-table))
+    (setq max-width (max max-width x-position)
+	  x-position 0
+	  min-x-position 0)
+    (setq max-height (max max-height y-position))
+    (incf y-position current-line-height)
+    (when auto-line-height
+      (setq current-line-height (send stream :line-height)))))
+
+(defmethod (:string-out pixel-width-stream) (string &optional (start 0) end)
+  (do-delimited-substrings ((string :start start :end end)
+			    (char start-index end-index))
+      (if auto-line-height
+	  (multiple-value-bind (dx nil nil nil lh nil)
+	      (send stream :string-length string start-index end-index)
+	    (incf x-position dx)
+	    (maxf current-line-height lh))
+	  (incf x-position (send stream :string-length string start-index end-index)))
+    (#\Return
+     (send self :tyo char))))
+
+(defmethod (:set-cursorpos pixel-width-stream) (x y &optional (unit :pixel))
+  (format-output-macro-convert-position x y unit :pixel)
+  (setq max-width (max max-width x-position)
+        max-height (max max-height y-position))
+  (setq x-position x
+        y-position y)
+  (minf-or min-x-position x-position)
+  (minf-or min-y-position y-position))
+
+(defmethod (:read-cursorpos pixel-width-stream) (&optional (unit :pixel))
+  (multiple-value-bind (x y)
+      (values x-position y-position)
+    (format-output-macro-convert-position x y :pixel unit)
+    (values x y)))
+
+(defmethod (:increment-cursorpos pixel-width-stream) (dx dy &optional (unit :pixel))
+  (unless ( dy 0)
+    (error "Cannot move backwards"))
+  (cl:ecase unit
+    (:pixel )
+    (:character
+     (setq dy (* dy (send self :line-height))
+           dx (* dx (send self :char-width)))))
+  (setq max-width (max max-width x-position)
+        max-height (max max-height y-position))
+  (incf x-position dx)
+  (incf y-position dy)
+  (minf-or min-x-position x-position)
+  (minf-or min-y-position y-position))
+
+(defmethod (:fresh-line pixel-width-stream) ()
+  (unless (zerop x-position)
+    (send self :tyo #\return)
+    t))
+
+(defun-in-flavor (pixel-width-stream-graphics-box pixel-width-stream) (left top right bottom)
+  (minf-or min-x-position left)
+  (minf-or min-y-position top)
+  (maxf max-width right)
+  (maxf max-height bottom)
+  nil)
+
+(defmethod (:output-as-presentation pixel-width-stream) (continuation xstream &rest ignore)
+  (funcall continuation xstream))
+
+(defmethod (:output-as-presentation-1 pixel-width-stream)
+	   (continuation continuation-args &rest ignore)
+  (apply continuation continuation-args))
+
+(defmethod (:display-internal pixel-width-stream) (displayer xstream
+						   &key cache-value
+						   &allow-other-keys)
+  ;; Don't try to do any redisplay.  Just do the output and see how big
+  ;; it is.  Things shouldn't really be doing continuation-output-size
+  ;; without cooperation with redisplay, but this at least keeps them
+  ;; from blowing out.
+  (funcall displayer cache-value xstream nil))
+
+(defmethod (:final-size pixel-width-stream) ()
+  (declare (values max-width max-height x-position y-position min-x-position min-y-position))
+  (unless (zerop x-position)			;Is this right?
+    (incf y-position current-line-height))
+  (setq max-width (max max-width x-position)
+	max-height (max max-height y-position))
+  (values max-width max-height x-position y-position min-x-position min-y-position))
+
+(defmethod (:line-width-table pixel-width-stream) ()
+  (vector-push-extend x-position line-width-table)
+  (setq max-width (max max-width x-position))
+  (loop for index below (length line-width-table) do
+    (setf (aref line-width-table index)
+	  (floor (- max-width (aref line-width-table index)) 2)))
+  line-width-table)
+
+;;; Don't want to count this line in the total.
+(defmethod (:display-on-each-column pixel-width-stream) (&rest ignore) t)
+
+(defmethod (:clear-region pixel-width-stream) (&rest ignore) )
+
+(defmethod (:clear-between-cursorposes pixel-width-stream) (&rest ignore) )
+
+(defmethod (:underline-between-cursorposes pixel-width-stream) (&rest ignore))
+
+(defmacro with-pixel-width-stream ((local-stream outer-stream) &body body)
+  `(stack-let ((.transform. (graphics:make-identity-transform)))
+     (with-data-stack 
+       (let* ((.state. (graphics::make-stack-raster-drawing-state :stack .transform.))
+	      (,local-stream (make-stack-pixel-width-stream ,outer-stream :stack .state.)))
+	 ,@body))))
+
+(defun continuation-output-size (continuation stream &optional (unit :pixel))
+  (declare (values width height x-motion y-motion min-x-position min-y-position))
+  (declare (sys:downward-funarg continuation))
+  (with-pixel-width-stream (xstream stream)
+    (funcall continuation xstream)
+    (multiple-value-bind (x y dx dy min-x min-y)
+	(send xstream :final-size)
+      (format-output-macro-convert-position x y :pixel unit stream)
+      (format-output-macro-convert-position dx dy :pixel unit stream)
+      (format-output-macro-convert-position min-x min-y :pixel unit stream)
+      (values x y dx dy min-x min-y))))
+
+(defun continuation-line-width-table (continuation stream)
+  (declare (sys:downward-funarg continuation))
+  (using-resource (xstream pixel-width-stream :stream stream :line-width-table t)
+    (funcall continuation xstream)
+    (send xstream :line-width-table)))
+
+(defflavor line-width-table-replaying-stream
+	((line-index 0)
+	 line-width-table)
+	(encapsulating-output-stream)
+  (:initable-instance-variables line-width-table))
+
+(defmethod (:init line-width-table-replaying-stream :after) (ignore)
+  (send stream :increment-cursorpos (aref line-width-table 0) 0))
+
+(defmethod (:tyo line-width-table-replaying-stream) (char)
+  (send stream :tyo char)
+  (when (char= char #\Return)
+    (incf line-index)
+    (send stream :increment-cursorpos (aref line-width-table line-index) 0)))
+
+(defmethod (:string-out line-width-table-replaying-stream) (string &optional (start 0) end)
+  (do-delimited-substrings ((string :start start :end end)
+			    (char start-index end-index))
+      (send stream :string-out string start-index end-index)
+    (#\Return
+     (send self :tyo char))))
+
+(defmethod (:read-cursorpos line-width-table-replaying-stream) (&rest args)
+  (lexpr-send stream :read-cursorpos args))
+
+;; Center a bunch of lines which must start and end with newlines
+(defmacro centering-lines ((&optional stream &rest options)
+			   &body body)
+  (format-output-macro-default-stream stream)
+  `(centering-lines-internal
+     (named-continuation centering-lines (,stream) . ,body)
+     ,stream . ,options))
+
+(defun centering-lines-internal (continuation stream)
+  (let ((line-width-table (continuation-line-width-table continuation stream)))
+    (funcall continuation
+	     (make-instance 'line-width-table-replaying-stream
+			    :line-width-table line-width-table
+			    :stream stream))))
+
+;; Center a single line, which is assumed to be drawn on a previously empty line
+(defmacro centering-line ((&optional stream &rest options)
+			  &body body)
+  (format-output-macro-default-stream stream)
+  `(centering-line-internal
+     (named-continuation centering-line (,stream) ,@body)
+     ,stream ,@options))
+
+(defun centering-line-internal (continuation stream &rest options)
+  options
+  (multiple-value-bind (start-x start-y)
+      (send stream :read-cursorpos)
+    (unless (zerop start-x)
+      (error "You must start ~S output at the beginning of a line" 'centering-line))
+    (let ((inside-width (send stream :inside-width))
+	  (line-width (continuation-output-size continuation stream)))
+      (send stream :set-cursorpos (+ start-x (truncate (- inside-width line-width) 2)) start-y)
+      (funcall continuation stream))))
+
+
+;; You're not allowed to do anything with this "stream" except centering-piece.
+(defflavor centering-pieces-helper-stream (stream (piece-data))
+	   ()
+  (:initable-instance-variables stream)
+  (:writable-instance-variables piece-data))
+
+(defmacro centering-pieces ((&optional stream) &body body)
+  (format-output-macro-default-stream stream)
+  (unless (null body)				;NIL if empty body
+    `(centering-pieces-internal ,stream
+				(named-continuation centering-pieces (,stream)
+				  ,@body))))
+
+;; Each piece starts its own "line", and must end with a newline.
+(defmacro centering-piece ((stream) &body body)
+  `(centering-piece-internal ,stream
+			     (named-value-snapshot-continuation centering-piece (,stream)
+			       ,@body)))
+
+(defmethod (centering-piece-internal centering-pieces-helper-stream) (continuation)
+  (multiple-value-bind (width height x-motion y-motion)
+      (continuation-output-size continuation stream)
+    (push (list continuation width height x-motion y-motion) piece-data)))
+
+(defun centering-pieces-internal (stream continuation)
+  (let ((helper-stream (make-instance 'centering-pieces-helper-stream :stream stream)))
+    (funcall continuation helper-stream)
+    (setf (centering-pieces-helper-stream-piece-data helper-stream)
+	  (nreverse (centering-pieces-helper-stream-piece-data helper-stream)))
+    (let ((piece-data (centering-pieces-helper-stream-piece-data helper-stream)))
+      (let ((n (length piece-data)))
+	(with-data-stack
+	  (let ((continuations (make-stack-array n))
+		(widths (make-stack-array n))
+		(heights (make-stack-array n))
+		(x-motions (make-stack-array n))
+		(y-motions (make-stack-array n))
+		(x-starts (make-stack-array n))
+		(y-starts (make-stack-array n))
+		(x-incr (make-stack-array n))
+		(y-incr (make-stack-array n)))
+	    (loop for (continuation width height x-motion y-motion) in piece-data
+		  for i from 0
+		  do
+	      (setf (aref continuations i) continuation)
+	      (setf (aref widths i) width)
+	      (setf (aref heights i) height)
+	      (setf (aref x-motions i) x-motion)
+	      (setf (aref y-motions i) y-motion))
+	    (let ((max-width (reduce #'max widths)))
+	      (let ((height-so-far 0))
+		(dotimes (i n)
+		  (setf (aref x-starts i) (floor (- max-width (aref widths i)) 2))
+		  (setf (aref y-starts i) height-so-far)
+		  (incf height-so-far (aref heights i))))
+	      (let ((prev-x 0) (prev-y 0))
+		(dotimes (i (1- n))
+		  (setf (aref x-incr i) (- (aref x-starts i) prev-x))
+		  (setf (aref y-incr i) (- (aref y-starts i) prev-y))
+		  (setq prev-x (+ (aref x-starts i) (aref x-motions i))
+			prev-y (+ (aref y-starts i) (aref y-motions i))))))
+	    (dotimes (i n)
+	      (send stream :increment-cursorpos (aref x-starts i) 0)
+	      (funcall (aref continuations i) stream))))))))
+
+(defmethod (:convert-to-absolute-coordinates new-coordinates-stream) (x y ignore)
+  (values (+ x x-offset)
+	  (+ y y-offset)))
+
+(defmethod (:convert-to-relative-coordinates new-coordinates-stream) (x y ignore)
+  (values (- x x-offset)
+	  (- y y-offset)))
+
+(defmethod (:inside-size new-coordinates-stream) ()
+  (values width height))
+
+(defmethod (:inside-width new-coordinates-stream) () width)
+(defmethod (:inside-height new-coordinates-stream) () height)
+
+(defmethod (:size-in-characters new-coordinates-stream) ()
+  (let ((x width)
+	(y height))
+    (format-output-macro-convert-position x y :pixel :character)
+    (values x y)))
+
+(defmethod (:tyo new-coordinates-stream) (char)
+  (if (char char #\Return)
+      (send stream :tyo char)
+      (multiple-value-bind (nil y)
+	  (send self :read-cursorpos)
+	(send self :set-cursorpos 0 (+ y (send self :line-height))))
+      (send self :clear-rest-of-line)))
+
+(defmethod (:string-out new-coordinates-stream) (string &optional (start 0) end)
+  (do-delimited-substrings ((string :start start :end end)
+			    (char start-index end-index))
+      (send stream :string-out string start-index end-index)
+    (#\Return
+     (send self :tyo char))))
+
+(defmethod (:set-cursorpos new-coordinates-stream) (x y &optional (unit :pixel))
+  (format-output-macro-convert-position x y unit :pixel)
+  (when x (incf x x-offset))
+  (when y (incf y y-offset))
+  (send stream :set-cursorpos x y))
+
+(defmethod (:read-cursorpos new-coordinates-stream) (&optional (unit :pixel))
+  (multiple-value-bind (x y)
+      (send stream :read-cursorpos)
+    (decf x x-offset)
+    (decf y y-offset)
+    (format-output-macro-convert-position x y :pixel unit)
+    (values x y)))
+
+(defmethod (:increment-cursorpos new-coordinates-stream) (&rest args)
+  (lexpr-send stream :increment-cursorpos args))
+
+;;; Why isn't this already on output-stream?
+(defmethod (:home-cursor new-coordinates-stream) ()
+  (send self :set-cursorpos 0 0))
+
+;;; Or this?
+(defmethod (:fresh-line new-coordinates-stream) ()
+  (unless (zerop (send self :read-cursorpos))
+    (send self :tyo #\Return)
+    t))
+
+(defmethod (:clear-rest-of-line new-coordinates-stream) ()
+  (if (operation-handled-p stream :clear-region)
+      (multiple-value-bind (x y)
+	  (send stream :read-cursorpos)
+	(send stream :clear-region x y
+				   (+ x-offset width) (min (+ y-offset height)
+							   (+ y (send stream :line-height)))))
+      (send stream :clear-rest-of-line)))
+
+(defmethod (:clear-region new-coordinates-stream) (left top right bottom)
+  (send stream :clear-region
+	(+ (or left 0) x-offset) (+ (or top 0) y-offset)
+	(+ (or right width) x-offset) (+ (or bottom height) y-offset)))
+
+(defmethod (:clear-window new-coordinates-stream) ()
+  (send self :clear-region nil nil nil nil))
+
+(defmethod (:clear-between-cursorposes new-coordinates-stream)
+	   (start-x start-y end-x end-y &optional (unit :pixel))
+  (format-output-macro-convert-position start-x start-y unit :pixel)
+  (format-output-macro-convert-position end-x end-y unit :pixel)
+  (send stream :clear-between-cursorposes (+ start-x x-offset) (+ start-y y-offset)
+	(+ end-x x-offset) (+ end-y y-offset)))
+
+(defmethod (:visible-cursorpos-limits new-coordinates-stream) (&optional (unit :pixel))
+  (let ((vis-width width)
+	(vis-height height))
+    (format-output-macro-convert-position vis-width vis-height :pixel unit)
+    (values 0 0 vis-width vis-height)))
+
+(defmethod (:insert-line new-coordinates-stream) (&rest args)
+  (lexpr-send stream :insert-line args))
+
+(defmethod (:delete-line new-coordinates-stream) (&rest args)
+  (lexpr-send stream :delete-line args))
+
+(defmethod (:insert-char new-coordinates-stream) (&rest args)
+  (lexpr-send stream :insert-char args))
+
+(defmethod (:delete-char new-coordinates-stream) (&rest args)
+  (lexpr-send stream :delete-char args))
+
+(defmethod (:clear-char new-coordinates-stream) (&rest args)
+  (lexpr-send stream :clear-char args))
+
+(defmethod (:clear-rest-of-window new-coordinates-stream) ()
+  (send stream :clear-rest-of-window))
+
+(defmethod (:move-region new-coordinates-stream) (width height from-x from-y to-x to-y)
+  (coordinate-convert-points self :absolute :inside from-x from-y to-x to-y)
+  (send stream :move-region width height from-x from-y to-x to-y))
+
+(defmethod (:reset new-coordinates-stream) (new-stream new-x new-y new-width new-height)
+  (setq stream new-stream x-offset new-x y-offset new-y width new-width height new-height))
+
+(defmethod (:underline-between-cursorposes new-coordinates-stream)
+	   (start-x start-y end-x end-y)
+  (send-if-handles stream :underline-between-cursorposes
+		   (+ start-x x-offset) (+ start-y y-offset)
+		   (+ end-x x-offset) (+ end-y y-offset)))
+
+(defmacro in-sub-window ((stream x y width height) &body body)
+  (format-output-macro-default-stream stream)
+  `(in-sub-window-internal (lambda (,stream) . ,body) ,stream ,x ,y ,width ,height))
+
+(defun in-sub-window-internal (continuation stream x y width height)
+  (tv:with-auto-line-height (stream nil)
+    (using-resource (xstream new-coordinates-stream)
+      (send xstream :reset stream x y width height)
+      (send xstream :home-cursor)
+      (funcall continuation xstream))))
+
+(defmacro with-own-coordinates ((&optional stream &rest options) &body body)
+  (declare (arglist (&optional stream
+		     &key left top right bottom
+			  (clear-window t) (erase-window nil)
+			  (enable-output-recording t))
+		    &body body))
+  (format-output-macro-default-stream stream)
+  `(with-own-coordinates-internal (named-continuation with-own-coordinates (,stream) . ,body)
+				  ,stream . ,options))
+
+(defun with-own-coordinates-internal (continuation stream
+				      &key left top right bottom
+					   (clear-window t) (erase-window nil)
+					   (enable-output-recording t)
+					   )
+  (when clear-window
+    (send stream :clear-window))
+  (multiple-value-bind (vleft vtop vright vbottom)
+      (send stream :visible-cursorpos-limits)
+    (unless left
+      (setq left vleft))
+    (unless top
+      (setq top vtop))
+    (unless right
+      (setq right vright))
+    (unless bottom
+      (setq bottom vbottom)))
+  (when erase-window
+    (send stream :clear-region left top right bottom))
+  (in-sub-window (stream left top (- right left) (- bottom top))
+    (if enable-output-recording
+	(funcall continuation stream)
+	(send stream :with-output-recording-disabled continuation stream))))
+
+;;;; Box printing macros
+
+(compiler:make-obsolete surrounding-output-with-border-and-label
+			"Use SCL:SURROUNDING-OUTPUT-WITH-BORDER instead")
+
+(defmacro surrounding-output-with-border ((&optional stream &rest options
+					   &key label &allow-other-keys)
+					  &body body)
+  (declare (arglist (&optional stream
+		     &key (shape :rectangle) (thickness 1) (margin 1)
+			  (pattern t) (gray-level 1) (opaque nil) (filled nil) alu
+			  (move-cursor t) (width nil) (height nil)
+			  (label nil) (label-position :bottom)
+			  (label-separator-line nil)
+			  (label-separator-line-thickness 1)
+			  (label-alignment :left))
+		    &body body))
+  (format-output-macro-default-stream stream)
+  ;;don't use a stack list, it destroys c-sm-M in the editor
+  (let ((some-options (si:rem-keywords options '(:label))))
+    `(surrounding-output-with-border-1
+       (named-continuation surrounding-output-with-border (,stream) . ,body)
+       ,stream 
+       :label ,(when label
+		 `(named-continuation border-label (,stream)
+		    ,(if (stringp label) `(write-string ',label ,stream) label)))
+       . ,some-options)))
+
+(defflavor border-box-drawer () ()
+  (:method-combination border-box-drawer-shape-size :case)
+  (:method-combination border-box-drawer-shape-draw :case))
+
+(defmethod (border-box-drawer-shape-size border-box-drawer :otherwise) (ignore width height)
+  (values width height 0 0))
+
+(defmacro define-border-box-shape (shape &body clauses)
+  `(progn
+     . ,(loop for (size-or-draw arglist . body) in clauses
+	      collect (let ((method (ecase size-or-draw
+				      (:size 'border-box-drawer-shape-size)
+				      (:draw 'border-box-drawer-shape-draw))))
+			`(defmethod (,method border-box-drawer ,shape) ,arglist
+			   . ,body)))))
+
+(define-border-box-shape :rectangle
+  (:draw (left top right bottom ignore ignore &rest args)
+    (apply #'graphics:draw-rectangle left top right bottom args)))
+
+(define-border-box-shape :oval
+  (:size (width height)
+    (let ((radius (ceiling height 2)))
+      (setq height (1+ (* radius 2))
+	    width (+ width height))
+      (values width height radius 0)))
+  (:draw (left top right bottom width height &rest args &key (filled nil) &allow-other-keys)
+    (apply #'graphics:draw-oval (floor (+ left right) 2) (floor (+ top bottom) 2)
+				(floor width 2) (floor height 2)
+				:filled filled args)))
+
+(define-border-box-shape :circle
+  (:size (width height)
+    (let ((radius (isqrt (+ (expt (ceiling width 2) 2)
+			    (expt (ceiling height 2) 2)))))
+      (values (* radius 2) (* radius 2)
+	      (- radius (floor width 2)) (- radius (floor height 2)))))
+  (:draw (left top right bottom width height &rest args)
+    (let ((radius (floor (max width height) 2))
+	  (center-x (floor (+ left right) 2))
+	  (center-y (floor (+ top bottom) 2)))
+      (apply #'graphics:draw-circle center-x center-y radius args))))
+
+(define-border-box-shape :diamond
+  (:size (width height)
+    (values (* width 2) (* height 2) (floor width 2) (floor height 2)))
+  (:draw (left top right bottom width height &rest args)
+    (ignore width height)
+    (let ((center-x (floor (+ left right) 2))
+	  (center-y (floor (+ top bottom) 2)))
+      (with-stack-list (points left center-y center-x top
+			       right center-y center-x bottom)
+	(apply #'graphics:draw-polygon points :points-are-convex-p t args)))))
+
+(defmethod (border-box-drawer-size border-box-drawer)
+	   (stream continuation &key (shape :rectangle) (thickness 1)
+				     (width nil) (height nil) (margin 1)
+				&allow-other-keys)
+  (declare (values width height inside-dx inside-dy))
+  (let* ((inside-dx (+ thickness margin))
+	 (inside-dy inside-dx))
+    (unless (and width height)
+      (multiple-value-bind (inside-width inside-height)
+	  (continuation-output-size continuation stream)
+	(unless width
+	  (setq width (+ inside-width inside-dx thickness (floor thickness 2) margin)))
+	(unless height
+	  (setq height (+ inside-height inside-dy thickness (floor thickness 2) margin)))))
+    (multiple-value-bind (new-width new-height dx dy)
+	(border-box-drawer-shape-size self shape width height)
+      (values new-width new-height (+ inside-dx dx) (+ inside-dy dy)))))
+
+(defmethod (border-box-drawer-draw border-box-drawer)
+	   (stream x y width height &rest args
+				    &key (shape :rectangle) (filled nil)
+					 (alu nil alu-p) (opaque nil opaque-p)
+				    &allow-other-keys)
+  (graphics:with-graphics-identity-transform (stream)
+    (let ((transform (send-if-handles stream :border-box-transform)))
+      (when transform
+	(graphics:graphics-transform transform :stream stream)))
+    (unless alu-p
+      (setq alu (if filled :flip :draw)))
+    (unless opaque-p
+      (setq opaque (if filled nil t)))
+    (let ((left x)
+	  (top y)
+	  (right (+ x width))
+	  (bottom (+ y height)))
+      (apply #'border-box-drawer-shape-draw self shape left top right bottom width height
+	     :filled filled :stream stream :alu alu :opaque opaque :allow-other-keys t args))))
+
+(compile-flavor-methods border-box-drawer)
+
+(defvar *border-box-drawer* (make-instance 'border-box-drawer))
+
+(defun compute-box-size (continuation stream &rest options)
+  (apply #'border-box-drawer-size *border-box-drawer* stream continuation options))
+
+(defun draw-box (x y width height &rest options
+				  &key (stream *standard-output*) &allow-other-keys)
+  (apply #'border-box-drawer-draw *border-box-drawer* stream x y width height options))
+
+(defun surrounding-output-with-border-1 (continuation stream &rest options
+					 &key (shape :rectangle) (thickness 1) (margin 1)
+					 (pattern t) (gray-level 1) (color nil) (opaque nil)
+					 (filled nil) alu
+					 (move-cursor t) (width nil) (height nil)
+					 (label nil) (label-position ':bottom)
+					 (label-separator-line nil)
+					 (label-separator-line-thickness 1)
+					 (label-alignment :left)
+					 &aux (gprint:*overriding-left-indent* 0)
+					      (gprint:*overriding-line-length*
+						(send-if-handles stream :size-in-characters))
+					 )
+  (ignore shape thickness margin pattern gray-level color opaque filled alu width height)
+  (unless (graphics:graphics-stream-p stream)
+    (return-from surrounding-output-with-border-1
+      (funcall continuation stream)))
+  (when (eq (send-if-handles stream :real-set-cursorpos) :hardcopy)
+    (return-from surrounding-output-with-border-1
+      (with-hardcopy-upside-down-stream (stream)
+	(apply #'surrounding-output-with-border-1 continuation stream options))))
+  (multiple-value-bind (original-x original-y)
+      (send stream :read-cursorpos)
+      (let ((x (+ original-x (ceiling thickness 2)))
+	    (y (+ original-y (ceiling thickness 2))))
+      (multiple-value-bind (box-width box-height inside-dx inside-dy)
+	  (apply #'compute-box-size continuation stream options)
+	(multiple-value-bind (label-inside-width label-text-height)
+	    (if label
+		(continuation-output-size label stream)
+		(values 0 0))
+	  (let* ((label-width (if label
+				  ;; Get the label width including borders and margins.
+				  (apply #'border-box-drawer-size *border-box-drawer*
+					 stream label options)
+				  0))
+		 (label-height (if label
+				   (+ label-text-height
+				      (if label-separator-line
+					  (+ label-separator-line-thickness
+					     (* 2 margin))
+					  margin));; reasonable distance from text to label?
+				   0))
+		 (total-box-width (max box-width label-width)))
+	    (flet ((draw-label ()
+		     (when label
+		       (in-sub-window (stream (+ x 
+						 (ecase label-alignment
+						   (:left inside-dx)
+						   (:right (- total-box-width label-inside-width
+							      inside-dx))
+						   (:center
+						     (round
+						       (- total-box-width label-inside-width)
+							  2))))
+					      (if (eq label-position ':bottom)
+						  (+ y (- box-height inside-dy)
+						     (if label-separator-line
+							 (+ label-separator-line-thickness
+							    (* 2 margin))
+							 margin)) ;; reasonable distance?
+						  (+ y inside-dy))
+					      label-width
+					      label-text-height)
+			 (funcall label stream))
+		       (when label-separator-line
+			 (in-sub-window (stream x
+						(if (eq label-position ':bottom)
+						    (+ y (- box-height thickness))
+						    (+ y inside-dy label-text-height margin))
+						total-box-width
+						(+ label-separator-line-thickness
+						   margin))
+			   (apply #'graphics:draw-line
+				  0
+				  0
+				  (max box-width label-width)
+				  0
+				  :draw-end-point nil
+				  :thickness label-separator-line-thickness
+				  :pattern pattern
+				  :stream stream
+				  :allow-other-keys t
+				  options
+			     ))))))
+	      (with-output-truncation (stream)
+		(multiple-value-bind (new-x new-y)
+		    (if move-cursor
+			(values 0 (+ y (+ box-height label-height (ceiling thickness 2))))
+			(values (+ x (max box-width label-width (ceiling thickness 2)))
+				original-y))
+		  (in-sub-window (stream
+				   (+ x inside-dx)
+				   (if (and label (eq label-position ':top))
+				       (+ y inside-dy label-height)
+				       (+ y inside-dy))
+				   box-width
+				   box-height)
+		    (funcall continuation stream))
+		  (draw-label)
+		  (apply #'draw-box x y total-box-width (+ box-height label-height)
+			 :stream stream options)
+		  (send stream :set-cursorpos new-x new-y))))))))))
+
+;;; Simulated presentation, for use primarily by Zwei
+
+(defflavor simulated-presentation
+	(left top right bottom real-x real-y)
+	(presentation))
+
+(defmethod (presentation-displayed-box simulated-presentation) ()
+  (make-temporary-box left top right bottom))
+
+(defmethod (simulated-presentation-edges simulated-presentation) ()
+  (values left top right bottom))
+
+(defmethod (simulated-presentation-set-edges simulated-presentation)
+	   (new-left new-top new-right new-bottom)
+  (setq left new-left top new-top right new-right bottom new-bottom))
+
+(defmethod (simulated-presentation-inferior-at-position simulated-presentation)
+	   (x y x-offset y-offset)
+  (when (and ( left x) ( top y)
+	     (> right x) (> bottom y))
+    (setq real-x x-offset real-y y-offset)
+    (or (loop for inf in inferiors
+	      thereis (simulated-presentation-inferior-at-position inf x y x-offset y-offset))
+	self)))
+
+(defmethod (presentation-mouse-sensitive-boxes simulated-presentation) (window)
+  (multiple-value-bind (left-adj top-adj)
+      (send window :margins)
+    (list (list (+ left real-x left-adj)
+		(+ top real-y top-adj)
+		(+ right real-x left-adj)
+		(+ bottom real-y top-adj)))))
+
+(defmacro with-simulated-presentation-recording ((&optional stream
+						  &rest options)
+						 &body body)
+  (format-output-macro-default-stream stream)
+  `(with-simulated-presentation-recording-internal
+     (named-continuation with-simulated-presentation-recording (,stream) . ,body)
+     ,stream
+     . ,options))
+
+(defun with-simulated-presentation-recording-internal
+       (continuation xstream &rest options)
+  (using-resource (stream simulated-presentation-recording-stream)
+    (lexpr-send stream :reset :stream xstream options)
+    (funcall continuation stream)
+    (send stream :end-presentation)))
+
+(defflavor simulated-presentation-recording-stream
+	((stream nil)
+	 (which-operations nil)
+	 x-offset y-offset
+	 left top right bottom
+	 presentation)
+	;; This is so that we get the chance to intercept the :draw-xxx messages.
+	(graphics:raster-graphics-mixin))
+  
+(defwhopper (:which-operations simulated-presentation-recording-stream) ()
+  (or which-operations
+      (setq which-operations (append (continue-whopper)
+				     (send stream :which-operations)))))
+
+(defmethod (:operation-handled-p simulated-presentation-recording-stream) (op)
+  (or (member op '(:which-operations :unclaimed-message))
+      (and stream (send stream :operation-handled-p op))
+      (member op (send self :which-operations))))
+
+(defmethod (:send-if-handles simulated-presentation-recording-stream) (op &rest args)
+  (when (send self :operation-handled-p op)
+    (lexpr-send self op args)))
+
+(defmethod (:unclaimed-message simulated-presentation-recording-stream) (&rest args)
+  (lexpr-send stream args))
+
+(defmethod (:clear-region simulated-presentation-recording-stream)
+	   (left top right bottom)
+  (loop for presentation in (presentation-inferiors presentation)
+	unless (box-overlaps-region-p
+		 (presentation-displayed-box presentation)
+		 left top right bottom)
+	  collect presentation))
+
+(defmethod (:reset simulated-presentation-recording-stream)
+	   (&key ((:stream new-stream) *standard-output*)
+		 (object nil) (type nil)
+		 ((:x-offset new-x-offset) 0) ((:y-offset new-y-offset) 0)
+		 )
+  (setq stream new-stream
+	x-offset new-x-offset
+	y-offset new-y-offset
+	left nil top nil right nil bottom nil
+	presentation (make-instance 'simulated-presentation :object object :type type))
+  )
+
+(defmethod (:end-presentation simulated-presentation-recording-stream) ()
+  (when left
+    (simulated-presentation-set-edges presentation (- left x-offset) (- top y-offset)
+						   (- right x-offset) (- bottom y-offset))
+    presentation))
+
+(defmethod (:output-as-presentation-1 simulated-presentation-recording-stream)
+	   (continuation continuation-args
+	    &key object type			;+++ single-box?
+	    &allow-other-keys)
+  (let ((new-presentation (make-instance 'simulated-presentation :object object :type type)))
+    (letf ((presentation new-presentation)
+	   (left nil) (top nil) (right nil) (bottom nil))
+      (apply continuation continuation-args)
+      (setq new-presentation (send self :end-presentation)))
+    (when new-presentation
+      (multiple-value-bind (inf-left inf-top inf-right inf-bottom)
+	  (simulated-presentation-edges new-presentation)
+	(minf-or left (+ inf-left x-offset))
+	(minf-or top (+ inf-top y-offset))
+	(maxf-or right (+ inf-right x-offset))
+	(maxf-or bottom (+ inf-bottom y-offset)))
+      (push new-presentation (presentation-inferiors presentation))
+      (setf (presentation-superior new-presentation) presentation)
+      new-presentation)))
+
+(defmethod (:string-out simulated-presentation-recording-stream)
+	   (string &optional (start 0) end)
+  (unless end (setq end (string-length string)))
+  (do-delimited-substrings ((string :start start :end end)
+			    (char start end))
+      (progn
+	(multiple-value-bind (x y)
+	    (send self :read-cursorpos)
+	  (minf-or left x)
+	  (minf-or top y))
+	(send stream :string-out string start end)
+	(multiple-value-bind (x y)
+	    (send self :read-cursorpos)
+	  (maxf-or right x)
+	  (maxf-or bottom (+ y (send self :line-height)))))
+    (#\Return
+     (send self :tyo char))))
+
+(defmethod (:tyo simulated-presentation-recording-stream) (char)
+  (multiple-value-bind (x y)
+      (send self :read-cursorpos)
+    (minf-or left x)
+    (minf-or top y))
+  (send stream :tyo char)
+  (multiple-value-bind (x y)
+      (send self :read-cursorpos)
+    (maxf-or right x)
+    (maxf-or bottom (+ y (send self :line-height)))))
+
+(defmethod (graphics::get-drawing-state simulated-presentation-recording-stream) ()
+  (setq graphics::drawing-state
+	(funcall (flavor:generic graphics::get-drawing-state) (si:follow-syn-stream stream))))
+
+(defmethod (graphics:draw-string-image simulated-presentation-recording-stream) (&rest args)
+  (apply (flavor:generic graphics:draw-string-image) (si:follow-syn-stream stream) args)
+  (multiple-value-bind (sleft stop sright sbottom)
+      (apply #'graphics::draw-string-image-transformed-bounding-box args)
+    (minf-or left sleft)
+    (minf-or top stop)
+    (maxf-or right sright)
+    (maxf-or bottom sbottom)))
+
+(defflavor full-encapsulating-stream ((which-operations nil) (stream nil)) ()
+  (:readable-instance-variables stream)
+  )
+  
+(defwhopper (:which-operations full-encapsulating-stream) ()
+  (or which-operations
+      (setq which-operations (append (continue-whopper)
+				     (send stream :which-operations)))))
+
+(defmethod (:operation-handled-p full-encapsulating-stream) (op)
+  (or (member op '(:which-operations :unclaimed-message))
+      (and stream (send stream :operation-handled-p op))
+      (member op (send self :which-operations))))
+
+(defmethod (:send-if-handles full-encapsulating-stream) (op &rest args)
+  (when (send self :operation-handled-p op)
+    (lexpr-send self op args)))
+
+(defmethod (:unclaimed-message full-encapsulating-stream) (&rest args)
+  (apply stream args))
+
+(defmethod ((setf full-encapsulating-stream-stream) full-encapsulating-stream) (new-stream)
+  (setq stream new-stream
+	which-operations nil))
+
+(defflavor hardcopy-upside-down-stream
+	((inversion-transform nil)
+	 (multiple-pages nil))
+	(full-encapsulating-stream)
+  :writable-instance-variables)
+
+(defmethod (:real-set-cursorpos hardcopy-upside-down-stream) () :simulated-hardcopy)
+
+(defmethod (:real-set-cursorpos pixel-width-stream) () t)
+
+(defmethod (:read-cursorpos hardcopy-upside-down-stream) (&optional (unit :pixel))
+  (send stream :check-page-exists)		;What :read-cursorpos method does.
+  (multiple-value-bind (x y)
+      (send stream :read-page-cursorpos)
+    (setq x (- x (send stream :bounding-box-left))
+	  y (- (- (send stream :bounding-box-top) (send stream :baseline)) y))
+    (format-output-macro-convert-position x y :pixel unit)
+    (values x y)))
+
+(defmethod (:set-cursorpos hardcopy-upside-down-stream) (x y &optional (unit :pixel))
+  (format-output-macro-convert-position x y unit :pixel)
+  (when x (setq x (+ x (send stream :bounding-box-left))))
+  (when y (setq y (- (- (send stream :bounding-box-top) (send stream :baseline)) y)))
+  (send stream :set-page-cursorpos x y))
+
+(defmethod (:increment-cursorpos hardcopy-upside-down-stream) (x y &rest units)
+  (lexpr-send stream :increment-cursorpos x (and y (- y)) units))
+
+(defmethod (:border-box-transform hardcopy-upside-down-stream) ()
+  inversion-transform)
+
+(defmethod (:border-box-transform encapsulating-output-stream) ()
+  (send-if-handles stream :border-box-transform))
+
+;;; Do not apply transform again when sizing.
+(defmethod (:border-box-transform pixel-width-stream) () nil)
+
+(defmethod (:border-box-transform redisplay-helper-stream) ()
+  (when (eq state :displaying)
+    (send-if-handles stream :border-box-transform)))
+
+(defmethod (:with-pages-for-box encapsulating-output-stream) (continuation xstream
+							      &rest ignore)
+  ;; I think this makes more sense than passing on to the inner stream.
+  (funcall continuation xstream))
+
+(defmethod (:with-pages-for-box hardcopy-upside-down-stream) (continuation xstream
+							      right bottom)
+  ;; right and bottom are in the funny upside down inside coordinate system.
+  (multiple-value-bind (width height)
+      (send stream :inside-size)
+    (setq width (ceiling right width)
+	  height (ceiling bottom height))
+    (if (or (and (= width 1) (= height 1))
+	    (not (operation-handled-p xstream :with-multiple-pages)))
+	(funcall continuation xstream)
+	(send xstream :with-multiple-pages continuation xstream width height)
+	(setq multiple-pages t))))
+
+(defmethod (:fix-multiple-page-cursorpos hardcopy-upside-down-stream) ()
+  (multiple-value-bind (x y)
+      (send self :read-cursorpos)
+    (multiple-value-bind (width height)
+	(send self :inside-size)
+      (setq x (mod x width)
+	    y (mod y height)))
+    (send self :set-cursorpos x y)))
+
+(defmethod (:clear-region hardcopy-upside-down-stream) (&rest ignore) )
+
+(compile-flavor-methods hardcopy-upside-down-stream)
+
+(defresource hardcopy-upside-down-stream ()
+  :constructor (make-instance 'hardcopy-upside-down-stream))
+
+(defmacro with-hardcopy-upside-down-stream ((&optional stream) &body body)
+  (format-output-macro-default-stream stream)
+  `(with-hardcopy-upside-down-stream-internal
+     (named-continuation with-hardcopy-upside-down-stream (,stream) . ,body)
+     ,stream))
+
+(defun with-hardcopy-upside-down-stream-internal (continuation xstream)
+  (using-resource (better-stream hardcopy-upside-down-stream)
+    (let ((inversion-transform (list 1 0 0 -1
+				     (send xstream :bounding-box-left)
+				     (send xstream :bounding-box-top))))
+      (setf (full-encapsulating-stream-stream better-stream) xstream)
+      (setf (hardcopy-upside-down-stream-multiple-pages better-stream) nil)
+      (setf (hardcopy-upside-down-stream-inversion-transform better-stream)
+	    inversion-transform)
+      (graphics::with-new-stream-transform xstream inversion-transform continuation
+					   better-stream))
+    (when (hardcopy-upside-down-stream-inversion-transform better-stream)
+      (send better-stream :fix-multiple-page-cursorpos))))
+
+;;; FORMAT control
+
+(format:defformat format:presentation (:multi-arg) (arguments parameters)
+  (ignore parameters)
+  (let* ((object (first arguments))
+	 (type (if format:atsign-flag (second arguments) (type-of object))))
+    (present object type :stream format:*format-output*)
+    (if format:atsign-flag
+	(rest (rest arguments))
+      (rest arguments))))

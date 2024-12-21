@@ -1,0 +1,246 @@
+;;; -*- Syntax: Common-lisp; Mode: LISP; Package: Nsage; Base: 10 -*-
+;;;
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;
+
+;;;Various tools for collecting and analyzing usage and performance data.
+;;;
+;;;Theory of data collection.  First approach was to push monitoring to lowest
+;;;invisible levels possible.  Thus a probe was stuck into sage-function-spec-get.
+;;;This worked for awhile but then some functions were written that checked the
+;;;documentation properties without looking up everything it found.  So the probe got
+;;;moved to the highest level (in copy-sage-record).  Every user interface function
+;;;that wants data is going to have to know to log events at the right level, logging
+;;;only once per event.
+
+(defvar *LOOKUP-HISTORY* ())
+;;;The following needs to be some kind of site option that says whether data collection is
+;;;permitted at all.
+(defvar *PERMIT-HISTORY-MONITOR* nil)		;sites will turn on by special agreement
+(defvar *FIRST-LOOKUP* t)			;need a hook for customizing variables
+(defvar *DATA-LOGGING-PROCESS* nil)		;holds the logger process or nil
+(defvar *DATA-REPOSITORY-PATHNAME*		;where to stash results of monitoring
+	  (fs:parse-pathname "sys:sage;log;log.text"))
+(defvar *MINIMUM-DATA-INTERVAL* 300.)		;5 minutes is often enough to check probably
+(defparameter *DEBUGGING-APPEND-SERVER* nil)
+
+;;;;very first crack at data collection
+;;;;Save when each lookup occurred and what was being looked up
+;;;;This doesn't tell you whether the thing was being looked up explicitly or as
+;;;;a result of expanding something else, but who cares.
+;;;;This is completely screwed up because *record-types* is so brain-damaged
+;;;;DOCUMENTATION-RECORD is constantly doing function-spec-get to find out the various
+;;;;possibilities when more than one exists so this approach to having data collection
+;;;;at the lowest level is bombing out.
+;
+;;;;Use this instead of si:function-spec-get to look up things when you want to have the
+;;;;record of the lookup kept.
+;(defun SAGE-FUNCTION-SPEC-GET (function-spec indicator)
+;  (let ((exists (si:function-spec-get function-spec indicator)))
+;    (when exists
+;      (push `(,function-spec			;the function spec itself
+;	      ,indicator			;property for doc being looked up
+;	      ,(time:get-universal-time))	;a timestamp
+;	    *lookup-history*)
+;      exists)))					;the function spec property it is getting
+
+(defun SAGE-FUNCTION-SPEC-GET (a b c)		;anything using this is WRONG
+  (ignore a b c)
+  (error "sage-function-spec-get is obsolete.  Go find out about get-sage-property."))
+
+;;;An approach to logging a data event and providing for it to be saved permanently
+;;;somewhere on disk
+(defun LOG-LOOKUP-EVENT (function-spec property documented-p)
+  (when (null *in-dex-background*)		; don't log lookups caused by background update
+    (when *first-lookup*			;---kludge to give interested parties a hook
+      (setq *first-lookup* nil))
+    (when *permit-history-monitor*
+      ;;Not clear this is the right place to start up the process, but why should anyone who
+      ;;has loaded Sage have to put up with the process running unless they look up something?
+      (setup-data-logging-process-if-necessary)
+      (without-interrupts			;?want to be sure that data logging is unitary
+	(push `(,function-spec			;and doesn't clash with saving
+		,property
+		,documented-p
+		,(time:get-universal-time))
+	      *lookup-history*)))))		;backwards in time
+
+(defun SETUP-DATA-LOGGING-PROCESS-IF-NECESSARY ()	;wonder what else I need to do with process
+  ;; launch the process if one hasn't been launched or if the old one is dead
+  ;; in the water
+  (when (or (null *data-logging-process*)
+	    (null (send *data-logging-process* :run-reasons)))
+    (setq *data-logging-process*
+	  (process-run-function '(:name "Sage Data Server"
+				  :priority -5	;need deep background
+				  :quantum 30)	;??are these reasonable
+	    'periodically-save-data-to-disk))
+    (push '(progn (if *lookup-history* (save-the-data))) sys:logout-list)))
+
+;;;Waits some minimum period before checking to see if any data, then saves data if
+;;;there are any.
+
+(defun PERIODICALLY-SAVE-DATA-TO-DISK ()
+  (loop do
+    (process-wait "Sleep"
+      #'(lambda (start-time minimum-wait)
+	  (and ( (time-difference (zl:time) start-time)
+		  minimum-wait)			;wait min time
+	       *lookup-history*))		;before checking for any data
+      (zl:time) *minimum-data-interval*)
+    (save-the-data)))				;women and children first
+
+;;;Make this a separate function so it can be on the logout list, in case anyone logs out.
+;;;It would be nice not to lose the final N minutes of data...
+(defun SAVE-THE-DATA ()
+  (let* ((history (without-interrupts		;safely snapshot the data
+		    (prog1 *lookup-history*
+			   (setq *lookup-history* nil))))
+	 (massaged-data (with-output-to-string (stream)
+			  (loop for (fspec property exists time) in (nreverse  history)
+				do
+			    ;; Data analysis tools that read the topic
+			    ;; from this string should also do so inside
+			    ;; with-standard-io-environment to get
+			    ;; the right package, readtable, base, etc.
+			    (with-standard-io-environment
+			      (format stream "~S ~S ~S ~S ~\\time\\~%"
+				      (if (or (string-equal zl:user-id "") (not zl:user-id))
+					  "not-logged-in" zl:user-id)
+				      (if (typep fspec 'record-group)
+					  (record-group-topic fspec)
+					  fspec)
+				      property
+				      (if exists t)
+				      time))))))
+    (fs:with-automatic-login-to-sys-host
+      ;; if this thing blows up, the user should not have to get involved
+      (condition-case-if (not *debugging-sage*) (err)
+	  (with-open-file (out *data-repository-pathname* :direction :output
+			       :if-exists :append :if-does-not-exist :create)
+	    (send out :string-out massaged-data))
+	;; There is a bug in the VMS CHAOS file server such that opening a file with
+	;; :if-exists :append and :if-does-not-exist :create will blow out with a file-not-found
+	;; error if they file does not already exist.  This handler kludges around the bug by
+	;; explicitly creating the file if the file-not-found error occurs.
+;;; THIS SHOULD BE REMOVED WHEN THE VMS CHAOS SERVER IS FIXED
+	(fs:file-not-found
+	  (without-interrupts			;safely reconstitute the data
+	    (setq *lookup-history* (append history *lookup-history*)))
+	  (ignore-errors			;guard against bug in the bugfix
+	    (with-open-file (f *data-repository-pathname* :direction :output :if-does-not-exist :create))))
+;;; END "TEMPORARY" FIX.  added 1/16/85 by York
+	;; for any other error just re-queue the history item and hope that it will work the
+	;; next time around.
+	(error
+	  (without-interrupts			;safely reconstitute the data
+	    (setq *lookup-history* (append history *lookup-history*))))))))
+
+#||  Comment-out the former APPEND server
+
+;;;This is the end-user handle on the append facility.
+;;;You pass the arguments to this baby by making the arguments into keyword args for the
+;;;invoke-service thing.  Then the appropriate protocol gets called.  It is a structure
+;;;with a slot for args which are stored there as a plist.
+;;;User gives a real file spec, which includes the destination host.
+;;;This extracts the host from it and changes the pathname to be sans host (so it becomes
+;;; for si:local-host when it arrives at destination).
+(defun APPEND-TO-FILE (pathname string-to-append)
+  (let* ((path (send (fs:parse-pathname pathname) ':translated-pathname))	;inefficient
+	 (full-name (send path ':string-for-printing))	;e.g. "F:>..."
+	 (name (substring full-name (1+ (string-search-char #\: full-name)))))	;name,no host
+    (net:invoke-service-on-host ':append (send path ':host)
+				':string string-to-append ':pathname name)))
+
+;;;This goes on the server host end
+;;;Assumption: the first line of the stream contains the "name" of the file (WITHOUT the
+;;;host part.  This gets used as string with local: as host).
+;;;Error checking approved by BSG.
+;;;This uses notifications to tell about any problems, so as not to make lots of
+;;; background error windows on the server machine.
+(network:define-server :APPEND (:medium :byte-stream :stream in :no-eof t)
+  (condition-case-if (not *debugging-append-server*) (error-object)
+      (let* ((destination			;data pathname = stream,line 1
+	       (fs:parse-pathname (readline in) si:local-host))
+	     (lock-location (locf (get (send destination ':property-list-location)
+				       ':sage-data-lock))))
+	(unwind-protect				;avoid "file busy" clashes by locking
+	  (progn
+	    (process-lock lock-location nil "Append Lock")
+	    (with-open-file (out destination ':direction ':output
+				 ':if-exists ':append ':if-does-not-exist ':create)
+	      (stream-copy-until-eof in out)))
+	  (process-unlock lock-location)))
+    (sys:network-error ())			;ignore, people have complained
+    (error (tv:notify nil "Append server error: ~A" error-object))))	;simple log
+
+;;;This is the internals of the user end.
+;;;This is pretty amazing.  The arguments arrive here invisibly as part of the object
+;;;called service, whose very existence is taken care of by this macro.  You just have to
+;;;know which arguments to expect based on how this gets invoked by invoke-service-on-host.
+(network:define-protocol :APPEND (:append :byte-stream)
+  (:invoke (service)
+   (with-open-stream (stream (net:get-connection-for-service service))
+     (let ((property-list (locf (neti:service-access-path-args service))))
+       (format stream "~A~%~A" (get property-list ':pathname)
+	       (get property-list ':string))))))
+
+;;; Make APPEND be the contact name on the Chaosnet for this.
+(chaos:add-contact-name-for-protocol ':append)
+
+
+;;;For testing
+(defun append-to-file (pathname string)
+  (format t "~A~%~A" pathname string))
+||#

@@ -1,0 +1,1462 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SYSTEM-INTERNALS; Base: 8; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; New who-calls technology.  --- Sombody figure out if that copyright is right.
+
+;;; --- Figure out how to do package filtering.  The worker is
+;;; map-over-callers, but also make all of its callers send in the info
+;;; as needed.
+
+;;; --- Maybe there should be an other-filter to map-over-callers.  This
+;;; would probably be a predicate that gets applied before the normal
+;;; funarg does.
+
+;;; --- Some information is lost in the lookup.  Specifically, the code
+;;; cannot currently determine if the caller is a fucntion or a
+;;; variable.  (who-calls 'fs:file-login) will show a variety of
+;;; callers, some of which are variables (initialization lists) and some
+;;; of which are functions.
+
+#|
+
+Outside functions users can call:
+
+.defun si:enable-who-calls mode
+	...blah blah blah...
+
+.defun si:add-files-to-who-calls-database &rest files
+	...blah blah blah...
+
+.defun si:add-system-to-who-calls-database system
+	...blah blah blah...
+
+Program interface is several pages below.
+
+|#
+
+
+
+#|
+.defvar *who-calls-mode*
+	[Not documented externally] This is one of :DISABLED, :MAKING,
+	:ALL, :NEW or :EXPLICIT.  :DISABLED means who calls has not been
+	enabled.  :MAKING means somebody is trying to enable who-calls
+	with :ALL but it has not yet finished.  :ALL and :NEW means
+	incremental mode is on.  :EXPLICIT means that new definitions
+	will not go in, but usage of some tools will explicitly update
+	the database.  :ALL tells full-gc to make a new database.  :NEW
+	and :EXPLICIT tells full-gc to just cdr-code it.  FDEFINE looks
+	at this variable to figure out what to do.  Various tools will
+	also look at this and tell the user that it is not enabled, or
+	what state it is in.
+|#
+
+;; defined in lispfn because fdefine and friends need it early.
+;; (defvar *who-calls-mode* :disabled)
+
+(defvar *who-calls-database* nil)
+(defvar *who-calls-queued-additions* nil)
+
+(defun disable-who-calls ()
+  (setq *who-calls-queued-additions* nil
+	*who-calls-mode* ':disabled))
+
+(defun enable-who-calls (&optional mode silent)
+  "MODE may be either :ALL, :ALL-REMAKE, :NEW, :ALL-NO-MAKE or
+   :EXPLICIT.  :ALL creates a full callers database.  This takes many
+   minutes and about 2000 pages of storage.  :ALL-REMAKE does the same
+   but doesn't query about the old state.  :NEW causes only new functions
+   to go into the callers database.  :ALL-NO-MAKE is like :NEW except
+   that at full-gc time the entire database is made.  :EXPLICIT enables
+   items to be added explicitly by SI:ADD-FILES-TO-WHO-CALLS-DATABASE or
+   SI:ADD-SYSTEM-TO-WHO-CALLS-DATABASE"
+  (when (eq si:*who-calls-mode* :making)
+    (ferror "Some process is currently making the who-calls database."))
+  (unless mode
+    (setq mode (accept '((scl:alist-member :alist
+			  (("New callers only" :value :new :documentation
+ "Record new callers defined or loaded in the future.
+Don't record callers already present in this world.")
+			   ("All callers" :value :all-remake :documentation
+ "Record all callers, even the ones in the Distribution world.
+This makes the world about 2000 pages bigger when you save it.")
+			   ("Full-GC records all callers" :value :all-no-make :documentation
+ "Record all callers, even the ones in the Distribution world, but delay initializing
+the database until (SI:FULL-GC) is done.  This makes the world about 2000 pages bigger.")
+			   ("Explicit callers only" :value :explicit :documentation
+ "Only record callers added explicitly by SI:ADD-FILES-TO-WHO-CALLS-DATABASE
+or SI:ADD-SYSTEM-TO-WHO-CALLS-DATABASE")
+			   ("Disable" :value :disabled :documentation
+ "Disable the who-calls facility completely.")))
+			 :description "a who-calls mode")
+		       :default ':new)))
+  (flet ((double-check (proposed-action &optional implications)
+	   (or silent
+	       (cl:yes-or-no-p "The current who-calls mode is ~S.~@
+				Do you still want to ~A? ~@[~@
+				~? ~]"
+			       si:*who-calls-mode* proposed-action implications))))
+    (cl:ecase mode
+      ((:all :all-remake)
+       (when (ensure-who-calls-macro-file)
+	 (when (or (eq mode :all-remake)
+		   (memq si:*who-calls-mode* '(:disabled :uninitialized))
+		   (double-check "make the entire database"))
+	   (make-who-calls-database)
+	   (setq si:*who-calls-mode* :all)
+	   (unless silent
+	     (format t "~&New definitions will be added automatically.~%")))))
+      (:all-no-make
+	(when (ensure-who-calls-macro-file)
+	  (when (or (memq si:*who-calls-mode* '(:disabled :uninitialized :all))
+		    (double-check
+		      "turn on :ALL mode but wait for full-gc to really make the database"
+		      "New definitions will be added automatically ~@
+		       even though the entire database will not be made yet."))
+	    (setq si:*who-calls-mode* :all))))
+      (:new
+	(when (or (memq si:*who-calls-mode* '(:disabled :uninitialized :new))
+		  (if (eq si:*who-calls-mode* :all)
+		      (double-check
+			"change from :ALL to :NEW"
+			"This will cause full-gc to spend much too much time ~@
+			 checking the validity of function definitions.")
+		      (double-check
+			"set the mode to incremental")))
+	  (setq si:*who-calls-mode* :new)
+	  (when (null *who-calls-database*)
+	    (clear-or-create-who-calls-database))
+	  (unless silent
+	    (format t "~&New definitions will be added to the who-calls database.~%"))))
+      (:explicit
+	(when (or (memq si:*who-calls-mode* '(:disabled :uninitialized :explicit))
+		  (if (eq si:*who-calls-mode* :all)
+		      (double-check
+			"change from :ALL to :EXPLICIT"
+			"This will cause full-gc to spend much too much time ~@
+			 checking the validity of function definitions.")
+		      (double-check
+			"set the mode to incremental")))
+	  (setq si:*who-calls-mode* :explicit)
+	  (when (null *who-calls-database*)
+	    (clear-or-create-who-calls-database))
+	  (unless silent
+	    (format t "~&Only explicit database additions will be ~
+		       recorded in the who-calls database.~%"))))
+      (:disabled (disable-who-calls))))
+  si:*who-calls-mode*)
+
+(defun add-files-to-who-calls-database (&rest files)
+  (unless (memq si:*who-calls-mode* '(:all :new :explicit :making))
+    (ferror "*WHO-CALLS-MODE* is not :ALL, :NEW, :EXPLICIT or :MAKING.~@
+	     Use the function SI:ENABLE-WHO-CALLS to properly set it."))
+  (dolist (file files)
+    (let* ((pathname (fs:parse-pathname file))
+	   (generic-pathname (send pathname :generic-pathname))
+	   (definitions (send generic-pathname :get 'si:definitions)))
+      (dolist (assoc-entry definitions)
+	(destructuring-bind (definer . specs) assoc-entry
+	  (multiple-value-bind (hook boundp)
+	      (selectq definer
+		((defvar defconstant) (values #'who-calls-defvar-hook #'boundp))
+		(defun (values #'who-calls-fdefine-hook #'fdefinedp))
+		(defflavor (values #'(lambda (spec)
+				       (who-calls-defflavor-hook (flavor:find-flavor spec)))
+				   #'(lambda (spec) (flavor:find-flavor spec nil)))))
+	    (when hook
+	      (dolist (spec specs)
+		(when (funcall boundp spec)
+		  (funcall hook spec))))))))))
+
+(defun add-system-to-who-calls-database (system)
+  (apply #'add-files-to-who-calls-database
+	 (si:system-source-files system :file-types '(:LISP)
+					:include-components nil)))
+
+
+
+(defconst *who-calls-how-alist*
+	  '((:variable            " uses ~S as a variable")
+	    (:function		  " calls ~S as a function")
+#+3600	    (:microcoded-function " calls ~S as an instruction")
+	    (:constant		  " uses ~S as a constant")
+	    (:unbound-function	  " calls ~S, an undefined function")
+#+ignore    (:flavor		  " uses ~S as a flavor")
+	    (:instance-variable	  " uses ~S as an instance variable")
+	    (:macro		  " uses ~S as a macro or optimized function")
+	    (:defined-constant	  " uses ~S as an open coded (DEFCONSTANT) constant")
+	    (:condition		  " establishes a condition handler for ~S")
+	    (:flavor-component	  " is a dependent flavor of ~S")
+	    (:generic-function	  " calls ~S as a generic function")
+	    (:setf		  " calls the SETF function for ~S")
+	    (:locf		  " calls the LOCF function for ~S")
+	    (:presentation-translator-from " is a presentation translator from ~S")
+	    (:presentation-translator-to " is a presentation translator to ~S")
+	    (:defines-instance-variable " is a flavor that defines ~S as an instance variable")
+	    (:resource		  " uses ~S as a resource")
+	    (:constructor	  " makes an instance of ~S")
+	    (nil		  ", an interpreted function, uses ~S somehow")))
+
+(defun who-calls (symbol &optional how)
+  (check-who-calls-mode-for-lookup-maybe-warn)
+  (let ((answer '()))
+    (map-over-callers
+      symbol
+      (lambda (caller how)
+	(format t "~&~S~@?."
+	  caller (or (cadr (assq how *who-calls-how-alist*))
+		     " uses ~S in an unknown way")
+	  symbol)
+	(cl:pushnew caller answer))
+      :called-how how
+      :eliminate-duplicates nil)
+    (when (null answer)
+      (format t "~&No callers.~%"))
+    (terpri)
+    (reverse answer)))
+(cp:define-command (com-show-callers :command-table "Callers")
+    ((symbol '((sys:function-spec :defined-p :any) :partial-completers nil)
+	     :prompt "a symbol"
+	     :documentation "Show callers of symbol")
+     &key
+     (called-how 'zwei:who-calls-how-called
+		 :prompt nil
+		 :documentation "List only callers which call in a certain way")
+     (pkg '((or null cl:package))
+	  :name "Package"
+	  :default nil
+	  :prompt nil
+	  :documentation "List only callers in the specified package")
+     (system '((or sct:subsystem sct:system))
+	     :prompt nil
+	     :documentation "List only callers in the specified system "))
+   (show-callers symbol
+		 :called-how called-how
+		 :package pkg
+		 :system system
+		 :printer t)
+   (format t "~&Done.~%"))
+(defun show-callersD,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB") 0(symbol &key called-how ((:package pkg)) system (printer t))
+  (cl:check-type pkg (or package null) "a package or NIL")
+  (cl:check-type system (or sct:subsystem sct:system null) "a system or NIL")
+  (let ((callers nil))
+    ;; If you change these filtering functions, also change
+    ;; ZWEI:REVERT-CALLERS-OF-FUNCTIONS-EDITING-BUFFER
+    (labels ((thing-in-package (thing &optional ignore)
+	       (declare (sys:downward-function))
+	       (cond ((symbolp thing)
+		      ;; If we have a symbol, just use its package
+		      (eq (symbol-package thing) pkg))
+		     ((and (listp thing)
+			   (memq (first thing) flavor:*fdefinable-method-types*))
+		      ;; If this is something flavorish, there are two case:
+		      ;; (1) the thing in the function position is in the right
+		      ;; package, or (2) the thing in the function position is
+		      ;; a keyword and the flavor is in the right package
+		      (let* ((generic (flavor:method-generic thing))
+			     (generic-package (when (symbolp generic)
+						(symbol-package generic))))
+			(if (listp generic)
+			    ;; Watch out for CL:SETF methods
+			    (thing-in-package generic)
+			    (or (eq generic-package pkg)
+				(and (eq generic-package pkg-keyword-package)
+				     (eq (symbol-package (flavor:method-flavor thing))
+					 pkg))))))
+		     ((listp thing)
+		      ;; If it's an internal function, etc., find the parent
+		      (thing-in-package (second thing)))
+		     (t t)))
+	     (thing-in-system (thing &optional ignore)
+	       (declare (sys:downward-function))
+	       (let* ((pathname (get-source-file-name-that-works thing nil t))
+		      (sys (when pathname (send pathname :get 'sct:system))))
+		 ;; Match if the specified system is EQ to the system we have our
+		 ;; hands on, or if the specified system is not a subsystem, the
+		 ;; current system is a subsystem, and the parent systems are EQ
+		 (or (eq sys system)
+		     (and (not (typep system 'sct:subsystem))
+			  (typep sys 'sct:subsystem)
+			  (eq system (sct:subsystem-parent-system sys))))))
+	     1(thing-in-package-and-system (thing &optional ignore)
+	       (and (thing-in-package thing)
+		    (thing-in-system thing)))
+0	     (get-source-file-name-that-works (fspec &optional type chase-parents)
+	       (when (zwei:flavor-method-has-no-source-code fspec)
+		 (setq fspec (flavor:method-flavor fspec)))	;instance variable accessor
+	       (si:get-source-file-name fspec type chase-parents)))
+      (map-over-callers
+	symbol
+	(cond ((null printer)
+	       #'(lambda (caller how) (push (cons caller how) callers)))
+	      ((eq printer t)
+	       #'(lambda (caller how)
+		   (format t "~&~S~@?."
+			   caller (or (cadr (assq how *who-calls-how-alist*))
+				      " uses ~S in an unknown way")
+			   symbol)))
+	      (t printer))
+	:called-how called-how
+	:eliminate-duplicates nil
+	:filter 
+	(cond ((and system pkg) #'thing-in-package-and-system)
+	      (system #'thing-in-system)
+	      (pkg #'thing-in-package)
+	      (t nil)))
+      )
+    callers))
+
+(defun what-files-call (symbol-or-symbols &optional how)
+  (check-who-calls-mode-for-lookup-maybe-warn)
+  (let ((specs (if (symbolp symbol-or-symbols)
+		   (list symbol-or-symbols)
+		 symbol-or-symbols))
+	(sources '()))
+    (dolist (spec specs)
+      (map-over-callers
+	spec
+	(lambda (caller ignore)
+	  (let ((source-file-name (or (si:get-source-file-name caller 'defun t)
+				      (si:get-source-file-name caller nil t))))
+	    (if source-file-name
+		(cl:pushnew source-file-name sources)
+		(format error-output "Warning:  Can't find source file name for ~S" caller))))
+	:called-how how
+	:eliminate-duplicates nil))
+    (reverse sources)))
+
+(defun who-calls-unbound-functions ()
+  (let ((answer '()))
+    ;; can't use the database because defun-methods get canonicalized
+    ;; out and fdefinedp of the raw defun-method symbol is NIL.
+    (si:map-compiled-functions t nil "Scanning all compiled functions for undefined functions"
+      (lambda (function ignore)
+	(when (si:function-same-as-function-from-name function)
+	  (si:map-over-compiled-function-callees
+	    function (lambda (caller callee how)
+		       (when (and (eq how :function)
+				  (not (fdefinedp callee)))
+			 (let ((caller (si:function-name caller)))
+			   (format t "~&~S calls ~S as a function, which is not defined.~%"
+				   caller callee)
+			   (push (list caller :calls callee) answer))))
+	    :external-references t))))
+    (terpri)
+    answer))
+
+;; This is a stub from the old who-calls substrate, in case anybody calls it.
+(DEFUN FIND-CALLERS-OF-SYMBOLS (SYMBOLS PKG FUNCTION
+				&OPTIONAL (DO-INFERIORS T) (DO-SUPERIORS T))
+  (DECLARE (IGNORE PKG DO-INFERIORS DO-SUPERIORS))
+  (CHECK-ARG SYMBOLS
+	     (OR (SYMBOLP SYMBOLS)
+		 (AND (LISTP SYMBOLS) (LOOP FOR SYM IN SYMBOLS ALWAYS (SYMBOLP SYM))))
+	     "a symbol or a list of symbols")
+  (IF (SYMBOLP SYMBOLS)
+      (SETQ SYMBOLS (LIST SYMBOLS)))
+  (LOOP FOR SYMBOL IN SYMBOLS DO (MAP-OVER-CALLERS SYMBOL FUNCTION))
+  NIL)
+
+
+(defun map-over-callers (callee funarg
+			 &key called-how no-update (eliminate-duplicates t) filter)
+  "FUNARG gets called with two arguments: caller and how the caller calls the callee.
+   CALLED-HOW can be NIL, meaning all types, a keyword which is the way
+   in which the program is interested, or a list of such keywords.
+   FILTER gets called with the same arguments as FUNARG, and should return T or NIL"
+  (declare (sys:downward-funarg funarg))
+  (unless no-update
+    (update-who-calls-database))
+  (macrolet ((called-how (type)
+	       `(or (not called-how)
+		    (eq called-how ,type)
+		    (and (listp called-how) (memq ,type called-how)))))
+    (let ((last-how nil)
+	  (last-callers nil)
+	  (other-last-callers nil)
+	  (still-other-last-callers nil))
+      (map-over-who-calls-tables
+	(lambda (how table)
+	  (when (called-how how)
+	    (let* ((tcallers (gethash callee table))
+		   ;; Duplicates in the list are rare, but not impossible
+		   (callers (if eliminate-duplicates (eliminate-duplicates tcallers) tcallers)))
+	      (dolist (caller callers)
+		;; Filter out obsolete compiled functions as callers
+		;; Filter out obsolete flavor :defines-instance-variable relations
+		(let ((caller-name (who-calls-caller-name caller callee how)))
+		  (when caller-name
+		    (when (or (null filter)
+			      (funcall filter caller-name how))
+		      (if eliminate-duplicates
+			  ;; Duplicate entries in more than one table are rare, but
+			  ;; not impossible
+			  (unless (and (eq how last-how)
+				       (or (memq caller last-callers)
+					   (memq caller other-last-callers)
+					   (memq caller still-other-last-callers)))
+			    (funcall funarg caller-name how))
+			(funcall funarg caller-name how))))))
+	      (when callers
+		(if (eq how last-how)
+		    (setq still-other-last-callers other-last-callers
+			  other-last-callers last-callers)
+		    (setq last-how how
+			  other-last-callers nil
+			  still-other-last-callers nil))
+		(setq last-callers callers)))))))
+    ;; Kludges for other databases besides the who-calls tables
+    (when (and (symbolp callee)
+	       (called-how :setf)
+	       (get callee 'lt:derived-setf-function))
+      (map-over-callers `(cl:setf ,callee)
+			(lambda (caller ignore)
+			  (funcall funarg caller ':setf))
+			:called-how :function :no-update t
+			:eliminate-duplicates eliminate-duplicates :filter filter))
+    (when (and (symbolp callee)
+	       (called-how :setf)
+	       (get callee 'lt:derived-future-common-lisp-setf-function))
+      (map-over-callers `(future-common-lisp:setf ,callee)
+			(lambda (caller ignore)
+			  (funcall funarg caller ':setf))
+			:called-how :function :no-update t
+			:eliminate-duplicates eliminate-duplicates :filter filter))
+    (when (and (symbolp callee)
+	       (called-how :locf)
+	       (get callee 'lt:derived-locf-function))
+      (map-over-callers `(locf ,callee)
+			(lambda (caller ignore)
+			  (funcall funarg caller ':locf))
+			:called-how :function :no-update t
+			:eliminate-duplicates eliminate-duplicates :filter filter))
+    (when (and (symbolp callee)
+	       (dw:presentation-type-p callee)
+	       (or (called-how :presentation-translator-from)
+		   (called-how :presentation-translator-to)))
+      (flet ((handle (handler how)
+	       ;; Use this function rather than the define-presentation-type, since
+	       ;; funarg does not take a definition-type argument
+	       (when (called-how how)
+		 (let ((caller (function-name
+				 (dw::presentation-mouse-handler-value-function handler))))
+		   (when (or (null filter)
+			     (funcall filter caller how))
+		     (funcall funarg caller how))))))
+	(dolist (x dw::*presentation-mouse-handlers*)
+	  (dw:with-type-decoded (context-presentation-type)
+				(dw::presentation-mouse-handler-context-presentation-type x)
+	    (when (eq context-presentation-type callee)
+	      (handle x ':presentation-translator-to)))
+	  (dw:with-type-decoded (displayed-presentation-type)
+				(dw::presentation-mouse-handler-displayed-presentation-type x)
+	    (when (eq displayed-presentation-type callee)
+	      (handle x ':presentation-translator-from))))))
+    (when (called-how :flavor-component)
+      (let ((flavor (and (symbolp callee)
+			 (not (null callee))
+			 (flavor:find-flavor callee nil nil))))
+	(when flavor
+	  (dolist (caller (flavor:flavor-all-dependents flavor))
+	    (when (or (null filter)
+		      (funcall filter caller ':flavor-component))
+	      (funcall funarg caller ':flavor-component))))))
+    (when (and (symbolp callee)
+	       (called-how :instance-variable))
+      (map-over-callers callee
+	(lambda (caller ignore)
+	  (flet ((caller (method-type generic)
+		   (let ((function-spec `(,method-type ,generic ,caller ,callee)))
+		     (when (or (null filter)
+			       (funcall filter function-spec ':instance-variable))
+		       (funcall funarg function-spec ':instance-variable)))))
+	    (let ((fl (flavor:find-flavor caller)))
+	      (dolist (x (flavor::flavor-local-readable-instance-variables fl))
+		(when (eq (second x) callee)
+		  (caller 'flavor:read-instance-variable (first x))))
+	      (dolist (x (flavor::flavor-local-writable-instance-variables fl))
+		(when (eq (second x) callee)
+		  (caller 'flavor:write-instance-variable (first x))))
+	      (dolist (x (flavor::flavor-local-locatable-instance-variables fl))
+		(when (eq (second x) callee)
+		  (caller 'flavor:locate-instance-variable (first x)))))))
+	:called-how :defines-instance-variable :no-update t
+	:eliminate-duplicates eliminate-duplicates))
+    (when (and (symbolp callee)
+	       (not (null callee))
+	       (called-how :constructor)
+	       (not (get callee 'sys:flavor)))	;avoid consing a flavor-class
+      (let ((class (clos:find-class callee nil nil)))
+	(when (and class (clos:slot-exists-p class 'clos-internals::constructors))
+	  (dolist (constructor (clos:slot-value class 'clos-internals::constructors))
+	    (map-over-callers constructor
+	      (lambda (caller ignore)
+		(funcall funarg caller :constructor))
+	      :called-how :function :no-update t
+	      :eliminate-duplicates eliminate-duplicates)))))))
+
+
+(defun check-who-calls-mode-for-lookup-maybe-warn ()
+  (tagbody
+    again
+    (selectq si:*who-calls-mode*
+      (:making (format t "~&Some process is currently making the who-calls database.~2%")
+	       (process-wait "who-calls database"
+		 (lambda () (neq si:*who-calls-mode* :making)))
+	       (go again))
+      (:new (format t "~&Only callers of definitions made since ~
+		         who-calls was enabled in :NEW mode will be found.~2%"))
+      (:explicit (format t "~&Only callers of explicitly added definitions ~
+			      will be found.~2%"))
+      ((:disabled :uninitialized)
+       (format t "~&Who-calls database is disabled")))))
+
+
+
+(defun describe-who-calls-tables ()
+  (update-who-calls-database)
+  (map-over-who-calls-tables
+    (lambda (how table)
+      (format t "~&~S:~%" how)
+      (sys:with-indentation (standard-output 4)
+	;; pretty gross, but there isn't any other interface into the hash-tables' queries.
+	(letf ((#'cl:y-or-n-p #'ignore))
+	  (describe table))))))
+
+(defun who-calls-major-callers (&optional (n 10.) how)
+  (update-who-calls-database)
+  (map-over-who-calls-tables
+    (lambda (table-how table)
+      (when (or (not how)
+		(eq table-how how))
+	(format t "~%~S:~%" table-how)
+	(let ((data '()))
+	  (maphash (lambda (callee callers)
+		     (push `(,(length callers) ,callee) data))
+		   table)
+	  (loop repeat n
+		for (count callee) in (sortcar (copylist data) #'>) do
+	    (let ((package nil))
+	      (format t "  ~S has ~D caller~:P.~%" callee count))))))))
+
+(defun who-calls-database-size ()
+  (let ((n-tables 0)
+	(filled 0)
+	(possible 0)
+	(table-words 0))	
+    (update-who-calls-database)
+    (map-over-who-calls-tables
+      (lambda (ignore table)
+	(incf n-tables 1)
+	(incf filled (send table :filled-elements))
+	(incf possible (send table :size))
+	(incf table-words (array-length (sys:symeval-in-instance table 'cli::internal-representation)))))
+    (format t "~&There are ~D hash tables with a total of ~D ~@
+	         filled elements from a possible ~D, taking up ~@
+	         ~D words for the tables (not counting entries).~%"
+	    n-tables filled possible table-words))
+  (let ((n-words 0))
+    (map-over-who-calls-tables
+      (lambda (ignore table)
+	(maphash (lambda (ignore value)
+		   (incf n-words (length value)))
+		 table)))
+    (format t "The entries, if cdr-coded, take up ~D words.~%" n-words)))
+
+
+  ;;
+;;;;;;  The database
+  ;;
+
+;;; The who-calls database gets its own area.  In the prototype it was
+;;; in debug-info-area, but it can just as well have its own.  The area
+;;; is static, since the database is rather permanent.  It does interact
+;;; with full-gc so the database gets compressed at full-gc time.
+
+;;; The database is a alist keyed by how the callee is used, such as
+;;; :constant, :function, :variable, :instance-variable,
+;;; :macro, :defined-constant, :condition, or :microcoded-function. 
+;;; Each entry in the alist looks like
+;;;	(how static-table dynamic-table ephemeral-table equal-table)
+;;; where each of the four tables can be nil if it is not needed yet.
+;;; The first three tables use EQ as the test and are separated to minimize rehashing.
+;;; The last table uses EQUAL as the test; it is used when the callee is not a symbol.
+
+(defun make-who-calls-database-area (&optional temporary-p)
+  (let ((gc-area-type (selectq temporary-p
+			((nil) :static)
+			(:yes-i-know-what-i-am-doing
+			 :temporary)
+			(otherwise
+			 (ferror "Don't call this directly!")))))
+    (make-area :name '*who-calls-database-area* :gc gc-area-type
+	       :region-size #o1400000)))
+
+(defconst *who-calls-database-area* (make-who-calls-database-area))
+
+(defun destroy-who-calls-database ()
+  (when (eq si:*who-calls-mode* :making)
+    (ferror "Can't destroy the database while it is being made."))
+  (without-interrupts
+    (setq *who-calls-database* nil
+	  *who-calls-queued-additions* nil)
+    (make-who-calls-database-area :yes-i-know-what-i-am-doing)
+    (sys:reset-temporary-area *who-calls-database-area* t)
+    (make-who-calls-database-area)
+    (setq *who-calls-database* nil
+	  *who-calls-queued-additions* nil)
+    (cond ((eq si:*who-calls-mode* :all)
+	   (setq si:*who-calls-mode* :disabled)))))
+
+(defun map-over-who-calls-tables (funarg)
+  "funarg gets called with two arguments: how the key is used and the table"
+  (declare (sys:downward-funarg funarg))
+  (loop for (how . tables) in *who-calls-database* do
+    (loop for table in tables do
+      (unless (null table)
+	(funcall funarg how table)))))
+
+;; Filter out obsolete compiled functions as callers
+;; Filter out obsolete flavor :defines-instance-variable relations
+(defun who-calls-caller-name (caller callee how)
+  (cond ((typep caller :symbol)
+	 (cond ((eq how ':defines-instance-variable)
+		(let ((fl (flavor:find-flavor caller nil)))
+		  (and fl (memq callee (flavor::flavor-local-instance-variables fl))
+		       caller)))
+	       ((boundp caller) caller)))
+	((typep caller :compiled-function)
+	 (when (function-same-as-function-from-name caller)
+	   (compiled-function-name-for-debugging caller)))
+	((interpreted-function-p caller)
+	 (let* ((fname (function-name caller))
+		(fspec (unencapsulate-function-spec fname))
+		(def (and (fdefinedp fspec) (fdefinition fspec))))
+	   (when (eq def caller)
+	     fname)))
+	((and (listp caller) (eq (first caller) :function-link))
+	 (destructuring-bind (ignore fname fdef) caller
+	   (let ((fspec (unencapsulate-function-spec fname)))
+	     (when (and (fdefinedp fspec) (eq (fdefinition fspec) fdef))
+	       fname))))
+	((and (listp caller) (eq (first caller) ':initialization))
+	 caller)
+	(t (ferror "Malformed item in caller table"))))
+
+
+;;; With new Tables, it's best to use EQ hash tables for symbols, which avoids
+;;; paging in the symbol and its name.  For lists, we use EQUAL hash tables.
+;;; A rehash of the EQ tables occurs whenever a static area is GC'ed, but that's rare.
+
+(defun clear-or-create-who-calls-database ()
+  (let* ((big-p (cl:ecase si:*who-calls-mode*
+		  ((:all :making) t)
+		  ((:new :explicit) nil)))
+	 ;; These big sizes are based on measurements of the internal
+	 ;; SCRC worlds.  The small sizes are guesses.
+	 ;; These sizes are the actual number of table elements; the :size parameter of
+	 ;; the table is larger to allow for 10% addition to the tables.
+	 (sizes (if big-p '((:constant			25500. nil nil nil)
+			    (:function			11500. nil nil nil)
+			    (:variable			 4700. nil nil nil)
+			    (:instance-variable		 2600. nil nil nil)
+			    (:macro			 4400. nil nil nil)
+			    (:defined-constant		  900. nil nil nil)
+			    (:condition			  160. nil nil nil)
+		#+3600	    (:microcoded-function	  150. nil nil nil)
+			    (:generic-function		  100. nil nil 20.))
+			  '((:constant			  200. nil nil nil)
+			    (:function			  500. nil nil nil)
+			    (:variable			  200. nil nil nil)
+			    (:instance-variable		  200. nil nil nil)
+			    (:macro			  200. nil nil nil)
+			    (:defined-constant		  100. nil nil nil)
+			    (:condition			  100. nil nil nil)
+		#+3600	    (:microcoded-function	  150. nil nil nil)
+			    (:generic-function		  100. nil nil nil)))))
+    (if (null *who-calls-database*)
+	(setq *who-calls-database*
+	      (copytree 
+		(loop for (how . sizes) in sizes
+		      collect `(,how
+				,@(loop for size in sizes
+					for test in '(eq eq eq cl:equal)
+					collect (and size
+						     (cl:make-hash-table
+						       :test test
+						       :growth-threshold 0.8
+						       :size (ceiling (* size 1.10))
+						       :area *who-calls-database-area*)))))
+		*who-calls-database-area*)
+	      *who-calls-queued-additions* nil)
+	;;--- I don't believe this clause can ever be reached, given the existing
+	;;--- callers of this function.  --Moon
+	(loop for (how) in sizes do
+	  (loop for table in (cdr (assq how *who-calls-database*)) do
+	    (when table
+	      ;;--- Should grow table if it's too small, but I don't know how to do that
+	      (clrhash table)))))))
+
+
+
+;;; GC and disk save interactions
+
+(define-gc-optimization optimize-who-calls-database :layered-ids-release
+  (:order (:before si:compress-debug-info))
+  (:documentation "Optimize or build the who-calls database, depending on SI:*WHO-CALLS-MODE*")
+  (:before-flip (incremental)
+    ;; Make sure anything left around in the area gets cleaned up.
+    (unless incremental
+      (selectq si:*who-calls-mode*
+	((:disabled :uninitialized))
+	((:new :explicit)
+	 ;; remove obsolete entries and cdr-code result
+	 (update-who-calls-database)
+	 (map-over-who-calls-tables
+	   (lambda (how table)
+	     (maphash (lambda (callee ignore)
+			(declare (sys:downward-function))
+			(send table :modify-hash callee
+			      (lambda (ignore callers ignore)
+				(declare (sys:downward-function))
+				(del-if-not #'(lambda (caller)
+						(who-calls-caller-name caller callee how))
+					    callers))))
+		      table)))		    
+	 (cdr-code-who-calls-database))
+	(:making (process-wait "Who-calls database made"
+		   (lambda () (neq si:*who-calls-mode* :making)))
+		 (cdr-code-who-calls-database))
+	(:all (make-who-calls-database)		;destroy old, recreate new
+	      (cdr-code-who-calls-database))
+	(otherwise
+	 (ferror "*who-calls-mode* is unexpectedly ~S" si:*who-calls-mode*))))
+    ;; Even for incremental GC's, ensure that what survives becomes permanent.
+    #+ignore ;;-- This screws up SI:COMPRESS-WHO-CALLS-DATABASE, so don't do this.
+    (setf (aref *immediate-gc-area-migration-array* *who-calls-database-area*)
+	  %permanent-level)))
+
+
+(defvar-resettable *who-calls-background-update-active-p* nil nil
+		   "Flag so only one process tries to do a background update")
+
+(defun who-calls-gc-every-flip ()
+  (when (zerop *inhibit-lengthy-background-updates*)
+    (who-calls-gc-every-flip-1)))
+
+(defvar *show-background-who-calls-progress* ())
+(defun who-calls-gc-every-flip-1 ()
+  (without-interrupts
+    (when (and *who-calls-queued-additions*
+	       (not *who-calls-background-update-active-p*))
+      (setq *who-calls-background-update-active-p* t)
+      ;; Before changing the priority, see the Bug-LispM archives of
+      ;; 24Feb86 for some rationale.
+      (process-run-function '(:name "Update who-calls database" :quantum 6 :priority 0)
+	#'(lambda ()
+	    (unwind-protect
+		(update-who-calls-database *show-background-who-calls-progress*)
+	      (setq *who-calls-background-update-active-p* nil)))))))
+
+(define-postponed-lengthy-background-update
+  (who-calls-gc-every-flip-1))
+
+(add-initialization "who-calls-gc-every-flip"
+		    '(push '(who-calls-gc-every-flip) si:gc-after-flip-list)
+		    '(:once))
+
+(defun who-calls-before-cold ()
+  (update-who-calls-database)			;update from any new info
+  (map-over-who-calls-tables			;rehash if necessary
+    (lambda (ignore table)
+      (send table :get-hash 0))))		;0 guaranteed not to be in table
+
+(add-initialization "who-calls before cold"
+		    '(who-calls-before-cold)
+		    '(:before-cold))
+
+;;; Optimization routines
+
+;This does not attempt to (del-if-not #'who-calls-caller-name value)
+;because it's too slow and if the database was freshly made there won't be any.
+;Maybe put it back in if unencapsulate-function-spec is ever fixed to be reasonably fast.
+;This does not (eliminate-duplicates value) because there shouldn't be any duplicates.
+(defun cdr-code-who-calls-database (&optional if-longer-than)
+  "IF-LONGER-THAN can be NIL, meaning always copy.  Otherwise it is a
+   number which is the length threshold above which lists get copied.
+   It is quite possible that each cons of a non-cdr-coded list is on a
+   separate page.  This will help FERROR and FORMAT (currently the two
+   greatest callees) from being too spread out."
+  (update-who-calls-database)
+  (map-over-who-calls-tables
+    (lambda (ignore table)
+      (maphash (lambda (key ignore)
+		 (declare (sys:downward-function))
+		 (send table :modify-hash key
+		       (lambda (ignore value ignore)
+			 (declare (sys:downward-function))
+			 (if (or (not if-longer-than)
+				 (> (length value) if-longer-than))
+			     (copylist value *who-calls-database-area*)
+			     value))))
+	       table))))
+
+(defun compress-who-calls-database (&key (cdr-code t) (safe nil))
+  ;;  this does a magic GC!
+  (format t "~&Updating...")
+  (update-who-calls-database)
+  (when cdr-code
+    (format t "~&cdr-coding database...")
+    (cdr-code-who-calls-database))
+  (format t "~&Flipping...")
+  (let-globally ((gc-immediately-in-progress t)
+		 (inhibit-scavenging-flag t)
+		 (inhibit-idle-scavenging-flag t))
+    (gc-reclaim-oldspace)
+    (let ((generation %gc-generation-number))
+      (stack-let ((area-mask (make-array (n-areas) :type art-boolean))
+		  (level-mask (make-array %number-of-levels :type art-boolean)))
+	(setf (aref area-mask *who-calls-database-area*) t)
+	(setf (aref level-mask %static-level) t)
+	(dynamic-gc-flip :ratio 1 :insufficient-address-space-action :proceed
+			 :area-mask area-mask
+			 :level-mask level-mask))
+      ;; cause outer fringes to transport by touching tables and cause rehash as needed
+      (format t "~&Touching outer levels...")
+      (map-over-who-calls-tables #'ignore)
+      (format t "~&Touching inner levels...")
+      (map-over-who-calls-tables
+	(lambda (ignore table)
+	  (maphash #'ignore table)))
+      (unless safe
+	;; Adjust the GC pointer to the free pointer of all scav-enabled
+	;; non-*who-calls-database-area* areas.  This is 'legal' since the
+	;; only pointer into the only flipped area is in
+	;; *who-calls-database*'s value cell which is intentionally tripped
+	;; over by map-over-who-calls-tables.  All other regions will never transport
+	;; anything, so this is really an optimization of scavenging.
+	(format t "~&Massaging rest of world...")
+	(unless (without-interrupts
+		  (when (= %gc-generation-number (+ generation  1))
+		    (map-over-regions
+		      (lambda (area) ( area *who-calls-database-area*))
+		      (lambda (region)
+			(ldb-test %%region-scavenge-enable (region-bits region)))
+		      (lambda (ignore region)
+			(setf (region-gc-pointer region) (region-free-pointer region))))
+		    t))
+	  (format t "   (skipped modifying region pointers due to intervening GC)"))))
+    (format t "~&Finishing GC scavenge...")
+    (gc-reclaim-oldspace)))
+
+
+
+(defun add-reference-to-who-calls-database (caller callee how &optional new-caller-p)
+  #| microcoded functions filtered out by add-compiled-function-to-who-calls-database |
+  (when (and (eq how :microcoded-function)
+	     (memq callee *microcoded-functions-not-for-who-calls*))
+    (return-from add-reference-to-who-calls-database nil)) ||#
+  #| macros filtered out by (a) the compiler and (b) by map-over-form-callees
+     by looking at compiler:do-not-record-macroexpansions |
+  (when (and (eq how :macro)
+	     (assq 'compiler:do-not-record-macroexpansions (debugging-info callee)))
+    (return-from add-reference-to-who-calls-database nil)) ||#
+  #| NIL and T filtered out by (a) the push-t instruction and (b) map-over-form-callees |
+  (when (and (eq how :constant)
+	     (memq callee '(NIL T)))
+    (return-from add-reference-to-who-calls-database nil)) ||#
+
+  ;; Don't record constant references to uninterned symbols.
+  (when (and (eq how :constant)
+	     (symbolp callee)
+	     (null (symbol-package callee)))
+    (return-from add-reference-to-who-calls-database nil))
+
+  ;; Find or create the appropriate table to use for how and callee
+  (let ((index (if (symbolp callee) (max (cli::gc-dependence callee) 1) 4))
+	how-entry table)
+    (without-interrupts
+      (unless (setq how-entry (assq how *who-calls-database*))
+	(cl:push (setq how-entry (list-in-area *who-calls-database-area* how nil nil nil nil))
+		 *who-calls-database*
+		 :area *who-calls-database-area*))
+      (unless (setq table (nth index how-entry))
+	(setf (nth index how-entry)
+	      (setq table (cl:make-hash-table :test (if (symbolp callee) 'eq 'cl:equal)
+					      :area *who-calls-database-area*)))))
+;--- Table should be protecting itself now.
+;--- Maybe we don't need a without-aborts here any more?
+    (without-aborts ("The who-calls database is being updated.~@
+		      Aborting this could destroy the table of callers.")
+      (send table :modify-hash callee
+	    (lambda (ignore value ignore)
+	      (declare (sys:downward-function))
+	      (if (and (not new-caller-p)
+		       (if (listp caller)
+			   (member caller value)
+			   (memq caller value)))
+		  value
+		  (cons-in-area caller value *who-calls-database-area*))))))
+  nil)
+
+
+  ;;
+;;;;;;  The database constructor
+  ;;
+
+(defun make-who-calls-database ()
+  (unwind-protect-case ()
+      (progn
+	(destroy-who-calls-database)
+	(setq si:*who-calls-mode* :making)
+	;; make or clear tables
+	(clear-or-create-who-calls-database)
+	;; rebuild
+	(let (#+3600(si:sequence-break-interval (min 100000. si:sequence-break-interval)))
+	  ;; the above line works because si:sequence-break doesn't
+	  ;; unbind the stack when checking for sequence break
+	  ;; elligibility.  It causes this process to allow another
+	  ;; user to run at least every 1/10th second.
+	  (format t "~&Scanning all compiled functions...")
+	  (si:map-compiled-functions t nil
+	    "Scanning compiled functions to build who-calls database"
+	    #'(lambda (function cca)
+		(let ((name (car (compiled-function-extra-info cca))))
+		  (unless (and (listp name) (eq (car name) ':internal))
+		    (add-compiled-function-to-who-calls-database function)))))
+	  ;; roughly mapatoms-all, but scans the symbols as they are
+	  ;; in memory, not in package-hash order.
+	  (format t "~&Scanning all symbols...")
+	  (si:map-over-objects
+	    (lambda (area)
+	      (or (= area si:safeguarded-objects-area)
+		  (= area si:symbol-area)))
+	    #'si:region-predicate-structure
+	    (lambda (ignore ignore ignore symbol ignore ignore)
+	      (when (and (symbolp symbol)
+			 (symbol-package symbol))
+		(add-symbol-cells-to-who-calls-database symbol))))
+	  (when *who-calls-macro-file*
+	    (reload-who-calls-macro-file))))
+    (:abort (setq si:*who-calls-mode* :disabled))
+    (:normal (setq si:*who-calls-mode* :all)
+	     (update-who-calls-database)
+	     (format t "~&Who calls database made.~%"))))
+
+;;; Incremental mode and updater
+
+(defun queue-reference-to-who-calls-database (caller callee how)
+  "Incremental mode uses this instead of add-reference-to-who-calls-database
+   as the funarg to the code-walkers."
+  (without-interrupts
+    ;; Cons.  Don't delete duplicates because that would
+    ;; take time and people (humans) would notice.
+    (push (list caller callee how) *who-calls-queued-additions*)))
+
+(defun queue-references-to-who-calls-database (queue)
+  (without-interrupts
+    (setq *who-calls-queued-additions* (nconc queue *who-calls-queued-additions*))))
+(defun who-calls-fdefine-hook (fspec &optional (queue-p t))
+  (flet ((consider (fdefinition)
+	   (let ((database-function (if queue-p
+					#'queue-reference-to-who-calls-database
+					#'add-reference-to-who-calls-database))
+		 (fname (si:function-name fdefinition)))
+	     (cl:typecase fdefinition
+	       (null)
+	       (sys:compiled-function
+		 (if (equal fspec fname)
+		     (add-compiled-function-to-who-calls-database fdefinition queue-p)
+		     (funcall database-function
+			      (list-in-area *who-calls-database-area*
+					    :function-link fspec fdefinition)
+			      fname :function)))
+	       ((cl:satisfies interpreted-function-p)
+		(if (equal fspec fname)
+		    (map-over-interpreted-definition-callees
+		      fdefinition fdefinition database-function)
+		    (funcall database-function
+			     (list-in-area *who-calls-database-area*
+					   :function-link fspec fdefinition)
+			     fname :function)))
+	       (symbol
+		 (funcall database-function
+			  (list-in-area *who-calls-database-area*
+					:function-link fspec fdefinition)
+			  fname :function))))))
+    (let ((fdefinition (fdefinition (si:unencapsulate-function-spec fspec))))
+      (if (and (listp fdefinition) (eq (car fdefinition) 'special))
+	  (progn (consider (si:special-form-p fdefinition))
+		 (consider (si:macro-function fdefinition)))
+	  (consider fdefinition)))))
+
+(defun who-calls-defvar-hook (variable)
+  (let ((value (and (boundp variable) (symeval variable))))
+    (when value
+      (si:map-over-leaves-of-list
+	value (lambda (leaf) (typecase leaf
+			       (:null)
+			       (:symbol
+				 (queue-reference-to-who-calls-database
+				   variable leaf :constant))
+			       (:compiled-function
+				 (queue-reference-to-who-calls-database
+				   variable (si:function-name leaf) :function))))))))
+
+(defun who-calls-add-initialization-hook (initialization-list form &optional name)
+  (let ((caller `(:initialization ,initialization-list ,name)))
+    (map-over-form-callees caller form
+			   #'queue-reference-to-who-calls-database))) 
+(defun who-calls-defflavor-hook (flavor)
+  (dolist (var (flavor::flavor-local-instance-variables flavor))
+    (queue-reference-to-who-calls-database (flavor:flavor-name flavor) var
+					   ':defines-instance-variable)))
+
+(defun update-who-calls-database (&optional (note-progress t))
+  (tv:noting-progress-if note-progress ("Update who-calls database")
+    (let ((progress-numerator 0)
+	  (progress-denominator (and note-progress
+				     (length *who-calls-queued-additions*))))
+      (loop with good-callers = nil
+	    with bad-callers = nil do
+	(when (and note-progress ( progress-numerator progress-denominator))
+	  ;; Someone's queueing stuff faster than we're adding references,
+	  ;; recompute progress denominator
+	  (setq progress-numerator 0
+		progress-denominator (length *who-calls-queued-additions*)))
+	(let ((addition (without-interrupts
+			  (if *who-calls-queued-additions*
+			      (pop *who-calls-queued-additions*)
+			      (return nil)))))
+	  (unwind-protect-case ()
+	      (let ((caller (first addition)))
+		(when note-progress
+		  (tv:note-progress progress-numerator progress-denominator))
+		(when (cond ((memq caller good-callers) t)
+			    ((memq caller bad-callers) nil)
+			    (t
+			     (let ((good-p (who-calls-caller-name caller
+					     (second addition)
+					     (if (cl:listp (third addition))
+						 ;; Multiple reference case never uses
+						 ;; :defines-instance-variable as 'how'
+						 (first (second addition))
+						 (third addition)))))
+				 (if good-p
+				     (push caller good-callers)
+				     (push caller bad-callers))
+				 good-p)))
+		  (if (cl:listp (third addition))
+		      ;; Multiple references with duplicates removed
+		      (add-references-to-who-calls-database addition)
+		      ;; Single reference
+		      (add-reference-to-who-calls-database caller (second addition)
+							   (third addition)))))
+	    (:normal (incf progress-numerator))
+	    (:abort (without-interrupts (push addition *who-calls-queued-additions*)))))))))
+
+;;; opcode filtering for being called as a :microcoded-function.
+;;; Instead of doing MEMQs for every opcode, cache all the data once
+;;; into a boolean array and just use aref.
+
+#+3600
+(defconst *consider-opcode-for-who-calls-p* nil
+  "Boolean table of opcodes to consider for who-calls database.")
+
+#+3600
+(defconst *microcoded-functions-not-for-who-calls*
+	  #+3600 'sys:(
+		       cons ncons car cdr cdr-local rplaca rplacd
+		       get memq assq getf member-fast assoc-fast
+		       eq eql not atom symbolp arrayp stringp cl:listp endp numberp fixp
+		       %data-type		;other datatype checks
+		       +-internal --internal *-internal //-internal \ mod minus
+		       minusp zerop plusp internal-< internal-= internal->
+		       ldb-internal dpb-internal char-ldb-internal
+		       char=-internal char-equal-internal
+		       1+local 1-local
+		       logand-internal logior-internal logxor-internal
+		       ap-1 ar-1 as-1 ap-leader array-leader store-array-leader
+		       array-active-length cl:array-total-size
+		       %jump %instance-ref %p-structure-offset
+		       %save-binding-stack-level %restore-binding-stack-level	;letf
+		       %bind-location location-boundp
+		       )
+	  #+IMach 'sys:())
+
+#+3600
+(defun setup-*consider-opcode-for-who-calls-p* ()
+  (dolist (fun *microcoded-functions-not-for-who-calls*)
+    (unless (cl:position fun l-lisp-compiler:*instruction-function-name*)
+      (ferror "Function ~S is in *MICROCODED-FUNCTIONS-NOT-FOR-WHO-CALLS* ~@
+	       but not in L-LISP-COMPILER:*INSTRUCTION-FUNCTION-NAME*"
+	      fun)))	
+  (let* ((n-opcodes (array-length l-lisp-compiler:*instruction-function-name*))
+	 (array (make-array n-opcodes :type 'art-boolean :initial-value nil)))
+    (loop for opcode below n-opcodes
+	  as lisp-function = (aref l-lisp-compiler:*instruction-function-name* opcode) do
+      (when (and lisp-function
+		 (not (memq lisp-function *microcoded-functions-not-for-who-calls*)))
+	(setf (aref array opcode) t)))
+    (setq *consider-opcode-for-who-calls-p* array)))
+
+#+3600
+(setup-*consider-opcode-for-who-calls-p*)
+
+;;; This will be passed as the :INSTRUCTIONS argument to
+;;; map-over-compiled-functions-callees.  If it passes the filter, which
+;;; in this case is 'Does this opcode have a corresponding lisp function
+;;; name that wants to be recorded?', funcall the funarg with the
+;;; function name.
+
+#+3600
+(defun who-calls-instruction-filter (cca inst i funarg)
+  (declare (sys:downward-funarg funarg)
+	   (ignore cca i))
+  (let ((opcode (l-lisp-compiler:get-universal-opcode inst)))
+    (when (aref *consider-opcode-for-who-calls-p* opcode)
+      (funcall funarg (aref l-lisp-compiler:*instruction-function-name* opcode)))))
+
+#|  Metering stuff, to generate *microcoded-functions-not-for-who-calls* |
+
+(defun summarize-callers-of-microcoded-functions ()
+  (update-who-calls-database)
+  (map-over-who-calls-tables
+    (lambda (key-type how table)
+      (when (and (eq key-type :symbol)
+		 (eq how :microcoded-function))
+	(let ((list nil))
+	  (send table :map-hash
+		#'(lambda (key value)
+		    (push (list (length value) key) list)))
+	  (setq list (sortcar (copylist list) #'>))
+	  (format t "~&Callers   Function")
+	  (loop for (number function) in list do
+	    (format t "~%~7D   ~A" number function)))))))
+
+(summarize-callers-of-microcoded-functions)
+||#
+
+(defvar *who-calls-macro-file* nil)
+;; Returns NIL if the user wants to abort
+(defun ensure-who-calls-macro-file ()
+  (tagbody ensure-who-calls-macro-file 
+    (when *who-calls-macro-file*
+      (unless (cl:probe-file *who-calls-macro-file*)
+	(format cl:*query-io*
+	  "~%Warning:  The file ~A is required to build~@
+	     ~2@Tthe who-calls database properly, but it does not exist.  Your options are:~@
+	     ~4@T~'bEnable~ the who-calls database anyway, ~
+		without macro and inline constant information,~@
+	     ~4@T~'bContinue~ after installing ~:*~A,~@
+	     ~4@T~'bAbort~ loading the who-calls database.~%"
+	  *who-calls-macro-file*)
+	(cl:case (scl:accept '(cl:member :enable :continue :abort)
+			     :prompt "  Option" :default nil)
+	  (:continue (go ensure-who-calls-macro-file))
+	  (:abort (return-from ensure-who-calls-macro-file nil))))))
+  t)
+
+(defun reload-who-calls-macro-file ()
+  (with-open-file-case (stream *who-calls-macro-file* :characters nil)
+    (fs:file-operation-failure
+      (format t "~&Could not load ~A: ~~A~~%" *who-calls-macro-file* stream))
+    (:no-error
+      (format t "~&Loading macro callers from ~A.~%" *who-calls-macro-file*)
+      (bin-load-file-internal stream nil t)
+      (setq *who-calls-macro-file* nil))))
+(defun dump-who-calls-macro-file (&optional destination)
+  (unless destination
+    (setq destination (format nil "SYS:PATCH;SYSTEM-~D;MACRO-CALLS.BIN"
+			      (sct:get-system-version))))
+  (setq destination (fs:merge-pathnames destination))
+  (format t "~&Writing macros for who-calls to ~A.~%" destination)
+  (let ((table (lisp:make-hash-table :test #'lisp:equal :size 30000)))
+    (map-compiled-functions t nil "writing who-calls macro file"
+      #'(lambda (function cca)
+	  (let ((name (car (compiled-function-extra-info cca))))
+	    (loop while (and (lisp:consp name) (eq (first name) :internal))
+		  do (setf name (second name)))
+	    (when (and (selectq (sys:validate-function-spec name)
+			 ((nil flavor:combined) nil)
+			 ((clos-internals::instance-function-name)
+			  (lisp:typecase name
+			    (clos-internals::positional-constructor nil)
+			    (clos:standard-method
+			      (setf name (clos:slot-value name 'clos-internals::function-parent))
+			      t)
+			    (otherwise t)))
+			 (otherwise t))
+		       (si:function-same-as-function-from-name function))
+	      (let* ((info (compiled-function-debugging-info function))
+		     (macros (assq ':macros-expanded info))
+		     (constants (assq ':constants-open-coded info)))
+		(when (or macros constants)
+		  (let ((entry (or (gethash name table)
+				   (setf (gethash name table) (cons nil nil)))))
+		    (setf (car entry) (append (cadr macros) (car entry)))
+		    (setf (cdr entry)
+			  (append (mapcar #'car (cadr constants)) (cdr entry))))))))))
+    (let ((truename
+	    (let ((file-attribute-list '(:package :zetalisp-user)))
+	      (writing-bin-file (stream destination)
+		(dump-attribute-list file-attribute-list stream)
+		(maphash #'(lambda (name entry)
+			     (dump-form-to-eval
+			       `(reload-who-calls-macro-calls
+				  ',name
+				  ,(and (car entry) (lisp:coerce (car entry) 'lisp:vector))
+				  ,(and (cdr entry) (lisp:coerce (cdr entry) 'lisp:vector)))
+			       stream))
+			 table)))))
+      (setq *who-calls-macro-file* (send destination :back-translated-pathname truename)))))
+(defun reload-who-calls-macro-calls (function-name macros constants)
+  ;; Check that this function is still valid by seeing that its debug info has been
+  ;; left alone.  If not, assume it has been redefined and skip it.
+  (let ((definition (valid-function-definition function-name)))
+    (when (listp definition)
+      (setq definition (or (special-form-p definition)
+			   (macro-function definition))))
+    (when (and (typep definition ':compiled-function)
+	       (let ((debug-info (cdr (cca-extra-info (compiled-function-cca definition)))))
+		 (or (fixnump (first debug-info))
+		     (loop for entry in debug-info
+			   never (memq (car entry)
+				       '(:macros-expanded :constants-open-coded))))))
+      (cl:map nil #'(lambda (macro)
+		      (add-reference-to-who-calls-database definition macro :macro))
+	      macros)
+      (cl:map nil
+	      #'(lambda (constant)
+		  (add-reference-to-who-calls-database definition constant :defined-constant))
+	      constants))))
+
+
+(defun map-over-interpreted-definition-callees (real-caller form funarg)
+  (declare (sys:downward-funarg funarg))
+  (multiple-value-bind (lambda-exp closurep name)
+      (interpreted-function-lambda-expression form)
+    (declare (ignore name))
+    (unless closurep
+      (setf form `(defun nil (&rest args) (apply #',(si:undigest lambda-exp) args)))))
+  (map-over-form-callees real-caller form funarg))
+;;; These probably belongs in EVAL.  If so, the filter for
+;;; *microcoded-functions-not-for-who-calls* needs to be in the funarg
+;;; instead of here.
+
+(defun map-over-form-callees (real-caller form funarg &optional env
+			      &aux (*store-back-expanded-extra-info* nil))
+  (declare (sys:downward-funarg funarg))
+  (lt:mapforms
+    (lambda (subform kind usage ignore)
+      (let ((vars lt::*mapforms-bound-variables*)
+	    (env lt::*mapforms-lexical-function-environment*))
+	;; (print (list subform kind usage vars))
+	(cond ((or (cl:listp kind)
+		   (memq kind 'lt:(quote symeval set)))
+	       (if (and (eq kind 'quote)
+			(listp subform)
+			(eq (car subform) 'quote)
+			(listp (cdr subform))
+			(null (cddr subform)))
+		   ;; Self quoting things, such as strings, get passed
+		   ;; in as "xyz" QUOTE EVAL, but if some macro quotes
+		   ;; the string, it can get passed in as '"xyz" QUOTE
+		   ;; EVAL.  Canonicalize -- the forms below will check
+		   ;; to see if KIND is QUOTE, in which case it is being
+		   ;; used as a constant.
+		   (setq subform (cadr subform)))
+	       (typecase subform
+		 (:symbol
+		   (cond ((eq usage 'lt:call)
+			  (funcall funarg real-caller subform :function))
+			 ((eq usage 'flavor:generic)
+			  (funcall funarg real-caller subform :generic-function))
+			 ((memq subform '(nil t)))
+			 ((eq kind 'quote)
+			  (funcall funarg real-caller subform :constant))
+			 ((memq subform vars))	;bound variable
+			 ((lt:named-constant-p subform)
+			  (funcall funarg real-caller subform :defined-constant))
+			 ((lt:symbol-macro-p subform env)
+			  (funcall funarg real-caller subform :macro))
+			 (t
+			  (funcall funarg real-caller subform :variable))))
+		 (:list
+		   (let ((callee (first subform))
+			 (def))
+		     (cond ((eq kind 'quote)
+			    (unless (eq usage 'lt:call)
+			      (si:map-over-leaves-of-list
+				subform
+				(lambda (leaf)
+				  (when (symbolp leaf)
+				    (funcall funarg real-caller leaf :constant))))))
+			   ((local-function-definition callee env))
+			   ((si:special-form-p callee))
+			   ((setq def (si:macro-function callee))
+			    (unless (debugging-info-user-entry
+				      def 'compiler:do-not-record-macroexpansions)
+			      (funcall funarg real-caller callee :macro)))
+		#+3600	   ((memq callee *microcoded-functions-not-for-who-calls*))
+			   (t (funcall funarg real-caller callee :function)))))
+		 (:instance
+		   (when (operation-handled-p
+			   subform 'dbg:map-over-instance-callees)
+		     (dbg:map-over-instance-callees subform real-caller funarg)))
+		 ))
+	      ((and (eq kind 'declare) (eq usage 'declare)
+		    (listp subform) (eq (car subform) 'special))
+	       (dolist (var (cdr subform))
+		 (funcall funarg real-caller var :variable)))
+	      ((and (eq kind 'let) (eq usage 'let)
+		    (lt:global-special-variable-p subform))
+	       (funcall funarg real-caller subform :variable))))
+      nil)
+    form
+    :bound-variables nil
+    :environment env))
+
+#+++ignore
+(map-over-form-callees
+  'hihi
+  ;#+ignore
+  '(condition-call (e) (// xyz www)
+     (listp (print e) (print '(a b c))))
+  #'(lambda (caller callee how)
+      (format t "~&~S calls ~S as a ~S~%" caller callee how)))
+
+
+;;; This assumes that function is very unlikely to have been added to the database already,
+;;; because it is newly compiled, newly loaded, or found by map-over-compiled-functions
+;;; starting with an empty database.  Thus we specify new-caller-p to minimize paging.
+(defun add-compiled-function-to-who-calls-database (function &optional queue-p)
+  (when (and (si:function-same-as-function-from-name function)
+	     ;; Don't record combined methods as callers, since everything in a combined
+	     ;; method was just copied from someplace else.
+	     (not (let ((name (compiled-function-name function)))
+		    (and (listp name) (eq (car name) 'flavor:combined)))))
+    (let ((queue nil))				;all references, duplicates removed
+      (si:map-over-compiled-function-callees
+	function #'(lambda (caller callee how)
+		     (let ((alist (assq caller queue)))
+		       (unless alist
+			 (push (setq alist (ncons caller)) queue))
+		       (let ((elem (assq how (cdr alist))))
+			 (unless elem
+			   (push (setq elem (ncons how)) (cdr alist)))
+			 (unless (member callee (cdr elem))
+			   (push callee (cdr elem))))))
+	:external-references t
+	:debugging-info t
+	:instructions #+3600 #'who-calls-instruction-filter #+IMach nil
+	:map-over-internal-functions-too t)
+      (if queue-p
+	  (queue-references-to-who-calls-database queue)
+	  (dolist (elem queue)
+	    (add-references-to-who-calls-database elem))))))
+
+(defun add-references-to-who-calls-database (elem)
+  (loop with caller = (car elem)
+	for (how . callees) in (cdr elem) do
+    (loop for callee in callees do
+      (add-reference-to-who-calls-database caller callee how t))))
+(defun add-symbol-cells-to-who-calls-database (symbol)
+  (when (fboundp symbol)
+    (let* ((fdef (fsymeval symbol)))
+      (unless (and (typep fdef :compiled-function)
+		   (eq (compiled-function-name fdef) symbol))
+	;; Compiled functions have already been processed, so the only thing
+	;; remaining to do with them is to establish :function-link records.
+	(who-calls-fdefine-hook symbol nil))))	;all the work is done there
+  (let ((initialization-list-p nil))
+    (loop for (indicator value) on (plist symbol) by 'cddr do
+      (cond ((eq indicator 'si:initialization-list)
+	     (setq initialization-list-p value))
+	    ((eq indicator 'flavor:flavor)
+	     (who-calls-defflavor-hook value))
+	    ((and (interpreted-function-p value)
+		  (let ((name (si:function-name value)))
+		    (and (listp name)
+			 (eq (first name) :property)
+			 (eq (second name) symbol)
+			 (eq (third name) indicator))))
+	     (map-over-form-callees value value #'add-reference-to-who-calls-database))
+	    ))
+    (when (boundp symbol)
+      (let ((value (symeval symbol)))
+	(cond ((and initialization-list-p
+		    (listp value))
+	       (dolist (init value)
+		 (let ((caller `(:initialization ,symbol ,(si:init-name init))))
+		   (map-over-form-callees caller
+					  (si:init-form init)
+					  #'add-reference-to-who-calls-database))))
+	      ((and (or (lt:global-special-variable-p symbol)
+			(lt:named-constant-p symbol))
+		    (listp value))
+	       (si:map-over-leaves-of-list
+		 value (lambda (leaf)
+			 (when (and (symbolp leaf) (neq leaf 'nil) (neq leaf 't))
+			   (add-reference-to-who-calls-database symbol leaf :constant)))))
+	      )))
+    ))
+
+;;; This must be last!
+
+(add-initialization "Enable who-calls"
+		    '(when (eq *who-calls-mode* ':uninitialized)
+		       (unless (neti:ns-eq net:*local-site* neti:*distribution-site*)
+			 (enable-who-calls ':new t)))
+		    '(site))

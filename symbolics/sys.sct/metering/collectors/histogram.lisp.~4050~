@@ -1,0 +1,1453 @@
+;;; -*- Mode: LISP; Package: METERING; Base: 10; Syntax: Common-lisp; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; To do:
+;; (1) use two words for total, rather than shifting nonsense, and use %add-bignum-step.
+;; (2) avoid consing stupid list, when mutating.
+;; (3) when overflow is about to convert from list to histogram, see if stuff can be shoved
+;;     back into main distribution.
+
+;; A histogram records data that is sent to it, in a compressed form.  It tries to keep
+;; the general pattern of values that it receives.  For example, knowing that 
+;; 	Range			Number of values in this range
+;;	0  x < 1		123
+;;	1  x < 2		435
+;;	2  x < 3		300
+;;	a handful between 3 and 8
+;;	8  x < 9		700
+;;	9  x < 10		150
+;; is a lot more useful than simply knowing that the average value was 5.
+
+;; Since a histogram will be used to record metering information, it
+;; shouldn't be very expensive.  We want to minimize the observer
+;; effect.  We want to avoid complicated restrictions on where and when
+;; histograms can be used.  Histograms will not cons except at creation time.
+
+;; A traditional histogram has preset values for bucket size, and for
+;; high and low bounds.  It keeps track of all values in its range, and
+;; a count of all values that were below its low bound, or above its
+;; high bound.  This has the great advantage of being trivial to
+;; implement, and efficient to execute.
+
+;; Sometimes, however, a programmer has no idea what range of values
+;; will be generated.  In these cases it is useful to have a self
+;; scaling histogram.  A self-scaling histogram dynamically computes
+;; bucket size, and the high and low bounds.
+
+;; This can sometimes backfire.  For example, imagine a histogram whose
+;; array is 25 elements long, and 4500 datapoints lie between 0 and 50.
+;; The histogram should have 2 integers in each bucket, and should have
+;; a low bound of 0, and a high bound of 50.  Now, if the next data
+;; value is on the order of 120,000, all the interesting data will be
+;; stuck in the lowest bucket, and all of the interesting information
+;; will be lost.  It is very difficult to catch all occurences of this
+;; phenomena, but a very common example is the bi-modal histogram.  It
+;; has two regions of interest.  It should be possible to keep the two
+;; regions seperate.
+
+;; If the histogram is bi-modal it keeps two seperate regions.
+
+;; In the best-of-all-possible worlds, this should detect logarithmic,
+;; exponential, or n-modal distribution, and set up buckets
+;; appropriately.  Actually what I really want is a much higher level
+;; metering facility.  All that I have done here is try to hide the
+;; details of the data distribution from the programmer, without losing
+;; too much information.  I try to be clever about how to store information,
+;; but, not yet, how to display it.
+
+;; We should also have a histogram that allows arbitrary collectors in each bucket.
+;; For example, using the value as a key -- or imagine:
+;; (make-data-collector 'histogram :component-description '((data collect-simple-averages)))
+;; (collect-data 'foo `(((,* integer1) (data integer1))))
+
+
+
+;; types of histograms
+
+;; These flavors are used internally to implement the client-visible
+;; flavors.  They should only be used by the flavors on the following
+;; page.
+
+(defflavor basic-histogram
+	((entries 50)				; Total number of elements in the distribution array
+	 (count 0)				; total count of number of datum entered
+	 low					; lowest value in lowest bucket
+	 high					; the highest value in the 
+						; highest bucket
+	 (interval 1)				; Size of each bucket
+	 data-distribution			; the array that the distribution is
+						; actually stored in
+	 (total1 0)				; total value of data seen so far; used
+						; for computing averages. Low word.
+	 (total2 0)				; High word of total.  We don't want to use 
+						; bignum arithmetic, since we want to avoid consing.
+	 (description nil))
+	(total-mixin)
+  (:initable-instance-variables entries)
+  (:functions basic-record-data basic-insert-data display-array clear-data-distribution)
+  (:conc-name histogram-)
+  (:readable-instance-variables low high))
+
+
+
+
+;; This histogram only looks at the region between low and high.
+;; Everything else is counted up only as overflow.
+
+(defcollector clipped-histogram
+	      ((data) ((data integer "Bucket value" :value)))
+  ((low 0)					; inherited from basic-histogram, but
+    (high 100)					; written here to suppress error message
+    (above 0)					; Place to keep count of entries > high
+    (below 0)					; Place to keep count of entries < low
+    (total1 0)					; Inherited from basic-histogram, but
+    (total2 0)					; put here so that we can make them
+    (count 0)
+    data-distribution				; ordered-instance-variables.
+    (interval 1))
+  (trivially-wirable-collector-mixin basic-histogram)
+  :wirable
+  (:init-options-and-types (&key ((low 0) integer "starting value of low bucket")
+				 ((high 100) integer "final value of high bucket")
+				 ((entries 50.) integer "number of buckets")))
+  (:initable-instance-variables low high)
+  ;; the next two options are internal; they exist only to allow
+  ;; GET-FORM-TO-COLLECT-DATA to generate wirable code.
+  (:ordered-instance-variables
+    above below total1 total2 count low high data-distribution interval)
+  (:writable-instance-variables above below total1 total2 count
+				(clipped-histogram-low low)
+				(clipped-histogram-high low)
+				(clipped-histogram-data-distribution low)
+				(clipped-histogram-interval low)))
+
+;; The standard histogram.  This handles :record-data messages and
+;; scales its bounds and bucket size appropriately to include all the
+;; data that it receives.  It tries to be efficient in both time and
+;; space.  It doesn't cons, except when it is created, and once after it
+;; receives the first "entries" elements.  It tries to keep track of
+;; every datum that it was supposed to record, and only actually goes to
+;; a histogram when it would be forced to cons.  In order to avoid
+;; consing, it doesn't use bignums.  
+
+;; To specify the size of the space it uses, use the init keyword
+;; :entries (default is 50.).
+;;	To specify 
+(defcollector histogram
+	      ((data) ((data integer "Bucket value" :value)))
+  ((collect-in-list t)
+   (internal-data-handler :append-histogram-data-to-list))
+  (basic-histogram)
+  (:init-options-and-types (&key ((entries 50.) integer "number of buckets")))
+  (:initable-instance-variables collect-in-list)
+  (:functions entries-needed-to-encompass-data
+	      entries-needed-to-encompass-new-data
+	      compute-range
+	      compute-range-with-new-low
+	      compute-range-with-new-high
+	      compute-additional-range-with-new-low
+	      compute-additional-range-with-new-high
+	      compact-histogram
+	      compact-histogram-low
+	      shift-histogram-left
+	      shift-histogram-right
+	      convert-from-list-to-scale))
+
+(defcollector modal-histogram
+	      ((data) ((data integer "Bucket value" :value)))
+	      ((overflow-list nil)
+	       (underflow-list nil))
+  (histogram)
+  (:init-options-and-types (&key ((entries 50.) integer "number of buckets")
+				 ((preallocate nil) boolean
+				  "preallocate space for all modes, so it never conses")))
+  (:init-keywords :preallocateD,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB"))
+0  (:functions convert-from-list-to-modal-distribution
+   	      insert-underflow-data insert-overflow-data))
+
+; This histogram should be used if you think that there might be two
+; interesting regions in your data.  In most cases the results of a
+; bimodal-histogram will be the same as a regular histogram, but there
+; is additional overhead in this case because it checks for, and deals
+; with bimodality.
+
+#||
+(defflavor bimodal-histogram
+	(low-2
+	 high-2
+	 intermediate)
+	(histogram))
+||#
+
+;; Normal histograms don't keep very careful track of what their bounds
+;; were.  Only the beginning and end of the first and last bucket.  This
+;; mixin keeps track of accurate bounds.
+(defflavor histogram-bounds-mixin
+	((low-value nil)
+	 (high-value nil))
+	()
+  (:required-flavors histogram))
+
+
+
+;;;
+
+;; Initialization routines.
+
+(defmethod (make-instance basic-histogram :after) (&rest ignore)
+  (setq data-distribution (make-array entries :fill-pointer 0 :area metering-collector-area)))
+
+(defmethod (make-instance clipped-histogram :after) (&rest ignore)
+  (when (> entries (1+ (- high low)))
+    (setf entries (1+ (- high low))))
+  (setq data-distribution (make-array entries
+				      :fill-pointer entries
+				      :initial-element 0
+				      :area metering-collector-area))
+  (setq interval (least-integer-greater-than (1+ (- high low)) entries)))
+
+
+(defmethod (make-instance histogram :after) (&rest ignore) 
+  (unless collect-in-list
+    (setq internal-data-handler :initial-record-data)))
+
+#||
+(defmethod (make-instance bimodal-histogram) (&rest ignore)
+  (if collect-in-list
+      (setq internal-data-handler :append-histogram-data-to-list)
+      (setq internal-data-handler :initial-record-bimodal-data-and-scale)))
+
+(defmethod (make-instance modal-histogram :after)
+	   (&rest args &key preallocate &allow-other-keys)
+  (ignore args)
+  (when preallocate
+    (setf overflow-list (make-instance 'histogram :entries 12))
+    (setf underflow-list (make-instance 'histogram :entries 12))))
+
+||#
+
+;;;
+
+;; Clearing a histogram
+
+(defmethod (reset basic-histogram) ()
+  (setf count 0)
+  (setf interval 1)
+  (reset-total self)
+  (setf (fill-pointer data-distribution) 0)
+  (clear-data-distribution data-distribution))
+
+(defmethod (reset histogram :after) ()
+  (setf collect-in-list 't)
+  (setf internal-data-handler :append-histogram-data-to-list))
+(defmethod (reset clipped-histogram) ()
+  (setf count 0)
+  (reset-total self)
+  (setf above 0)
+  (setf below 0)
+  (clear-data-distribution data-distribution))
+
+(defmethod (reset modal-histogram :after) ()
+  (setf overflow-list nil)
+  (setf underflow-list nil)
+  #||
+  (reset overflow-list)
+  (reset underflow-list)
+  ||#)
+
+(defmethod (collector-empty-p basic-histogram) () (zerop count))
+(defmethod (complete-data-p basic-histogram) () (or (zerop count) (= interval 1)))
+(defwhopper (complete-data-p modal-histogram) ()
+  (and (continue-whopper)
+       (or (listp overflow-list)
+	   (complete-data-p overflow-list))
+       (or (listp underflow-list)
+	   (complete-data-p underflow-list))))
+
+(defun-in-flavor (clear-data-distribution basic-histogram) (array)
+  (fill array 0))
+
+
+(defmethod (:count basic-histogram) () count)
+
+(defmethod (entry-count basic-histogram) () count)
+
+(defmethod (entry-count modal-histogram) ()
+  (+ count
+     (if (listp overflow-list) (length overflow-list) (entry-count overflow-list))
+     (if (listp underflow-list) (length underflow-list) (entry-count underflow-list))))
+
+(defmethod (reasonable-entry-count basic-histogram) () count)
+(defmethod (reasonable-entry-count modal-histogram) () count)
+
+(defmethod (get-histogram-bounds basic-histogram) ()
+  (values low high))
+
+(defmethod (get-histogram-bounds histogram-bounds-mixin) ()
+  (values low-value high-value))
+
+(defwhopper (get-histogram-bounds histogram) ()
+  (if (equal internal-data-handler :append-histogram-data-to-list)
+      (loop for datum being the array-elements of data-distribution
+	    minimize datum into low1
+	    maximize datum into high1
+	    finally (return (values low1 high1)))
+      (continue-whopper)))
+
+(defmethod (get-reasonable-histogram-bounds basic-histogram) ()
+  (get-histogram-bounds self))
+
+(defmethod (get-reasonable-histogram-bounds modal-histogram) ()
+  (if (equal internal-data-handler :append-histogram-data-to-list)
+      (loop for datum being the array-elements of data-distribution
+	    minimize datum into low1
+	    maximize datum into high1
+	    finally (return (values low1 high1)))
+      (values low high)))
+
+(defmethod (get-histogram-bounds modal-histogram) ()
+  (values (if underflow-list
+	      (if (listp underflow-list)
+		  (loop for d in underflow-list minimize d)
+		  (get-histogram-bounds underflow-list))
+	      low)
+	  (if overflow-list
+	      (if (listp overflow-list)
+		  (loop for d in overflow-list maximize d)
+		  (multiple-value-bind (ignore high)
+		      (get-histogram-bounds overflow-list)
+		    high))
+	      high)))
+
+
+
+;;; The meat of all of histogram.  the  :record-data handler.
+
+;; A clipped histogram records overflows; otherwise just increments the appropriate bucket.
+(defmethod (collect-data clipped-histogram) (data)
+  (basic-record-data data)
+  (cond ((< data low) (incf below))
+	((> data high) (incf above))
+	(t (basic-insert-data data))))
+(defmethod (get-form-to-collect-data clipped-histogram) (instance &key args for-value)
+  (if for-value
+      (error "You can't build a hierarchical collector using CLIPPED-HISTOGRAM")
+      (let* ((instance-name (if (eq instance ':constant)
+				(gensym "HISTOGRAM")
+				instance))
+	     (data (if (eq instance ':constant)
+		       (gensym "DATA")
+		       (safe-instance-reference
+			 'clipped-histogram 'data-distribution instance)))
+	     (low-bound (if (eq instance ':constant)
+			    (gensym "LOW")
+			    (safe-instance-reference 'clipped-histogram 'low instance)))
+	     (high-bound (if (eq instance ':constant)
+			     (gensym "HIGH")
+			     (safe-instance-reference 'clipped-histogram 'high instance)))
+	     (interval-name (if (eq instance ':constant)
+				(gensym "BUCKET-SIZE")
+				(safe-instance-reference
+				  'clipped-histogram 'interval instance))))
+	(values
+	  `(let ((h ,instance-name))
+	     ,(get-form-to-add-data self 'h data 'clipped-histogram)
+	     (incf ,(safe-instance-reference 'clipped-histogram 'count 'h))
+	     (cond ((< ,(car args) ,low-bound)
+		    (incf ,(safe-instance-reference 'clipped-histogram 'below 'h)))
+		   ((> ,(car args) ,high-bound)
+		    (incf ,(safe-instance-reference 'clipped-histogram 'above 'h)))
+		   (t (incf (aref ,data (floor (- ,(car args) ,low-bound) ,interval-name))))))
+	  (if (eq instance ':constant) instance-name nil)
+	  (if (eq instance ':constant)
+	      `((,data (si:eval-in-instance ,instance-name 'data-distribution))
+		(,low-bound (si:eval-in-instance ,instance-name 'low))
+		(,high-bound (si:eval-in-instance ,instance-name 'high))
+		(,interval-name (si:eval-in-instance ,instance-name 'interval)))
+	      nil)))))
+
+;; All other histograms start out as a list.  When the list overflows,
+;; we convert ourselves into a self-scaling histogram.  If necessary we
+;; become a bi-modal histogram.
+
+;; If the histogram still has the room to do so, just record the data.
+;; otherwise, use the histogram
+(defmethod (collect-data histogram) (data)
+  (basic-record-data data)
+  (send self internal-data-handler data))
+
+; record accurate bounds
+(defmethod (collect-data histogram-bounds-mixin :after) (data)
+  (cond ((not low-value) (setq low-value data) (setq high-value data))
+	((< data low-value) (setq low-value data))
+	((> data high-value) (setq high-value data)))
+  nil)
+
+; should probably be a defun method, because it is internal to histogram.
+(defmethod (:append-histogram-data-to-list histogram) (data)
+  (vector-push data data-distribution)
+  (when ( count entries)
+    (setq internal-data-handler :record-data-internal)
+    (convert-from-list-to-scale)))
+
+(defmethod (:append-histogram-data-to-list modal-histogram) (data)
+  (vector-push data data-distribution)
+  (when ( count entries)
+    (setq internal-data-handler :record-data-internal)
+    (convert-from-list-to-modal-distribution)))
+
+#||
+(defmethod (:append-histogram-data-to-list bimodal-histogram) (data)
+  (vector-push data data-distribution)
+  (when ( count entries)
+    (setq internal-data-handler :record-bimodal-data-and-scale)
+    (convert-from-list-to-bimodal)))
+||#
+
+(defmethod (:initial-record-data histogram) (data)
+	; If data doesn't fit in histogram, we'll have to massage it.
+  (setq low data)
+  (setq high data)
+  (setf (aref data-distribution 0) 0)
+  (setf (fill-pointer data-distribution) 1)
+  (setq internal-data-handler :record-data-internal)
+  (send self :record-data-internal data))
+
+(defmethod (:record-data-internal histogram) (data)
+  ; If data doesn't fit in histogram, we'll have to massage it.
+  (cond ((< data low)  ; data value too low; we have to stretch histogram.  But in new
+	               ; direction - so there will be additional fragmentation at the low end.
+	 (let ((new-range (compute-additional-range-with-new-low data)))
+	   ; Can we get away with using the empty elements at the high end of the array?
+	   (when (> (entries-needed-to-encompass-new-data new-range) entries)
+	     ; We are going to have to combine adjacent buckets until this range can fit
+	     ; into the array.
+	     (compact-histogram-low new-range))
+	   ; Now, the buckets are the right size, we just have to make certain that they
+	   ; are shifted over to their appropriate spot.
+	   (shift-histogram-right		; open up enough space on the bottom to fit
+	     (entries-needed-to-encompass-data	; the newly added range on the bottom
+	       (compute-additional-range-with-new-low data)))))	; of the histogram
+	((> data high) 
+	 (let ((range (compute-range-with-new-high data)))
+	   (when (> (entries-needed-to-encompass-data range)
+		    entries)
+	     (compact-histogram range))
+	   (shift-histogram-left
+	     (entries-needed-to-encompass-data
+	       (compute-additional-range-with-new-high data))))))
+  (basic-insert-data data))
+  
+(defmethod (:initial-record-data modal-histogram) (data)
+	; If data doesn't fit in histogram, we'll have to massage it.
+  (setq low data)
+  (setq high data)
+  (setf (aref data-distribution 0) 0)
+  (setf (fill-pointer data-distribution) 1)
+  (setq internal-data-handler :record-data-internal)
+  (send self :record-data-internal data))
+(defmethod (:record-data-internal modal-histogram) (data)
+  (let ((overflow nil))
+    (macrolet
+      ((not-worth-expanding-histogram (above-or-below)
+	 (multiple-value-bind (spillover-list predicate closer closest)
+	     (cond ((eq :below above-or-below)
+		    (values
+		      'underflow-list
+		      `(multiple-value-bind (nil high-bound)
+			   (get-histogram-bounds underflow-list)
+			 ( data high-bound))
+		      '> 'max))
+		   ((eq :above above-or-below)
+		    (values 'overflow-list
+			    '( data (get-histogram-bounds overflow-list)) '< 'min))
+		   (t (error "Above-or-below must be :above or :below, not ~S"
+			      above-or-below)))
+	   `(if (listp ,spillover-list)
+		     ;; if we can fit it in without changing the bucket size, do it!
+		(and (> new-entries entries)
+		     (if (< (length ,spillover-list) 12)
+			 ;; rather than expanding now, queue us up until we have more data
+			 ;; for the new range.
+			 't
+			 ;; If the list is full, tell our caller to try again with *best*
+			 ;; choice from overflow list.
+			 (when (> new-entries (+ entries entries))
+			   (let ((new-data (apply ',closest ,spillover-list)))
+			     (if (,closer new-data data) new-data 't)))))
+		;; It's not worth it to more than double the range, just for one value.  
+		;; We already have an overflow histogram, anyway.
+		(or (> new-entries (+ entries entries))
+		    ;; we can't re-merge across the bound of the histogram, otherwise the
+		    ;; main histogram and the overflow will overlap.
+		    (and (> new-entries entries) ,predicate)))))
+       (try-to-reinsert-elements-from (above-or-below)
+	 (let ((spillover-list
+		 (cond ((eq :below above-or-below) 'underflow-list)
+		       ((eq :above above-or-below) 'overflow-list)
+		       (t (error "Above-or-below must be :above or :below, not ~S"
+				  above-or-below))))
+	       (predicate (if (eq :below above-or-below) '> '<)))
+	   `(when (listp ,spillover-list)
+	      (let ((spillover ,spillover-list))
+		(setq ,spillover-list nil)
+		(loop for d in (sort spillover ',predicate)
+		      do (collect-data self d)))))))
+    ; If data doesn't fit in histogram, we'll have to massage it.
+    (cond ((< data low) ; data value too low; we have to stretch histogram.  But in new
+	              ; direction - so there will be additional fragmentation at the low end.
+	   (let* ((new-range (compute-additional-range-with-new-low data))
+		  (new-entries  (entries-needed-to-encompass-new-data new-range))
+		  ; Can we get away with using the empty elements at the high end of
+		  ; the array?
+		  (dont-expand-p (not-worth-expanding-histogram :below)))
+	     (if (and dont-expand-p
+		      (or (not (typep dont-expand-p 'fixnum))
+			  (progn
+			    (setf underflow-list
+				  (cons-in-area data
+						(delete dont-expand-p underflow-list :count 1)
+						metering-cons-area))
+			    ;; adjustment is negative.
+			    (add-data self (- data dont-expand-p))
+			    (setf data dont-expand-p)
+			    (setf new-range (compute-additional-range-with-new-low data))
+			    (setf new-entries
+				  (entries-needed-to-encompass-new-data new-range))
+			    (not-worth-expanding-histogram :below))))
+		 (setq overflow -1)
+		 (when (> new-entries entries)
+		   ; We are going to have to combine adjacent buckets until this range can fit
+		   ; into the array.
+		   (compact-histogram-low new-range))
+		 ; Now, the buckets are the right size, we just have to make certain that they
+		 ; are shifted over to their appropriate spot.
+		 (shift-histogram-right		; open up enough space on the bottom to fit
+		   (entries-needed-to-encompass-data	; the newly added range on the bottom
+		     (compute-additional-range-with-new-low data)))	; of the histogram
+		 (try-to-reinsert-elements-from :below))))
+	  ((> data high) 
+	   (let* ((range (compute-range-with-new-high data))
+		  (new-entries  (entries-needed-to-encompass-data range))
+		  (dont-expand-p (not-worth-expanding-histogram :above)))
+	     (if (and dont-expand-p
+		      (or (not (typep dont-expand-p 'fixnum))
+			  (progn
+			    (setf overflow-list
+				  (cons-in-area data
+						(delete dont-expand-p overflow-list :count 1)
+						metering-cons-area))
+			    ;; adjustment is negative.
+			    (add-data self (- dont-expand-p data))
+			    (setf data dont-expand-p)
+			    (setf range (compute-range-with-new-high data))
+			    (setf new-entries
+				  (entries-needed-to-encompass-data range))
+			    (not-worth-expanding-histogram :below))))
+		 (setq overflow +1)
+		 (when (> new-entries entries) (compact-histogram range))
+		 (shift-histogram-left (entries-needed-to-encompass-data
+					 (compute-additional-range-with-new-high data)))
+		 (try-to-reinsert-elements-from :above)))))
+    (cond ((null overflow) (basic-insert-data data))
+	  ((plusp overflow) (insert-overflow-data data))
+	  (t (insert-underflow-data data))))))
+  
+;; same as scale for the time being
+
+#||
+(defmethod (:initial-record-bimodal-data-and-scale histogram) (data)
+	; If data doesn't fit in histogram, we'll have to massage it.
+  (setq low data)
+  (setq high data)
+  (setf (aref data-distribution 0) 0)
+  (setf (fill-pointer data-distribution) 1)
+  (setq internal-data-handler :record-bimodal-data-and-scale)
+  (send self :record-bimodal-data-and-scale data))
+
+(defmethod (:record-bimodal-data-and-scale bimodal-histogram) (data)
+  (cond ((< data low)
+	 (let ((range (compute-range-with-new-low data)))
+	   (when (> (entries-needed-to-encompass-data range)
+		    entries)
+	     (compact-histogram range))
+	   (shift-histogram-right
+	     (entries-needed-to-encompass-data
+	       (compute-additional-range-with-new-low data)))))
+	((> data high) 
+	 (let ((range (compute-range-with-new-high data)))
+	   (when (> (entries-needed-to-encompass-data range)
+		    entries)
+	     (compact-histogram range))
+	   (shift-histogram-left
+	     (entries-needed-to-encompass-data
+	       (compute-additional-range-with-new-high data))))))
+  (basic-insert-data data))
+||#
+  
+;;; defuns to help record-data of various types of histograms.
+
+; records the data in order to keep average
+  
+(defun-in-flavor (basic-record-data basic-histogram) (data)
+  (add-data self data)
+  (incf count))
+
+; If the data fits into a currently existing bucket, this routine
+; increments the count for that bucket.  It is illegal to call this
+; routine unless you have already performed bounds-checking
+(defun-in-flavor (basic-insert-data basic-histogram) (data)
+  (incf (aref data-distribution (floor (- data low) interval))))
+(defun-in-flavor (insert-overflow-data modal-histogram) (data)
+  ;; remove from totals
+  (add-data self (- data))
+  (decf count)
+  (cond ((null overflow-list) (push data overflow-list :area metering-cons-area))
+	((listp overflow-list)
+	 (if (< (length overflow-list) 12)
+	     (push data overflow-list :area metering-cons-area)
+	     (progn
+	       (setq overflow-list
+		     (loop with h = (make-instance 'histogram :entries 12)
+			   for d in overflow-list
+			   do (collect-data h d)
+			   finally (collect-data h data)
+				   (return h))))))
+	(t (collect-data overflow-list data))))
+(defun-in-flavor (insert-underflow-data modal-histogram) (data)
+  ;; remove from totals
+  (add-data self (- data))
+  (decf count)
+  (cond ((null underflow-list) (push data underflow-list :area metering-cons-area))
+	((listp underflow-list)
+	 (if (< (length underflow-list) 12)
+	     (push data underflow-list :area metering-cons-area)
+	     (progn
+	       (setq underflow-list
+		     (loop with h = (make-instance 'histogram :entries 12)
+			   for d in underflow-list
+			   do (collect-data h d)
+			   finally (collect-data h data)
+				   (return h))))))
+	(t (collect-data underflow-list data))))
+
+
+(defmethod (total basic-histogram) () (total-total self))
+(defmethod (total modal-histogram) ()
+  (+ (total-total self)
+     (if (listp overflow-list)
+	 (loop for d in overflow-list sum d)
+	 (total overflow-list))
+     (if (listp underflow-list)
+	 (loop for d in underflow-list sum d)
+	 (total underflow-list))))
+
+;; compatibility
+
+(defmethod (:total basic-histogram) ()
+  (total self))
+(defmethod (reasonable-total modal-histogram) ()
+ (total-total self))
+
+(defmethod (reasonable-total clipped-histogram) ()
+  (if (and (zerop above) (zerop below))
+      (total self)
+      (loop for bucket being the array-elements of data-distribution
+	    as value = (+ low (floor interval 2)) then (+ value interval)
+	    unless (zerop bucket)
+	      sum (* value bucket))))
+  
+;;--- Rename me MEAN!
+(defmethod (average basic-histogram) ()
+  (let ((count-of-entries (entry-count self)))
+    (if (zerop count-of-entries)
+	0
+	(/ (float (total self)) count-of-entries))))
+
+(defmethod (reasonable-average basic-histogram) ()
+  (average self))
+
+(defmethod (reasonable-average clipped-histogram) ()
+  (if (and (zerop above) (zerop below))
+      (average self)
+      (let ((count-of-entries (- count above below)))
+	(if (zerop count-of-entries)
+	    0
+	    (/ (float (reasonable-total self)) count-of-entries)))))
+  
+(defmethod (reasonable-average modal-histogram) ()
+  (if (zerop count)
+      0
+      (/ (float (reasonable-total self)) count)))
+
+(defmethod (reasonable-sum-of-squares basic-histogram) ()
+  (loop for bucket being the array-elements of data-distribution
+	as value = (+ low (floor interval 2)) then (+ value interval)
+	unless (zerop bucket)
+	  sum (* value value bucket)))
+
+(defwhopper (reasonable-sum-of-squares histogram) ()
+  (if (equal internal-data-handler :append-histogram-data-to-list)
+      (loop for value being the array-elements of data-distribution
+	    sum (* value value))
+      (continue-whopper)))
+
+(defmethod (sum-of-squares basic-histogram) ()
+  (reasonable-sum-of-squares self))
+
+(defwhopper (sum-of-squares clipped-histogram) ()
+  (+ (* below low low)
+     (* above high high)
+     (continue-whopper)))
+
+(defmethod (sum-of-squares modal-histogram) ()
+  (+ (reasonable-sum-of-squares self)
+     (if (listp overflow-list)
+	 (loop for d in overflow-list sum (* d d))
+	 (sum-of-squares overflow-list))
+     (if (listp underflow-list)
+	 (loop for d in underflow-list sum (* d d))
+	 (sum-of-squares underflow-list))))
+
+;;
+(defmethod (reasonable-sum-of-buckets basic-histogram) ()
+  (loop for bucket being the array-elements of data-distribution
+	as value = (+ low (floor interval 2)) then (+ value interval)
+	unless (zerop bucket)
+	  sum (* value bucket)))
+
+(defwhopper (reasonable-sum-of-buckets histogram) ()
+  (if (equal internal-data-handler :append-histogram-data-to-list)
+      (loop for value being the array-elements of data-distribution
+	    sum value)
+      (continue-whopper)))
+
+(defmethod (sum-of-buckets basic-histogram) ()
+  (reasonable-sum-of-buckets self))
+
+(defwhopper (sum-of-buckets clipped-histogram) ()
+  (+ (* below low)
+     (* above high)
+     (continue-whopper)))
+
+(defmethod (sum-of-buckets modal-histogram) ()
+  (+ (reasonable-sum-of-buckets self)
+     (if (listp overflow-list)
+	 (loop for d in overflow-list sum d)
+	 (sum-of-buckets overflow-list))
+     (if (listp underflow-list)
+	 (loop for d in underflow-list sum d)
+	 (sum-of-buckets underflow-list))))
+;;
+
+;;; sd   = sqrt( sum( (x[i]-mean)^2, i, 1, n) *1/(n-1) ).
+
+(defwhopper (standard-deviation basic-histogram) (&optional (mean nil mean-supplied-p))
+  (if (zerop count) 0 (if mean-supplied-p (continue-whopper mean) (continue-whopper))))
+
+(defmethod (standard-deviation basic-histogram) (&optional mean)
+  (ignore mean)
+  (let* ((bucket-total (sum-of-buckets self))
+	 (count (entry-count self))
+	 (mean (/ bucket-total count)))
+    (sqrt (/ (- (sum-of-squares self) (* mean bucket-total))
+	     count))))
+
+(defmethod (reasonable-standard-deviation basic-histogram) (&optional mean)
+  (ignore mean)
+  (if (zerop count)
+      0
+      (let* ((bucket-total (reasonable-sum-of-buckets self))
+	     (mean (/ bucket-total count)))
+	(sqrt (/ (- (reasonable-sum-of-squares self) (* mean bucket-total))
+		 count)))))
+
+(defmethod (compact-results basic-histogram) () (average self))
+(defmethod (compact-results-description basic-histogram) () 'average)
+  
+(defwhopper (get-entries histogram) (function)
+  (if (equal internal-data-handler :append-histogram-data-to-list)
+      (loop for d in (coerce data-distribution 'list)
+	    do (funcall function d))
+      (continue-whopper function)))
+(defmethod (get-entries basic-histogram) (function)
+  (let ((total (total-total self))
+	(minimal-total (loop for counter being the array-elements of data-distribution
+			     for start = low then (+ start interval)
+			     sum (* counter start))))
+    (multiple-value-bind (offset threshold)
+	(floor (/ (- total minimal-total) count))
+      (loop for counter being the array-elements of data-distribution
+	    for start = low then (+ start interval) do
+	(loop with value = (let ((value (+ start offset)))
+			     (if (and (minusp value)
+				      (= start low)
+				      (not (minusp (+ start interval))))
+				 (1- (+ start interval))
+				 value))
+	      for i below counter do
+	  (funcall function (+ value (if (> i threshold) 1 0))))))))
+
+(defwhopper (get-entries modal-histogram) (function)
+  (continue-whopper function)
+  (if (listp overflow-list)
+      (loop for d in overflow-list do (funcall function d))
+      (get-entries overflow-list function))
+  (if (listp underflow-list)
+      (loop for d in underflow-list do (funcall function d))
+      (get-entries underflow-list function)))
+
+
+;;display a histogram
+
+;; Should have choice of numberical or graphical output, and whether to
+;; periodically automatically update or wait for an explicit display
+;; message.  You should be able to mouse a bar (in the graph) and get
+;; the number displayed. and so on....
+
+(defun display-histogram-array (array bucket-size low stream)
+  (fresh-line stream)
+  ;; don't refer to instance variables, or we'll trigger a compiler bug.
+  (formatting-table
+    (stream :multiple-columns t
+	    :multiple-column-inter-column-spacing (* 3 (send stream :char-width)))
+    (formatting-column-headings (stream :underline-p t)
+      (with-character-face (:italic stream)
+	(formatting-cell (stream) "Bucket")
+	(formatting-cell (stream) "Count")))
+    (loop for counter being the array-elements of array
+	  for start = low then (+ start bucket-size) do
+      (formatting-row (stream)
+	(formatting-cell (stream)
+	  (with-character-face (:italic stream)
+	    (if (> bucket-size 1)
+		(format stream "~D-~D: " start (1- (+ start bucket-size)))
+		(format stream "~D: " start))))
+	(formatting-cell (stream)
+	  (princ (if (zerop counter) #\space counter) stream))))))
+
+;; force-p 't forces the exact elements to be displayed, even if interval is 1.  This is
+;; useful if the order of the list makes a difference.
+(defun display-list-as-histogram (list nbuckets low high list-label stream force-p)
+  (stack-let* ((temp-interval (ceiling (1+ (- high low)) nbuckets))
+	       (real-nbuckets (ceiling (1+ (- high low)) temp-interval))
+	       (h-a (make-array real-nbuckets
+				:element-type 'integer
+				:initial-element 0)))
+	     
+    (loop for d in list do
+      (incf (aref h-a (floor (- d low) temp-interval))))
+    (display-histogram-array h-a temp-interval low stream)
+    (when (and (not (= low high))
+	       (or force-p (> temp-interval 1)))
+      (format stream "~&~A: ~A" list-label list))))
+
+#||
+(defun-in-flavor (display-array basic-histogram) (array stream)
+  (fresh-line stream)
+  ;; don't refer to instance variables, or we'll trigger a compiler bug.
+  (let ((bucket-size interval))
+    (formatting-table (stream :multiple-columns t
+			      :multiple-column-inter-column-spacing (* 3 (send stream :char-width)))
+      (formatting-column-headings (stream :underline-p t)
+	(with-character-face (:italic stream)
+	  (formatting-cell (stream) "Bucket")
+	  (formatting-cell (stream) "Count")))
+      (loop for counter being the array-elements of array
+	    for start = low then (+ start bucket-size) do
+	(formatting-row (stream)
+	  (formatting-cell (stream)
+	    (with-character-face (:italic stream)
+	      (if (> bucket-size 1)
+		  (format stream "~D-~D: " start (1- (+ start bucket-size)))
+		  (format stream "~D: " start))))
+	  (formatting-cell (stream)
+	    (princ (if (zerop counter) #\space counter) stream)))))))
+
+||#
+
+(defmethod (display histogram) (&optional (stream *standard-output*) &key label)
+  (multiple-value-bind (low1 high1)
+      (get-reasonable-histogram-bounds self)
+    (when label
+      (format stream "~&~A" (if (listp label) (car label) label)))
+    (format stream
+	    "~&Low: ~7D High: ~7D ~0,10T Bucket-size: ~4D ~0,10T Count: ~4D ~0,10T Avg: ~D Std Dev: ~F~%"
+	    low1 high1 interval (reasonable-entry-count self) (reasonable-average self)
+	    (reasonable-standard-deviation self))
+    (if (equal internal-data-handler :append-histogram-data-to-list)
+	(display-list-as-histogram (coerce data-distribution 'list)
+				   entries
+				   low1 high1
+				   "Data available in order"
+				   stream
+				   't)
+	(display-histogram-array data-distribution interval low stream))))
+  
+(defwhopper (display modal-histogram) (&optional (stream *standard-output*) &key label)
+  (when label
+    (format stream "~&~A~%" (if (listp label) (car label) label)))
+  (macrolet ((indent ((stream n) &body body)
+	       `(indenting-output (,stream ,n) ,@body)))
+    (if (or underflow-list overflow-list)
+	(multiple-value-bind (low1 high1)
+	    (get-histogram-bounds self)
+	  (format
+	    stream
+	    "~&Low: ~7D High: ~7D ~0,10T Count: ~4D ~0,10T Avg: ~D Std Dev: ~F~%"
+	    low1 high1 (entry-count self) (average self) (standard-deviation self))
+	  (indent (stream 2)
+  	    (flet ((display-list (list stream &key label)
+		     (when label
+		       (format stream "~&~A" (if (listp label) (car label) label)))
+		     (multiple-value-bind (mean stdev)
+			 (compute-characteristics list)
+		       (multiple-value-bind (low1 high1)
+			   (loop for d in list
+				 minimize d into low1
+				 maximize d into high1
+				 finally (return (values low1 high1)))
+			 (format stream
+				 "~&Low: ~7D High: ~7D ~,10T Count: ~4D ~,10T Avg: ~D Std Dev: ~F~%"
+				 low1 high1 (length list) mean stdev)
+			 (display-list-as-histogram list 12 low1 high1
+						    "Exact data available"
+						    stream nil)))))
+	      (format stream "~&This histogram is multi-modal:")
+	      (fresh-line stream)
+	      (continue-whopper stream :label "Main mode:")
+	      (when underflow-list
+		(indent (stream 3)
+ 		  (fresh-line stream)
+		  (if (listp underflow-list)
+		      (display-list underflow-list stream :label "Underflow:")
+		      (display underflow-list stream :label "Underflow:"))))
+	      (when overflow-list
+		(indent (stream 3)
+		  (fresh-line stream)
+		  (if (listp overflow-list)
+		      (display-list overflow-list stream :label "Overflow:")
+		      (display overflow-list stream :label "Overflow:")))))))
+	(continue-whopper stream))))
+  
+(defmethod (display clipped-histogram) (&optional (stream *standard-output*) &key label)
+  (when label
+    (format stream "~&~A: " (if (listp label) (car label) label)))
+  (format stream
+	  "~&Low: ~D High:~D ~0,10T Bucket-size:~D ~0,10T Count:~D ~0,10T Avg:~D Std Dev: ~F~%"
+	  low high interval count (reasonable-average self) (reasonable-standard-deviation self))
+  (format stream "Above: ~D ~0,10T Below: ~D ~0,10T ~%" above below)
+  (display-histogram-array data-distribution interval low stream))
+
+(defmethod (:display basic-histogram) (window)
+  (let* ((height (send window :height))
+	 (bar-width (floor (send window :width) (fill-pointer data-distribution)))
+	 (maximum (loop for d being the array-elements of data-distribution
+			maximize d))
+	 (scale-y (if (<= maximum height)
+		      (let ((ratio (floor height maximum)))
+			(if (= ratio 1)
+			    #'(lambda (y-value) y-value)
+			    #'(lambda (y-value) (* ratio y-value))))
+		      #'(lambda (y-value) (floor (* y-value height) maximum)))))
+    (loop for d being the array-elements of data-distribution
+	  for x-pos = 0 then (+ x-pos bar-width)
+	  for bar-height = (funcall scale-y d)
+	  do (let ((corner-y (- height bar-height))) 
+	       (send window :draw-rectangle bar-width bar-height x-pos corner-y)))))
+
+(defmethod (display-short-form basic-histogram) (&optional (stream *standard-output*) &key label)
+  (when label
+    (format stream "~&~A: " (if (listp label) (car label) label)))
+  (format stream "~&Count: ~D Total: ~D Average value: " (entry-count self) (total self))
+  (present self 'histogram-avg :stream stream))
+
+
+
+;;; functions that convert from integer ranges to numbers of buckets
+
+;; remember that high is the highest value contained in the highest bucket.
+;; and low is the lowest value contained in the lowest bucket.
+
+(defmacro inclusive-difference (high low)
+  `(1+ (- ,high ,low)))
+
+(defun-in-flavor
+  (entries-needed-to-encompass-data histogram) (range)
+  (least-integer-greater-than range interval))
+
+(defun-in-flavor
+  (entries-needed-to-encompass-new-data histogram) (new-range)
+  (+ (least-integer-greater-than new-range interval)
+     (least-integer-greater-than (compute-range) interval)))
+
+(defun-in-flavor (compute-range histogram) ()
+  (inclusive-difference high low))
+
+(defun-in-flavor (compute-range-with-new-low histogram) (new-low)
+  (inclusive-difference high new-low))
+
+(defun-in-flavor (compute-range-with-new-high histogram) (new-high)
+  (inclusive-difference new-high low))
+
+(defun-in-flavor (compute-additional-range-with-new-low histogram) (new-low)
+  (- low new-low))
+
+(defun-in-flavor (compute-additional-range-with-new-high histogram) (new-high)
+  (- new-high high))
+
+
+
+;;; functions that readjust histogram to accomodate more data.  They all side-effect self
+
+;;; Increases bucket size so that range can be accomodated in the histogram.
+(defun-in-flavor (compact-histogram histogram) (range)
+  (let* ((new-entries (entries-needed-to-encompass-data range))
+	 (interval-ratio (least-integer-greater-than new-entries entries)))
+						; Set up instance variable appropriately
+    (setq interval (* interval interval-ratio))
+						; recompute new-entries with new
+						; value of interval
+    (setq new-entries (entries-needed-to-encompass-data (compute-range)))
+						; For every interval-ratio buckets, add
+						; 'em up together, and put into
+						; a single new bucket.
+    (loop for new-bucket from 0 to (1- new-entries)
+	  with old-bucket = 0
+	  with active-entries = (fill-pointer data-distribution)
+	  do (setf
+	       (aref data-distribution new-bucket) 
+	       (loop repeat interval-ratio
+		     while (< old-bucket
+			      active-entries)	; careful, there might not be
+						; an integral number of old-buckets in the 
+		     summing			; last clump
+		       (aref data-distribution old-bucket)
+		     do (incf old-bucket))))
+						; readjust high
+    (setq high (+ low (* new-entries interval) -1))
+    (setf (fill-pointer data-distribution) new-entries)))
+
+;;; Increases bucket size so that range can be accomodated in the histogram.
+(defun-in-flavor (compact-histogram-low histogram) (new-range)
+  (let* ((active-entries (fill-pointer data-distribution))
+	 (new-entries (entries-needed-to-encompass-new-data new-range))
+	 (interval-ratio (least-integer-greater-than new-entries entries)))
+						; Set up instance variable appropriately
+    (setq interval (* interval interval-ratio))
+						; recompute new-entries with new
+						; value of interval
+    (setq new-entries (entries-needed-to-encompass-data (compute-range)))
+						; For every interval-ratio buckets, add
+						; 'em up together, and put into
+						; a single new bucket.
+    (loop for new-bucket from 0 to (1- new-entries)
+	  with old-bucket = 0
+	  for number-of-buckets = (- interval-ratio (mod active-entries interval-ratio))
+				then interval-ratio
+	  do (setf
+	       (aref data-distribution new-bucket) 
+	       (loop repeat interval-ratio
+		     while (< old-bucket
+			      active-entries)	; careful, there might not be
+						; an integral number of old-buckets in the 
+		     summing			; last clump
+		       (aref data-distribution old-bucket)
+		     do (incf old-bucket))))
+						; readjust low
+    (setq low (1+ (- high (* new-entries interval))))
+    (setf (fill-pointer data-distribution) new-entries)))
+
+(defun-in-flavor (shift-histogram-right histogram) (shift-count)
+  (let* ((active-entries (fill-pointer data-distribution))
+	 (new-active-entries (+ active-entries shift-count)))
+    (when (> new-active-entries entries)
+      (error "shift-histogram-right attempted to shift a histogram out of bounds."))
+    (decf low (* interval
+		 shift-count))
+						; shift towards the high end to make
+						; room at the bottom.
+    (copy-histogram-portion
+      data-distribution 0 active-entries
+      data-distribution shift-count new-active-entries)
+						; clear newly allocated buckets
+    (loop for bucket from 0 to (1- shift-count)
+	  do (setf (aref data-distribution bucket) 0))
+    (setf (fill-pointer data-distribution) new-active-entries)))
+
+
+(defun-in-flavor (shift-histogram-left histogram) (shift-count)
+  (let* ((active-entries (fill-pointer data-distribution))
+	 (new-active-entries (+ active-entries shift-count)))
+    (when (> new-active-entries entries)
+      (error "shift-histogram-left attempted to shift a histogram out of bounds."))
+    (incf high (* interval
+		  shift-count))
+    (loop for bucket from active-entries to (1- new-active-entries)
+	  do (setf (aref data-distribution bucket) 0))
+    (setf (fill-pointer data-distribution) new-active-entries)))
+
+
+
+;; mutation routines
+
+(defun-in-flavor (convert-from-list-to-scale histogram) ()
+  (stack-let ((data (make-array (length data-distribution))))
+    (replace data data-distribution)
+    (multiple-value-setq (low high)
+      (loop for d being the array-elements of data
+	    maximize d fixnum into max
+	    minimize d fixnum into min
+	    finally (return (values min max))))
+    (let* ((range (compute-range))
+	   (new-entries (entries-needed-to-encompass-data range)))
+      (when (> new-entries entries)
+	(setq interval (least-integer-greater-than new-entries entries))
+	(setq new-entries (entries-needed-to-encompass-data range)))
+      (setq high (1- (+ low (* new-entries interval))))
+      (setf (fill-pointer data-distribution) new-entries)
+      (loop for counter being the array-elements of data-distribution
+			using (index bucket)
+	    do (ignore counter) (setf (aref data-distribution bucket) 0)))
+    (loop for d being the array-elements of data do (basic-insert-data d))))
+(defun-in-flavor (convert-from-list-to-modal-distribution modal-histogram) ()
+  (stack-let ((data (make-array (length data-distribution))))
+    (replace data data-distribution)
+    (multiple-value-bind (mean standard-deviation)
+	(compute-data-characteristics data)
+      (multiple-value-setq (low high)
+	(loop for d being the array-elements of data
+	      when ( (abs (- d mean)) standard-deviation)
+		maximize d fixnum into max
+		and minimize d fixnum into min
+	      finally (return (values min max))))
+      (let* ((range (compute-range))
+	     (new-entries (entries-needed-to-encompass-data range)))
+	(when (> new-entries entries)
+	  (setq interval (least-integer-greater-than new-entries entries))
+	  (setq new-entries (entries-needed-to-encompass-data range)))
+	(setq high (1- (+ low (* new-entries interval))))
+	(setf (fill-pointer data-distribution) new-entries)
+	(loop for counter being the array-elements of data-distribution
+			  using (index bucket)
+	      do (ignore counter)(setf (aref data-distribution bucket) 0)))
+						; reset instance variables....
+      (reset-total self)
+      (setq count 0)
+      (stack-let ((data-out-of-range (make-array (length data) :fill-pointer 0)))
+	(loop for d being the array-elements of data
+	      do (if (and ( d high) ( d low))
+		     (collect-data self d)
+		     (vector-push-extend d data-out-of-range))
+	      finally (loop for d being the array-elements of data-out-of-range do
+			(collect-data self d)))))))
+
+(defun compute-characteristics (data)
+  (let ((sum 0)
+	(sum-of-squares 0)
+	(count 0)
+	mean)
+    (loop for d in data
+	  do (incf sum d)
+	     (incf sum-of-squares (* d d))
+	     (incf count))
+    (setq mean (truncate sum count))
+    (values mean (cl:isqrt (- (ceiling sum-of-squares count) (* mean mean))))))
+
+(defun compute-data-characteristics (data)
+  (let ((sum 0)
+	(sum-of-squares 0)
+	(count 0)
+	mean)
+    (loop for d being the array-elements of data
+	  do (incf sum d)
+	     (incf sum-of-squares (* (float d) d))
+	     (incf count))
+    (setq mean (truncate sum count))
+    (let ((avg-square (/ sum-of-squares count))
+	  (square-avg (* (float mean) mean)))
+      (when (< avg-square most-positive-fixnum)
+	(setq avg-square (ceiling avg-square)))
+      (when (< square-avg most-positive-fixnum)
+	(setq square-avg (ceiling square-avg)))
+      (let ((diff (max 0 (- avg-square square-avg))))
+	(values mean 
+		(if (< diff most-positive-fixnum)
+		    (cl:isqrt (ceiling diff))
+		    (ceiling (sqrt diff))))))))
+
+
+;; utility functions
+
+;; rounds up a rational number, assuming both are positive. Returns the smallest integer
+;; greater than (numerator/denominator)
+(defun least-integer-greater-than (numerator denominator)
+  (floor (+ numerator (1- denominator)) denominator))
+
+(defun copy-histogram-portion (from-array from-start from-end
+			       to-array to-start to-end)
+  (let ((from from-array) (to to-array)		; until compiler is fixed about array register
+						; arguments, same as copy-array-portion 
+	(from-length (- from-end from-start))
+	(to-length (- to-end to-start)))
+    (declare (compiler:array-register-1d from to))
+    (if (and (eq from-array to-array)
+	     (< from-start to-start))
+	(let* ((length (min from-length to-length))
+	       (index-from (+ from-start length))
+	       (index-to (+ to-start length)))
+	  (loop repeat length
+		do (decf index-from)
+		   (decf index-to)
+		   (si:%1d-aset (si:%1d-aref from index-from) to index-to))
+	  (when (< length to-length)
+	    (loop with null-elem = (si:array-null-element (si:array-type-field to))
+		  with index-to = (+ to-start length)
+		  do (si:%1d-aset null-elem to index-to)
+		     (incf index-to)
+		  while (< index-to to-end))))
+	(let ((index-from from-start)
+	      (index-to to-start))
+	  (loop repeat (min from-length to-length)
+		do (si:%1d-aset (si:%1d-aref from index-from) to index-to)
+		   (incf index-from)
+		   (incf index-to))
+	  (when (< index-to to-end)
+	    (loop with null-elem = (si:array-null-element (si:array-type-field to))
+		  do (si:%1d-aset null-elem to index-to)
+		     (incf index-to)
+		  while (< index-to to-end)))))))
+
+
+(define-presentation-type histogram-avg ()
+   :printer ((object stream)
+	     (format stream "~S " (average object))))
+
+(define-presentation-action display-histogram
+   (histogram-avg t
+     :documentation "display histogram of values"
+     :gesture :describe
+     :context-independent 't)
+   (h &key window)
+  (let ((fixup-needed sys:rubout-handler))
+    (when fixup-needed (send window :start-typeout si:*typeout-default*))
+    (display h window)
+    (when fixup-needed (send window :finish-typeout))))
+
+
+(defgeneric map-over-histogram-buckets (histogram function)
+  (declare (sys:downward-funarg function)))
+
+(defmethod (map-over-histogram-buckets histogram) (function)
+  (declare (sys:downward-funarg function))
+  (if (equal internal-data-handler :append-histogram-data-to-list)
+      (loop for d being the array-elements of data-distribution do
+	(funcall function d d 1))
+      (loop for d being the array-elements of data-distribution
+	    for bucket-bottom = low then (+ bucket-bottom interval)
+	    for bucket-top = (1- (+ low interval)) then (+ bucket-top interval) do
+	(funcall function bucket-bottom bucket-top d))))
+
+(defwhopper (map-over-histogram-buckets modal-histogram) (function)
+  (declare (sys:downward-funarg function))
+  (continue-whopper function)
+  (when underflow-list
+    (if (listp underflow-list)
+	(loop for d in underflow-list do (funcall function d d 1))
+	(map-over-histogram-buckets underflow-list function)))
+  (when overflow-list
+    (if (listp overflow-list)
+	(loop for d in overflow-list do (funcall function d d 1))
+	(map-over-histogram-buckets overflow-list function))))
+
+(defmethod (map-over-histogram-buckets clipped-histogram) (function)
+  (declare (sys:downward-funarg function))
+  (loop for d being the array-elements of data-distribution
+	for bucket-bottom = low then (+ bucket-bottom interval)
+	for bucket-top = (1- (+ low interval)) then (+ bucket-top interval) do
+    (funcall function bucket-bottom bucket-top d)))
+
+;;;;
+;;;;
+(defun test-histogram (&optional h)
+  (let ((test-hist (or h (make-data-collector 'modal-histogram :entries 15))))
+    (loop for d in '(20 20 21 21 21 21 23 24 21 21 20 24 25 2 23 21 22 2 22 24 25 26 28 25 28 22 22 22 22 22 22 22
+			22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 28 29 22 3 22 22 22 22 22
+			13000 16001 15000 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22
+			22 22 22 22 22 22 22 22 22 22 22 28 29 22 3 22 22 22 22 22 13000 16001 15000 22 22 22 22
+			22 22 22 22 22 22 22 22 22 22 22 22 1456322 13877 24455 10000 11000 12000 500000
+			24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24 24) do
+      (collect-data test-hist d)
+      (format t "~&Datum: ~D Total:  ~S Entry-count: ~S Average: ~S Reasonable avg: ~S" 
+	      d (total test-hist) (entry-count test-hist) (average test-hist) (reasonable-average test-hist))
+      (when (y-or-n-p "Display the full histogram?")
+	(display test-hist)))
+    test-hist))
+
+(defun test-histogram-1 (&optional h)
+  (let ((test-hist (or h (make-data-collector 'modal-histogram :entries 15))))
+    (loop for d in '(20 20 21 21 21 21 23 24 21 21 20 24 25 2 23 21 22 2 22 24 25 26  
+			28 29 22 3 13000 16001 15000 22 33
+			-100 3 4 5 7 8 9 10 11 12 -100 -100 -100 -100 -100 -100 -10 -100 -100 -10) do
+      (collect-data test-hist d)
+      (format t "~&Datum: ~D Total:  ~S Entry-count: ~S Average: ~S Reasonable avg: ~S" 
+	      d (total test-hist) (entry-count test-hist) (average test-hist) (reasonable-average test-hist))
+      (when (y-or-n-p "Display the full histogram?")
+	(display test-hist)))
+    test-hist))
+
+
+#||
+;; Some QA code used for testing patch Metering 21.19
+
+;=====================================
+(SYSTEM-INTERNALS:BEGIN-PATCH-SECTION)
+(SYSTEM-INTERNALS:PATCH-SECTION-SOURCE-FILE "SYS:METERING;COLLECTORS;HISTOGRAM.LISP.NEWESTDevelopment.40")
+(SYSTEM-INTERNALS:PATCH-SECTION-ATTRIBUTES
+  "-*- Mode: LISP; Package: METERING; Base: 10; Syntax: Common-lisp; Lowercase: Yes -*-")
+
+;; Here's how to reproduce the bug:
+(let ((thx (make-data-collector 'modal-histogram :entries 8)))
+  ;; get a main mode.
+  (loop repeat 9 do (collect-data thx 10000))
+  ;; fill up the pending underflow list with a closely clumped bunch of data
+  (loop repeat 12
+	for i from 795 do
+    (collect-data thx i))
+  ;; record something in underflow, but out of the current range, so insert-underflow-data
+  ;; will trash low/high for the underflow-histogram
+  (collect-data thx 840)
+  ;; Now collect something that will require the underflow histogram to be shifted right;
+  (collect-data thx 793)
+1  ;; >>>*** here's where the error happens***<<<
+0  thx)
+#||
+(2 0 (NIL 0) (:FIX :BOLD :NORMAL) "CPTFONTCB")Error: shift-histogram-right attempted to shift a histogram out of bounds.
+
+(DEFUN-IN-FLAVOR METERING:SHIFT-HISTOGRAM-RIGHT METERING:HISTOGRAM)
+0   Arg 0 (SELF): #<METERING:HISTOGRAM 74156523>
+   Arg 1 (SYS:SELF-MAPPING-TABLE): #<Map to flavor METERING:HISTOGRAM 1062636>
+   Arg 2 (METERING:SHIFT-COUNT): 1
+s-A, ‘:    Return to Lisp Top Level in Dynamic Lisp Listener 1
+s-B:           Restart process Dynamic Lisp Listener 1
+ Abort(3 0 (NIL 0) (:FIX :ITALIC :NORMAL) "CPTFONTI") Abor(4 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")t
+0||#
+
+;; more random testing stuff.
+(defun test-histogram (count)
+  (let ((h (metering:make-data-collector 'metering:modal-histogram :entries 25)))
+    (loop repeat count do
+      (metering:collect-data
+	h
+	(+ (random 1000) (random 1000) (random 1000)
+	   (* (floor (random 30) 28) (random 100000))
+	   (* (floor (random 60) 58) -8000))))
+    h))
+||#
+
+#||
+
+
+;; some more test functions...
+
+(defun test-total1 (n r)
+  (let* ((s 0)
+	 (c (metering::make-data-collector
+	      'metering:collect-hash :component-description
+	      '((foo metering:sum)
+		(bar metering:integer-sum)
+		(brux metering:clipped-histogram)
+		(baz metering:modal-histogram))))
+	 (foo-extractor (metering:get-component-extractor-from-components 'foo nil c))
+	 (bar-extractor (metering:get-component-extractor-from-components 'bar nil c))
+	 (brux-extractor (metering:get-component-extractor-from-components 'brux nil c))
+	 (baz-extractor (metering:get-component-extractor-from-components 'baz nil c)))
+    (loop repeat n do
+      (let ((r (- (random (1+ r)) (floor r 2)))) (incf s r) 
+	   (let ((components (metering:collect-data-for-value c 'foo)))
+	     (metering:collect-data (funcall foo-extractor components) r)
+	     (metering:collect-data (funcall bar-extractor components) r)
+	     (metering:collect-data (funcall brux-extractor components) r)
+	     (metering:collect-data (funcall baz-extractor components) r))))
+    (values c s)))
+
+(metering::define-collector-function test-total3 (r c)
+  (metering:define-collector-type
+    (c metering:collect-hash
+       :component-description
+       ((foo metering:sum)
+	(bar metering:integer-sum)
+	(brux metering:clipped-histogram)
+	(baz metering:modal-histogram))))
+  (metering:with-collector (c 'foo)
+    (metering:collect foo r)
+    (metering:collect bar r)
+    (metering:collect brux r)
+    (metering:collect baz r)))
+
+(defun test-total2 (n r)
+  (let* ((s 0)
+	 (c (metering::make-data-collector 'metering:collect-hash
+					   :component-description
+					   '((foo metering:sum)
+					     (bar metering:integer-sum)
+					     (brux metering:clipped-histogram)
+					     (baz metering:modal-histogram)))))
+    (loop repeat n do
+      (let ((r (- (random (1+ r)) (floor r 2))))
+	(incf s r)
+	(test-total3 r c)))
+    (values c s)))
+
+||#

@@ -1,0 +1,552 @@
+;;; -*- Mode: LISP; Package: GPrint; Syntax: Common-Lisp; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; This software is based on ideas published by Richard C. Waters
+;;; His aid is gratefully acknowledged
+
+;;; This file contains the parser and code generator for the formatting
+;;; strings.  The top-level goal of this file is to define the gformat macro,
+;;; which is used elsewhere in the system.
+
+;;; Given a formatting string and argument forms, return a form that executes
+;;; the string and so adds items to the queue.
+(defmacro gformat (string . arguments)
+  (cons 'progn (generate-code (tokenize string) arguments)))
+
+(defvar *basic-printer* ':prin1
+  "Controls the behavior of the P directive. :princ or :prin1")
+(defvar *syntax-table* (make-array #o400)
+  "Drives parser.  Indexed by char code.  Contains token, list
+   of balances and tokens from an abbrev, or BLANK.")
+(defvar *closing-chars* nil
+  "List of characters that close balancing opening characters.")
+(defvar *arg-users* nil
+  "List of token (symbols) that use arguments.")
+
+;;; The parser.
+
+;;; Control strings are first converted into a flat sequence of tokens,
+;;; and then code is generated from this sequence.  Usually, one character,
+;;; sometimes with a following parameter, turns into a token.  However,
+;;; some characters are abbreviations for several tokens, and in one case
+;;; two characters turn into a single token.  Each token is given a symbol
+;;; that represents it in the sequence.  TOKENIZE returns the sequence,
+;;; a list of each of whose elements is of the form (<token> <param>).
+;;; DEFTOKEN defines a token.  DEFABBREV defines a character that is
+;;; an abbreviation for other tokens.
+
+;;; DEFTOKEN has the following subforms:
+;;;  NAME is the symbol naming the token.
+;;;  CHAR is the single character that turns into this token.  It can be
+;;;       NIL if no single character does so.
+;;;  PARAM-STYLE says how this character takes its parameter; it can be
+;;;       any of NO-PARAM, NUMERIC-PARAM, FUNCTION-PARAM, or QUOTE-PARAM.
+;;;  ARG-USER is T if this command uses up an argument.  This is to tell
+;;;       the code generator when to advance *value* inside a [] iteration.
+;;;  FORM is a Lisp form which, when evaluated, should produce the Lisp
+;;;       form to be inserted into the body of the generated code.  It's
+;;;       like a macro body that gets expanded.  At "expand-time", it can
+;;;       call the functions ARGUMENT and PARAM to get the parameters from
+;;;       the control string and the arguments passed by the caller.  FORM
+;;;       should be SPECIAL-CASE for those tokens handled specially by the
+;;;       code-generator.
+;;;  BALANCES (optional) is a closing character code that this opening character
+;;;       must be balanced with.
+
+(defmacro deftoken (name char param-style arg-user form &optional balances)
+  `(define-token ',name ',char ',param-style ',arg-user ',form ',balances))
+
+(defun define-token (name char param-style arg-user form balances)
+  (when char
+    (setf (aref *syntax-table* (char-int char)) name))
+  (setf (get name 'param-style) param-style)
+  (when arg-user
+    (push name *arg-users*))
+  (setf (get name 'form) form)
+  (when balances
+    (setf (get name 'balances) balances)
+    (push balances *closing-chars*)))
+
+(deftoken p #\P no-param t
+  `(enqueue *basic-printer* ,(argument)))
+
+(deftoken c #\C no-param t
+  `(enqueue ':princ ,(argument)))
+
+(deftoken s #\S no-param t
+  `(enqueue ':special ,(argument)))
+
+(deftoken i #\I no-param t
+  (argument))
+
+(deftoken quote #\' quote-param nil
+  `(enqueue ':special ,(param)))
+
+(deftoken ~ #\~ numeric-param nil
+  `(enqueue ':space ,(or (param) 1)))
+
+(deftoken tab #\T numeric-param nil
+  `(enqueue ':tab ,(param)))
+
+(deftoken * #\* no-param t
+  `(gdispatch nil ,(argument)))
+
+(deftoken & #\& function-param nil
+  `(funcall ,(param)))
+
+(deftoken % #\% function-param t
+   (let ((arg (argument))
+	 (par (param)))
+     `(funcall ,par ,arg)))
+
+(deftoken $ #\$ function-param t
+   (let ((arg (argument))
+	 (par (param)))
+     `(gdispatch ,par ,arg)))
+
+(deftoken start-sub nil no-param t		;Special case: $"
+  special-case
+  #\")
+
+(deftoken end-sub #\" no-param t
+  ignore)
+
+(deftoken ind nil numeric-param nil		;Only comes from abbrevs.
+  `(enqueue ':ind ,(param)))
+
+(deftoken + #\+ numeric-param nil
+  `(enqueue ':ind ,(or (param) 1)))
+
+(deftoken a #\A no-param nil
+  `(enqueue ':newline ':always))
+
+(deftoken n #\N no-param nil
+  `(enqueue ':newline ':normal))
+
+(deftoken b #\B no-param nil
+  `(enqueue ':newline ':block))
+
+(deftoken m #\M no-param nil
+  `(enqueue ':newline ':miser))
+
+(deftoken e #\E no-param nil
+  `(enqueue ':eval ,(argument t)))
+
+(deftoken < #\< no-param nil
+  'L
+   #\>)
+
+(deftoken > #\> no-param nil
+  '(go L))
+
+(deftoken go-in #\[ no-param t
+  special-case
+  #\])
+
+(deftoken go-out #\] no-param t
+  special-case)
+
+(deftoken period #\. no-param nil
+  special-case)
+
+(deftoken open nil no-param nil			;Only from the open-paren abbrev.
+  ignore)
+
+(deftoken close nil no-param nil		;Only from the close-paren abbrev.
+  ignore)
+
+(deftoken start nil no-param nil		;Only from the { abbrev.
+  `(enqueue ':start nil))
+
+(deftoken end #\} no-param nil
+  `(enqueue ':end nil))
+
+;;; DEFABBREV takes a character, a "balances", and a list of token symbols.  When
+;;; that character is seen in a control string, the corresponding
+;;; sequence of tokens is generated.  Instead of a symbol, you can also
+;;; provide a list of a symbol and a fixed parameter value, so that the
+;;; parameter to the character won't be used.  "balances" is as above
+;;; in DEFTOKEN.
+
+(defmacro defabbrev (character balances &rest tokens)
+  `(define-abbrev ',character ',balances ',tokens))
+
+(defun define-abbrev (character balances tokens)
+  (dolist (tok tokens)
+    (unless (get (if (listp tok) (car tok) tok) 'param-style)
+      (error "~S is not a valid token" tok)))
+  (setf (aref *syntax-table* (char-int character)) (cons balances tokens))
+  (when balances
+    (push balances *closing-chars*)))
+
+(defabbrev #\{ nil start ind)			;Note that {} need not balance!
+
+(defabbrev #\( #\) open start ind (quote "(") go-in)	;is the open right?
+
+(defabbrev #\) nil go-out (quote ")") end close)	;is the close right?
+
+(defabbrev #\! nil A)
+
+(defabbrev #\- nil ~ N)
+
+(defabbrev #\, nil ~ B)
+
+(defabbrev #\; nil (~ nil) TAB B)
+
+(defabbrev #\_ nil ~ M)
+
+(dolist (code '(#\space #\tab #\return #\line))
+  (setf (aref *syntax-table* (char-int code)) 'blank))
+
+;;; The lexical analyzer.
+
+(defvar *result* nil "The list being built, to be reversed and returned")
+(defvar *string* nil "The string being tokenized")
+(defvar *index* 0 "The index of the next char in the string to be seen")
+(defvar *limit* 0 "The length of the string")
+(defvar *stack* nil "Keeps track of balancing brackets")
+(defvar *token-index* "Index of first char of token, for error reporting")
+
+;;; As advertised above, this takes a string and returns a list of two-element lists,
+;;; (<token-symbol> <parameter-value>).
+(defun tokenize (*string*)
+  (let ((*result* nil)
+	(*index* 0)
+	(*limit* (string-length *string*))
+	(*stack* nil))
+    (loop do
+	  (when (>= *index* *limit*)
+	    (return))
+	  (let* ((char (char-upcase (aref *string* *index*)))
+		 (*token-index* *index*)
+		 (syntax (aref *syntax-table* (char-int char))))
+	    (incf *index*)
+	    (cond ((and (char= char #\$)
+			(< *index* *limit*)
+			(char= (aref *string* *index*) #\"))
+		   ;; Special case for start-sub
+		   (incf *index*)
+		   (process-token 'start-sub nil)
+		   (process-char-after #\"))	;No after, because there's no char.
+		  ((eq syntax 'blank))		;Ignore this set of characters.
+		  ((null syntax)		;Complain about this set of characters.
+		   (syntax-error "The character ~C is unknown" char))
+		  ((symbolp syntax)
+		   ;; There was a deftoken for this character.
+		   (process-char-before char)
+		   (process-token syntax (funcall (get syntax 'param-style)))
+		   (process-char-after (get syntax 'balances)))
+		  (t
+		   ;; There was a defabbrev for this character.
+		   (process-char-before char)
+		   (dolist (e (cdr syntax))
+		     (if (symbolp e)
+			 (process-token e (funcall (get e 'param-style)))
+			 (process-token (first e) (second e))))
+		   (process-char-after (car syntax))))))
+    (when *stack*
+      (let* ((elt (pop *stack*))
+	     (*token-index* (second elt)))
+	(syntax-error "Unmatched opening bracket: ~C" (aref *string* *token-index*))))
+    (nreverse *result*)))
+
+;;; Add a token and associated parameter to *result*.  Also, do the special
+;;; expansion of the open and close tokens, based on the stack context.
+;;; tokenize calls this once for every token ("after" abbrevs are expanded).
+(defun process-token (token parameter)
+  (case token
+    (open
+     (when (find-first '(#\] #\)) '(#\") *stack* #'char-equal)
+       (push '(start-sub nil) *result*)))
+    (close
+     (when (find-first '(#\] #\)) '(#\") *stack* #'char-equal)
+       (push '(end-sub nil) *result*)))
+    (otherwise
+     (push (list token parameter) *result*))))
+
+;;; Check out this character.  Keep track of the stack context, for process-token,
+;;; and in order to detect and report unbalanced tokens.  tokenize calls these once
+;;; for every key character ("before" abbrevs are expanded); it has to, in order to
+;;; report misbalanced ()'s correctly, since they disappear after abbrevs are expanded.
+;;; process-char-before is called before process-token, and process-char-after is
+;;; called afterward.  Elements of *stack* are (<closing char> <where the open was>).
+
+;;; char is the character being processed.
+(defun process-char-before (char)
+  (when (and (member char '(#\. #\<) :test #'char-equal)
+	     *stack*
+	     (not (member (caar *stack*) '(#\] #\)) :test #'char-equal)))
+    (syntax-error "The ~C character must appear within [] or ()" char))
+  (when (and (member char '(#\{ #\}) :test #'char-equal)
+	     *stack*
+	     (member (caar *stack*) '(#\] #\)) :test #'char-equal))
+    ;; (I just copied this; I don't know what it's for - DLW)
+    (syntax-error "The { and } characters are unsafe immediately within [] or ()"))
+  (cond ((member char *closing-chars* :test #'char-equal)
+	 ;; This token is a close-something.  Make sure it matches, and pop
+	 ;; the stack.
+	 (let ((elt (pop *stack*)))
+	   (unless (and elt (char-equal char (first elt)))
+	     (cond (elt
+		    (syntax-error "Unbalanced brackets: ~C and ~C"
+				  (aref *string* (second elt)) char))
+		   (t
+		    (syntax-error "No open bracket for ~C" char))))))))
+
+;;; balances is the balancing closing char, if the character is an opening character.
+(defun process-char-after (balances)
+  (when balances
+    ;; This character is an open-something.  Push the name of the corresonding
+    ;; closing token onto *stack*, along with its position.
+    (push (list balances *token-index*) *stack*)))
+
+;;; Returns T if it finds an element of HITS in the car of element of LIST
+;;; before an element of MISSES.  Returns NIL if it doesn't find either.
+(defun find-first (hits misses list &optional (test 'eql))
+  (dolist (l list)
+    (cond ((member (car l) hits :test test) (return t))
+	  ((member (car l) misses :test test) (return nil)))))
+
+;;; Simple error reporting for now.  Probably it should be improved later.
+(defun syntax-error (format-string &rest format-args)
+  (apply #'error format-string format-args))
+
+;;; The token doesn't take any parameter.
+(defun no-param ()
+  nil)
+
+;;; The token has a function parameter, which means that it's followed by the
+;;; name of a Lisp symbol, terminated by a space.  It can also be #, meaning
+;;; that the function to be used is an argument instead of appearing as a
+;;; parameter in the control string.
+(defun function-param ()
+  (when (>= *index* *limit*)
+    (syntax-error "Missing function parameter"))
+  (cond ((char= (aref *string* *index*) #\#)
+	 (incf *index*)
+	 '\#)
+	(t
+	 (let ((space-pos (or (string-search-char #\space *string* :start *index*)
+			      *limit*)))
+	   (prog1 `',(read-from-string *string* nil nil :start *index* :end space-pos)
+		  (setq *index* (1+ space-pos)))))))
+
+;;; The token has a quoted string parameter, which means that the next
+;;; characters up to a matching single-quote are a string.  Inside this,
+;;; you can express a single-quote itself by doubling it.
+(defun quote-param ()
+  (loop with result = nil
+	with start-search = *index*
+	for quote-pos = (string-search-char #\' *string* :start start-search) do
+	(unless quote-pos (syntax-error "Unmatched single-quote"))
+	(let ((s (substring *string* *index* quote-pos)))
+	  (setq *index* (1+ quote-pos))
+	  (setq result (if (null result) s (string-append result s))))
+	(when (or (>= *index* *limit*)
+		  (not (char= (aref *string* *index*) #\')))
+	  (return result))
+	(setq start-search (1+ *index*))))
+
+;;; The token has a numeric parameter.  This means it's followed by a decimal
+;;; number, terminated by a non-digit.  It can also be #, meaning that an
+;;; argument should be used instead.
+(defun numeric-param ()
+  (cond ((>= *index* *limit*) nil)
+	((char= (aref *string* *index*) #\#)
+	 (incf *index*)
+	 '\#)
+	(t
+	 (multiple-value-bind (n new-index)
+              (parse-integer *string* :start *index* :junk-allowed t)
+	   (when n
+	     (setq *index* new-index))
+	   n))))
+
+;; Test cases for the tokenizer.  Use c-m-@ c-m-sh-E.
+;; (tokenize "pcsi")			Simple case.
+;; (tokenize "p c s i")			Blanks.
+;; (tokenize "~")			Numeric param, with no param.
+;; (tokenize "~3")			Numeric param, with one digit.
+;; (tokenize "a~3p")			Numeric param, surrounded.
+;; (tokenize "a~33p")			Numeric param, two digits.
+;; (tokenize "a~-33p")			Numeric param, negative number.
+;; (tokenize "a~#p")			Numeric param, use argument instead.
+;; (tokenize "'foo'")			Quoted param, simple case.
+;; (tokenize "'foo''bar'")		Quoted param, test doubled quotes.
+;; (tokenize "a'foo'b'bar'c")		Quoted param, surrounded.
+;; (tokenize "&foo")			Function param, simple case.
+;; (tokenize "&foo a")			Function param, delimited and followed.
+;; (tokenize "&fs:foo a")		Function param, with packages.
+;; (tokenize "&#a")			Function param, use argument instead.
+;; (tokenize "p!c-s")			Basic abbrevs.
+;; (tokenize "[]")			go-in/go-out pair.
+;; (tokenize "[!-!]")			go-in/go-out pair with contents.
+;; (tokenize "[ !-!	]")		Ditto, with blanks.
+;; (tokenize "{}")			Start/end pair.
+;; (tokenize "[*.*]")			go-in/go-out pair, with dot.
+;; (tokenize "[<>]")			</> pair; must be nested in [].
+;; (tokenize "()")			open/close pair.
+;; (tokenize "(!-!)")			open/close pair with contents.
+;; (tokenize "$\"pcs\"")		start-sub/end-sub pair.
+;; (tokenize "[()]")			open/close with implicit start-sub/end-sub.
+
+;; Error cases (i.e., test out the error-checking stuff).
+;; (tokenize "[)")
+;; (tokenize "[")
+;; (tokenize "]")
+;; (tokenize "[<]>")
+;; (tokenize "$\"pc")
+;; (tokenize "pc\"")
+;; (tokenize "'foo")
+;; (tokenize "'foo''")
+;; (tokenize "a<>p")
+;; (tokenize "a.p")
+;; (tokenize "[{}]")
+;; (tokenize "({})")
+
+;;; Code-generator.
+
+(defvar *token-list* nil "List of (<token> <parameter>) items from tokenizer.")
+(defvar *arguments* nil "List of argument forms passed to the format string.")
+(defvar *arg-state* 'top "State of arg taking.  One of top, var, or car-var.")
+(defvar *parameter* nil "Parameter value for this form: nil, value, or |#|.")
+
+(defun generate-code (*token-list* *arguments*)
+  (let ((answer (generate-code-internal 'top)))
+    (when *arguments*
+      (error "Too many arguments for formatting string"))
+    answer))
+
+;;; During code generation, this function is called to get an argument.  At
+;;; top level, it really gets an argument form; inside nested stuff, it gets
+;;; a reference to *value*.  always-top means to always act as if it were top
+;;; level; this is a special case for the E directive.
+(defun argument (&optional always-top)
+  (cond ((or always-top (eq *arg-state* 'top))
+	 (unless *arguments* (error "Too few arguments for formatting string"))
+	 (pop *arguments*))
+	((eq *arg-state* 'var)
+	 '*value*)
+	((eq *arg-state* 'car-var)
+	 '(car *value*))
+	(t
+	 (error "Unknown *arg-state* ~S"))))
+
+;;; During code generation, this function is called to get a parameter.
+(defun param ()
+  (cond ((eq *parameter* '|#|)
+	 (argument))
+	(t *parameter*)))
+
+;;; Returns a list of forms.
+(defun generate-code-internal (*arg-state*)
+  (loop with forms = nil
+	when (null *token-list*)
+	return (nreverse forms)
+	do (destructuring-bind
+	     (token *parameter*) (pop *token-list*)
+	     (case token
+	       ((go-out end-sub)
+		;; At end of token list, or at end of this recursive sequence.
+		(return (nreverse forms)))
+	       (period
+		 ;; Don't take the car of the variable next time.
+		 (setq *arg-state* 'var))
+	       (start-sub
+		 ;; Call the dispatcher, using this chunk of code as the suggested format.
+		 (let ((arg (argument)))
+		   (push `(gdispatch
+			    #'(lambda (*value*) .,(generate-code-internal 'var))
+			    ,arg)
+			 forms)))
+	       (go-in
+		 ;; Start destructuring list.  *value* is the list, and generate code in the
+		 ;; car-var state so that car will be taken to get the element.
+		 (push
+		   `(let ((*value* ,(argument)))
+		      (prog ()
+			    (when (initial-test) (return))
+			 .,(generate-code-internal 'car-var)))
+		   forms))
+	       (otherwise
+		 ;; Not a special case; just use the associated form from the deftoken.
+		 (push (eval (get token 'form)) forms)))
+	     (when (and (eq *arg-state* 'car-var)
+			(member token *arg-users*))
+	       ;; We're inside a [] and used an argument.  Need to progress *value*.
+	       (if (find-first '(period) *arg-users* *token-list*)
+		   (push '(go-to-next-period) forms)
+		   (push '(when (go-to-next) (return)) forms))))))
+
+;;; Test function
+
+(defun gt (string args)
+  (format t "~&Code for ~A~&" string)
+  (pprint
+    (cons 'progn (generate-code (tokenize string) args))))
+
+;; Test cases for the code generator.  Use c-m-@ c-m-sh-E.
+;; (gt "p" '(arg1))
+;; (gt "psi" '(arg1 arg2 arg3))
+;; (gt "p_3'foo'" '(arg1))
+;; (gt "p_#'foo'" '(arg1 arg2))
+;; (gt "&fs:foo T4CAE" '(arg1 arg2))
+;; (gt "%format " '(arg1))
+;; (gt "%#" '(arg1 arg2))
+;; (gt "[p]" '(arg1))
+;; (gt "[p.p]" '(arg1))
+;; (gt "[pp]" '(arg1))
+;; (gt "$\"p\"" '(arg1))
+;; (gt "(P_<*_*A>)" '(arg1))
+;; (gt "(*<~(*)B>)" '(arg1))
+;; (gt "$#" '(obj format))

@@ -1,0 +1,516 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SCT; Base: 10; Lowercase: T -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Definitions for the System Construction Tool
+
+
+;; The system currently being built, and its (canonicalized) version number.
+;; These two variables must be bound by all top-level functions, and nearly
+;; all lower-level functions can (and do) take them as implicit inputs.
+(defvar *system*)
+(defvar *version*)
+(defvar *branch*)
+
+;; Including LM2's is more trouble than it's worth
+(defvar *all-machine-types* '(#+ignore :lm2 :|3600| :imach :vlm))
+(defvar *local-machine-type* #+cadr  :lm2
+			     #+3600  :|3600|
+			     #+(and imach (not vlm)) :imach
+			     #+(and imach vlm) :vlm)
+(defvar *current-machine-type* *local-machine-type*)
+
+;; Collect the source file and product file truenames from the compilers,
+;; and use this to write the correct data into the journal files.
+(defvar *source-and-product-truenames*)
+
+;; This is used to avoid redundantly building plans for component systems
+(defvar *systems-with-plans-built*)
+
+;; System caches to flush after all plans have been built and executed
+(defvar *system-caches-to-flush*)
+
+;; These are used to reduce the number of PROBEs during plan-building
+(defvar *cached-system-directories*)
+(defvar *cached-component-directories*)
+(defvar *cached-system-creation-dates*)
+
+;; Used in order to gather in advance the version numbers for all components
+(defvar *component-system-info*)
+
+;; Bound while gathering component system information, so that users can
+;; see what is going on (for example, in a :VERSION clause in a DEFSYSTEM).
+(defvar *component-system*)
+(defvar *component-system-requested-version*)
+
+;; What "pass" we are in, used for conjugating verbs in the documentation
+(defvar *system-pass*)
+
+;; In the face of building plans for multiple machine types, it is possible to
+;; see the exact same pathname more than once.  System operations can bind and
+;; use this to filter out duplicates.
+(defvar *pathname-mark-table*)
+
+;; A couple of things used to note progress
+(defvar *sct-progress-note*)
+(defvar *maintain-sct-progress-note* t)
+
+;; All the systems which have ever been defined
+(defvar *all-systems* nil :localize t)
+(defvar *all-systems-lock* (process:make-lock "Global SCT lock" :recursive t))
+
+;; These aarrays are used by the SCT:SYSTEM presentation-type parser, which
+;; used to cons all this stuff up on the fly, which is slow, paging-intensive
+;; and conses a lot.
+(defvar *true-systems-aarray*
+	(si:make-aarray 50. :name "system name completion table"))
+(defvar *patchable-systems-aarray*
+	(si:make-aarray 50. :name "patchable system name completion table"))
+(defvar *subsystems-aarray*
+	(si:make-aarray 125. :name "subsystem name completion table"))
+
+;; Maintain a table which maps from system-name to system object, which makes
+;; FIND-SYSTEM-NAMED run much faster and page much less than doing a linear
+;; search through *ALL-SYSTEMS*
+(defun system-name-hash-function (name)
+  ;; These can be either strings or keywords.  Since we're only interested
+  ;; in STRING-EQUAL, hash them as strings
+  (cli::xequal-hash (string name)))
+
+(defun system-name-compare-function (name1 name2)
+  (or (eql name1 name2)
+      (string-equal name1 name2)))
+
+(defvar *all-systems-table* (scl:make-hash-table :size 100.
+						 :test #'system-name-compare-function
+						 :hash-function #'system-name-hash-function
+						 :store-hash-code t))
+
+
+;; A list of systems and modules which have not yet been loaded as a result
+;; of using the :REQUIRED-SYSTEMS module option
+(defvar *unloaded-system-modules*)
+(defvar *all-unloaded-system-modules* nil)
+
+
+;; List of strings that users add to when they wish to announce a
+;; private patch has been loaded.
+(defvar *private-patch-info* nil)
+
+;; Additional info is printed after the version when the system is booted.
+(defvar system-additional-info "")
+
+;; These get shoved into *SYSTEM-OPERATION-ALIST*
+(defstruct (operation-alist :list (:conc-name operation-))
+  operation
+  driving-function
+  documentation
+  encache				;one of :BOTH, :SOURCE, :DESTINATION, or NIL
+  class					;one of :NORMAL or :SIMPLE
+  subsystems-ok
+  funny-p)				;T or NIL
+
+(defvar *system-operation-alist* nil)
+(defvar *module-type-flavor-alist* nil)
+(defvar *module-type-file-type-alist* nil)
+
+;; A list of all of the known source file types, and all of the known destination
+;; (product) file types.  The two lists should be disjoint!
+(defvar *source-file-types* nil)
+(defvar *destination-file-types* nil)
+
+;; Some things we need for environments...
+(defvar *all-environments* nil)
+(defvar *environment-type-flavor-alist* nil)
+(defvar *environments-to-save*)
+
+;; Global controls for constructing systems
+(defconst *date-testing-off* nil
+  "Switch for testing system construction without frobbing the filesystem")
+
+;; All top-level functions need to bind these to something useful
+(defvar *query-p*)
+(defvar *silent-p*)
+(defvar *batch-p*)
+(defvar *query-type*)
+
+;; This is needed for global knowledge of whether to "do the rest" within
+;; multi-level selective querying.  Must be bound by querying functions.
+(defvar *proceed-p*)
+
+;; Set this to T to check for circularities at DEFSYSTEM time
+(defconst *system-check-circularities* t)
+
+;; For distribution
+(defconst *category-rank-alist* '((:basic . 0) (:optional . 1) (:restricted . 2)))
+
+;; These operations are treated specially
+(defconst *special-system-operations* '(:compile :load :read))
+
+;; State for the short-form parser
+(defvar *module-count*)
+(defvar *new-modules*)
+(defvar *module-creation-options*)
+(defvar *named-modules*)
+(defvar *modules-changed*)
+(defvar *anonymous-module-count*)
+
+(eval-when (compile load)
+
+;; Not this again...
+(defun fintern (format-string &rest format-args)
+  (prog1
+    (intern (string-thin (lexpr-funcall #'format nil format-string format-args)
+			 :remove-bits t :error-if :fat))))
+
+(defun fintern-in-package (pkg format-string &rest format-args)
+  (prog1
+    (intern (string-thin (lexpr-funcall #'format nil format-string format-args)
+			 :remove-bits t :error-if :fat)
+	    (pkg-find-package pkg))))
+
+(defun intern-in-keyword-package (thing)
+  (if (keywordp thing)
+      thing
+    (prog1
+      (intern (string-thin (cond ((stringp thing)
+				  (string-upcase thing))
+				 (t (cl:symbol-name thing)))
+			   :remove-bits t :error-if :fat)
+	      pkg-keyword-package))))
+
+)	;eval-when
+
+(zwei:defindentation (sct-warn 0 3 1 1))
+(defun sct-warn (format-string &rest format-args)
+  (cl:fresh-line error-output)
+  (lexpr-funcall #'format error-output format-string format-args))
+
+(zwei:defindentation (sct-inform 0 3 1 1))
+(defun sct-inform (format-string &rest format-args)
+  (when (or (not (variable-boundp *silent-p*))
+	    (not *silent-p*))
+    (lexpr-funcall #'format error-output format-string format-args)))
+
+
+;; Define the flavor upon which all systems are based
+(defflavor basic-system
+	(name
+	 (short-name nil)
+	 (pretty-name nil)
+	 (parameters nil)		;the "arglist" for this system
+	 (default-package nil)		;in case no package given in a module
+	 (package-override nil)		;forcibly all modules into this package
+	 (default-module-type :lisp)
+	 (default-pathname nil)		;usually a logical host and directory
+	 (default-destination-pathname nil)
+	 modules
+	 (module-names nil)		;maps module-name  module
+	 (component-systems nil)	;used to discover what system a function is in
+	 (component-of-systems nil)	;ditto
+	 (before-patches-initializations nil)	;run just before patches are loaded
+	 (after-patches-initializations  nil)	;run just after patches are loaded
+	 (before-construction nil)		;funcalled before anything gets loaded
+	 (after-construction  nil)		;funcalled after files are loaded
+	 (machine-types :all)		;frob the system only for these machine-types
+	 (distribute-sources t)		;for distribution...
+	 (distribute-binaries t)
+	 (source-category :basic)
+	 (bug-reports nil)		;where bug reports get sent
+	 (pathnames-translated nil)	;T ==> all logical pathnames have been translated
+	 (files-info nil)		;table of file plists, when needed
+	 (plans-built nil)		;for optimizing recursive plan-building
+	 (loaded-version nil)		;NIL if not loaded, an integer otherwise
+	 (loaded-branch nil)		;what system branch is currently loaded
+	 (version-mapping nil)		;maps (operation x version)  component-version
+	 (default-system-branch nil)	;like it says
+	 (branch-mapping nil)		;default mapping from system-branch to VC-branch
+	 (version-controlled nil)	;NIL ==> don't ever sweat VC for this system
+	 (lock				;only one process building plans at a time...
+	   (process:make-lock "SCT lock" :recursive t)))
+	()
+  (:conc-name system-)
+  (:initable-instance-variables name short-name pretty-name parameters
+				default-package package-override
+				before-patches-initializations after-patches-initializations
+				before-construction after-construction
+				default-module-type machine-types version-mapping
+				default-system-branch branch-mapping version-controlled
+				default-pathname default-destination-pathname
+				distribute-sources distribute-binaries source-category
+				bug-reports)
+  (:init-keywords :initializations)
+  :writable-instance-variables
+  :abstract-flavor)
+
+(defmethod (system-version-loaded basic-system) ()
+  (system-version-loaded-in-environment (system-environment self) self))
+
+(defmethod ((cl:setf system-version-loaded) basic-system) (new-value)
+  (set-system-version-loaded-in-environment (system-environment self) self new-value))
+
+(defmethod (system-branch-loaded basic-system) ()
+  (system-branch-loaded-in-environment (system-environment self) self))
+
+(defmethod ((cl:setf system-branch-loaded) basic-system) (new-value)
+  (set-system-branch-loaded-in-environment (system-environment self) self new-value))
+
+;; A full-fledged system, which is journalled and can be patched
+(defflavor system
+	((patchable t)			;everything is patchable by default
+	 (maintain-journals t)		;allow user to disable journalling
+	 (journal-directory nil)	;base directory where journals and patches are kept
+	 (advertised-in '(:herald))	;list of :DISK-LABEL, :HERALD, :FINGER
+	 (compile-is-transitive nil)	;:COMPILE is transitive when this is a component
+	 (initial-status :experimental)	;:RELEASED, :EXPERIMENTAL, :OBSOLETE, :BROKEN
+	 (status :experimental)
+	 (maintaining-sites nil)	;what sites can patch this system
+	 (environment nil)		;most likely the Lisp environment
+	 (required-systems nil)		;systems which must be loaded...
+	 (installation-script nil)	;an automated installation script might live here
+	 (patch-atom nil)		;used for creating journal pathnames
+	 (patches-reviewed nil)		;NIL, T, or mailing-list where doc-changes are sent
+	 (load-patches-plan nil)	;cache plan for loading patches
+	 (loaded-patches nil)		;PATCH-SYSTEM structure for patches that are loaded
+	 (loaded-patch-dir-creation-date nil)	;cache to avoid unneeded file activity
+	 (cached-patch-dir nil)			;cache of contents of last patch-dir file read
+	 (cached-patch-dir-file-info nil)	; and the file-info for that file
+	 (cached-system-dir nil)
+	 (cached-system-dir-file-info nil)
+	 (cached-component-dir nil)
+	 (cached-component-dir-file-info nil)
+	 (cached-component-dir-machine-type nil)
+	 (cached-vc-source-change-journal nil)	;journal of changes to the source
+	 (cached-vc-source-change-journal-file-info nil)
+	 (eco-level nil))
+	(basic-system)
+  (:conc-name system-)
+  (:initable-instance-variables patchable journal-directory advertised-in
+				patch-atom initial-status environment required-systems
+				maintaining-sites patches-reviewed
+				maintain-journals installation-script compile-is-transitive)
+  :writable-instance-variables
+  (:locatable-instance-variables environment))
+
+;; A subsystem is not journalled and cannot be patched
+(defflavor subsystem
+	((patchable nil)		;subsystems are not patchable
+	 (maintain-journals nil)	; and do not maintain journals
+	 (journal-directory nil)	; and have no patch directory
+	 (advertised-in nil)		; and are not advertised
+	 (initial-status nil)		;because I'm lazy
+	 (status nil)
+	 (compile-is-transitive t)	;:COMPILE is transitive
+	 (required-systems nil))	;subsystems depend on nothing
+	(basic-system)
+  (:conc-name system-)
+  :writable-instance-variables
+  ;; Allow these in subsystems for compatibility, even though they're no-ops
+  (:init-keywords :initial-status :maintaining-sites))
+
+;; An undefined system is used when someone did a SET-SYSTEM-SOURCE-FILE, but
+;; has not actually compiled the DEFSYSTEM.  SYSTEM-NAME's plist has the source
+;; file name for the DEFSYSTEM.
+(defflavor undefined-system
+	()
+	(basic-system)
+  (:conc-name system-)
+  :writable-instance-variables)
+
+(defvar *dummy-lock* (process:make-lock "Dummy SCT lock" :recursive t))
+
+(defmacro with-system-locked (system &body body)
+  `(process:with-lock ((if ,system (system-lock ,system) *dummy-lock*))
+     ,@body))
+
+
+;; The basic module abstraction
+(defflavor basic-module
+	(name
+	 inputs				;all the files in the module
+	 dependencies			;all the :IN-ORDER-TO's
+	 uses-definitions-from		;list of all "used" modules
+	 (in-package nil)		;overrides the system's declaration
+	 circularity-count		;for detecting circularities
+	 operation-cache		;to speed up plan-building...
+	 force-compilation		;for :USES-DEFINITIONS-FROM
+	 (root-module t)		;every module is defaultly a "root"
+	 (compile-satisfies-load nil)	;if this module was :COMPILE'd,
+	 inhibit-loading		;  then don't :LOAD it
+	 (machine-types :all)		;default usually comes from the system
+	 distribute-sources		;for distribution: T, NIL, or :ALWAYS
+	 distribute-binaries		;ditto
+	 source-category		;e.g., :BASIC or :RESTRICTED
+	 (branch-mapping nil)		;just like for systems...
+	 (version-controlled nil))	;ditto
+	(si:property-list-mixin)
+  (:conc-name module-)
+  :initable-instance-variables
+  :writable-instance-variables
+  :abstract-flavor
+  (:required-methods :compile))
+
+;; A NODE is how we represent a single operation in the dependency graph, the
+;; key being (module * module-op).  A NODE remembers how many edges lead into
+;; it, and points to all the NODEs it depends on.
+(defstruct (node :named :conc-name)
+  (dependents nil)			;a list of all the dependents
+  ((ordering (byte 16 00))		;an integer, which we sort when done
+   (n-inward-edges (byte 12 16))	;number of modules which point here
+   (marked (byte 1 28)))		;this node has been visited by the tree-walk
+  (module*operation nil))		;e.g., (:LOAD FOO)
+
+;; A PLAN is just a Lisp object which is executed in order to carry out a
+;; module-operation on the inputs of a module to produce the module's outputs
+(defflavor plan
+	(module				;points back to the module object
+	 system				;backpointer into the system
+	 environment			;snapshot of the environment
+	 (inputs nil)			;list of input files
+	 (outputs nil)			;list of output files
+	 (default-input-type nil)
+	 (default-output-type nil)
+	 (driving-function nil)		;function to call to execute this plan
+	 (documentation nil)		;documentation for this plan
+	 (never-query nil))		;never query about this plan
+	()
+  (:conc-name plan-)
+  :initable-instance-variables
+  :writable-instance-variables)
+
+
+;; This can sure be useful
+(defflavor system-not-found
+	(system-name)
+	(error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (dbg:report system-not-found) (stream)
+  (format stream "The system ~A has not been defined" system-name))
+
+
+(defflavor system-declaration-not-found
+	(system)
+	(fs:file-not-found)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (:report-without-pathname system-declaration-not-found) (stream)
+  (format stream "The system declaration file for ~A was not found" system))
+
+
+(defflavor system-not-found-for-machine-type
+	(system version)
+	(error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (dbg:report system-not-found-for-machine-type) (stream)
+  (format stream "Version ~D of system ~A does not appear to have been compiled~@
+		  for this machine-type" version system))
+
+
+;; Condition to allow specification of a new VC branch
+(defflavor no-system-branch-mapping
+	(system module system-branch)
+	(error)
+  :initable-instance-variables)
+
+(defmethod (:report no-system-branch-mapping) (stream)
+  (if (null module)
+      (format stream "You haven't supplied a system VC branch for ~A" system)
+    (format stream
+	"No VC branch mapping can be found for module ~A in system ~A~@
+         for the system VC branch ~S" system module system-branch)))
+
+(defmethod (:proceed no-system-branch-mapping :no-action) ()
+  (values :no-action system-branch))
+
+(defmethod (:document-proceed-type no-system-branch-mapping :no-action) (stream)
+  (format stream "Use ~S as the system branch for ~A" system-branch module))
+
+(defmethod (:proceed no-system-branch-mapping :new-value)
+	   (&optional (new-branch (scl:prompt-and-accept 'string
+				    "Use what system branch name instead")))
+  (values :new-value new-branch))
+
+(defmethod (:document-proceed-type no-system-branch-mapping :new-value) (stream)
+  (format stream "Specify a new system branch name to use"))
+
+
+;; Condition to allow specification of a component system version
+(defflavor no-component-version
+	(system component version)
+	(error)
+  :initable-instance-variables)
+
+(defmethod (:report no-component-version) (stream)
+  (format stream
+      "No version number can be found for the component ~A" component))
+
+(defmethod (:proceed no-component-version :no-action) ()
+  (values :no-action version))
+
+(defmethod (:document-proceed-type no-component-version :no-action) (stream)
+  (format stream "Use ~S as the version for ~A" version component))
+
+(defmethod (:proceed no-component-version :new-value)
+	   (&optional (new-version (scl:accept `(sct:system-version :system ,component)
+					       :prompt "Use what version instead"
+					       :default :released)))
+  (values :new-value (canonicalize-system-version-number component new-version :exact-match t)))
+
+(defmethod (:document-proceed-type no-component-version :new-value) (stream)
+  (format stream "Specify a new version to use"))

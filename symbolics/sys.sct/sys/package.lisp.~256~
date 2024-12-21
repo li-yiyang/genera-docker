@@ -1,0 +1,2555 @@
+;;; -*- Mode: Lisp; Package: System-Internals; Base: 10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Packages for the Lisp Machine (combined Zetalisp and Common Lisp version).
+
+;;; This file is in the cold load.
+
+;-------
+;--- MEMBER and ASSOC herein are the Zetalisp ones, not the Common Lisp ones
+;-------
+
+;;; Locking strategy:
+;;;  The lowest-level primitives use WITHOUT-INTERRUPTS to prevent the hash
+;;;  tables from getting mangled.  Name-conflict checking does not lock, on
+;;;  the assumption that the package won't change between the time the check
+;;;  is performed and the time the actual action is taken.
+
+;; These variables are set by BUILD-INITIAL-PACKAGES
+(DEFVAR PKG-USER-PACKAGE)
+(DEFVAR PKG-KEYWORD-PACKAGE)
+(DEFVAR PKG-GLOBAL-PACKAGE)
+(DEFVAR PKG-SYSTEM-PACKAGE)
+(DEFVAR PKG-SYSTEM-INTERNALS-PACKAGE)
+(DEFVAR PKG-NETWORK-PACKAGE)
+(DEFVAR PKG-FONTS-PACKAGE)
+(DEFVAR *USER-PACKAGE*)				;USER for SCL
+(DEFVAR *LISP-PACKAGE*)				;LISP for CL
+(DEFVAR *SCL-PACKAGE*)				;just as it says.
+
+(DEFVAR *REASONABLE-PACKAGES* NIL
+  "Packages which contain a reasonable facsimile of the LISP language.")
+
+;; The current package.
+;; Also in SYSDEF for remote debugging
+(RECORD-SOURCE-FILE-NAME 'CL:*PACKAGE* 'DEFVAR T)
+(DEFVAR-STANDARD CL:*PACKAGE*
+   ;; The DEFVAR won't be done at cold load time, but instead later, and
+   ;; by then it will have a value.  All the other side effects of this
+   ;; form will get evaluated as part of booting the cold load.
+   ;; Therefore, there isn't any special hair in build-initial-packages
+   ;; to try to set up the warm and standard bindings.
+   NIL *USER-PACKAGE* *USER-PACKAGE*
+   (COND ((NOT (TYPEP PACKAGE 'PACKAGE))
+	  (VALUES NIL "~A is not of type PACKAGE"))
+	 ((NULL (CL:INTERSECTION (PKG-SELF-AND-USE-LIST PACKAGE)
+				 *REASONABLE-PACKAGES*))
+	  (VALUES NIL
+		  (FORMAT NIL "Package ~~A is not suitable because it does not use one of~
+			     ~%~{~A~^, ~}."
+			  (MAPCAR #'SYS:PACKAGE-NAME-FOR-SYNTAX *REASONABLE-PACKAGES*))))
+	 ((PKG-LOCKED PACKAGE)
+	  (VALUES NIL "Package ~A is locked"))
+	 (T (VALUES T NIL))))
+
+;; The function that the reader should call to convert strings to symbols
+;; Normally this is INTERN, but it can be bound by package prefixes
+(DEFVAR-STANDARD *READER-INTERN* 'CL:INTERN 'CL:INTERN 'CL:INTERN NIL
+   "*READER-INTERN* is called when a symbol without a package prefix is read.
+    It is called with one argument, a string with a fill-pointer. It cannot store
+ (or return) the value of STRING.  (This means that if it calls MAKE-SYMBOL, PERMANENT-P must
+ be 'T.)  It should return two values, the first is generally the symbol identified by the
+ string, and the second is ignored.")
+
+;; When bound to non-NIL, inhibits interning of any new symbols in any package.
+(DEFVAR-RESETTABLE GLOBALLY-LOCK-PACKAGES NIL)
+
+;; When bound to non-NIL, prevents MAKE-PACKAGE from calling INTERN
+(DEFVAR *PACKAGE-BOOTSTRAP-FLAG* NIL)
+
+;; A package is an array whose leader contains the following structure
+;; and whose main array contains a hash table of symbols.
+;; NOTE: The A-machine debug console (UCADR;QF) and L-Machine debug console (LPRINT?)
+;;  understand the format of this structure.
+(DEFSTRUCT (PACKAGE :NAMED :ARRAY-LEADER
+		    (:CONSTRUCTOR MAKE-PACKAGE-INTERNAL) (:CONC-NAME "PKG-")
+		    (:SIZE-MACRO PACKAGE-DEFSTRUCT-SIZE))
+  NAME-LIST		;List of strings.  Car is the primary name, cdr is the nicknames.
+  PREFIX-NAME		;The name preferred when printing qualified names (a string).
+  SELF-AND-USE-LIST	;Car is this package, cdr is list of packages whose
+			; externals are inherited by this one.
+  USED-BY-LIST		;List of packages that inherit this one's externals.
+  INCLUDE-LIST		;Kludge for simulating old Zetalisp package system
+  RELATIVE-NAMES	;Alist from strings to packages for relative naming (usually NIL).
+  SHADOWING-SYMBOLS	;List of symbols in this package that have been declared to shadow.
+  NEW-SYMBOL-FUNCTION	;Function(pkg,sym,hash,code) to add a new symbol to package.
+  LOCKED		;If T, error if any attempt to add a new symbol.
+  HASH-INHERITED-SYMBOLS;If T, inherited symbols are entered into the hash table (save search)
+  NUMBER-OF-SYMBOLS	;The number of entries currently in the hash table.
+  MAX-NUMBER-OF-SYMBOLS	;The number of entries allowed before rehashing.
+  HASH-MODULUS		;The size of the array/2 (stored redundantly for speed).
+  PREFIX-INTERN-FUNCTION;Function reader calls to intern symbols here when the
+			; package was selected by a package prefix
+  SAFEGUARDED-SYMBOLS)	;A list of all symbols which are safeguarded in this package.
+
+;; The main array is a 1-dimensional array with two elements for each hash
+;; entry, as follows:
+
+;; The first word contains the hash code of the print name
+;; or NIL for an empty entry
+;; or T for an entry that was made empty by REMOB (needed in case of hash collisions)
+(DEFSUBST PKG-ENTRY-HASH (PKG I)
+  (AREF PKG I))
+
+;; The second word contains the symbol, or NIL if the entry is empty
+(DEFSUBST PKG-ENTRY-SYMBOL (PKG I)
+  (AREF PKG (1+ I)))
+
+;; The cdr code of the second word contains a code number describing the symbol
+(DEFSUBST PKG-ENTRY-CODE (PKG I)
+  (%P-CDR-CODE (ALOC PKG (1+ I))))
+
+(DEFCONSTANT PKG-INTERNAL-CODE 0)		;The symbol is internal to the package
+(DEFCONSTANT PKG-EXTERNAL-CODE 1)		;The symbol is external (exported from the package)
+(DEFCONSTANT PKG-INHERITED-CODE 2)		;The symbol is inherited from a used package
+						;3 is not used currently
+
+(DEFVAR PKG-CODE-SYMBOLS)
+
+(DEFSUBST PKG-NAME (PKG)
+  (FIRST (PKG-NAME-LIST PKG)))
+
+(DEFSUBST PKG-NICKNAMES (PKG)
+  (REST1 (PKG-NAME-LIST PKG)))
+
+(DEFSUBST PKG-USE-LIST (PKG)
+  (REST1 (PKG-SELF-AND-USE-LIST PKG)))
+
+;; List of all packages except for "invisible" ones
+;; Used for FIND-ALL-SYMBOLS and the like
+;; Note that newly-created packages are added to the end of this list.
+(DEFVAR *ALL-PACKAGES* NIL)
+
+;; Table of names of all non-invisible packages, used for lookup by absolute name
+;; This is separate from *ALL-PACKAGES* to minimize paging
+;; This is not an EQUAL-HASH-TABLE for bootstrapping reasons
+(DEFVAR *PACKAGE-NAME-TABLE*)			;Array of pairs of entries: string, pkg
+(DEFVAR *PACKAGE-NAME-TABLE-MODULUS*)		;Size of array (over two)
+(DEFVAR *PACKAGE-NAME-TABLE-COUNT*)		;Number of entries in array
+
+;; For the editor, another form of *PACKAGE-NAME-TABLE*
+(DEFVAR *PACKAGE-NAME-AARRAY*)
+
+;;;; "Instant" package dwim support
+
+(DEFVAR *INSTANT-PACKAGE-DWIM-MODULUS*) ;Number of hash buckets
+(DEFVAR *INSTANT-PACKAGE-DWIM-TABLE*)	;Map hash code to compressed package number list
+(DEFVAR *INSTANT-PACKAGE-DWIM-PACKAGE*)	;Map package number to package
+
+;; A value of 5.0 seems to give the best balance between size of tables and
+;; speed of search.  This assumes the number of symbols interned after full-GC
+;; is not large compared to the number interned before full-GC; if not, the
+;; tables should be built again.
+;; Analyzing 136,013 symbols, actually 140,090 interned symbols.
+;; Of 27,211 hash codes, 26,706 (98%) are non-empty, average number of packages 4.63
+;; There are 11,700 overflow buckets (43%).  Total storage 53,338 words (209 pages).
+;; Distribution of bucket sizes:
+;;    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17...
+;;  1.9  6.9 13.0 17.5 17.8 15.0 10.9  6.8  4.0  2.2  1.2  0.8  0.5  0.3  0.2  0.2  0.1  0.1...
+(DEFVAR *INSTANT-PACKAGE-DWIM-RATIO* 5.0)
+
+;; Build a fresh set of tables by looking at all packages; takes about one minute
+;; In computing the modulus, this disregards wired and safeguarded symbols, which is okay
+(DEFUN BUILD-INSTANT-PACKAGE-DWIM-TABLES (&OPTIONAL IF-NEEDED)
+  (LET ((NUMBER-OF-SYMBOLS 0))
+    (MAP-OVER-REGIONS-OF-AREA SYMBOL-AREA #'REGION-PREDICATE-STRUCTURE
+      (LAMBDA (REGION)
+	(INCF NUMBER-OF-SYMBOLS (FLOOR (REGION-FREE-POINTER REGION)
+				       (DEFSTORAGE-SIZE SYMBOL)))))
+    (UNLESS (AND IF-NEEDED
+		 (VARIABLE-BOUNDP *INSTANT-PACKAGE-DWIM-TABLE*)
+		 (< (FLOOR NUMBER-OF-SYMBOLS *INSTANT-PACKAGE-DWIM-RATIO*)
+		    (* *INSTANT-PACKAGE-DWIM-MODULUS* 1.25)))
+      (TV:NOTING-PROGRESS ("Building instant package dwim tables")
+	(LET* ((N-PACKAGES (LENGTH *ALL-PACKAGES*))
+	       (SIZE (+ N-PACKAGES 20))
+	       (PACKAGE-TABLE (CL:MAKE-ARRAY SIZE :FILL-POINTER N-PACKAGES))
+	       (MODULUS (LOOP FOR M FROM (LOGIOR (FLOOR NUMBER-OF-SYMBOLS
+							*INSTANT-PACKAGE-DWIM-RATIO*)
+						 1) BY 2
+			      UNTIL (LOOP FOR F FROM 3 BY 2 TO (ISQRT M)
+					  NEVER (ZEROP (REMAINDER M F)))
+			      FINALLY (RETURN M)))
+	       (TABLE (CL:MAKE-ARRAY MODULUS :INITIAL-ELEMENT NIL)))
+	  (CL:REPLACE PACKAGE-TABLE *ALL-PACKAGES*)
+	  (LOOP FOR PKG# FROM 0 FOR PKG IN *ALL-PACKAGES* DO
+	    (TV:NOTE-PROGRESS PKG# N-PACKAGES)
+	    (PAGE-IN-STRUCTURE PKG :HANG-P NIL)
+	    (LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PKG) 2) DO
+	      (LET ((HASH (PKG-ENTRY-HASH PKG I)))
+		(UNLESS (SYMBOLP HASH)	;T or NIL
+		  (UNLESS (= (PKG-ENTRY-CODE PKG I) PKG-INHERITED-CODE)
+		    (PKG-DWIM-APPEND TABLE (MOD HASH MODULUS) PKG#)))))
+	    (PAGE-OUT-STRUCTURE PKG))
+	  (SETQ *INSTANT-PACKAGE-DWIM-MODULUS* MODULUS
+		*INSTANT-PACKAGE-DWIM-TABLE* TABLE
+		*INSTANT-PACKAGE-DWIM-PACKAGE* PACKAGE-TABLE))))))
+
+(DEFUN DESCRIBE-INSTANT-PACKAGE-DWIM-TABLES ()
+  (LET* ((MODULUS *INSTANT-PACKAGE-DWIM-MODULUS*)
+	 (TABLE *INSTANT-PACKAGE-DWIM-TABLE*)
+	 (HIST (CL:MAKE-ARRAY 21 :INITIAL-ELEMENT 0))
+	 (NZR 0)
+	 (NOV 0)
+	 (NWD (1+ MODULUS))
+	 (SUM 0))
+    (DOTIMES (HASH MODULUS)
+      (LET ((COUNT (PKG-DWIM-AREF-LENGTH TABLE HASH)))
+	(INCF (AREF HIST (MIN COUNT 20)))
+	(INCF SUM COUNT)
+	(UNLESS (ZEROP COUNT)
+	  (INCF NZR))
+	(LET ((ENTRY (AREF TABLE HASH)))
+	  (WHEN (CL:CONSP ENTRY)
+	  (INCF NOV)
+	  (INCF NWD (LENGTH ENTRY))))))
+    (FORMAT T "Of ~:D hash codes, ~:D (~D%) are non-empty, average number of packages ~$~%"
+	    MODULUS NZR (ROUND (* NZR 100) MODULUS) (// (FLOAT SUM) NZR))
+    (FORMAT T "There are ~:D overflow buckets (~D%).  Total storage ~:D words (~:D pages).~%"
+	    NOV (ROUND (* NOV 100) MODULUS) NWD (CEILING NWD SYS:PAGE-SIZE))
+    (FORMAT T "Distribution of bucket sizes:~%")
+    (LOOP FOR COUNT FROM 0 TO 19 DO (FORMAT T "~5D" COUNT)) (PRINC " more") (TERPRI)
+    (LOOP FOR I FROM 0 TO 20 DO
+      (FORMAT T "~5<~1$~>" (// (* (AREF HIST I) 100.0) MODULUS)))))
+
+;; (ELT (AREF TABLE HASH) INDEX), but the list is stored in compressed form
+(DEFUN PKG-DWIM-AREF (TABLE HASH INDEX)
+  (LET ((VALUE 0)
+	(ENTRY (AREF TABLE HASH)))
+    (MACROLET ((DECODE (ITEM)
+		 `(PROGN (WHEN (SINGLE-FLOAT-P ,ITEM)
+			   (INCF VALUE 256)
+			   (SETQ ,ITEM (%FIXNUM ,ITEM)))
+			 (LOOP REPEAT (MIN (1+ INDEX) 4) DO
+			   (INCF VALUE (LDB (BYTE 8 0) ,ITEM))
+			   (SETQ ,ITEM (LDB (BYTE 24 8) ,ITEM))
+			   (DECF INDEX)))))
+      (COND ((NULL ENTRY))
+	    ((ATOM ENTRY) (DECODE ENTRY))
+	    (T (DOLIST (ITEM ENTRY)
+		 (DECODE ITEM)
+		 (WHEN (MINUSP INDEX) (RETURN)))))
+      VALUE)))
+
+;; (LENGTH (AREF TABLE HASH)), but the list is stored in compressed form
+(DEFUN PKG-DWIM-AREF-LENGTH (TABLE HASH)
+  (LET ((LENGTH 0)
+	(ENTRY (AREF TABLE HASH)))
+    (MACROLET ((DECODE (ITEM)
+		 `(PROGN (WHEN (SINGLE-FLOAT-P ,ITEM)
+			   (SETQ ,ITEM (%FIXNUM ,ITEM)))
+			 (INCF LENGTH (COND ((LDB-TEST (BYTE 8 24) ,ITEM) 4)
+					    ((LDB-TEST (BYTE 8 16) ,ITEM) 3)
+					    ((LDB-TEST (BYTE 8  8) ,ITEM) 2)
+					    (T 1))))))
+      (COND ((NULL ENTRY))
+	    ((ATOM ENTRY) (DECODE ENTRY))
+	    (T (DOLIST (ITEM ENTRY)
+		 (DECODE ITEM))))
+      LENGTH)))
+
+;; (PUSHNEW VALUE (AREF TABLE HASH)), but the list is stored in compressed form
+(DEFUN PKG-DWIM-APPEND (TABLE HASH VALUE)
+  (LET ((ENTRY (AREF TABLE HASH)))
+    ;; Check for the easy case first
+    (WHEN (AND (< VALUE 256) (OR (NULL ENTRY) (EQL ENTRY VALUE)))
+      (SETF (AREF TABLE HASH) VALUE)
+      (RETURN-FROM PKG-DWIM-APPEND NIL))
+    ;; Recycle the old storage if possible
+    (UNLESS (CL:CONSP ENTRY)
+      (SETQ ENTRY NIL))
+    ;; Decompress what is currently there and insert the new value
+    (LET ((N (PKG-DWIM-AREF-LENGTH TABLE HASH)))
+      (STACK-LET ((VALUES (MAKE-ARRAY (1+ N))))
+	(DOTIMES (I N)
+	  (LET ((OLD (PKG-DWIM-AREF TABLE HASH I)))
+	    (WHEN (= OLD VALUE)
+	      (RETURN-FROM PKG-DWIM-APPEND NIL))
+	    (WHEN (> OLD VALUE)
+	      (SWAPF OLD VALUE))
+	    (SETF (AREF VALUES I) OLD)))
+	(SETF (AREF VALUES N) VALUE)
+	;; Compress it again
+	(LET ((WORD 0)
+	      (FLOAT NIL)
+	      (LIST NIL))
+	  (FLET ((FINISH-WORD ()
+		   (WHEN FLOAT (SETQ WORD (%FLONUM WORD)))
+		   (CL:TYPECASE LIST
+		     (NULL (SETQ LIST WORD))
+		     (CONS (IF ENTRY
+			       (CL:SETF (FIRST ENTRY) WORD
+					ENTRY (CDR ENTRY))
+			       (STACK-LET ((L (LIST WORD)))
+				 (SETQ LIST (APPEND LIST L NIL)))))
+		     (T (IF ENTRY
+			    (CL:SETF (FIRST ENTRY) LIST
+				     (SECOND ENTRY) WORD
+				     LIST ENTRY
+				     ENTRY (CDDR ENTRY))
+			    (SETQ LIST (LIST LIST WORD)))))
+		   (SETQ WORD 0 FLOAT NIL)))
+	    (LOOP FOR I FROM 0 TO N
+		  FOR B FIRST 0 THEN (%FIXNUM-MOD (+ B 8) 32)
+		  FOR LAST FIRST 0 THEN NEXT
+		  FOR NEXT = (AREF VALUES I)
+		  FOR DIFF = (- NEXT LAST)
+		  DO (WHEN (AND (ZEROP B) (NOT (ZEROP I)))
+		       ;; Finish the preceding word
+		       (FINISH-WORD))
+		     (LOOP DO (WHEN (AND (ZEROP B) ( DIFF 256))
+				(SETQ FLOAT T)
+				(DECF DIFF 256))
+			   UNTIL (< DIFF 256)
+			   ;; Gap is too large, we'll just have to create a false hit
+			   DO (SETQ WORD (DPB 255 (BYTE 8 B) WORD))
+			      (DECF DIFF 255)
+			      (WHEN (ZEROP (SETQ B (%FIXNUM-MOD (+ B 8) 32)))
+				(FINISH-WORD)))
+		     (SETQ WORD (DPB DIFF (BYTE 8 B) WORD))
+		  FINALLY (FINISH-WORD)))
+	  ;; Check for impossible error
+	  (COMPILER:%ERROR-WHEN ENTRY
+	    (ERROR "INTERNAL ERROR: new list is shorter than old list, ~S left over" ENTRY))
+	  ;; Store the compressed list into the table
+	  (SETF (AREF TABLE HASH) LIST))))))
+
+;;; Package structure support
+
+;A-machine cold-load generator can't handle internal functions inside
+;of functions whose names aren't symbols.
+(DEFPROP PACKAGE PACKAGE-NAMED-STRUCTURE-INVOKE NAMED-STRUCTURE-INVOKE)
+(DEFUN PACKAGE-NAMED-STRUCTURE-INVOKE (OP PKG &REST ARGS)
+  (SELECTQ OP
+    (:WHICH-OPERATIONS '(:DESCRIBE :PRINT-SELF))
+    (:DESCRIBE (DESCRIBE-PACKAGE PKG))
+    (:PRINT-SELF
+     (LET ((STANDARD-OUTPUT (FIRST ARGS))
+	   (SLASHIFY-P (THIRD ARGS)))
+       (IF SLASHIFY-P
+	   (SI:PRINTING-RANDOM-OBJECT (PKG STANDARD-OUTPUT)
+	     (PRINC "Package ")
+	     (PRINC PKG))
+	   (PKG-PACKAGE-PREFIX #'(LAMBDA (NAME CNT FLAG)
+				   (PRINC NAME)
+				   (COND ((ZEROP CNT)
+					  (UNLESS (PKG-COMPARE-NAMES NAME (PKG-NAME PKG))
+					    (PRINC " (really ")
+					    (PRINC (PKG-NAME PKG))
+					    (PRINC ")")))
+					 ((EQ FLAG :SYNTAX)
+					  (PRINC ":::"))
+					 (T (PRINC ":"))))
+			       PKG PACKAGE NIL))))))
+
+;; This can't use TYPEP because that doesn't work during package initialization.
+;; Is this still true?  Who cares!
+(DEFSUBST PKG-PACKAGE-P (X)
+  (EQ (NAMED-STRUCTURE-P X) 'PACKAGE))
+
+;; Print a thorough description of a package (except for all the symbols in it).
+(DEFUN DESCRIBE-PACKAGE (PKG)
+  (SETQ PKG (PKG-FIND-PACKAGE PKG))
+  (FORMAT T "~&Package ~A.~@[  Nicknames: ~{~A~^, ~}.~]" (PKG-NAME PKG) (PKG-NICKNAMES PKG))
+  (AND (PKG-LOCKED PKG) (PRINC "  Locked."))
+  (AND (PKG-HASH-INHERITED-SYMBOLS PKG)
+       (FORMAT T "~%Hash table includes inherited symbols."))
+  (FORMAT T "~%  ~D symbol~:P out of ~D.  Hash modulus=~D.  ~D% full."
+	  (PKG-NUMBER-OF-SYMBOLS PKG)
+	  (PKG-MAX-NUMBER-OF-SYMBOLS PKG)
+	  (PKG-HASH-MODULUS PKG)
+	  (// (* (PKG-NUMBER-OF-SYMBOLS PKG) 100) (PKG-HASH-MODULUS PKG)))
+  (FORMAT T "~%New symbols added via ~S.  Colon prefix looks up symbols via ~S"
+	  (PKG-NEW-SYMBOL-FUNCTION PKG) (PKG-PREFIX-INTERN-FUNCTION PKG))
+  (WHEN (PKG-USE-LIST PKG)
+    (FORMAT T ".~%Uses package~P " (LENGTH (PKG-USE-LIST PKG)))
+    (FORMAT:PRINT-LIST T "~A" (PKG-USE-LIST PKG)))
+  (WHEN (PKG-USED-BY-LIST PKG)
+    (FORMAT T ".~%Used by package~P " (LENGTH (PKG-USED-BY-LIST PKG)))
+    (FORMAT:PRINT-LIST T "~A" (PKG-USED-BY-LIST PKG)))
+  (WHEN (PKG-INCLUDE-LIST PKG)
+    (FORMAT T ".~%Anything that uses ~A also uses " PKG)
+    (FORMAT:PRINT-LIST T "~A" (PKG-INCLUDE-LIST PKG)))
+  (PRINC ".")
+  (WHEN (PKG-SHADOWING-SYMBOLS PKG)
+    (FORMAT T "~%Symbols declared to be /"shadowing/" other symbols with the same name: ")
+    (LET ((PACKAGE PKG))
+      (FORMAT:PRINT-LIST T "~S" (PKG-SHADOWING-SYMBOLS PKG))))
+  (DOLIST (P (PKG-SELF-AND-USE-LIST PKG))
+    (WHEN (PKG-RELATIVE-NAMES P)
+      (FORMAT T "~%Relative names ~:[inherited from ~A~;declared in this package~]:"
+	      (EQ P PKG) P)
+      (LOOP FOR (NAME . PKG) IN (PKG-RELATIVE-NAMES P) DO
+	(IF PKG
+	    (FORMAT T "~%    ~20A~S" NAME PKG)
+	    (FORMAT T "~%    ~20A<invisible>" NAME)))))
+  PKG)
+
+;;; Creating packages
+
+;; Special form for defining a package
+(DEFMACRO DEFPACKAGE (NAME &BODY MAKE-PACKAGE-KEYWORDS)
+  (CHECK-ARG-TYPE NAME :SYMBOL)
+  (SETQ NAME (CL:INTERN (STRING NAME) PKG-KEYWORD-PACKAGE))	;Because only one space of pkg names
+  (FLET ((CANONICALIZE (KEYWORD ARGS)
+	   `(,KEYWORD
+	     ',(SELECTQ KEYWORD
+		 ((:SIZE :EXTERNAL-ONLY :NEW-SYMBOL-FUNCTION :HASH-INHERITED-SYMBOLS
+			 :INVISIBLE :COLON-MODE :PREFIX-INTERN-FUNCTION :SYNTAX)
+		  (UNLESS (= (LENGTH ARGS) 1)
+		    (ERROR "More than one argument to the ~S keyword." KEYWORD))
+		  (FIRST ARGS))
+		 ((:PREFIX-NAME)
+		  (UNLESS (= (LENGTH ARGS) 1)
+		    (ERROR "More than one argument to the ~S keyword." KEYWORD))
+		  (STRING (FIRST ARGS)))
+		 ((:NICKNAMES :USE :SHADOW :EXPORT :INCLUDE :SAFEGUARDED)
+		  (MAPCAR #'STRING ARGS))
+		 ((:IMPORT :SHADOWING-IMPORT)
+		  ARGS)
+		 ((:IMPORT-FROM)
+		  (UNLESS (LISTP (FIRST ARGS))
+		    (SETF ARGS (LIST ARGS)))
+		  (MAPCAR #'(LAMBDA (X)
+			      (MAPCAR #'STRING X))
+			  ARGS))
+		 ((:RELATIVE-NAMES :RELATIVE-NAMES-FOR-ME)
+		  ARGS)
+		 (OTHERWISE
+		  ARGS)))))
+    `(WHEN (RECORD-SOURCE-FILE-NAME ',NAME 'DEFPACKAGE)
+       (DEFPACKAGE-INTERNAL
+	 ,(STRING NAME)
+	 ,@(LOOP FOR X IN MAKE-PACKAGE-KEYWORDS
+		 APPEND (IF (ATOM X)
+			    (CANONICALIZE X '(T))
+			    (CANONICALIZE (FIRST X) (REST1 X))))))))
+
+(DEFUN DEFPACKAGE-INTERNAL (NAME &REST MAKE-PACKAGE-KEYWORDS &KEY SYNTAX &ALLOW-OTHER-KEYS)
+  (LEXPR-FUNCALL (IF (PKG-FIND-PACKAGE NAME ':FIND NIL SYNTAX)
+		     #'RE-MAKE-PACKAGE
+		     (IF SYNTAX
+			 #'MAKE-PACKAGE-FOR-SYNTAX
+			 #'MAKE-PACKAGE))
+		 NAME MAKE-PACKAGE-KEYWORDS))
+
+(DEFPROP DEFPACKAGE "Package" DEFINITION-TYPE-NAME)
+
+;; Primitive function for making a package
+(DEFUN MAKE-PACKAGE (NAME &REST KEYWORDS &KEY
+		     (NICKNAMES NIL)
+		     PREFIX-NAME		;Defaults to shortest nickname or name
+		     (USE "GLOBAL")		;Package or name or list of packages or names
+		     (SHADOW NIL)		;List of strings (or symbols)
+		     (EXPORT NIL)		;List of strings (or symbols)
+		     (IMPORT NIL)		;List of symbols
+		     (SHADOWING-IMPORT NIL)	;List of symbols
+		     (IMPORT-FROM NIL)		;List of a package and then some strings
+		     (RELATIVE-NAMES NIL)	;Alist of strings, packages or names
+		     (RELATIVE-NAMES-FOR-ME NIL)	;List of (from-pkg name) entries
+		     (SIZE 500)
+		     (EXTERNAL-ONLY NIL)	;T means all symbols external
+		     (NEW-SYMBOL-FUNCTION 'PKG-NEW-SYMBOL)
+		     (HASH-INHERITED-SYMBOLS NIL)
+		     (INVISIBLE NIL)		;T means not on list of all packages
+		     (COLON-MODE ':INTERNAL)	;Default is like old ZL package system
+		     (PREFIX-INTERN-FUNCTION 'CL:INTERN)	;..
+		     (INCLUDE NIL)		;Kludge for simulating old ZL package system
+		     (SAFEGUARDED NIL)		;List of safeguarded symbols, ignored for now
+		     (SYNTAX NIL)		;For use in specialized syntaxes like
+					        ; CLtL and Cloe.  This argument should not
+		     				; be used casually by users.  It is not a
+						; public interface.  Use
+						; MAKE-PACKAGE-FOR-SYNTAX instead.
+		     &AUX NAMES PKG MODULUS (ABORTED T))
+  ;; Argument type checking
+  (SETQ NAME (SUBSTRING NAME 0 NIL PKG-AREA))
+  (SETQ NAMES (COPYLIST (LIST* NAME (MAPCAR #'(LAMBDA (NAME) (SUBSTRING NAME 0 NIL PKG-AREA))
+					    NICKNAMES))
+			PKG-AREA))
+  (WHEN PREFIX-NAME (SETQ PREFIX-NAME (SUBSTRING PREFIX-NAME 0 NIL PKG-AREA)))
+  (CHECK-ARG-TYPE SIZE :FIXNUM)
+  (CHECK-ARG COLON-MODE (MEMQ COLON-MODE '(:INTERNAL :EXTERNAL))
+	     "either :INTERNAL or :EXTERNAL")
+  (WHEN (EQ COLON-MODE ':EXTERNAL)
+    (SETQ PREFIX-INTERN-FUNCTION 'INTERN-EXTERNAL-ONLY))
+  ;; Default certain arguments
+  (WHEN EXTERNAL-ONLY
+    (SETQ NEW-SYMBOL-FUNCTION 'PKG-NEW-SYMBOL-EXTERNAL-ONLY))
+  ;; Decide what hash modulus to use (find a good prime number)
+  (MULTIPLE-VALUE (MODULUS SIZE)
+    (PKG-GOOD-SIZE SIZE))
+  (LET ((TEMP NIL))
+    (PROCESS-RELATIVE-NAME-SPEC
+      RELATIVE-NAMES
+      #'(LAMBDA (NAME PKG)
+	  (SETF TEMP (NCONC TEMP (NCONS (CONS (SUBSTRING NAME 0 NIL PKG-AREA)
+					      (PKG-FIND-PACKAGE PKG :ERROR NIL SYNTAX)))))))
+    (SETF RELATIVE-NAMES (COPYTREE TEMP PKG-AREA)))
+  ;; Build the data structure
+  (SETQ PKG (MAKE-PACKAGE-INTERNAL :MAKE-ARRAY (:LENGTH (* MODULUS 2) :AREA PKG-AREA)
+				   NAME-LIST NAMES
+				   PREFIX-NAME (OR PREFIX-NAME (PKG-BEST-PREFIX-NAME NAMES))
+				   USED-BY-LIST NIL
+				   INCLUDE-LIST
+				   (COPYLIST
+				     (MAPCAR #'(LAMBDA (P)
+						 (PKG-FIND-PACKAGE P :ERROR NIL SYNTAX))
+					     INCLUDE)
+				     PKG-AREA)
+				   RELATIVE-NAMES RELATIVE-NAMES
+				   SHADOWING-SYMBOLS NIL
+				   NEW-SYMBOL-FUNCTION NEW-SYMBOL-FUNCTION
+				   LOCKED NIL
+				   HASH-INHERITED-SYMBOLS HASH-INHERITED-SYMBOLS
+				   NUMBER-OF-SYMBOLS 0
+				   MAX-NUMBER-OF-SYMBOLS SIZE
+				   HASH-MODULUS MODULUS
+				   PREFIX-INTERN-FUNCTION PREFIX-INTERN-FUNCTION))
+  (SETF (PKG-SELF-AND-USE-LIST PKG) (NCONS-IN-AREA PKG PKG-AREA))
+  ;; Undo the creation of the package if aborted before we finish, in case the package
+  ;; was created by a create-if-not-found, thus ensuring it will be created again.
+  (UNWIND-PROTECT
+      (PROGN
+	;; Atomically enter in the data structure and check for name conflicts
+	(UNLESS INVISIBLE
+	  (WITHOUT-INTERRUPTS
+	    ;; The following names are the D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")global0 names for this package.
+	    ;; They are different than all other package arguments.
+	    ;; Do 1not0 parse them relative to the SYNTAX argument! -kmp 26-Jan-90
+	    (LET ((CONFLICTS (LOOP FOR NAME IN NAMES
+				   WHEN (PKG-FIND-PACKAGE NAME ':FIND) COLLECT NAME)))
+	      (WHEN CONFLICTS
+		(SETQ INHIBIT-SCHEDULING-FLAG NIL)	;Not atomic any more
+		(SIGNAL-PROCEED-CASE (() 'MAKE-PACKAGE-NAME-DUPLICATION
+				      :NAME NAME :CONFLICTS CONFLICTS)
+		  (:NO-ACTION
+		    (SETQ ABORTED NIL)
+		    (RETURN-FROM MAKE-PACKAGE
+		      (LEXPR-FUNCALL #'MAKE-PACKAGE-MORE NAME KEYWORDS))))))
+	    (SETQ *ALL-PACKAGES* (NCONC *ALL-PACKAGES* (NCONS-IN-AREA PKG PKG-AREA)))
+	    (WHEN (VARIABLE-BOUNDP *INSTANT-PACKAGE-DWIM-PACKAGE*)
+	      (ARRAY-PUSH-EXTEND *INSTANT-PACKAGE-DWIM-PACKAGE* PKG))
+	    (DOLIST (NAME NAMES)
+	      (ADD-NAME-TABLE-ENTRY NAME PKG))))
+	;; Finish initializing the package
+	;; The order of processing of these options matters!
+	;; Do SHADOW before USE, in case SHADOW is shadowing name conflicts.
+	;; Do SHADOW before IMPORT, because IMPORT must be done after USE to get
+	;; the best reporting of name conflicts.  Because of this, and the comment
+	;; at the front of PKGDCL saying not to use SHADOWING-IMPORT, we have to
+	;; have SHADOWING-IMPORT-FROM.
+	;; Do EXPORT last, when we know exactly what symbols are in the package.
+	(UNLESS *PACKAGE-BOOTSTRAP-FLAG*
+	  (MAKE-PACKAGE-SHADOW PKG SHADOWING-IMPORT SHADOW IMPORT-FROM))
+	(WHEN USE (USE-PACKAGE USE PKG))
+	(MAKE-PACKAGE-SAFEGUARD PKG SAFEGUARDED)
+	(UNLESS *PACKAGE-BOOTSTRAP-FLAG*
+	  (MAKE-PACKAGE-IMPORT-EXPORT PKG IMPORT EXPORT IMPORT-FROM))
+	(WHEN EXTERNAL-ONLY
+	  (SETF (PKG-LOCKED PKG) T))
+	(PROCESS-RELATIVE-NAME-SPEC RELATIVE-NAMES-FOR-ME
+				    #'(LAMBDA (FROM-PKG NAME TO-PKG)
+					(PKG-ADD-RELATIVE-NAME FROM-PKG NAME TO-PKG SYNTAX))
+				    PKG)
+	(SETQ ABORTED NIL))
+    ;; Cleanup handler
+    (WHEN ABORTED
+      (WITHOUT-INTERRUPTS
+	(WHEN USE (UNUSE-PACKAGE-FOR-SYNTAX USE PKG SYNTAX))
+	(PROCESS-RELATIVE-NAME-SPEC RELATIVE-NAMES-FOR-ME
+				    #'(LAMBDA (FROM-PKG NAME TO-PKG)
+					(PKG-DELETE-RELATIVE-NAME FROM-PKG NAME TO-PKG SYNTAX))
+				    PKG)
+	(DOLIST (NAME NAMES)
+	  (DELETE-NAME-TABLE-ENTRY NAME PKG))
+	(SETQ *ALL-PACKAGES* (DELQ PKG *ALL-PACKAGES*)))))
+  PKG)
+
+(DEFUN MAKE-PACKAGE-SHADOW (PKG SHADOWING-IMPORT SHADOW IMPORT-FROM &OPTIONAL SYNTAX)
+  (WHEN SHADOWING-IMPORT (SHADOWING-IMPORT SHADOWING-IMPORT PKG))
+  (WHEN IMPORT-FROM
+    (UNLESS (LISTP (FIRST IMPORT-FROM))
+      (SETF IMPORT-FROM (LIST IMPORT-FROM)))
+    (LOOP FOR (PACKAGE-NAME . IMPORTS) IN IMPORT-FROM
+	  FOR FROM-PACKAGE = (PKG-FIND-PACKAGE PACKAGE-NAME ':ERROR PKG SYNTAX)
+	  DO (DOLIST (SYM IMPORTS)
+	       (LET ((STR (STRING SYM)))
+		 (WHEN (CL:MEMBER STR SHADOW :TEST #'PKG-COMPARE-PNAMES :KEY #'STRING)
+		   (SHADOWING-IMPORT-INTERNAL (CL:INTERN STR FROM-PACKAGE) PKG))))))
+  (DOLIST (SYM SHADOW)
+    (SHADOW-INTERNAL SYM PKG)))
+
+(DEFUN MAKE-PACKAGE-IMPORT-EXPORT (PKG IMPORT EXPORT IMPORT-FROM &OPTIONAL SYNTAX)
+  (WHEN IMPORT (IMPORT IMPORT PKG))
+  (WHEN IMPORT-FROM
+    (UNLESS (LISTP (FIRST IMPORT-FROM))
+      (SETF IMPORT-FROM (LIST IMPORT-FROM)))
+    (LOOP FOR (PACKAGE-NAME . IMPORTS) IN IMPORT-FROM
+	  FOR FROM-PACKAGE = (PKG-FIND-PACKAGE PACKAGE-NAME ':ERROR PKG SYNTAX)
+	  DO (DOLIST (STR IMPORTS)
+	       (IMPORT-INTERNAL (CL:INTERN (STRING STR) FROM-PACKAGE) PKG))))
+  (DOLIST (SYM EXPORT)
+    (EXPORT-INTERNAL (CL:INTERN (STRING SYM) PKG) PKG)))
+
+(DEFVAR AREA-FOR-NEW-SYMBOLS SYMBOL-AREA)
+
+(DEFUN MAKE-PACKAGE-SAFEGUARD (PKG SAFEGUARDED)
+  (SETF (PKG-SAFEGUARDED-SYMBOLS PKG)
+	(DO* ((RESULT (MAKE-LIST (LENGTH SAFEGUARDED) :AREA PKG-AREA))
+	      (R RESULT (CDR R))
+	      (L SAFEGUARDED (CDR L)))
+	     ((NULL L) RESULT)
+	  (LET ((STRING (STRING (CAR L))))
+	    (MULTIPLE-VALUE-BIND (SYMBOL FOUND)
+		(INTERN-SOFT STRING PKG)
+	      (IF FOUND
+		  (IF (EQ (ACTUAL-STORAGE-CATEGORY :CONSTANT SYMBOL) :UNSAFEGUARDED)
+		      (ERROR "Attempt to safeguard ~S in ~S,~@
+			    but an unsafeguarded symbol already exists." STRING PKG)
+		      (SETF (CAR R) SYMBOL))
+		  (SETF (CAR R)
+			(IF *PACKAGE-BOOTSTRAP-FLAG*
+			    STRING
+			    (LET ((AREA-FOR-NEW-SYMBOLS SAFEGUARDED-OBJECTS-AREA))
+			      (INTERN-LOCAL STRING PKG))))))))))
+
+;Adjust aspects of the package based on any keywords that are present
+;But don't delete anything that can be added by one of the separate
+;functions, such as SHADOW and USE-PACKAGE
+(DEFUN RE-MAKE-PACKAGE (NAME &REST KEYWORDS
+			     &KEY NICKNAMES PREFIX-NAME SYNTAX
+			     &ALLOW-OTHER-KEYS)
+  (LET ((PKG (PKG-FIND-PACKAGE NAME :ERROR NIL SYNTAX)))
+    (WHEN (EQ NAME PKG) (SETQ NAME (PKG-NAME PKG)))
+    (RENAME-PACKAGE-FOR-SYNTAX PKG NAME NICKNAMES SYNTAX)
+    (SETF (PKG-PREFIX-NAME PKG)
+	  (STRING (OR PREFIX-NAME (PKG-BEST-PREFIX-NAME (PKG-NAME-LIST PKG)))))
+    (RE-MAKE-PACKAGE-INTERNAL PKG KEYWORDS)))
+
+;Adjust aspects of the package based on any keywords that are present
+;but don't delete anything at all.  This is a modified version of RE-MAKE-PACKAGE.
+(DEFUN MAKE-PACKAGE-MORE (NAME &REST KEYWORDS
+			  &KEY (NICKNAMES NIL NICKNAMES-P) PREFIX-NAME SYNTAX
+			  &ALLOW-OTHER-KEYS)
+  (LET ((PKG (PKG-FIND-PACKAGE NAME :ERROR NIL SYNTAX)))
+    (IF (EQ NAME PKG)
+	(SETQ NAME (PACKAGE-NAME-FOR-SYNTAX PKG SYNTAX)))
+    (WHEN NICKNAMES-P
+      (RENAME-PACKAGE-FOR-SYNTAX PKG NAME NICKNAMES SYNTAX))
+    ;; Even though the stuff above is syntax-relative, the prefix-name stuff is not.
+    ;; I 1think0 that's ok because because the prefix-name is still checked against the 
+    ;; set of valid names, so it just won't get used in situations where it's not available.
+    ;; -kmp 31-May-90
+    (COND (PREFIX-NAME
+	   (SETF (PKG-PREFIX-NAME PKG) (STRING PREFIX-NAME)))
+	  (NICKNAMES-P
+	   (SETF (PKG-PREFIX-NAME PKG) (STRING (PKG-BEST-PREFIX-NAME (PKG-NAME-LIST PKG))))))
+    (RE-MAKE-PACKAGE-INTERNAL PKG KEYWORDS)))
+
+(DEFUN RE-MAKE-PACKAGE-INTERNAL (PKG KEYWORDS)
+  (LET ((PKG-WAS-LOCKED (PKG-LOCKED PKG)) (SYNTAX NIL))
+    (UNWIND-PROTECT
+	(PROGN
+	  (SETF (PKG-LOCKED PKG) NIL)
+	  (SETQ SYNTAX (GETF KEYWORDS :SYNTAX))
+	  (LOOP FOR (KWD ARG) ON KEYWORDS BY 'CDDR DO
+	    (SELECTQ KWD
+	      (:SYNTAX)				;Handled already
+	      (:USE
+	       (USE-PACKAGE-FOR-SYNTAX ARG PKG SYNTAX))
+	      (:SHADOW
+	       (DOLIST (SYM ARG)
+		 (SHADOW-INTERNAL SYM PKG)))
+	      (:EXPORT
+	       (DOLIST (SYM ARG)
+		 (EXPORT-INTERNAL (CL:INTERN (STRING SYM) PKG) PKG)))
+	      (:IMPORT
+	       (IMPORT ARG PKG))
+	      (:IMPORT-FROM
+	       (WHEN ARG
+		 (UNLESS (LISTP (FIRST ARG))
+		   (SETF ARG (LIST ARG)))
+		 (LOOP FOR (PACKAGE-NAME . IMPORTS) IN ARG
+		       FOR FROM-PACKAGE = (PKG-FIND-PACKAGE PACKAGE-NAME
+							    ':ERROR PKG SYNTAX)
+		       DO (DOLIST (STR IMPORTS)
+			    (IMPORT-INTERNAL (CL:INTERN (STRING STR) FROM-PACKAGE) PKG)))))
+	      (:SHADOWING-IMPORT
+	       (SHADOWING-IMPORT ARG PKG))
+	      (:RELATIVE-NAMES
+	       (PROCESS-RELATIVE-NAME-SPEC
+		 ARG #'(LAMBDA (NAME PACKAJE PKG)
+			 (PKG-ADD-RELATIVE-NAME PKG NAME PACKAJE SYNTAX))
+		 PKG))
+	      (:RELATIVE-NAMES-FOR-ME
+	       (PROCESS-RELATIVE-NAME-SPEC
+		 ARG #'(LAMBDA (NAME PACKAJE PKG)
+			 (PKG-ADD-RELATIVE-NAME NAME PACKAJE PKG SYNTAX))
+		 PKG))
+	      (:SIZE
+	       (WHEN (> ARG (PKG-MAX-NUMBER-OF-SYMBOLS PKG))
+		 (PKG-REHASH PKG ARG)))
+	      (:NEW-SYMBOL-FUNCTION
+	       (SETF (PKG-NEW-SYMBOL-FUNCTION PKG) ARG))
+	      (:PREFIX-INTERN-FUNCTION
+	       (SETF (PKG-PREFIX-INTERN-FUNCTION PKG) ARG))
+	      (:COLON-MODE
+	       (SETF (PKG-PREFIX-INTERN-FUNCTION PKG)
+		     (IF (EQ ARG ':EXTERNAL) 'INTERN-EXTERNAL-ONLY 'CL:INTERN)))
+	      ;; These are handled above
+	      ((:NICKNAMES :PREFIX-NAME))
+	      ;; These are not changeable
+	      (:INVISIBLE
+	       (AND ARG (FERROR "~S is not changeable" KWD)))
+	      (:EXTERNAL-ONLY
+	       ;; If changing state of this option, adjust the exported status of all symbols
+	       ;; But if not changing the state, leave them the way they are
+	       (IF ARG
+		   (UNLESS (EQ (PKG-NEW-SYMBOL-FUNCTION PKG) 'PKG-NEW-SYMBOL-EXTERNAL-ONLY)
+		     (MAKE-ALL-SYMBOLS-EXTERNAL PKG))
+		   (WHEN (EQ (PKG-NEW-SYMBOL-FUNCTION PKG) 'PKG-NEW-SYMBOL-EXTERNAL-ONLY)
+		     (MAKE-ALL-SYMBOLS-INTERNAL PKG)))
+	       ;; Store the new parameters
+	       (SETF (PKG-NEW-SYMBOL-FUNCTION PKG)
+		     (IF ARG 'PKG-NEW-SYMBOL-EXTERNAL-ONLY 'PKG-NEW-SYMBOL))
+	       (SETF PKG-WAS-LOCKED (NOT (NULL ARG))))
+	      (:HASH-INHERITED-SYMBOLS
+	       (OR (EQ ARG (PKG-HASH-INHERITED-SYMBOLS PKG))
+		   (FERROR "~S is not changeable" KWD)))
+	      (:INCLUDE
+	       (OR (EQUAL (MAPCAR #'(LAMBDA (P) (PKG-FIND-PACKAGE P :ERROR NIL SYNTAX))
+				  ARG)
+			  (PKG-INCLUDE-LIST PKG))
+		   (FERROR "~S is not changeable" KWD)))
+	      (:SAFEGUARDED
+	       (MAKE-PACKAGE-SAFEGUARD PKG ARG))
+	      (OTHERWISE
+	       (FERROR "MAKE-PACKAGE keyword ~S not recognized" KWD)))))
+      (SETF (PKG-LOCKED PKG) PKG-WAS-LOCKED)))
+  PKG)
+
+;Just pick the shortest one
+;The previous package system always used the last one on the list
+(DEFUN PKG-BEST-PREFIX-NAME (NAME-LIST)
+  (LOOP WITH BEST = (FIRST NAME-LIST)
+	FOR NAME IN (CDR NAME-LIST)
+	DO (WHEN (< (STRING-LENGTH NAME) (STRING-LENGTH BEST))
+	     (SETQ BEST NAME))
+	FINALLY (RETURN BEST)))
+
+;The first of the new-names becomes the primary name
+;Common Lisp's function with the same name takes different arguments, gratuitously.
+(DEFUN RENAME-PACKAGE (PKG &REST NEW-NAMES)
+  (SETQ PKG (PKG-FIND-PACKAGE PKG))
+  (OR NEW-NAMES
+      (FERROR "A package must have at least one name"))
+  (LET ((OLD-NAMES (PKG-NAME-LIST PKG)))
+    (UNLESS (EQUAL NEW-NAMES OLD-NAMES)
+      (SETQ NEW-NAMES (MAPCAR #'(LAMBDA (NAME) (SUBSTRING NAME 0 NIL PKG-AREA)) NEW-NAMES))
+      (WITHOUT-INTERRUPTS
+	(LET ((CONFLICTS (LOOP FOR NAME IN NEW-NAMES
+			       UNLESS (MEM #'PKG-COMPARE-NAMES NAME OLD-NAMES)
+			         WHEN (PKG-FIND-PACKAGE NAME ':FIND)
+				   COLLECT NAME)))
+	  (WHEN CONFLICTS
+	    (FERROR "The package name~P ~{~A~^, ~} ~2:*~[~;is~:;are~] already in use."
+		    (LENGTH CONFLICTS) CONFLICTS)))
+	(DOLIST (NAME OLD-NAMES)
+	  (OR (MEM #'PKG-COMPARE-NAMES NAME NEW-NAMES)
+	      (DELETE-NAME-TABLE-ENTRY NAME)))
+	(DOLIST (NAME NEW-NAMES)
+	  (OR (MEM #'PKG-COMPARE-NAMES NAME OLD-NAMES)
+	      (ADD-NAME-TABLE-ENTRY NAME PKG)))
+	(OR (MEM #'PKG-COMPARE-NAMES (PKG-PREFIX-NAME PKG) NEW-NAMES)
+	    (SETF (PKG-PREFIX-NAME PKG) (PKG-BEST-PREFIX-NAME NEW-NAMES)))
+	(SETF (PKG-NAME-LIST PKG) (COPYLIST NEW-NAMES PKG-AREA))))))
+
+(DEFCONST PKG-GOOD-SIZES
+	  '(67 73 83 97 113 131 149 163 179 193 223 239 251 269 283 293
+	    307 317 337 359 383 409 433 457 487 521 547 577 613 643 677 719
+	    751 787 827 863 877 919 967 1009 1051 1087 1113 1171 1213 1259 1319 1373
+	    1433 1489 1553 1619 1693 1759 1823 1889 1973 2039 2113 2179 2251 2333 2411 2503
+	    2591 2689 2777 2879 2999 3109 3187 3299 3407 3511 3637 3761 3889 4019 4159 4289
+	    4481 4691 4931 5147 5347 5569 5827 6089 6353 6619 6883 7177 7477 7789 8111 8419
+	    8707 9091 9473 9923 10369 10831 11273 11777 12373 12941 13513 14081 14657 15233
+	    15877 16519 17239 17921 18637 19403 20161 21001 21767 22531 23297 24071 24967
+	    25867 26759 27653 28547))
+
+;Given a number of symbols, return a good length of hash table to hold that many
+;and the number of entries to use before deciding that the table is too full.
+(DEFUN PKG-GOOD-SIZE (NUMBER-OF-SYMBOLS)
+  (LET* ((TEM (// (* NUMBER-OF-SYMBOLS 5) 4))	;Allow hash table to become 80% full.
+	 (MODULUS (OR (DOLIST (SIZE PKG-GOOD-SIZES)
+			(AND (> SIZE TEM) (RETURN SIZE)))
+		      ;; Beyond the list of good sizes => avoid multiples of small primes.
+		      (DO ((N (LOGIOR TEM 1) (+ N 2)))
+			  ((NOT (OR (ZEROP (\ N 3))
+				    (ZEROP (\ N 5))
+				    (ZEROP (\ N 7))
+				    (ZEROP (\ N 11))))
+			   N)))))
+    (VALUES MODULUS (// (* MODULUS 4) 5))))
+
+(DEFUN PROCESS-RELATIVE-NAME-SPEC (SPEC FUNCTION &REST ARGS)
+  (LOOP FOR SPEC IN SPEC
+	DO (LET ((FIRST (FIRST SPEC)))
+	     (IF (LISTP (CDR SPEC))
+		 (LOOP FOR SECOND IN (CDR SPEC)
+		       DO (LEXPR-FUNCALL FUNCTION FIRST SECOND ARGS))
+		 (LEXPR-FUNCALL FUNCTION FIRST (CDR SPEC) ARGS)))))
+
+;;; Symbol lookup
+
+(DEFMACRO COERCE-PACKAGE-ARG (ARG-NAME)
+  `(COND ((NULL ,ARG-NAME)
+	  (SETQ ,ARG-NAME PACKAGE))
+	 ((NOT (PKG-PACKAGE-P ,ARG-NAME))
+	  (SETQ ,ARG-NAME (PKG-FIND-PACKAGE ,ARG-NAME :ERROR PACKAGE)))))  
+
+;Value 1 is the interned symbol.
+;Value 2 is a flag, non-NIL if the symbol was already interned
+;	NIL means the symbol wasn't interned, so a new internal symbol was made
+;	:INTERNAL means an internal symbol was found
+;	:EXTERNAL means an external symbol was found
+;	:INHERITED means an inherited symbol was found (external to him, internal to us)
+;There is no longer a third value
+(DEFUN CL:INTERN (STRING &OPTIONAL PKG)
+  (DECLARE (ARGLIST STRING &OPTIONAL (PKG CL:*PACKAGE*)))
+  (DECLARE (VALUES SYMBOL ALREADY-INTERNED))
+  (CHECK-ARG-TYPE STRING :STRING)
+  (COERCE-PACKAGE-ARG PKG)
+  (LET ((HASH (SXHASH-STRING STRING)))
+    ;; Prevent interrupts to lock the hash table against both intern and rehash
+    (WITHOUT-INTERRUPTS
+      (MULTIPLE-VALUE-BIND (FOUND IDX)
+	  (PKG-INTERN-INTERNAL STRING HASH PKG)
+	(WHEN IDX
+	  (RETURN-FROM CL:INTERN
+	    (VALUES FOUND (AREF PKG-CODE-SYMBOLS (PKG-ENTRY-CODE PKG IDX))))))
+      ;; Not found in local hash table, search inherited packages
+      (UNLESS (PKG-HASH-INHERITED-SYMBOLS PKG)
+	(DOLIST (PKG (PKG-USE-LIST PKG))
+	  (MULTIPLE-VALUE-BIND (FOUND IDX)
+	      (PKG-INTERN-INTERNAL STRING HASH PKG)
+	    (WHEN (AND IDX (= (PKG-ENTRY-CODE PKG IDX) PKG-EXTERNAL-CODE))
+	      (RETURN-FROM CL:INTERN (VALUES FOUND :INHERITED))))))
+      ;; Not found anywhere, make a new symbol
+      (LET ((SYM (MAKE-SYMBOL STRING T)))
+	(FUNCALL (PKG-NEW-SYMBOL-FUNCTION PKG) PKG SYM HASH PKG-INTERNAL-CODE)
+	(VALUES SYM NIL)))))
+
+;Find a symbol, if it is already interned, but don't intern it otherwise.
+;The values are the same as for INTERN, except that for a symbol
+;which is not found both are NIL.
+(DEFUN CL:FIND-SYMBOL (STRING &OPTIONAL PKG)
+  (DECLARE (ARGLIST STRING &OPTIONAL (PKG CL:*PACKAGE*)))
+  (DECLARE (VALUES SYMBOL ALREADY-INTERNED))
+  (CHECK-ARG-TYPE STRING :STRING)
+  (COERCE-PACKAGE-ARG PKG)
+  (LET ((HASH (SXHASH-STRING STRING)))
+    ;; Prevent interrupts to lock the hash table against both intern and rehash
+    (WITHOUT-INTERRUPTS
+      (MULTIPLE-VALUE-BIND (FOUND IDX)
+	  (PKG-INTERN-INTERNAL STRING HASH PKG)
+	(WHEN IDX
+	  (RETURN-FROM CL:FIND-SYMBOL
+	    (VALUES FOUND (AREF PKG-CODE-SYMBOLS (PKG-ENTRY-CODE PKG IDX))))))
+      ;; Not found in local hash table, search inherited packages
+      (UNLESS (PKG-HASH-INHERITED-SYMBOLS PKG)
+	(DOLIST (PKG (PKG-USE-LIST PKG))
+	  (MULTIPLE-VALUE-BIND (FOUND IDX)
+	      (PKG-INTERN-INTERNAL STRING HASH PKG)
+	    (WHEN (AND IDX (= (PKG-ENTRY-CODE PKG IDX) PKG-EXTERNAL-CODE))
+	      (RETURN-FROM CL:FIND-SYMBOL (VALUES FOUND :INHERITED))))))
+      ;; Not found at all, give up
+      (VALUES NIL NIL))))
+
+;Check whether a symbol is present in a given package (not inherited).
+;The values match those of INTERN.
+(DEFUN FIND-SYMBOL-LOCAL (STRING PKG)
+  (DECLARE (VALUES SYMBOL ALREADY-INTERNED))
+  (LET ((HASH (SXHASH-STRING STRING)))
+    ;; Prevent interrupts to lock the hash table against both intern and rehash
+    (WITHOUT-INTERRUPTS
+      (MULTIPLE-VALUE-BIND (FOUND IDX)
+	  (PKG-INTERN-INTERNAL STRING HASH PKG)
+	(WHEN IDX
+	  (LET ((CODE (PKG-ENTRY-CODE PKG IDX)))
+	    (WHEN ( CODE PKG-INHERITED-CODE)
+	      (VALUES FOUND (AREF PKG-CODE-SYMBOLS CODE)))))))))
+
+;; Old Zetalisp intern takes symbols.
+(DEFUN INTERN (SYM &OPTIONAL PKG)
+  (ARGUMENT-TYPECASE SYM
+    (:STRING (CL:INTERN SYM PKG))
+    (:SYMBOL
+	(MULTIPLE-VALUE-BIND (NEW-SYM ALREADY)
+	    (CL:FIND-SYMBOL (GET-PNAME SYM) PKG)
+	  (IF ALREADY
+	      (VALUES NEW-SYM ALREADY)
+	      (IMPORT SYM PKG)
+	      SYM)))))
+
+(DEFUN INTERN-SOFT (SYM &OPTIONAL PKG)
+  (ARGUMENT-TYPECASE SYM
+    (:STRING (CL:FIND-SYMBOL SYM PKG))
+    (:SYMBOL (CL:FIND-SYMBOL (GET-PNAME SYM) PKG))))
+
+;Intern using the current or specified package only.
+;The values match those of INTERN.
+(DEFUN INTERN-LOCAL (SYM &OPTIONAL PKG)
+  (DECLARE (VALUES SYMBOL ALREADY-INTERNED))
+  (COERCE-PACKAGE-ARG PKG)
+  (ARGUMENT-TYPECASE SYM
+    (:STRING
+      (SHADOW-INTERNAL (MAKE-SYMBOL SYM) PKG)
+      (FIND-SYMBOL-LOCAL SYM PKG))
+    (:SYMBOL
+      (MULTIPLE-VALUE-BIND (FOUND FLAG)
+	  (FIND-SYMBOL-LOCAL (GET-PNAME SYM) PKG)
+	(IF FLAG
+	    (VALUES FOUND FLAG)
+	    (SHADOWING-IMPORT-INTERNAL SYM PKG)
+	    (VALUES SYM :INTERNAL))))))
+
+;Check whether a symbol is present in a given package (not inherited).
+;The values match those of INTERN.
+(DEFUN INTERN-LOCAL-SOFT (SYM &OPTIONAL PKG)
+  (DECLARE (VALUES SYMBOL ALREADY-INTERNED))
+  (COERCE-PACKAGE-ARG PKG)
+  (ARGUMENT-TYPECASE SYM
+    (:STRING (FIND-SYMBOL-LOCAL SYM PKG))
+    (:SYMBOL (FIND-SYMBOL-LOCAL (GET-PNAME SYM) PKG))))
+
+;;; Value of *READER-INTERN* for Common-Lisp external package prefix
+(DEFUN INTERN-EXTERNAL-ONLY (STRING &OPTIONAL (PKG CL:*PACKAGE*))
+  (MULTIPLE-VALUE-BIND (SYMBOL FLAG)
+      (CL:FIND-SYMBOL STRING PKG)
+    (UNLESS (EQ FLAG :EXTERNAL)
+      (SIGNAL-PROCEED-CASE (() 'EXTERNAL-SYMBOL-NOT-FOUND
+			       :STRING STRING :PACKAGE PKG)
+	(:EXPORT
+	 (WITH-PACKAGE-LOCK PKG NIL
+	   (EXPORT-INTERNAL (SETQ SYMBOL (CL:INTERN STRING PKG)) PKG)))
+	(:INTERNAL
+	 (SETQ SYMBOL (CL:INTERN STRING PKG)))))
+    (VALUES SYMBOL FLAG)))
+
+;INTERN but always return-array the print-name argument
+;This is a crock, but there are still eight callers of it
+(DEFUN INTERN1 (PNAME &OPTIONAL (PKG CL:*PACKAGE*))
+  (PROG1 (INTERN PNAME PKG)
+	 (RETURN-ARRAY PNAME)))
+
+;;; Internals of INTERN.
+
+;;;Search a given package for a given symbol with given hash code.
+;;;If it is found, return it and the index it was at.
+;;;Otherwise, return NIL NIL.
+;;;Called with interrupts locked out.
+(DEFUN PKG-INTERN-INTERNAL (STRING HASH PKG)
+  (LET* ((MODULUS (PKG-HASH-MODULUS PKG))
+	 (MODULUS*2 (+ MODULUS MODULUS))
+	 (I (\ HASH MODULUS)))
+    (SETQ I (+ I I))
+    (LOOP AS TEM = (PKG-ENTRY-HASH PKG I)
+	  REPEAT MODULUS
+	  FINALLY (RETURN NIL)
+	  DO
+      (COND ((NULL TEM) (RETURN NIL))
+	    ((AND (EQL TEM HASH)
+		  (PKG-COMPARE-PNAMES STRING
+				      (GET-PNAME (SETQ TEM (PKG-ENTRY-SYMBOL PKG I)))))
+	     (RETURN (VALUES TEM I))))
+      (UNLESS (< (SETQ I (+ I 2)) MODULUS*2)
+	(SETQ I (- I MODULUS*2))))))
+
+;;; Implements whatever INTERN's rules for EQ-ness should be.  For now this is like STRING=.
+(DEFUN PKG-COMPARE-PNAMES (STRING1 STRING2)
+  (LET ((COUNT (ARRAY-ACTIVE-LENGTH STRING1)))
+    (AND (= COUNT (ARRAY-ACTIVE-LENGTH STRING2))
+	 (IF (AND (> COUNT 4)			;AREF loop is faster in this case.
+		  (LET ((H1 (%P-POINTER (SETQ STRING1 (FOLLOW-STRUCTURE-FORWARDING STRING1))))
+			(H2 (%P-POINTER (SETQ STRING2 (FOLLOW-STRUCTURE-FORWARDING STRING2)))))
+		    #+3600 (AND (= (LDB ARRAY-DISPATCH-FIELD H1) %ARRAY-DISPATCH-CHARACTER)
+				(= (LDB ARRAY-DISPATCH-FIELD H2) %ARRAY-DISPATCH-CHARACTER)
+				(= (LDB ARRAY-TYPE-FIELD     H1) ART-STRING)
+				(= (LDB ARRAY-TYPE-FIELD     H2) ART-STRING))
+		    #+IMach (AND (ZEROP (LDB ARRAY-LONG-PREFIX-BIT H1))
+				 (ZEROP (LDB ARRAY-LONG-PREFIX-BIT H2))
+				 (= (LDB ARRAY-TYPE-FIELD     H1) ART-STRING)
+				 (= (LDB ARRAY-TYPE-FIELD     H2) ART-STRING))))
+	     (#+IMach WITH-BLOCK-REGISTERS #+IMach (1 2) #+3600 PROGN
+	      #+IMach (SETF (%BLOCK-REGISTER 1) (%MAKE-POINTER-OFFSET DTP-LOCATIVE STRING1 1))
+	      #+IMach (SETF (%BLOCK-REGISTER 2) (%MAKE-POINTER-OFFSET DTP-LOCATIVE STRING2 1))
+	      (LET (#+3600 (POINTER1 (%MAKE-POINTER DTP-LOCATIVE STRING1))
+		    #+3600 (POINTER2 (%MAKE-POINTER DTP-LOCATIVE STRING2))
+		    (MASK (LDB (BYTE 2 0) COUNT)))
+		(DO ((N (LDB (BYTE #o35 2) COUNT) (1- N)))
+		    (( N 0)
+		     (OR (ZEROP MASK)
+			 (= (LOGAND #+3600  (%P-CONTENTS-INCREMENT-POINTER POINTER1)
+				    #+IMach (%BLOCK-READ 1 :SET-CDR-NEXT T :PREFETCH NIL
+							 :FIXNUM-ONLY T :NO-INCREMENT T)
+				    (SETQ MASK (LSH -1 (- (DPB (- 4 MASK) (BYTE 2 3) 0)))))
+			    (LOGAND #+3600  (%P-CONTENTS-INCREMENT-POINTER POINTER2)
+				    #+IMach (%BLOCK-READ 2 :SET-CDR-NEXT T :PREFETCH NIL
+							 :FIXNUM-ONLY T :NO-INCREMENT T)
+				    MASK))))
+		  (IF #+3600  ( (%P-CONTENTS-INCREMENT-POINTER POINTER1)
+				 (%P-CONTENTS-INCREMENT-POINTER POINTER2))
+		      #+IMach ( (%BLOCK-READ 1 :SET-CDR-NEXT T :PREFETCH NIL :FIXNUM-ONLY T)
+				 (%BLOCK-READ 2 :SET-CDR-NEXT T :PREFETCH NIL :FIXNUM-ONLY T))
+		      (RETURN NIL)))))
+	     (LET ((STRING1 STRING1) (STRING2 STRING2))
+	       (DECLARE (SYS:ARRAY-REGISTER STRING1 STRING2))
+	       (CL:DOTIMES (INDEX COUNT T)
+		 (UNLESS (CHAR= (AREF STRING1 INDEX) (AREF STRING2 INDEX))
+		   (RETURN NIL))))))))
+
+(DEFUN PKG-NEW-SYMBOL-INTERNAL (PKG SYM CODE)
+  (FUNCALL (PKG-NEW-SYMBOL-FUNCTION PKG) PKG SYM (SXHASH-STRING (GET-PNAME SYM)) CODE))
+
+;Add a new symbol to a package.  Called with interrupts locked out.
+;Makes package bigger if necessary.
+(DEFUN PKG-NEW-SYMBOL (PKG SYM HASH CODE)
+  (LET ((LOCKED (OR GLOBALLY-LOCK-PACKAGES (PKG-LOCKED PKG))))
+    (WHEN (= CODE PKG-EXTERNAL-CODE)
+      (LET ((CONFLICTS (LOOP FOR USER IN (PKG-USED-BY-LIST PKG) WITH (FOUND FLAG)
+			     DO (MULTIPLE-VALUE (FOUND FLAG)
+				  (CL:FIND-SYMBOL (GET-PNAME SYM) USER))
+			     WHEN (AND FLAG 
+				       (NEQ FOUND SYM)
+				       (NOT (MEMQ FOUND (PKG-SHADOWING-SYMBOLS USER))))
+			       COLLECT (CONS FOUND USER))))
+	(WHEN CONFLICTS
+	  (SIGNAL-PROCEED-CASE (() (IF LOCKED
+				       'NAME-CONFLICT-IN-EXPORT-FROM-LOCKED-PACKAGE
+				       'NAME-CONFLICT-IN-EXPORT)
+				:SYMBOL SYM :PACKAGE PKG :CONFLICTS CONFLICTS)
+	    ;; The work is all done in the :PROCEED methods
+	    ((:EXPORT :SHADOW :SHARE :CHOOSE))
+	    (:SKIP (RETURN-FROM PKG-NEW-SYMBOL NIL)))
+	  (SETF LOCKED NIL))))
+    (WHEN LOCKED
+      (SIGNAL 'PACKAGE-LOCKED ':PACKAGE PKG ':SYMBOL SYM ':PROCEED-TYPES ':NO-ACTION)))
+  ;; Done with error checking, do the work
+  (WHEN (NULL (SYMBOL-PACKAGE SYM))
+    (SETF (SYMBOL-PACKAGE SYM) PKG))
+  (LET* ((MODULUS (PKG-HASH-MODULUS PKG))
+	 (I (\ HASH MODULUS)))
+    (SETQ I (+ I I) MODULUS (+ MODULUS MODULUS))
+    (LOOP AS TEM = (PKG-ENTRY-HASH PKG I) DO
+      (WHEN (SYMBOLP TEM)			;NIL or T
+	(SETF (PKG-ENTRY-HASH PKG I) HASH)
+	(SETF (PKG-ENTRY-SYMBOL PKG I) SYM)
+	(SETF (PKG-ENTRY-CODE PKG I) CODE)
+	(RETURN))
+      (UNLESS (< (SETQ I (+ I 2)) MODULUS)
+	(SETQ I (- I MODULUS))))
+    (WHEN (VARIABLE-BOUNDP *INSTANT-PACKAGE-DWIM-TABLE*)
+      (LET ((PKG# (CL:POSITION PKG *INSTANT-PACKAGE-DWIM-PACKAGE*)))
+	(WHEN PKG#	;can be NIL in PKG-REHASH
+	  (PKG-DWIM-APPEND *INSTANT-PACKAGE-DWIM-TABLE*
+			   (MOD HASH *INSTANT-PACKAGE-DWIM-MODULUS*)
+			   PKG#))))
+    (WHEN (> (INCF (PKG-NUMBER-OF-SYMBOLS PKG))
+	     (PKG-MAX-NUMBER-OF-SYMBOLS PKG))
+      (PKG-REHASH PKG))))
+
+(DEFUN PKG-NEW-SYMBOL-EXTERNAL-ONLY (PKG SYM HASH CODE)
+  (PKG-NEW-SYMBOL PKG SYM HASH (IF (= CODE PKG-INTERNAL-CODE) PKG-EXTERNAL-CODE CODE)))
+
+(DEFUN PKG-NEW-KEYWORD-SYMBOL (PKG SYM HASH IGNORE)
+  (SET SYM SYM)
+  (FORWARD-SELF-EVALUATING-SYMBOL SYM)
+  (PKG-NEW-SYMBOL PKG SYM HASH PKG-EXTERNAL-CODE))
+
+;Remove a symbol from a package.  Leaves T as the "hash code" where the
+;symbol was, so that PKG-INTERN-INTERNAL will search past that point.
+;Put NIL into the package-cell of the symbol so that we know it
+;is uninterned, if this was its home package.
+;If the user then interns it someplace else, its package
+;cell will then be set to that as it should be.
+;Returns T if the symbol was previously interned on that package, NIL if not.
+(DEFUN REMOB (SYM &OPTIONAL (PKG (SYMBOL-PACKAGE SYM))
+	      &AUX (SHADOWING-IMPORT NIL) (SHADOWING-IMPORT-P NIL))
+  (WHEN PKG					;Supposed to be a no-op for uninternd symbols
+    (SETQ PKG (PKG-FIND-PACKAGE PKG :ERROR PACKAGE))
+    (WHEN (OR GLOBALLY-LOCK-PACKAGES (PKG-LOCKED PKG))
+      (SIGNAL 'PACKAGE-LOCKED :PACKAGE PKG :SYMBOL SYM :ACTION 'REMOB
+	      :PROCEED-TYPES ':NO-ACTION))
+    (WHEN (MEMQ SYM (PKG-SHADOWING-SYMBOLS PKG))
+      ;; Check for a discovered name conflict
+      (LOOP FOR P IN (PKG-USE-LIST PKG) WITH (CONFLICT FLAG)
+	    DO (MULTIPLE-VALUE (CONFLICT FLAG) (FIND-SYMBOL-LOCAL (GET-PNAME SYM) P))
+	    WHEN (AND (EQ FLAG ':EXTERNAL)
+		      (NOT (ASSQ CONFLICT CONFLICTS)))
+	      COLLECT (CONS CONFLICT P) INTO CONFLICTS
+	    FINALLY
+	      (WHEN (CDR CONFLICTS)
+		(SIGNAL-PROCEED-CASE ((WINNER) 'NAME-CONFLICT-IN-UNINTERN
+				      :SYMBOL SYM :PACKAGE PKG
+				      :CONFLICTS CONFLICTS)
+		  (:SHADOWING-IMPORT (SETQ SHADOWING-IMPORT WINNER
+					   SHADOWING-IMPORT-P T))
+		  (:SKIP (RETURN-FROM REMOB NIL)))))
+      (SETF (PKG-SHADOWING-SYMBOLS PKG) (DELQ SYM (PKG-SHADOWING-SYMBOLS PKG))))
+    ;; Do it
+    (PROG1 (REMOB-INTERNAL SYM PKG)
+	   (WHEN SHADOWING-IMPORT-P
+	     (SHADOWING-IMPORT-INTERNAL SHADOWING-IMPORT PKG)))))
+
+(DEFUN REMOB-INTERNAL (SYM PKG)
+  (LET* ((STR (GET-PNAME SYM))
+	 (HASH (SXHASH-STRING STR)))
+    (WITHOUT-INTERRUPTS
+      (MULTIPLE-VALUE-BIND (PSYM IDX)
+	  (PKG-INTERN-INTERNAL STR HASH PKG)
+	(WHEN (AND IDX (EQ PSYM SYM))
+	  (WHEN (EQ (SYMBOL-PACKAGE SYM) PKG)
+	    (SETF (SYMBOL-PACKAGE SYM) NIL))
+	  (SETF (PKG-ENTRY-HASH PKG IDX) NIL)
+	  (SETF (PKG-ENTRY-SYMBOL PKG IDX) NIL)
+	  (DECF (PKG-NUMBER-OF-SYMBOLS PKG))
+	  ;; Knuth's Algorithm R:  We don't expect a lot of uninterning,
+	  ;; so we are willing to spend some time here; in the case
+	  ;; where there is a lot of uninterning going on, the time
+	  ;; spent here is emminently worth it, as otherwise the table
+	  ;; can degenerate to requiring MODULUS probes for new interns.
+	  ;; C.f., Knuth, vol. 3, p. 526
+	  (LET* ((MODULUS (PKG-HASH-MODULUS PKG))
+		 (MODULUS*2 (+ MODULUS MODULUS))
+		 (I IDX)
+		 (J IDX))
+	    (LOOP WITH WRAP = NIL
+		  UNLESS (< (SETQ I (+ I 2)) MODULUS*2)
+		    DO (SETQ WRAP T
+			     I (- I MODULUS*2))
+		  AS TEM = (PKG-ENTRY-HASH PKG I)
+		  WHILE TEM DO
+	      (LET ((R (ASH (\ TEM MODULUS) 1)))
+		(UNLESS (IF WRAP
+			    (OR (> R J) ( I R))
+			    (AND (> R J) ( I R)))
+		  (CL:SHIFTF (PKG-ENTRY-HASH PKG J) (PKG-ENTRY-HASH PKG I) NIL)
+		  (CL:SHIFTF (PKG-ENTRY-SYMBOL PKG J) (PKG-ENTRY-SYMBOL PKG I) NIL)
+		  (SETQ J I)))))
+	  T)))))
+
+;This is to aid in determining accuracy of declared sizes.
+(DEFVAR PKG-REHASH-HISTORY ())
+
+;Rehash a package into a larger hash table.
+(DEFUN PKG-REHASH (PKG &OPTIONAL (SIZE (* 2 (PKG-MAX-NUMBER-OF-SYMBOLS PKG))) (AREA PKG-AREA)
+		   &AUX MODULUS NEW-PKG (CURRENT-SIZE (PKG-MAX-NUMBER-OF-SYMBOLS PKG)))
+  ;; Interrupts are already inhibited if called by the package system.
+  ;; But inhibit them anyway so people can shrink packages using this function
+  (WITHOUT-INTERRUPTS
+    ;; Get the real package object.
+    (SETQ PKG (FOLLOW-STRUCTURE-FORWARDING PKG))
+    ;; Canonicalize the size and compute the modulus.
+    (MULTIPLE-VALUE (MODULUS SIZE) (PKG-GOOD-SIZE SIZE))
+    (SETQ NEW-PKG (MAKE-PACKAGE-INTERNAL :MAKE-ARRAY (:LENGTH (* MODULUS 2) :AREA AREA)))
+    (WHEN (VARIABLE-BOUNDP #'PAGE-IN-ARRAY)
+      (PAGE-IN-ARRAY PKG))
+    (DOTIMES (I (ARRAY-LEADER-LENGTH PKG))
+      (STORE-ARRAY-LEADER (ARRAY-LEADER PKG I) NEW-PKG I))
+    (SETF (PKG-NUMBER-OF-SYMBOLS NEW-PKG) 0)
+    (SETF (PKG-MAX-NUMBER-OF-SYMBOLS NEW-PKG) SIZE)
+    (SETF (PKG-HASH-MODULUS NEW-PKG) MODULUS)
+    (WITH-PACKAGE-LOCK NEW-PKG NIL
+      (LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PKG) 2)
+	    AS HASH = (PKG-ENTRY-HASH PKG I)
+	    UNLESS (SYMBOLP HASH)		;T or NIL
+	      DO (PKG-NEW-SYMBOL NEW-PKG (PKG-ENTRY-SYMBOL PKG I) HASH (PKG-ENTRY-CODE PKG I))))
+    (COND ((OR (> SIZE CURRENT-SIZE) ( (%AREA-NUMBER PKG) AREA))
+	   (STRUCTURE-FORWARD PKG NEW-PKG
+			      (ARRAY-PREFIX-LENGTH PKG)
+			      (ARRAY-PREFIX-LENGTH NEW-PKG))
+	   (SETQ PKG-REHASH-HISTORY (LIST* (PKG-NAME PKG) SIZE PKG-REHASH-HISTORY)))
+	  (T ;; Shrinking.  Copy back into the old array and shrink it in place.
+	     ;; Note:  This has to preserve the cdr-codes, which is why it doesn't
+	     ;; call COPY-ARRAY-CONTENTS-AND-LEADER!
+	     (LOOP FOR I FROM 0 BELOW (PACKAGE-DEFSTRUCT-SIZE)
+		   DO (SETF (ARRAY-LEADER PKG I) (ARRAY-LEADER NEW-PKG I)))
+	     (FLAVOR::%BLOCK-COPY-ALLOW-NULL (LOCF (AREF NEW-PKG 0))
+					     (LOCF (AREF PKG 0))
+					     (* MODULUS 2))
+	     (ADJUST-ARRAY-SIZE PKG (* MODULUS 2))
+	     (RETURN-ARRAY (PROG1 NEW-PKG (SETQ NEW-PKG PKG)))))
+    NEW-PKG))
+
+;; Actually count the number of symbols in a package.
+(DEFUN PKG-COUNT-NUMBER-OF-SYMBOLS (PKG)
+  (LOOP FOR I BELOW (* (PKG-HASH-MODULUS PKG) 2) BY 2
+	COUNT (FIXNUMP (PKG-ENTRY-HASH PKG I))))
+
+;;; Package lookup
+
+;;; This is because we are non-standard and don't use STRING= to compare package names.
+(DEFUN PKG-COMPARE-NAMES (X Y)
+  (STRING-EQUAL X Y))
+
+;This is a kludge due to the cross-compiler
+;Remove this when all references are purged from bins and sources.
+#+IGNORE
+(DEFVAR PKG-SYNONYM-REFNAMES
+	;; Conversion from 3600 to Ivory
+	#+IMach  '(("XIC" . "I-LISP-COMPILER")
+		   ("XI-COMPILER" . "I-LISP-COMPILER"))
+	;; Conversion from LM2 to 3600
+	#+3600   '(("L-COMPILER" . "COMPILER")
+		   ("LLC" . "COMPILER")
+		   ("L-SYSTEM" . "SYSTEM")
+		   ("L-GLOBAL" . "GLOBAL")
+		   ("L-SYSTEM-INTERNALS" . "SYSTEM-INTERNALS")
+		   ("LBIN" . "SYSTEM-INTERNALS")
+		   ("L-DBG" . "DEBUGGER")
+		   ("L-TV" . "TV")))
+
+;Interpret THING as a package-specification.
+;If it is undefined, CREATE-P controls what happens:
+;  NIL or :ERROR => cause an error (the default)
+;  :FIND => just return NIL
+;  :ASK => ask the user whether to create it.
+;  T => just create it
+;If RELATIVE-TO is supplied and non-NIL, use relative names of that
+;package.  Otherwise just use absolute names.
+;If THING is a list, it is a declaration for the package if it doesn't already exist.
+;In such a case, CREATE-P and RELATIVE-TO are meaningless.  This is for -*- lines.
+;The list looks like (name), (name use), (name use size),
+; or (name :keyword arg :keyword arg...).
+; SYNTAX provides the default USE list for CREATE-P t or :ASK. 
+(DEFUN PKG-FIND-PACKAGE (NAME &OPTIONAL (CREATE-P ':ERROR) RELATIVE-TO SYNTAX)
+  (COND ((PKG-PACKAGE-P NAME) NAME)
+	((OR (SYMBOLP NAME) (STRINGP NAME))
+	 (SETQ NAME (STRING NAME))
+	 (WHEN SYNTAX (SETQ SYNTAX (FIND-LISP-SYNTAX SYNTAX)))
+	 (BLOCK SEARCH 
+	   (WHEN RELATIVE-TO
+	     (SETQ RELATIVE-TO (PKG-FIND-PACKAGE RELATIVE-TO :ERROR NIL SYNTAX))
+	     (DOLIST (PKG (PKG-SELF-AND-USE-LIST RELATIVE-TO))
+	       (LET ((ENTRY (ASS #'PKG-COMPARE-NAMES NAME (PKG-RELATIVE-NAMES PKG))))
+		 (WHEN ENTRY
+		   (IF (SETQ PKG (CDR ENTRY))
+		       (RETURN-FROM PKG-FIND-PACKAGE PKG)
+		       (RETURN-FROM SEARCH NIL))))))
+	   (WHEN SYNTAX
+	     (LET ((ENTRY (ASS #'PKG-COMPARE-NAMES NAME
+			       (LISP-SYNTAX-RELATIVE-NAMES SYNTAX))))
+	       (WHEN ENTRY
+		 (LET ((PKG (CDR ENTRY)))
+		   (IF PKG
+		       (RETURN-FROM PKG-FIND-PACKAGE PKG)
+		       (RETURN-FROM SEARCH NIL)))))
+	     (WHEN (LISP-SYNTAX-SHADOW-GLOBAL-PACKAGES SYNTAX)
+	       (RETURN-FROM SEARCH NIL)))
+	   (LOOP WITH I = (* (\ (SXHASH-STRING NAME) *PACKAGE-NAME-TABLE-MODULUS*) 2)
+		 AS STR = (AREF *PACKAGE-NAME-TABLE* I)
+		 DO (COND ((NULL STR) (RETURN NIL))
+			  ((AND (NOT (SYMBOLP STR)) (PKG-COMPARE-NAMES STR NAME))
+			   (RETURN-FROM PKG-FIND-PACKAGE (AREF *PACKAGE-NAME-TABLE* (1+ I)))))
+		    (INCF I 2)
+		    (UNLESS (< I (* *PACKAGE-NAME-TABLE-MODULUS* 2))
+		      (SETQ I 0))))
+	 (COND ((EQ CREATE-P ':FIND) NIL)
+	       ((OR (EQ CREATE-P 'T)
+		    (AND (EQ CREATE-P ':ASK)
+			 (CL:YES-OR-NO-P "Package ~A is not known.  Create it with :USE ~:S? "
+					 NAME (DEFAULT-PACKAGE-USE-LIST SYNTAX))))
+		(MAKE-PACKAGE-FOR-SYNTAX NAME :SYNTAX SYNTAX))
+	       (T				;NIL or :ERROR or :ASK and said "no"
+		(SIGNAL-PROCEED-CASE ((VAL) 'PACKAGE-NOT-FOUND
+				      :NAME NAME
+				      :RELATIVE-TO RELATIVE-TO
+				      :RELATIVE-TO-SYNTAX SYNTAX)
+		  (:CREATE-PACKAGE (MAKE-PACKAGE-FOR-SYNTAX NAME :USE VAL :SYNTAX SYNTAX))
+		  (:NEW-NAME (PKG-FIND-PACKAGE VAL CREATE-P RELATIVE-TO SYNTAX))
+		  (:NO-ACTION  ;;User thinks the refname is now defined; try again.
+		    (PKG-FIND-PACKAGE NAME CREATE-P RELATIVE-TO SYNTAX))))))
+	((LISTP NAME)
+	 (LET ((NAME (CAR NAME)) (DATA (CDR NAME)))
+	   (LET ((N (LENGTH DATA)))
+	     (OR (PKG-FIND-PACKAGE NAME ':FIND RELATIVE-TO SYNTAX)
+		 (COND ((= N 1)			;(name use)                    -- Unambiguous
+			(MAKE-PACKAGE-FOR-SYNTAX NAME :SYNTAX SYNTAX :USE (FIRST DATA)))
+		       ((AND (= N 2)		;(name use size)               -- Ambiguous
+			     (NUMBERP (SECOND DATA))
+			     (ATOM (FIRST DATA))
+			     (PKG-FIND-PACKAGE (FIRST DATA) ':FIND RELATIVE-TO SYNTAX))
+			;; We get here with (:FOO :LISP 37) but not (:FOO :SIZE 37).
+			(MAKE-PACKAGE-FOR-SYNTAX NAME :USE (FIRST DATA) :SIZE (SECOND DATA)))
+		       (T			;(name key1 val1 key2 val2...) -- Unambiguous
+			 (CL:APPLY #'MAKE-PACKAGE-FOR-SYNTAX NAME :SYNTAX SYNTAX DATA)))))))
+	(T (FERROR "~A is neither a package nor a string nor a symbol" NAME))))
+
+;Called WITHOUT-INTERRUPTS
+(DEFUN ADD-NAME-TABLE-ENTRY (NAME PKG)
+  (WHEN (>= *PACKAGE-NAME-TABLE-COUNT* (// (* *PACKAGE-NAME-TABLE-MODULUS* 4) 5))
+    (SETQ *PACKAGE-NAME-TABLE-MODULUS*
+	  (PKG-GOOD-SIZE (// (* *PACKAGE-NAME-TABLE-MODULUS* 3) 2)))
+    (LET ((OLD *PACKAGE-NAME-TABLE*))
+      (SETQ *PACKAGE-NAME-TABLE*
+	    (MAKE-ARRAY (* *PACKAGE-NAME-TABLE-MODULUS* 2) :AREA PKG-AREA))
+      (SETQ *PACKAGE-NAME-TABLE-COUNT* 0)
+      (LOOP FOR I FROM 0 BELOW (ARRAY-LENGTH OLD) BY 2 DO
+	(UNLESS (SYMBOLP (AREF OLD I))		;T or NIL
+	  (ADD-NAME-TABLE-ENTRY (AREF OLD I) (AREF OLD (1+ I)))))))
+  (AARRAY-INSERT *PACKAGE-NAME-AARRAY* NAME PKG)
+  (INCF *PACKAGE-NAME-TABLE-COUNT*)
+  (LOOP WITH I = (* (\ (SXHASH-STRING NAME) *PACKAGE-NAME-TABLE-MODULUS*) 2) DO
+    (WHEN (SYMBOLP (AREF *PACKAGE-NAME-TABLE* I))	;T or NIL
+      (ASET NAME *PACKAGE-NAME-TABLE* I)
+      (ASET PKG *PACKAGE-NAME-TABLE* (1+ I))
+      (RETURN T))
+    (INCF I 2)
+    (UNLESS (< I (* *PACKAGE-NAME-TABLE-MODULUS* 2))
+      (SETQ I 0))))
+
+;Called WITHOUT-INTERRUPTS
+(DEFUN DELETE-NAME-TABLE-ENTRY (NAME &OPTIONAL PKG)
+  (IF PKG
+      (AARRAY-DELETE *PACKAGE-NAME-AARRAY* NAME PKG)
+      (AARRAY-DELETE-BY-NAME *PACKAGE-NAME-AARRAY* NAME))
+  (LOOP WITH I = (* (\ (SXHASH-STRING NAME) *PACKAGE-NAME-TABLE-MODULUS*) 2)
+	AS STR = (AREF *PACKAGE-NAME-TABLE* I)
+	DO (COND ((NULL STR)
+		  (RETURN NIL))
+		 ((AND (NOT (SYMBOLP STR))
+		       (PKG-COMPARE-NAMES STR NAME)
+		       (OR (NULL PKG) (EQ (AREF *PACKAGE-NAME-TABLE* (1+ I)) PKG)))
+		  (ASET T *PACKAGE-NAME-TABLE* I)
+		  (ASET NIL *PACKAGE-NAME-TABLE* (1+ I))
+		  (DECF *PACKAGE-NAME-TABLE-COUNT*)
+		  (RETURN T)))
+	   (INCF I 2)
+	   (UNLESS (< I (* *PACKAGE-NAME-TABLE-MODULUS* 2))
+	     (SETQ I 0))))
+
+ ;;Factored out of PKG-ADD-RELATIVE-NAME
+(DEFUN ADD-RELATIVE-NAME-INTERNAL (TYPE-DESC THING LOC NAME TO-PKG &OPTIONAL SYNTAX)
+  (SETQ NAME (SUBSTRING NAME 0 NIL PKG-AREA)
+	TO-PKG (IF TO-PKG (PKG-FIND-PACKAGE TO-PKG :ERROR NIL SYNTAX)))
+  (WITHOUT-INTERRUPTS
+    (LET ((ELEM (ASS #'PKG-COMPARE-NAMES NAME (LOCATION-CONTENTS LOC))))
+      (COND ((NULL ELEM)
+	     (PUSH-IN-AREA (CONS-IN-AREA NAME TO-PKG PKG-AREA) (LOCATION-CONTENTS LOC)
+			   PKG-AREA))
+	    ((NULL (CDR ELEM))
+	     (SETF (CDR ELEM) TO-PKG))
+	    ((NEQ (CDR ELEM) TO-PKG)
+	     (CL:CERROR "Make ~A ~A's relative name ~S point to ~*~A instead."
+			"~@(~A~) ~A already has a relative name ~S, which points to ~S."
+			TYPE-DESC THING NAME (CDR ELEM) TO-PKG)
+	     (SETF (CDR ELEM) TO-PKG))))))
+
+(DEFUN PKG-ADD-RELATIVE-NAME (FROM-PKG NAME TO-PKG &OPTIONAL SYNTAX)
+  (LET ((PKG (PKG-FIND-PACKAGE FROM-PKG :ERROR NIL SYNTAX)))
+    (ADD-RELATIVE-NAME-INTERNAL
+      "package" PKG (LOCF (PKG-RELATIVE-NAMES PKG)) NAME TO-PKG SYNTAX)))
+
+ ;;Factored out of PKG-DELETE-RELATIVE-NAME
+(DEFUN DELETE-RELATIVE-NAME-INTERNAL (LOC NAME TO-PKG TO-PKG-P)
+  (SETQ NAME (STRING NAME))
+  (WITHOUT-INTERRUPTS
+    (LET ((ELEM (ASS #'PKG-COMPARE-NAMES NAME (LOCATION-CONTENTS LOC))))
+      (WHEN (OR (NOT TO-PKG-P) (EQ (CDR ELEM) TO-PKG))
+	(SETF (LOCATION-CONTENTS LOC)
+	      (DELQ ELEM (LOCATION-CONTENTS LOC)))))))
+
+(DEFUN PKG-DELETE-RELATIVE-NAME (FROM-PKG NAME &OPTIONAL (TO-PKG NIL TO-PKG-P) SYNTAX)
+  (DELETE-RELATIVE-NAME-INTERNAL
+    (LOCF (PKG-RELATIVE-NAMES (PKG-FIND-PACKAGE FROM-PKG :ERROR NIL SYNTAX)))
+    NAME TO-PKG TO-PKG-P))
+
+;;; CL/ZL functions
+
+;;; The real CL versions of these functions will be separate, for now,
+;;; because they have to convert between CL strings and ZL strings.
+
+(DEFUN PACKAGE-USE-LIST (PKG)
+  (CL:CHECK-TYPE PKG ZL:PACKAGE)
+  (PKG-USE-LIST PKG))
+
+(DEFUN PACKAGE-USED-BY-LIST (PKG)
+  (CL:CHECK-TYPE PKG ZL:PACKAGE)
+  (PKG-USED-BY-LIST PKG))
+
+(DEFUN PACKAGE-SHADOWING-SYMBOLS (PKG)
+  (CL:CHECK-TYPE PKG ZL:PACKAGE)
+  (PKG-SHADOWING-SYMBOLS PKG))
+
+;Not in Common Lisp, but obviously desirable to have
+(DEFUN PACKAGE-EXTERNAL-SYMBOLS (PKG)
+  (CL:CHECK-TYPE PKG ZL:PACKAGE)
+  (WITHOUT-INTERRUPTS				;lock against rehash
+    (LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PKG) 2)
+	  UNLESS (SYMBOLP (PKG-ENTRY-HASH PKG I))	;T or NIL
+	    WHEN (= (PKG-ENTRY-CODE PKG I) PKG-EXTERNAL-CODE)
+	      COLLECT (PKG-ENTRY-SYMBOL PKG I))))
+
+;;;
+
+(DEFUN EXPORT (SYMBOLS &OPTIONAL PKG)
+  (PACKAGE-SYMBOL-OPERATION SYMBOLS PKG #'EXPORT-INTERNAL))
+
+(DEFUN EXPORT-INTERNAL (SYMBOL PKG)
+  (MULTIPLE-VALUE-BIND (FOUND FLAG)
+      (CL:FIND-SYMBOL (GET-PNAME SYMBOL) PKG)
+    ;; Can't export things that aren't there
+    (UNLESS (AND FLAG (EQ FOUND SYMBOL))
+      (CL:CERROR "Import ~S into ~A and then export it."
+		 "The symbol ~S is not present in ~S, hence cannot be exported from it.~:[~;~@
+		    Furthermore ~2:*~S already contains a different symbol by that name.~]"
+		 SYMBOL PKG FLAG)
+      ;; If continue from the error, import the symbol.  Do it now, not down below
+      ;; because in this case the import could get a name-conflict error.
+      (WITH-PACKAGE-LOCK PKG NIL		;Avoid gratuitous error message
+	(IMPORT-INTERNAL SYMBOL PKG)))
+    ;; Name conflict checking
+    (LOOP FOR USER IN (PKG-USED-BY-LIST PKG)
+	  DO (MULTIPLE-VALUE (FOUND FLAG)
+	       (CL:FIND-SYMBOL (GET-PNAME SYMBOL) USER))
+	  WHEN (AND FLAG (NEQ FOUND SYMBOL) (NOT (MEMQ FOUND (PKG-SHADOWING-SYMBOLS USER))))
+	    COLLECT (CONS FOUND USER) INTO CONFLICTS
+	  FINALLY
+	    (WHEN CONFLICTS
+	      (SIGNAL-PROCEED-CASE (() 'NAME-CONFLICT-IN-EXPORT
+				    :SYMBOL SYMBOL :PACKAGE PKG :CONFLICTS CONFLICTS)
+		;; The work is all done in the :PROCEED methods
+		((:EXPORT :SHADOW :SHARE :CHOOSE))
+		(:SKIP (RETURN-FROM EXPORT-INTERNAL NIL)))))
+    ;; Symbol must be part of this package to be exported
+    (IMPORT-INTERNAL SYMBOL PKG)
+    (SET-SYMBOL-STATUS SYMBOL PKG PKG-EXTERNAL-CODE)))
+
+(DEFUN UNEXPORT (SYMBOLS &OPTIONAL PKG)
+  (PACKAGE-SYMBOL-OPERATION SYMBOLS PKG #'UNEXPORT-INTERNAL))
+
+(DEFUN UNEXPORT-INTERNAL (SYMBOL PKG)
+  (LET ((NAME (GET-PNAME SYMBOL)))
+    (MULTIPLE-VALUE-BIND (FOUND FLAG)
+	(CL:FIND-SYMBOL NAME PKG)
+      (COND ((OR (NULL FLAG) (NEQ FOUND SYMBOL))
+	     (FSIGNAL "The symbol ~S is not present in ~S" SYMBOL PKG))
+	    ((EQ FLAG :EXTERNAL)
+	     (COND ((OR (MEMQ SYMBOL (PKG-SHADOWING-SYMBOLS PKG))
+			(LOOP FOR PKG IN (PKG-USE-LIST PKG)
+			      NEVER (MULTIPLE-VALUE-BIND (FOUND FLAG)
+					(CL:FIND-SYMBOL NAME PKG)
+				      (DECLARE (IGNORE FOUND))
+				      (EQ FLAG :EXTERNAL))))
+		    (SET-SYMBOL-STATUS SYMBOL PKG PKG-INTERNAL-CODE))
+		   ((PKG-HASH-INHERITED-SYMBOLS PKG)
+		    (SET-SYMBOL-STATUS SYMBOL PKG PKG-INHERITED-CODE))
+		   (T
+		    (REMOB-INTERNAL SYMBOL PKG)))))
+      NIL)))
+
+(DEFUN IMPORT (SYMBOLS &OPTIONAL PKG)
+  (PACKAGE-SYMBOL-OPERATION SYMBOLS PKG #'IMPORT-INTERNAL))
+
+(DEFUN IMPORT-INTERNAL (SYMBOL PKG)
+  (MULTIPLE-VALUE-BIND (CONFLICT FLAG)
+      (CL:FIND-SYMBOL (GET-PNAME SYMBOL) PKG)
+    (COND ((NULL FLAG)
+	   (PKG-NEW-SYMBOL-INTERNAL PKG SYMBOL PKG-INTERNAL-CODE))
+	  ((NEQ CONFLICT SYMBOL)
+	   (SIGNAL-PROCEED-CASE (() 'NAME-CONFLICT-IN-IMPORT
+				    :SYMBOL SYMBOL :PACKAGE PKG :CONFLICT CONFLICT)
+	     (:UNINTERN
+	       (REMOB CONFLICT PKG)
+	       (PKG-NEW-SYMBOL-INTERNAL PKG SYMBOL PKG-INTERNAL-CODE))
+	     (:SHADOWING-IMPORT
+	       (SHADOWING-IMPORT-INTERNAL SYMBOL PKG))
+	     (:SKIP NIL)))
+	  ((EQ FLAG ':INHERITED)
+	   (UNLESS (PKG-HASH-INHERITED-SYMBOLS PKG)
+	     (PKG-NEW-SYMBOL-INTERNAL PKG SYMBOL PKG-INTERNAL-CODE))))))
+
+(DEFUN SHADOW (SYMBOLS &OPTIONAL PKG)
+  (PACKAGE-SYMBOL-OPERATION SYMBOLS PKG #'SHADOW-INTERNAL :ALLOW-STRINGS T))
+
+(DEFUN SHADOW-INTERNAL (SYMBOL-OR-STRING PKG)
+  (LET ((STRING (IF (STRINGP SYMBOL-OR-STRING)
+		    SYMBOL-OR-STRING
+		    (GET-PNAME SYMBOL-OR-STRING))))
+    (MULTIPLE-VALUE-BIND (SYM FLAG)
+	(FIND-SYMBOL-LOCAL STRING PKG)
+      (WHEN (NULL FLAG)
+	;; Need to do something about hashed inherited symbols.
+	(WHEN (PKG-HASH-INHERITED-SYMBOLS PKG)
+	  (FERROR "Can't SHADOW in the presence of hashed inherited symbols."))
+	;; Simulate intern
+	(SETF SYM (MAKE-SYMBOL STRING T))
+	(PKG-NEW-SYMBOL-INTERNAL PKG SYM PKG-INTERNAL-CODE))
+      ;; Remember to shadow from now on.
+      (PUSH*-IN-AREA SYM (PKG-SHADOWING-SYMBOLS PKG) PKG-AREA))))
+
+(DEFUN SHADOWING-IMPORT (SYMBOLS &OPTIONAL PKG)
+  (PACKAGE-SYMBOL-OPERATION SYMBOLS PKG #'SHADOWING-IMPORT-INTERNAL))
+
+(DEFUN SHADOWING-IMPORT-INTERNAL (SYMBOL PKG)
+  (MULTIPLE-VALUE-BIND (CONFLICT FLAG)
+      (FIND-SYMBOL-LOCAL (GET-PNAME SYMBOL) PKG)
+    (WHEN (AND FLAG (NOT (EQ CONFLICT SYMBOL)))
+      (REMOB CONFLICT PKG))
+    (UNLESS (AND FLAG (EQ CONFLICT SYMBOL))
+      (PKG-NEW-SYMBOL-INTERNAL PKG SYMBOL PKG-INTERNAL-CODE)))
+  (PUSH*-IN-AREA SYMBOL (PKG-SHADOWING-SYMBOLS PKG) PKG-AREA))
+
+(DEFUN PACKAGE-SYMBOL-OPERATION (SYMBOLS PKG FUNCTION &KEY ALLOW-STRINGS)
+  (DECLARE (SYS:DOWNWARD-FUNARG FUNCTION))
+  (COND ((NULL PKG) (SETQ PKG PACKAGE))
+	((NOT (PKG-PACKAGE-P PKG)) (SETQ PKG (PKG-FIND-PACKAGE PKG ':ERROR PACKAGE))))
+  (COND ((CL:LISTP SYMBOLS)
+	 (DOLIST (SYMBOL SYMBOLS)
+	   (UNLESS (OR (SYMBOLP SYMBOL) (AND ALLOW-STRINGS (STRINGP SYMBOL)))
+	     (FERROR "~S is not a symbol; it is not acceptable to ~S" SYMBOL FUNCTION))
+	   (FUNCALL FUNCTION SYMBOL PKG)))
+	(T (UNLESS (OR (SYMBOLP SYMBOLS) (AND ALLOW-STRINGS (STRINGP SYMBOLS)))
+	     (FERROR "~S is not a symbol; it is not acceptable to ~S" SYMBOLS FUNCTION))
+	   (FUNCALL FUNCTION SYMBOLS PKG)))
+  T)
+
+(DEFUN PACKAGE-PACKAGE-OPERATION (PACKAGES PKG FUNCTION &OPTIONAL SYNTAX)
+  (COND ((NULL PKG) (SETQ PKG PACKAGE))
+	((NOT (PKG-PACKAGE-P PKG)) (SETQ PKG (PKG-FIND-PACKAGE PKG ':ERROR PACKAGE SYNTAX))))
+  (COND ((CL:LISTP PACKAGES)
+	 (DOLIST (PACKAJE PACKAGES)
+	   (FUNCALL FUNCTION (PKG-FIND-PACKAGE PACKAJE ':ERROR PACKAGE SYNTAX) PKG)))
+	(T (FUNCALL FUNCTION (PKG-FIND-PACKAGE PACKAGES ':ERROR PACKAGE SYNTAX) PKG)))
+  PKG)
+
+(DEFUN SET-SYMBOL-STATUS (SYM PKG CODE)
+  (LET* ((STR (STRING SYM))
+	 (HASH (SXHASH-STRING STR)))
+    ;; Prevent interrupts to lock the hash table against both intern and rehash
+    (WITHOUT-INTERRUPTS
+      (MULTIPLE-VALUE-BIND (FOUND IDX)
+	  (PKG-INTERN-INTERNAL STR HASH PKG)
+	(WHEN (OR (NULL IDX) (NEQ FOUND SYM))
+	  (FERROR "Symbol ~S unexpectedly not found in ~S" SYM PKG))
+	(SETF (PKG-ENTRY-CODE PKG IDX) CODE)))))
+
+(DEFUN USE-PACKAGE (PACKAGES &OPTIONAL PKG)
+  (PACKAGE-PACKAGE-OPERATION PACKAGES PKG #'USE-PACKAGE-INTERNAL)
+  T)
+
+(DEFUN USE-PACKAGE-INTERNAL (PACKAJE PKG)
+  (UNLESS (MEMQ PACKAJE (PKG-USE-LIST PKG))
+    ;; Name conflict checking
+    (LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PACKAJE) 2) WITH (OTHER FLAG)
+	  AS SYM = (PKG-ENTRY-SYMBOL PACKAJE I)
+	  UNLESS (SYMBOLP (PKG-ENTRY-HASH PACKAJE I))	;NIL or T
+	    WHEN (= (PKG-ENTRY-CODE PACKAJE I) PKG-EXTERNAL-CODE)
+	      DO (MULTIPLE-VALUE (OTHER FLAG)
+		   (CL:FIND-SYMBOL (GET-PNAME SYM) PKG))
+	      AND WHEN (AND FLAG
+			    (NEQ OTHER SYM)
+			    (NOT (MEMQ OTHER (PKG-SHADOWING-SYMBOLS PKG))))
+		    COLLECT (CONS SYM OTHER) INTO CONFLICTS
+	  FINALLY
+	    (WHEN CONFLICTS
+	      (SIGNAL-PROCEED-CASE (() 'NAME-CONFLICT-IN-USE-PACKAGE
+				    :PACKAGE PKG :FROM-PACKAGE PACKAJE
+				    :CONFLICTS CONFLICTS)
+		;; The :PROCEED methods do all the work
+		((:EXPORT :SHADOW :SHARE :CHOOSE))
+		(:SKIP (RETURN-FROM USE-PACKAGE-INTERNAL NIL)))))
+    (WITHOUT-INTERRUPTS				;Lock so all the lists are consistent
+      (SETF (PKG-USE-LIST PKG) (NCONC (PKG-USE-LIST PKG) (NCONS-IN-AREA PACKAJE PKG-AREA)))
+      (PUSH-IN-AREA PKG (PKG-USED-BY-LIST PACKAJE) PKG-AREA)
+      ;; If called for, do all the searching now to save time later
+      (WHEN (PKG-HASH-INHERITED-SYMBOLS PKG)
+	(LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PACKAJE) 2)
+	      AS SYM = (PKG-ENTRY-SYMBOL PACKAJE I) DO
+	  (UNLESS (SYMBOLP (PKG-ENTRY-HASH PACKAJE I))	;NIL or T
+	    (WHEN (= (PKG-ENTRY-CODE PACKAJE I) PKG-EXTERNAL-CODE)
+	      (MULTIPLE-VALUE-BIND (IGNORE FLAG)	;Check for shadowing
+		  (FIND-SYMBOL-LOCAL (GET-PNAME SYM) PKG)
+		(UNLESS FLAG
+		  (PKG-NEW-SYMBOL-INTERNAL PKG SYM PKG-INHERITED-CODE))))))))
+    ;; Kludge to simulate old Zetalisp package system
+    (DOLIST (PACKAJE (PKG-INCLUDE-LIST PACKAJE))
+      (USE-PACKAGE-INTERNAL PACKAJE PKG))))
+
+(DEFUN UNUSE-PACKAGE (PACKAGES &OPTIONAL PKG)
+  (UNUSE-PACKAGE-FOR-SYNTAX PACKAGES PKG))
+
+ ;; New subroutine factored out for use by other Lisp syntaxes -kmp 14-Feb-90
+(DEFUN UNUSE-PACKAGE-FOR-SYNTAX (PACKAGES &OPTIONAL PKG SYNTAX)
+  (SETQ PKG (PACKAGE-PACKAGE-OPERATION PACKAGES PKG #'UNUSE-PACKAGE-INTERNAL SYNTAX))
+  (WHEN (PKG-HASH-INHERITED-SYMBOLS PKG)
+    (WITHOUT-INTERRUPTS
+      ;; Must re-encache inheritances
+      (LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PKG) 2) DO
+	(WHEN (AND (NOT (SYMBOLP (PKG-ENTRY-HASH PKG I)))
+		   (= (PKG-ENTRY-CODE PKG I) PKG-INHERITED-CODE))
+	  (SETF (PKG-ENTRY-HASH PKG I) T)
+	  (SETF (PKG-ENTRY-SYMBOL PKG I) NIL)))
+      (LET ((STILL-USED (PKG-USE-LIST PKG)))
+	(SETF (PKG-USE-LIST PKG) NIL)
+	(DOLIST (PACKAJE STILL-USED)
+	  (USE-PACKAGE-INTERNAL PACKAJE PKG)))))
+  T)
+
+(DEFUN UNUSE-PACKAGE-INTERNAL (PACKAJE PKG)
+  (WHEN (MEMQ PACKAJE (PKG-USE-LIST PKG))
+    (SETF (PKG-USE-LIST PKG) (DELQ PACKAJE (PKG-USE-LIST PKG)))
+    (SETF (PKG-USED-BY-LIST PACKAJE) (DELQ PKG (PKG-USED-BY-LIST PACKAJE)))))
+
+(DEFUN FIND-ALL-SYMBOLS (STR)
+  (SETQ STR (STRING STR))
+  (LOOP FOR PKG IN *ALL-PACKAGES* WITH (SYM FLAG)
+	DO (MULTIPLE-VALUE (SYM FLAG) (FIND-SYMBOL-LOCAL STR PKG))
+	WHEN FLAG
+	  UNLESS (MEMQ SYM ANS)
+	    COLLECT SYM INTO ANS
+	FINALLY (RETURN ANS)))
+
+(DEFUN KEYWORDP (OBJECT)
+  (DECLARE LT:(SIDE-EFFECTS SIMPLE REDUCIBLE))
+  (AND (SYMBOLP OBJECT) (EQ (SYMBOL-PACKAGE OBJECT) PKG-KEYWORD-PACKAGE)))
+
+;;; "Commands"
+
+;; Go to type-in package.
+(DEFUN PKG-GOTO (&OPTIONAL (PKG PKG-USER-PACKAGE) GLOBALLY)
+  (SETQ PKG (PKG-FIND-PACKAGE PKG))
+  (CL:SETF (STANDARD-VALUE 'PACKAGE) PKG)	;don't change global if there is a
+						;standard value binding.
+  (IF GLOBALLY
+      (SETQ-GLOBALLY PACKAGE PKG)
+    (SETQ PACKAGE PKG)))
+
+;; "Kill" a package by removing it from the list of all packages and from
+;; the used/used-by/refname relationships.  Can still be home package of symbols.
+(DEFUN PKG-KILL (PKG)
+  (SETQ PKG (PKG-FIND-PACKAGE PKG))
+  (DOLIST (USER (PKG-USED-BY-LIST PKG))
+    (UNUSE-PACKAGE PKG USER))
+  (WITHOUT-INTERRUPTS
+    (DOLIST (USED (PKG-USE-LIST PKG))
+      (SETF (PKG-USED-BY-LIST USED) (DELQ PKG (PKG-USED-BY-LIST USED))))
+    (DOLIST (PACKAJE *ALL-PACKAGES*)
+      (SETF (PKG-RELATIVE-NAMES PACKAJE)
+	    (DEL #'(LAMBDA (PKG ITEM) (EQ (CDR ITEM) PKG)) PKG (PKG-RELATIVE-NAMES PACKAJE))))
+    (DOLIST (SYNTAX *KNOWN-LISP-SYNTAXES*)
+      (SETF (LISP-SYNTAX-RELATIVE-NAMES SYNTAX)
+	    (DEL #'(LAMBDA (PKG ITEM) (EQ (CDR ITEM) PKG))
+		 PKG (LISP-SYNTAX-RELATIVE-NAMES SYNTAX))))
+    (LET ((POSITION (FIND-POSITION-IN-LIST PKG *ALL-PACKAGES*)))
+      (WHEN (AND POSITION (< POSITION *N-PACKAGES-OPTIMIZED*))
+	(DECF *N-PACKAGES-OPTIMIZED*))
+      (WHEN (AND (VARIABLE-BOUNDP *INSTANT-PACKAGE-DWIM-PACKAGE*)
+		 (SETQ POSITION (CL:POSITION PKG *INSTANT-PACKAGE-DWIM-PACKAGE*)))
+	(SETF (AREF *INSTANT-PACKAGE-DWIM-PACKAGE* POSITION) NIL)))
+    (SETQ *ALL-PACKAGES* (DELQ PKG *ALL-PACKAGES*))
+    (DOLIST (NAME (PKG-NAME-LIST PKG))
+      (DELETE-NAME-TABLE-ENTRY NAME))
+    T))
+
+;; Remove all symbols from a package, not counting inherited ones.
+;; Does not touch any symbols' package cells.  Leaves the package good as new.
+(DEFUN PKG-CLEAR-PACKAGE (PKG)
+  (SETQ PKG (PKG-FIND-PACKAGE PKG))
+  (SETF (PKG-SHADOWING-SYMBOLS PKG) NIL)
+  (SETF (PKG-NUMBER-OF-SYMBOLS PKG) 0)
+  (FILL-ARRAY PKG (* (PKG-HASH-MODULUS PKG) 2) NIL)
+  (WHEN (PKG-HASH-INHERITED-SYMBOLS PKG)
+    (LET ((STILL-USED (PKG-USE-LIST PKG)))
+      (SETF (PKG-USE-LIST PKG) NIL)
+      (DOLIST (PACKAJE STILL-USED)
+	(USE-PACKAGE-INTERNAL PACKAJE PKG)))))
+
+;Old excuse for EXPORT, still sometimes the right thing
+;Given a symbol, move it into the GLOBAL package, or to whatever package
+;is specified, from all packages that inherit from that one.
+;All symbols with those names in other packages are forwarded.
+;Values, properties and function definitions are all merged from
+;those other symbols into these ones.  Multiple values or function
+;definitions, such as cannot properly be merged, cause errors.
+;Given a string instead of a symbol, take the first extant symbol with
+;that name, or create a new one.
+(DEFUN GLOBALIZE (STRING &OPTIONAL (INTO-PACKAGE PKG-GLOBAL-PACKAGE))
+  (SETQ INTO-PACKAGE (PKG-FIND-PACKAGE INTO-PACKAGE))
+  (LET ((SYM (IF (SYMBOLP STRING)
+		 (IF (KEYWORDP STRING)
+		     (FERROR "Attempt to globalize keyword ~S" STRING)
+		     STRING)
+		 (BLOCK SYM
+		   (MULTIPLE-VALUE-BIND (FOUND FLAG) (FIND-SYMBOL-LOCAL STRING INTO-PACKAGE)
+		     (WHEN FLAG (RETURN-FROM SYM FOUND)))
+		   (CL:DOLIST (PKG (PKG-USED-BY-LIST INTO-PACKAGE))
+		     (MULTIPLE-VALUE-BIND (FOUND FLAG) (FIND-SYMBOL-LOCAL STRING PKG)
+		       (WHEN (AND FLAG
+				  (NOT (MEMQ FOUND (PKG-SHADOWING-SYMBOLS PKG))))
+			 (RETURN-FROM SYM FOUND))))
+		   ;; Disable automatic export, will be done below
+		   (LETF (((PKG-LOCKED INTO-PACKAGE) NIL)
+			  ((PKG-NEW-SYMBOL-FUNCTION INTO-PACKAGE)
+			   'PKG-NEW-SYMBOL))
+		     (CL:INTERN STRING INTO-PACKAGE))))))
+    ;; Move the symbol's home package "up", but not "down"
+    (LET* ((OLD-HOME (SYMBOL-PACKAGE SYM))
+	   (NEW-HOME (IF (MEMQ OLD-HOME (PKG-USE-LIST INTO-PACKAGE)) OLD-HOME INTO-PACKAGE)))
+      (COND ((EQ NEW-HOME OLD-HOME)
+	     (FORMAT ERROR-OUTPUT "~&Globalizing ~A in package ~A." SYM INTO-PACKAGE))
+	    (T
+	     (LET ((PACKAGE NIL))		;Always print package prefix
+	       (FORMAT ERROR-OUTPUT "~&Globalizing ~S into package ~A."
+		       SYM INTO-PACKAGE))
+	     (SETF (SYMBOL-PACKAGE SYM) NEW-HOME))))
+    ;; SYM is the "principal symbol".  Export it from the package it was put into.
+    ;; Don't do this by calling EXPORT, because we're just about to resolve the name
+    ;; conflicts if there are any.
+    ;; Disable automatic export, will be done below
+    (LETF (((PKG-LOCKED INTO-PACKAGE) NIL)
+	   ((PKG-NEW-SYMBOL-FUNCTION INTO-PACKAGE) 'PKG-NEW-SYMBOL))
+      (IMPORT-INTERNAL SYM INTO-PACKAGE))
+    (SET-SYMBOL-STATUS SYM INTO-PACKAGE PKG-EXTERNAL-CODE)
+    ;; SYM is now the "principal symbol".  Forward any others to it that should have been EQ
+    ;; and return a list of them.
+    (VALUES SYM
+	    (LOOP FOR PKG IN (PKG-USED-BY-LIST INTO-PACKAGE) WITH (LOCAL FLAG)
+		  DO (MULTIPLE-VALUE (LOCAL FLAG) (FIND-SYMBOL-LOCAL (GET-PNAME SYM) PKG))
+		  WHEN (AND FLAG
+			    (NEQ LOCAL SYM)
+			    (NOT (MEMQ LOCAL (PKG-SHADOWING-SYMBOLS PKG))))
+		    COLLECT LOCAL
+		    AND DO (LET ((PACKAGE NIL))	;Always print package prefix
+			     (FORMAT ERROR-OUTPUT
+				     "~%Forwarding value, function, and property cells of ~S~@
+			to ~S and making it a shadowing symbol as a substitute for having~@
+			only a single symbol by that name."
+				     LOCAL SYM))
+			   (PUSH-IN-AREA LOCAL (PKG-SHADOWING-SYMBOLS PKG) PKG-AREA)
+			   (FORWARD-SYMBOL-CELLS LOCAL SYM)))))
+
+(DEFUN MERGE-SOURCE-FILE-NAME-PROPERTIES (SYM1 PROP1 SYM2 PROP2)
+  (WHEN (NLISTP PROP1)
+    (SETQ PROP1 `((DEFUN ,PROP1))))
+  (WHEN (NLISTP PROP2)
+    (SETQ PROP2 `((DEFUN ,PROP2))))
+  (LOOP FOR BUCKET1 IN PROP1
+	FOR (TYPE . PATHS1) = BUCKET1
+	FOR BUCKET2 = (ASSQ TYPE PROP2)
+	FOR (NIL . PATHS2) = BUCKET2
+	UNLESS BUCKET2
+	  DO (SETQ BUCKET2 `(,TYPE))
+	     (PUSH BUCKET2 PROP2)
+	WHEN (AND PATHS1 PATHS2
+		  (NEQ (FIRST PATHS1) (FIRST PATHS2)))
+	  DO (FORMAT ERROR-OUTPUT
+		     "~&Merging :SOURCE-FILE-NAME properties of ~S and ~S;~@
+		      these have both been defined as ~A, but in different files.~@
+		      The version from ~S will be recorded as most recent, but this~@
+		      may not be correct."
+		     SYM1 SYM2
+		     (LET ((TYPE-STRING (GET TYPE 'DEFINITION-TYPE-NAME)))
+		       (IF TYPE-STRING
+			   (STRING-DOWNCASE (STRING-PLURALIZE TYPE-STRING))
+			 (STRING-APPEND TYPE "'s")))
+		     SYM1)
+	DO (SETF (CDR BUCKET2)
+		 (ELIMINATE-DUPLICATES (APPEND PATHS1 PATHS2))))
+  PROP2)
+
+;;; FORWARD-SYMBOL-CELLS moved to MEMORY-COLD, where its friends are.
+
+
+;; Returns T if instant package dwim is off, or the symbol "named" by HASH
+;; is found in the package "named" by PKG#.
+;; Returns NIL when instant package dwim is on and the symbol is certain 
+;; not to be in the package.
+(DEFUN INSTANT-PACKAGE-DWIM-SYMBOL-IN-PACKAGE (HASH PKG# LENGTH)
+  (OR (NOT (VARIABLE-BOUNDP SI:*INSTANT-PACKAGE-DWIM-TABLE*))
+      (LOOP FOR I BELOW LENGTH
+	    THEREIS (= (SI:PKG-DWIM-AREF SI:*INSTANT-PACKAGE-DWIM-TABLE* HASH I) PKG#))))
+
+(DEFUN PREFETCH-FOR-MAPPING-OVER-LOOKALIKE-SYMBOLS (STRING PKG
+						    &OPTIONAL NOTE-PROGRESS INSTANT)
+  (DECLARE (IGNORE PKG))
+  (LET* ((PACKAGES *ALL-PACKAGES*)
+	 (HASH (SXHASH-STRING (STRING STRING)))
+	 (HASH-1 (AND INSTANT
+		      (VARIABLE-BOUNDP SI:*INSTANT-PACKAGE-DWIM-TABLE*)
+		      (MOD HASH *INSTANT-PACKAGE-DWIM-MODULUS*)))
+	 (LENGTH (AND HASH-1
+		      (SI:PKG-DWIM-AREF-LENGTH SI:*INSTANT-PACKAGE-DWIM-TABLE* HASH-1)))
+	 (N (IF LENGTH (FILL-POINTER SI:*INSTANT-PACKAGE-DWIM-PACKAGE*) (LENGTH PACKAGES))))
+    ;; Page in the list.  This is actually faster than prefetching conses
+    ;; or faulting on them in the subsequent loop.
+    (LENGTH PACKAGES)
+    ;; Page in the array leaders of all the packages.
+    ;; This loses if the package is structure forwarded, but then again the
+    ;; entries on *ALL-PACKAGES* shouldn't be anymore.
+    (LOOP FOR PKG# FROM 0 BELOW N AS PS = PACKAGES THEN (CDR PS) AS P = (CAR PS) DO
+      (WHEN (OR (NOT INSTANT)
+		(INSTANT-PACKAGE-DWIM-SYMBOL-IN-PACKAGE HASH-1 PKG# LENGTH))
+	(WHEN HASH-1
+	  ;; *ALL-PACKAGES* and *INSTANT-PACKAGE-DWIM-PACKAGE* aren't always the same order
+	  (SETQ P (AREF SI:*INSTANT-PACKAGE-DWIM-PACKAGE* PKG#)))
+	(WHEN P					;package might have been killed
+	  (PAGE-IN-WORDS
+	    #+3600 P
+	    #+IMACH (%MAKE-POINTER-OFFSET DTP-LOCATIVE P (- (PACKAGE-DEFSTRUCT-SIZE)))
+	    (+ 10 (PACKAGE-DEFSTRUCT-SIZE))
+	    :HANG-P NIL))))
+    (IF NOTE-PROGRESS (TV:NOTE-PROGRESS 1 4))
+    ;; Page in the first probe address for each package.
+    (LOOP FOR PKG# FROM 0 BELOW N AS PS = PACKAGES THEN (CDR PS) AS P = (CAR PS) DO
+      (WHEN (OR (NOT INSTANT)
+		(INSTANT-PACKAGE-DWIM-SYMBOL-IN-PACKAGE HASH-1 PKG# LENGTH))
+	(WHEN HASH-1
+	  ;; *ALL-PACKAGES* and *INSTANT-PACKAGE-DWIM-PACKAGE* aren't always the same order
+	  (SETQ P (AREF SI:*INSTANT-PACKAGE-DWIM-PACKAGE* PKG#)))
+	(WHEN P					;package might have been killed
+	  (PAGE-IN-WORDS
+	    (%MAKE-POINTER-OFFSET
+	      DTP-LOCATIVE
+	      (ALOC P 0)	; This can fault following structure forwarding.
+	      (* 2 (\ HASH (PKG-HASH-MODULUS P))))
+	    2
+	    :HANG-P NIL))))
+    (IF NOTE-PROGRESS (TV:NOTE-PROGRESS 2 4))
+    ;; Page in the symbols for probes that hit.
+    (LOOP FOR PKG# FROM 0 BELOW N AS PS = PACKAGES THEN (CDR PS) AS P = (CAR PS) DO
+      (WHEN (OR (NOT INSTANT)
+		(INSTANT-PACKAGE-DWIM-SYMBOL-IN-PACKAGE HASH-1 PKG# LENGTH))
+	(WHEN HASH-1
+	  ;; *ALL-PACKAGES* and *INSTANT-PACKAGE-DWIM-PACKAGE* aren't always the same order
+	  (SETQ P (AREF SI:*INSTANT-PACKAGE-DWIM-PACKAGE* PKG#)))
+	(WHEN P					;package might have been killed
+	  (LET ((I (* 2 (\ HASH (PKG-HASH-MODULUS P)))))
+	    (WHEN (EQ (PKG-ENTRY-HASH P I) HASH)
+	      (PAGE-IN-WORDS (PKG-ENTRY-SYMBOL P I)
+			     5
+			     :HANG-P NIL))))))
+    (IF NOTE-PROGRESS (TV:NOTE-PROGRESS 3 4))))
+
+;Find all symbols with a given pname, which packages they are in, and
+;which packages they are accessible from.  Print out this information
+;and also return a list of the symbols.
+(DEFUN WHERE-IS (PNAME)
+  ;; Given a string, strip case and style.  But given a symbol copy it exactly.
+  (SETQ PNAME (IF (STRINGP PNAME)
+		  ;; CL:MAP isn't in the cold-load, so we can't use:
+		  ;;  (CL:MAP 'STRING #'(LAMBDA (CHAR)
+		  ;;			  (SETF (CHAR-STYLE-INDEX CHAR) 0)
+		  ;;			  (CHAR-UPCASE CHAR)) PNAME)
+		  (LOOP WITH RESULT = (MAKE-ARRAY (STRING-LENGTH PNAME) :TYPE 'ART-STRING)
+			FOR CHAR BEING THE ARRAY-ELEMENTS OF PNAME
+			FOR I UPFROM 0
+			DO (LET ((CH (CHAR-UPCASE CHAR)))
+			     (SETF (CHAR-STYLE-INDEX CH) 0)
+			     (SETF (AREF RESULT I) CH))
+			FINALLY (RETURN RESULT))
+		(STRING PNAME)))
+  (FUNCALL STANDARD-OUTPUT ':FRESH-LINE)
+  (LET ((TABLE NIL)
+	(SHOW-PROGRESS TV:*SHOW-SYSTEM-INTERNAL-PROGRESS-NOTES*))
+    (TV:NOTING-PROGRESS-IF SHOW-PROGRESS ("Searching for lookalike symbols")
+      (PREFETCH-FOR-MAPPING-OVER-LOOKALIKE-SYMBOLS PNAME NIL SHOW-PROGRESS)
+      ;; Each entry in TABLE is (symbol found-in-pkg inherited-from-pkg),
+      ;; highest package first.
+      (DOLIST (FOUND-IN-PKG *ALL-PACKAGES*)
+	(MULTIPLE-VALUE-BIND (SYM FOUND) (CL:FIND-SYMBOL PNAME FOUND-IN-PKG)
+	  (WHEN FOUND
+	    (LET ((INHERITED-FROM-PKG FOUND-IN-PKG))
+	      (WHEN (EQ FOUND ':INHERITED)
+		(DOLIST (PKG (PKG-USE-LIST FOUND-IN-PKG))
+		  (MULTIPLE-VALUE-BIND (SYMBOL FOUND) (FIND-SYMBOL-LOCAL PNAME PKG)
+		    (AND (EQ SYMBOL SYM) (EQ FOUND ':EXTERNAL)
+			 (RETURN (SETQ INHERITED-FROM-PKG PKG))))))
+	      (PUSH (LIST SYM FOUND-IN-PKG INHERITED-FROM-PKG) TABLE)))))
+      (SETQ TABLE (NREVERSE TABLE)))
+    (IF (NULL TABLE) (FORMAT T "No symbols named ~S exist.~%" PNAME)
+	(LOOP UNTIL (NULL TABLE)
+	  AS SYM = (CAAR TABLE)
+	  AS INHERITED-FROM-PKG = (CADDAR TABLE)
+	  AS FROM-PKGS = (SORT (MAPCAN #'(LAMBDA (X)
+					    (COND ((AND (EQ (CAR X) SYM)
+							(EQ (CADDR X) INHERITED-FROM-PKG))
+						   (SETQ TABLE (DELQ X TABLE 1))
+						   (NCONS (PKG-NAME (CADR X))))))
+				       TABLE)
+			       #'STRING-LESSP)
+	  DO (LET ((PACKAGE NIL))
+	       (PRIN1 SYM))			;Print symbol always with package prefix
+	     (UNLESS (EQ (SYMBOL-PACKAGE SYM) INHERITED-FROM-PKG)
+	       (FORMAT T " (interned in ~A)" INHERITED-FROM-PKG))
+	     (FORMAT T " is accessible from package~P ~{~<~%~10@T~2:;~A~>~^, ~}~%"
+		     (LENGTH FROM-PKGS) FROM-PKGS)
+	  UNLESS (ASSQ SYM TABLE)
+	    COLLECT SYM))))
+
+;;; Compatibility with previous Zetalisp package systems
+
+(DEFUN PKG-CREATE-PACKAGE (NAME &OPTIONAL (SUPER CL:*PACKAGE*) (SIZE 500))
+  (MAKE-PACKAGE (STRING NAME) ':USE SUPER ':SIZE SIZE ':INVISIBLE (NULL SUPER)))
+
+;The PACKAGE-DECLARE for a package has this form:
+;(PACKAGE-DECLARE package-name superpackage-name package-size
+;		  file-alist
+;		  ....)  ;the body.
+;The file-alist is obsolete and should be NIL.  It may be omitted if there is no body.
+(COMPILER:MAKE-OBSOLETE PACKAGE-DECLARE "use DEFPACKAGE instead.")
+(DEFMACRO PACKAGE-DECLARE (NAME SUPER SIZE &OPTIONAL FILE-ALIST &REST BODY)
+  `(LEXPR-FUNCALL #'PACKAGE-DECLARE-1 ',NAME ',SUPER ',SIZE ',FILE-ALIST ',BODY))
+
+(DEFUN PACKAGE-DECLARE-1 (NAME SUPER SIZE &OPTIONAL FILE-ALIST &REST BODY &AUX KEYS)
+  ;; Translate the arguments
+  (SETQ NAME (STRING NAME))
+  (SETQ KEYS `(:USE ,SUPER
+	       :SIZE ,SIZE))
+  (WHEN FILE-ALIST
+    (FSIGNAL "PACKAGE-DECLARE no longer does anything with files"))
+  (LOOP FOR (WORD . ARGS) IN BODY DO
+    (SELECTOR WORD STRING-EQUAL
+      ("BORROW" (SETQ KEYS `(:IMPORT-FROM ,ARGS . ,KEYS)))
+      ("INTERN" (SETQ KEYS `(:EXPORT ,ARGS . ,KEYS)))
+      ("SHADOW" (SETQ KEYS `(:SHADOW ,ARGS . ,KEYS)))
+      ("REFNAME" (PUSH (CONS (FIRST ARGS) (SECOND ARGS)) (GET (LOCF KEYS) ':RELATIVE-NAMES)))
+      ("MYREFNAME" (IF (STRING-EQUAL (FIRST ARGS) "GLOBAL")
+		       (PUSH (SECOND ARGS) (GET (LOCF KEYS) ':NICKNAMES))
+		       (PUSH (LIST (FIRST ARGS) (SECOND ARGS))
+			     (GET (LOCF KEYS) ':RELATIVE-NAMES-FOR-ME))))
+      (OTHERWISE (FERROR "~S is not a recognized PACKAGE-DECLARE keyword" WORD))))
+  ;; Either make a new package or adjust an existing package
+  (LEXPR-FUNCALL (IF (PKG-FIND-PACKAGE NAME ':FIND) #'RE-MAKE-PACKAGE #'MAKE-PACKAGE)
+		 NAME KEYS))
+
+;;; Iterating over symbols in packages
+
+(DEFMACRO DO-SYMBOLS ((VAR &OPTIONAL PKG RESULT-FORM) &BODY BODY &ENVIRONMENT ENV)
+  (LET ((TAG (GENSYM))
+	(INDEX (GENSYM))
+	(STATE (GENSYM)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS REAL-BODY)
+	(FIND-BODY-DECLARATIONS BODY ENV)
+      `(MULTIPLE-VALUE-BIND (,INDEX ,VAR ,STATE)
+	   (LOOP-INITIALIZE-MAPATOMS-STATE ,(OR PKG `PACKAGE) NIL)
+	 ,@DECLARATIONS
+	 (PROG ()				; Create a block named NIL, intentionally.
+	   ,TAG
+	     (WHEN (MULTIPLE-VALUE (NIL ,INDEX ,VAR ,STATE)
+		     (LOOP-TEST-AND-STEP-MAPATOMS ,INDEX ,VAR ,STATE))
+	       (RETURN ,RESULT-FORM))
+	     (PROGN . ,REAL-BODY)
+	     (GO ,TAG))))))
+
+(DEFMACRO DO-EXTERNAL-SYMBOLS ((VAR &OPTIONAL PKG RESULT-FORM) &BODY BODY &ENVIRONMENT ENV)
+  (LET ((TAG (GENSYM))
+	(INDEX (GENSYM))
+	(STATE (GENSYM)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS REAL-BODY)
+	(FIND-BODY-DECLARATIONS BODY ENV)
+      `(MULTIPLE-VALUE-BIND (,INDEX ,VAR ,STATE)
+	   (LOOP-INITIALIZE-MAPATOMS-STATE ,(OR PKG `PACKAGE) T)
+	 ,@DECLARATIONS
+	 (PROG ()				; Create a block named NIL, intentionally.
+	   ,TAG
+	     (WHEN (MULTIPLE-VALUE (NIL ,INDEX ,VAR ,STATE)
+		     (LOOP-TEST-AND-STEP-MAPATOMS-EXTERNAL ,INDEX ,VAR ,STATE))
+	       (RETURN ,RESULT-FORM))
+	     (PROGN . ,REAL-BODY)
+	     (GO ,TAG)))))) 
+
+;SCL extension
+(DEFMACRO DO-LOCAL-SYMBOLS ((VAR &OPTIONAL PKG RESULT-FORM) &BODY BODY &ENVIRONMENT ENV)
+  (LET ((TAG (GENSYM))
+	(INDEX (GENSYM))
+	(STATE (GENSYM)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS REAL-BODY)
+	(FIND-BODY-DECLARATIONS BODY ENV)
+      `(MULTIPLE-VALUE-BIND (,INDEX ,VAR ,STATE)
+	   (LOOP-INITIALIZE-MAPATOMS-STATE ,(OR PKG `PACKAGE) T)
+	 ,@DECLARATIONS
+	 (PROG ()					; Create a block named NIL, intentionally.
+	   ,TAG
+	     (WHEN (MULTIPLE-VALUE (NIL ,INDEX ,VAR ,STATE)
+		     (LOOP-TEST-AND-STEP-MAPATOMS-LOCAL ,INDEX ,VAR ,STATE))
+	       (RETURN ,RESULT-FORM))
+	     (PROGN . ,REAL-BODY)
+	     (GO ,TAG))))))
+
+(DEFMACRO DO-ALL-SYMBOLS ((VAR &OPTIONAL RESULT-FORM) &BODY BODY &ENVIRONMENT ENV)
+  (LET ((TAG (GENSYM))
+	(INDEX (GENSYM))
+	(STATE (GENSYM)))
+    (MULTIPLE-VALUE-BIND (DECLARATIONS REAL-BODY)
+	(FIND-BODY-DECLARATIONS BODY ENV)
+      `(MULTIPLE-VALUE-BIND (,INDEX ,VAR ,STATE)
+	   (LOOP-INITIALIZE-MAPATOMS-ALL-STATE)
+	 ,@DECLARATIONS
+	 (PROG ()				; Create a block named NIL, intentionally.
+	   ,TAG
+	     (WHEN (MULTIPLE-VALUE (NIL ,INDEX ,VAR ,STATE)
+		     (LOOP-TEST-AND-STEP-MAPATOMS-LOCAL ,INDEX ,VAR ,STATE))
+	       (RETURN ,RESULT-FORM))
+	     (PROGN . ,REAL-BODY)
+	     (GO ,TAG))))))
+
+;Apply the given function to each symbol in the given package.
+(DEFUN MAPATOMS (FUNCTION &OPTIONAL (PKG CL:*PACKAGE*) (INHERITED-P T))
+  (DECLARE (DOWNWARD-FUNARG FUNCTION))
+  (SETQ PKG (PKG-FIND-PACKAGE PKG))
+  (LOOP FOR I FROM 0 BY 2 BELOW (* (PKG-HASH-MODULUS PKG) 2)
+	UNLESS (SYMBOLP (PKG-ENTRY-HASH PKG I))	;T or NIL
+	  UNLESS (= (PKG-ENTRY-CODE PKG I) PKG-INHERITED-CODE)
+	    DO (FUNCALL FUNCTION (PKG-ENTRY-SYMBOL PKG I)))
+  (WHEN INHERITED-P
+    (DOLIST (PKG (PKG-USE-LIST PKG))
+      (DO-EXTERNAL-SYMBOLS (SYM PKG)
+	(FUNCALL FUNCTION SYM)))))
+
+;MAPATOMS over all packages in the world.
+(DEFUN MAPATOMS-ALL (FUNCTION)
+  (DECLARE (DOWNWARD-FUNARG FUNCTION))
+  (DOLIST (PKG *ALL-PACKAGES*)
+    (MAPATOMS FUNCTION PKG NIL)))
+
+;;; Support routines for the LOOP paths (compatible with old compiled code)
+;;; also used by the DO-SYMBOLS special forms
+
+(DEFUN LOOP-INITIALIZE-MAPATOMS-STATE (PKG LOCALP)
+    ; Return the initial values of the three state variables.
+    ; This scheme uses them to be:
+    ; (1)  Index into the package (decremented as we go)
+    ; (2)  Temporary (to hold the symbol)
+    ; (3)  the package list (or the package if local path)
+    (SETQ PKG (PKG-FIND-PACKAGE PKG))
+    (VALUES (* (PKG-HASH-MODULUS PKG) 2)
+	    NIL
+	    (IF (OR LOCALP (PKG-HASH-INHERITED-SYMBOLS PKG))
+		PKG
+		(PKG-SELF-AND-USE-LIST PKG))))
+
+(DEFUN LOOP-INITIALIZE-MAPATOMS-ALL-STATE ()
+  (VALUES (* (PKG-HASH-MODULUS (FIRST *ALL-PACKAGES*)) 2) NIL *ALL-PACKAGES*))
+
+; Iterate through symbols in a list of packages.
+; Packages in the list after the first are inherited packages, from which we
+; consider only the external symbols.  To cram the state into three variables,
+; the sign of the index is used to indicate this.  Also, we can have a single
+; package rather than a list if the state was initialized that way.
+(DEFUN LOOP-TEST-AND-STEP-MAPATOMS (INDEX TEMP PKGS)
+    TEMP ; ignored
+    (LOOP WITH PKG = (IF (ATOM PKGS) PKGS (FIRST PKGS)) DOING
+      (COND ((ZEROP INDEX)
+	     (IF (AND (LISTP PKGS)
+		      (SETQ PKG (CAR (SETQ PKGS (CDR PKGS)))))
+		 (SETQ INDEX (* (PKG-HASH-MODULUS PKG) -2))
+		 (RETURN T)))
+	    ((PLUSP INDEX)
+	     (DECF INDEX 2)
+	     (WHEN (NUMBERP (PKG-ENTRY-HASH PKG INDEX))
+	       (RETURN (VALUES NIL INDEX (PKG-ENTRY-SYMBOL PKG INDEX) PKGS))))
+	    (T
+	     (INCF INDEX 2)
+	     (WHEN (AND (NUMBERP (PKG-ENTRY-HASH PKG (- INDEX)))
+			(= (PKG-ENTRY-CODE PKG (- INDEX)) PKG-EXTERNAL-CODE))
+	       (RETURN (VALUES NIL INDEX (PKG-ENTRY-SYMBOL PKG (- INDEX)) PKGS)))))))
+
+(DEFUN LOOP-TEST-AND-STEP-MAPATOMS-LOCAL (INDEX TEMP PKGS)
+    TEMP ; ignored
+    (LOOP WITH PKG = (IF (ATOM PKGS) PKGS (FIRST PKGS)) DOING
+      (COND ((MINUSP (DECF INDEX 2))
+	     (IF (AND (LISTP PKGS)
+		      (SETQ PKG (CAR (SETQ PKGS (CDR PKGS)))))
+		 (SETQ INDEX (* (PKG-HASH-MODULUS PKG) 2))
+		 (RETURN T)))
+	    ((AND (NUMBERP (PKG-ENTRY-HASH PKG INDEX))
+		  ( (PKG-ENTRY-CODE PKG INDEX) PKG-INHERITED-CODE))
+	     (RETURN (VALUES NIL INDEX (PKG-ENTRY-SYMBOL PKG INDEX) PKGS))))))
+
+(DEFUN LOOP-TEST-AND-STEP-MAPATOMS-EXTERNAL (INDEX TEMP PKG)
+    TEMP ; ignored
+    (LOOP DOING
+      (COND ((MINUSP (DECF INDEX 2))
+	     (RETURN T))
+	    ((AND (NUMBERP (PKG-ENTRY-HASH PKG INDEX))
+		  (= (PKG-ENTRY-CODE PKG INDEX) PKG-EXTERNAL-CODE))
+	     (RETURN (VALUES NIL INDEX (PKG-ENTRY-SYMBOL PKG INDEX) PKG))))))
+
+;;; Qualified-name output
+
+;;; Compute the package prefix needed to print a symbol, or to dump one into
+;;; a BIN (QBIN) file.
+;;; The first argument is a function called for each package prefix to be
+;;; printed, with arguments of a string, the number of package prefixes that
+;;; will be printed to its right, and a flag which is T if this symbol is not
+;;; available via normal package prefixing, because it is not an external of
+;;; the package and the package follows Common Lisp prefixing rules.
+;;; The flag is NIL unless the number is 0.
+;;; The third argument is the package relative to which the prefix is to be
+;;; computed.  It is the expected binding of PACKAGE when this symbol's
+;;; printed representation is read (or loaded) back into Lisp.  If this is NIL,
+;;; a prefix will always be generated.
+;;; A prefix is required if interning relative to the current package returns
+;;; a different symbol (either it is shadowed or is in a different package).
+;;; For efficiency, a slightly hairier algorithm than that is used.
+(DEFUN PKG-SYMBOL-PREFIX
+       (FUNCTION SYMBOL &OPTIONAL (PACKAJE CL:*PACKAGE*) (SYNTAX (CURRENT-LISP-SYNTAX)))
+  (DECLARE (SYS:DOWNWARD-FUNARG FUNCTION))
+  (LET ((PKG (SYMBOL-PACKAGE SYMBOL)))
+    (WHEN (AND PKG				;Must be interned to get a prefix
+	       (OR (EQ PKG PKG-KEYWORD-PACKAGE)	;Keywords always get a prefix
+		   (NULL PACKAJE)		;Always print a prefix if no "current" pkg
+		   (AND (NEQ PACKAJE PKG)	;Print prefix if in some other package
+			(MULTIPLE-VALUE-BIND (FOUND FLAG)  ;and not inherited or imported
+			    (CL:FIND-SYMBOL (GET-PNAME SYMBOL) PACKAJE)
+			  (NOT (AND FLAG (EQ FOUND SYMBOL)))))))
+      (PKG-PACKAGE-PREFIX FUNCTION PKG PACKAJE T 0
+			  (MULTIPLE-VALUE-BIND (NIL FLAG)
+			      (CL:FIND-SYMBOL (GET-PNAME SYMBOL) PKG)
+			    (AND (NEQ FLAG ':EXTERNAL)
+				 (NEQ (PKG-PREFIX-INTERN-FUNCTION PKG) 'CL:INTERN)))
+			  SYNTAX))))
+
+;;; Compute the name of a package relative to a specified other package.
+;;; In some cases this can be a "pathname" involving package prefixing.
+;;; The first argument is a function called for each package name to be
+;;; printed, with arguments of a string, the number of package names that
+;;; will be printed to its right, and a flag argument used by PKG-SYMBOL-PREFIX.
+;;; The second argument is the package whose name is to be printed and the
+;;; third argument is the package it is relative to (this can be NIL).
+;;;
+;;; This tries to find a relative name.  If it can't find one, it uses the
+;;; package's absolute name.  If the absolute name is shadowed, it prints
+;;; a two-level package prefix where the first is the refname of some other
+;;; accessible package from which the absolute name is not shadowed.
+;;; ABBREVIATE-P means that we prefer the package's prefix-name over its
+;;; main name and nicknames.  If ABBREVIATE-P is NIL use only the main name.
+;;;
+;;; Note:  This algorithm is N^2 in the case that there is no refname.
+;;; Somebody should fix the package data structures to at least make it linear.
+(DEFUN PKG-PACKAGE-PREFIX (FUNCTION TO-PKG FROM-PKG ABBREVIATE-P
+			   &OPTIONAL (CNT 0) FLAG (SYNTAX (CURRENT-LISP-SYNTAX)))
+  (DECLARE (SYS:DOWNWARD-FUNARG FUNCTION))
+  (WHEN SYNTAX (SETQ SYNTAX (FIND-LISP-SYNTAX SYNTAX)))
+  (LABELS ((PREFERRED-NAME (PKG ABBREVIATE-P)
+	     (IF ABBREVIATE-P (PKG-PREFIX-NAME PKG) (PKG-NAME PKG)))
+	   (FIND-BEST-NAME-FOR-REFERENCE (PKG1 PKG2 PREFERRED-NAME ABBREVIATE-P ALLOW-NULL)
+	     ;; Use the preferred name if present as a relative name.
+	     (WHEN (AND (OR ALLOW-NULL (NOT (PKG-COMPARE-NAMES "" PREFERRED-NAME)))
+			(OR (WHEN PKG1
+			      (DOLIST (PKG (PKG-SELF-AND-USE-LIST PKG1))
+				(WHEN (ASS #'PKG-COMPARE-NAMES PREFERRED-NAME
+					   (PKG-RELATIVE-NAMES PKG))
+				  (RETURN T))))
+			    (WHEN SYNTAX
+			      (ASS #'PKG-COMPARE-NAMES PREFERRED-NAME
+				   (LISP-SYNTAX-RELATIVE-NAMES SYNTAX))))
+			(EQ (PKG-FIND-PACKAGE PREFERRED-NAME :FIND FROM-PKG SYNTAX) TO-PKG))
+	       (RETURN-FROM FIND-BEST-NAME-FOR-REFERENCE PREFERRED-NAME))
+	     ;; Then try any relative name
+	     (MACROLET ((LOOKUP (ALIST)
+			  `(LOOP FOR (NAME . OTHER-PKG) IN ,ALIST DO
+			     (WHEN (AND (EQ OTHER-PKG PKG2)
+					(OR ALLOW-NULL
+					    (NOT (PKG-COMPARE-NAMES "" NAME)))
+					;; Now that we've found a match on the package
+					;; -object-, we must consider whether we've already 
+					;; passed by a conflicting use of the package -name-
+					;; in the relative names. Consider what happens if
+					;; FOO uses BAR and CL
+					;; and BAR defines ("USER" . #<Package BAR-USER>)
+					;; and CL  defines ("USER" . #<Package CL-USER>)
+					;; Then "USER" might be erroneously `found' as the
+					;; name for #<Package CL-USER> if we're not careful.
+					;; This bug was pointed out by Hotchkiss.
+					;; -kmp 27-Sep-89
+					(EQ (PKG-FIND-PACKAGE NAME :FIND FROM-PKG SYNTAX)
+					    TO-PKG))
+			       (RETURN-FROM FIND-BEST-NAME-FOR-REFERENCE NAME)))))
+	       (WHEN PKG1
+		 (DOLIST (PKG (PKG-SELF-AND-USE-LIST PKG1))
+		   (LOOKUP (PKG-RELATIVE-NAMES PKG))))
+	       (WHEN SYNTAX
+		 (LOOKUP (LISP-SYNTAX-RELATIVE-NAMES SYNTAX))))
+	     ;; The following looks suboptimal in that PKG-USEABLE-NAME knows about multiple
+	     ;; names, but can only return one at a time.  I think this punts prematurely,
+	     ;; but don't have time to fix it right now. -kmp 9-Oct-89
+	     ;; Then try any unshadowed absolute name
+	     (LET ((NAME (PKG-USEABLE-NAME PKG2 PKG1 ABBREVIATE-P SYNTAX)))
+	       (WHEN (AND NAME
+			  (OR ALLOW-NULL
+			      (NOT (PKG-COMPARE-NAMES "" NAME))))
+		 (RETURN-FROM FIND-BEST-NAME-FOR-REFERENCE NAME)))
+	     ;; Then punt.
+	     NIL))
+    (LET* ((PREFERRED-NAME (PREFERRED-NAME TO-PKG ABBREVIATE-P))
+	   (NAME (FIND-BEST-NAME-FOR-REFERENCE
+		   FROM-PKG TO-PKG PREFERRED-NAME ABBREVIATE-P T)))
+      (UNLESS NAME
+	;; Try indirecting through anything (KEYWORD will be tried first)
+	;; Avoid secondary names of "" to avoid double colons.
+	(MACROLET ((CHECK (PKG)
+		     `(LET* ((PREFNAME (PREFERRED-NAME ,PKG ABBREVIATE-P))
+			     (REFNAME (FIND-BEST-NAME-FOR-REFERENCE
+					FROM-PKG ,PKG PREFNAME ABBREVIATE-P T)))
+			(WHEN REFNAME
+			  (LET ((NAME1 (FIND-BEST-NAME-FOR-REFERENCE
+					 ,PKG TO-PKG PREFERRED-NAME ABBREVIATE-P NIL)))
+			    (WHEN NAME1
+			      ;; Call the function once for the prefix...
+			      (FUNCALL FUNCTION REFNAME (1+ CNT) NIL)
+			      ;; And again call it relative to the prefix... Then return.
+			      (RETURN-FROM PKG-PACKAGE-PREFIX
+				(FUNCALL FUNCTION NAME1 CNT (AND (ZEROP CNT) FLAG)))))))))
+	  (CHECK SI:PKG-KEYWORD-PACKAGE)
+	  (DOLIST (PKG *ALL-PACKAGES*) (CHECK PKG)))
+	(FUNCALL FUNCTION "ZL" (1+ CNT) :SYNTAX)
+	;; Package is totally inaccessible, just use its main name I guess ---
+	;; Should this print a # first or check the print-readably flag?
+	;; Should it do something different if the package is invisible?
+	;; Should it still respect ABBREVIATE-P?
+	(SETQ NAME (PKG-PREFIX-NAME TO-PKG))
+	(IF (STRING-EQUAL NAME "") (SETQ NAME (PKG-NAME TO-PKG))))
+      ;; We get here either if we fell through the relative-name thing above,
+      ;; or if we really had a normal, single name...
+      (FUNCALL FUNCTION NAME CNT (AND (ZEROP CNT) FLAG)))))
+
+;; Return a name that gets from FROM-PKG to TO-PKG, or NIL if none.
+;; Try the preferred name first, according to ABBREVIATE-P
+;; This has to hack structure forwarding, or the worst case N^2 algorithm above
+;; will kill us.
+(DEFUN PKG-USEABLE-NAME (TO-PKG FROM-PKG ABBREVIATE-P &OPTIONAL SYNTAX)
+  ;; This new syntax argument needs to be optional so things don't break
+  ;; if the function is called while installing this patch, but can
+  ;; be made to be required later when everything is in place and we've
+  ;; proven everyone passes it that is supposed to. -kmp 7-Oct-89
+  (LET* ((TO-PKG (FOLLOW-STRUCTURE-FORWARDING TO-PKG))
+	 (NAME (IF ABBREVIATE-P (PKG-PREFIX-NAME TO-PKG) (PKG-NAME TO-PKG))))
+    (IF (EQ (FOLLOW-STRUCTURE-FORWARDING
+	      (PKG-FIND-PACKAGE NAME ':FIND FROM-PKG SYNTAX)) TO-PKG)
+	NAME
+	(DOLIST (NAME (PKG-NAME-LIST TO-PKG))
+	  (WHEN (EQ (FOLLOW-STRUCTURE-FORWARDING
+		      (PKG-FIND-PACKAGE NAME ':FIND FROM-PKG SYNTAX))
+		    TO-PKG)
+	    (RETURN NAME))))))
+
+;; Since packages are touched by almost everything...
+;; try to get the name table and the various lists onto as few pages as possible
+
+(DEFVAR *N-PACKAGES-OPTIMIZED* 0)
+
+(DEFINE-GC-OPTIMIZATION PACKAGE-OPTIMIZE :LAYERED-SYSTEM-RELEASE
+  (:DOCUMENTATION "Localize package structures")
+  (:BEFORE-FLIP (IGNORE)
+    ;; CDR-code some lists.
+    ;; Leave this with a CDR-NORMAL on the end since adding a package NCONCs.
+    (SETQ *ALL-PACKAGES* (COPYLIST *ALL-PACKAGES* PKG-AREA T))
+    (DO ((P *ALL-PACKAGES* (CDR P))
+	 PKG)
+	((NULL P))
+      (SETQ PKG (CAR P))
+      (SETF (PKG-RELATIVE-NAMES PKG) (COPYLIST (PKG-RELATIVE-NAMES PKG) PKG-AREA))
+      (SETF (PKG-SELF-AND-USE-LIST PKG) (COPYLIST (PKG-SELF-AND-USE-LIST PKG) PKG-AREA))
+      (SETF (PKG-USED-BY-LIST PKG) (COPYLIST (PKG-USED-BY-LIST PKG) PKG-AREA))
+      (SETF (PKG-SHADOWING-SYMBOLS PKG) (COPYLIST (PKG-SHADOWING-SYMBOLS PKG) PKG-AREA)))
+    (SORT-AARRAY *PACKAGE-NAME-AARRAY*)
+    (SETQ *N-PACKAGES-OPTIMIZED* (LENGTH *ALL-PACKAGES*))))
+
+;; A version which is more careful about consing.
+(DEFUN INCREMENTAL-PACKAGE-OPTIMIZE ()
+  (LET ((SO-FAR *N-PACKAGES-OPTIMIZED*)
+	(LENGTH (LENGTH *ALL-PACKAGES*)))
+    (WHEN (> LENGTH SO-FAR)
+      (LET ((TAIL (IF (ZEROP SO-FAR)
+		      (LOCF *ALL-PACKAGES*)
+		      (NTHCDR (1- SO-FAR) *ALL-PACKAGES*))))
+	(UNLESS (AND TAIL (= (- SO-FAR LENGTH) 1))
+	  (SETF (CDR TAIL) (COPYLIST (CDR TAIL) PKG-AREA T)))
+	(MACROLET ((LOCALIZEF (PLACE)
+		     `(SETF ,PLACE (LOCALIZE-LIST ,PLACE PKG-AREA))))
+	  (DO ((P (CDR TAIL) (CDR P))
+	       PKG)
+	      ((NULL P))
+	    (SETQ PKG (CAR P))
+	    (LOCALIZEF (PKG-RELATIVE-NAMES PKG))
+	    (LOCALIZEF (PKG-SELF-AND-USE-LIST PKG))
+	    (LOCALIZEF (PKG-USED-BY-LIST PKG))
+	    (LOCALIZEF (PKG-SHADOWING-SYMBOLS PKG)))
+	  (SORT-AARRAY *PACKAGE-NAME-AARRAY*)
+	  (SETQ *N-PACKAGES-OPTIMIZED* LENGTH))))))
+
+(ADD-INITIALIZATION "INCREMENTAL-PACKAGE-OPTIMIZE"
+		    '(INCREMENTAL-PACKAGE-OPTIMIZE)
+		    '(BEFORE-COLD))
+
+;;; Bootstrapping
+
+;; This is sent over by the cold load generator.  It is a list of calls
+;; to DEFPACKAGE-INTERNAL (macro expansions of DEFPACKAGE).  First argument
+;; of each call is a string, the package name.
+(DEFVAR BUILD-INITIAL-PACKAGES)
+
+(DEFVAR *COLD-LOAD-DUPLICATED-SYMBOLS*)
+
+;; This is called by LISP-REINITIALIZE the first time we boot in the cold load.
+(DEFUN BUILD-INITIAL-PACKAGES ()
+  (IF (VARIABLE-BOUNDP PKG-AREA)
+      (RESET-AREA PKG-AREA)
+      ;; This used to specify :REGION-SIZE #o3000000, but I think that's vestigial.
+      (SETQ PKG-AREA (MAKE-AREA :NAME 'PKG-AREA :GC ':STATIC)))
+  (SETQ PKG-CODE-SYMBOLS (MAKE-ARRAY 4 :AREA PKG-AREA))
+  (SETF (AREF PKG-CODE-SYMBOLS PKG-INTERNAL-CODE) ':INTERNAL)
+  (SETF (AREF PKG-CODE-SYMBOLS PKG-EXTERNAL-CODE) ':EXTERNAL)
+  (SETF (AREF PKG-CODE-SYMBOLS PKG-INHERITED-CODE) ':INHERITED)
+  
+  (SETQ PACKAGE NIL)				;Gets passed as an arg to PKG-FIND-PACKAGE
+  (SETQ *ALL-PACKAGES* NIL)			;In case called a second time (reset-area done)
+  (SETQ *PACKAGE-NAME-TABLE*
+	(MAKE-ARRAY (* (SETQ *PACKAGE-NAME-TABLE-MODULUS* (PKG-GOOD-SIZE 100)) 2)
+		    :AREA PKG-AREA))
+  (SETQ *PACKAGE-NAME-TABLE-COUNT* 0)
+  (LET ((DEFAULT-CONS-AREA PKG-AREA))
+    (SETQ *PACKAGE-NAME-AARRAY* (MAKE-AARRAY 160. :NAME "package name completion table")))
+  (SETQ *COLD-LOAD-DUPLICATED-SYMBOLS* NIL)
+  
+  (LETF ((#'DEFPACKAGE-INTERNAL #'MAKE-PACKAGE))
+    (LET ((*PACKAGE-BOOTSTRAP-FLAG* T))		;Build packages but don't make any symbols
+      (SETQ *LISP-PACKAGE* (BUILD-INITIAL-PACKAGE "LISP"))
+      (SETQ *SCL-PACKAGE* (BUILD-INITIAL-PACKAGE "SYMBOLICS-COMMON-LISP"))
+      (SETQ PKG-GLOBAL-PACKAGE (BUILD-INITIAL-PACKAGE "GLOBAL"))
+      (SETQ PKG-SYSTEM-PACKAGE (BUILD-INITIAL-PACKAGE "SYSTEM"))
+      (SETQ PKG-NETWORK-PACKAGE (BUILD-INITIAL-PACKAGE "NETWORK"))
+      (INITIALIZE-SELF-EVALUATING-SYMBOL-TABLE)	;needed for keywords
+      (SETQ PKG-KEYWORD-PACKAGE (BUILD-INITIAL-PACKAGE "KEYWORD"))
+      (BUILD-INITIAL-PACKAGE "STORAGE")		;used by SI
+      (SETQ PKG-SYSTEM-INTERNALS-PACKAGE (BUILD-INITIAL-PACKAGE "SYSTEM-INTERNALS"))
+      (SETQ PKG-USER-PACKAGE (BUILD-INITIAL-PACKAGE "ZETALISP-USER"))
+      (SETQ PKG-FONTS-PACKAGE (BUILD-INITIAL-PACKAGE "FONTS"))
+      (SETQ PACKAGE PKG-SYSTEM-INTERNALS-PACKAGE)
+      
+      (DOLIST (FORM BUILD-INITIAL-PACKAGES)
+	(UNLESS (PKG-FIND-PACKAGE (SECOND FORM) ':FIND)
+	  (EVAL FORM)))))
+  
+  (FLET ((FIXUP-SYMBOL-PACKAGE (AREA REGION ADDRESS SYM LEADER SIZE)
+	   (IGNORE AREA REGION ADDRESS LEADER SIZE)
+	   (WHEN (SYMBOLP SYM)
+	     (LET ((PKG-NAME (SYMBOL-PACKAGE SYM)))
+	       (WHEN PKG-NAME
+		 (LET ((PKG (PKG-FIND-PACKAGE PKG-NAME)))
+		   (WITH-PACKAGE-LOCK PKG NIL
+		     (MULTIPLE-VALUE-BIND (OTHER FLAG)
+			 (FIND-SYMBOL-LOCAL (GET-PNAME SYM) PKG)
+		       (WHEN FLAG
+			 (PUSH (CONS SYM OTHER) *COLD-LOAD-DUPLICATED-SYMBOLS*)))
+		     (SETF (SYMBOL-PACKAGE SYM) PKG)
+		     (PKG-NEW-SYMBOL-INTERNAL PKG SYM PKG-INTERNAL-CODE))))))))
+    ;; On the I machine, T and NIL are in VMA=PMA space.
+    #+IMACH (FIXUP-SYMBOL-PACKAGE NIL NIL NIL T NIL NIL)
+    #+IMACH (FIXUP-SYMBOL-PACKAGE NIL NIL NIL NIL NIL NIL)
+    (MAP-OVER-OBJECTS
+      #'(LAMBDA (AREA)
+	  (OR (= AREA SYMBOL-AREA)
+	      (= AREA SAFEGUARDED-OBJECTS-AREA)))	;T, NIL, SYS:UNWIND-PROTECT-TAG
+      #'REGION-PREDICATE-STRUCTURE
+      #'FIXUP-SYMBOL-PACKAGE))
+
+  ;; Have to do the SHADOW commands first so we don't get spurious name conflicts
+  (LETF ((#'DEFPACKAGE-INTERNAL #'PKG-BOOTSTRAP-SHADOW))
+    (MAPC #'EVAL BUILD-INITIAL-PACKAGES))
+
+  (LETF ((#'DEFPACKAGE-INTERNAL #'PKG-BOOTSTRAP-IMPORT-EXPORT))
+    (MAPC #'EVAL BUILD-INITIAL-PACKAGES))
+  
+  ;; Finally check intern the safeguarded symbols.
+  (LOOP FOR PKG IN *ALL-PACKAGES* DO
+    (LOOP FOR SUBLIST ON (PKG-SAFEGUARDED-SYMBOLS PKG)
+	  AS STRING = (CAR SUBLIST) DO
+      (MULTIPLE-VALUE-BIND (SYMBOL FOUND)
+	  (INTERN-LOCAL-SOFT (STRING STRING) PKG)
+	(WHEN (OR (NOT FOUND)
+		  (EQ (ACTUAL-STORAGE-CATEGORY :CONSTANT SYMBOL) :UNSAFEGUARDED))
+	  (ERROR "~S didn't get safeguarded." STRING))
+	(SETF (CAR SUBLIST) SYMBOL))))
+  (SETQ *REASONABLE-PACKAGES* (LIST PKG-GLOBAL-PACKAGE
+				    *LISP-PACKAGE*
+				    (PKG-FIND-PACKAGE "SYMBOLICS-COMMON-LISP")
+				    (PKG-FIND-PACKAGE "FUTURE-COMMON-LISP")))
+
+  (SETF *USER-PACKAGE* (PKG-FIND-PACKAGE "CL-USER"))
+  (ADJUST-HOME-PACKAGES)
+  NIL)
+
+(DEFUN BUILD-INITIAL-PACKAGE (NAME)
+  (LOOP FOR FORM IN BUILD-INITIAL-PACKAGES
+	DO (WHEN (PKG-COMPARE-NAMES (SECOND FORM) NAME)
+	     (RETURN (EVAL FORM)))
+	FINALLY (FERROR "No DEFPACKAGE ~S found" NAME)))
+
+(DEFUN PKG-BOOTSTRAP-SHADOW (NAME &KEY SHADOWING-IMPORT SHADOW IMPORT-FROM &ALLOW-OTHER-KEYS)
+  (LET ((PKG (PKG-FIND-PACKAGE NAME)))
+    (WITH-PACKAGE-LOCK PKG NIL
+      (MAKE-PACKAGE-SHADOW PKG SHADOWING-IMPORT SHADOW IMPORT-FROM))))
+
+(DEFUN PKG-BOOTSTRAP-IMPORT-EXPORT (NAME &KEY IMPORT EXPORT IMPORT-FROM &ALLOW-OTHER-KEYS)
+  (LET ((PKG (PKG-FIND-PACKAGE NAME)))
+    (WITH-PACKAGE-LOCK PKG NIL
+      (MAKE-PACKAGE-IMPORT-EXPORT PKG IMPORT EXPORT IMPORT-FROM))))
+
+;;; Placed here so that DO-***-SYMBOLS can be used.
+(DEFUN MAKE-ALL-SYMBOLS-EXTERNAL (PKG)
+  (DO-LOCAL-SYMBOLS (SYMBOL PKG T)
+    (EXPORT-INTERNAL SYMBOL PKG)))
+
+(DEFUN MAKE-ALL-SYMBOLS-INTERNAL (PKG)
+  (DO-EXTERNAL-SYMBOLS (SYMBOL PKG T)
+    (UNEXPORT-INTERNAL SYMBOL PKG)))
+
+;;; Fix some symbols' home packages
+;;; Too inconvenient to do in the PKGDCL file because of forward references
+;;; This only affects how the symbols print, not how they read
+(DEFUN ADJUST-HOME-PACKAGES ()
+  ;; All the external functions except for SETF want their home package to be CLOS.
+  ;; SETF is special-cased below.
+  (LET ((CLOS (PKG-FIND-PACKAGE "CLOS")))
+    (DO-EXTERNAL-SYMBOLS (SYMBOL CLOS)
+      (SETF (SYMBOL-PACKAGE SYMBOL) CLOS)))
+  (LET ((COND (PKG-FIND-PACKAGE "CONDITIONS")))
+    (DO-EXTERNAL-SYMBOLS (SYMBOL COND)
+      (SETF (SYMBOL-PACKAGE SYMBOL) COND)))
+  (LOOP FOR (SYMBOL PKG) IN '((TV:WITH-NOTIFICATION-MODE "TV")
+			      (COMPILER:INHIBIT-STYLE-WARNINGS-SWITCH "COMPILER")
+			      (COMPILER:OBSOLETE-FUNCTION-WARNING-SWITCH "COMPILER")
+			      (COMPILER:OPEN-CODE-MAP-SWITCH "COMPILER")
+			      (COMPILER:SUPPRESS-COMPILER-WARNINGS "COMPILER")
+			      (CP:READ-COMMAND "CP")
+			      (CP:READ-COMMAND-OR-FORM "CP")
+			      (FUTURE-COMMON-LISP:SETF "FUTURE-COMMON-LISP")
+			      (SCL:*PRINT-READABLY* "SYMBOLICS-COMMON-LISP")
+			      (SCL:FDEFINITION "SYMBOLICS-COMMON-LISP")
+			      (SCL:DESTRUCTURING-BIND "SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-NEGATIVE-NORMALIZED-DOUBLE-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-NEGATIVE-NORMALIZED-LONG-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-NEGATIVE-NORMALIZED-SHORT-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-NEGATIVE-NORMALIZED-SINGLE-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-POSITIVE-NORMALIZED-DOUBLE-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-POSITIVE-NORMALIZED-LONG-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-POSITIVE-NORMALIZED-SHORT-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:LEAST-POSITIVE-NORMALIZED-SINGLE-FLOAT
+				"SYMBOLICS-COMMON-LISP")
+			      (SCL:MAP-INTO "SYMBOLICS-COMMON-LISP")
+			      (FS:LOGICAL-PATHNAME "FS"))
+	DO
+    (SETF (SYMBOL-PACKAGE SYMBOL) (PKG-FIND-PACKAGE PKG))))
+
+
+;;; Package things (Chapter 11)
+;;; Most of the package system just comes from ZL directly
+
+(DEFUN CL:FIND-PACKAGE (NAME)
+  (DECLARE LT:(SIDE-EFFECTS READER))
+  (FIND-PACKAGE-FOR-SYNTAX NAME :COMMON-LISP :FIND))
+
+(DEFUN CL:PACKAGE-NAME (PKG)
+  (DECLARE LT:(SIDE-EFFECTS READER))
+  (CL:CHECK-TYPE PKG ZL:PACKAGE)
+  (PACKAGE-NAME-FOR-SYNTAX PKG :COMMON-LISP NIL))
+
+(DEFUN CL:PACKAGE-NICKNAMES (PKG)
+  (DECLARE LT:(SIDE-EFFECTS READER))
+  (CL:CHECK-TYPE PKG ZL:PACKAGE)
+  (REST1 (SI:PKG-NAME-LIST PKG)))
+
+;;; Brain-damaged arguments, as in the CL (Mary Poppins) manual
+;;; Should be &rest, not &optional
+(DEFUN CL:RENAME-PACKAGE (PKG NEW-NAME &OPTIONAL NEW-NICKNAMES)
+  (CL:APPLY #'SI:RENAME-PACKAGE PKG NEW-NAME NEW-NICKNAMES))
+
+(DEFUN CL:LIST-ALL-PACKAGES ()
+  (DECLARE LT:(SIDE-EFFECTS READER))
+  SI:*ALL-PACKAGES*)
+
+;;; Adjust defaults for making new packages
+
+(DEFUN CL:MAKE-PACKAGE (NAME &REST ARGS &KEY (USE "LISP") (COLON-MODE :EXTERNAL) &ALLOW-OTHER-KEYS)
+  (DECLARE (ARGLIST NAME &KEY NICKNAMES PREFIX-NAME USE SHADOW EXPORT IMPORT
+		    SHADOWING-IMPORT IMPORT-FROM RELATIVE-NAMES
+		    RELATIVE-NAMES-FOR-ME SIZE EXTERNAL-ONLY NEW-SYMBOL-FUNCTION
+		    HASH-INHERITED-SYMBOLS INVISIBLE COLON-MODE
+		    PREFIX-INTERN-FUNCTION INCLUDE))
+  (CL:APPLY #'ZL:MAKE-PACKAGE NAME :USE USE :COLON-MODE COLON-MODE
+	    ARGS))
+
+(DEFUN CL:UNINTERN (SYMBOL &OPTIONAL PKG)
+  (COERCE-PACKAGE-ARG PKG)
+  (REMOB SYMBOL PKG))

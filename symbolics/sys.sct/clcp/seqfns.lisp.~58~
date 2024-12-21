@@ -1,0 +1,2085 @@
+;;; -*- Mode: Lisp; Package: Common-lisp-internals; Syntax: Common-Lisp; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;Chapter 14
+
+(defun sequence-index-error (sequence index variable)
+  (declare (dbg:error-reporter))
+  (error 'sequence-index-out-of-range
+	 :sequence sequence :index index :variable variable))
+
+(defmacro sequence-index-error-f (sequence index)
+  `(sequence-index-error ,sequence ,index ',index))
+
+;;;
+;;; A version of VECTOR-LENGTH which returns the vector's length if it is a vector
+;;; and NIL otherwise.
+;;;
+#+IMACH
+(defun vector-length-when-vectorp (vector)
+   (and (type-member vector dtp-array dtp-string)
+	(with-block-registers (1)
+	  ;; use block register 1 to read the header using the appropriate cycle type.
+	  ;; afterward, we can address other words of the array header relative to it,
+	  ;; since it follows any forwarding pointers.
+	  (setf (%block-register 1) vector)
+	  (let ((header (%set-tag (%block-read 1 :cycle-type %memory-header) dtp-fixnum)))
+	    ;; first do a quick check for a short prefix array with leader-length 0,
+	    ;; returning the short array length field in the header in this common case.
+	    (cond ((not (ldb-test array-leader-length-and-long-prefix-field header))
+		   (ldb array-short-length-field header))
+		  ((not (ldb-test array-long-prefix-bit header))
+		   ;; it's a short-prefix array with a leader.  if the first leader element
+		   ;; is a fixnum, it's a fill-pointer, otherwise return the length.
+		   (let ((fill-pointer
+			    (%memory-read
+			       ;; block register has advanced to one past the header.
+			       (%pointer-plus (%block-register 1) -2))))
+		     (if (cl:typep fill-pointer 'cl:fixnum)
+			 fill-pointer
+			 (ldb array-short-length-field header))))
+		  ;; now we know it's a long-prefix array, possibly with a leader.  however,
+		  ;; it must be one-dimensional, so check that here.
+		  ((= (ldb array-long-dimensions-field header) 1)
+		   ;; if it has a leader and the first element is a fill-pointer, return that.
+		   (if (ldb-test array-leader-length-field header)
+		       (let ((fill-pointer
+			        (%memory-read
+				   ;; block register has advanced to one past the header.
+				   (%pointer-plus (%block-register 1) -2))))
+			 (if (cl:typep fill-pointer 'cl:fixnum)
+			     fill-pointer
+			     ;; return the long length, conveniently located in the next word.
+			     (%block-read 1 :fixnum-only t :prefetch nil)))
+		       (%block-read 1 :fixnum-only t :prefetch nil)
+		       ))
+		  ;; multidimensional arrays are no good
+		  (t nil))))))
+
+(defun elt (sequence index)
+   (declare lt:(side-effects reader reducible))
+   (check-type index (integer 0 *))
+   (cond
+      ((consp sequence)
+       (let ((list sequence))
+	  (dotimes (ignore index)
+	     (setf list (cdr list))
+	     (compiler:%error-unless (consp list)
+		(sequence-index-error-f sequence index)))
+	  ;;
+	  ;;        Without the RETURN-FROM, the compiler generated code sequence to
+	  ;;        return the CAR of the list on Ivory is remarkably inefficient.
+	  ;;
+	  (return-from elt (car list))))
+      #+3600
+      ((vectorp sequence)
+       ;;
+       ;;        ZL:ARRAY-ACTIVE-LENGTH is in the microcode so just use it.
+       ;;
+       (unless (< index (zl:array-active-length sequence))
+	  (sequence-index-error-f sequence index))
+       (return-from elt (aref sequence index)))
+      #+IMACH
+      ((let ((vector-length (vector-length-when-vectorp sequence)))
+	  (when vector-length
+	     (compiler:%error-unless (< index vector-length)
+		(sequence-index-error-f sequence index))
+	     (return-from elt (aref sequence index)))))
+      ((null sequence)
+       (sequence-index-error-f sequence index))
+      (t
+       (compiler:%error-unless nil
+			       (dbg:check-type-1 'sequence sequence 'sequence nil t)
+			       nil))))
+
+;Not global, but needed for SETF to expand into
+(defun setelt (sequence index value)
+   (check-type index (integer 0 *))
+   (cond
+      ((consp sequence)
+       (let ((list sequence))
+	  (dotimes (ignore index)
+	     (setf list (cdr list))
+	     (compiler:%error-unless (consp list)
+		(sequence-index-error-f sequence index)))
+	  (return-from setelt (setf (car list) value))))
+      #+3600
+      ((vectorp sequence)
+       ;;
+       ;;        ZL:ARRAY-ACTIVE-LENGTH is in the microcode so just use it.
+       ;;
+       (unless (< index (zl:array-active-length sequence))
+	  (sequence-index-error-f sequence index))
+       (return-from setelt (setf (aref sequence index) value)))
+      #+IMACH
+      ((let ((vector-length (vector-length-when-vectorp sequence)))
+	  (when vector-length
+	     (compiler:%error-unless (< index vector-length)
+		(sequence-index-error-f sequence index))
+	     (return-from setelt (setf (aref sequence index) value)))))
+      ((null sequence)
+       (sequence-index-error-f sequence index))
+      (t
+       (compiler:%error-unless nil
+			       (dbg:check-type-1 'sequence sequence 'sequence nil t)
+			       nil))))
+
+;; LENGTH is in FUNCTIONS
+
+(defun subseq (sequence start &optional end)
+  (declare lt:(side-effects reader reducible))
+  (ctypecase sequence
+    (vector
+      ;; This code replaces the code below because it is much faster.
+      ;; When we straighten out the type system, we can be more elegant.
+      (let ((array-active-length nil))
+	(unless end
+	  (setq end (setq array-active-length (zl:array-active-length sequence))))
+	(unless (<= start end (or array-active-length (zl:array-active-length sequence)))
+	  (sequence-index-error-f sequence end))
+	(unless (<= 0 start)
+	  (sequence-index-error-f sequence start))
+	(let* ((res-length (- end start))
+	       (res (zl:make-array res-length :type (si:array-type-field sequence))))
+	  (copy-array-portion sequence start end res 0 res-length)
+	  res))
+      #|
+      (let ((length (length sequence)))
+	(unless (<= 0 start length)
+	  (sequence-index-error-f sequence start))
+	(if (null end)
+	    (setq end length))
+	(unless (<= 0 end length)
+	  (sequence-index-error-f sequence end))
+	(let ((array (make-array (- end start)
+				 :element-type (array-element-type sequence))))
+	  (copy-array-portion sequence start end array 0 (- end start))
+	  array)))))
+      |#
+      )
+    (list
+      (let ((length (- (or end (list-length sequence)) start)))
+	(when (or (minusp length) (minusp start))
+	  (sequence-index-error-f sequence start))
+	(let ((list (make-list length)))
+	  (loop with seq = (nthcdr start sequence)
+		for node on list
+		do (when (endp seq)
+		     (sequence-index-error-f sequence end))
+		(setf (car node) (car seq))
+		(setq seq (cdr seq)))
+	  list)))
+    ))
+
+(defun copy-seq (sequence &optional area)
+  (declare lt:(side-effects reader))
+  (ctypecase sequence
+    (list
+      (copy-list sequence area))
+    (vector
+      (let ((array 
+	      ;(make-array (length sequence)
+	      ;		   :element-type (array-element-type sequence)
+	      ;		   :area area)
+	      ;This is faster, by avoiding unnecessary type manipulations
+	      (zl:make-array (zl:array-active-length sequence)
+			     :type (array-type-field sequence)
+			     :area area)))
+	(copy-array-contents sequence array)
+	array))))
+
+(defun reverse (sequence)
+  (declare lt:(side-effects reader))
+  (ctypecase sequence
+    (list
+      (let ((answer nil))
+	(dolist (element sequence answer)
+	  (push element answer))))
+    (vector
+      (let* ((length  (length sequence))
+	     (array (make-array length :element-type (array-element-type sequence))))
+	(dotimes (i length)
+	  (setf (aref array i) (aref sequence (- length i 1))))
+	array))))
+
+(defun nreverse (sequence)
+  (ctypecase sequence
+    (null nil)
+    (list (nreconc sequence nil))
+    (vector
+      (loop for up upfrom 0
+	    and down downfrom (1- (length sequence))
+	    while (> down up)
+	    do (psetf (aref sequence up) (aref sequence down)
+		      (aref sequence down) (aref sequence up)))
+      sequence)))
+
+(compiler:defoptimizer (make-sequence make-sequence-with-constant-type) (form)
+  (block optimizer
+    (compiler:matchp form
+      (('make-sequence type size . keywords)	; at least two args
+       (when (constantp type)
+	 (let ((new-function (case (evaluate-constant type)
+			       ((list) 'make-list)
+			       ((vector array) 'make-array)
+			       ((string simple-string) 'make-string))))
+	   (when new-function
+	     (return-from optimizer `(,new-function ,size ,@keywords)))))))
+    form))
+
+(defun make-sequence (type size &rest keywords)
+  (declare lt:(side-effects reader))
+  (declare (arglist type size &key initial-element area))
+  (si:validate-keywords-internal '(:initial-element :area :element-type) keywords)
+  ;; First handle some cases we want to be fast.
+  (typecase type
+    (symbol
+      (case type
+	((list)
+	 (return-from make-sequence
+	   (apply #'make-list size keywords)))
+	((vector array)
+	 (return-from make-sequence
+	   (apply #'make-array size keywords)))
+	((string simple-string)
+	 (return-from make-sequence
+	   (apply #'make-string size keywords)))))
+    (cons
+      (case (first type)
+	((vector)
+	 (return-from make-sequence
+	   (let ((element-type (second type)))
+	     (apply #'make-array size :element-type (case element-type
+						      ((nil *) t)
+						      (t element-type))
+		    keywords))))
+	((array)
+	 (when (or (< (length type) 3)		;forgive people who say "(array integer)"
+		   (and (>= (length type) 3)
+			(let ((dimensions (third type)))
+			  (if (listp dimensions)
+			      (= (length dimensions) 1)
+			    (eql dimensions 1)))))
+	   (return-from make-sequence
+	     (let ((element-type (second type)))
+	       (apply #'make-array size :element-type (case element-type
+							((nil *) t)
+							(t element-type))
+		      keywords))))))))
+  ;; Decide whether this is a list sequence or an array sequence
+  (cond ((subtypep type 'list)
+	 (apply #'make-list size keywords))
+	;; Can't handle strings here because we will need the encoded element type information
+	;; to decide whether to make it fat.
+	((subtypep type 'vector)
+	 ;; Try to decode the type enough to figure out an element type.
+	 (multiple-value-bind (nil type-name type-args)
+	     (type-expand type '(string array and))
+	   ;; Kludgily strip off SATISFIES for the sake of simple-array types.
+	   (loop while (and (eq type-name 'and)
+			    (= (length type-args) 2)
+			    (listp (second type-args))
+			    (eq (first (second type-args)) 'satisfies))
+		 do (multiple-value-setq (nil type-name type-args)
+		      (type-expand (first type-args) '(string array and))))
+	   ;; Decide what element type to use
+	   (case type-name
+	     (array
+	       (let ((element-type (first type-args)))
+		 (apply #'make-array size :element-type (case element-type
+							  ((nil *) t)
+							  (t element-type))
+			keywords)))
+	     (string
+	       (apply #'make-string size keywords))
+	     (otherwise
+	       (apply #'make-array size keywords)))))
+	(t (error "~S is not a subtype of SEQUENCE." type))))
+
+(defun concatenate (result-type &rest sequences)
+  (declare lt:(side-effects reader))
+  (let ((answer
+	  (make-sequence result-type
+			 (loop for sequence in sequences
+			       summing (length sequence)))))
+    (cond ((listp answer)
+	   (let ((node answer))
+	     (dolist (sequence sequences)
+	       (if (listp sequence)
+		   (dolist (x sequence)
+		     (setf (car node) x)
+		     (setq node (cdr node)))
+		   (let ((sequence sequence))
+		     (declare (sys:array-register sequence))
+		     (loop for j below (zl:array-active-length sequence)
+			   do (setf (car node) (aref sequence j))
+			      (setq node (cdr node))))))))
+	  ((and (stringp answer) (not (string-fat-p answer)))
+	   (macrolet ((check-char (char)
+			(once-only (char)
+			  `(progn
+			     (when (char-fat-p ,char)
+			       (return-array (prog1 answer (setf answer nil)))
+			       (return-from concatenate
+				 (apply #'concatenate '(vector character) sequences)))
+			     ,char))))
+	     (let ((answer answer)
+		   (i 0))
+	       (declare (sys:array-register answer))
+	       (dolist (sequence sequences)
+		 (if (listp sequence)
+		     (dolist (x sequence)
+		       (setf (aref answer i) (check-char x))
+		       (incf i))
+		     (let ((sequence sequence))
+		       (declare (sys:array-register sequence))
+		       (loop for j below (zl:array-active-length sequence)
+			     do (setf (aref answer i) (check-char (aref sequence j)))
+				(incf i))))))))
+	  (t (let ((answer answer)
+		   (i 0))
+	       (declare (sys:array-register answer))
+	       (dolist (sequence sequences)
+		 (if (listp sequence)
+		     (dolist (x sequence)
+		       (setf (aref answer i) x)
+		       (incf i))
+		     (let ((sequence sequence))
+		       (declare (sys:array-register sequence))
+		       (loop for j below (zl:array-active-length sequence)
+			     do (setf (aref answer i) (aref sequence j))
+				(incf i))))))))
+    answer))
+
+(defmacro multi-sequence-map-wrap ((result-length sequence more-sequences &optional index)
+				   &body body)
+  (check-type more-sequences symbol)
+  (when (null index) (setq index (gensym)))
+  `(let (ii sqp sq
+	 (nseq ,(if result-length `(1+ (length ,more-sequences)) 1))
+	 (min-array-length ,(or result-length
+				`(unless (listp ,sequence)
+				    (vector-length ,sequence)))))
+     ;; Get minimum array length.
+     ,@(unless result-length
+	  `((dolist (sq ,more-sequences)
+	      (incf nseq)
+	      (unless (listp sq)
+		 (let ((array-length (vector-length sq)))
+		    (if (null min-array-length)
+			(setq min-array-length array-length)
+			(setq min-array-length (min min-array-length array-length))))))))
+     ;; Copy ,sequences so that invoke-function-on-sequences can rplaca it
+     ;; Avoid consing if there are three or fewer sequences
+     (let* ((elt0 ,sequence)
+	    (elt1 (if ,more-sequences
+		      (pop ,more-sequences)
+		      (progn (si:%set-cdr-code-1 (compiler:%stack-location-internal 0))
+			     nil)))
+	    (elt2 (if ,more-sequences
+		      (pop ,more-sequences)
+		      (progn (si:%set-cdr-code-1 (compiler:%stack-location-internal 0))
+			     nil)))
+	    (elt3 (if ,more-sequences
+		      (pop ,more-sequences)
+		      (progn (si:%set-cdr-code-1 (compiler:%stack-location-internal 0))
+			     nil)))
+	    (elt4 (if (cdr ,more-sequences)
+		      (progn (si:%set-cdr-code-2 (compiler:%stack-location-internal 0))
+			     (copy-list ,more-sequences))
+		      (if ,more-sequences
+			  (prog1 (car ,more-sequences)
+				 (si:%set-cdr-code-1 (compiler:%stack-location-internal 0)))
+			  (progn (si:%set-cdr-code-1 (compiler:%stack-location-internal 0))
+				 nil))))
+	    (sequences (%make-pointer dtp-list (compiler:%stack-location-internal 4))))
+       elt0 elt1 elt2 elt3 elt4
+       (loop named index-loop
+	       ,@(if result-length
+		     `(for ,index below ,result-length)
+		     `(for ,index upfrom 0))
+	     do
+	 (macrolet ((invoke-function (function &optional (use-val t))
+		      `(progn
+			  (setq ii nseq sqp sequences)
+			  (sys:%start-function-call ,function ,use-val nseq nil)
+			  (loop until (zerop ii) doing
+			    (setq sq (car sqp))
+			    (cond ((or (null sq)
+				       (and min-array-length ( ,',index min-array-length)))
+				   ;; One of the subsequences has ended, so abort
+				   ;; this call
+				   #+3600
+				   ;; Restore the stack
+				   (loop until (= ii nseq) doing
+				     (%pop)
+				     (incf ii)
+					 finally
+					   ;; And one more for the function
+					   (%pop))
+				   #+IMACH
+				   ;; Abort the call and restore the stack
+				   (si:abort-call-0 (+ (- nseq ii) 2))
+				   (return-from index-loop nil))
+				  ((listp sq)
+				   (sys:%push (car sq))
+				   (setf (car sqp) (cdr sq)))
+				  (t (sys:%push (aref sq ,',index))))
+			    (setq sqp (cdr sqp))
+			    (decf ii))
+			  (sys:%finish-function-call ,function ,use-val nseq nil))))
+	   ,@body)))))
+
+(defmacro single-sequence-map-wrap ((sequence &optional index) &body body)
+  (let ((array-index (or index (gensym))))
+     `(let ()
+	 (declare (inline vectorp))
+	 (etypecase ,sequence
+	   (list
+	     (macrolet ((invoke-function (predicate &optional ignore)
+			  `(funcall ,predicate elt)))
+	       (let ,(and index `((,index 0)))
+		  (dolist (elt ,sequence)
+		    ,@body
+		    ,@(and index `((incf ,index)))))))
+	   (vector
+	     (macrolet ((invoke-function (predicate &optional ignore)
+			  `(funcall ,predicate (aref array ,',array-index))))
+	       (let ((array ,sequence))
+		  (declare (sys:array-register array))
+		  (dotimes (,array-index (vector-length array))
+		    ,@body))))))))
+
+(defmacro single-else-multiple-sequence-map-wrap ((result-length sequence more-sequences
+						   &optional index)
+						  &body body)
+   `(if (null ,more-sequences)
+	(single-sequence-map-wrap (,sequence ,index)
+	   ,@body)
+	(multi-sequence-map-wrap (,result-length ,sequence ,more-sequences ,index)
+	   ,@body)))
+
+;;;
+;;;	Optimizer to try and inline (map nil function sequence).
+;;;
+(compiler:define-compile-only-optimizer (map maybe-inline-map-function) (form)
+  (compiler:matchp form
+    (('map nil function sequence)
+     (let ((function-symbol (gensymbol "FUNCTION-"))
+	   (sequence-symbol (gensymbol "SEQUENCE-"))
+	   (vector-symbol (gensymbol "VECTOR-"))
+	   (vector-control (gensymbol "VECTOR-"))
+	   (vector-base (gensymbol "VECTOR-"))
+	   (vector-register-length (gensymbol "VECTOR-"))
+	   (vector-length (gensymbol "VECTOR-"))
+	   (vector-index (gensymbol "VECTOR-"))
+	   (end-test (gensymbol "END-TEST-"))
+	   (loop-body (gensymbol "LOOP-BODY-")))
+       (return-from maybe-inline-map-function
+	 (lt:let-subst
+	   `(,function-symbol)
+	   `(,function)
+	   `(let* ((,sequence-symbol ,sequence))
+	      (multiple-value-bind (,vector-symbol ,vector-control ,vector-base
+				    ,vector-register-length ,vector-length ,vector-index)
+		  (if (listp ,sequence-symbol)
+		      (values nil nil nil nil nil nil)
+		      (multiple-value-bind (,vector-symbol ,vector-control
+					    ,vector-base ,vector-register-length)
+			  (sys:setup-1d-array ,sequence-symbol)
+			(values ,vector-symbol ,vector-control ,vector-base
+				,vector-register-length
+				(1- (length ,vector-symbol))
+				-1)))
+		(tagbody
+		  (go ,end-test)
+		  ,loop-body
+		  (funcall ,function-symbol (if (null ,vector-index)
+						(pop ,sequence-symbol)
+						(sys:fast-aref-1
+						  ,vector-index
+						  (progn
+						    ,vector-symbol
+						    ,vector-control
+						    ,vector-base
+						    ,vector-register-length
+						    ,vector-length
+						    ,vector-control))))
+		  ,end-test
+		  (cond
+		    ((null ,vector-index)
+		     (when ,sequence-symbol (go ,loop-body)))
+		    (t
+		     (and (prog1 (< ,vector-index ,vector-length)
+				 (incf ,vector-index))
+			  (go ,loop-body)))))
+		nil))
+	   compiler:*optimizer-environment*)))))
+  form)
+
+(defun map (result-type function sequence &rest more-sequences)
+  (declare (sys:downward-funarg function))
+  (functionally-evaluate function)
+  (if (null result-type)
+      (progn (single-else-multiple-sequence-map-wrap (nil sequence more-sequences)
+	       (invoke-function function nil))
+	     nil)
+      (let* ((result-length (loop with min = (length sequence)
+				  for sequence in more-sequences
+				  do (setq min (min (length sequence) min))
+				  finally (return min)))
+	     (result (make-sequence result-type result-length)))
+	 (if (listp result)
+	     (let ((result-list result))	;tail pointer
+		(single-else-multiple-sequence-map-wrap
+		  (result-length sequence more-sequences)
+		  (setf (car result-list) (invoke-function function))
+		  (setq result-list (cdr result-list))))
+	     (let ((thin-string-p (and (stringp result) (not (string-fat-p result))))
+		   (result-array result))
+		(declare (sys:array-register result-array))
+		(single-else-multiple-sequence-map-wrap
+		    (result-length sequence more-sequences index)
+		  (let ((elem (invoke-function function)))
+		     (when (and thin-string-p (char-fat-p elem))
+			       ;; Result should have been a fat string
+			       (stack-let ((copy (make-array index
+							     :element-type 'string-char)))
+				 (copy-array-portion result 0 index copy 0 index)
+				 (return-array result)
+				 (setq thin-string-p nil)
+				 (setq result (make-array result-length
+							  :element-type 'character))
+				 (copy-array-portion copy 0 index result 0 index)
+				 (setq result-array result)))
+		     (setf (aref result-array index) elem)))))
+	 result)))
+
+(defun map-into (result-sequence function &rest sequences)
+  (declare (sys:downward-funarg function))
+  (when (null result-sequence) (return-from map-into nil))
+  (functionally-evaluate function)
+  (block map
+    (cond ((null sequences)
+	   (etypecase result-sequence
+	     (list
+	       (let ((result-list result-sequence))
+		 (dotimes (ignore (length result-sequence))
+		   (setf (car result-list) (funcall function))
+		   (setf result-list (cdr result-list)))))
+	     (vector
+	       (let ((result-array result-sequence))
+		 (declare (sys:array-register result-array))
+		 (dotimes (index (array-total-size result-array))
+		   (setf (aref result-array index) (funcall function)))
+		 (when (array-has-fill-pointer-p result-array)
+		   (setf (fill-pointer result-array) (array-total-size result-array)))))))
+	  ((null (cdr sequences))
+	   (let ((sequence (car sequences)))
+	     (if (listp result-sequence)
+		 (let ((result-list result-sequence))
+		   (single-sequence-map-wrap (sequence)
+		     (setf (car result-list) (invoke-function function))
+		     (setf result-list (cdr result-list))
+		     (when (null result-list) (return-from map))))
+		 (let ((result-length (array-total-size result-sequence))
+		       (times-invoked 0)
+		       (result-array result-sequence))
+		   (declare (sys:array-register result-array))
+		   (block wrap
+		     (single-sequence-map-wrap (sequence index)
+		       (when (= index result-length)
+			 (return-from wrap))
+		       (setf (aref result-array index) (invoke-function function))
+		       (incf times-invoked)))
+		   (when (array-has-fill-pointer-p result-array)
+		     (setf (fill-pointer result-array) times-invoked))))))
+	  (t
+	   (let* ((result-listp (and (listp result-sequence) result-sequence))
+		  (result-length (and (not result-listp) (array-total-size result-sequence)))
+		  (times-invoked 0)
+		  (first-sequence (car sequences))
+		  (other-sequences (cdr sequences)))
+	     (block wrap
+	       (multi-sequence-map-wrap (nil first-sequence other-sequences index)
+		 (let ((elem (invoke-function function)))
+		   (cond (result-listp
+			  (setf (car result-listp) elem)
+			  (setf result-listp (cdr result-listp))
+			  (when (null result-listp) (return-from map)))
+			 (t
+			  (when (= index result-length)
+			    (return-from wrap))
+			  (setf (aref result-sequence index) elem)
+			  (incf times-invoked))))))
+	     (when (and (not result-listp) (array-has-fill-pointer-p result-sequence))
+	       (setf (fill-pointer result-sequence) times-invoked))))))
+  result-sequence)
+
+(defmacro define-sequence-mapping-predicate (name (predicate sequence .&rest. more-sequences)
+					     fall-through-value &body body)
+   (check-type name symbol)
+   (check-type predicate symbol)
+   (check-type sequence symbol)
+   (check-type .&rest. (member &rest))
+   (check-type more-sequences symbol)
+   `(progn
+       (record-source-file-name ',name 'define-sequence-mapping-predicate)
+       (defun ,name (,predicate ,sequence &rest ,more-sequences)
+	  (declare (sys:function-parent ,name define-sequence-mapping-predicate))
+	  (declare (sys:downward-funarg ,predicate))
+	  (functionally-evaluate ,predicate)
+	  (block ,name
+	     (single-else-multiple-sequence-map-wrap (nil ,sequence ,more-sequences)
+		,@body)
+	     ,fall-through-value))))
+
+(define-sequence-mapping-predicate some (predicate sequence &rest more-sequences)
+   nil
+   (let ((tem (invoke-function predicate)))
+      (when tem
+	 (return-from some tem))))
+
+(define-sequence-mapping-predicate every (predicate sequence &rest more-sequences)
+   t
+   (unless (invoke-function predicate)
+      (return-from every nil)))
+
+(define-sequence-mapping-predicate notany (predicate sequence &rest more-sequences)
+   t
+   (when (invoke-function predicate)
+      (return-from notany nil)))
+
+(define-sequence-mapping-predicate notevery (predicate sequence &rest more-sequences)
+   nil
+   (unless (invoke-function predicate)
+      (return-from notevery t)))
+
+;;;
+;;;	Optimizer to try and inline (reduce function sequence).
+;;;
+(compiler:define-compile-only-optimizer (reduce maybe-inline-reduce-function) (form)
+   (compiler:matchp form
+      (('reduce function sequence)
+       (let ((block-symbol (gensymbol "BLOCK-"))
+	     (null-sequence-block-symbol (gensymbol "NULL-SEQUENCE-"))
+	     (function-symbol (gensymbol "FUNCTION-"))
+	     (vector-symbol (gensymbol "VECTOR-"))
+	     (sequence-symbol (gensymbol "SEQUENCE-"))
+	     (vector-index (gensymbol "VECTOR-"))
+	     (vector-length (gensymbol "VECTOR-"))
+	     (vector-register-length (gensymbol "VECTOR-"))
+	     (vector-control (gensymbol "VECTOR-"))
+	     (vector-base (gensymbol "VECTOR-"))
+	     (end-test (gensymbol "END-TEST-"))
+	     (loop-body (gensymbol "LOOP-BODY-"))
+	     (initial-value (gensymbol "INITIAL-VALUE-")))
+	  (return-from maybe-inline-reduce-function
+	     (lt:let-subst
+	       `(,function-symbol)
+	       `(,function)
+	       `(block ,block-symbol
+		   (block ,null-sequence-block-symbol
+		     (let* ((,sequence-symbol ,sequence))
+		       (multiple-value-bind (,vector-symbol
+					     ,vector-control ,vector-base
+					     ,vector-register-length
+					     ,initial-value ,vector-length ,vector-index)
+			   (if (listp ,sequence-symbol)
+			       (if (consp ,sequence-symbol)
+				   (values nil nil nil nil (pop ,sequence-symbol) nil nil)
+				   (return-from ,null-sequence-block-symbol))
+			       (multiple-value-bind (,vector-symbol ,vector-control
+						     ,vector-base ,vector-register-length)
+				   (sys:setup-1d-array ,sequence-symbol)
+				 (let ((,initial-value nil)
+				       (,vector-length (length ,sequence-symbol)))
+				   (cond ((> ,vector-length 0)
+					  (setf ,vector-length (1- ,vector-length))
+					  (setf ,initial-value
+						(sys:fast-aref-1 0 ,vector-control))
+					  (values ,vector-symbol ,vector-control ,vector-base
+						  ,vector-register-length
+						  ,initial-value ,vector-length 0))
+					 (t
+					  (return-from ,null-sequence-block-symbol))))))
+			 (tagbody
+			   (go ,end-test)
+			   ,loop-body
+			   (setq ,initial-value
+				 (funcall ,function-symbol
+					  ,initial-value
+					  (if (null ,vector-index)
+					      (pop ,sequence-symbol)
+					      (sys:fast-aref-1
+						,vector-index
+						(progn
+						  ,vector-symbol
+						  ,vector-base
+						  ,vector-register-length
+						  ,vector-control)))))
+			   ,end-test
+			   (cond
+			     ((null ,vector-index)
+			      (when ,sequence-symbol (go ,loop-body)))
+			     (t
+			      (and (prog1 (< ,vector-index ,vector-length)
+					  (incf ,vector-index))
+				   (go ,loop-body)))))
+			 (return-from ,block-symbol ,initial-value))))
+		   ;; fall through to here when the sequence is empty
+		   (compiler-let
+		     ((compiler:inhibit-wrong-number-of-arguments-warning-switch t))
+		     ;;
+		     ;;   Make sure the compiler doesn't complain
+		     ;;   about forms like (funcall #'max).
+		     ;;
+		     (funcall ,function-symbol)))
+	       compiler:*optimizer-environment*)))))
+   form)
+
+(defun reduce (function sequence
+	       &key from-end (start 0) end (initial-value nil initial-value-p)
+	       (key #'identity))
+  (declare (sys:downward-funarg function key))
+  (functionally-evaluate function)
+  (if (and (listp sequence) from-end)
+      (return-from reduce
+	(reverse-list-reduce function sequence start end initial-value initial-value-p key)))
+  (sequence-check-and-default-limits sequence)
+  (let ((value (cond (initial-value-p
+		      initial-value)
+		     ((and end (= start end))	;empty vector
+		      (funcall function))
+		     (from-end			;guaranteed to be a vector
+		      (decf end)
+		      (funcall key (aref sequence end)))
+		     (t
+		      (prog1
+			(typecase sequence
+			  (list
+			    (let ((cons (nthcdr start sequence)))  ;will loop again, too bad
+			      (cond (cons
+				     (cond ((or (and (null (cdr cons))
+						     (null end))
+						(and end
+						     (= end (1+ start))))
+					    (return-from reduce (funcall key (car cons))))
+					   (t (funcall key (car cons)))))
+				    (t		;list null at this point
+				     (if (or (null end)
+					     (= end start))
+					 (return-from reduce (funcall function))
+					 (sequence-index-error-f sequence start))))))
+			  (vector (funcall key (aref sequence start))))
+			(incf start))))))
+    (sequence-iterator sequence
+		       :forward-form
+		       (setq value (funcall function value (funcall key (sequence-element))))
+		       :backward-form
+		       (setq value (funcall function (funcall key (sequence-element)) value)))
+    value))
+
+(defun reverse-list-reduce
+       (rlr-function rlr-sequence start rlr-end rlr-initval rlr-initval-p rlr-key
+	&aux (sequence rlr-sequence))
+  (declare (sys:downward-funarg rlr-function rlr-key))
+  (labels ((reverse-list-reduce-recurse-indefinite
+	      (sequence)
+	     (declare (sys:downward-function))
+	     (cond ((null sequence)
+		    rlr-initval)
+		   ((and (null (cdr sequence))
+			 (not rlr-initval-p))
+		    (funcall rlr-key (car sequence)))
+		   (t (funcall rlr-function (funcall rlr-key (car sequence))
+			       (reverse-list-reduce-recurse-indefinite (cdr sequence))))))
+	   (reverse-list-reduce-recurse-numbered
+	      (sequence end)
+	     (declare (sys:downward-function))
+	     (cond ((zerop end)
+		    ;;Should only get here if initval-p
+		    rlr-initval)
+		   ((null sequence)
+		    (error 'sequence-index-out-of-range :sequence rlr-sequence
+			   :index rlr-end
+			   :variable 'end))	;(neq ',variable ',index), uncommon case
+		   ((and (= end 1)
+			 (not rlr-initval-p))
+		    (funcall rlr-key (car sequence)))
+		   (t (funcall rlr-function (funcall rlr-key (car sequence))
+			       (reverse-list-reduce-recurse-numbered (cdr sequence)
+								     (1- end)))))))
+    (dotimes (i start)
+      (setq sequence (cdr sequence))
+      (if (and (null sequence)
+	       (< i (1- start)))
+	  (sequence-index-error-f sequence start)))
+    (cond ((null sequence)
+	   (if rlr-initval-p
+	       rlr-initval
+	       (funcall rlr-function)))
+	  ((null rlr-end)
+	   (reverse-list-reduce-recurse-indefinite sequence))
+	  (t
+	   (reverse-list-reduce-recurse-numbered sequence (- rlr-end start))))))
+
+;;;
+
+(defun fill (sequence item &key (start 0) end)
+  (fill-fast sequence item start end))
+
+(defun fill-fast (sequence item &optional (start 0) end)
+  (sequence-check-and-default-limits sequence)
+  (cond ((and (arrayp sequence) (> (- end start) 20))
+	 (si:fast-fill-array-portion sequence start end item))
+	(t (sequence-iterator sequence
+			      :forward-form (store-sequence-element item)
+			      :backward-form nil)))
+  sequence)
+
+(compiler:defoptimizer (fill fill-fast-optimizer fill-fast) (form)
+  (block optimizer
+    (compiler:matchp form
+      (('fill sequence item . args)
+       (unless (evenp (length args)) (return-from optimizer form))
+       (let ((sequence-var (gensym))
+	     (item-var (gensym))
+	     start-var end-var
+	     (vars nil) (vals nil))
+	 (loop until (null args) do
+	   (let ((keyword (pop args))
+		 (value (pop args)))
+	     (unless (constantp keyword compiler:*optimizer-environment*)
+	       (return-from optimizer form))
+	     (push (gensym) vars)
+	     (push value vals)
+	     (select (evaluate-constant keyword compiler:*optimizer-environment*)
+	       ;; for duplicate keywords, take the first
+	       (:start (unless start-var
+			 (setq start-var (first vars))))
+	       (:end   (unless end-var
+			 (setq end-var (first vars))))
+	       (otherwise (return-from optimizer form)))))
+	 (let-subst `(,sequence-var ,item-var ,@(nreverse vars))
+		    `(,sequence ,item ,@(nreverse vals))
+		    (cond (end-var `(fill-fast ,sequence-var ,item-var
+					       ,(or start-var 0) ,end-var))
+			  (start-var `(fill-fast ,sequence-var ,item-var ,start-var))
+			  (t `(fill-fast ,sequence-var ,item-var)))
+		    compiler:*optimizer-environment*)))
+      (* form))))
+
+;;;
+
+(defun replace (sequence1 sequence2 &key (start1 0) end1 (start2 0) end2)
+  (sequence-check-and-default-limits sequence1 start1 end1)
+  (sequence-check-and-default-limits sequence2 start2 end2)
+  (when (and (eq sequence1 sequence2)
+	     (> start1 start2)
+	     (not (and end2 ( end2 start1))))
+    ;; Sequences overlap and left-to-right copy would fail
+    (when (arrayp sequence1)
+      ;; Use right-to-left copy for arrays
+      (let ((len (min (- end1 start1) (- end2 start2))))
+	(loop repeat len
+	      for i downfrom (+ start1 len -1)
+	      for j downfrom (+ start2 len -1)
+	      do (setf (aref sequence1 i) (aref sequence1 j))))
+      (return-from replace sequence1))
+    ;; Lists overlap: copy the damned thing and start all over again.
+    ;; The out-of-bounds error will come from subseq.
+    (setq sequence2 (subseq sequence2 start2 end2)
+	  end2 (and end2 (- end2 start2))
+	  start2 0))
+  (cond ((arrayp sequence1)
+	 (cond ((arrayp sequence2)
+		(let ((len (min (- end1 start1) (- end2 start2))))
+		  (si:copy-array-portion-internal sequence2 start2 (+ start2 len)
+						  sequence1 start1 (+ start1 len))))
+	       (t (sequence-iterator sequence2
+				     :backward-form nil
+				     :start start2 :end end2
+				     :forward-form
+				     (if ( start1 end1)
+					 (return-from replace sequence1)
+					 (progn
+					   (setf (aref sequence1 start1) (sequence-element))
+					   (incf start1)))))))
+	(t (let ((end1a (and end1 (- end1 start1)))
+		 (target sequence1))
+	     (dotimes (i start1)
+	       (declare (ignore i))
+	       (setq target (cdr target)))
+	     (sequence-iterator sequence2
+				:start start2 :end end2
+				:backward-form nil
+				:forward-form
+				(cond ((eql end1a 0)
+				       (return-from replace sequence1))
+				      ((null target)
+				       (if (null end1a)
+					   (return-from replace sequence1)
+					   (sequence-index-error-f sequence1 end1)))
+				      (t 
+				       (rplaca target (sequence-element))
+				       (setq target (cdr target))
+				       (if end1a (decf end1a))))))))
+  sequence1)
+
+(deftest-key-macro nsubstitute-
+		   ((:global-arglist nil
+		     (sequence &key from-end (start 0) end count &aux (rlseq sequence)))
+		    (:2arg-fast nsubstitute-fast (newitem olditem sequence))
+		    (:2arg-seqfast nil)
+		    (:2arg nsubstitute (newitem olditem))
+		    (:2arg-test nsubstitute-test (newitem olditem sequence test))
+		    (:if nsubstitute-if olditem)
+		    (:if-not nsubstitute-if-not olditem))
+		   nil
+  (sequence-check-and-default-limits sequence)
+  (when-test-key-macro-slow
+    (reverse-list-check-macro olditem))
+  (sequence-iterator sequence
+		     :reverse-list-code :default
+		     :forward-form
+		     (when (test-key-macro-test (sequence-element) olditem)
+		       (when-test-key-macro-slow
+			 (when (and count (not (plusp count)))
+			   (return nil)))
+		       (store-sequence-element newitem)
+		       (when-test-key-macro-slow
+			 (when count (decf count)))))
+  sequence)
+
+(define-keyword-to-positional-arguments-optimizers nsubstitute
+  (newitem olditem sequence
+   &key (test #'eql) test-not (key #'identity) from-end (start 0) end count)
+  ((newitem olditem sequence :test test) (nsubstitute-test newitem olditem sequence test)))
+
+(deftest-key-macro substitute-
+		   ((:global-arglist nil
+		     (sequence &key from-end (start 0) end count &aux (rlseq sequence)))
+		    (:2arg-fast substitute-fast (newitem olditem sequence))
+		    (:2arg-seqfast nil)
+		    (:2arg substitute (newitem olditem))
+		    (:2arg-test substitute-test (newitem olditem sequence test))
+		    (:if substitute-if olditem)
+		    (:if-not substitute-if-not olditem)
+		    )
+		   nil
+  (if (not (listp sequence))			;listp faster than vectorp, works in cold-load
+      (test-key-macro-case
+	(:2arg-seqfast (return-from substitute
+			 (nsubstitute-fast newitem olditem (copy-seq sequence))))
+	(:2arg-fast (return-from substitute-fast
+		      (nsubstitute-fast newitem olditem (copy-seq sequence))))
+	(:2arg (return-from substitute
+		 (nsubstitute newitem olditem (copy-seq sequence) :from-end from-end
+			      :start start :end end :count count
+			      :test test :test-not (if not-test nil test)
+			      :key key)))
+	(:2arg-test (return-from substitute-test
+		      (nsubstitute-test newitem olditem (copy-seq sequence) test)))
+	(:if (return-from substitute-if
+	       (nsubstitute-if newitem predicate (copy-seq sequence)
+			       :from-end from-end :key key
+			       :start start :end end :count count)))
+	(:if-not (return-from substitute-if-not
+		   (nsubstitute-if-not newitem predicate (copy-seq sequence) :from-end from-end
+				       :start start :end end :count count :key key)))))
+  (when-test-key-macro-slow
+    (reverse-list-check-macro olditem))
+  (let* ((output sequence)
+	 (output-ptr (locf output))
+	 (unshared-output-ptr (locf output)))
+    (when-test-key-macro-slow
+      (when (and from-end (neq rlseq sequence))
+	(loop until (eq (cdr output-ptr) rlseq)
+	      do (setq output-ptr (cdr output-ptr)))))
+    (sequence-iterator sequence
+		       :reverse-list-code :default
+		       :else-list-form (setq output-ptr (cdr output-ptr))
+		       :list-only t
+		       :forward-form
+		       (cond ((test-key-macro-test (sequence-element) olditem)
+			      (when-test-key-macro-slow
+				(when (and count (not (plusp count)))
+				  (return nil)))
+			      (unshare-list-macro output-ptr unshared-output-ptr)
+			      (rplacd output-ptr (cons newitem (cdr (sequence-node))))
+			      (setq output-ptr (cdr output-ptr)
+				    unshared-output-ptr output-ptr)
+			      (when-test-key-macro-slow
+				(when count (decf count))))
+			     (t (setq output-ptr (cdr output-ptr)))))
+    output))
+
+(define-keyword-to-positional-arguments-optimizers substitute
+  (newitem olditem sequence
+   &key (test #'eql) test-not (key #'identity) from-end (start 0) end count)
+  ((newitem olditem sequence :test test) (substitute-test newitem olditem sequence test)))
+
+(deftest-key-macro find-skip-match-
+		   ((:2arg find-skip-match (item sequence howmany))
+		    (:2arg-fast find-skip-match-fast (item sequence howmany))
+		    (:2arg-seqfast nil)		;needed to generate fast inline case
+		    (:if find-skip-match-if item)
+		    (:if-not find-skip-match-if-not item))
+		   nil
+  (loop for x upfrom 0
+	when (test-key-macro-test (car sequence) item)
+	do (decf howmany)
+	(when (zerop howmany)
+	  (return (values (cdr sequence) (1+ x))))
+	do (pop sequence)))
+
+(defmacro defseqfn-1 (&rest args)
+  (declare (arglist name body &key auxvars finally reverse-list-code force-fast-with-index
+				   side-effects))
+  (apply #'defseqfn-1-function args))
+
+(defprop defseqfn-1 deftest-key-macro zwei:definition-function-spec-type)
+
+(eval-when (compile load eval)
+(defun defseqfn-1-function (name forward-form
+			     &key auxvars finally reverse-list-code force-fast-with-index
+				  side-effects if-fast if-not-fast)
+  (setq name (symbol-name name))
+  (let ((namel (string-length name)))
+    (unless (string-equal "-" (subseq name (1- namel) namel))
+      (error "DEFSEQFN-1 name ~S must end in hyphen" name))
+    `(deftest-key-macro ,(intern name)
+			((:global-arglist nil
+			  (sequence &key from-end (start 0) end))
+			 (:2arg-fast ,(intern (string-append name "FAST"))
+			  (item sequence))
+			 (:2arg ,(intern (subseq name 0 (1- namel))) (item))
+			 (:2arg-seqfast)
+			 (:if ,(intern (string-append name "IF")) item)
+			 ,@(when if-fast
+			     (ncons (list ':if-fast
+					  (intern (string-append name "IF-FAST"))
+					  if-fast)))
+			 (:if-not ,(intern (string-append name "IF-NOT")) item)
+			 ,@(when if-not-fast
+			     (ncons (list ':if-not-fast
+					  (intern (string-append name "IF-NOT-FAST"))
+					  if-not-fast))))
+			()
+       ,@(when side-effects `((declare lt:(side-effects ,@side-effects))))
+       (sequence-check-and-default-limits sequence)
+       (let ,auxvars
+	 (or (sequence-iterator sequence
+				:force-fast-with-index ,force-fast-with-index
+				:reverse-list-code ,reverse-list-code
+				:forward-form ,forward-form)
+	     ,finally)))))
+);eval-when
+
+(defseqfn-1 find-
+  (let ((element (sequence-element)))
+    (compiler:%error-when (test-key-macro-test element item)
+      (return element)))
+  :side-effects lt:(reader)
+  :reverse-list-code
+  (let ((last-element nil))
+    (sequence-iterator sequence
+		       :forward-list-only t
+		       :forward-form
+		       (let ((element (sequence-element)))
+			 (compiler:%error-when (test-key-macro-test element item)
+			   (setq last-element element))))
+    last-element)
+  :if-fast (predicate sequence))
+
+;; Must be defined before the following optimizer
+(defsubst find-positional-using-assoc (item sequence)
+  (declare (notinline find-positional))
+  ;; This rather strange looking expression generates the ASSOC inline
+  ;; and the call to FIND-POSITIONAL out of line.  It's too bad there's
+  ;; no COMPILER:%ERROR-IF ...
+  (compiler:%error-unless (and item
+			       (listp sequence)
+			       (return-from find-positional-using-assoc (assoc item sequence)))
+      (find-positional item sequence #'eql nil #'car nil 0 nil)))
+
+(compiler:defoptimizer (find-positional find-positional->assoc) (form)
+  (destructuring-bind (fp element sequence test test-not key from-end start end) form
+    (declare (ignore fp))
+    (cond ((and (equal test '#'eql)
+		(null test-not)
+		(or (equal key '#'car) (equal key '#'first))
+		(null from-end)
+		(eql start 0)
+		(null end))
+	   `(find-positional-using-assoc ,element ,sequence))
+	  (t form))))
+
+(defseqfn-1 position-
+  (compiler:%error-when (test-key-macro-test (sequence-element) item)
+    (return .index.))
+  :side-effects lt:(reader)
+  :force-fast-with-index t
+  :reverse-list-code
+  (let ((last-element-position nil))
+    (sequence-iterator sequence
+		       :forward-list-only t
+		       :force-fast-with-index t
+		       :forward-form
+		       (compiler:%error-when (test-key-macro-test (sequence-element) item)
+			 (setq last-element-position .index.)))
+    last-element-position))
+
+(defseqfn-1 count-
+  (compiler:%error-when (test-key-macro-test (sequence-element) item)
+    (incf count))
+  :side-effects lt:(reader)
+  :auxvars ((count 0)) :finally count
+  :reverse-list-code
+  (sequence-iterator sequence
+		     :forward-list-only t
+		     :forward-form
+		     (compiler:%error-when (test-key-macro-test (sequence-element) item)
+		       (incf count))))
+
+(define-keyword-to-positional-arguments-function
+  (delete-duplicates delete-duplicates-positional)
+  (sequence &key (test #'eql) test-not (start 0) end from-end key replace)
+;  (declare (sys:downward-funarg *))
+  (declare (sys:downward-funarg test test-not key))
+  (sequence-check-and-default-limits sequence)
+  (when replace (setq from-end t))
+  (let ((not-test nil))
+    (if test-not
+	(setq test test-not)
+	(setq not-test t))
+    (functionally-evaluate key)
+    (functionally-evaluate test)
+    (cond ((listp sequence)
+	   (let ((seq sequence)
+		 (unique-ptr (locf sequence))
+		 (start-ptr (locf sequence)))
+	     (loop for index upfrom 0 do
+	       (cond ((< index start)
+		      (setq unique-ptr seq
+			    start-ptr seq
+			    seq (cdr seq)))
+		     ((eql index end)
+		      (return sequence))
+		     ((null seq)
+		      (if end
+			  (sequence-index-error-f sequence end)
+			  (return sequence)))
+		     ((if from-end
+			  (let ((tseq (cdr start-ptr))	;is a duplicate
+				(uptr (cdr unique-ptr)))
+			    (loop with element = (if key (funcall key (car seq)) (car seq))
+				  until (eq tseq uptr)
+				  do (when (eq not-test
+					       (notnull (funcall test
+								 (if key
+								     (funcall key (car tseq))
+								     (car tseq))
+								 element)))
+				       ;; (car tseq) is an earlier duplicate of (car seq)
+				       (when replace
+					 (setf (car tseq) (car seq)))
+				       (return t))
+				     (setq tseq (cdr tseq))))
+			  ;; From beginning
+			  (loop with element = (if key (funcall key (car seq)) (car seq))
+				for test-element in (cdr seq)
+				for index from (1+ index)
+				until (eql index end)
+				thereis (eq not-test
+					    (notnull (funcall test element
+							      (if key
+								  (funcall key test-element)
+								  test-element))))))
+		      ;; Splice (car seq) out of the list
+		      (cond ((and (listp unique-ptr)	;Not locative
+				  (= (%p-cdr-code unique-ptr) cdr-next))
+			     ;; Splice out of list without consing and
+			     ;; without delocalizing the list
+			     (%p-store-cdr-and-contents seq (setq seq (cdr seq)) cdr-nil)
+			     (%p-store-cdr-code unique-ptr cdr-normal))
+			    (t (rplacd unique-ptr (setq seq (cdr seq))))))
+		     (t			;not a duplicate
+		      (setq unique-ptr seq
+			    seq (cdr seq)))))))
+	  ((vectorp sequence)
+	   (let ((unique-index start))
+	     (loop for index upfrom start below (length sequence)
+		   finally (progn
+			     (if (array-has-leader-p sequence)
+				 (setf (fill-pointer sequence) unique-index))
+			     (zl:adjust-array-size sequence unique-index))
+		   as element = (aref sequence index)
+		   as test-element = (if key (funcall key element) element)
+		   do
+		   (cond ((or ( index end)
+			      (if from-end
+				  (loop for tindex upfrom start below unique-index
+					as elt = (aref sequence tindex)
+					do (when (eq not-test
+						     (notnull
+						       (funcall test
+								(if key (funcall key elt) elt)
+								test-element)))
+					     ;; elt is an earlier duplicate of element
+					     (when replace
+					       (setf (aref sequence tindex) element))
+					     (return nil))
+					finally (return t))	;never duplicated
+				  (loop for tindex upfrom (1+ index) below end
+					as elt = (aref sequence tindex)
+					never (eq not-test
+						  (notnull
+						    (funcall
+						      test test-element
+						      (if key (funcall key elt) elt)))))))
+			  ;; Not a duplicate
+			  (setf (aref sequence unique-index) element)
+			  (incf unique-index)))))
+	   sequence)
+	  (t (error "Not a sequence: ~S" sequence))))) 
+
+(defun delete-duplicates-fast (sequence)
+  (cond ((consp sequence)
+	 (prog ((seq sequence)
+		(unique-ptr (locf sequence)))
+	    loop-body
+	       (when (loop with element = (car seq)
+			   for test-element in (cdr seq)
+			   thereis (eql element test-element))
+		 ;;
+		 ;;        Splice (car seq) out of the list
+		 ;;
+		 (cond ((and (listp unique-ptr)	; Not locative
+			     (= (%p-cdr-code unique-ptr) cdr-next))
+			;;
+			;;        Splice out of list without consing and
+			;;        without delocalizing the list.
+			;;
+			(%p-store-cdr-and-contents seq (setq seq (cdr seq)) cdr-nil)
+			(%p-store-cdr-code unique-ptr cdr-normal))
+		       (t (rplacd unique-ptr (setq seq (cdr seq)))))
+		 (go end-loop))
+	       (setq unique-ptr seq
+		     seq (cdr seq))
+	    end-loop
+	       (unless (endp seq)
+		 (go loop-body)))
+	 sequence)
+	;;
+	((vectorp sequence)
+	 (let ((unique-index 0)
+	       element
+	       (end (vector-length sequence))
+	       (sequence sequence))
+	   (declare (sys:array-register sequence))
+	   (dotimes (index end)
+	     (setq element (aref sequence index))
+	     ;;
+	     ;;        The when clause below is a highly bummed form of
+	     ;;        (loop for tindex upfrom (1+ index) below end
+	     ;;              never (eql element (aref sequence tindex)))
+	     ;;
+	     (when (prog (#+IMACH (end end)
+			  (tindex (1+ index)))
+			 (unless (< tindex end)
+			   (go end-loop))
+			 #+IMACH
+			 (setq end (1- end))
+		      loop-body
+			 (when (eql element (aref sequence tindex))
+			   (return nil))
+		      next-loop
+			 #+IMACH
+			 (when (prog1 (< tindex end) (setq tindex (1+ tindex)))
+			   (go loop-body))
+			 #+3600
+			 (when (progn (setq tindex (1+ tindex)) (< tindex end))
+			   (go loop-body))
+		      end-loop
+			 (return t))
+	       (setf (aref sequence unique-index) element)
+	       (incf unique-index)))
+	   (if (array-has-leader-p sequence)
+	       (setf (fill-pointer sequence) unique-index))
+	   (zl:adjust-array-size sequence unique-index))
+	 sequence)
+	;;
+	((null sequence)
+	 nil)
+	;;
+	(t (error "Not a sequence: ~S" sequence))))
+
+(define-keyword-to-positional-arguments-optimizers delete-duplicates
+  (sequence &key (test #'eql) test-not (start 0) end from-end key replace)
+  ((sequence) (delete-duplicates-fast sequence)))
+
+(define-keyword-to-positional-arguments-function
+  (remove-duplicates remove-duplicates-positional)
+  (sequence &key from-end (test #'eql) test-not (start 0) end key)
+  (declare (sys:downward-funarg test test-not key))
+  ;;(declare (sys:downward-funarg *))
+  (if (not (listp sequence))			;listp faster than vectorp, works in cold-load
+      (return-from remove-duplicates
+	(delete-duplicates (copy-seq sequence) :test test :test-not test-not
+			   :start start :end end :from-end from-end :key key)))
+  (let ((not-test nil))
+    (if test-not
+	(setq test test-not)
+	(setq not-test t))
+    (functionally-evaluate key)
+    (functionally-evaluate test)    
+    (let ((seq sequence)
+	  (original-sequence sequence)
+	  (unique-ptr (locf sequence))
+	  (start-ptr (locf sequence))
+	  (unshared-output-ptr (locf sequence)))
+      (loop for index upfrom 0
+	    do (cond ((< index start)
+		      (setq unique-ptr (cdr unique-ptr)
+			    start-ptr (cdr start-ptr)))
+		     ((and end (= index end))
+		      (return sequence))
+		     ((null seq)
+		      (if end
+			  (sequence-index-error-f original-sequence end)
+			  (return sequence)))
+		     ((if from-end
+			  (let ((tseq (cdr start-ptr))	;is a duplicate
+				(uptr (cdr unique-ptr)))
+			    (loop with element = (if key (funcall key (car seq)) (car seq))
+				  until (eq tseq uptr)
+				  thereis (eq not-test
+					      (notnull (funcall test
+								(if key
+								    (funcall key (car tseq))
+								    (car tseq))
+								element)))
+				  do (setq tseq (cdr tseq))))
+			  ;; From beginning
+			  (loop with element = (if key (funcall key (car seq)) (car seq))
+				for test-element in (cdr seq)
+				for index from (1+ index)
+				until (eql index end)
+				thereis (eq not-test
+					    (notnull (funcall test element
+							      (if key
+								  (funcall key test-element)
+								  test-element))))))
+		      (unshare-list-macro unique-ptr unshared-output-ptr)
+		      (rplacd unique-ptr (cdr seq)))
+		     (t				;not a duplicate
+		      (setq unique-ptr seq)))
+	    (setq seq (cdr seq)))))
+  sequence)
+
+(defun remove-duplicates-fast (sequence)
+  (if (not (listp sequence))			;listp faster than vectorp, works in cold-load
+      (return-from remove-duplicates-fast (delete-duplicates-fast (copy-seq sequence))))
+  (unless (null sequence)
+    (prog ((seq sequence)
+	   (unique-ptr (locf sequence))
+	   (unshared-output-ptr (locf sequence)))
+       loop-body
+	  (cond ((loop with element = (car seq)
+		       for test-element in (cdr seq)
+		       thereis (eql element test-element))
+		 (unshare-list-macro unique-ptr unshared-output-ptr)
+		 (rplacd unique-ptr (cdr seq)))
+		(t				;not a duplicate
+		 (setq unique-ptr seq)))
+	  (setq seq (cdr seq))
+       end-loop
+	  (unless (endp seq)
+	    (go loop-body))))
+  sequence)
+
+(define-keyword-to-positional-arguments-optimizers remove-duplicates
+  (sequence &key from-end (test #'eql) test-not (start 0) end key)
+  ((sequence) (remove-duplicates-fast sequence)))
+
+(deftest-key-macro delete- ((:global-arglist nil (sequence &key from-end (start 0) end count
+							   &aux skip-count))
+			    (:2arg-seqfast)
+			    (:2arg delete (item))
+			    (:2arg-fast delete-fast (item sequence))
+			    (:2arg-test delete-test (item sequence test))
+			    (:if delete-if item)
+			    (:if-fast delete-if-fast (predicate sequence))
+			    (:if-not delete-if-not item)
+			    (:if-not-fast delete-if-not-fast (predicate sequence)))
+		   ()
+  (when-test-key-macro-slow
+    (reverse-either-check-macro item))
+  (sequence-check-and-default-limits sequence)
+  (cond ((listp sequence)
+	 (let ((seq sequence)
+	       (output-ptr (locf sequence)))
+	   (when-test-key-macro-slow
+	     (dotimes (i start)
+	       (setq output-ptr (cdr output-ptr)
+		     seq (cdr seq))
+	       (if (and (null seq) (< i (1- start)))
+		   (sequence-index-error-f sequence start))))
+	   (cond ((when-test-key-macro-slow
+		    (and count (not (plusp count)))))
+		 ((test-key-macro-case
+		    ((:2arg-fast :2arg-seqfast :2arg-test :if-fast :if-not-fast) t)
+		    (t (and (null end) (null skip-count))))
+		  (block delete
+		    ;; Remove any occurrences of ITEM from the front of SEQ
+		    (unless (when-test-key-macro-slow (plusp start))
+		      (loop doing
+			(cond ((atom sequence) (return-from delete))
+			      ((test-key-macro-test (car sequence) item)
+			       (setq sequence (cdr sequence))
+			       (when-test-key-macro-slow
+				 (when count
+				   (decf count)
+				   (when (zerop count)
+				     (return-from delete)))))
+			      (t (return))))
+		      (setq output-ptr sequence
+			    seq (cdr sequence)))
+		    ;; Remove interior occurrences of ITEM
+		    ;; sequence is what to return
+		    ;; output-ptr is some cons in it (not a locative any more)
+		    ;; seq is (cdr output-ptr)
+		    (loop until (atom seq) do
+		      (cond ((test-key-macro-test (car seq) item)
+			     (cond ((= (%p-cdr-code output-ptr) cdr-next)
+				    ;; Splice ITEM out of list without consing and without
+				    ;; delocalizing the list
+				    (%p-store-cdr-and-contents seq (setq seq (cdr seq))
+							       cdr-nil)
+				    (%p-store-cdr-code output-ptr cdr-normal))
+				   (t (rplacd output-ptr (setq seq (cdr seq)))))
+			     (when-test-key-macro-slow
+			       (when count
+				 (decf count)
+				 (when (zerop count)
+				   (return)))))
+			    (t (setq output-ptr seq
+				     seq (cdr seq)))))))
+		 ((test-key-macro-case
+		    ((:2arg-fast :2arg-seqfast :2arg-test :if-fast :if-not-fast) nil)
+		    (t t))
+		  (loop for index upfrom start do
+		    (cond ((eql index end)
+			   (return))
+			  ((null seq)
+			   (if end
+			       (sequence-index-error-f sequence end)
+			       (return)))
+			  ((not (test-key-macro-test (car seq) item))
+			   (setq output-ptr seq
+				 seq (cdr seq)))
+			  ((when-test-key-macro-slow
+			     (and skip-count
+				  (prog1 (plusp skip-count)
+					 (decf skip-count))))
+			   (setq output-ptr seq
+				 seq (cdr seq)))
+			  (t
+			   (cond ((and (listp output-ptr)	;Not locative
+				       (= (%p-cdr-code output-ptr) cdr-next))
+				  ;; Splice ITEM out of list without consing and
+				  ;; without delocalizing the list
+				  (%p-store-cdr-and-contents seq (setq seq (cdr seq))
+							     cdr-nil)
+				  (%p-store-cdr-code output-ptr cdr-normal))
+				 (t (rplacd output-ptr (setq seq (cdr seq)))))
+			   (when-test-key-macro-slow
+			     (when count
+			       (decf count)
+			       (when (zerop count)
+				 (return)))))))))))
+	((vectorp sequence)
+	 (let ((output-index (test-key-macro-case
+			       ((:2arg-fast :2arg-seqfast :2arg-test :if-fast :if-not-fast) 0)
+			       (t start))))
+	   (loop for index upfrom output-index below (length sequence)
+		 finally (progn
+			   (if (array-has-leader-p sequence)
+			       (setf (fill-pointer sequence) output-index))
+			   (zl:adjust-array-size sequence output-index))
+		 as element = (aref sequence index)
+		 do (cond ((or (test-key-macro-case
+				 ((:2arg-fast :2arg-seqfast :2arg-test :if-fast :if-not-fast)
+				  nil)
+				 (t ( index end)))
+			       (not
+				 (test-key-macro-case
+				   ((:2arg-fast :2arg-seqfast :2arg-test
+				     :if-fast :if-not-fast)
+				    (test-key-macro-test element item))
+				   (t
+				     (and (test-key-macro-test element item)
+					  (or (null skip-count)
+					      (prog1
+						(not (plusp skip-count))
+						(decf skip-count)))
+					  (or (null count)
+					      (prog1
+						(plusp count)
+						(decf count))))))))
+				      
+			   (setf (aref sequence output-index) element)
+			   (incf output-index))))))
+	(t (error "Not a sequence: ~S" sequence)))
+  sequence)
+
+(define-keyword-to-positional-arguments-optimizers delete
+  (item sequence &key (test #'eql) test-not (key #'identity) from-end (start 0) end count)
+  ((item sequence :test test) (delete-test item sequence test)))
+
+(deftest-key-macro remove- ((:global-arglist nil (sequence &key from-end (start 0) end count
+							   &aux (rlseq sequence)))
+			    (:2arg-seqfast)
+			    (:2arg remove (item))
+			    (:2arg-fast remove-fast (item sequence &aux (rlseq sequence)))
+			    (:if remove-if item)
+			    (:if-fast remove-if-fast
+				      (predicate sequence &aux (rlseq sequence)))
+			    (:if-not remove-if-not item)
+			    (:if-not-fast remove-if-not-fast
+					  (predicate sequence &aux (rlseq sequence))))
+		   ()
+  ;;Vector case wins us nothing; dispatch to delete etc.
+  (if (not (listp sequence))			;listp faster than vectorp, works in cold-load
+      (test-key-macro-case
+	(:2arg-seqfast (return-from remove (delete-fast item (copy-seq sequence))))
+	(:2arg-fast (return-from remove-fast (delete-fast item (copy-seq sequence))))
+	(:2arg (return-from remove (delete item (copy-seq sequence) :from-end from-end
+					   :start start :end end :count count
+					   :test test :test-not (if not-test nil test)
+					   :key key)))
+	(:if (return-from remove-if (delete-if predicate (copy-seq sequence)
+					       :from-end from-end :key key
+					       :start start :end end :count count)))
+	(:if-fast (return-from remove-if-fast (delete-if-fast predicate (copy-seq sequence))))
+	(:if-not (return-from remove-if-not
+		   (delete-if-not predicate (copy-seq sequence) :from-end from-end
+				  :start start :end end :count count :key key)))
+	(:if-not-fast (return-from remove-if-not-fast
+			(delete-if-not-fast predicate (copy-seq sequence))))))
+  (when-test-key-macro-slow
+    (reverse-list-check-macro item))		;limit check useless for lists.
+  (let ((output-ptr (locf sequence))
+	(unshared-output-ptr (locf sequence)))
+    (when-test-key-macro-slow
+      (if from-end
+	  (when (neq rlseq sequence)
+	    (loop until (eq (cdr output-ptr) rlseq)
+		  do (setq output-ptr (cdr output-ptr))))
+	  (dotimes (i start)
+	    (setq output-ptr (cdr output-ptr)
+		  rlseq (cdr rlseq))
+	    (if (and (null rlseq) (< i (1- start)))
+		(sequence-index-error-f sequence start)))))
+    (cond ((when-test-key-macro-slow
+	     (and count (not (plusp count)))))
+	  ;;Fast case, avoids tests and counts
+	  ((test-key-macro-case
+	     ((:2arg-fast :2arg-seqfast :if-fast :if-not-fast) t)
+	     (t (and (null end) (null from-end))))
+	   (loop while rlseq
+		 when (test-key-macro-test (car rlseq) item)
+		 do
+		 (unshare-list-macro output-ptr unshared-output-ptr)
+		 (rplacd output-ptr (cdr rlseq))
+		 (when-test-key-macro-slow
+		   (when count
+		     (decf count)
+		     (if (zerop count) (loop-finish))))
+		 else do (setq output-ptr rlseq)
+		 do (setq rlseq (cdr rlseq)))) 
+	  ((test-key-macro-case
+	     ((:2arg-fast :2arg-seqfast :if-fast :if-not-fast) nil)
+	     (t t))
+	   (loop with original-sequence = sequence
+		 for index upfrom start
+		 do (cond ((and end (= index end))
+			   (return sequence))
+			  ((null rlseq)
+			   (if end
+			       (sequence-index-error-f original-sequence end)
+			       (loop-finish)))
+			  ((not (test-key-macro-test (car rlseq) item))
+			   (setq output-ptr rlseq))
+			  (t
+			   (unshare-list-macro output-ptr unshared-output-ptr)
+			   (rplacd output-ptr (cdr rlseq))
+			   (when-test-key-macro-slow
+			     (when count
+			       (decf count)
+			       (if (zerop count) (loop-finish))))))
+		 (setq rlseq (cdr rlseq)))))
+    sequence))					;Believe it or not, this is right.
+
+(define-keyword-to-positional-arguments-function (merge merge-positional)
+  (result-type sequence1 sequence2 predicate &key key)
+  (declare (sys:downward-funarg predicate key))
+;  (declare (sys:downward-funarg *))
+  (functionally-evaluate predicate)
+  (functionally-evaluate key)
+  (let (elt1 elt2 key1 key2 index1 index2 len1 len2 output output-index take)
+    (if (null sequence1) (setq len1 0))
+    (if (null sequence2) (setq len2 0))
+
+    (unless (listp sequence1)
+      (setq len1 (length sequence1) index1 0))
+    (unless (listp sequence2)
+      (setq len2 (length sequence2) index2 0))
+
+    (if (or (eql len1 0) (eql len2 0))		;return copied thing.
+	(let ((common (if (eql len1 0) sequence2 sequence1)))
+	  (return-from merge
+	    (if (typep common result-type)
+		(copy-seq common)		;is this copy necessary?
+		(concatenate result-type common)))))
+
+    (if (eq result-type 'list)
+	(setq output-index (locf output))
+	(setq output (make-sequence result-type (+ (or len1 (length sequence1))
+						   (or len2 (length sequence2))))
+	      output-index (if (listp output) output 0)))
+    ;;guaranteed to be elements
+    (setq elt1 (cond (index1 (aref sequence1 index1)) (t (car sequence1)))
+	  key1 (if key (funcall key elt1) elt1))
+    (setq elt2 (cond (index2 (aref sequence2 index2)) (t (car sequence2)))
+	  key2 (if key (funcall key elt2) elt2))
+    (macrolet ((get-elt1 ()
+		   '(setq elt1 (cond (index1
+				      (incf index1)
+				      (if (= index1 len1)
+					  (setq sequence1 nil)
+					  (aref sequence1 index1)))
+				     (t  (pop sequence1)
+					 (car sequence1)))
+			  key1 (if key (and sequence1 (funcall key elt1)) elt1)))
+	       (get-elt2 (&environment env)
+		    (sublis
+		      '((sequence1 . sequence2) (index1 . index2) (key1 . key2)
+			(len1 . len2) (elt1 . elt2))
+		      (macroexpand-1 '(get-elt1) env))))
+      (loop with thin-string-p = (and (stringp output) (not (string-fat-p output))) do
+	(setq take
+	      (cond ((and (null sequence1) (null sequence2))
+		     (return-from merge output))
+		    ((null sequence1)
+		     (when (and (eq result-type 'list) (listp sequence2))
+		       (rplacd output-index sequence2)
+		       (return-from merge output))
+		     2)
+		    ((null sequence2)
+		     (when (and (eq result-type 'list) (listp sequence1))
+		       (rplacd output-index sequence1)
+		       (return-from merge output))
+		     1)
+		    ((funcall predicate key1 key2)
+		     1)
+		    ((funcall predicate key2 key1)
+		     2)
+		    (t 1)))
+	;;(format t "~&s1= ~S, s2=~S, take= ~D, e1=~S, e2=~S, o=~S"
+	;;	      sequence1 sequence2 take elt1 elt2 output)
+	(let ((elt
+		(case take
+		  (1 
+		    (prog1 elt1
+			   (if sequence1
+			       (get-elt1))))	;pops the one we just considered
+		  (2
+		    (prog1 elt2
+			   (if sequence2
+			       (get-elt2)))))))
+	  (cond ((eq result-type 'list)
+		 (setq output-index
+		       (cdr (rplacd output-index (ncons elt)))))
+		((listp output)
+		 (rplaca output-index elt)
+		 (setq output-index (cdr output-index)))
+		(t (when (and thin-string-p (char-fat-p elt))
+		     ;; Result should have been a fat string
+		     (stack-let ((copy (make-array output-index
+						   :element-type 'string-char))
+				 (length (length output)))
+		       (copy-array-portion output 0 output-index copy 0 output-index)
+		       (return-array output)
+		       (setq thin-string-p nil)
+		       (setq output (make-array length :element-type 'character))
+		       (copy-array-portion copy 0 output-index output 0 output-index)))
+		   (setf (aref output output-index) elt)
+		   (incf output-index))))
+	;;(format t "~&...s1= ~S, s2=~S, take= ~D, e1=~S, e2=~S, o=~S"
+	;;	      sequence1 sequence2 take elt1 elt2 output)
+	)))) 
+
+(define-keyword-to-positional-arguments-function (mismatch mismatch-positional)
+  (sequence1 sequence2 &key from-end (test #'eql) test-not key (start1 0) (start2 0) end1 end2
+		       &aux not-test last-difference listp-1 listp-2)
+  (declare (sys:downward-funarg test test-not key))
+  ;;(declare (sys:downward-funarg *))
+  (sequence-check-and-default-limits sequence1 start1 end1)
+  (sequence-check-and-default-limits sequence2 start2 end2)
+  (setq listp-1 (listp sequence1) listp-2 (listp sequence2))
+  (if test-not
+      (setq test test-not)
+      (setq not-test t))
+  (functionally-evaluate key)
+  (functionally-evaluate test)
+  (let ((seq1 sequence1)
+	(seq2 sequence2))
+    (when (and listp-1 (plusp start1))
+      (dotimes (ignore start1)
+	(or sequence1 (sequence-index-error-f seq1 start1))
+	(pop sequence1)))
+    (when (and listp-2 (plusp start2))
+      (dotimes (ignore start2)
+	(or sequence2 (sequence-index-error-f seq2 start2))
+	(pop sequence2)))
+    ;;End-checking here is not as great as in some other functions.
+    (cond
+      (from-end
+       (when (and listp-1 (null end1))
+	 (setq end1 (+ start1 (list-length sequence1))))	;We need to know this.
+       (when (and listp-2 (null end2))
+	 (setq end2 (+ start2 (list-length sequence2))))
+       (let ((len1 (- end1 start1))
+	     (len2 (- end2 start2)))
+	 (cond ((> len1 len2)
+		(let ((diff (- len1 len2)))
+		  (incf start1 diff)
+		  (setq last-difference start1)
+		  (if listp-1
+		      (dotimes (ignore diff)
+			(pop sequence1)))))
+	       ((> len2 len1)
+		(let ((diff (- len2 len1)))
+		  (incf start2 diff)
+		  (setq last-difference start1)
+		  (if listp-2
+		      (dotimes (ignore diff)
+			(pop sequence2)))))))
+       ;;If both vectors, actually match backwards as designed.
+       (when (and (not listp-1) (not listp-2))
+	 (loop for i1 from (1- end1) downto start1
+	       and i2 from (1- end2) downto start2
+	       as elt1 = (aref sequence1 i1)
+	       and elt2 = (aref sequence2 i2)
+	       when key do  (setq elt1 (funcall key elt1)
+				  elt2 (funcall key elt2))
+	       unless (eq not-test (notnull (funcall test elt1 elt2)))
+	       do (return-from mismatch (1+ i1))
+	       finally (return-from mismatch last-difference)))
+       (loop until (= start1 end1)
+	     do
+	     (let ((elt1 (if listp-1
+			     (pop sequence1)
+			     (aref sequence1 start1)))
+		   (elt2 (if listp-2
+			     (pop sequence2)
+			     (aref sequence2 start2))))
+	       (if key
+		   (setq elt1 (funcall key elt1)
+			 elt2 (funcall key elt2)))
+	       (if (neq not-test
+			(notnull (funcall test elt1 elt2)))
+		   (setq last-difference (1+ start1))))
+	     (incf start1)
+	     (incf start2))
+       last-difference)
+      (t					;Forward case
+		
+       (loop
+	 (cond ((or (null sequence1) (and end1 (= start1 end1)))
+		(return-from mismatch
+		  (if (or (null sequence2) (and end2 (= start2 end2)))
+		      nil
+		      start1)))
+	       ((or (null sequence2) (and end2 (= start2 end2)))
+		(return-from mismatch start1)))
+	 (let ((elt1 (if listp-1
+			 (pop sequence1)
+			 (aref sequence1 start1)))
+	       (elt2 (if listp-2
+			 (pop sequence2)
+			 (aref sequence2 start2))))
+	   (if key
+	       (setq elt1 (funcall key elt1)
+		     elt2 (funcall key elt2)))
+	   (if (neq not-test
+		    (notnull (funcall test elt1 elt2)))
+	       (return-from mismatch start1))
+	   (incf start1)
+	   (incf start2)))))))
+
+(define-keyword-to-positional-arguments-function (search search-positional)
+  (sequence1 sequence2 &key from-end (test #'eql) test-not key
+			    (start1 0) (start2 0) end1 end2 &aux not-test)
+  (declare (sys:downward-funarg test test-not key))
+  ;;(declare (sys:downward-funarg *))		;downward-funarg loses against &key
+  (sequence-check-and-default-limits sequence1 start1 end1)
+  (sequence-check-and-default-limits sequence2 start2 end2)
+  (when from-end
+    (return-from search
+      (search-reverse sequence1 sequence2 start1 start2 end1 end2 test test-not key)))
+  (if test-not
+      (setq test test-not)
+      (setq not-test t))
+  (functionally-evaluate key)
+  (functionally-evaluate test)
+  (let ((seq1 sequence1)
+	(seq2 sequence2))
+    (when (and (listp sequence1) (plusp start1))
+      (dotimes (ignore start1)
+	(or sequence1 (sequence-index-error-f seq1 start1))
+	(pop sequence1))
+      (and end1 (decf end1 start1))
+      (setq start1 0))
+    (when (and (listp sequence2) (plusp start2))
+      (dotimes (ignore start2)
+	(or sequence2 (sequence-index-error-f seq2 start2))
+	(pop sequence2)))
+    (when (or (null sequence1)
+	      (and end1 (>= start1 end1)))
+      (return-from search start2))
+    (cond
+      ((listp sequence2)			;searching a list
+       (loop with telt1 = (if (listp sequence1)
+			      (car sequence1)
+			      (aref sequence1 start1))
+	     with tkey1 = (if key (funcall key telt1) telt1)
+	     for i upfrom start2
+	     until (or (and end2 (= i end2))
+		       (null sequence2))
+	     for (telt2 . rest2) on sequence2
+	     as tkey2 = (if key (funcall key telt2) telt2)
+	     when (eq not-test (notnull (funcall test tkey1 tkey2)))
+	     do (if (if (arrayp sequence1)
+			(loop for i2 upfrom (1+ i)
+			      for i1 upfrom (1+ start1) below end1
+			      until (and (or (and end2 (= i2 end2)) (null rest2))
+					 (return-from search nil))	;yuck
+			      as telt1 = (aref sequence1 i1)
+			      and telt2 = (pop rest2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2))))
+			(loop for i2 upfrom (1+ i)	;sequence1 a list
+			      for i1 upfrom (1+ start1)
+			      for telt1 in (cdr sequence1)
+			      until (and end1 ( i1 end1))
+			      until (and (or (and end2 (= i2 end2)) (null rest2))
+					 (return-from search nil))	;yuck
+			      for telt2 = (pop rest2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2)))))
+		    (return-from search i))))
+      (t
+       (loop with telt1 = (if (listp sequence1)
+			      (car sequence1)
+			      (aref sequence1 start1))
+	     with tkey1 = (if key (funcall key telt1) telt1)
+	     for i upfrom start2 below end2
+	     for telt2 = (aref sequence2 i)
+	     as tkey2 = (if key (funcall key telt2) telt2)
+	     when (eq not-test (notnull (funcall test tkey1 tkey2)))
+	     do (if (if (arrayp sequence1)
+			(loop for i2 upfrom (1+ i)
+			      for i1 upfrom (1+ start1) below end1
+			      until (and (= i2 end2)
+					 (return-from search nil))	;yuck
+			      for telt1 = (aref sequence1 i1)
+			      and telt2 = (aref sequence2 i2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2))))
+			(loop for i2 upfrom (1+ i)	;sequence1 a list
+			      for i1 upfrom (1+ start1)
+			      for telt1 in (cdr sequence1)
+			      until (and end1 ( i1 end1))
+			      until (and (= i2 end2)
+					 (return-from search nil))	;yuck
+			      for telt2 = (aref sequence2 i2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2)))))
+		    (return-from search i)))))))
+
+;; Internal subroutine of SEARCH
+(defun search-reverse (sequence1 sequence2
+		       start1 start2 end1 end2
+		       test test-not key &aux not-test len1 len2)
+  (declare (sys:downward-funarg test test-not key))
+  ;(sequence-check-and-default-limits sequence1 start1 end1)
+  ;(sequence-check-and-default-limits sequence2 start2 end2)
+  (when (and (null end1) (listp sequence1)) (setq end1 (list-length sequence1)))
+  (when (and (null end2) (listp sequence2)) (setq end2 (list-length sequence2)))
+  (setq len1 (- end1 start1)
+	len2 (- end2 start2))
+  (when (> len1 len2)
+    (return-from search-reverse nil))
+  (if test-not
+      (setq test test-not)
+      (setq not-test t))
+  (let ((seq1 sequence1)
+	(seq2 sequence2))
+    (when (and (listp sequence1) (plusp start1))
+      (dotimes (i start1)
+	(declare (ignore i))
+	(or sequence1 (sequence-index-error-f seq1 start1))
+	(pop sequence1))
+      (decf end1 start1)
+      (setq start1 0))
+    (when (and (listp sequence2) (plusp start2))
+      (dotimes (i start2)
+	(declare (ignore i))
+	(or sequence2 (sequence-index-error-f seq2 start2))
+	(pop sequence2)))
+    (unless (> len1 0)
+      (return-from search-reverse end2))
+    (cond
+      ((listp sequence2)
+       ;;Search lists forward to avoid copy or recursion.
+       (loop with last-found = nil
+	     with telt1 = (if (listp sequence1)
+			      (car sequence1)
+			      (aref sequence1 start1))
+	     with tkey1 = (if key (funcall key telt1) telt1)
+	     for i upfrom start2 to (- end2 len1)
+	     for (telt2 . rest2) on sequence2
+	     as tkey2 = (if key (funcall key telt2) telt2)
+	     when (eq not-test (notnull (funcall test tkey1 tkey2)))
+	     do (if (if (arrayp sequence1)
+			(loop for i1 upfrom (1+ start1) below end1
+			      as telt1 = (aref sequence1 i1)
+			      and telt2 = (pop rest2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2))))
+			(loop for i1 upfrom (1+ start1)	;sequence1 a list
+			      for telt1 in (cdr sequence1)
+			      until ( i1 end1)
+			      for telt2 = (pop rest2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2)))))
+		    (setq last-found i))
+	     finally (return last-found)))
+      (t
+       (loop with telt1 = (if (listp sequence1)
+			      (car sequence1)
+			      (aref sequence1 start1))
+	     with tkey1 = (if key (funcall key telt1) telt1)
+	     for i downfrom (- end2 len1) to start2
+	     for telt2 = (aref sequence2 i)
+	     as tkey2 = (if key (funcall key telt2) telt2)
+	     when (eq not-test (notnull (funcall test tkey1 tkey2)))
+	     do (if (if (arrayp sequence1)
+			(loop for i2 upfrom (1+ i)
+			      for i1 upfrom (1+ start1) below end1
+			      for telt1 = (aref sequence1 i1)
+			      and telt2 = (aref sequence2 i2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2))))
+			(loop for i2 upfrom (1+ i)	;sequence1 a list
+			      for i1 upfrom (1+ start1)
+			      for telt1 in (cdr sequence1)
+			      until ( i1 end1)
+			      for telt2 = (aref sequence2 i2)
+			      if key do (setq telt1 (funcall key telt1)
+					      telt2 (funcall key telt2))
+			      always (eq not-test (notnull (funcall test telt1 telt2)))))
+		    (return-from search-reverse i)))))))
+
+
+#|| "Test suite" for SEARCH
+
+  (search '(1 2 5 4) '(1 2 3 4 5) :start1 2 :end1 4) ==> D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")nil
+0  (search '(1 2 5 4) '(1 2 3 4 5) :start1 2 :end1 5) ==> 1nil
+0  (search '(4) '(1 2 3 4 5) :start2 2 :end2 5) ==> 13
+
+0  (search '(3 4 5) '(1 2 3 4 5)  :start1 1 :end1 2 :start2 2) ==> 13
+0  (search '(3 4 5) '(1 2 3 4 5)  :start1 1 :end1 2 :start2 1) ==> 13
+0  (search '#(3 4 5) '(1 2 3 4 5 2 3 4 5 6) :start1 2 :end1 2) => 0
+  (search '#(3 4 5) '(1 2 3 4 5 2 3 4 5 6) :start1 2 :end1 3) => 4
+
+  (search '(1 2 5 4) '(1 2 3 4 5) :start1 2 :end1 4 :from-end t) ==>1 nil
+0  (search '(1 2 5 4) '(1 2 3 4 5) :start1 2 :end1 5 :from-end t) ==>1 nil
+0  (search '(4) '(1 2 3 4 5) :start2 2 :end2 5 :from-end t) ==>1 3
+
+0  (search '(3 4 5) '(1 2 3 4 5)  :start1 1 :end1 2 :start2 2 :from-end t) ==>1 3
+0  (search '(3 4 5) '(1 2 3 4 5)  :start1 1 :end1 2 :start2 1 :from-end t) ==>1 3
+0  (search '#(3 4 5) '(1 2 3 4 5 2 3 4 5 6) :start1 2 :end1 2 :from-end t) => 10
+  (search '#(3 4 5) '(1 2 3 4 5 2 3 4 5 6) :start1 2 :end1 3 :from-end t) => 8
+  (search '(1) '(1)) => 0
+  (search "" "abcde") => 0
+  (search "abcde" "abcde" :start1 3 :end1 3) => 0
+  (search '(1) '(1) :from-end t) => 0
+  (search "" "abcde" :from-end t) => 5
+  (search "abcde" "abcde" :start1 3 :end1 3 :from-end t) => 5
+  (search '(1) '(1) :end1 0) => 0
+  (search '(1) '(1) :end1 0 :from-end t) => 1
+
+||#

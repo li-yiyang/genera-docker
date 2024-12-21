@@ -1,0 +1,546 @@
+;;; -*- Mode: Lisp; Syntax: Common-lisp; Package: DBFS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Definitions common to multiple DBFS modules which require recompilation of
+;;; all callers when they are modified.
+
+(eval-when (compile load eval)
+
+(defconstant fixnum-n-bits #.(1+ (ceiling (log most-positive-fixnum 2))))
+
+(defconstant max-supported-page-size 8192)
+
+;;;  Ordered list of locks in ascending strength for the lock manager
+(si:defenumerated *lock-states*
+		  (%unlocked
+		   %read-lock
+		   %probable-write-lock
+		   %write-lock))
+
+(si:defenumerated *page-data-states*
+		  (%uninitialized %invalid %valid))
+
+(si:defenumerated *page-write-states*
+		  (%na %mutable %modified %written))
+) ;; eval-when
+
+(defvar *n-lock-states* #.(length *lock-states*))
+
+(defstruct (page-state (:type :fixnum))
+  ((permanent 0  :byte (byte 1 7))
+   (data-state 0 :byte (byte 2 5))		D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI"); See *page-data-states* for legal values
+0   (lock-state 0 :byte (byte 2 3))		1; See *lock-states* for legal values
+0   (write-state 0 :byte (byte 3 0))		1; See *page-write-states* for legal values
+0   ))
+
+;;;; General macrology
+
+;;; This takes about 256us on a 3600 to copy 288 words (a 3600 disk block)
+;;; That means that the overhead of doing this copy is actually close to
+;;; the overhead of simply translating one virtual to physical address.
+(defsubst fast-copy-fixnum-array (from-array from-offset to-array to-offset n-words)
+  ;; Can't use ALOC on art-fixnum arrays, sigh.
+  (multiple-value-bind (ignore ignore from-address) (si:setup-1d-array from-array)
+    (when from-offset
+      (setq from-address (si:%make-pointer-offset si:dtp-locative from-address from-offset)))
+    (multiple-value-bind (ignore ignore to-address) (si:setup-1d-array to-array)
+      (when to-offset
+	(setq to-address (si:%make-pointer-offset si:dtp-locative to-address to-offset)))
+      #+3600
+      (si:%block-gc-copy from-address to-address n-words)
+      #+IMACH
+      (si:%block-scavenge-copy-fixnum-only from-address to-address n-words)
+      nil)))
+
+;; Save a few microseconds from gethash.
+(defsubst fast-gethash (key table)
+  (cli::fast-table-get table key))
+
+;(eval-when (eval compile load)
+;  (defsubst fast-string= (x y)
+;    (sys:%string= x 0 y 0 nil))
+;
+;  (or (cli::test-function-hash-function 'fast-string=)
+;      (cli::add-test-function-hash-function 'fast-string= 'sys:sxhash-string)))
+
+;;; This structure is intended to be used as a hash table key.  It
+;;; identifies a page uniquely by holding the UID of the file and the
+;;; page number of the page, which is what we mean by a page's identity
+;;; (even if we destroy and create the page; that doesn't change
+;;; identity).
+(defstruct (page-id (:type :array))
+  word0
+  word1
+  word2
+  page-n)
+
+(defun page-id-equal (page-id-1 page-id-2)
+  (let ((p1 page-id-1)
+	(p2 page-id-2))
+    (declare (sys:array-register p1) (sys:array-register p2))
+    (and (= (page-id-page-n p1) (page-id-page-n p2))
+	 (= (page-id-word0 p1) (page-id-word0 p2))
+	 (= (page-id-word1 p1) (page-id-word1 p2))
+	 (= (page-id-word2 p1) (page-id-word2 p2)))))
+
+(defun page-id-hash (page-id)
+  (let ((p page-id))
+    (declare (sys:array-register p))
+    (logxor (page-id-page-n p)
+	    (page-id-word0 p)
+	    (page-id-word1 p)
+	    (page-id-word2 p))))
+
+;  (or (cli::test-function-hash-function 'page-id-equal)
+;      (cli::add-test-function-hash-function 'page-id-equal 'page-id-hash))
+
+(defsubst make-insert-only-set (size)
+  (make-array size :fill-pointer 0 :adjustable t))
+
+(defmacro doing-over-set ((var set) &body body)
+  ;; Unfortunately, this is a bit faster than using the array-elements
+  ;; iteration construct in loop.  The array register speeds up all cases
+  ;; except where there are a very few (like less than 4) elements.
+  `(let ((set-reg ,set))
+     (declare (si:array-register set-reg))
+     (dotimes (.i. (fill-pointer set-reg))
+       (let ((,var (aref set-reg .i.)))
+	 ,@body))))
+
+(defsubst clear-set (set)
+  (setf (fill-pointer set) 0))
+
+(defsubst set-push (element set)
+  (vector-push-extend element set))
+
+(defsubst set-pushnew (element set)
+  (or (sys:%block-search-eq element (locf (aref set 0)) (length set))
+      (vector-push-extend element set)))
+
+(defsubst eq-car (x y)
+  (eq x (car y)))
+
+(defmacro with-debugger-message ((format-string &rest format-args) &body body)
+  `(let ((sys:error-message-hook
+	   #'(lambda ()
+	       (declare (sys:downward-function))
+	       (format t ,(string-append "~%" format-string ":") . ,format-args))))
+     . ,body))
+
+(defmacro dbfs-trace (name &rest args)
+  `(when *enable-trace*
+     (insert-trace ,name ,@args)))
+
+(defmacro dbfs-internal-trace (name &rest args)
+  `(when *enable-full-trace*
+     (insert-trace ,name ,@args)))
+
+;;; ++++ This is really just a placeholder.  Pretty soon we'll decide
+;;; that we're sure that the ufs object is the same as the namespace
+;;; object, and we'll get rid of this, and do some renames.
+(defun get-ufs-from-object (object)
+  object)
+
+;; This uses a multiple-value-bind with a fixed number of arguments rather than
+;; the more general multiple-value-list to eliminate consing.  While I could have
+;; also written a funny multiple-value-vector-using-data-stack, that would
+;; have ended up being machine specific and this is good enough.
+(defmacro catch-case (tag body-form &body catch-clauses)
+  (let ((clause-forms
+	  (loop for (selector vars . body) in catch-clauses
+		when (> (length vars) 5)
+		  do (error "More than 5 variables in a catch-case is not supported.")
+		collecting (list selector
+				 `(let ,(loop for var in vars
+					      for val-var in '(arg1 arg2 arg3 arg4 arg5)
+					      collecting `(,var ,val-var))
+				    ,@body)))))
+    `(block catch-case
+       (multiple-value-bind (selector arg1 arg2 arg3 arg4 arg5)
+	   (catch ,tag (progn ,body-form (return-from catch-case nil)))
+	 (ecase selector
+	   ,@clause-forms)))))
+
+;; Again, this is more complex than it could be because I didn't want to use
+;; multiple-value-list since it conses.
+(defmacro catch-with-handler ((tag handler &rest args) &body body)
+  `(block catch-with-handler
+     (multiple-value-bind (selector arg1 arg2 arg3 arg4 arg5)
+	 (catch ',tag (return-from catch-with-handler (progn ,@body)))
+       (,handler ,@args selector arg1 arg2 arg3 arg4 arg5))))
+
+(defmacro catch-handler-case (vals &body catch-clauses)
+  (let ((clause-forms
+	  (loop for (selector vars . body) in catch-clauses
+		when (> (length vars) 5)
+		  do (error "More than 5 variables in a catch-handler-case clause")
+		collecting (list selector
+				 `(let ,(loop for var in vars
+					      for i upfrom 1
+					      collecting `(,var (nth ,i ,vals)))
+				    ,@body)))))
+    `(ecase (first ,vals)
+       ,@clause-forms)))
+
+(defmacro return-to-top-level (selector &rest vals)
+  `(throw 'top-level-tag (values ,selector ,@vals)))
+
+(defmacro with-page ((var file page-n) &body body)
+  (let ((lock-arg-var (gensym)))
+    `(let ((,var nil))
+       (process::with-stack-lock-argument (,lock-arg-var nil)
+	 (unwind-protect-case ()
+	     (progn
+	       (setq ,var (lookup-page ,file ,page-n ,lock-arg-var))
+	       (multiple-value-prog1
+		 (progn ,@body)
+		 (unlock (page-lock ,var) ,lock-arg-var)))
+	   (:abort
+	     (recover-from-lookup-page ,var ,file ,page-n ,lock-arg-var)))))))
+
+#|
+The following macros are used to deal with a sequence which is NIL if it is
+empty, an atom if it only has one element, or a LIFO list if it has multiple
+elements.  The whole point of this silliness is to avoid consing when the normal
+case for the sequence is that it will be either empty or have only one element
+while still making it possible for multiple elements to be present.  If it is
+commonly the case that multiple elements are present, then these macros shouldn't
+be used since it isn't worth the hair to avoid the consing.
+|#
+
+(defmacro push-or-setq (value var)
+  `(cond ((null ,var)
+	  (setq ,var ,value))
+	 ((atom ,var)
+	  (setq ,var (list ,value ,var)))
+	 (t
+	  (push ,value ,var))))
+
+(defmacro delete-or-setq (value var)
+  `(cond ((atom ,var)
+	  (when (eq ,var ,value)
+	    (setq ,var nil)))
+	 ((listp ,var)
+	  (setq ,var (delete ,value ,var :count 1))
+	  (if (= 1 (length ,var))
+	      (setq ,var (car ,var))))))
+
+(defmacro member-or-eql (value var)
+  `(cond ((atom ,var) (eql ,value ,var))
+	 ((listp ,var) (member ,value ,var))))
+
+(defmacro maplist-or-apply (var function &rest args)
+  `(cond ((null ,var) nil)
+	 ((atom ,var)
+	  (,function ,var ,@args))
+	 (t
+	  (loop for entity in ,var doing
+	    (,function entity ,@args)))))
+  
+(defmacro with-connection-timeout ((dbfs-connection direction timeout
+						    &optional condition-name
+						    &rest condition-args)
+				   &body body)
+  `(neti:with-stream-timeout ((dbfs-connection-byte-stream ,dbfs-connection)
+			      ,direction ,timeout ,condition-name . ,condition-args)
+     . ,body))
+
+;;Better have *global-commit-lock*
+(defmacro with-all-transaction-pages-latched ((pending-in-elements-var transaction) &body body)
+  `(let ((,pending-in-elements-var nil))
+     (loop named trying-to-lock-all-pages 
+	   with successful 
+	   with losing-page
+	   do (multiple-value-setq (successful losing-page ,pending-in-elements-var)
+		(latch-all-transaction-element-pages ,transaction))
+	      ;; if we didn't win, wait for the losing page to become unlocked.
+	   unless successful 
+	     do (process-wait "Page Unlatch" 
+		  #'(lambda (page) (null (process::lock-holder (page-lock page))))
+		  losing-page)
+	   until successful)
+     (let ((aborted t))
+       (unwind-protect
+	   (progn ,@body
+		  (setf aborted nil))
+	 (when aborted
+	   (carefully-unlatch-all-transaction-element-pages ,transaction))))))
+
+(defmacro with-atomic-transaction ((pending-in-elements-var transaction) &body body)
+  `(with-ordered-lock (*global-commit-lock*)
+     (with-all-transaction-pages-latched (,pending-in-elements-var ,transaction)
+       . ,body)))
+
+;;;; (2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")Network protocol definitions
+
+0;; Net protocol version history
+;; Version 1: DBFS 34.0
+;; Version 2: DBFS 34.11 added version verification, open command net block with
+;;   client UID
+;; Version 3: DBFS 34.17 eliminate page generation IDs
+;; Version 4: DBFS 35.0 recompilation of the same, changes command numbers.
+;; Version 5: DBFS 36.0 elimination of file opening, use UID for file-id
+;; Version 6: DBFS 40.2 added invalid-data-ok-p to lock-page-cmd
+;; Version 7: DBFS 40.5 added create-p to open-file-cmd, renamed destroy-all-pages
+;;   to destroy-file.  Added %file-extant-p-cmd as well for future patch.
+;; Version 8: DBFS 40.16 added multiple cache invalidates
+;; Version 9: DBFS 42.2 added %transaction-abort-reply, file system disabled reason
+;; Version 10: DBFS 402.2 added 
+;; Version 11: DBFS ??.?? added cache-valid-p to read-page-cmd, remote-transaction-id
+;;   to open-connection-reply
+(eval-when (eval compile load)
+  (defconstant %dbfs-page-protocol-version 10))
+
+(eval-when (compile load eval)
+(si:defenumerated *dbfs-commands*
+		  (%open-connection-cmd
+		   %open-connection-reply
+		   %close-connection-cmd
+		   %open-file-cmd
+		   %open-file-reply
+		   %lock-page-cmd
+		   %optimistic-lock-page-cmd
+		   %unlock-page-cmd
+		   %create-page-cmd
+		   %created-page-reply
+		   %optimistic-create-page-cmd
+		   %destroy-page-cmd
+		   %page-extant-p-cmd
+		   %read-page-cmd
+		   %read-page-reply
+		   %write-page-cmd
+		   %file-page-length-cmd
+		   %file-page-length-reply
+		   %commit-cmd
+		   %NOP-CMD			;+++ take this away when recompiled
+		   %cache-invalid-reply
+		   %page-lock-wait-reply
+		   %validate-transaction-cmd
+		   
+		   ;;++ this is a kludge - convert all of these to have
+		   ;; their own defnetblock forms.
+		   ;; These are the simple command and replies which don't have any
+		   ;; arguments and thus just fit into a net-header net block.
+		   ;; They don't need to have their own defnetblock forms.
+		   %done-reply
+		   %nonextant-page-reply
+		   %extant-page-reply
+		   %nonextant-file-reply
+		   %file-already-exists-reply
+		   %nonextant-file-system-reply
+		   %invalid-file-system-reply
+
+		   ;; These are the asynchronous commands
+		   %invalidate-page-cmd
+
+		   ;;+++ These should be moved into their right places at a later
+		   ;; recompilation and the protocol version bumped.
+		   ;; They are here for now since they are being patched in.
+		   %file-system-disabled-reply
+		   %destroy-file-cmd
+		   %file-extant-p-cmd
+		   %transaction-abort-reply
+		   %dbfs-disabled-reply
+		   %note-pending-cmd
+		   ))
+);; end eval-when
+
+(si:defenumerated *dbfs-booleans*		; Used for boolean values in net blocks
+		  (%false
+		   %true))
+
+(eval-when (compile load eval)
+(defvar *maximum-net-block-fixed-size* 0)
+);; End eval-when
+
+(defvar *maximum-net-block-string-size* 100.)
+
+(defmacro defnetblock (name (&optional includes conc-name) &body fields)
+  (let (forms)
+    (unless conc-name
+      (setq conc-name (string-append name "-")))
+    (loop with done-string = nil
+	  for offset = (if includes
+			   (symbol-value (intern (string-append "%" includes "-FIXED-SIZE")))
+			   0)
+		    then (if size (+ offset size) offset)
+	  for (field-name type size) in fields
+	  do (when done-string
+	       (error "Can only be one string, and it must be the last field in a net block"))
+	     (push `(defsubst ,(intern (string-append conc-name field-name)) (array)
+		      ,(ecase type
+			 (unsigned-integer
+			   `(aref-unsigned-integer array ,offset ,size))
+			 (boolean
+			   (setq size 1)
+			   `(aref-boolean array ,offset))
+			 (string
+			   (setq done-string t
+				 size 1)	; Just account for the fixed byte count
+			   `(aref-string array ,offset))))
+		   forms)
+	  finally (push `(eval-when (compile load eval)
+			   (when (> ,offset *maximum-net-block-fixed-size*)
+			     (setq *maximum-net-block-fixed-size* ,offset))
+			   (defconstant ,(intern (string-append "%" name "-FIXED-SIZE"))
+					,offset))
+			forms))
+
+    `(progn ,@forms)))
+
+(defnetblock net-block ()
+  (n-bytes unsigned-integer 2)
+  (n-bytes-copy unsigned-integer 2))
+
+(defnetblock net-header (net-block "NET-BLOCK-")
+  (checksum unsigned-integer 1)
+  (sequence-number unsigned-integer 4)
+  (command unsigned-integer 1))			; One of *dbfs-commands*
+
+(defnetblock net-file (net-header "NET-BLOCK-")
+  (remote-id unsigned-integer 4))
+
+(defnetblock net-page (net-file "NET-BLOCK-")
+  (page-n unsigned-integer 4))
+
+#+ignore
+(defnetblock open-asynch-connection-cmd (net-header)
+  (foreign-id string))
+
+(defnetblock connection-header (net-header)
+  (version unsigned-integer 1)
+  (word1 unsigned-integer 4)
+  (word2 unsigned-integer 4)
+  (word3 unsigned-integer 4))
+
+(defnetblock open-connection-cmd (connection-header))
+
+(defnetblock open-connection-reply (connection-header)
+  (remote-transaction-id unsigned-integer 4))
+
+(defnetblock close-connection-cmd (net-header))
+
+(defnetblock open-file-cmd (net-header)
+  (file-id0 unsigned-integer 4)
+  (file-id1 unsigned-integer 4)
+  (file-id2 unsigned-integer 4)
+  (create-p boolean)
+  (file-system-name string))
+
+(defnetblock open-file-reply (net-file)
+  (page-size unsigned-integer 2))
+
+(defnetblock file-system-disabled-reply (net-header)
+  (reason string))
+
+(defnetblock dbfs-disabled-reply (net-header)
+  (reason string))
+
+(defnetblock destroy-file-cmd (net-file))
+
+(defnetblock read-page-cmd (net-page)
+  (lock-type unsigned-integer 1)
+  (create-p boolean))
+
+(defnetblock read-page-reply (net-page)
+  (n-bytes unsigned-integer 2)
+  (cache-valid-p boolean))
+
+(defnetblock write-page-cmd (net-page)
+  (n-bytes unsigned-integer 2))
+
+(defnetblock page-extant-p-cmd (net-page))
+
+(defnetblock create-page-cmd (net-page)
+  (extant-ok-p boolean))
+
+(defnetblock created-page-reply (net-page))
+
+(defnetblock destroy-page-cmd (net-page))
+
+(defnetblock lock-page-cmd (net-page)
+  (lock-type unsigned-integer 1)
+  (invalid-data-ok-p boolean))
+
+(defnetblock file-page-length-cmd (net-file))
+
+(defnetblock file-page-length-reply (net-file)
+  (n-pages unsigned-integer 4)
+  (first-page-n unsigned-integer 4)
+  (last-page-n unsigned-integer 4))
+
+(defnetblock invalidate-page-cmd (net-page))
+
+(defnetblock commit-cmd (net-header))
+
+(defnetblock cache-invalid-reply (net-page)
+  (n-invalidates unsigned-integer 4))
+
+(defnetblock page-lock-wait-reply (net-page))
+
+(defnetblock nonextant-file-reply (net-file))
+
+(defnetblock transaction-abort-reply (net-header)
+  (type unsigned-integer 1)
+  (reason string))
+
+(defnetblock note-pending-cmd (net-page))
+
+(defvar *process-transaction* nil
+  "The transaction associated with this process, or NIL if none.")
+(defvar *active-transactions* (make-hash-table :number-of-values 0 :size 10 :locking nil)
+  "Set of all currently active transactions in the Lisp world.")
+(defvar *abort-table* (make-hash-table)
+  "Maps transaction abort condition flavor symbol to integer count, for debugging")
+

@@ -1,0 +1,800 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: (NFS SCL); Base: 10; Lowercase: Yes; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;;; This file implements the lisp machine user end for the Sun Network File
+;;; System (NFS) Protocol, as specified in the sun Network File System
+;;; Protocol Specification, Revision B of 17 February 1986.
+
+;;; NFS streams
+
+(defflavor nfs2-stream-mixin
+	()
+	()
+  (:required-flavors nfs-stream-mixin)
+  :abstract-flavor
+  )
+
+(defflavor nfs2-data-stream-mixin
+	()
+	()
+  (:required-flavors nfs-data-stream-mixin)
+  :abstract-flavor
+  )
+
+(defun-in-flavor (update-plist nfs2-data-stream-mixin) (fattr)
+  (unless preserve-dates
+    (setf (getf plist :creation-date) (unix-to-udt (nfs2-fattr-mtime-seconds fattr)))
+    (setf (getf plist :reference-date) (unix-to-udt (nfs2-fattr-atime-seconds fattr))))
+  ;; Update the length from the fattr returned if we're keeping track
+  (when length
+    (setf length (floor (nfs2-fattr-size fattr) (ceiling (send self :byte-size) 8)))))
+
+(defmethod (stream-update-fhandle-and-plist nfs2-data-stream-mixin) ()
+  (if (or (null dir-fhandle) (null fhandle))
+      (setq plist (cdr (stream-properties-without-preserving-dates self)))
+    (setq plist
+	  (cdr (fap-stat si:file-access-path (pathname self) truename dir-fhandle fhandle
+			 'stream-update-fhandle-and-plist)))))
+
+(defflavor nfs2-input-data-stream-mixin
+	()
+	()
+  (:required-flavors nfs2-data-stream-mixin nfs-input-data-stream-mixin)
+  :abstract-flavor
+  )
+
+(defmethod (stream-read-data nfs2-input-data-stream-mixin) (offset count)
+  (declare (values array))
+  (let ((array nil))
+    (unwind-protect
+	(progn
+	  (setq array (allocate-resource 'nfs-card8-data))
+	  (with-nfs2-fattr (fattr)
+	    (with-nfs2-readres (readres-in fattr array)
+	      (with-nfs2-error-information ((truename self) 'stream-read-data)
+		(update-plist
+		  (nfs2-readres-fattr
+		    (let* ((readres
+			     (nfs2proc-read
+			       fhandle offset count 0 readres-in
+			       :transport-agent (fap-transport-agent si:file-access-path)))
+			   (data (nfs2-readres-data readres)))
+		      (when (neq data array)
+			(setf (fill-pointer array) (vector-length data))
+			(replace array data))
+		      readres))))))
+	  (prog1 array (setq array nil)))
+      (when array (deallocate-resource 'nfs-card8-data array)))))
+
+(defflavor nfs2-read-ahead-mixin
+	()
+	()
+  (:required-flavors nfs2-data-stream-mixin nfs-read-ahead-mixin)
+  :abstract-flavor)
+
+(defmethod (stream-start-read-ahead nfs2-read-ahead-mixin) (offset count)
+  (start-nfs2proc-read-future
+    fhandle offset count 0 :transport-agent (fap-transport-agent si:file-access-path)))
+
+(defmethod (stream-finish-read-ahead nfs2-read-ahead-mixin) (future &optional (errorp t))
+  (declare (values array))
+  (let ((array nil))
+    (unwind-protect 
+	(progn
+	  (setq array (allocate-resource 'nfs-card8-data))
+	  (condition-case-if (not errorp) ()
+	       (progn
+		 (with-nfs2-fattr (fattr)
+		   (with-nfs2-readres (readres-in fattr array)
+		     (update-plist
+		       (nfs2-readres-fattr
+			 (with-nfs2-error-information ((truename self) 'stream-read-data)
+			   (let* ((readres (finish-nfs2proc-read-future future readres-in))
+				  (data (nfs2-readres-data readres)))
+			     (when (neq data array)
+			       (setf (fill-pointer array) (vector-length data))
+			       (replace array data))
+			     readres))))))
+		 (prog1 array (setq array nil)))
+	     ((rpc:rpc-error fs:file-error))))
+      (when array (deallocate-resource 'nfs-card8-data array)))))
+
+(defmethod (stream-abort-read-ahead nfs2-read-ahead-mixin) (future)
+  (abort-nfs2proc-read-future future))
+
+(defflavor nfs2-output-data-stream-mixin
+	()
+	()
+  (:required-flavors nfs2-data-stream-mixin nfs-output-data-stream-mixin)
+  :abstract-flavor
+  )
+
+(defmethod (stream-write-data-internal nfs2-output-data-stream-mixin) (array offset)
+  (with-nfs2-fattr (fattr-in)
+    (with-nfs2-error-information ((truename self) 'stream-write-data)
+      (update-plist 
+	(nfs2proc-write
+	  fhandle 0 offset 0 array fattr-in
+	  :transport-agent (fap-transport-agent si:file-access-path))))))
+
+(defmethod (stream-write-data nfs2-output-data-stream-mixin) (array offset deallocate-p)
+  (stream-write-data-internal self array offset)
+  (when deallocate-p (deallocate-resource 'nfs-card8-data array)))
+
+(defflavor nfs2-write-behind-mixin
+	()
+	()
+  (:required-flavors nfs2-data-stream-mixin nfs-write-behind-mixin)
+  :abstract-flavor)
+
+(defmethod (stream-start-write-behind nfs2-write-behind-mixin) (array offset)
+  (start-nfs2proc-write-future
+    fhandle 0 offset 0 array
+    :transport-agent (fap-transport-agent si:file-access-path)))
+
+(defmethod (stream-finish-write-behind nfs2-write-behind-mixin) (future array offset)
+  (condition-case (error)
+       (with-nfs2-fattr (fattr-in)
+	 (update-plist
+	   (with-nfs2-error-information ((truename self) 'stream-write-data)
+	     (finish-nfs2proc-write-future future fattr-in))))
+     ((rpc:rpc-error fs:file-error)
+      (stream-write-data-internal self array offset))))
+
+(defmethod (stream-abort-write-behind nfs2-write-behind-mixin) (future)
+  (abort-nfs2proc-write-future future))
+
+;;; And now the stream definitions.
+
+(defflavor nfs2-probe-stream
+	()
+	(nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-probe-stream)
+
+(defflavor nfs2-input-wide-binary-stream
+	()
+	(nfs-wide-binary-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-sequential-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-16-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-input-wide-binary-stream)
+
+(defflavor nfs2-direct-access-input-wide-binary-stream
+	()
+	(nfs-wide-binary-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-direct-access-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-16-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-direct-access-input-wide-binary-stream)
+
+(defflavor nfs2-input-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-sequential-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-input-binary-stream)
+
+(defflavor nfs2-unix-translating-input-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-sequential-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-input-binary-stream)
+
+(defflavor nfs2-ascii-translating-input-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-ascii-translating-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-sequential-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-ascii-translating-input-binary-stream)
+
+(defflavor nfs2-direct-access-input-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-direct-access-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-direct-access-input-binary-stream)
+
+(defflavor nfs2-unix-translating-direct-access-input-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-direct-access-read-ahead-mixin
+	 si:input-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-input-binary-stream
+	 si:input-file-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-direct-access-input-binary-stream)
+
+(defflavor nfs2-unix-translating-input-character-stream
+	()
+	(nfs-character-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-sequential-read-ahead-mixin
+	 si:buffered-input-character-stream
+	 si:input-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-input-character-stream)
+
+(defflavor nfs2-ascii-translating-input-character-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-ascii-translating-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-read-ahead-mixin
+	 nfs-sequential-read-ahead-mixin
+	 si:buffered-input-character-stream
+	 si:input-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-ascii-translating-input-character-stream)
+
+(defflavor nfs2-unix-translating-direct-access-input-character-stream
+	()
+	(nfs-character-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:buffered-input-character-stream
+	 si:input-file-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-direct-access-input-character-stream)
+
+(defflavor nfs2-output-wide-binary-stream
+	()
+	(nfs-wide-binary-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-write-behind-mixin
+	 nfs-write-behind-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-16-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-output-wide-binary-stream)
+
+(defflavor nfs2-direct-access-output-wide-binary-stream
+	()
+	(nfs-wide-binary-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-16-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-direct-access-output-wide-binary-stream)
+
+(defflavor nfs2-output-binary-stream
+	()
+	(nfs-binary-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-write-behind-mixin
+	 nfs-write-behind-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-output-binary-stream)
+
+(defflavor nfs2-unix-translating-output-binary-stream
+	()
+	(nfs-binary-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-write-behind-mixin
+	 nfs-write-behind-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-output-binary-stream)
+
+(defflavor nfs2-ascii-translating-output-binary-stream
+	()
+	(nfs-binary-output-data-stream-mixin
+	 nfs-ascii-translating-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-write-behind-mixin
+	 nfs-write-behind-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-ascii-translating-output-binary-stream)
+
+(defflavor nfs2-direct-access-output-binary-stream
+	()
+	(nfs-binary-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-direct-access-output-binary-stream)
+
+(defflavor nfs2-unix-translating-direct-access-output-binary-stream
+	()
+	(nfs-binary-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-output-binary-stream
+	 si:output-file-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-direct-access-output-binary-stream)
+
+(defflavor nfs2-unix-translating-output-character-stream
+	()
+	(nfs-character-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-write-behind-mixin
+	 nfs-write-behind-mixin
+	 si:output-pointer-remembering-mixin
+	 si:buffered-output-character-stream
+	 si:output-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-output-character-stream)
+
+(defflavor nfs2-ascii-translating-output-character-stream
+	()
+	(nfs-character-output-data-stream-mixin
+	 nfs-ascii-translating-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 nfs2-write-behind-mixin
+	 nfs-write-behind-mixin
+	 si:output-pointer-remembering-mixin
+	 si:buffered-output-character-stream
+	 si:output-file-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-ascii-translating-output-character-stream)
+
+(defflavor nfs2-unix-translating-direct-access-output-character-stream
+	()
+	(nfs-character-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:output-pointer-remembering-mixin
+	 si:buffered-output-character-stream
+	 si:output-file-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-direct-access-output-character-stream)
+
+(defflavor nfs2-bidirectional-wide-binary-stream
+	()
+	(nfs-wide-binary-output-data-stream-mixin
+	 nfs-wide-binary-input-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:input-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-16-stream
+	 si:buffered-binary-stream
+	 si:file-data-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-bidirectional-wide-binary-stream)
+
+(defflavor nfs2-direct-access-bidirectional-wide-binary-stream
+	()
+	(nfs-wide-binary-input-data-stream-mixin
+	 nfs-wide-binary-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:input-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-16-stream
+	 si:buffered-binary-stream
+	 si:file-data-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-direct-access-bidirectional-wide-binary-stream)
+
+(defflavor nfs2-bidirectional-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-binary-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:input-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-binary-stream
+	 si:file-data-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-bidirectional-binary-stream)
+
+(defflavor nfs2-unix-translating-bidirectional-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs-binary-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:input-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-binary-stream
+	 si:file-data-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-bidirectional-binary-stream)
+
+(defflavor nfs2-direct-access-bidirectional-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-binary-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:input-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-binary-stream
+	 si:file-data-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-direct-access-bidirectional-binary-stream)
+
+(defflavor nfs2-unix-translating-direct-access-bidirectional-binary-stream
+	()
+	(nfs-binary-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs-binary-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:input-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:unsigned-byte-8-with-character-io-mixin
+	 si:unsigned-byte-8-stream
+	 si:buffered-binary-stream
+	 si:file-data-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-direct-access-bidirectional-binary-stream)
+
+(defflavor nfs2-unix-translating-bidirectional-character-stream
+	()
+	(nfs-character-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs-character-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:buffered-character-stream
+	 si:file-data-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-bidirectional-character-stream)
+
+(defflavor nfs2-unix-translating-direct-access-bidirectional-character-stream
+	()
+	(nfs-character-input-data-stream-mixin
+	 nfs-unix-translating-input-data-stream-mixin
+	 nfs-character-output-data-stream-mixin
+	 nfs-unix-translating-output-data-stream-mixin
+	 nfs-bidirectional-data-stream-mixin
+	 nfs2-input-data-stream-mixin
+	 nfs-input-data-stream-mixin
+	 nfs2-output-data-stream-mixin
+	 nfs-output-data-stream-mixin
+	 nfs2-data-stream-mixin
+	 nfs-data-stream-mixin
+	 nfs2-stream-mixin
+	 nfs-stream-mixin
+	 si:bidirectional-pointer-remembering-mixin
+	 si:output-pointer-remembering-mixin
+	 si:buffered-character-stream
+	 si:file-data-stream-mixin
+	 si:direct-access-buffered-input-stream-mixin
+	 si:direct-access-buffered-output-stream-mixin)
+  )
+
+(compile-flavor-methods nfs2-unix-translating-direct-access-bidirectional-character-stream)
+

@@ -1,0 +1,1509 @@
+;;;-*- Mode:LISP; Package:FS; Lowercase:T; base:8; lowercase:yes -*-
+;;;
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;
+
+;;; "The QFILE Server"
+;;; Chaos-specific, packet-limited file protocol.
+;;; Renamed from server.lisp.261, which was (for historical reasons) part of the
+;;; LMFS system.
+
+;;; This file contains flavor declarations that the NFILE server relies on.
+;;; And a few functions, too.
+
+(defstruct (server-dataproc-comm (:type :list) :conc-name)
+  iotype					;'input, 'output ,direct
+  control-proc					;involved control process
+  data-proc					;data process
+  conn						;chaos connection
+  sibling					;another server-dataproc-comm
+  cell						;( command . handle)
+  opening					;file stream, or 'directory
+  arg						;random junk between cc and dc
+  binp						;says if a binary transfer needed
+  dinfo						;info for directory list
+  svri						;server instance object
+  tid						;transaction ID for commands where dc answers
+  user-id
+  user
+  access-cell
+  abort-flag)					;close with abort...
+
+(defstruct (server-direct-dataproc-comm (:type :list) :conc-name
+					(:include server-dataproc-comm))
+  odata)
+
+
+;; This so you can log other hosts if you want.
+(defun log-transaction-for-host-p (address)
+  (not (chaos:host-trusted-p address)))
+
+;;; Toplevel and parsers
+
+(defflavor qfile-server
+	((server-user-id server-login-id)
+	 (server-user (or (net:find-object-named :user server-login-id nil)
+			  (net:find-object-named :user "LISP-MACHINE" nil))))
+	(chaos:chaos-server))
+
+(defmethod (:user-id qfile-server) ()
+  server-user-id)
+
+(defmethod (:peek qfile-server) ()
+  (qfile-peek-server (send (send self :process) :stack-group)))
+
+(defmethod (:server-top-level qfile-server) ()
+  (let ((*server-instance* self)
+	(user-id server-user-id)
+	(si:*user* server-user))
+    (si:link-variables (variable-location user-id) (variable-location server-user-id)
+		       (variable-location si:*user*) (variable-location server-user))
+    (qfile-server-top-level (send self :conn))))
+
+(compile-flavor-methods qfile-server)
+
+(net:define-server :qfile (:medium :chaos :conn conn
+				   :no-host-in-process-name t	D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");Since we compute it on our own
+0				   :flavor qfile-server :who-line t))
+
+
+(defvar server-is-logged-in)
+(defvar trace-server-enabled nil)
+(defvar server-traces nil)
+(defvar *qfile-server-dont-answer-logins* nil)
+(defvar *qfile-server-notification* nil)
+(defvar server-protocol-version 0)
+(defvar server-openings)
+(defvar alldatas)				;all dataconn cells
+(defvar *transaction-id*)					;running transaction id
+(defvar *stream*)					;connection stream
+(defvar *conn*)					;connection
+(defvar server-instance)			;tag for props
+(defvar qfile-debug-server nil)
+(defvar *qfile-server-local-host*)
+
+(defconst *qfile-server-command-specs*
+	;;name fh-required strings-required magic-flag
+	'((:data-connection nil 0)
+	  (:rename :fh-or 2)
+	  (:change-properties :fh-or 1 min)
+	  (:delete :fh-or 1)
+	  (:directory t 1)
+	  (:properties t 0 min)
+	  (:close t 0)
+	  (:continue t 0)
+	  (:complete nil 2)
+	  (:expunge nil 1)
+	  (:create-directory nil 1)
+	  (:create-link nil 2)
+	  (:read t 0)
+	  (:abort t 0)
+	  (:direct-output t 0)
+	  (:finish t 0)
+	  (:enable-capabilities nil 1)
+	  (:disable-capabilites nil 0)))
+
+(defun trace-server (&optional (onoff t))
+  (setq trace-server-enabled onoff))
+
+(defun report-server-error (err info)
+  (report-file-server-error "QFile" (send *server-instance* :foreign-host) err info))
+
+(defun lookup-file-handle (fh &optional (must-have-opening nil) type)
+  (let ((data (or (get fh server-instance)
+		  (server-error 'server-protocol-violation "Unknown file handle: ~A" fh))))
+    (unless (null type)
+      (unless (eq type (server-dataproc-comm-iotype data))
+	(server-error 'server-protocol-violation
+		      "File handle ~A is of the wrong gender or type for this operation."
+		      fh)))
+    (when (eq must-have-opening t)
+      (unless (server-dataproc-comm-opening data)
+	(server-error 'server-bug "No opening on file handle ~A" fh)))
+    (if (and (eq must-have-opening 'better-not)
+	     (server-dataproc-comm-opening data))
+	(server-error 'server-protocol-violation
+		      "File handle ~A is still (or already?) in use." fh))
+    (if (eq (car (server-dataproc-comm-cell data)) ':conn-aborted)
+	(throw 'server-chaos-disappear nil))
+    data))
+
+(defun iodata-from-ddata (ddata type)
+  (let* ((opening (or (server-dataproc-comm-opening ddata)
+		      (ferror "No opening on direct file handle.")))
+	 (data (or (selectq type
+		     (input (ferror "No idata from ddata allowed."))
+		     (output (server-direct-dataproc-comm-odata ddata)))
+		   (ferror "No data handle for direct handle."))))
+    (or (eq opening (server-dataproc-comm-opening data))
+	(ferror "Data file handle does not correspond to direct file handle."))
+    data))
+
+(defun server-error (cond &rest format-args)
+  (error cond ':report-string (lexpr-funcall #'format nil format-args)))
+
+(defun qfile-server-top-level (conn)
+  (login-file-server-machine-if-necessary #'report-server-error)
+  (let (*transaction-id* *stream* *conn* alldatas server-openings
+	(server-instance (gensym))		;bind em all local....
+	(*qfile-server-local-host* net:local-host)
+	(lmfs:*access-groups* nil)
+	(*access-cell* (ncons nil))
+	(server-is-logged-in nil)
+	(server-protocol-version server-protocol-version))
+    (declare (special lmfs:*access-groups* lmfs:*access-permissive* lmfs:*require-login*))
+    (si:link-variables (locf lmfs:*access-groups*) *access-cell*)
+    (let-if (not (send *server-instance* :trusted-p))
+	    ((lmfs:*access-permissive* nil)
+	     (lmfs:*require-login* t))
+      (unwind-protect
+	  (condition-case (err)
+	       (catch 'server-chaos-disappear
+		 (setq *conn* conn)
+		 (setf (si:process-name current-process)
+		       (string-append "FILE Control (" (send
+							 (send *server-instance* :foreign-host)
+							 :short-name) ")"))
+		 (when *qfile-server-dont-answer-logins*
+		   (chaos:reject (prog1 *conn* (setq *conn* nil conn nil))
+				 *qfile-server-dont-answer-logins*)
+		   (throw 'server-chaos-disappear nil))
+		 (let* ((pkt (chaos:read-pkts conn))	;s/b rfc
+			(result (qfile-server-parse-rfc pkt)))
+		   (cond ((fixp result)
+			  (setq server-protocol-version result))
+			 (t (chaos:reject (prog1 *conn* (setq *conn* nil)) result)
+			    (throw 'server-chaos-disappear nil))))
+		 (chaos:accept conn)
+		 ;; If there's a message, send it off right away.
+		 (if *qfile-server-notification*
+		     (let ((pkt (chaos:get-pkt)))
+		       (chaos:set-pkt-string pkt *qfile-server-notification*)
+		       (chaos:send-pkt conn pkt fs:%file-notification-opcode)))
+		 (setq *stream* (chaos:make-stream conn))
+		 (if *server-shutdown-message* (send-single-shutdown-message conn))
+		 (qfile-server-command-loop conn))
+	     ;; Major trap
+	     ((connection-closed connection-closed-locally connection-lost
+				 host-stopped-responding bad-connection-state))
+						;De mortuis nil nisi bonum...
+	     (error (report-server-error err "Server Top Level")))
+	;;UNWIND-PROTECT cleanups
+	(cleanup-qfile-server-instance conn)))))
+
+(defun qfile-server-command-loop (conn)
+  (do ((pkt) (op)) (())
+    (setq pkt (condition-case ()
+		  (chaos:get-next-pkt conn)
+		((sys:host-not-responding sys:bad-connection-state)
+		 (throw 'server-chaos-disappear nil))))	;don't complain...
+    (setq op (chaos:pkt-opcode pkt))
+    (selector op =
+      ((chaos:eof-op chaos:cls-op)
+       (chaos:return-pkt pkt)
+       (send *stream* ':force-output)
+       (return nil))
+      (chaos:dat-op )
+      (chaos:los-op
+	(error 'chaos:chaos-connection-lost
+	       ':connection conn
+	       ':attempt "to get control packet from"
+	       ':reason (prog1 (string-append (chaos:pkt-string pkt))
+			       (chaos:return-pkt pkt))))
+      (otherwise
+	(unwind-protect
+	  (error 'chaos:unknown-pkt-opcode
+		 ':pkt pkt ':opcode op ':connection conn)
+	  (chaos:return-pkt pkt))))
+    (unwind-protect ;; to free packet in case we get an uncaught error
+		    ;; in here.  It may be that *stream* is now closed
+		    ;; and will cause such an error.  -dcp 7/13/83
+      (progn
+	(let* ((string (chaos:pkt-string pkt))
+	       (strings (get-strings-from-pktstring string)))	;nl-delimited strings
+	  
+	  (if trace-server-enabled
+	      (without-interrupts (push (string-append string) server-traces)))
+	  (destructuring-bind (*transaction-id* fh cmd . rest)
+			      (qfile-server-parse-cmd-string string)
+	    (if (and *qfile-server-dont-answer-logins*
+		     ;; Yes, you can go away, but don't come back!
+		     (not (memq cmd '(:close :undata-connection))))
+		(format *stream* "~A ~A ERROR HNA F Host not available - ~A "
+			*transaction-id* (or fh "")
+			*qfile-server-dont-answer-logins*)
+		(condition-case (err)
+		    (condition-bind ((error #'file-server-error-filter))
+		      (qfile-server-dispatch cmd rest strings fh))
+		  ((fs:file-error fs:parse-pathname-error server-error)
+		   (let ((message
+			   (cl:with-output-to-string (message-stream)
+			     (format message-stream "~A ~@[~A~] ERROR ~A F "
+				     *transaction-id* fh (server-three-letter-code err))
+			     (cond
+			       ((send err ':operation-handled-p ':report-without-pathname)
+				(send err ':report-without-pathname message-stream))
+			       (t (send err ':report message-stream))))))
+		     (log-server-error-event
+		       err "QFILE"
+		       (send *server-instance* :foreign-host)
+		       "~A" message)
+		     (send *stream* :string-out message)))
+		  (error
+		    (format *stream*
+			    "~A ~@[~A~] ERROR BUG F Operating system error - ~A.~%"
+			    *transaction-id* fh err)
+		    (report-server-error
+		      err (format nil "Processing ~S, host ~A *transaction-id* ~A FH ~A"
+				  cmd (send *server-instance* :foreign-host)
+				  *transaction-id* fh)))))))	;end of let*...
+	(send *stream* ':force-output))
+      (chaos:return-pkt pkt))))
+
+(defun qfile-server-dispatch (cmd rest strings fh)
+  (selectq cmd
+    (:login (progn
+	      (setq user-id (setq *server-is-logged-in* (qfile-server-login rest)))
+	      (let ((user-object (net:find-object-named :user user-id nil)))
+		(when user-object (setq si:*user* user-object)))
+	      (setq server-is-logged-in t)))
+    (:data-connection (qfile-server-data-connection rest))
+    (:undata-connection (qfile-server-undata-connection fh))
+    (otherwise
+     (if (not server-is-logged-in)
+	 (format *stream* "~A ~A ERROR NLI F Not Logged In"
+		 *transaction-id* (or fh ""))
+	 (let ((info (assq cmd *qfile-server-command-specs*)))
+	   (if info (validate-qfile-server-command info fh strings)))
+	 (let ((host (chaos:foreign-host-object *conn*)))
+	   (when (and (not (memq cmd '(:close :filepos :complete)))
+		      (log-transaction-for-host-p host))
+	     (log-untrusted-transaction "QFILE" host cmd rest strings)))
+	 (selectq cmd
+	   (:open   (qfile-server-open fh rest (car strings)))
+	   (:close (qfile-server-finish-close fh t))
+	   (:filepos (qfile-server-filepos fh rest))
+	   (:delete (qfile-server-delete fh strings))
+	   (:rename (qfile-server-rename fh strings))
+	   (:expunge (qfile-server-expunge strings))
+	   (:complete (qfile-server-complete rest strings))
+	   (:continue (qfile-server-continue fh))
+	   (:directory (qfile-server-directory fh rest strings nil))
+	   (:properties (qfile-server-directory fh rest strings t))
+	   (:change-properties (qfile-server-change-props fh strings))
+	   (:create-directory (qfile-server-create-directory strings))
+	   (:create-link (qfile-server-create-link strings))
+	   (:set-file-system (qfile-server-set-file-system rest))
+	   (:read (qfile-server-counted-read fh rest))
+	   (:abort (qfile-server-abort fh rest))
+	   (:direct-output (qfile-server-direct-output fh rest))
+	   (:finish (qfile-server-finish-close fh nil))
+	   (:enable-capabilities (qfile-server-capabilities (car rest) (car strings) t))
+	   (:disable-capabilities (qfile-server-capabilities (car rest) nil nil))
+	   (otherwise (error 'server-unknown-operation ':operation cmd)))))))
+
+
+(defun cleanup-qfile-server-instance (conn)
+  (neti:logout-server :qfile (send *server-instance* :foreign-host))
+  (when conn
+    (condition-case (err)
+	(chaos:close-conn conn
+			  (or *qfile-server-dont-answer-logins*
+			      "Control connection abandoned."))
+      (error (report-server-error err "Server Top Level close")))
+    (chaos:remove-conn conn))
+  ;;Get the Data Connections to cool it, and kill 'em.
+  (dolist (data alldatas)
+    (condition-case (err)
+	(and
+	  (cleanup-data-connection (server-dataproc-comm-cell data))
+	  (if (server-dataproc-comm-sibling data)	;not DIRECT
+	      (cleanup-data-connection (server-dataproc-comm-cell
+					 (get (server-dataproc-comm-sibling data)
+					      server-instance))))
+	  ;;Don't remove unless everybody took their hands off.
+	  (if (server-dataproc-comm-conn data)
+	      (chaos:remove-conn (server-dataproc-comm-conn data))))
+      (error (report-server-error err "Server toplevel close data connections"))))
+  ;;Only then close what openings there are.
+  (dolist (opening server-openings)
+    (condition-case (err)
+	(send opening ':close ':abort)
+      (error (report-server-error err "Server finish closing remaining openings")))))
+
+(defun cleanup-data-connection (cell)
+  (condition-case (err)
+      (catch 'server-chaos-disappear
+	(await-data-process cell 'undata "Cleanup DataProc" 240.)	;4 seconds
+	(if (eq (car cell) ':conn-aborted)
+	    (rplaca cell nil))
+	(if (car cell)
+	    (ferror "Data process failed to relinquish data connection - state is ~S."
+		    (car cell))))
+    (error (report-server-error err "Data connection cleanup") nil)
+    (:no-error t)))
+
+(defun validate-qfile-server-command (specs fh strings &aux (nstrings (length strings)))
+  (destructuring-bind (name fh-required strings-required flag) specs
+    (cond ((null fh-required)
+	   (cond (fh
+		  (server-error 'server-protocol-violation
+				"~A does not want a file handle, but one was given." name))))
+	  ((eq fh-required ':fh-or)
+	   (cond (fh (decf strings-required))))
+	  ((null fh)
+	   (server-error 'server-protocol-violation
+			 "~A requires a file handle, but none was given." name)))
+    (cond ((and ( nstrings strings-required)
+		(or (neq flag 'min)		;allow CHANGE-PROPERTIES to win..
+		    (< nstrings strings-required)))
+	   (server-error 'server-protocol-violation
+			 "~A requires ~D string~:P, but ~D ~\was-were\ given."
+			 name strings-required nstrings nstrings)))))
+
+(defun qfile-server-parse-rfc (pkt &aux s fx version)
+  (setq s (chaos:pkt-string pkt))
+  (setq fx (string-search "FILE" s))
+  (cond ((null fx) "Unparseable RFC")
+	(t (setq fx (string-search-not-char #\SP s (+ fx 4)))
+	   (cond ((null fx) 0)
+		 ((null (setq version (parse-number s fx)))
+		  "Unparseable version number in RFC")
+		 ((or (= version 0) (= version 1)) version)
+		 (t (format nil "Unsupported FILE protocol version: ~D" version))))))
+
+(defun qfile-server-parse-cmd-string (string)
+  (loop with nlx = (string-search-char #\CR string)
+	with lim = (or nlx (string-length string))
+	for start upfrom 0		;gets munged internally
+	for count upfrom 0
+	while (< start lim)
+	when (char-equal (aref string start) #\SP) collect nil
+	else collect
+	     (let ((endx (or (string-search-char #\SP string start lim) lim)))
+	       (prog1
+		 (cond ((zerop count) (substring string start endx))
+		       ;; Plan is to hack FH's at count=1 specially.
+		       (t (or (parse-number string start endx nil t)
+			      (si:intern1
+				(substring string start endx) si:pkg-keyword-package))))
+		 (setq start endx)))))
+
+(defun get-strings-from-pktstring (string &aux answer)
+  (do ((start (string-search-char #\CR string)))
+      ((null start) nil)
+    (let ((ix (string-search-char #\CR string (1+ start))))
+      (if (null ix)
+	  (progn
+	    (if (not (= (1+ start) (string-length string)))
+		(push (substring string (1+ start)) answer))
+	    (return (nreverse answer))))
+      (push (substring string (1+ start) ix) answer)
+      (setq start ix))))
+
+(defun qfile-server-login (rest)
+  (let* ((uname
+	   (string (or (car rest)
+		       (server-error 'server-protocol-violation
+				     "Null or missing user name in LOGIN request."))))
+	 (password (second rest))
+	 (user-name (user-name-from-login-name uname)))
+    (declare (special lmfs:*require-login*))
+    (cond ((null net:*system-secured*))		;ignore the password and user
+	  (password
+	   (neti:login-server :qfile (send *server-instance* :foreign-host)
+			      uname password))
+	  (lmfs:*require-login*			;if you turn this on without
+						;there being a LMFS, you lose.
+	   (server-error 'server-invalid-password
+			 "Login for ~A failed: with password is required."
+			 uname)))
+    (format *stream* "~A  ~A ~A ~%~A~%" *transaction-id* "LOGIN" user-name
+	    (send
+	      (fs:make-pathname ':host si:local-host ':device ':unspecific
+				':directory
+				(list user-name)
+				':name nil ':type nil ':version nil)
+	      ':string-for-host))
+    user-name))
+
+
+;;; Opening files. 
+
+(defun qfile-server-open (fh rest filename &aux answer fmode binp direction
+			  deleted byte-size preserve-dates inhibit-links
+			  direct estimated-length probe-directory xdirection
+			  if-exists if-not-exists if-locked)
+  
+  (loop for olist on rest
+	as (opt) = olist
+	do
+    (selectq opt
+      ((:binary :character :default)
+       (if (and fmode (neq fmode opt))
+	   (server-error 'server-protocol-violation
+			 "Opening character mode multiply specified."))
+       (setq fmode opt))
+      ((:read :write :probe :append :bidirectional)
+       (setq opt (cdr (assq opt '((:read . :input) (:write . :output) (:probe . :probe)
+				  (:append . :append) (:bidirectional . :io)))))
+       (if (and direction (neq direction opt))
+	   (server-error 'server-protocol-violation
+			 "Opening direction multiply specified."))
+       (setq direction opt))
+      ((:temporary :raw :super))		;:super-image comes in as :super
+      (:deleted (setq deleted t))
+      (:preserve-dates (setq preserve-dates t))
+      (:inhibit-links (setq inhibit-links t))
+      (:probe-directory (setq probe-directory t))
+      (:byte-size
+       (setq byte-size (cadr olist))
+       (pop olist))
+      (:direct (setq direct t))
+      (:estimated-length
+       (setq estimated-length (cadr olist))
+       (pop olist))
+      (:if-exists
+       (setq if-exists (cadr olist))
+       (pop olist))
+      (:if-does-not-exist
+       (setq if-not-exists (cadr olist))
+       (pop olist))
+      (:if-locked
+       (setq if-locked (cadr olist))
+       (pop olist))
+      (t (error 'server-unimplemented-option ':option opt))))
+  (if (and (eq direction ':io)
+	   (not direct))
+      (server-error 'server-protocol-violation
+		    "DIRECT is required for bidirectional open."))
+  
+  (cond ((null fh)				;Probe, they say....
+	 (if (not (memq direction '(:probe nil)))
+	     (server-error 'server-protocol-violation
+			   "Inconsistency of file handle vs. open mode")
+	     (or direction (setq direction ':probe))))
+	;; File handle given. Must be real READ or WRITE.
+	(direct
+	 (let ((comdata (get fh server-instance)))
+	   (when (null comdata)
+	     (setq comdata (make-server-direct-dataproc-comm iotype 'direct
+							     cell `(nil . ,fh)))
+	     (putprop fh comdata server-instance)
+	     (push comdata alldatas))
+	   (if (server-dataproc-comm-opening comdata)
+	       (server-error 'server-protocol-violation
+			     "Direct file handle ~A is still (or already?) in use." fh))))
+	(t
+	 (let* ((comdata (lookup-file-handle
+			   fh
+			   'better-not
+			   (cond ((null direction) nil)
+				 ((memq direction '(:output :append)) 'output)
+				 (t 'input))))
+		(type (server-dataproc-comm-iotype comdata)))
+	   (when (or inhibit-links probe-directory)
+	     (unless (eq direction ':probe)
+	       (server-error 'server-protocol-violation
+			     "Special PROBE options only valid for :PROBE")))
+	   (when (null direction)
+	     (setq direction (cdr (assq type '((input . :input) (output . :output)))))))))
+  
+  (setq xdirection
+	(cond (inhibit-links ':probe-link)
+	      (probe-directory ':probe-directory)
+	      (t direction)))
+  
+  (let* ((pathname (qfile-server-check-access
+		     (qfile-parse-for-server filename)
+		     *conn* (selectq direction
+			      ((:input :probe) #/R) (:output #/C) (otherwise #/M))))
+    	 (opening nil))
+    (when (and (memq direction '(:io :input :probe :probe-directory :probe-link))
+	       (null if-not-existS))
+      (setq if-not-existS ':error))
+    (when (null if-exists)
+      (setq if-exists ':error))
+    (let ((char-mode (selectq fmode
+		       (:default ':default)
+		       (:binary nil)
+		       (:character t)
+		       (nil t)
+		       (t fmode)))
+	  (nargs 9))
+      (if deleted (incf nargs 2))
+      (if preserve-dates (incf nargs 2))
+      (if direct (incf nargs 2))
+      (if estimated-length (incf nargs 2))
+      (if if-exists (incf nargs 2))
+      (if if-not-exists (incf nargs 2))
+      (if if-locked (incf nargs 2))
+      ;;; Calling the instance directly wouldn't be such a bad idea, either.
+      (setq opening
+	    (block nil				;Compiler problem 10/31/85 13:34:37
+	      (%start-function-call #'open t nargs nil)
+	      (%push pathname)
+	      (%push ':direction)          (%push xdirection)
+	      (%push ':characters)	  (%push char-mode)
+	      (%push ':byte-size)	  (%push byte-size)
+	      (cond (deleted      (%push ':deleted)    (%push t)))
+	      (cond (preserve-dates (%push ':preserve-dates) (%push t)))
+	      (cond (direct       (%push ':direct)     (%push t)))
+	      (cond (estimated-length
+		     (%push ':estimated-length)   (%push estimated-length)))
+	      (cond (if-exists     (%push ':if-exists)         (%push if-exists)))
+	      (cond (if-not-exists (%push ':if-does-not-exist) (%push if-not-exists)))
+	      (cond (if-locked     (%push ':if-locked)	       (%push if-locked)))
+	      (%push '%return-binary-stream-for-character-file) (%push t)
+	      (%finish-function-call #'open t nargs nil))))
+    (setq answer
+	  (selector server-protocol-version =
+	    (0  
+	      (format nil
+		      "~D ~A ~D ~S~%~A~%"
+		      (send (send opening ':truename) ':version)
+		      (print-directory-date-property (send opening ':creation-date) nil)
+		      (send opening ':length)
+		      (send opening ':qfaslp)
+		      (send (send opening ':truename) ':string-for-host)))
+	    (1
+	      (let ((file-element-type (%file-stream-file-element-type opening)))
+		(setq binp (not (cl:subtypep file-element-type 'cl:character)))
+		(let 
+		  ((byte-size (or (and (null binp) 8.)	; a character file.
+				  (and (scl:equal-typep file-element-type 'cl:fixnum)
+				       32.)
+				  (and binp (listp file-element-type)
+				       (eq (first file-element-type) 'cl:unsigned-byte)
+				       (numberp (second file-element-type))
+				       (second file-element-type))
+				  16.)))
+		  (format nil
+			  "~A ~D ~S ~S ~S ~D ~D~%~A~%"
+			  (print-directory-date-property (send opening ':creation-date) nil)
+			  (send opening ':length)
+			  binp			;qfaslp, needed for compatibility
+			  (not binp)
+			  (send opening ':author)
+			  byte-size
+			  (send opening ':send-if-handles ':read-pointer)
+			  (send (send opening ':truename) ':string-for-host)))))))
+    (if (eq direction ':probe)
+	(close opening)
+	(let ((servi (get fh server-instance)))
+	  (push opening server-openings)
+	  (setf (server-dataproc-comm-abort-flag servi) nil)
+	  (setf (server-dataproc-comm-binp servi) binp)
+	  (setf (server-dataproc-comm-tid servi) *transaction-id*)
+	  (setf (server-dataproc-comm-opening servi) opening)
+	  (unless direct
+	    (rplaca (server-dataproc-comm-cell servi)
+		    (if (eq direction ':input) 'read 'write)))))
+    (format *stream*  "~A ~A OPEN ~A" *transaction-id* (or fh "") answer)))
+
+
+(defun qfile-parse-for-server (string)
+  (fs:merge-pathnames ;this is probably bogus, makes CFTP happy -DLW & BSG 11/19/82
+    (fs:parse-pathname string *qfile-server-local-host*)))
+
+(defun qfile-server-set-file-system (data)
+  (cond #-CADR
+	((and (eq (car data) ':fep)
+	      (numberp (cadr data)))
+	 (cond ((si:disk-unit-mounted-p (cadr data))
+		(setq *qfile-server-local-host* (fs:add-fep-file-host (cadr data)))
+		(format *stream* "~A  SET-FILE-SYSTEM" *transaction-id*))
+	       (t (format *stream* "~A  ERROR NFS F Disk unit ~D not mounted."
+			  *transaction-id* (cadr data)))))
+	(t (format *stream* "~A  ERROR NFS F Cannot access file system ~S."
+		   *transaction-id* data))))
+
+
+;;; Data connection stuff.
+
+(defun null-car (x) (null (car x)))
+
+(defun qfile-server-send-sync-mark (dconn)
+  (chaos:send-pkt dconn (chaos:get-pkt) fs:%file-synchronous-mark-opcode))
+
+(defun qfile-server-data-connection (rest)
+  (let ((ifh (car rest))
+	(ofh (cadr rest))
+	(default-cons-area working-storage-area))
+    (if (not (and ifh ofh (symbolp ifh) (symbolp ofh)))
+	(server-error 'server-protocol-violation "Ill-formed data-connection request"))
+    (let ((dconn
+	    (condition-case (err)
+		(chaos:connect (chaos:foreign-address *conn*) (string ofh))
+	      (sys:network-error (server-error 'server-network-error
+					       "Reverse connection lost: ~A" err))))
+	  (host-name (send (send *server-instance* :foreign-host) :short-name)))
+      (putprop ifh
+	       (make-server-dataproc-comm iotype 'input conn dconn svri *server-instance*)
+	       server-instance)
+      (putprop ofh
+	       (make-server-dataproc-comm iotype 'output conn dconn svri *server-instance*)
+	       server-instance)
+      (let ((ocell (cons nil ofh))
+	    (icell (cons nil ifh))
+	    (idata (get ifh server-instance))
+	    (odata (get ofh server-instance)))
+	(setf (server-dataproc-comm-user-id idata) user-id)
+	(setf (server-dataproc-comm-user    idata) si:*user*)
+	(setf (server-dataproc-comm-data-proc idata)
+	      (process-run-function
+		(string-append "FILE In  " ifh " (" host-name ")")
+		'qfile-server-data-top-level 
+		server-instance icell ifh))
+	(setf (server-dataproc-comm-user-id odata) user-id)
+	(setf (server-dataproc-comm-user    odata) si:*user*)
+	(setf (server-dataproc-comm-data-proc odata)
+	      (process-run-function
+		(string-append "FILE Out " ofh " (" host-name")")
+		'qfile-server-data-top-level 
+		server-instance ocell ofh))
+	(setf (server-dataproc-comm-sibling idata) ofh)
+	(setf (server-dataproc-comm-sibling odata) ifh)
+	(setf (server-dataproc-comm-access-cell idata) *access-cell*)
+	(setf (server-dataproc-comm-access-cell odata) *access-cell*)
+	(push odata alldatas)			;one side's good enough.
+	(setf (server-dataproc-comm-cell idata) icell)
+	(setf (server-dataproc-comm-cell odata) ocell)
+	(format *stream* "~A  DATA-CONNECTION" *transaction-id*)))))
+
+(defun qfile-server-undata-connection (fh)
+  (let ((data (lookup-file-handle fh)))
+    (dolist (fh (list fh (server-dataproc-comm-sibling data)))
+      (let* ((data (get fh server-instance))
+	     (cell (server-dataproc-comm-cell data)))
+	(await-data-process cell 'undata)
+	;; We can't predict which side will be told to undata, so make sure
+	;; that all sides get removed from alldatas.
+	(setq alldatas (delq data alldatas)))
+      (si:nremprop fh server-instance))
+    (chaos:remove-conn (server-dataproc-comm-conn data))
+    (format *stream* "~A ~A UNDATA-CONNECTION" *transaction-id* fh)))
+
+(defun qfile-server-data-top-level (server-instance cell handle)
+  (let* ((cmd nil)
+	 (data (get handle server-instance))
+	 (dconn (server-dataproc-comm-conn data))
+	 (*server-instance* (server-dataproc-comm-svri data))
+	 (user-id (server-dataproc-comm-user-id data))
+	 (si:*user* (server-dataproc-comm-user data))
+	 (lmfs:*access-groups* nil))
+    (declare (special *server-instance* user-id si:*user*
+		      lmfs:*access-groups* lmfs:*access-permissive* lmfs:*require-login*))
+    (si:link-variables (locf lmfs:*access-groups*) (server-dataproc-comm-access-cell data))
+    (let-if (not (send *server-instance* :trusted-p))
+	    ((lmfs:*access-permissive* nil)
+	     (lmfs:*require-login* t))
+      (condition-case (err)
+	   (condition-bind ((error #'file-server-error-filter))
+	     (do () (())
+	       (process-wait "Data Conn Cmd"
+		 #'(lambda ()
+		     (or (car cell) (neq (chaos:state dconn) 'chaos:open-state))))
+	       (unless (eq (chaos:state dconn) 'chaos:open-state)
+		 (return (rplaca cell ':conn-aborted)))
+	       (let ((celloc (locf (car cell)))
+		     (opening (server-dataproc-comm-opening data)))
+		 (catch 'async-abort
+		   (selectq (setq cmd (car cell))
+		     (undata			;Gute Nacht, O Wesen.
+		      (rplaca cell nil)
+		      (return nil))
+		     
+		     (hands-off
+		      (rplaca cell nil))
+		     
+		     ((fpsync wsync)
+		      (qfile-server-send-sync-mark dconn)
+		      (rplaca cell nil))
+		     
+		     (directory
+		      (server-dataproc-hack-directory data handle)
+		      (%store-conditional celloc 'directory nil))
+		     (write
+		      (if (null opening) (ferror "File Server Data Top Level - no opening"))
+		      (qfile-server-dataproc-write-loop data dconn cell opening))
+		     ((read read-with-count)
+		      (if (null opening) (ferror "File Server Data Top Level - No opening."))
+		      (qfile-server-dataproc-read-loop data dconn cell cmd))
+		     (t (ferror "Bogus communication cell value: ~S" (car cell))))))))
+	 ((connection-closed connection-closed-locally connection-lost
+			     host-stopped-responding bad-connection-state)
+	  (rplaca cell ':conn-aborted))
+	 (error (rplaca cell ':conn-aborted)
+		(ignore-errors (chaos:close-conn dconn "Error encountered by data process" nil))
+		(report-server-error err "Data connection top level"))))))
+
+(defun qfile-server-dataproc-write-loop (data dconn cell opening
+					 &aux (celloc (locf (car cell))))
+  (condition-bind ((fs:file-error #'(lambda (cond)
+				      (qfile-server-async-error-handler cond data))))
+    (do () (())
+      (if (not (eq (car cell) 'write)) (return nil))
+      (let* ((pkt (if (server-window-write-check cell dconn 'write)
+		      (chaos:get-next-pkt dconn)
+		      (return nil))))
+	(select (chaos:pkt-opcode pkt)
+	  (chaos:eof-op
+	   (chaos:return-pkt pkt)
+	   (or (server-window-write-check cell dconn 'write) (return nil))
+	   (setq pkt (chaos:get-next-pkt dconn))
+	   (or (= (chaos:pkt-opcode pkt) fs:%file-synchronous-mark-opcode)
+	       (= (chaos:pkt-opcode pkt) chaos:cls-op)	;aborted
+	       (= (chaos:pkt-opcode pkt) chaos:los-op)	;lost
+	       (error 'chaos:unknown-pkt-opcode ':connection dconn
+		      ':pkt pkt ':opcode (chaos:pkt-opcode pkt)))
+	   (chaos:return-pkt pkt)
+	   (%store-conditional celloc 'write nil)
+	   (return nil))
+	  (fs:%file-synchronous-mark-opcode
+	   (chaos:return-pkt pkt)
+	   (%store-conditional celloc 'write nil)
+	   (return nil))
+	  (fs:%file-binary-opcode
+	   (unwind-protect
+	     (send opening ':string-out pkt chaos:first-data-word-in-pkt
+		   (+ (// (chaos:pkt-nbytes pkt) 2) chaos:first-data-word-in-pkt))
+	     (chaos:return-pkt pkt)))
+	  (fs:%file-character-opcode
+	   (unwind-protect
+	     (send opening ':string-out (chaos:pkt-8b-array pkt)
+		   0 (chaos:pkt-nbytes pkt))
+	     (chaos:return-pkt pkt)))
+	  ((chaos:cls-op chaos:los-op)
+	   (chaos:return-pkt pkt)
+	   (%store-conditional celloc 'write ':conn-aborted)
+	   (return nil))
+	  (otherwise (error 'chaos:unknown-pkt-opcode ':connection dconn
+			    ':pkt pkt ':opcode (chaos:pkt-opcode pkt))))))))
+
+(defun qfile-server-dataproc-read-loop (data dconn cell cmd
+					&aux (celloc (locf (car cell)))
+					(binp (server-dataproc-comm-binp data))
+					(opening (server-dataproc-comm-opening data)))
+  (condition-bind ((fs:file-error #'(lambda (cond)
+				      (qfile-server-async-error-handler cond data))))
+    (loop with last and eofp
+	  with count = (and (eq cmd 'read-with-count)
+			    (server-dataproc-comm-dinfo data))
+	  until (or eofp (and count ( count 0)))
+	  finally
+	  (progn
+	    (when count
+	      (setf (server-dataproc-comm-dinfo data) nil)	;cleanliness, not need.
+	      (setf (server-dataproc-comm-opening data) nil))	;need, not cleanliness
+	    (%store-conditional celloc cmd nil))
+	  when (server-window-read-check cell dconn cmd) return nil
+	  as pkt = (chaos:get-pkt)
+	  do
+	  (cond (binp
+		 (multiple-value (last eofp)
+		   (send opening ':string-in nil pkt
+			 chaos:first-data-word-in-pkt
+			 (min (if count
+				  (+ count chaos:first-data-word-in-pkt)
+				  chaos:max-data-words-per-pkt)
+			      chaos:max-data-words-per-pkt)))
+		 (setf (chaos:pkt-opcode pkt) fs:%file-binary-opcode)
+		 (let ((whack (- last chaos:first-data-word-in-pkt)))
+		   (if count (decf count whack))
+		   (setf (chaos:pkt-nbytes pkt) (* 2 whack))))
+		(t (multiple-value (last eofp)
+		     (send opening ':string-in nil (chaos:pkt-8b-array pkt)
+			   0
+			   (min (or count chaos:max-data-bytes-per-pkt)
+				chaos:max-data-bytes-per-pkt)))
+		   (setf (chaos:pkt-opcode pkt) fs:%file-character-opcode)
+		   (if count (decf count last))
+		   (setf (chaos:pkt-nbytes pkt) last)))
+	  ;; Hmm.  Don't Divest the ol' Buffer Resources AFTER sending out that
+	  ;; precious LAST BYTE.  Failure to do this can get the user to cause the
+	  ;; user process to proceed, sending further commands (usually FILEPOS), and thus
+	  ;; the control process to diddle the opening and race :divest-buffer-resources
+	  ;; (observed failure is :real-set-pointer blows up once it grabs the lock
+	  ;; with cur-addressor NIL).
+	  (when (and count (zerop count))
+	    (send opening ':send-if-handles ':divest-buffer-resources))
+
+	  (if (plusp (chaos:pkt-nbytes pkt))
+	      (chaos:send-pkt dconn pkt (chaos:pkt-opcode pkt))	;don't let SEND dft it
+	      (chaos:return-pkt pkt))
+	  (when eofp
+	    (if (server-window-read-check cell dconn cmd) (return nil))
+	    (chaos:send-pkt dconn (chaos:get-pkt) chaos:eof-op)))))
+
+(defun qfile-server-async-error-handler (error data)
+  (let* ((cell (server-dataproc-comm-cell data))
+	 (celloc (locf (car cell)))
+	 (handle (cdr cell))
+	 (tid (server-dataproc-comm-tid data))
+	 (direction (server-dataproc-comm-iotype data))
+	 (dconn (server-dataproc-comm-conn data))
+	 (cconn (send *server-instance* :conn ))
+	 (cellcont (car cell)))
+    (declare (unspecial tid))
+    (and (memq cellcont '(read write)) (%store-conditional celloc cellcont 'async-mark))
+    ;; Send an async pkt on the control connection to advertise our woes.
+    (let ((pkt (chaos:get-pkt))
+	  (string (with-output-to-string (standard-output)
+		    (send error ':report-without-pathname standard-output))))
+      (chaos:set-pkt-string
+	    pkt tid " " handle " ERROR "
+	    (server-three-letter-code error) " "
+	    (if (send error ':proceed-type-p ':retry-file-error)
+		"R"
+		"F")
+	    " "
+	    string)
+      (chaos:send-pkt
+	(if (eq direction 'input)
+	    dconn
+	    cconn)
+	pkt %file-asynchronous-mark-opcode))
+    ;; Now wait for the control connection to fix us.
+    (process-wait "Async Marked" #'(lambda () (neq (car cell) 'async-mark)))
+    (selectq (car cell)
+      (continue    (rplaca cell cellcont)
+		   (send error ':proceed ':retry-file-error))
+      (async-abort (or (eq direction 'input)
+		       (loop for pkt = (chaos:get-next-pkt dconn)
+			     as op = (chaos:pkt-opcode pkt)
+			     do (chaos:return-pkt pkt)
+			     until (= op fs:%file-synchronous-mark-opcode)))
+		   (rplaca cell nil)
+		   (throw 'async-abort nil))
+      (undata      (throw 'async-abort nil))	;CFTP closing its connection
+      (otherwise  (ferror "Cell in odd state in async recover - ~S" (car cell))))))
+
+(defun server-window-write-check (cell dconn val)
+  (do () (())
+    (if (neq (car cell) val) (return nil))
+    (if (chaos:read-pkts dconn) (return t))
+    (if (neq (chaos:state dconn) 'chaos:open-state) (return t))
+    (process-wait "Net In or Cmd" #'(lambda ()
+				      (or (neq (car cell) val)
+					  (neq (chaos:state dconn) 'chaos:open-state)
+					  (chaos:read-pkts dconn))))))
+
+
+(defun server-window-read-check (cell dconn &optional (cstate 'read))
+  (do () (())
+    (if (neq (car cell) cstate) (return t))
+    (if (chaos:may-transmit dconn) (return nil))
+    (if (neq (chaos:state dconn) 'chaos:open-state) (return nil))
+    (process-wait "Net Out or Cmd" #'(lambda ()
+				       (or (neq (car cell) cstate)
+					   (neq (chaos:state dconn) 'chaos:open-state)
+					   (chaos:may-transmit dconn))))))
+
+(defun await-data-process (cell &optional flag (whostate "Await Data Conn") timeout)
+  (if (eq (car cell) ':conn-aborted)
+      (throw 'server-chaos-disappear nil))
+  (and flag (rplaca cell flag))
+  (if timeout
+      (process-wait-with-timeout whostate timeout #'await-dataproc-cell cell)
+      (process-wait whostate #'await-dataproc-cell cell))
+  (if (eq (car cell) ':conn-aborted)
+      (throw 'server-chaos-disappear nil)))
+
+(defun await-dataproc-cell (cell)
+  (memq (car cell) '(nil :conn-aborted)))
+
+(defun qfile-server-continue (fh)
+  (let* ((data (lookup-file-handle fh t))
+	 (cell (server-dataproc-comm-cell data)))
+    (cond ((neq (car cell) 'async-mark)
+	   (server-error 'server-bug "Channel not in async marked state")))
+    (%store-conditional (locf (car cell)) 'async-mark 'continue)
+    (format *stream* "~A ~A CONTINUE" *transaction-id* fh)))
+
+(defun qfile-server-finish-close (fh close-p)
+  (let* ((data (lookup-file-handle fh t))
+	 (direction (server-dataproc-comm-iotype data))
+	 (opening (server-dataproc-comm-opening data))
+	 (cell (server-dataproc-comm-cell data))
+	 (direct (eq direction 'direct))
+	 (operation (if close-p ':close ':finish))
+	 ddata)
+    (when direct
+      (setq ddata data data (server-direct-dataproc-comm-odata data))
+      (when data
+	(setq direction 'output)
+	(setq cell (server-dataproc-comm-cell data))))
+
+    (when (eq direction 'output)
+      (process-wait "Write Finish or Abort"
+		    #'(lambda () (memq (car cell) '(nil :conn-aborted async-mark)))))
+
+    (if (eq (car cell) ':conn-aborted)
+	(throw 'server-chaos-disappear nil))
+
+    (if (eq (car cell) 'async-mark)
+	(if (eq direction 'output)
+	    (error 'server-channel-error-pending
+		   ':pathname (send opening ':truename)
+		   ':operation operation)
+	    (await-data-process cell 'async-abort)))
+
+    (if (eq direction 'input)
+	(await-data-process cell 'hands-off "Read Finish"))
+
+    (if (and data close-p)
+	(setf (server-dataproc-comm-opening data) nil))
+
+    (cond ((eq opening 'directory)
+	   (format *stream* "~A ~A CLOSE" *transaction-id* fh))
+	  (t
+	   (if close-p
+	       (send opening ':close (and (server-dataproc-comm-abort-flag data) ':abort))
+	       (send opening ':finish))
+	   (send opening operation)
+	   (setq server-openings (delq opening server-openings))
+	   (send-server-close-response fh (if close-p
+					      "CLOSE"
+					      "FINISH")
+				       opening)))
+    (send *stream* ':force-output)
+    (if (eq direction 'input)
+	(await-data-process cell 'wsync "Send Syn Mark"))
+    (when (and direct close-p)
+      (setf (server-dataproc-comm-opening ddata) nil)
+      (si:nremprop fh server-instance)
+      (setq alldatas (delq ddata alldatas)))
+    (when (and data (not close-p))
+      (rplaca cell 'write))))
+
+(defun send-server-close-response (fh command opening)
+  (selectq server-protocol-version
+    (0
+     (format *stream* "~A ~A ~A ~D ~A ~D~%~A~%"
+	     *transaction-id* fh command
+	     (send (send opening ':truename) ':version)
+	     (print-directory-date-property (send opening ':creation-date) nil)
+	     (send opening ':length)
+	     (send (send opening ':truename) ':string-for-host)))
+    (1
+     (format *stream* "~A ~A ~A ~A ~D~%~A~%"
+	     *transaction-id* fh command
+	     (print-directory-date-property (send opening ':creation-date) nil)
+	     (send opening ':length)
+	     (send (send opening ':truename) ':string-for-host)))))
+
+;;; Random commands.
+
+(defun qfile-server-filepos (fh rest)
+  (let* ((data (lookup-file-handle fh t))
+	 (direction (server-dataproc-comm-iotype data))
+	 (opening (server-dataproc-comm-opening data))
+	 (cell (server-dataproc-comm-cell data)))
+    (when (eq direction 'direct)
+      (setq data (server-direct-dataproc-comm-odata data))
+      (when data
+	(setq direction 'output)
+	(setq cell (server-dataproc-comm-cell data))
+	(await-data-process cell nil "Filepos Syn Mark")))	;Wait for it to finish.
+    (if (and cell (eq (car cell) 'read-with-count))
+	(server-error 'server-protocol-violation
+		       "FILEPOS illegal with counted READ still in progress."))
+    (if data (await-data-process cell 'hands-off "Filepos Sync"))
+    (unwind-protect
+      (progn
+	(send opening ':set-pointer (car rest))
+	(format *stream* "~A ~A FILEPOS" *transaction-id* fh)
+	(send *stream* ':force-output)
+	(if (eq direction 'input)
+	    (await-data-process cell 'wsync)))
+      ;;If set-pointer fails, restart the data connection anyway, to avoid
+      ;;an ill-defined stopped state.
+      (and cell (rplaca cell (if (eq direction 'input) 'read 'write))))))
+
+(defun qfile-server-delete (fh strings)
+  (cond ((null fh)				;must be string, delete random file
+	 (send (qfile-server-check-access (qfile-parse-for-server (first strings)) *conn* #/M)
+	       ':delete)
+	 (format *stream* "~A  DELETE" *transaction-id*))
+	(t					;delete while open
+	 (let ((data (lookup-file-handle fh t)))
+	   ;; We decided that DELETE (to a stream) in QFILE can't mean
+	   ;; DELETE, but really means "queue for aborting close".
+	   ;; Done correctly in NFILE.
+	   (setf (server-dataproc-comm-abort-flag data) t)
+	   ;; If marked, make like normal and let file system do the aboart.
+	   ;; Done right in NFP.
+	   (if (eq (car (server-dataproc-comm-cell data)) 'async-mark)
+	       (setf (car (server-dataproc-comm-cell data)) 'async-abort)))
+	 (format *stream* "~A ~A DELETE" *transaction-id* fh))))
+
+
+(defun qfile-server-directory (fh rest strings just-props &aux data)
+  (setq data (lookup-file-handle fh 'better-not 'input))
+  (when just-props
+    (or (car rest)
+	(car strings)
+	(server-error 'server-protocol-violation
+		      "Neither file handle nor pathname in PROPERTIES command."))
+    (and (car rest)
+	 (car strings)
+	 (server-error 'server-protocol-violation
+		       "Both file handle and pathname in PROPERTIES command.")))
+  (setf (server-dataproc-comm-arg data)
+	(if just-props
+	    (if (car rest)
+		(cons (server-dataproc-comm-opening
+			(lookup-file-handle (car rest) t nil)) '(properties))
+		(cons (qfile-server-check-access
+			(qfile-parse-for-server (car strings)) *conn* #/L)
+		      '(properties)))	    
+	    (cons (qfile-server-check-access
+		    (qfile-parse-for-server (car strings)) *conn* #/L)
+		  rest)))
+  (setf (server-dataproc-comm-tid data) *transaction-id*)
+  (setf (server-dataproc-comm-abort-flag data) nil)
+  (setf (server-dataproc-comm-opening data) 'directory)	;make close work
+  (setf (server-dataproc-comm-dinfo data)
+	(cons (format nil "~A ~A " *transaction-id* fh) *conn*))
+  ;;let dataproc do the answerage
+  (setf (car (server-dataproc-comm-cell data)) 'directory))
+
+(defun server-dataproc-hack-directory
+       (data handle &aux ok (*conn* (server-dataproc-comm-conn data))
+			    (cell (server-dataproc-comm-cell data)))
+  (let* ((stream (chaos:make-stream *conn*))
+	 (arg (server-dataproc-comm-arg data))
+	 (path (car arg))
+	 (opts (cdr arg))
+	 (dinfo (server-dataproc-comm-dinfo data))
+	 (head (car dinfo))
+	 (pkt (chaos:get-pkt))
+	 (cconn (cdr dinfo))
+	 (responded-positively nil)
+	 (prop-p (memq 'properties opts)))
+    (unwind-protect
+      (condition-case (dirlist-or-err changeables)
+	  (if prop-p
+	      (send path ':properties)
+	      (lexpr-funcall #'fs:directory-list path opts))
+	(fs:file-error
+	  (chaos:set-pkt-string pkt head "ERROR " (server-three-letter-code dirlist-or-err)
+				" F "
+				(with-output-to-string (standard-output)
+				  (send dirlist-or-err
+					':report-without-pathname standard-output)))
+	  (chaos:send-pkt cconn pkt))
+	(:no-error
+	 (chaos:set-pkt-string
+	   pkt head
+	   (if prop-p
+	       "PROPERTIES"
+	       "DIRECTORY"))
+	 (chaos:send-pkt cconn pkt)
+	 (setq responded-positively t)
+	 (condition-case (err)
+	     (progn
+	       (cond (prop-p
+		      (loop for (prop . there/'s-more) on changeables
+			    do (princ prop stream)
+			    when there/'s-more do (send stream ':tyo #\SP))
+		      (server-dirlist-single (cdr dirlist-or-err) (car dirlist-or-err)
+					     stream))
+		     (t (server-dirlist-single (cdar dirlist-or-err) nil stream)
+			(dolist (file (cdr dirlist-or-err))
+			  (if (server-window-read-check cell *conn* 'directory) (return nil))
+			  (server-dirlist-single (cdr file) (car file) stream))))
+	       (send stream ':tyo #\CR)
+	       (setq ok t)
+	       (send stream ':force-output)
+	       (if ok (chaos:send-pkt *conn* (chaos:get-pkt) chaos:eof-op)))
+	   (error 
+	     (send-data-async-lossage *conn* "System error during dir list processing" handle)
+	     (report-server-error err "Dirlist processing")))))
+      (or responded-positively			;if responded +ly, await close...
+	  (setf (server-dataproc-comm-opening data) nil)))))
+
+(defun send-data-async-lossage (conn msg handle)
+  (let ((pkt (chaos:get-pkt)))
+    (chaos:set-pkt-string pkt " " handle " ERROR MSC F " msg)
+    (chaos:send-pkt conn pkt fs:%file-asynchronous-mark-opcode)))
+  
+(defun server-dirlist-single (props pn stream
+			      &aux (base 10.) (cl:*print-radix* nil))
+  (send stream ':tyo #\CR)
+  (if pn (send stream ':line-out (send pn ':string-for-host)))
+  (tv:doplist (props prop ind)
+    (loop for ((nil fcn prop-type) . props-of-this-conversion)
+	  in *known-directory-properties*
+	  when (memq ind props-of-this-conversion)
+	  do
+	  ;; Print the property using the specific printing function, except
+	  ;; that if it is a date or boolean that might be "never", maybe don't print it.
+	  (unless (and (null prop)
+		       (memq prop-type '(:boolean :date-or-never)))
+	    (send stream ':string-out (get-pname ind))
+	    (send stream ':tyo #\SP)
+	    (funcall fcn prop stream)
+	    (send stream ':tyo #\CR))
+	  (return)
+	  finally (send stream ':string-out (get-pname ind))
+		  (send stream ':tyo #\SP)
+		  (princ prop stream)  ;User extensible properties
+		  (send stream ':tyo #\CR))))
+
+(defun qfile-server-change-props (fh strings)
+  (cond ((null fh)
+	 (change-props-1 (qfile-parse-for-server (car strings))
+			 "" (cdr strings)))
+	(t 
+	 (change-props-1 (server-dataproc-comm-opening
+			   (lookup-file-handle fh t)) fh strings))))
+
+(defun change-props-1 (actor fh strings)
+  (qfile-server-check-access (if (typep actor 'si:stream)
+				(send actor ':truename)
+				actor)
+			    *conn* #/M)
+  (loop with sym
+	for string in strings
+	as spacex = (string-search-char #\sp string)
+	unless spacex do
+	(server-error 'server-protocol-violation "Ill formated property spec: ~A" string)
+	nconc (list* (setq sym (si:intern1 (substring string 0 spacex)
+					   si:pkg-keyword-package))
+		     (server-convert-known-file-property string (1+ spacex) sym)
+		     nil)
+	into plist
+	finally  (lexpr-funcall actor ':change-properties t plist)
+	         (format *stream* "~A ~A CHANGE-PROPERTIES" *transaction-id* fh)))
+
+(defun server-convert-known-file-property (string index ind)	;not really general
+  (loop for ((fcn) . propnames) in fs:*known-directory-properties*
+	if (memq ind propnames)
+	return (funcall fcn string index)
+	finally (return (substring string index nil))))
+
+(defun qfile-server-rename (fh strings &aux from to)
+  (cond ((null fh)				;must be string, delete random file
+	 (let ((path1 (qfile-server-check-access
+			(qfile-parse-for-server (first strings)) *conn* #/M))
+	       (path2 (qfile-server-check-access
+			(qfile-parse-for-server (second strings)) *conn* #/C)))
+	   (or (send path1 ':version)
+	       (setq path1 (send path1 ':new-version ':newest)))
+	   (or (send path2 ':version)
+	       (setq path2 (send path2 ':new-version ':newest)))
+	   (multiple-value (from to)
+	     (send path1 ':rename path2))
+	   (format *stream* "~A  RENAME" *transaction-id*)))
+	(t					;rename while open
+	 (let* ((path (qfile-parse-for-server (first strings)))
+		(data (lookup-file-handle fh t))
+		(opening (server-dataproc-comm-opening data)))
+	   (if (symbolp opening)	;yes, I know NIL is a symbol, thx
+	       (server-error 'server-protocol-violation "No opening for handle ~A" fh))
+	   (qfile-server-check-access
+	     (send opening ':truename) *conn* #/M)
+	   (qfile-server-check-access path *conn* #/C)
+	   (if (null (send path ':version))
+	       (setq path (send path ':new-version ':newest)))
+	   (multiple-value (from to)
+	       (send opening ':rename path))
+	   (format *stream* "~A ~A RENAME" *transaction-id* fh))))
+  (when (and (not (null from))
+	     (not (null to)))
+    (send *stream* ':tyo #\CR)
+    (send *stream* ':string-out (send to ':string-for-host))
+    (send *stream* ':tyo #\CR)
+    (send *stream* ':string-out (send from ':string-for-host))))
+	       
+(defun qfile-server-expunge (strings)
+  (format *stream* "~A  EXPUNGE ~D" *transaction-id*
+	  (send (qfile-server-check-access
+		  (qfile-parse-for-server (first strings)) *conn*  #/M)
+		':expunge)))
+
+(defun qfile-server-create-directory (strings)
+  (send (qfile-server-check-access
+	  (qfile-parse-for-server (first strings)) *conn*  #/M)
+	':create-directory)
+  (format *stream* "~A  CREATE-DIRECTORY" *transaction-id*))
+
+(defun qfile-server-create-link (strings)
+  (unless (chaos:host-trusted-p (chaos:foreign-address *conn*))
+    (error 'server-access-error ':pathname nil
+	   ':report-string "Link creation not allowed from unprivileged host."))
+  (send (qfile-parse-for-server (first strings))
+	':create-link
+	(qfile-parse-for-server (second strings)))
+  (format *stream* "~A  CREATE-LINK" *transaction-id*))
+
+(defun qfile-server-complete (args strings)
+  (unless (chaos:host-trusted-p (chaos:foreign-address *conn*))
+    (error 'server-access-error ':pathname nil
+	   ':report-string "Completion not allowed from unprivileged host."))
+  (multiple-value-bind (result success)
+    (send (condition-case ()
+	      (fs:parse-pathname (first strings) *qfile-server-local-host*)
+	    (fs:parse-pathname-error (fs:user-homedir *qfile-server-local-host*)))
+	  ':complete-string
+	  (second strings)
+	  (list*
+	    (if (memq ':write args) ':write ':read)
+	    (if (memq ':new-ok args) ':new-ok ':old)
+	    (if (memq ':deleted args) '(:deleted))))
+    (format *stream* "~A  COMPLETE ~A~%~A~%" *transaction-id* success result)))
+
+(defun qfile-server-counted-read (dfh args)
+  (destructuring-bind (count ifh filepos) args
+    (unless (and count ifh)
+      (server-error 'server-protocol-violation
+		    "Missing input file handle or count in counted READ."))
+    (unless (and (numberp count) (plusp count))
+      (server-error 'server-protocol-violation
+		    "Non-numeric or non-positive count in counted READ."))
+    (when filepos
+      (unless (and (numberp filepos) ( filepos 0))
+	(server-error 'server-protocol-violation
+		      "Non-numeric or negative file position in counted READ.")))
+    (let* ((ddata (lookup-file-handle dfh t 'direct))
+	   (idata (lookup-file-handle ifh 'better-not 'input))
+	   (opening (server-dataproc-comm-opening ddata)))
+      (send opening ':read-bytes count filepos)
+      (setf (server-dataproc-comm-opening idata) opening)
+      (setf (server-dataproc-comm-binp idata) (server-dataproc-comm-binp ddata))
+      (setf (server-dataproc-comm-tid idata) (server-dataproc-comm-tid ddata))
+      (setf (server-dataproc-comm-dinfo idata) count)
+      (rplaca (server-dataproc-comm-cell idata) 'read-with-count))
+    (format *stream* "~A ~A READ" *transaction-id* dfh)))
+
+(defun qfile-server-abort (fh args)
+  (let* ((idata (lookup-file-handle
+		  (or (car args)
+		      (server-error 'server-protocol-violation
+				    "Missing input file handle in ABORT."))
+		  nil 'input))
+	 (cell (server-dataproc-comm-cell idata)))
+    (if (eq (car cell) 'async-mark)
+	(await-data-process cell 'async-abort))
+    ;;;BUG - should Halt now, Wsyn after response.
+    (await-data-process cell 'wsync "Write Syn Mark")
+    (setf (server-dataproc-comm-opening idata) nil))
+  (format *stream* "~A ~A ABORT" *transaction-id* fh))
+
+(defun qfile-server-direct-output (dfh rest)
+  (let* ((ddata (lookup-file-handle dfh t 'direct))
+	 (ofh (car rest))
+	 (odata (if ofh
+		    (lookup-file-handle ofh 'better-not 'output)
+		    (iodata-from-ddata ddata 'output))))
+    (cond (ofh					;Binding
+	   (setf (server-dataproc-comm-opening odata) (server-dataproc-comm-opening ddata))
+	   (setf (server-dataproc-comm-binp odata) (server-dataproc-comm-binp ddata))
+	   (setf (server-dataproc-comm-tid odata) (server-dataproc-comm-tid ddata))
+	   (setf (server-direct-dataproc-comm-odata ddata) odata)
+	   (rplaca (server-dataproc-comm-cell odata) 'write))
+	  (t					;Unbinding
+	   (let ((cell (server-dataproc-comm-cell odata)))
+	     (if (eq (car cell) 'async-mark)
+		 (await-data-process cell 'async-abort))
+	     (await-data-process cell nil "Write Finish"))
+	   (send (server-dataproc-comm-opening odata) ':force-output)
+	   (setf (server-direct-dataproc-comm-odata ddata) nil) 
+	   (setf (server-dataproc-comm-opening odata) nil))))
+  (format *stream* "~A ~A DIRECT-OUTPUT" *transaction-id* dfh))
+
+
+(compiler:function-defined 'lmfs:add-capability-raw)
+(compiler:function-defined 'lmfs:check-and-err-password)
+(compiler:function-defined 'lmfs:remove-capability-raw)
+
+;;; --- fix for not logged in.
+(defun qfile-server-capabilities (cap password on)
+  ;;Don't send messages to the local access path, for they prompt for the password.
+  (cond (on
+	 (lmfs:add-capability-raw (lmfs:check-and-err-password user-id (string cap) password))
+	 (format *stream* "~A  ENABLE-CAPABILITIES ~A ~A" *transaction-id* cap T))
+	(t
+	 (lmfs:remove-capability-raw cap)
+	 (format *stream* "~A  DISABLE-CAPABILITIES ~A ~A" *transaction-id* cap nil))))
+
+(defun send-single-shutdown-message (conn)
+  (let ((pkt (chaos:get-pkt)))
+    (chaos:set-pkt-string pkt (format nil "File Server shutting down in ~D minute~:P - ~A"
+				      (fixr (// (- *server-shutdown-time*
+						   (time:get-universal-time)) 60.))
+				      *server-shutdown-message*))
+    (condition-case ()
+	(chaos:send-pkt conn pkt fs:%file-notification-opcode)
+      (sys:bad-connection-state))))
+
+(defmethod (:file-server-notification qfile-server) (message)
+   (let ((pkt (chaos:get-pkt)))
+     (chaos:set-pkt-string pkt message)
+     (condition-case ()
+	 (chaos:send-pkt (send self ':conn) pkt fs:%file-notification-opcode)
+       (sys:bad-connection-state))))
+
+(defmethod (:file-server-shutdown qfile-server) (&optional (reason "File Server Shutdown"))
+  (chaos:close-conn (send self ':conn) reason))
+
+(defun qfile-peek-server (sg)
+  (let ((itag (symeval-in-stack-group 'server-instance sg)))
+    (list '()
+	  (tv:scroll-parse-item
+	    "    User: "
+	    `(:function ,#'symeval-in-stack-group (user-id ,sg) 15.)
+	    "    Server Tag: "
+	    (string itag))
+	  (tv:scroll-maintain-list
+	    `(lambda () (symeval-in-stack-group 'alldatas ',sg))
+	    `(lambda (x) (qfile-peek-data-process
+			   (server-dataproc-comm-cell x) ',itag))))))
+
+(defun qfile-peek-data-process (cell itag)
+  (let* ((handle (cdr cell))
+	 (data (get handle itag))
+	 (conn (server-dataproc-comm-conn data)))
+    (cond ((null data)
+	   (tv:scroll-parse-item
+			(format nil "      Vanished process ~A, instance ~A." handle itag)))
+	  (t (let* ((sib (server-dataproc-comm-sibling data))
+		    (sibdata (get sib itag)))
+	       (list '(:pre-process-function qfile-data-server-preprocess)
+		     (and (neq (server-dataproc-comm-iotype data) 'direct)
+			  (tv:scroll-parse-item
+			    ':leader (list nil nil nil nil nil nil)
+			    "      Data Connection: "
+			    `(:mouse-item
+			      (nil :kbd (send :server-connection-menu
+					      ,chaos:*local-chaosnet*	;sigh
+					      ,conn tv:item)
+				   :documentation
+				   "Menu of useful things to do to data connection")
+			      :string ,(format nil "~S" conn))))
+		     nil
+		     (qfile-peek-data-process-half data)
+		     (and sibdata (qfile-peek-data-process-half sibdata))))))))
+
+(defun qfile-data-server-preprocess (list-item)
+  (let ((line-item (second list-item)))
+    (if line-item				;Directs don't have it
+	(let* ((wanted (array-leader line-item (+ 4 tv:scroll-item-leader-offset)))
+	       (got (array-leader line-item (+ 5 tv:scroll-item-leader-offset))))
+	  (cond ((null wanted)
+		 (store-array-leader nil line-item (+ 5 tv:scroll-item-leader-offset))
+		 (setf (third list-item) nil))
+		((eq wanted got))
+		(t
+		 (setf (third list-item) (chaos:peek-chaos-conn wanted))
+		 (store-array-leader wanted line-item
+				     (+ 5 tv:scroll-item-leader-offset))))))))
+
+
+(defun qfile-peek-data-process-half (data)
+  (let ((process (server-dataproc-comm-data-proc data))
+	(cell (server-dataproc-comm-cell data))
+	(iotype (server-dataproc-comm-iotype data)))
+    (list (list ':pre-process-function 'qfile-peek-server-preprocess
+		'qfile-cdata data 'cur-display (ncons nil))
+	  (if (eq iotype 'direct)
+	      (tv:scroll-parse-item
+		"      "
+		"Direct File Handle  "
+		(string (cdr cell))
+		`(:function ,#'(lambda (x)
+				 (if (cdr x)
+				     (string-append
+				       ", Output Handle "
+				       (cdr (server-dataproc-comm-cell (cdr x))))
+				     ""))
+		  (,(locf (server-direct-dataproc-comm-odata data)))))
+	      (tv:scroll-parse-item
+		"      "
+		`(:mouse
+		  (nil :kbd (send :process-menu ,process)
+		       :documentation
+		       "Menu of useful things to do to this process.")
+		  :string
+		  ,(format nil "~A" (process-name process)))
+		"    "
+		`(:function ,#'tv:peek-process-whostate ,(ncons process))
+		", sibling "
+		(string (server-dataproc-comm-sibling data))
+		(format nil ", ~A" (server-dataproc-comm-iotype data))
+		", cmd: "
+		`(:function ,#'(lambda (x) (or (car x) "(Idle)")) (,cell))))
+	  nil)))
+
+(defun qfile-peek-server-preprocess (list-item)
+  (let* ((plist (locf (first list-item)))
+	 (data (get plist 'qfile-cdata))
+	 (cell (get plist 'cur-display))
+	 (curdisp (car cell))
+	 (opening (server-dataproc-comm-opening data)))
+    (cond ((eq curdisp opening))
+	  ((null opening) (setf (third list-item) nil))
+	  ((eq opening 'directory)
+	   (rplaca cell opening)
+	   (setf (third list-item) (tv:scroll-parse-item "         Directory state.")))
+	  ((setf (third list-item) (send opening ':peek-file-system 9))
+	   (rplaca cell opening)))))
+
+
+(defun qfile-server-check-access (path conn required)
+  (if (chaos:host-trusted-p (chaos:foreign-address conn))
+      path
+      (file-server-check-access path required)))

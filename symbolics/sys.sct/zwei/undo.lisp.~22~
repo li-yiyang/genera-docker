@@ -1,0 +1,1925 @@
+;;; -*- Syntax: Zetalisp; Base: 10; Mode: LISP; Package: ZWEI -*-
+;;; Primitives for recording and undoing changes
+;;; Based on a concept by Richard Stallman
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+    
+
+;;; Returns NIL or a buffer that has a change history
+(DEFUN BP-CHANGE-RECORDING-BUFFER (BP)
+  (LET ((BUFFER (INTERVAL-HOME-BUFFER  ;(BP-BUFFER BP)))
+		  (OR (BP-BUFFER-INTERNAL BP)
+		      ;; Check for things like the patch editor, which modify a non-selected
+		      ;; buffer using temporary BP's, without binding *INTERVAL*.  Avoid
+		      ;; breaking Zmail, where BP-BUFFER is inferior to BP-TOP-LEVEL-NODE.
+		      ;;--- This is probably a symptom of a bug elsewhere in Zwei
+		      ;;--- but right now I'm too senile to try to change it
+		      (INTERVAL-BUFFER (BP-NODE BP))))))
+    (AND (NEQ (BUFFER-CHANGE-HISTORY BUFFER) ':DISABLED)
+	 BUFFER)))
+
+;;; Scan an interval that is going to be recorded in a change record, gather information
+;;; about the textual contents and save the positions of the BP's inside it.
+;;; BP1 and BP2 enclose the interval (must be in order).
+;;; PREPEND is true if prepending before some existing text, NIL otherwise.
+;;; FIRST-BP, LAST-BP enclose the interval we are appending/prepending to, or are NIL.
+;;;   We cannot be both appending or prepending at the same time,
+;;;   and if FIRST-BP, LAST-BP aren't NIL then either FIRST-BP=BP2 or LAST-BP=BP1
+;;; N-LINES is the number of carriage returns in any text we're appending to, or 0.
+;;; N-CHARS is the number of characters after the last such carriage return, or 0.
+;;; BP-POSITIONS is a list of saved bp positions in any text we're appending/prepending to.
+;;; Returns LENGTH, the number of characters between BP1 and BP2
+;;;         WIDTH, either ART-STRING or ART-FAT-STRING depending on fatness of those characters
+;;;         BP-POSITIONS, the updated list of saved bp positions (not cdr-coded)
+;;;         N-LINES, the number of carriage returns in the text (including any appended to)
+;;;         N-CHARS, the number of characters after the last carriage return
+(DEFUN PREPARE-TO-RECORD (BP1 BP2 &OPTIONAL (PREPEND NIL) FIRST-BP LAST-BP
+					    (N-LINES 0) (N-CHARS 0) (BP-POSITIONS NIL))
+  (DECLARE (VALUES LENGTH WIDTH BP-POSITIONS N-LINES N-CHARS))
+  (LET ((LENGTH 0)
+	(FAT NIL)
+	(MORE-BP-POSITIONS NIL)
+	(OFFSET (- (BP-INDEX BP1) N-CHARS)))
+    ;; Scan the text being changed, counting its length and width and saving bp positions
+    (LINEMAP (BP1 BP2)
+      (DOLIST (BP (LINE-BP-LIST LINE))
+	(WHEN (AND ( (BP-INDEX BP) *FIRST-INDEX*)
+		   ( (BP-INDEX BP) *LAST-INDEX*)
+		   (NEQ BP BP1) (NEQ BP BP2)
+		   (NEQ BP FIRST-BP) (NEQ BP LAST-BP)
+		   (BP-REPOSITIONABLE-BY-UNDO BP))
+	  (UNLESS (ASSQ BP BP-POSITIONS)
+	    (PUSH (LIST-IN-AREA *CHANGE-RECORD-AREA* BP N-LINES (- (BP-INDEX BP) OFFSET))
+		  MORE-BP-POSITIONS))))
+      (INCF LENGTH (- *LAST-INDEX* *FIRST-INDEX*))
+      (WHEN (AND (NOT FAT) (STRING-FAT-P LINE))
+	(LOOP FOR I FROM *FIRST-INDEX* BELOW *LAST-INDEX* DO
+	  (WHEN (CHAR-FAT-P (AREF LINE I))
+	    (RETURN (SETQ FAT T)))))
+      (COND (*THIS-IS-THE-LAST-LINE*
+	     (INCF N-CHARS (- *LAST-INDEX* *FIRST-INDEX*)))
+	    (T
+	     (SETQ N-CHARS 0)
+	     (SETQ OFFSET 0)
+	     (INCF N-LINES)
+	     (INCF LENGTH 1))))
+    (WHEN PREPEND
+      ;; Account for additional text pushed in front of these BP's saved positions
+      (DOLIST (ITEM BP-POSITIONS)
+	(WHEN (ZEROP (SECOND ITEM))		;If on first line of text being prepended to
+	  (INCF (THIRD ITEM) N-CHARS))		; then there is more text in front of it
+	(INCF (SECOND ITEM) N-LINES)))		;This many more lines in front of it
+    (VALUES LENGTH (IF FAT ART-FAT-STRING ART-STRING)
+	    (IF PREPEND
+		(NRECONC MORE-BP-POSITIONS BP-POSITIONS)
+		(NCONC BP-POSITIONS (NREVERSE MORE-BP-POSITIONS)))
+	    N-LINES N-CHARS)))
+
+;--- Does this find all the right VC/WT things?  Genericize?? [Ugh]
+(DEFUN BP-REPOSITIONABLE-BY-UNDO (BP)
+  (AND (LOOP FOR W IN *WINDOW-LIST*
+	     NEVER (EQ BP (WINDOW-POINT W))
+	     NEVER (EQ BP (WINDOW-MARK W))
+	     NEVER (EQ BP (WINDOW-START-BP W)))
+       (LOOP FOR N FIRST (BP-NODE BP) THEN (NODE-SUPERIOR N) WHILE N
+	     NEVER (EQ BP (INTERVAL-FIRST-BP N))
+	     NEVER (EQ BP (INTERVAL-LAST-BP N)))))
+
+;;; Guts of WITH-UNDO-SAVE
+(DEFUN SAVE-INTERVAL-FOR-UNDO (VERB BP1 &OPTIONAL BP2 IN-ORDER-P)
+  (WHEN *ENABLE-CHANGE-RECORDING*
+    (GET-INTERVAL BP1 BP2 IN-ORDER-P)
+    (LET ((BUFFER (BP-CHANGE-RECORDING-BUFFER BP1)))
+      (WHEN BUFFER
+	;; Make a MUNG-NODE-RECORD if necessary
+	(MUNG-NODES-IN-INTERVAL BP1 BP2 T T)
+	;; Now record the current contents of the interval
+	(RECORD-ACCUMULATED-CHANGES BUFFER)
+	(MULTIPLE-VALUE-BIND (LENGTH WIDTH BP-POSITIONS)
+	    (PREPARE-TO-RECORD BP1 BP2)
+	  (CL:PUSH (MAKE-NAMED-CHANGE-RECORD VERB (COPY-BP BP1 ':NORMAL) (COPY-BP BP2 ':MOVES)
+			  (FINALIZE-BP-POSITIONS BP-POSITIONS)
+			  (COPY-INTERVAL-INTO-STRING-OR-INTERVAL BP1 BP2 LENGTH WIDTH
+								 :AREA *CHANGE-RECORD-AREA*))
+		   (BUFFER-CHANGE-HISTORY BUFFER) :AREA *CHANGE-RECORD-AREA*)))))
+  NIL)	;*ENABLE-CHANGE-RECORDING* gets bound to this
+
+;;; Guts of WITH-UNDO-SAVE-SIMPLE
+(DEFUN SAVE-INTERVAL-FOR-UNDO-SIMPLE (BP1 &OPTIONAL BP2 IN-ORDER-P)
+  (WHEN *ENABLE-CHANGE-RECORDING*
+    (GET-INTERVAL BP1 BP2 IN-ORDER-P)
+    (LET ((BUFFER (BP-CHANGE-RECORDING-BUFFER BP1)))
+      (WHEN BUFFER
+	;; Make a MUNG-NODE-RECORD if necessary
+	(MUNG-NODES-IN-INTERVAL BP1 BP2 T T)
+	;; Now record the current contents of the interval
+	(RECORD-ACCUMULATED-CHANGES BUFFER)
+	(MULTIPLE-VALUE-BIND (LENGTH WIDTH BP-POSITIONS)
+	    (PREPARE-TO-RECORD BP1 BP2)
+	  (CL:PUSH (MAKE-SIMPLE-CHANGE-RECORD (COPY-BP BP1 ':NORMAL) (COPY-BP BP2 ':MOVES)
+			  (FINALIZE-BP-POSITIONS BP-POSITIONS)
+			  (COPY-INTERVAL-INTO-STRING-OR-INTERVAL BP1 BP2 LENGTH WIDTH
+								 :AREA *CHANGE-RECORD-AREA*))
+		   (BUFFER-CHANGE-HISTORY BUFFER) :AREA *CHANGE-RECORD-AREA*)))))
+  NIL)	;*ENABLE-CHANGE-RECORDING* gets bound to this
+
+;;; INCLUSIVE = NIL  BP1's nodes are already munged
+(DEFUN MUNG-NODES-IN-INTERVAL (BP1 &OPTIONAL BP2 IN-ORDER-P INCLUSIVE)
+  (GET-INTERVAL BP1 BP2 IN-ORDER-P)
+  (LET ((NODE (IF INCLUSIVE NIL (BP-NODE BP1))))
+    (LINEMAP (BP1 BP2)
+      (IGNORE *FIRST-INDEX*)
+      (UNLESS (OR (EQ NODE (SETQ NODE (LINE-NODE LINE)))
+		  (AND (NEQ LINE (BP-LINE BP1))
+		       *THIS-IS-THE-LAST-LINE* (ZEROP *LAST-INDEX*)))
+	(MUNG-NODE NODE)))))
+
+(DEFUN COPY-INTERVAL-INTO-STRING (BP1 BP2 STRING &OPTIONAL (INDEX 0))
+  (LINEMAP (BP1 BP2 (VALUES STRING INDEX))
+    (COPY-ARRAY-PORTION LINE *FIRST-INDEX* *LAST-INDEX*
+			STRING INDEX (INCF INDEX (- *LAST-INDEX* *FIRST-INDEX*)))
+    (UNLESS *THIS-IS-THE-LAST-LINE*
+      (SETF (AREF STRING INDEX) #\RETURN)
+      (INCF INDEX))))
+
+;;;; Accumulation of simple changes to a buffer
+
+;; Add an insertion to the current batch of small changes being accumulated.
+;; SINGLE is true if this is a single-character insertion
+;; Call this before actually changing the buffer!
+;; However, MUNG-NODE (MUNG-BP-INTERVAL) must have been called already
+(DEFUN PREPARE-TO-INSERT (BP SINGLE &AUX BUFFER)
+  (WHEN (AND *ENABLE-CHANGE-RECORDING* *RECORD-SMALL-CHANGES*
+	     (SETQ BUFFER (BP-CHANGE-RECORDING-BUFFER BP)))
+    (LET ((CURRENT (AND (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER)
+			(FIRST (BUFFER-CHANGE-HISTORY BUFFER)))))
+      ;; Try to merge with the current batch of changes being accumulated.
+      (UNLESS (AND CURRENT (ACCUMULATE-INSERTION CURRENT BP SINGLE BUFFER))
+	;; Can't merge, start accumulating a new insertion
+	(WHEN CURRENT
+	  (RECORD-ACCUMULATED-CHANGES BUFFER))
+	(CL:PUSH (MAKE-INSERT-RECORD (COPY-BP BP ':NORMAL BUFFER) (COPY-BP BP ':MOVES BUFFER))
+		 (BUFFER-CHANGE-HISTORY BUFFER) :AREA *CHANGE-RECORD-AREA*)
+	(SETF (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER) 0)
+	(SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) NIL)
+	NIL))))
+
+;; Add an interval to the current batch of small changes being accumulated.
+;; If it is not contiguous within *SIMPLE-CHANGE-CONTIGUITY-RANGE*, start a new batch.
+;; Call this before actually changing the buffer!
+;; However, MUNG-NODE must have been called already for all nodes in the interval
+;; The BP's must be in order.
+;; TYPE is one of the symbols DELETE, CHANGE (more might be added in the future)
+(DEFUN PREPARE-TO-CHANGE (BP1 BP2 &OPTIONAL (TYPE 'CHANGE) &AUX BUFFER)
+  (WHEN (AND *ENABLE-CHANGE-RECORDING* *RECORD-SMALL-CHANGES*
+	     (SETQ BUFFER (BP-CHANGE-RECORDING-BUFFER BP1)))
+    ;; Check for a change that spans hard sections, record separately for each section
+    (LET ((NODE (BP-TOP-LEVEL-LINE-LINKED-NODE BP1)))
+      (COND ((EQ NODE (BP-TOP-LEVEL-LINE-LINKED-NODE BP2)))
+	    ((AND (ZEROP (BP-INDEX BP2))
+		  (EQ (BP-LINE BP2)
+		      (LINE-NEXT-IN-BUFFER (BP-LINE (NODE-LAST-BP NODE)) :BUFFER BUFFER)))
+	     ;; BP2 is just past the end of a section, so back it up a character
+	     (SETQ BP2 (NODE-LAST-BP NODE)))
+	    (T
+	     ;; Split this up into multiple changes
+	     (RECORD-ACCUMULATED-CHANGES BUFFER)
+	     (LINEMAP (BP1 BP2)
+	       (UNLESS (AND *THIS-IS-THE-LAST-LINE* (ZEROP *LAST-INDEX*))
+		 (UNLESS (EQ (LINE-TOP-LEVEL-LINE-LINKED-NODE LINE) NODE)
+		   (PREPARE-TO-CHANGE BP1 (SETQ BP1 (CREATE-BP LINE *FIRST-INDEX*)) TYPE)
+		   (SETQ NODE (LINE-TOP-LEVEL-LINE-LINKED-NODE LINE)))))
+	     (RETURN-FROM PREPARE-TO-CHANGE
+	       (PREPARE-TO-CHANGE BP1 BP2 TYPE)))))
+    ;; Normal single-section case
+    (LET ((CURRENT (AND (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER)
+			(FIRST (BUFFER-CHANGE-HISTORY BUFFER)))))
+      (UNLESS (AND CURRENT (ACCUMULATE-CHANGE CURRENT BP1 BP2 TYPE BUFFER))
+	;; Was not able to merge, start accumulating a new set of changes
+	(WHEN CURRENT
+	  (RECORD-ACCUMULATED-CHANGES BUFFER))
+	(LET ((BP1 (COPY-BP BP1 ':NORMAL BUFFER))
+	      (BP2 (COPY-BP BP2 ':MOVES BUFFER)))
+	  (MULTIPLE-VALUE-BIND (LENGTH WIDTH BP-POSITIONS N-LINES N-CHARS)
+	      (PREPARE-TO-RECORD BP1 BP2)
+	    (CL:PUSH (MAKE-SIMPLE-CHANGE-RECORD BP1 BP2 BP-POSITIONS
+		       ;; This temporary string will be recopied when the change is finalized
+		       (COPY-INTERVAL-INTO-STRING-OR-INTERVAL BP1 BP2 (MAX LENGTH 100) WIDTH
+							      :FILL-POINTER 0))
+		     (BUFFER-CHANGE-HISTORY BUFFER) :AREA *CHANGE-RECORD-AREA*)
+	    (SETF (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER) N-LINES)
+	    (SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) N-CHARS)
+	    NIL))))))
+
+(DEFUN RECORD-ACCUMULATED-CHANGES-BP (BP)
+  (LET ((BUFFER (BP-CHANGE-RECORDING-BUFFER BP)))
+    (WHEN BUFFER (RECORD-ACCUMULATED-CHANGES BUFFER))))
+
+;; Stash away the current set of accumulated changes and stop concatenating to it
+(DEFUN RECORD-ACCUMULATED-CHANGES (BUFFER)
+  (LET ((CHANGE-RECORD (AND (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER)
+			    (FIRST (BUFFER-CHANGE-HISTORY BUFFER)))))
+    (WHEN CHANGE-RECORD
+      (FINALIZE-ACCUMULATED-CHANGES CHANGE-RECORD)
+      (SETF (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER) NIL)
+      (SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) NIL))))
+
+;;; Add an interval to the end of a simple-change-record
+(DEFUN APPEND-TO-CHANGE-RECORD (CHANGE-RECORD FIRST-BP LAST-BP END-APPEND-BP BUFFER)
+  (MULTIPLE-VALUE-BIND (LENGTH WIDTH BP-POSITIONS N-LINES N-CHARS)
+      (PREPARE-TO-RECORD LAST-BP END-APPEND-BP NIL FIRST-BP LAST-BP
+			 (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER)
+			 (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER)
+			 (CHANGE-RECORD-BP-POSITIONS CHANGE-RECORD))
+    (SETF (CHANGE-RECORD-OLD-TEXT CHANGE-RECORD)
+	  (COPY-INTERVAL-INTO-STRING-OR-INTERVAL LAST-BP END-APPEND-BP LENGTH WIDTH
+					     :APPEND (CHANGE-RECORD-OLD-TEXT CHANGE-RECORD)))
+    (MOVE-BP LAST-BP END-APPEND-BP)
+    (SETF (CHANGE-RECORD-BP-POSITIONS CHANGE-RECORD) BP-POSITIONS)
+    (SETF (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER) N-LINES)
+    (SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) N-CHARS)))
+
+;;; Add an interval to the front of a simple-change-record
+(DEFUN PREPEND-TO-CHANGE-RECORD (CHANGE-RECORD FIRST-BP LAST-BP START-PREPEND-BP BUFFER)
+  (MULTIPLE-VALUE-BIND (LENGTH WIDTH BP-POSITIONS N-LINES N-CHARS)
+      (PREPARE-TO-RECORD START-PREPEND-BP FIRST-BP T FIRST-BP LAST-BP 0 0
+			 (CHANGE-RECORD-BP-POSITIONS CHANGE-RECORD))
+    (SETF (CHANGE-RECORD-OLD-TEXT CHANGE-RECORD)
+	  (COPY-INTERVAL-INTO-STRING-OR-INTERVAL START-PREPEND-BP FIRST-BP LENGTH WIDTH
+					     :PREPEND (CHANGE-RECORD-OLD-TEXT CHANGE-RECORD)))
+    (MOVE-BP FIRST-BP START-PREPEND-BP)
+    (SETF (CHANGE-RECORD-BP-POSITIONS CHANGE-RECORD) BP-POSITIONS)
+    (WHEN (ZEROP (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER))
+      (INCF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) N-CHARS))
+    (INCF (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER) N-LINES)))
+
+;;; Restore the bp positions saved in a change record
+(DEFUN RESTORE-BP-POSITIONS (BP-POSITIONS BUFFER STARTING-BP)
+  (LOOP WITH LINE-NUMBER = 0
+	WITH LINE = (BP-LINE STARTING-BP)
+	WITH OFFSET = (BP-INDEX STARTING-BP)
+	FOR (BP N-LINES N-CHARS) IN BP-POSITIONS DO
+    (LOOP UNTIL (= LINE-NUMBER N-LINES) DO
+      (WHEN (OR (> LINE-NUMBER N-LINES) (NULL LINE))
+	(ERROR "INTERNAL ERROR: Saved BPs out of order."))
+      (SETQ LINE (LINE-NEXT-IN-BUFFER LINE :BUFFER BUFFER)
+	    LINE-NUMBER (1+ LINE-NUMBER)
+	    OFFSET 0))
+    ;; Use of MIN here is to be more robust if user undoes overlapping changes out of order
+    ;; Messing up the text is expected, and can be fixed by redo, but we shouldn't blow out
+    (MOVE-BP BP LINE (MIN (+ N-CHARS OFFSET) (LINE-LENGTH LINE)))))
+
+(DEFCOM COM-DISCARD-CHANGE-HISTORY
+  "Throw away all records of changes to this buffer.
+It will no longer be possible to undo those changes." ()
+  (DISCARD-CHANGE-HISTORY (INTERVAL-HOME-BUFFER (BP-BUFFER (POINT))))
+  DIS-NONE)
+
+;;;--- I think there are more places that need to call this,
+;;;--- basically anything that "reverts".  We get most of those via DELETE-INTERVAL
+;;;--- but I think not all of them.
+(DEFUN DISCARD-CHANGE-HISTORY (BUFFER)
+  (LET ((HISTORY (BUFFER-CHANGE-HISTORY BUFFER)))
+    (UNLESS (EQ HISTORY ':DISABLED)
+      (SETF (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER) NIL)
+      (SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) NIL)
+      (MAPC #'FLUSH-BUFFER-POINTERS HISTORY)
+      (SETF (BUFFER-CHANGE-HISTORY BUFFER) NIL))))
+
+;;;; Special efficient handling of sparse changes, especially to whitespace
+
+;; The change is encoded as two interleaved sequences, one of 8-bit bytes
+;; and the other of characters, strings, and integers.  The bytes are packed four per
+;; fixnum and the two sequences are then formed into a list (a list takes
+;; one less word than an array).
+;; Each piece of the change requires this information:
+;;   The number of unchanged characters between this and the previous changed piece
+;;   The number of characters at this position in the new text
+;;   The old text at this position
+;;
+;; We use a compressed encoding:
+;;   The number of unchanged characters is omitted if zero, and is encoded in
+;;   a single byte if between 1 and 127.  Larger numbers are encoded by repetition.
+;;   Very large numbers are encoded by putting the count in the other sequence.
+;;
+;;   The number of new characters is omitted if the same as the number of old
+;;   characters (as is typical in m-Q), and is encoded in a single byte if
+;;   between 0 and 62.  Larger numbers are encoded by repetition, very large
+;;   numbers by putting the count in the other sequence.
+;;
+;;   The old text is a string in general, but we have special encodings for whitespace,
+;;   single-character strings are stored as characters, and there is a repeat count
+;;   allowing up to 8 identical characters to be encoded in one byte.
+
+;; Encoding of the 8-bit bytes:
+(DEFCONSTANT %%SPARSE-CHANGE-OP (BYTE 5 3))	;Opcode is some or all of these bits
+
+(DEFCONSTANT %SPARSE-CHANGE-SKIP 1_4)		;This or larger means skip...
+(DEFCONSTANT %%SPARSE-CHANGE-SKIP-COUNT (BYTE 7 0))	; this many+1 unchanged characters
+
+(DEFCONSTANT %SPARSE-CHANGE-NEW-TEXT 1_3)	;This or larger means new text is...
+(DEFCONSTANT %%SPARSE-CHANGE-NEW-COUNT (BYTE 6 0))	; this many characters
+
+;; The remaining opcodes describe part of the old text
+(DEFCONSTANT %%SPARSE-CHANGE-COUNT (BYTE 3 0))	;Repeat count-1 in this field
+(DEFCONSTANT %SPARSE-CHANGE-OLD-TEXT 0)		;Take character or string from other sequence
+						;or if end of list reached, this is padding
+(DEFCONSTANT %SPARSE-CHANGE-RETURN 1)		;Carriage return
+(DEFCONSTANT %SPARSE-CHANGE-TAB 2)		;Tab in null style
+(DEFCONSTANT %SPARSE-CHANGE-STYLED-TAB 3)	;Tab in same style as previous character
+(DEFCONSTANT %SPARSE-CHANGE-SPACE 4)		;Space in null style
+(DEFCONSTANT %SPARSE-CHANGE-STYLED-SPACE 5)	;Space in same style as previous character
+
+(DEFUN FINISH-SPARSE-CHANGE-RECORD (VERB &REST OPTIONS &AUX BUFFER LENGTH)
+  (IF (AND *ENABLE-CHANGE-RECORDING*
+	   (NOT (ZEROP (SETQ LENGTH (FILL-POINTER *SPARSE-CHANGE-ARRAY*))))
+	   (SETQ BUFFER (BP-CHANGE-RECORDING-BUFFER *SPARSE-CHANGE-FIRST-BP*)))
+      (LET ((LIST (MAKE-LIST LENGTH :AREA *CHANGE-RECORD-AREA*))
+	    (BP-POSITIONS (COPYLIST (NREVERSE *SPARSE-CHANGE-BP-POSITIONS*)
+				    *CHANGE-RECORD-AREA*)))
+	(CL:REPLACE LIST *SPARSE-CHANGE-ARRAY*)
+	(RECORD-ACCUMULATED-CHANGES BUFFER)
+	(CL:PUSH (COND ((NULL OPTIONS)
+			(MAKE-SPARSE-CHANGE-RECORD VERB *SPARSE-CHANGE-FIRST-BP*
+						   *SPARSE-CHANGE-LAST-BP* BP-POSITIONS LIST))
+		       ((EQ (FIRST OPTIONS) ':FLAVOR)
+			(CL:APPLY #'MAKE-INSTANCE (SECOND OPTIONS)
+				  :VERB VERB :FIRST-BP *SPARSE-CHANGE-FIRST-BP*
+				  :LAST-BP *SPARSE-CHANGE-LAST-BP*
+				  :BP-POSITIONS BP-POSITIONS :CHANGES LIST
+				  (CDDR OPTIONS)))
+		       (T
+			(ERROR "~S options list must begin with :FLAVOR" OPTIONS)))
+		 (BUFFER-CHANGE-HISTORY BUFFER)
+		 :AREA *CHANGE-RECORD-AREA*))
+      (FLUSH-BP *SPARSE-CHANGE-FIRST-BP*)
+      (FLUSH-BP *SPARSE-CHANGE-LAST-BP*)))
+
+;;; The interval from BP1 to BP2 is a sequence of characters that are being changed.
+;;; NEW-LENGTH is the number of characters that will replace them.
+;;; This function can only called inside WITH-UNDO-SAVE-SPARSE,
+;;; and must be called for successive changes in the order they appear in the text.
+(DEFUN RECORD-SPARSE-CHANGE (BP1 BP2 NEW-LENGTH &AUX (ADJACENT T))
+  ;; Check for total no-op
+  (WHEN (ZEROP NEW-LENGTH)
+    (WHEN (BP-= BP1 BP2)
+      (RETURN-FROM RECORD-SPARSE-CHANGE NIL)))
+  (UNLESS *ENABLE-CHANGE-RECORDING*
+    (RETURN-FROM RECORD-SPARSE-CHANGE NIL))
+  ;; The interval from BP1 to BP2 hasn't been changed yet, but mung it now,
+  ;; outside our caller's binding of *ENABLE-CHANGE-RECORDING* to NIL, so
+  ;; that a MUNG-NODE record gets created if necessary
+  (MUNG-NODES-IN-INTERVAL BP1 BP2 T
+			  (OR (BP-= *SPARSE-CHANGE-FIRST-BP* *SPARSE-CHANGE-LAST-BP*)
+			      (NEQ (BP-NODE BP1) (BP-NODE *SPARSE-CHANGE-LAST-BP*))))
+  ;; A macro to get open-coding of byte operations
+  (MACROLET ((RECORD-SPARSE-CHANGE-BYTE (OPCODE COUNT COUNT-FIELD ORIGIN &OPTIONAL ARGUMENT)
+	       (ONCE-ONLY (OPCODE COUNT)
+		 (LET ((MAX-COUNT `(+ (- (EXPT 2 (BYTE-SIZE ,COUNT-FIELD)) 2) ,ORIGIN)))
+		   `(COND ((> ,COUNT (* ,MAX-COUNT 4))
+			   ;; Won't fit in four bytes, so put out count as a separate word
+			   (RECORD-SPARSE-CHANGE-ELEMENT
+			     (DPB -1 ,COUNT-FIELD (DPB ,OPCODE %%SPARSE-CHANGE-OP 0)))
+			   (RECORD-SPARSE-CHANGE-ELEMENT ,COUNT NIL)
+			   (WHEN ,ARGUMENT
+			     (RECORD-SPARSE-CHANGE-ELEMENT ,ARGUMENT NIL)))
+			  (T
+			   (LOOP FOR COUNT = ,COUNT THEN (- COUNT ,MAX-COUNT)
+				 UNTIL (< COUNT ,ORIGIN)
+				 DO (RECORD-SPARSE-CHANGE-ELEMENT
+				      (+ (IF ( COUNT ,MAX-COUNT)
+					     (- COUNT ,ORIGIN)
+					     (- ,MAX-COUNT ,ORIGIN))
+					 (DPB ,OPCODE %%SPARSE-CHANGE-OP 0)))
+				    (WHEN ,ARGUMENT
+				      (RECORD-SPARSE-CHANGE-ELEMENT ,ARGUMENT NIL)))))))))
+    ;; Record how to advance from previous changed piece to this change
+    (UNLESS (BP-= *SPARSE-CHANGE-LAST-BP* BP1)
+      (UNLESS (BP-< *SPARSE-CHANGE-LAST-BP* BP1)
+	(ERROR "INTERNAL ZWEI ERROR: sparse change recorded out of order."))
+      (SETQ ADJACENT NIL)			;Last byte output was not old-text
+      (RECORD-SPARSE-CHANGE-BYTE %SPARSE-CHANGE-SKIP
+				 (COUNT-CHARS *SPARSE-CHANGE-LAST-BP* BP1 T)
+				 %%SPARSE-CHANGE-SKIP-COUNT 1)
+      (COND ((EQ (BP-LINE *SPARSE-CHANGE-LAST-BP*) (BP-LINE BP1))
+	     (INCF *SPARSE-CHANGE-N-CHARS*
+		   (- (BP-INDEX BP1) (BP-INDEX *SPARSE-CHANGE-LAST-BP*))))
+	    (T (INCF *SPARSE-CHANGE-N-LINES*
+		     (1- (COUNT-LINES *SPARSE-CHANGE-LAST-BP* BP1 T)))
+	       (SETQ *SPARSE-CHANGE-N-CHARS* (BP-INDEX BP1)))))
+    ;; Record the number of new characters unless it is unchanged
+    (LET ((OLD-LENGTH (COUNT-CHARS BP1 BP2 T)))
+      (UNLESS (AND (= OLD-LENGTH NEW-LENGTH) (NOT ADJACENT))
+	(RECORD-SPARSE-CHANGE-BYTE %SPARSE-CHANGE-NEW-TEXT NEW-LENGTH
+				   %%SPARSE-CHANGE-NEW-COUNT 0)))
+    ;; Record the old text from BP1 to BP2, in compressed form
+    (LET ((DEFAULT-STYLE (SI:CHAR-STYLE-INDEX (BP-CHAR-BEFORE BP1)))
+	  (CHAR NIL) (STRING-BP NIL) (STRING-CHAR NIL) (COUNT NIL))
+      (FLET ((STUFF-IT (BP)
+	       (WHEN CHAR
+		 ;; Recorded repeated sequence of a single character
+		 (LET ((STYLE (SI:CHAR-STYLE-INDEX CHAR))
+		       (EXTRA NIL))
+		   (RECORD-SPARSE-CHANGE-BYTE
+		     (COND ((EQL CHAR #\RETURN) %SPARSE-CHANGE-RETURN)
+			   ((EQL CHAR #\SPACE) %SPARSE-CHANGE-SPACE)
+			   ((EQL CHAR #\TAB) %SPARSE-CHANGE-TAB)
+			   (( STYLE DEFAULT-STYLE)
+			    (SETQ EXTRA CHAR)
+			    %SPARSE-CHANGE-OLD-TEXT)
+			   ((CHAR-EQUAL CHAR #\SPACE) %SPARSE-CHANGE-STYLED-SPACE)
+			   ((CHAR-EQUAL CHAR #\TAB) %SPARSE-CHANGE-STYLED-TAB)
+			   (T (SETQ EXTRA CHAR)
+			      %SPARSE-CHANGE-OLD-TEXT))
+		     COUNT %%SPARSE-CHANGE-COUNT 1 EXTRA)
+		   (SETQ DEFAULT-STYLE STYLE)
+		   (SETQ CHAR NIL)))
+	       (WHEN STRING-BP
+		 ;; Record a sequence of characters between STRING-BP and BP
+		 (COND (STRING-CHAR
+			;; When all the characters are the same, don't cons a string
+			(RECORD-SPARSE-CHANGE-BYTE %SPARSE-CHANGE-OLD-TEXT COUNT
+						   %%SPARSE-CHANGE-COUNT 1 STRING-CHAR)
+			(SETQ DEFAULT-STYLE (SI:CHAR-STYLE-INDEX STRING-CHAR)))
+		       (T
+			(RECORD-SPARSE-CHANGE-ELEMENT
+			  (DPB %SPARSE-CHANGE-OLD-TEXT %%SPARSE-CHANGE-OP 0))
+			(RECORD-SPARSE-CHANGE-ELEMENT
+			  (LET ((DEFAULT-CONS-AREA *CHANGE-RECORD-AREA*))
+			    (STRING-INTERVAL STRING-BP BP T))
+			  NIL)
+			(SETQ DEFAULT-STYLE (SI:CHAR-STYLE-INDEX (BP-CHAR-BEFORE BP)))))
+		 (SETQ STRING-BP NIL STRING-CHAR NIL))))
+	(CHARMAP (BP1 BP2)
+	  (LET ((THIS-CHAR (CHARMAP-CHAR)))
+	    (COND ((EQL THIS-CHAR CHAR) (INCF COUNT))
+		  ((OR (CHAR-EQUAL THIS-CHAR #\RETURN) (CHAR-EQUAL THIS-CHAR #\SPACE)
+		       (CHAR-EQUAL THIS-CHAR #\TAB))
+		   (STUFF-IT (CHARMAP-BP-BEFORE)) (SETQ CHAR THIS-CHAR COUNT 1))
+		  ((EQL THIS-CHAR STRING-CHAR) (INCF COUNT))
+		  (STRING-BP (SETQ STRING-CHAR NIL) (INCF COUNT))
+		  (T (LET ((BP (CHARMAP-BP-BEFORE)))
+		       (STUFF-IT BP)
+		       (SETQ STRING-BP BP
+			     STRING-CHAR THIS-CHAR
+			     COUNT 1))))))
+	(STUFF-IT BP2)))
+    ;; Record the bp positions from BP1 to BP2, relative to *SPARSE-CHANGE-FIRST-BP*
+    (LET ((OFFSET (- (BP-INDEX BP1) *SPARSE-CHANGE-N-CHARS*)))
+      (LINEMAP (BP1 BP2)
+	(DOLIST (BP (LINE-BP-LIST LINE))
+	  (WHEN (AND ( (BP-INDEX BP) *FIRST-INDEX*)
+		     ( (BP-INDEX BP) *LAST-INDEX*)
+		     (NEQ BP BP1) (NEQ BP BP2)
+		     (NEQ BP *SPARSE-CHANGE-FIRST-BP*)
+		     (NEQ BP *SPARSE-CHANGE-LAST-BP*)
+		     (BP-REPOSITIONABLE-BY-UNDO BP))
+	    (PUSH (LIST-IN-AREA *CHANGE-RECORD-AREA* BP *SPARSE-CHANGE-N-LINES*
+				(- (BP-INDEX BP) OFFSET))
+		  *SPARSE-CHANGE-BP-POSITIONS*)))
+	(UNLESS *THIS-IS-THE-LAST-LINE*
+	  (INCF *SPARSE-CHANGE-N-LINES*)
+	  (SETQ OFFSET 0))))
+    (SETQ *SPARSE-CHANGE-N-CHARS* (IF (EQ (BP-LINE BP1) (BP-LINE BP2))
+				      (+ *SPARSE-CHANGE-N-CHARS*
+					 (- (BP-INDEX BP2) (BP-INDEX BP1)))
+				      (BP-INDEX BP2)))
+    (MOVE-BP *SPARSE-CHANGE-LAST-BP* BP2)))
+
+(DEFUN RECORD-SPARSE-CHANGE-ELEMENT (X &OPTIONAL (PACKED T))
+  (COND ((AND PACKED (PLUSP *SPARSE-CHANGE-BYTE-ROOM*))
+	 (INCF (AREF *SPARSE-CHANGE-ARRAY* *SPARSE-CHANGE-BYTE-INDEX*)
+	       (LSH X (* (- 4 *SPARSE-CHANGE-BYTE-ROOM*) 8)))
+	 (DECF *SPARSE-CHANGE-BYTE-ROOM*))
+	(T
+	 (WHEN PACKED
+	   (SETQ *SPARSE-CHANGE-BYTE-INDEX* (FILL-POINTER *SPARSE-CHANGE-ARRAY*)
+		 *SPARSE-CHANGE-BYTE-ROOM* 3))
+	 (ARRAY-PUSH-EXTEND *SPARSE-CHANGE-ARRAY* X))))
+
+(DEFUN UNDO-SPARSE-CHANGES (FIRST-BP CHANGES BP-POSITIONS BUFFER)
+  (LOOP WITH BP = FIRST-BP
+	WITH OLD-LENGTH = NIL WITH NEW-LENGTH = NIL
+	UNTIL (NULL CHANGES)
+	AS X = (POP CHANGES) DO
+    (LOOP REPEAT 4
+	  AS OP = (LDB %%SPARSE-CHANGE-OP X)
+	  AS COUNT = (1+ (LDB %%SPARSE-CHANGE-COUNT X)) DO
+      (WHEN (OR (AND OLD-LENGTH ( OP %SPARSE-CHANGE-NEW-TEXT))
+		(AND NEW-LENGTH ( OP %SPARSE-CHANGE-SKIP)))
+	;; End of one change, beginning of the next, delete the previous new-text
+	(SETQ BP (DELETE-INTERVAL BP (FORWARD-CHAR BP (OR NEW-LENGTH OLD-LENGTH) T
+						   *INTERVAL*) T))
+	(SETQ OLD-LENGTH NIL NEW-LENGTH NIL))
+      (COND (( OP %SPARSE-CHANGE-SKIP)
+	     (SETQ COUNT (1+ (LDB %%SPARSE-CHANGE-SKIP-COUNT X)))
+	     (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-SKIP-COUNT)))
+	       (SETQ COUNT (POP CHANGES)))
+	     (SETQ BP (FORWARD-CHAR BP COUNT NIL *INTERVAL*)))
+	    (( OP %SPARSE-CHANGE-NEW-TEXT)
+	     (SETQ COUNT (LDB %%SPARSE-CHANGE-NEW-COUNT X))
+	     (WHEN (= COUNT (1- (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-NEW-COUNT))))
+	       (SETQ COUNT (POP CHANGES)))
+	     (SETQ NEW-LENGTH (+ (OR NEW-LENGTH 0) COUNT)))
+	    ((= OP %SPARSE-CHANGE-OLD-TEXT)
+	     (WHEN CHANGES			;otherwise it is padding
+	       (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-COUNT)))
+		 (SETQ COUNT (POP CHANGES)))
+	       (SETQ OP (POP CHANGES))
+	       (COND ((CHARACTERP OP)
+		      (SETQ BP (INSERT-CHARS BP OP COUNT))
+		      (SETQ OLD-LENGTH (+ (OR OLD-LENGTH 0) COUNT)))
+		     (T
+		      (LOOP REPEAT COUNT DO
+			(SETQ BP (INSERT BP OP)))
+		      (SETQ OLD-LENGTH (+ (OR OLD-LENGTH 0) (* COUNT (STRING-LENGTH OP))))))))
+	    (T
+	     (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-COUNT)))
+	       (SETQ COUNT (POP CHANGES)))
+	     (SETQ BP (INSERT-CHARS BP (SELECTOR OP =
+					 (%SPARSE-CHANGE-RETURN #\RETURN)
+					 (%SPARSE-CHANGE-TAB #\TAB)
+					 (%SPARSE-CHANGE-SPACE #\SPACE)
+					 (%SPARSE-CHANGE-STYLED-TAB
+					   (MAKE-CHARACTER #\TAB
+					     :STYLE (SI:CHAR-STYLE (BP-CHAR-BEFORE BP))))
+					 (%SPARSE-CHANGE-STYLED-SPACE
+					   (MAKE-CHARACTER #\SPACE
+					     :STYLE (SI:CHAR-STYLE (BP-CHAR-BEFORE BP)))))
+				    COUNT))
+	     (SETQ OLD-LENGTH (+ (OR OLD-LENGTH 0) COUNT))))
+      (SETQ X (LSH X -8)))
+	FINALLY
+	  (WHEN (OR OLD-LENGTH NEW-LENGTH)
+	    ;; End of last change, delete the new-text
+	    (DELETE-INTERVAL BP (FORWARD-CHAR BP (OR NEW-LENGTH OLD-LENGTH) T *INTERVAL*) T)))
+  (RESTORE-BP-POSITIONS BP-POSITIONS BUFFER FIRST-BP))
+
+;;; I find debugging easier with this
+(DEFMETHOD (:DESCRIBE SPARSE-CHANGE-RECORD :AFTER) ()
+  (FORMAT T "~&~4@TDecoded changes: ")
+  (SCL:FILLING-OUTPUT (STANDARD-OUTPUT :AFTER-LINE-BREAK "      " :FILL-ON-SPACES NIL)
+    (LET ((STATE NIL))
+      (FLET ((COMMA (OLD)
+	       (WHEN STATE
+		 (STRING-OUT ",")
+		 (SEND STANDARD-OUTPUT :CONDITIONAL-STRING-OUT " "))
+	       (WHEN (AND OLD (NEQ STATE ':OLD))
+		 (STRING-OUT "was "))
+	       (SETQ STATE (IF OLD ':OLD ':NEW))))
+	(LOOP WITH CHANGES = CHANGES WITH COUNT WITH TEXT
+	      UNTIL (NULL CHANGES)
+	      AS X = (POP CHANGES) DO
+	  (LOOP REPEAT 4
+		AS OP = (LDB %%SPARSE-CHANGE-OP X) DO
+	    (COND (( OP %SPARSE-CHANGE-SKIP)
+		   (COMMA NIL)
+		   (SETQ COUNT (1+ (LDB %%SPARSE-CHANGE-SKIP-COUNT X)))
+		   (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-SKIP-COUNT)))
+		     (SETQ COUNT (POP CHANGES)))
+		   (FORMAT T "skip ~D character~:P" COUNT))
+		  (( OP %SPARSE-CHANGE-NEW-TEXT)
+		   (COMMA NIL)
+		   (SETQ COUNT (LDB %%SPARSE-CHANGE-NEW-COUNT X))
+		   (WHEN (= COUNT (1- (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-NEW-COUNT))))
+		     (SETQ COUNT (POP CHANGES)))
+		   (FORMAT T "~D new character~:P" COUNT))
+		  (T
+		   (SETQ COUNT (1+ (LDB %%SPARSE-CHANGE-COUNT X)))
+		   (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-COUNT)))
+		     (SETQ COUNT (POP CHANGES)))
+		   (SETQ TEXT (SELECTOR OP =
+				(%SPARSE-CHANGE-OLD-TEXT
+				  (WHEN (NULL CHANGES) (RETURN NIL))	;Padding
+				  (POP CHANGES))
+				(%SPARSE-CHANGE-RETURN "return")
+				(%SPARSE-CHANGE-TAB "tab")
+				(%SPARSE-CHANGE-SPACE "space")
+				(%SPARSE-CHANGE-STYLED-TAB "tab(default style)")
+				(%SPARSE-CHANGE-STYLED-SPACE "space(default style)")))
+		   (COMMA T)
+		   (WHEN (> COUNT 1)
+		     (FORMAT T "~D " COUNT))
+		   (IF (= OP %SPARSE-CHANGE-OLD-TEXT)
+		       (FORMAT T "/"~A/"" TEXT)
+		       (STRING-OUT TEXT))
+		   (WHEN (> COUNT 1)
+		     (STRING-OUT "s"))))
+	    (SETQ X (LSH X -8))))))))
+
+;;;; Methods for change-records
+
+(DEFMETHOD (CHANGE-RECORD-KIND CHANGE-RECORD) () 'INITIAL)	;Default
+
+(DEFMETHOD (CHANGE-RECORD-KIND UNDO-RECORD) () 'UNDO)
+
+(DEFMETHOD (CHANGE-RECORD-KIND REDO-RECORD) () 'REDO)
+
+(DEFMETHOD (CHANGE-RECORD-KIND MUNG-NODE-RECORD) () 'MUNG-NODE)
+
+;; Assumes any OLD-TEXT that is an interval is non-empty, which is reasonable
+(DEFMETHOD (CHANGE-RECORD-VERB SIMPLE-CHANGE-RECORD) ()
+  (COND ((EQUAL OLD-TEXT "") "insertion")
+	((EQ FIRST-BP LAST-BP) "deletion")
+	(T "simple changes")))
+
+(DEFMETHOD (CHANGE-RECORD-VERB REPLACE-CHANGE-RECORD) () "replace")
+
+(DEFMETHOD (CHANGE-RECORD-VERB INSERT-RECORD) () "insertion")
+
+(DEFMETHOD (CHANGE-RECORD-VERB EXCHANGE-RECORD) () "exchange")
+
+(DEFMETHOD (CHANGE-RECORD-VERB KILL-RECORD) () "kill")
+
+(DEFMETHOD (CHANGE-RECORD-VERB UNDO-RECORD) ()
+  (STRING-APPEND "undo of " (CHANGE-RECORD-VERB (CHANGE-RECORD-INITIAL-CHANGE))))
+
+(DEFMETHOD (CHANGE-RECORD-VERB REDO-RECORD) ()
+  (STRING-APPEND "redo of " (CHANGE-RECORD-VERB (CHANGE-RECORD-INITIAL-CHANGE))))  
+
+(DEFMETHOD (CHANGE-RECORD-REPORT-UNDONE CHANGE-RECORD) ()
+  (FORMAT T "~: undone" (CHANGE-RECORD-VERB SELF)))
+
+(DEFMETHOD (CHANGE-RECORD-REPORT-UNDONE UNDO-RECORD) ()
+  (FORMAT T "~: redone" (CHANGE-RECORD-VERB (CHANGE-RECORD-INITIAL-CHANGE))))
+
+(DEFMETHOD (FINALIZE-ACCUMULATED-CHANGES CHANGE-RECORD) () NIL)
+
+(DEFMETHOD (FINALIZE-ACCUMULATED-CHANGES SIMPLE-CHANGE-RECORD) ()
+  ;; Finalize string and list, making them small and in the proper area
+  (SETQ BP-POSITIONS (FINALIZE-BP-POSITIONS BP-POSITIONS))
+  (WHEN (STRINGP OLD-TEXT)
+    (SETQ OLD-TEXT (SUBSTRING OLD-TEXT 0 (FILL-POINTER OLD-TEXT) *CHANGE-RECORD-AREA*)))
+  ;; If this turned out to be just a deletion, keep only one BP so we will know
+  ;; it was a deletion, and so we don't have to bother keeping two BP's equal.
+  (WHEN (BP-= FIRST-BP LAST-BP)
+    (FLUSH-BP LAST-BP)
+    (SETQ LAST-BP FIRST-BP)))
+
+;;; Copy into proper area and cdr-code
+(DEFUN FINALIZE-BP-POSITIONS (BP-POSITIONS)
+  ;; Copy level 1 of list structure
+  (SETQ BP-POSITIONS (COPYLIST BP-POSITIONS *CHANGE-RECORD-AREA*))
+  ;; Copy level 2 of list structure
+  (LOOP FOR CONS ON BP-POSITIONS DO
+    (SETF (CAR CONS) (COPYLIST (CAR CONS) *CHANGE-RECORD-AREA*)))
+  BP-POSITIONS)
+
+(DEFMETHOD (ACCUMULATE-INSERTION CHANGE-RECORD) (BP SINGLE BUFFER)
+  (IGNORE BP SINGLE BUFFER)
+  NIL)		;Default is not to accumulate
+
+(DEFMETHOD (ACCUMULATE-INSERTION INSERT-RECORD) (BP SINGLE BUFFER)
+  (SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) NIL)	;Forget pending deletion
+  (WHEN (EQ (BP-NODE BP) (BP-NODE FIRST-BP))	;Don't cross section boundaries
+    (COND ((BP-= BP LAST-BP)
+	   ;; It's at the end of this insertion, so extend to cover it
+	   ;; unless this looks like a new paragraph
+	   ;; Don't use *SIMPLE-CHANGE-CONTIGUITY-RANGE* here, since this is an insertion
+	   (UNLESS (AND (NOT *FORCIBLY-MERGE-CHANGE-RECORD*)
+			(ZEROP (BP-INDEX LAST-BP))
+			(NEQ (BP-LINE FIRST-BP) (BP-LINE LAST-BP))
+			(LINE-BLANK-P (LINE-PREVIOUS (BP-LINE LAST-BP)))
+			(BPS-FAR-APART FIRST-BP LAST-BP *INSERTION-BREAKUP-LINES*))
+	     (MOVE-BP LAST-BP BP)
+	     T))
+	  ((BP-= BP FIRST-BP)
+	   ;; It's at the beginning of this insertion, so extend backwards to cover it
+	   (MOVE-BP FIRST-BP BP)
+	   T)
+	  ((AND (OR SINGLE *FORCIBLY-MERGE-CHANGE-RECORD*)
+		(BP-IN-RANGE BP FIRST-BP LAST-BP))
+	   ;; It's a single character being inserted somewhere inside this insertion
+	   ;; (could be an extension of a prepend picked up by the previous clause)
+	   ;; so cover it.  But a big insertion in the middle of another is a separate change.
+	   T))))
+
+(DEFMETHOD (ACCUMULATE-INSERTION SIMPLE-CHANGE-RECORD) (BP SINGLE BUFFER)
+  (WHEN (EQ (BP-NODE BP) (BP-NODE FIRST-BP))	;Don't cross section boundaries
+    (COND ((AND (EQ (BP-LINE BP) (BP-LINE LAST-BP))
+		( 0 (- (BP-INDEX BP) (BP-INDEX LAST-BP)) *SIMPLE-CHANGE-CONTIGUITY-RANGE*))
+	   ;; It's close to the end of this change, so extend to cover it
+	   (APPEND-TO-CHANGE-RECORD SELF FIRST-BP LAST-BP BP BUFFER))
+	  ((AND (EQ (BP-LINE BP) (BP-LINE FIRST-BP))
+		( 0 (- (BP-INDEX FIRST-BP) (BP-INDEX BP)) *SIMPLE-CHANGE-CONTIGUITY-RANGE*))
+	   ;; It's close to the beginning of this change, so extend backwards to cover it
+	   (PREPEND-TO-CHANGE-RECORD SELF FIRST-BP LAST-BP BP BUFFER))
+	  ((AND (OR SINGLE *FORCIBLY-MERGE-CHANGE-RECORD*)
+		(BP-IN-RANGE BP FIRST-BP LAST-BP))
+	   ;; It's a single character being inserted somewhere inside this change, cover it.
+	   ;; But a big insertion would count as a separate change.
+	   T))))
+
+(DEFMETHOD (ACCUMULATE-CHANGE CHANGE-RECORD) (BP1 BP2 TYPE BUFFER)
+  (IGNORE BP1 BP2 TYPE BUFFER)
+  NIL)		;Default is not to accumulate
+
+(DEFUN-IN-FLAVOR (MATERIALIZE-DELETIONS INSERT-RECORD) (BUFFER)
+  (LET ((CHARS (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER)))
+    (RECORD-ACCUMULATED-CHANGES BUFFER)		;Stash the insertion
+    (WITH-BP (BP1 LAST-BP :NORMAL)		;Deletion was from BP1 to BP2
+      (WITH-BP (BP2 LAST-BP :MOVES)
+	(LET ((*ENABLE-CHANGE-RECORDING* NIL))	;Put back the deleted text
+	  (DOLIST (CHAR CHARS)
+	    (INSERT BP2 CHAR)))
+	(DELETE-INTERVAL BP1 BP2 T)))))		;Delete it so it gets recorded
+
+(DEFMETHOD (ACCUMULATE-CHANGE INSERT-RECORD) (BP1 BP2 TYPE BUFFER)
+  ;; See if we can merge with the current batch of changes being accumulated.
+  ;; Check for most common cases first
+  (COND ;; Do not merge across section boundaries.  One thing this is important
+	;; for is Zmail reply mode, so that a change record doesn't span both the
+	;; headers and the text.  It's probably also a good heuristic for Lisp mode.
+	((NEQ (BP-NODE BP1) (BP-NODE FIRST-BP)) NIL)
+	;; Allow a short change at the right-hand end of the insertion, e.g.
+	;; rubbing out or twiddling characters just inserted.  If the change is
+	;; a deletion, save the deleted characters so that if there are too many
+	;; successive deletions, we can change our mind and record the insertion
+	;; of the characters and then their deletion as two separate changes.
+	((AND (BP-IN-RANGE BP1 FIRST-BP LAST-BP)
+	      (BP-IN-RANGE BP2 FIRST-BP LAST-BP)
+	      (OR *FORCIBLY-MERGE-CHANGE-RECORD*
+		  (AND (NOT (BPS-CHARS-FAR-APART BP1 LAST-BP *INSERTION-AMENDMENT-SIZE*))
+		       (NOT (BPS-CHARS-FAR-APART BP2 LAST-BP *INSERTION-AMENDMENT-SIZE*)))))
+	 (CL:CASE TYPE
+	   (DELETE
+	     ;; When forced, don't worry about later splitting off the deletion record
+	     (WHEN *FORCIBLY-MERGE-CHANGE-RECORD*
+	       (RETURN-FROM ACCUMULATE-CHANGE T))
+	     ;; Must only be a deletion of the n most recently inserted characters
+	     (UNLESS (BP-= BP2 LAST-BP) (RETURN-FROM ACCUMULATE-CHANGE NIL))
+	     ;; Total characters deleted must not get too large
+	     (WHEN (> (+ (COUNT-CHARS BP1 BP2 T)
+			 (LENGTH (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER)))
+		      *INSERTION-AMENDMENT-SIZE*)
+	       ;; Don't merge those earlier deletions after all
+	       (MATERIALIZE-DELETIONS BUFFER)
+	       ;; Now merge with that deletion instead of with this insertion
+	       (LET ((CURRENT (AND (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER)
+				   (FIRST (BUFFER-CHANGE-HISTORY BUFFER)))))
+		 (RETURN-FROM ACCUMULATE-CHANGE
+		   (AND CURRENT (ACCUMULATE-CHANGE CURRENT BP1 BP2 TYPE BUFFER)))))
+	     ;; Save the characters that were deleted
+	     (RCHARMAP (BP2 BP1)
+	       (PUSH (RCHARMAP-CHAR) (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER))))
+	   (OTHERWISE 
+	     ;; Forget pending deletion
+	     (SETF (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER) NIL)))
+	 T)))
+
+(DEFMETHOD (ACCUMULATE-CHANGE SIMPLE-CHANGE-RECORD) (BP1 BP2 TYPE BUFFER)
+  (IGNORE TYPE)
+  (LET ((APPEND NIL)
+	(PREPEND NIL))
+    ;; See if we can merge with the current batch of changes being accumulated.
+    ;; Check for most common cases first
+    (COND ;; Do not merge across section boundaries.  One thing this is important
+	  ;; for is Zmail reply mode, so that a change record doesn't span both the
+	  ;; headers and the text.  It's probably also a good heuristic for Lisp mode.
+	  ((NEQ (BP-NODE BP1) (BP-NODE FIRST-BP))
+	   (RETURN-FROM ACCUMULATE-CHANGE NIL))
+	  ;; Check for extending the edit from one of its boundaries
+	  ((AND (EQ (BP-LINE BP1) (BP-LINE LAST-BP))
+		( 0 (- (BP-INDEX BP1) (BP-INDEX LAST-BP)) *SIMPLE-CHANGE-CONTIGUITY-RANGE*))
+	   (SETQ APPEND T))
+	  ((AND (EQ (BP-LINE BP2) (BP-LINE FIRST-BP))
+		( 0 (- (BP-INDEX FIRST-BP) (BP-INDEX BP2)) *SIMPLE-CHANGE-CONTIGUITY-RANGE*))
+	   (SETQ PREPEND T))
+	  ;; If the new edit is large, and not an append or prepend of this one, don't merge
+	  ((AND (NOT *FORCIBLY-MERGE-CHANGE-RECORD*)
+		(BPS-CHARS-FAR-APART BP1 BP2 *SIMPLE-CHANGE-SIZE*))
+	   (RETURN-FROM ACCUMULATE-CHANGE NIL))
+	  ;; Check for BP1 or BP2 inside current interval
+	  ((LET ((BP1-FOUND NIL) (BP2-FOUND NIL))
+	     (LINEMAP (FIRST-BP LAST-BP)
+	       (AND (EQ LINE (BP-LINE BP1))
+		    ( *FIRST-INDEX* (BP-INDEX BP1) *LAST-INDEX*)
+		    (SETQ BP1-FOUND T))
+	       (AND (EQ LINE (BP-LINE BP2))
+		    ( *FIRST-INDEX* (BP-INDEX BP2) *LAST-INDEX*)
+		    (SETQ BP2-FOUND T)))
+	     (UNLESS BP1-FOUND
+	       (SETQ PREPEND T))
+	     (UNLESS BP2-FOUND
+	       (SETQ APPEND T))
+	     (OR BP1-FOUND BP2-FOUND)))
+	  ;; Check for current interval enclosed in BP1-BP2
+	  ((LINEMAP (BP1 BP2)
+	     (AND (EQ LINE (BP-LINE FIRST-BP))
+		  ( *FIRST-INDEX* (BP-INDEX FIRST-BP) *LAST-INDEX*)
+		  (RETURN T))
+	     (AND (EQ LINE (BP-LINE LAST-BP))
+		  ( *FIRST-INDEX* (BP-INDEX LAST-BP) *LAST-INDEX*)
+		  (RETURN T)))
+	   #|| superfluous (SETQ PREPEND T APPEND T) ||#)
+	  (T (RETURN-FROM ACCUMULATE-CHANGE NIL)))
+    (WHEN PREPEND
+      (PREPEND-TO-CHANGE-RECORD SELF FIRST-BP LAST-BP BP1 BUFFER))
+    (WHEN APPEND
+      (APPEND-TO-CHANGE-RECORD SELF FIRST-BP LAST-BP BP2 BUFFER))
+    T))
+
+(DEFMETHOD (PREPARE-FOR-UNDO-COMMAND CHANGE-RECORD) (BUFFER)
+  (IGNORE BUFFER)
+  NIL)		;default is to do nothing
+
+;; If there are some queued up deletions, split them into a separate change record
+(DEFMETHOD (PREPARE-FOR-UNDO-COMMAND INSERT-RECORD) (BUFFER)
+  (WHEN (BUFFER-CHANGE-ACCUMULATION-N-CHARS BUFFER)
+    (MATERIALIZE-DELETIONS BUFFER)))
+
+(DEFMETHOD (FLUSH-BUFFER-POINTERS CHANGE-RECORD) () NIL)
+
+(DEFMETHOD (FLUSH-BUFFER-POINTERS INTERVAL-CHANGE-RECORD) ()
+  (FLUSH-BP FIRST-BP)
+  (FLUSH-BP LAST-BP))
+
+(DEFMETHOD (FLUSH-BUFFER-POINTERS INSERT-RECORD) ()
+  (FLUSH-BP FIRST-BP)
+  (FLUSH-BP LAST-BP))
+
+(DEFMETHOD (FLUSH-BUFFER-POINTERS EXCHANGE-RECORD) ()
+  (FLUSH-BP BP1)
+  (FLUSH-BP BP2)
+  (FLUSH-BP BP3)
+  (FLUSH-BP BP4))
+
+(DEFMETHOD (CHANGE-RECORD-INTERVAL INTERVAL-CHANGE-RECORD) ()
+  (DECLARE (VALUES FIRST-BP LAST-BP))
+  (VALUES FIRST-BP LAST-BP))
+
+(DEFMETHOD (CHANGE-RECORD-INTERVAL INSERT-RECORD) ()
+  (VALUES FIRST-BP LAST-BP))
+
+(DEFMETHOD (CHANGE-RECORD-INTERVAL EXCHANGE-RECORD) ()
+  (VALUES BP1 BP4))
+
+(DEFMETHOD (CHANGE-RECORD-FIRST-BP EXCHANGE-RECORD) () BP1)
+
+(DEFMETHOD (CHANGE-RECORD-LAST-BP EXCHANGE-RECORD) () BP4)
+
+(DEFMETHOD (UNDO-CHANGE SIMPLE-CHANGE-RECORD) (BUFFER)
+  (WITH-INTERVAL-WRITE-LOCKED (FIRST-BP LAST-BP T)
+    (DELETE-INTERVAL FIRST-BP LAST-BP T)
+    (VALUES FIRST-BP
+	    (PROG1 (INSERT FIRST-BP OLD-TEXT)
+		   (RESTORE-BP-POSITIONS BP-POSITIONS BUFFER FIRST-BP)))))
+
+(DEFMETHOD (UNDO-CHANGE INSERT-RECORD) (BUFFER)
+  (IGNORE BUFFER)
+  (WITH-INTERVAL-WRITE-LOCKED (FIRST-BP LAST-BP T)
+    (DELETE-INTERVAL FIRST-BP LAST-BP T))
+  (VALUES FIRST-BP LAST-BP))
+
+(DEFMETHOD (UNDO-CHANGE EXCHANGE-RECORD) (BUFFER)
+  ;; No need to write lock, since EXCHANGE-INTERVALS does it for us
+  (EXCHANGE-INTERVALS BP1 BP2 BP3 BP4 NIL)
+  (RESTORE-BP-POSITIONS BP-POSITIONS BUFFER BP1)
+  (VALUES BP1 BP4))
+
+(DEFMETHOD (UNDO-CHANGE SPARSE-CHANGE-RECORD) (BUFFER)
+  (WITH-INTERVAL-WRITE-LOCKED (FIRST-BP LAST-BP T)
+    (UNDO-SPARSE-CHANGES FIRST-BP CHANGES BP-POSITIONS BUFFER))
+  (VALUES FIRST-BP LAST-BP))
+
+;;; Method for changes that are undone by restoring full saved text
+(DEFMETHOD (PREPARE-TO-UNDO-CHANGE CHANGE-RECORD) (BUFFER)
+  (MULTIPLE-VALUE-BIND (FIRST-BP LAST-BP)
+      (CHANGE-RECORD-INTERVAL SELF)
+    (MULTIPLE-VALUE-BIND (LENGTH WIDTH BP-POSITIONS)
+	(PREPARE-TO-RECORD FIRST-BP LAST-BP)
+      (CL:PUSH (FUNCALL (IF (EQ (CHANGE-RECORD-KIND SELF) 'UNDO) #'MAKE-REDO-RECORD
+								 #'MAKE-UNDO-RECORD)
+			(COPY-BP FIRST-BP ':NORMAL) (COPY-BP LAST-BP ':MOVES)
+			(FINALIZE-BP-POSITIONS BP-POSITIONS)
+			(COPY-INTERVAL-INTO-STRING-OR-INTERVAL FIRST-BP LAST-BP LENGTH WIDTH
+							       :AREA *CHANGE-RECORD-AREA*)
+			SELF)
+	       (BUFFER-CHANGE-HISTORY BUFFER) :AREA *CHANGE-RECORD-AREA*))))
+
+;;;; Commands
+
+(DEFCOM COM-QUICK-UNDO "Undo the last change to this buffer.
+Repeating this command several times undoes successive changes in reverse order.
+A numeric argument of 0 displays the Undo history; displayed changes are mouse-sensitive.
+A numeric argument of D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")n0 undoes the last 1n0 changes.
+A numeric argument of 1-n0 undoes the 1n0th most recent change." (KM)
+  (UNDO-COMMAND NIL NIL NIL NIL))
+
+(DEFCOM COM-QUICK-UNDO-IN-REGION 
+"Undo the last change to the highlighted region of this buffer.
+If there is no region, undo the last change to the current definition.
+Repeating this command several times undoes successive changes in reverse order.
+A numeric argument of 0 displays the Undo history; displayed changes are mouse-sensitive.
+A numeric argument of 1n0 undoes the last 1n0 changes to the region.
+A numeric argument of 1-n0 undoes the 1n0th most recent change to the region." (KM)
+  (UNDO-COMMAND NIL NIL T NIL))
+
+(DEFCOM COM-UNDO "Undo the last change to this buffer, querying first.
+Repeating this command several times undoes successive changes in reverse order.
+A numeric argument of 0 displays the Undo history; displayed changes are mouse-sensitive.
+A numeric argument of 1n0 undoes the last 1n0 changes.
+A numeric argument of 1-n0 undoes the 1n0th most recent change." (KM)
+  (UNDO-COMMAND T NIL NIL NIL))
+
+(DEFCOM COM-QUICK-REDO "Redo the last undone change to this buffer.
+Repeating this command several times redoes successive undone changes in reverse order.
+A numeric argument of 0 displays the Redo history; displayed changes are mouse-sensitive.
+A numeric argument of 1n0 redoes the last 1n0 undone changes.
+A numeric argument of 1-n0 redoes the 1n0th most recent undone change." (KM)
+  (UNDO-COMMAND NIL T NIL NIL))
+
+(DEFCOM COM-QUICK-REDO-IN-REGION 
+"Redo the last undone change to the highlighted region of this buffer.
+If there is no region, redo the last undone change to the current definition.
+Repeating this command several times redoes successive undone changes in reverse order.
+A numeric argument of 0 displays the Redo history; displayed changes are mouse-sensitive.
+A numeric argument of 1n0 redoes the last 1n0 undone changes to the region.
+A numeric argument of 1-n0 redoes the 1n0th most recent undone change to the region." (KM)
+  (UNDO-COMMAND NIL T T NIL))
+
+(DEFCOM COM-REDO "Redo the last undone change to this buffer, querying first.
+Repeating this command several times redoes successive undone changes in reverse order.
+A numeric argument of 0 displays the Redo history; displayed changes are mouse-sensitive.
+A numeric argument of 1n0 redoes the last 1n0 undone changes.
+A numeric argument of 1-n0 redoes the 1n0th most recent undone change." (KM)
+  (UNDO-COMMAND T T NIL NIL))
+
+;;; Central routine for all undo and redo commands
+(DEFUN UNDO-COMMAND (QUERY REDO REGION SPECIFIC-CHANGES &OPTIONAL SILENT)
+  (LET* ((BUFFER (OR (BP-CHANGE-RECORDING-BUFFER (POINT))
+		     (BARF "This buffer does not maintain a history of changes.")))
+	 (HISTORY (OR (BUFFER-CHANGE-HISTORY BUFFER)
+		      (BARF "No changes have been made to this buffer.")))
+	 (MOUSE SPECIFIC-CHANGES)
+	 (DISPLAY (AND (NOT MOUSE) (ZEROP *NUMERIC-ARG*)))
+	 (COUNT (IF MOUSE CL:MOST-POSITIVE-FIXNUM (ABS *NUMERIC-ARG*)))
+	 (MULTIPLE (PLUSP *NUMERIC-ARG*))	;Minus arg means undo only one
+	 (CONFIRM-REDO NIL)
+	 (CANCELLATIONS NIL)
+	 (UNDO-SEEN NIL)
+	 (INDEX 0)
+	 (FULLY-CANCELLED (NOT REDO)))
+    (MULTIPLE-VALUE-BIND (REGION-START REGION-END)	;Confine to region if m-sh-U or m-sh-R
+	(WHEN REGION
+	  (COND ((WINDOW-REGION-P *WINDOW*)		;Use highlighted region if any
+		 (IF (BP-< (POINT) (MARK))
+		     (VALUES (POINT) (MARK))
+		     (VALUES (MARK) (POINT))))
+		((AND (LISTP *LAST-COMMAND-TYPE*)	;Use same region as last time
+		      (EQ (FIRST *LAST-COMMAND-TYPE*) 'UNDO))
+		 (VALUES (SECOND *LAST-COMMAND-TYPE*) (THIRD *LAST-COMMAND-TYPE*)))
+		(T					;Use default region if none
+		 (DEFINITION-REGION-INTERNAL))))
+      ;; Save the region for next time
+      (WHEN REGION
+	(SETQ *CURRENT-COMMAND-TYPE* (LIST 'UNDO REGION-START REGION-END)))
+      ;; If accumulating changes, diddle the current change slightly
+      (LET ((CURRENT (AND (BUFFER-CHANGE-ACCUMULATION-N-LINES BUFFER)
+			  (FIRST HISTORY))))
+	(WHEN CURRENT
+	  (PREPARE-FOR-UNDO-COMMAND CURRENT BUFFER)
+	  (SETQ HISTORY (BUFFER-CHANGE-HISTORY BUFFER))))	;May have changed
+      ;; Find the beginning of the relevant portion of the history
+      ;; For undo, skip over undos to find the most recent change not already undone
+      ;; For redo, find the most recent undo not already redone
+      (LOOP AS CHANGE = (FIRST HISTORY) DO
+	(UNLESS (OR (SELECTQ (CHANGE-RECORD-KIND CHANGE)
+		      (MUNG-NODE T)		;Always skip these
+		      (INITIAL (WHEN (AND REDO (NOT DISPLAY) (NOT CONFIRM-REDO)
+					  (CHANGE-RECORD-OVERLAPS-INTERVAL
+					    CHANGE REGION-START REGION-END T))
+				 (SETQ CONFIRM-REDO T))
+			       REDO)
+		      (UNDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+			    (UNLESS UNDO-SEEN
+			      (WHEN (CHANGE-RECORD-OVERLAPS-INTERVAL CHANGE REGION-START
+								     REGION-END T)
+				(SETQ UNDO-SEEN T)))
+			    (NOT REDO))
+		      (REDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+			    REDO))
+		    (MEMQ CHANGE CANCELLATIONS))
+	  (WHEN (CHANGE-RECORD-OVERLAPS-INTERVAL CHANGE REGION-START REGION-END T)
+	    (RETURN))
+	  (INCF INDEX))
+	(POP HISTORY)
+	(WHEN (NULL HISTORY)
+	  (BARF (IF REDO
+		    (IF UNDO-SEEN "All undone changes to this ~A have been redone."
+			"No changes to this ~A have been undone, so there is nothing to redo.")
+		    (IF UNDO-SEEN "All changes to this ~A have been undone."
+			"No changes have been made to this ~A."))
+		(IF (ZEROP INDEX) "buffer" "region"))))
+      ;; Having found the starting point, perform the command
+      (IF DISPLAY
+	  (DISPLAY-CHANGE-HISTORY *TYPEOUT-WINDOW* HISTORY CANCELLATIONS REDO BUFFER
+				  REGION-START REGION-END INDEX NIL)
+	  (LOOP	UNTIL (ZEROP COUNT)
+		UNTIL (NULL HISTORY)
+		UNTIL (AND MOUSE (NULL SPECIFIC-CHANGES))
+		WITH PREVIOUS-CHANGE = NIL
+		WITH (PREVIOUS-CHANGE-FIRST-BP PREVIOUS-CHANGE-LAST-BP)
+		AS CHANGE = (POP HISTORY) DO
+	    (UNLESS (OR (SELECTQ (CHANGE-RECORD-KIND CHANGE)
+			  (MUNG-NODE T)		;Always skip these
+			  (INITIAL REDO)
+			  (UNDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+				(SETQ UNDO-SEEN T)
+				(NOT REDO))
+			  (REDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+				REDO))
+			(MEMQ CHANGE CANCELLATIONS))
+	      (BLOCK CHANGE	;Return early if this change is to be skipped
+		(UNLESS (SELECTQ (CHANGE-RECORD-OVERLAPS-INTERVAL CHANGE REGION-START
+								  REGION-END T)
+			  ((T) T)
+			  ((PARTIAL)
+			   (SETQ QUERY NIL)
+			   (SEND *TYPEIN-WINDOW* :CLEAR-WINDOW)	;So query starts at the top
+			   (FQUERY `(:BEEP T)
+				   "This change partially overlaps the region but ~
+				    extends outside it.~@
+				    Go ahead with ~Ado of ~Q? "
+				   (IF REDO "re" "un")
+				   (LAMBDA ()
+				     (DISPLAY-CHANGE-RECORD CHANGE BUFFER QUERY-IO)))))
+		  (SETQ FULLY-CANCELLED NIL)
+		  (RETURN-FROM CHANGE))
+		(DECF COUNT)
+		(UNLESS (IF MOUSE
+			    (EQ CHANGE (FIRST SPECIFIC-CHANGES))
+			    (OR MULTIPLE (ZEROP COUNT)))
+		  (SETQ FULLY-CANCELLED NIL)
+		  (RETURN-FROM CHANGE))
+		(POP SPECIFIC-CHANGES)
+		(WHEN CONFIRM-REDO
+		  (SETQ CONFIRM-REDO NIL)
+		  (SETQ QUERY NIL)
+		  (SEND *TYPEIN-WINDOW* :CLEAR-WINDOW)		;So query starts at the top
+		  (UNLESS (FQUERY `(:BEEP T)
+				  "The buffer has been changed since the most recent undo.~@
+				   Go ahead with redo of ~Q? "
+				  (LAMBDA ()
+				    (DISPLAY-CHANGE-RECORD
+				      (CHANGE-RECORD-CANCELLED-CHANGE CHANGE)
+				      BUFFER QUERY-IO)))
+		    (BARF)))
+		(WHEN (AND QUERY (NOT (QUERY-ABOUT-UNDO CHANGE REDO BUFFER)))
+		  (SETQ FULLY-CANCELLED NIL)
+		  (RETURN-FROM CHANGE))
+		;; This change is to be undone
+		(MULTIPLE-VALUE-BIND (FIRST-BP LAST-BP)
+		    (CHANGE-RECORD-INTERVAL CHANGE)
+		  ;; If editing a limited range of the buffer (as in Zmail), make sure
+		  ;; we don't make changes outside of *INTERVAL*
+		  (UNLESS (EQ BUFFER *INTERVAL*)	;speed bum
+		    (WHEN (OR (BP-< FIRST-BP (INTERVAL-FIRST-BP *INTERVAL*))
+			      (BP-< (INTERVAL-LAST-BP *INTERVAL*) LAST-BP))
+		      (BARF "Cannot undo a change that lies outside of ~
+			    the current editing interval.")))
+		  ;; Record this change so it can be undone later.
+		  ;; But if this is redoing the most recent undo, and everything is
+		  ;; in order, it's less confusing if we let the undo and the redo
+		  ;; simply cancel each other out.
+		  (COND ((AND REDO (EQ CHANGE (FIRST (BUFFER-CHANGE-HISTORY BUFFER))))
+			 (POP (BUFFER-CHANGE-HISTORY BUFFER)))
+			(T
+			 (RECORD-ACCUMULATED-CHANGES BUFFER)
+			 (PREPARE-TO-UNDO-CHANGE CHANGE BUFFER)))
+		  ;; Now undo it
+		  (WITH-READ-ONLY-SUPPRESSED (BUFFER)
+		    (LET ((*ENABLE-CHANGE-RECORDING* NIL))
+		      (MULTIPLE-VALUE (FIRST-BP LAST-BP)
+			(UNDO-CHANGE CHANGE BUFFER))))
+		  ;; Keep the user informed of what is going on
+		  ;; If this isn't the first change, then the previous one wasn't
+		  ;; the last change, so report it
+		  (WHEN PREVIOUS-CHANGE
+		    ;; This is not the last change, so keep it simple
+		    (UNLESS SILENT
+		      (TYPEIN-LINE "~vQ." PREVIOUS-CHANGE #'CHANGE-RECORD-REPORT-UNDONE)))
+		  ;; Remember the last change we made
+		  (SETQ PREVIOUS-CHANGE CHANGE
+			PREVIOUS-CHANGE-FIRST-BP FIRST-BP
+			PREVIOUS-CHANGE-LAST-BP LAST-BP))))
+	    FINALLY
+	      ;; Keep the user informed of what is going on
+	      (WHEN PREVIOUS-CHANGE
+		;; Unless the region is being used, highlight the text that was
+		;; changed, so the user sees what happened.
+		(UNLESS REGION-START
+		  (WHEN *UNDO-SETS-REGION*
+		    (SETF (WINDOW-MARK-P *WINDOW*)
+			  (LIST PREVIOUS-CHANGE-FIRST-BP
+				(IF (BP-= PREVIOUS-CHANGE-FIRST-BP PREVIOUS-CHANGE-LAST-BP)
+				    (FORWARD-CHAR PREVIOUS-CHANGE-LAST-BP 1 T BUFFER)
+				    PREVIOUS-CHANGE-LAST-BP))))
+		  ;; Put point at the end rather than start since that's more commonly useful.
+		  (WHEN (BP-= (POINT) PREVIOUS-CHANGE-FIRST-BP)
+		    (MOVE-POINT PREVIOUS-CHANGE-LAST-BP))
+		  ;; Try to get the whole change visible in the window.  The UNLESS check
+		  ;; is to avoid spuriously scrolling the window when the change substituted
+		  ;; a non-EQ line for the first line in the window.  :START means that we'd
+		  ;; rather move Point than leave the highlighting off-screen.
+		  (UNLESS (EQ (LINE-PREVIOUS (BP-LINE PREVIOUS-CHANGE-FIRST-BP))
+			      (LINE-PREVIOUS (BP-LINE (WINDOW-START-BP *WINDOW*))))
+		    (REDISPLAY-POINT-ON-PLINE PREVIOUS-CHANGE-FIRST-BP *WINDOW*
+					      (ROUND (* (WINDOW-N-PLINES *WINDOW*)
+							*MAX-RESET-FRACTION*))
+					      T :START)))
+		;; Report what just happened in the echo area
+		(COND ((LOOP FOR CHANGE IN HISTORY
+			     THEREIS
+			       (AND (SELECTQ (CHANGE-RECORD-KIND CHANGE)
+				      (INITIAL (IF REDO (RETURN NIL) T))
+				      (UNDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE
+						    CHANGE)
+						  CANCELLATIONS)
+					    REDO)
+				      (REDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE
+						    CHANGE)
+						  CANCELLATIONS)
+					    (NOT REDO)))
+				    (NOT (MEMQ CHANGE CANCELLATIONS))
+				    (CHANGE-RECORD-OVERLAPS-INTERVAL CHANGE REGION-START
+								     REGION-END T)))
+		       (UNLESS SILENT
+			 (IF REDO
+			     (TYPEIN-LINE "~vQ.~@[  ~A to redo more,~] ~
+				           ~@[~A to undo it.~]"
+					  PREVIOUS-CHANGE #'CHANGE-RECORD-REPORT-UNDONE
+					  (KEY-FOR-COMMAND (IF REGION 'COM-QUICK-REDO-IN-REGION
+							       'COM-QUICK-REDO)
+							   *COMTAB*)
+					  (KEY-FOR-COMMAND 'COM-QUICK-UNDO *COMTAB*))
+			     (TYPEIN-LINE "~vQ.~@[  ~A to undo more,~] ~
+				           ~@[~A to undo the Undo.~]"
+					  PREVIOUS-CHANGE #'CHANGE-RECORD-REPORT-UNDONE
+					  (KEY-FOR-COMMAND (IF REGION 'COM-QUICK-UNDO-IN-REGION
+							       'COM-QUICK-UNDO)
+							   *COMTAB*)
+					  (KEY-FOR-COMMAND 'COM-QUICK-REDO *COMTAB*)))))
+		      (T
+		       (UNLESS SILENT
+			 (IF REDO
+			     (TYPEIN-LINE "~vQ.~@[  Press ~A to undo it.~]"
+					  PREVIOUS-CHANGE #'CHANGE-RECORD-REPORT-UNDONE
+					  (KEY-FOR-COMMAND 'COM-QUICK-UNDO *COMTAB*))
+			     (TYPEIN-LINE "~vQ.~@[  Press ~A to undo the Undo.~]"
+					  PREVIOUS-CHANGE #'CHANGE-RECORD-REPORT-UNDONE
+					  (KEY-FOR-COMMAND 'COM-QUICK-REDO *COMTAB*)))))))
+	      (WHEN SPECIFIC-CHANGES
+		(BARF "Change to be undone was not found; this may be the wrong buffer."))
+	      (WHEN FULLY-CANCELLED
+		(LOOP FOR ITEM IN (BUFFER-CHANGE-HISTORY BUFFER) WITH FLAG = NIL DO
+		  (IF (EQ (CHANGE-RECORD-KIND ITEM) 'MUNG-NODE)
+		      (NOTE-UNDONE-CHANGES (MUNG-NODE-RECORD-NODE ITEM)
+					   (MUNG-NODE-RECORD-TICK ITEM))
+		      (WHEN FLAG (RETURN)))			;Stop at first change not hit
+		  (WHEN (EQ ITEM CHANGE) (SETQ FLAG T))))	;This is how far back we got
+	      ;; Finished undo/redo, return right thing to get rid of the typeout window
+	      (RETURN (COND (MOUSE
+			     (SEND *TYPEOUT-WINDOW* :MAKE-COMPLETE)
+			     NIL)		;NIL for mouse clicks
+			    (T
+			     DIS-TEXT))))))))	;DIS-TEXT for normal c-sh-U command
+
+;;; Returns T, NIL, or PARTIAL
+(DEFUN CHANGE-RECORD-OVERLAPS-INTERVAL (CHANGE BP1 &OPTIONAL BP2 IN-ORDER-P)
+  (OR (NULL BP1)				;All changes overlap the infinite interval
+      (MULTIPLE-VALUE-BIND (FIRST-BP LAST-BP)
+	  (CHANGE-RECORD-INTERVAL CHANGE)
+	(GET-INTERVAL BP1 BP2 IN-ORDER-P)
+	(LET ((FIRST-BP-INSIDE (AND (BP-IN-RANGE FIRST-BP BP1 BP2) (NOT (BP-= FIRST-BP BP2))))
+	      (LAST-BP-INSIDE (AND (BP-IN-RANGE LAST-BP BP1 BP2) (NOT (BP-= LAST-BP BP1)))))
+	  (OR (AND FIRST-BP-INSIDE LAST-BP-INSIDE)
+	      (AND (OR FIRST-BP-INSIDE LAST-BP-INSIDE)
+		   (AND (BP-IN-RANGE BP1 FIRST-BP LAST-BP) (NOT (BP-= BP1 LAST-BP)))
+		   (AND (BP-IN-RANGE BP2 FIRST-BP LAST-BP) (NOT (BP-= BP2 FIRST-BP)))
+		   'PARTIAL))))))
+
+(DEFUN QUERY-ABOUT-UNDO (CHANGE REDO BUFFER)
+  (FQUERY '(:SELECT T) "~A ~Q? "
+	  (IF REDO "Redo" "Undo")
+	  (LAMBDA ()
+	    (DISPLAY-CHANGE-RECORD (IF REDO (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CHANGE)
+				   BUFFER QUERY-IO))))
+
+;;;; Mouse Breath
+
+;;; It seems to be too difficult to make this share code with DISPLAY-HISTORY-MENU
+;;; If DISPLAY-LIST is non-NIL, it's a list of the changes that have already been
+;;; displayed, and this is a continuation due to clicking on "(More items in history.)"
+(DEFUN DISPLAY-CHANGE-HISTORY (STREAM HISTORY CANCELLATIONS REDO BUFFER
+			       REGION-START REGION-END INDEX DISPLAY-LIST)
+  ;; INDEX is the argument to c-sh-U that reaches the first change in HISTORY
+  (COND (DISPLAY-LIST
+	 (UNLESS (LISTP DISPLAY-LIST)		;could be T
+	   (SETQ DISPLAY-LIST NIL))
+	 (CL:FRESH-LINE STREAM))
+	(T
+	 (FORMAT STREAM "~&History of ~A changes in ~A:~%"
+		 (IF REDO "undone, redoable" "undoable") (IF REGION-START "region" "buffer"))))
+  (LOOP FOR HISTORY ON HISTORY
+	AS CHANGE = (CAR HISTORY)
+	WITH COUNT = 0		;Number of lines printed so far
+	WITH LIMIT = *HISTORY-MENU-LENGTH*
+	WHILE (< COUNT LIMIT) DO
+    (UNLESS (SELECTQ (CHANGE-RECORD-KIND CHANGE)
+	      (MUNG-NODE T)			;Always skip these
+	      (INITIAL REDO)
+	      (UNDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+		    (NOT REDO))
+	      (REDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+		    REDO))
+      (INCF INDEX)
+      (WHEN (CHANGE-RECORD-OVERLAPS-INTERVAL CHANGE REGION-START REGION-END T)
+	(INCF COUNT)
+	(COND ((MEMQ CHANGE CANCELLATIONS)
+	       (FORMAT STREAM "~5@T")
+	       (DISPLAY-CHANGE-RECORD CHANGE BUFFER STREAM)
+	       (FORMAT STREAM "  [undone]"))
+	      (T
+	       (PUSH CHANGE DISPLAY-LIST)
+	       (DW:WITH-OUTPUT-AS-PRESENTATION (:STREAM STREAM
+						:OBJECT DISPLAY-LIST
+						:TYPE 'CHANGE-HISTORY-ELEMENT
+						:ALLOW-SENSITIVE-INFERIORS NIL
+						:SINGLE-BOX T)
+		 (FORMAT STREAM "~3D: " INDEX)
+		 (DISPLAY-CHANGE-RECORD CHANGE BUFFER STREAM))))
+	(TERPRI STREAM)))
+    (WHEN (LISTEN-FOR-BLIP-OTHER-THAN STREAM 'REDISPLAY 'SELECT-WINDOW)
+      (RETURN NIL))
+    FINALLY
+      (IF (LOOP FOR CHANGE IN HISTORY		;See if any remaining changes count
+		ALWAYS (SELECTQ (CHANGE-RECORD-KIND CHANGE)
+			 (MUNG-NODE T)		;Always skip these
+			 (INITIAL REDO)
+			 (UNDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+			       (NOT REDO))
+			 (REDO (PUSH (CHANGE-RECORD-CANCELLED-CHANGE CHANGE) CANCELLATIONS)
+			       REDO))
+		ALWAYS (CHANGE-RECORD-OVERLAPS-INTERVAL CHANGE REGION-START REGION-END T))
+	  (FORMAT STREAM "(End of history.)")
+	  (DW:WITH-OUTPUT-AS-PRESENTATION (:STREAM STREAM
+					   :OBJECT (LIST HISTORY CANCELLATIONS REDO BUFFER
+							 REGION-START REGION-END INDEX
+							 (OR DISPLAY-LIST T))
+					   :TYPE 'DISPLAY-REST-OF-CHANGE-HISTORY)
+	    (FORMAT STREAM "(More items in history.)"))))
+  DIS-NONE)
+
+;;;; Presentation types used by history display
+
+(SCL:DEFINE-PRESENTATION-TYPE CHANGE-HISTORY-ELEMENT ()
+   :EXPANDER 'T
+   :PRINTER ((IGNORE IGNORE) NIL))  ;So the HIGHLIGHT-CHANGED-REGION echo blip won't be ugly
+
+(DEFINE-PRESENTATION-TO-EDITOR-COMMAND-TRANSLATOR UNDO-BACK-TO-CHANGE
+	(CHANGE-HISTORY-ELEMENT "Undo back to change" *STANDARD-COMTAB*
+	 :DOCUMENTATION ((CHANGE-RECORDS)
+			 (IF (EQ (CHANGE-RECORD-KIND (FIRST CHANGE-RECORDS)) 'UNDO)
+			     "Redo all changes back to this one"
+			     "Undo all changes back to this one"))
+	 :GESTURE :LEFT :MENU T)
+	(CHANGE-RECORDS)
+  `(UNDO-COMMAND NIL ,(EQ (CHANGE-RECORD-KIND (FIRST CHANGE-RECORDS)) 'UNDO)
+		 NIL ,(REVERSE CHANGE-RECORDS)))
+
+(DEFINE-PRESENTATION-TO-EDITOR-COMMAND-TRANSLATOR UNDO-ONE-CHANGE
+	(CHANGE-HISTORY-ELEMENT "Undo one change" *STANDARD-COMTAB*
+	 :DOCUMENTATION ((CHANGE-RECORDS)
+			 (IF (EQ (CHANGE-RECORD-KIND (FIRST CHANGE-RECORDS)) 'UNDO)
+			     "Redo just this change"
+			     "Undo just this change"))
+	 :GESTURE :MIDDLE :MENU T)
+	(CHANGE-RECORDS)
+  `(UNDO-COMMAND NIL ,(EQ (CHANGE-RECORD-KIND (FIRST CHANGE-RECORDS)) 'UNDO)
+		 NIL ,(LIST (FIRST CHANGE-RECORDS))))
+
+(DEFINE-PRESENTATION-TO-EDITOR-COMMAND-TRANSLATOR HIGHLIGHT-CHANGED-REGION
+	(CHANGE-HISTORY-ELEMENT "Highlight changed region" *STANDARD-COMTAB*
+	 :DOCUMENTATION "Highlight the region of the buffer that was changed"
+	 :GESTURE :EDIT-DEFINITION :MENU T)
+	(CHANGE-RECORDS)
+  `(HIGHLIGHT-CHANGED-REGION ,(FIRST CHANGE-RECORDS)))
+
+(DEFUN HIGHLIGHT-CHANGED-REGION (CHANGE-RECORD)
+  (LET ((BP (COPY-BP (POINT)))
+	(FIRST-BP (CHANGE-RECORD-FIRST-BP CHANGE-RECORD))
+	(LAST-BP (CHANGE-RECORD-LAST-BP CHANGE-RECORD)))
+    (SETF (WINDOW-MARK-P *WINDOW*)
+	  (LIST FIRST-BP (IF (BP-= FIRST-BP LAST-BP) (FORWARD-CHAR LAST-BP 1 T) LAST-BP)))
+    ;; Try to get the whole change visible in the window.  The UNLESS check
+    ;; is to avoid spuriously scrolling the window when the change substituted
+    ;; a non-EQ line for the first line in the window.  :START means that we'd
+    ;; rather move Point than leave the highlighting off-screen.
+    (UNLESS (EQ (LINE-PREVIOUS (BP-LINE FIRST-BP))
+		(LINE-PREVIOUS (BP-LINE (WINDOW-START-BP *WINDOW*))))
+      (REDISPLAY-POINT-ON-PLINE FIRST-BP *WINDOW*
+				(ROUND (* (WINDOW-N-PLINES *WINDOW*)
+					  *MAX-RESET-FRACTION*))
+				T :START))
+    (SEND *TYPEOUT-WINDOW* :MAKE-COMPLETE)	;Make sure highlight is visible
+    (MAYBE-PUSH-POINT BP)
+    NIL))	;Returning NIL means pop the typeout window
+
+(SCL:DEFINE-PRESENTATION-TYPE DISPLAY-REST-OF-CHANGE-HISTORY ()
+   :EXPANDER 'T
+   :PRINTER ((IGNORE STREAM)
+	     (CL:WRITE-STRING "(More items in history.)" STREAM)))
+
+(DW:DEFINE-PRESENTATION-ACTION DISPLAY-REST-OF-CHANGE-HISTORY
+   (DISPLAY-REST-OF-CHANGE-HISTORY SI:INPUT-EDITOR
+    :DOCUMENTATION "Display rest of this history")
+   (STATE)
+  (SI:WITH-IE-TYPEOUT-IF-APPROPRIATE ()
+    (CL:APPLY #'DISPLAY-CHANGE-HISTORY STANDARD-OUTPUT STATE)))
+
+;;;; Display methods
+
+;;; The reconstruction of "before" and "after" text for changes is inherently complicated
+;;; and error-prone, since I'm unwilling to spend the space to compute it when the change
+;;; originally occurs.  Therefore, shelter the user from the consequences of bugs.
+(DEFWHOPPER (DISPLAY-CHANGE-RECORD CHANGE-RECORD) (BUFFER STREAM)
+  (CONDITION-CASE () (CONTINUE-WHOPPER BUFFER STREAM)
+     (ERROR (FORMAT STREAM " ~" "Description not currently available"))))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD UNDO-REDO-RECORD) (BUFFER STREAM)
+  (FORMAT STREAM "~: of " (CHANGE-RECORD-KIND SELF))
+  (DISPLAY-CHANGE-RECORD (CHANGE-RECORD-INITIAL-CHANGE) BUFFER STREAM))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD SIMPLE-CHANGE-RECORD) (BUFFER STREAM)
+  (COND ((EQUAL OLD-TEXT "")
+	 (STRING-OUT "Insertion of " STREAM)
+	 (SUMMARIZE-INTERVAL-BEFORE-CHANGES FIRST-BP LAST-BP T 30 SELF BUFFER STREAM T))
+	((IF (EQ SELF (FIRST (BUFFER-CHANGE-HISTORY BUFFER)))
+	     (BP-= FIRST-BP LAST-BP)
+	     (EQ FIRST-BP LAST-BP))
+	 (STRING-OUT "Deletion of " STREAM)
+	 (SUMMARIZE-STRING-OR-INTERVAL OLD-TEXT 30 STREAM T))
+	(T
+	 (STRING-OUT "Edit of " STREAM)
+	 (LET ((LENGTH (SUMMARIZE-STRING-OR-INTERVAL OLD-TEXT 20 STREAM T)))
+	   (STRING-OUT "  " STREAM)
+	   (SUMMARIZE-INTERVAL-BEFORE-CHANGES FIRST-BP LAST-BP T (- 35 LENGTH)
+					      SELF BUFFER STREAM T)))))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD REPLACE-CHANGE-RECORD) (BUFFER STREAM)
+  (FORMAT STREAM "~: of " (CHANGE-RECORD-VERB SELF))
+  (LET ((LENGTH (SUMMARIZE-STRING-OR-INTERVAL OLD-TEXT 20 STREAM T)))
+    (STRING-OUT "  " STREAM)
+    (SUMMARIZE-INTERVAL-BEFORE-CHANGES FIRST-BP LAST-BP T (- 35 LENGTH)
+				       SELF BUFFER STREAM T)))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD NAMED-CHANGE-RECORD) (BUFFER STREAM)
+  (IGNORE BUFFER)
+  (FORMAT STREAM "~: of " (CHANGE-RECORD-VERB SELF))
+  (SUMMARIZE-STRING-OR-INTERVAL OLD-TEXT 35 STREAM T))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD INSERT-RECORD) (BUFFER STREAM)
+  (FORMAT STREAM "~: of " (CHANGE-RECORD-VERB SELF))
+  (SUMMARIZE-INTERVAL-BEFORE-CHANGES FIRST-BP LAST-BP T 35 SELF BUFFER STREAM T))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD EXCHANGE-RECORD) (BUFFER STREAM)
+  (IGNORE BUFFER)
+  (STRING-OUT "Exchange of " STREAM)
+  (SUMMARIZE-INTERVAL-BEFORE-CHANGES BP1 BP2 T 20 SELF BUFFER STREAM T)
+  (STRING-OUT " and " STREAM)
+  (SUMMARIZE-INTERVAL-BEFORE-CHANGES BP3 BP4 T 20 SELF BUFFER STREAM T))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD SPARSE-CHANGE-RECORD) (BUFFER STREAM)
+  (FORMAT STREAM "~: of " (CHANGE-RECORD-VERB SELF))
+  ;; To be useful, we need some context, the old-text might be all whitespace
+  (WITH-BP (START-OF-BLACK (FORWARD-OVER *BLANKS* FIRST-BP LAST-BP) :NORMAL)
+    (WITH-BP (END-OF-LINE (IF (ZEROP (BP-INDEX LAST-BP)) LAST-BP (END-LINE LAST-BP 0 T))
+			  :MOVES)
+      (SUMMARIZE-INTERVAL-BEFORE-CHANGES START-OF-BLACK END-OF-LINE T 35
+					 (SECOND (MEMQ SELF (BUFFER-CHANGE-HISTORY BUFFER)))
+					 BUFFER STREAM T))))
+
+(DEFMETHOD (DISPLAY-CHANGE-RECORD SPARSE-REPLACE-CHANGE-RECORD) (BUFFER STREAM)
+  (IGNORE BUFFER)
+  (FORMAT STREAM "~: of ~S  ~S" (CHANGE-RECORD-VERB SELF) FROM-STRING TO-STRING))
+
+(DEFUN SUMMARIZE-STRING-OR-INTERVAL (STRING MAX-LENGTH STREAM QUOTE)
+  (IF (STRINGP STRING)
+      (SUMMARIZE-STRING STRING MAX-LENGTH STREAM QUOTE)
+      (SUMMARIZE-INTERVAL STRING NIL NIL MAX-LENGTH STREAM QUOTE)))
+
+;; Print a brief description of STRING onto STREAM
+;; Enclose it in nice quotes and lozenge tabs and returns, for better readability.
+;; Returns approximately the number of characters from string printed
+(DEFUN SUMMARIZE-STRING (STRING MAX-LENGTH STREAM QUOTE)
+  (LET* ((LENGTH (STRING-LENGTH STRING))
+	 (WHITESPACE-CHARS *WHITESPACE-CHARS*)
+	 (START (OR (STRING-SEARCH-NOT-SET WHITESPACE-CHARS STRING) LENGTH)))
+    (COND ((ZEROP LENGTH)
+	   (STRING-OUT "nothing" STREAM)
+	   5)
+	  (T
+	   (FLET ((SEGMENT (FROM TO)
+		    (LOOP WHILE (< FROM TO)
+			  AS INDEX = (STRING-SEARCH-SET '(#\RETURN #\TAB #\BACKSPACE)
+							STRING FROM TO) DO
+		      (SEND STREAM :STRING-OUT STRING FROM (OR INDEX TO))
+		      (UNLESS INDEX (RETURN NIL))
+		      (INCF LENGTH 2)		;Lozenged characters count for three
+		      (SEND STREAM :DISPLAY-LOZENGED-STRING (CL:CHAR-NAME (AREF STRING INDEX)))
+		      (SETQ FROM (1+ INDEX)))))
+	     (WHEN QUOTE (SEND STREAM :TYO #/"))
+	     (IF ( LENGTH MAX-LENGTH)
+		 (SEGMENT 0 LENGTH)
+		 ;; String is too long, start by abbreviating any whitespace at the ends
+		 ;; Abbreviate five or more spaces, or more than one non-space
+		 (LET ((END (1+ (STRING-REVERSE-SEARCH-NOT-SET WHITESPACE-CHARS STRING)))
+		       (END-WHITE NIL))
+		   (IF (OR ( START 5)
+			   (AND (> START 1)
+				(STRING-SEARCH-NOT-CHAR #\SPACE STRING 0 START)))
+		       (SEND STREAM :DISPLAY-LOZENGED-STRING "whitespace")
+		       (SETQ START 0))
+		   (IF (OR ( (- LENGTH END) 5)
+			   (AND (> (- LENGTH END) 1)
+				(STRING-SEARCH-NOT-CHAR #\SPACE STRING END LENGTH)))
+		       (SETQ END-WHITE T)
+		       (SETQ END LENGTH))
+		   (SETQ LENGTH (- END START))
+		   (IF ( (- END START) MAX-LENGTH)
+		       (SEGMENT START END)
+		       ;; Have to break the string in half.  Try to break at word boundaries.
+		       ;; The ellipsis for the break takes 5 characters off MAX-LENGTH itself.
+		       (LET* ((MAX-LENGTH (- MAX-LENGTH 5))
+			      (SEG1 (LET ((XLEFT (+ START (FLOOR MAX-LENGTH 3)))	;1/3
+					  (LEFT (+ START (FLOOR MAX-LENGTH 2.7)))	;3/8
+					  (MIDDLE (+ START (FLOOR MAX-LENGTH 2)))	;1/2
+					  (RIGHT (+ START (FLOOR MAX-LENGTH 1.3))))	;3/4
+				      (1+ (OR (STRING-REVERSE-SEARCH-NOT-SET WHITESPACE-CHARS
+									     STRING
+						(OR (STRING-SEARCH-SET WHITESPACE-CHARS
+								       STRING MIDDLE RIGHT)
+						    (STRING-SEARCH-SET WHITESPACE-CHARS
+								       STRING LEFT RIGHT)
+						    MIDDLE)
+						XLEFT)
+					      XLEFT))))
+			      (SEG2 (LET* ((MAX-LENGTH (- MAX-LENGTH (- SEG1 START)))
+					   (LEFT (- END MAX-LENGTH))
+					   (RIGHT (- END (FLOOR MAX-LENGTH 2))))
+				      (OR (STRING-SEARCH-NOT-SET WHITESPACE-CHARS STRING
+					    (OR (STRING-SEARCH-SET WHITESPACE-CHARS STRING
+								   (1- LEFT) (1- RIGHT))
+						LEFT)
+					    RIGHT)
+					  RIGHT)))
+			      (LINES (CL:COUNT #\RETURN STRING :START SEG1 :END SEG2)))
+			 (SEGMENT START SEG1)
+			 (SUMMARIZE-ELIDED-TEXT LINES STREAM)
+			 (SEGMENT SEG2 END)
+			 (SETQ LENGTH (+ (- SEG1 START) (- END SEG2)))))
+		   (WHEN END-WHITE
+		     (SEND STREAM :DISPLAY-LOZENGED-STRING "whitespace"))))
+	     (WHEN QUOTE (SEND STREAM :TYO #/"))
+	     LENGTH)))))
+
+(DEFUN SUMMARIZE-ELIDED-TEXT (LINES STREAM)
+  (IF (< LINES 1)
+      (STRING-OUT " ... " STREAM)
+      (STACK-LET ((BUFFER (MAKE-ARRAY 20 :TYPE 'ART-STRING
+				      :FILL-POINTER 0)))
+	(FORMAT BUFFER "~:D line~:P" LINES)
+	(STRING-OUT " ..." STREAM)
+	(SEND STREAM :DISPLAY-LOZENGED-STRING BUFFER)
+	(STRING-OUT "... " STREAM))))
+
+;; Similar to SUMMARIZE-STRING but the input is an interval
+(DEFUN SUMMARIZE-INTERVAL (BP1 BP2 IN-ORDER-P MAX-LENGTH STREAM QUOTE)
+  (GET-INTERVAL BP1 BP2 IN-ORDER-P)
+  (LET ((BP1B (FORWARD-OVER *WHITESPACE-CHARS* BP1 BP2))
+	(LENGTH 5))
+    (IF (BP-= BP1 BP2)
+	(STRING-OUT "nothing" STREAM)
+	(LABELS ((SEGMENT (FROM TO)
+		   (CHARMAP (FROM TO)
+		     (LET ((CHAR (CHARMAP-CHAR)))
+		       (COND ((AND (EQL CHAR #\RETURN) (DIAGRAM (CHARMAP-LINE)))
+			      (SEND STREAM :DISPLAY-LOZENGED-STRING "diagram")
+			      (INCF LENGTH 3))
+			     ((MEMQ CHAR '(#\RETURN #\TAB #\BACKSPACE))
+			      (SEND STREAM :DISPLAY-LOZENGED-STRING (CL:CHAR-NAME CHAR))
+			      (INCF LENGTH 3))
+			     (T
+			      (SEND STREAM :TYO CHAR)
+			      (INCF LENGTH))))))
+		 (WHITESPACE (FROM TO)
+		   (SEND STREAM :DISPLAY-LOZENGED-STRING
+			 (CHARMAP (FROM TO "whitespace")
+			   (WHEN (AND (EQL (CHARMAP-CHAR) #\RETURN) (DIAGRAM (CHARMAP-LINE)))
+			     (CHARMAP-RETURN "diagram")))))
+		 (DIAGRAM (LINE)
+		   ;; WT puts SAGE::SAGE-STRUCTURE-REPRESENTATION on things that turn
+		   ;; back into diagrams when inserted
+		   (AND (ZEROP (LINE-LENGTH LINE))
+			(CL:GET-PROPERTIES (LINE-PLIST LINE)
+					   '(:DIAGRAM SAGE::SAGE-STRUCTURE-REPRESENTATION)))))
+	  (WHEN QUOTE (SEND STREAM :TYO #/"))
+	  (SETQ LENGTH 0)
+	  (IF (NOT (BPS-CHARS-FAR-APART BP1 BP2 MAX-LENGTH))
+	      (SEGMENT BP1 BP2)
+	      ;; String is too long, start by abbreviating any whitespace at the ends
+	      ;; Abbreviate five or more spaces, or more than one non-space	      
+	      (LET* ((BP1E (BACKWARD-OVER *WHITESPACE-CHARS* BP2 BP1))
+		     (BP2E BP1E)
+		     (BP2B BP1B)
+		     (END-WHITE NIL))
+		(IF (OR (BPS-CHARS-FAR-APART BP1 BP2B 4)
+			(AND (BPS-CHARS-FAR-APART BP1 BP2B 1)
+			     (CHARMAP (BP1 BP2B NIL)
+			       (UNLESS (CHAR-EQUAL (CHARMAP-CHAR) #\SPACE)
+				 (CHARMAP-RETURN T)))))
+		    (WHITESPACE BP1 BP2B)
+		    (SETQ BP2B BP1))
+		(IF (OR (BPS-CHARS-FAR-APART BP2E BP2 4)
+			(AND (BPS-CHARS-FAR-APART BP2E BP2 1)
+			     (CHARMAP (BP2E BP2 NIL)
+			       (UNLESS (CHAR-EQUAL (CHARMAP-CHAR) #\SPACE)
+				 (CHARMAP-RETURN T)))))
+		    (SETQ END-WHITE T)
+		    (SETQ BP2E BP2))
+		(IF (BPS-CHARS-FAR-APART BP2B BP2E MAX-LENGTH)
+		    ;; Have to break the string in half.  Try to break at word boundaries.
+		    ;; The ellipsis for the break takes 5 characters off MAX-LENGTH itself.
+		    (LET* ((MAX-LENGTH (- MAX-LENGTH 5))
+			   (BP3B (LET* ((LEFT (FORWARD-CHAR BP2B (FLOOR MAX-LENGTH 3)))    ;1/3
+					(MIDDLE (FORWARD-CHAR BP2B (FLOOR MAX-LENGTH 2)))  ;1/2
+					(RIGHT (FORWARD-CHAR BP2B (FLOOR MAX-LENGTH 1.3))) ;3/4
+					(BOUND (CREATE-INTERVAL LEFT RIGHT)))
+				   (OR (FORWARD-TO-WORD MIDDLE 2 NIL BOUND)
+				       (FORWARD-TO-WORD LEFT 2 NIL BOUND)
+				       MIDDLE)))
+			   (BP3E (LET* ((MAX-LENGTH (- MAX-LENGTH (COUNT-CHARS BP2B BP3B)))
+					(LEFT (FORWARD-CHAR BP2E (- MAX-LENGTH)))
+					(RIGHT (FORWARD-CHAR LEFT (CEILING MAX-LENGTH 2)))
+					(BOUND (CREATE-INTERVAL LEFT RIGHT)))
+				   (OR (FORWARD-TO-WORD LEFT 2 NIL BOUND) RIGHT))))
+		      (SEGMENT BP2B BP3B)
+		      (SUMMARIZE-ELIDED-TEXT (- (COUNT-LINES BP3B BP3E) 1) STREAM)
+		      (SEGMENT BP3E BP2E))
+		    (SEGMENT BP2B BP2E))
+		(WHEN END-WHITE
+		  (WHITESPACE BP2E BP2))))
+	  (WHEN QUOTE (SEND STREAM :TYO #/"))))
+    LENGTH))
+
+;;;; Reconstruction of old text
+
+;; Similar to SUMMARIZE-STRING but the input is an interval and we want its contents
+;; at an earlier time, right after making the specified change.
+;; This works by undoing all later changes that overlap this interval.  The undoing
+;; happens in a copy of this interval, so we don't have to worry about damaging
+;; the real text if we forget to redo the changes.  Doing it this way causes some
+;; consing, but it's a hell of a lot simpler and more reliable than the "more efficient"
+;; way that I tried, where we first compute the summary and then update it from the changes.
+(DEFUN SUMMARIZE-INTERVAL-BEFORE-CHANGES (START-BP END-BP IN-ORDER-P MAX-LENGTH
+					  CHANGE BUFFER STREAM QUOTE)
+  (GET-INTERVAL START-BP END-BP IN-ORDER-P)
+  ;; Undo the effects of any later changes that were made to this interval
+  (MULTIPLE-VALUE-BIND (START-BP END-BP)
+      (RECONSTRUCT-CHANGED-TEXT-1 CHANGE BUFFER START-BP END-BP)
+    ;; Display the summary
+    (SUMMARIZE-INTERVAL START-BP END-BP T MAX-LENGTH STREAM QUOTE)))
+
+(DEFUN RECONSTRUCT-CHANGED-TEXT-1 (CHANGE BUFFER START-BP END-BP)
+  (DECLARE (VALUES START-BP END-BP))
+  (LET ((COPIED-INTERVAL NIL)		;Notes whether the text has been copied yet
+	(COPIED-BPS NIL)		;Alist from original bp's to bp's in the copy
+	(*ENABLE-CHANGE-RECORDING* NIL)
+	(*LINE-AREA* WORKING-STORAGE-AREA)	;Text we are about to cons is ephemeral
+	(*BP-AREA* WORKING-STORAGE-AREA))
+    (LOOP FOR LATER-CHANGE IN (BUFFER-CHANGE-HISTORY BUFFER)
+	  UNTIL (EQ LATER-CHANGE CHANGE) DO
+      (MULTIPLE-VALUE (COPIED-INTERVAL COPIED-BPS)
+	(RECONSTRUCT-CHANGED-TEXT LATER-CHANGE BUFFER START-BP END-BP
+				  COPIED-INTERVAL COPIED-BPS)))
+    (VALUES (OR (CDR (ASSQ START-BP COPIED-BPS)) START-BP)
+	    (OR (CDR (ASSQ END-BP COPIED-BPS)) END-BP))))
+
+(DEFMETHOD (RECONSTRUCT-CHANGED-TEXT SIMPLE-CHANGE-RECORD) (BUFFER START-BP END-BP
+							    COPIED-INTERVAL COPIED-BPS)
+  (IGNORE BUFFER)
+  (RECONSTRUCT-FROM-OLD-TEXT OLD-TEXT FIRST-BP LAST-BP BP-POSITIONS
+			     START-BP END-BP COPIED-INTERVAL COPIED-BPS))
+
+(DEFMETHOD (RECONSTRUCT-CHANGED-TEXT INSERT-RECORD) (BUFFER START-BP END-BP
+						     COPIED-INTERVAL COPIED-BPS)
+  (IGNORE BUFFER)
+  (RECONSTRUCT-FROM-OLD-TEXT "" FIRST-BP LAST-BP NIL
+			     START-BP END-BP COPIED-INTERVAL COPIED-BPS))
+
+;; Doesn't affect the text
+(DEFMETHOD (RECONSTRUCT-CHANGED-TEXT MUNG-NODE-RECORD) (BUFFER START-BP END-BP
+							COPIED-INTERVAL COPIED-BPS)
+  (IGNORE BUFFER START-BP END-BP)
+  (VALUES COPIED-INTERVAL COPIED-BPS))
+
+(DEFMETHOD (RECONSTRUCT-CHANGED-TEXT EXCHANGE-RECORD) (BUFFER START-BP END-BP
+						       COPIED-INTERVAL COPIED-BPS)
+  ;; Start with a quick check for whether this text was affected by this change
+  (WHEN (OR (ASSQ START-BP BP-POSITIONS) (ASSQ END-BP BP-POSITIONS)
+	    (BP-IN-RANGE BP1 START-BP END-BP) (BP-IN-RANGE BP2 START-BP END-BP)
+	    (BP-IN-RANGE BP3 START-BP END-BP) (BP-IN-RANGE BP4 START-BP END-BP))
+    ;; Reconstruct the text of the whole changed range.  It doesn't work to reconstruct
+    ;; just the two pieces that were exchanged, because we wouldn't know how to relate
+    ;; BP-POSITIONS to the second piece.
+    (MULTIPLE-VALUE-BIND (RBP1 RBP4)
+	(RECONSTRUCT-CHANGED-TEXT-1 SELF BUFFER BP1 BP4)
+      ;; Use that to reconstruct our argument
+      (MULTIPLE-VALUE (COPIED-INTERVAL COPIED-BPS)
+	(RECONSTRUCT-FROM-OLD-TEXT (CREATE-INTERVAL RBP1 RBP4 NIL) BP1 BP4 BP-POSITIONS
+				   START-BP END-BP COPIED-INTERVAL COPIED-BPS))))
+  (VALUES COPIED-INTERVAL COPIED-BPS))
+
+;;; The first four arguments describe the state of the buffer before a change
+;;; The last four arguments describe the interval we are reconstructing
+(DEFUN RECONSTRUCT-FROM-OLD-TEXT (OLD-TEXT FIRST-BP LAST-BP BP-POSITIONS
+				  START-BP END-BP COPIED-INTERVAL COPIED-BPS)
+  (LET ((START-POSITION (ASSQ START-BP BP-POSITIONS))
+	(END-POSITION (ASSQ END-BP BP-POSITIONS)))
+    ;; Test whether OLD-TEXT overlaps (START-BP,END-BP).  The first line checks for
+    ;; one end of (START-BP,END-BP) being inside OLD-TEXT, while the second line
+    ;; checks for OLD-TEXT completely enclosed in (START-BP,END-BP).
+    (WHEN (OR START-POSITION END-POSITION
+	      (BP-IN-RANGE FIRST-BP START-BP END-BP) (BP-IN-RANGE LAST-BP START-BP END-BP))
+      ;; Make a copy before munging
+      (UNLESS COPIED-INTERVAL
+	(SETQ COPIED-INTERVAL (LET ((*ENABLE-STRUCTURAL-DIAGRAMS* NIL))	;don't blow out
+				(COPY-INTERVAL START-BP END-BP T)))
+	(LET ((COPIED-LINE (BP-LINE (INTERVAL-FIRST-BP COPIED-INTERVAL))))
+	  (LINEMAP (START-BP END-BP)
+	    (DOLIST (BP (LINE-BP-LIST LINE))
+	      (WHEN ( *FIRST-INDEX* (BP-INDEX BP) *LAST-INDEX*)
+		(PUSH (CONS BP (CREATE-BP COPIED-LINE (- (BP-INDEX BP) *FIRST-INDEX*)
+					  (BP-STATUS BP) COPIED-INTERVAL))
+		      COPIED-BPS)))
+	    (SETQ COPIED-LINE (LINE-NEXT COPIED-LINE)))))
+      ;; Restore the state of the text from before this change
+      (LET ((FIRST-BP (OR (CDR (ASSQ FIRST-BP COPIED-BPS))	;Subset that lies within
+			  (INTERVAL-FIRST-BP COPIED-INTERVAL)))	; the reconstructed interval
+	    (LAST-BP (OR (CDR (ASSQ LAST-BP COPIED-BPS))
+			 (INTERVAL-LAST-BP COPIED-INTERVAL)))
+	    (SKIP-LINES (OR (SECOND START-POSITION) 0))		;Where to begin in OLD-TEXT
+	    (SKIP-CHARS (OR (THIRD START-POSITION) 0))
+	    (STOP-LINES (SECOND END-POSITION))			;Where to end in OLD-TEXT
+	    (STOP-CHARS (THIRD END-POSITION)))
+	(WHEN (BP-< FIRST-BP LAST-BP)	;I don't know how, but they can get out of order
+	  (DELETE-INTERVAL FIRST-BP LAST-BP T))
+	(COND ((AND (NULL START-POSITION) (NULL END-POSITION))	;Use all of OLD-TEXT
+	       (INSERT-THING FIRST-BP OLD-TEXT))
+	      ((STRINGP OLD-TEXT)
+	       (FLET ((FIND-POSITION (STRING N-LINES N-CHARS &OPTIONAL (START 0))
+			(LOOP REPEAT N-LINES DO
+			  (SETQ START (1+ (OR (STRING-SEARCH-CHAR #\RETURN STRING START)
+					      (1- (STRING-LENGTH STRING))))))
+			(MIN (+ START N-CHARS) (STRING-LENGTH STRING))))
+		 (INSERT FIRST-BP
+			 (NSUBSTRING OLD-TEXT
+				     (FIND-POSITION OLD-TEXT SKIP-LINES SKIP-CHARS)
+				     (AND STOP-LINES
+					  (FIND-POSITION OLD-TEXT STOP-LINES STOP-CHARS))))))
+	      (T
+	       (INSERT-INTERVAL FIRST-BP
+				(FORWARD-CHAR (FORWARD-LINE (INTERVAL-FIRST-BP OLD-TEXT)
+							    SKIP-LINES T OLD-TEXT)
+					      SKIP-CHARS T OLD-TEXT)
+				(IF STOP-LINES
+				    (FORWARD-CHAR (FORWARD-LINE (INTERVAL-FIRST-BP OLD-TEXT)
+								STOP-LINES T OLD-TEXT)
+						  STOP-CHARS T OLD-TEXT)
+				    (INTERVAL-LAST-BP OLD-TEXT))
+				T)))
+	;; Adjust positions of BP's that should be inside what we just inserted
+	(LOOP WITH LINE-NUMBER = SKIP-LINES
+	      WITH LINE = (BP-LINE FIRST-BP)
+	      WITH OFFSET = (- SKIP-CHARS (BP-INDEX FIRST-BP))
+	      FOR (BP N-LINES N-CHARS) IN BP-POSITIONS DO
+	  (LOOP UNTIL (OR ( LINE-NUMBER N-LINES)
+			  (NULL LINE)
+			  (EQL LINE-NUMBER STOP-LINES)) DO
+	    (SETQ LINE (LINE-NEXT LINE)
+		  LINE-NUMBER (1+ LINE-NUMBER)
+		  OFFSET 0))
+	  (WHEN (AND (= LINE-NUMBER N-LINES)
+		     ( N-CHARS OFFSET)
+		     (NOT (NULL LINE)))
+	    (UNLESS (AND (EQL LINE-NUMBER STOP-LINES)
+			 (> N-CHARS STOP-CHARS))
+	      (WHEN (SETQ BP (CDR (ASSQ BP COPIED-BPS)))
+		(UNLESS (> (- N-CHARS OFFSET) (LINE-LENGTH LINE))	;Robustedness
+		  (MOVE-BP BP LINE (- N-CHARS OFFSET)))))))))
+    (VALUES COPIED-INTERVAL COPIED-BPS)))
+
+(DEFMETHOD (RECONSTRUCT-CHANGED-TEXT SPARSE-CHANGE-RECORD) (BUFFER START-BP END-BP
+							    COPIED-INTERVAL COPIED-BPS)
+  (IGNORE BUFFER)
+  ;; Test whether the changed region overlaps (START-BP,END-BP).  The first line checks for
+  ;; one end of (START-BP,END-BP) being inside the changed region, while the second line
+  ;; checks for the changed region being completely enclosed in (START-BP,END-BP).
+  ;; Can't use the START-POSITION / END-POSITION speedup, because sparse changes don't
+  ;; save all interior BP's in BP-POSITIONS, only the ones in the changed text regions.
+  (WHEN (OR (BP-IN-RANGE START-BP FIRST-BP LAST-BP) (BP-IN-RANGE END-BP FIRST-BP LAST-BP)
+	    (BP-IN-RANGE FIRST-BP START-BP END-BP) (BP-IN-RANGE LAST-BP START-BP END-BP))
+    ;; Yes, it overlaps.  Map over changes undoing each one in a copy of the text.
+    ;; First some subroutines to translate changes to original text into changes to a copy.
+    (LET ((BP-IN-ORIGINAL FIRST-BP)
+	  (BP-IN-COPY NIL)
+	  (SKIP-LINES 0)	;Offset from FIRST-BP to START-BP (start of COPIED-INTERVAL),
+	  (SKIP-CHARS 0)	;in terms from before the sparse-change.
+	  (FOUND NIL))		;Set to T when COPIED-INTERVAL is reached.
+      (LABELS ((COPY-BEFORE-MUNGING ()
+		 (UNLESS COPIED-INTERVAL
+		   (SETQ COPIED-INTERVAL
+			 (LET ((*ENABLE-STRUCTURAL-DIAGRAMS* NIL))	;don't blow out
+			   (COPY-INTERVAL START-BP END-BP T)))
+		   (LET ((COPIED-LINE (BP-LINE (INTERVAL-FIRST-BP COPIED-INTERVAL))))
+		     (LINEMAP (START-BP END-BP)
+		       (DOLIST (BP (LINE-BP-LIST LINE))
+			 (WHEN ( *FIRST-INDEX* (BP-INDEX BP) *LAST-INDEX*)
+			   (PUSH (CONS BP (CREATE-BP COPIED-LINE
+						     (- (BP-INDEX BP) *FIRST-INDEX*)
+						     (BP-STATUS BP) COPIED-INTERVAL))
+				 COPIED-BPS)))
+		       (SETQ COPIED-LINE (LINE-NEXT COPIED-LINE))))))
+	       (BP-IN-COPY (BP)
+		 (FORWARD-CHAR (INTERVAL-FIRST-BP COPIED-INTERVAL)
+			       (COUNT-CHARS START-BP BP T) T COPIED-INTERVAL))
+	       (FORWARD-CHAR-IN-COPY (BP N)
+		 (WHEN BP
+		   (MOVE-BP BP (FORWARD-CHAR BP N T COPIED-INTERVAL))))
+	       (DELETE-FROM-COPY (BP1 BP2)
+		 (WHEN (AND (BP-< START-BP BP2) (BP-< BP1 END-BP))
+		   (COPY-BEFORE-MUNGING)
+		   (SETQ BP-IN-COPY (DELETE-INTERVAL (IF (BP-< START-BP BP1) (BP-IN-COPY BP1)
+							 (COPY-BP (INTERVAL-FIRST-BP
+								    COPIED-INTERVAL)))
+						     (IF (BP-< BP2 END-BP) (BP-IN-COPY BP2)
+							 (INTERVAL-LAST-BP COPIED-INTERVAL))
+						     T))))
+	       (INSERT-IN-COPY (BP THING COUNT)
+		 (UNLESS FOUND
+		   (LOOP REPEAT COUNT WITH TEM DO
+		     (COND ((EQL THING #\RETURN) (INCF SKIP-LINES) (SETQ SKIP-CHARS 0))
+			   ((CHARACTERP THING) (INCF SKIP-CHARS))
+			   ((SETQ TEM (STRING-REVERSE-SEARCH-EXACT-CHAR #\RETURN THING))
+			    (INCF SKIP-LINES (CL:COUNT #\RETURN THING))
+			    (SETQ SKIP-CHARS (- (STRING-LENGTH THING) TEM)))
+			   (T (INCF SKIP-CHARS (STRING-LENGTH THING))))))
+		 (WHEN (BP-IN-RANGE BP START-BP END-BP)
+		   (COPY-BEFORE-MUNGING)
+		   (UNLESS BP-IN-COPY
+		     (SETQ BP-IN-COPY (BP-IN-COPY BP)))
+		   (IF (CHARACTERP THING)
+		       (SETQ BP-IN-COPY (INSERT-CHARS BP-IN-COPY THING COUNT))
+		       (LOOP REPEAT COUNT DO
+			 (INSERT-MOVING BP-IN-COPY THING))))))
+	;; Map over the changes, undoing them
+	(LOOP WITH OLD-LENGTH = NIL WITH NEW-LENGTH = NIL
+	      WITH CHANGES = CHANGES	;Copy the instance variable
+	      UNTIL (NULL CHANGES)
+	      AS X = (POP CHANGES) DO
+	  (LOOP REPEAT 4
+		AS OP = (LDB %%SPARSE-CHANGE-OP X)
+		AS COUNT = (1+ (LDB %%SPARSE-CHANGE-COUNT X)) DO
+	    (WHEN (OR (AND OLD-LENGTH ( OP %SPARSE-CHANGE-NEW-TEXT))
+		      (AND NEW-LENGTH ( OP %SPARSE-CHANGE-SKIP)))
+	      ;; End of one change, beginning of the next, delete the previous new-text
+	      (DELETE-FROM-COPY BP-IN-ORIGINAL
+				(SETQ BP-IN-ORIGINAL (FORWARD-CHAR BP-IN-ORIGINAL
+								   (OR NEW-LENGTH OLD-LENGTH)
+								   T
+								   *INTERVAL*)))
+	      (SETQ OLD-LENGTH NIL NEW-LENGTH NIL))
+	    (UNLESS (OR FOUND (BP-< BP-IN-ORIGINAL START-BP))
+	      (SETQ FOUND T))
+	    (COND (( OP %SPARSE-CHANGE-SKIP)
+		   (SETQ COUNT (1+ (LDB %%SPARSE-CHANGE-SKIP-COUNT X)))
+		   (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-SKIP-COUNT)))
+		     (SETQ COUNT (POP CHANGES)))
+		   (LET ((BP (FORWARD-CHAR BP-IN-ORIGINAL COUNT T *INTERVAL*)))
+		     (UNLESS FOUND
+		       (LINEMAP (BP-IN-ORIGINAL BP)
+			 (COND ((AND (EQ LINE (BP-LINE START-BP))
+				     ( *LAST-INDEX* (BP-INDEX START-BP)))
+				(INCF SKIP-CHARS (- (BP-INDEX START-BP) *FIRST-INDEX*))
+				(SETQ FOUND T)
+				(RETURN))
+			       (*THIS-IS-THE-LAST-LINE*
+				(INCF SKIP-CHARS (- *LAST-INDEX* *FIRST-INDEX*)))
+			       (T
+				(INCF SKIP-LINES)
+				(SETQ SKIP-CHARS 0)))))
+		     (SETQ BP-IN-ORIGINAL BP)
+		     (SETQ BP-IN-COPY (FORWARD-CHAR-IN-COPY BP-IN-COPY COUNT))))
+		  (( OP %SPARSE-CHANGE-NEW-TEXT)
+		   (SETQ COUNT (LDB %%SPARSE-CHANGE-NEW-COUNT X))
+		   (WHEN (= COUNT (1- (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-NEW-COUNT))))
+		     (SETQ COUNT (POP CHANGES)))
+		   (SETQ NEW-LENGTH (+ (OR NEW-LENGTH 0) COUNT)))
+		  ((= OP %SPARSE-CHANGE-OLD-TEXT)
+		   (WHEN CHANGES			;otherwise it is padding
+		     (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-COUNT)))
+		       (SETQ COUNT (POP CHANGES)))
+		     (SETQ OP (POP CHANGES))
+		     (INSERT-IN-COPY BP-IN-ORIGINAL OP COUNT)
+		     (SETQ OLD-LENGTH (+ (OR OLD-LENGTH 0) (* COUNT (STRING-LENGTH OP))))))
+		  (T
+		   (WHEN (= COUNT (EXPT 2 (BYTE-SIZE %%SPARSE-CHANGE-COUNT)))
+		     (SETQ COUNT (POP CHANGES)))
+		   (INSERT-IN-COPY BP-IN-ORIGINAL
+				   (SELECTOR OP =
+				     (%SPARSE-CHANGE-RETURN #\RETURN)
+				     (%SPARSE-CHANGE-TAB #\TAB)
+				     (%SPARSE-CHANGE-SPACE #\SPACE)
+				     (%SPARSE-CHANGE-STYLED-TAB
+				       (MAKE-CHARACTER #\TAB
+					 :STYLE (SI:CHAR-STYLE (BP-CHAR-BEFORE
+								 BP-IN-ORIGINAL))))
+				     (%SPARSE-CHANGE-STYLED-SPACE
+				       (MAKE-CHARACTER #\SPACE
+					 :STYLE (SI:CHAR-STYLE (BP-CHAR-BEFORE
+								 BP-IN-ORIGINAL)))))
+				   COUNT)
+		   (SETQ OLD-LENGTH (+ (OR OLD-LENGTH 0) COUNT))))
+	    (SETQ X (LSH X -8)))
+	      FINALLY
+		(WHEN (OR OLD-LENGTH NEW-LENGTH)
+		  ;; End of last change, delete the new-text
+		  (DELETE-FROM-COPY BP-IN-ORIGINAL
+				    (FORWARD-CHAR BP-IN-ORIGINAL (OR NEW-LENGTH OLD-LENGTH) T
+						  *INTERVAL*)
+				    ))
+		;; Relocate COPIED-BPS according to BP-POSITIONS
+		(LOOP FOR (BP . COPY) IN COPIED-BPS
+		      AS (FOUND N-LINES N-CHARS) = (ASSQ BP BP-POSITIONS) DO
+		  (WHEN FOUND
+		    (MOVE-BP COPY (FORWARD-CHAR
+				    (FORWARD-LINE (INTERVAL-FIRST-BP COPIED-INTERVAL)
+						  (- N-LINES SKIP-LINES)
+						  T COPIED-INTERVAL)
+				    (IF (= N-LINES SKIP-LINES)
+					(- N-CHARS SKIP-CHARS)
+					N-CHARS)
+				    T COPIED-INTERVAL))))))))
+  (VALUES COPIED-INTERVAL COPIED-BPS))

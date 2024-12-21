@@ -1,0 +1,2982 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: statice-storage; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; The record part of Statice Storage Level.
+;;; See q:>dlw>statice>areas.text for overall design decisions and comments.
+
+;;; Basic manipulation of single data pages and blocks therein.
+
+;;; What would be the largest size block that could be allocated on an
+;;; empty page, of the given size?
+(defsubst max-block-size (page-size &key clustered-p)
+  (- page-size (if clustered-p *cluster-page-header-size* *data-page-header-size*) 1))
+
+;;; Allocate a block on the data page.  If that's impossible, return
+;;; NIL.  Otherwise, also allocate a descriptor, set up its start and
+;;; size leaving other fields alone, and return the address of the
+;;; descriptor word, i.e. the desc-number.  The caller is responsible
+;;; for turning on desc-external and other fields.  It's OK for size to
+;;; be zero; set-record-size does this sometime to allocate just a desc.
+(defun allocate-block (page size page-size)
+  (let ((size+1 (+ 1 size)))
+    (when ( size+1 (data-page-n-free page))
+      (let ((first-free (data-page-first-free page))
+	    (first-desc-number (data-page-first-desc-number page)))
+	(when (< (- first-desc-number first-free) size+1)
+	  (compress-page page page-size)
+	  (fix-open-record-addressors page)
+	  (setq first-free (data-page-first-free page))
+	  (setq first-desc-number (data-page-first-desc-number page))
+	  (when (< (- first-desc-number first-free) size+1)
+	    (error "compress didn't work")))
+	(let* ((first-desc-number (data-page-first-desc-number page))
+	       (new-desc-number
+		 (loop for dn from first-desc-number below page-size do
+		   (when (zerop (aref page dn))
+		     (return dn)))))
+	  (unless new-desc-number
+	    (setq new-desc-number (1- first-desc-number))
+	    (setf (data-page-first-desc-number page) new-desc-number)
+	    (decf (data-page-n-free page)))
+ 	  (setf (aref page new-desc-number)
+		(make-desc :start first-free :size size))
+	  (decf (data-page-n-free page) size)
+	  (setf (data-page-first-free page) (+ first-free size))
+	  ;; The following is intended to aid debugging and could be removed.
+	  (loop for i from first-free repeat size do
+	    (setf (aref page i) #o0707070707))
+	  new-desc-number)))))
+
+;;; Internal function to compact the blocks into the lowest possible
+;;; locations, to coalese the free space in the data page.  The caller
+;;; MUST call fix-open-record-addressors, after getting the page back
+;;; into shape.
+(defun compress-page (page page-size)
+  (let* ((n-free (data-page-n-free page))
+	 (first-desc-number (data-page-first-desc-number page))
+	 (clustered-p (= (data-page-type-code page) *cluster-page-code*))
+	 (page-header-size
+	   (if clustered-p *cluster-page-header-size* *data-page-header-size*)))
+    (using-resource (buffer utility-vector page-size)
+      (loop with first-free = page-header-size
+	    for dn from first-desc-number below page-size do
+	(let ((desc (aref page dn)))
+	  (when (and (not (zerop desc))
+		     (zerop (desc-indirect desc)))
+	    (let ((start (desc-start desc))
+		  (size (desc-size desc)))
+	      (copy-array-portion page start (+ start size)
+				  buffer first-free (+ first-free size))
+	      (setf (desc-start desc) first-free)
+	      (incf first-free size)))
+	  (setf (aref buffer dn) desc))
+	finally
+	  ;; The following is intended to aid debugging and could be removed.
+	  (loop for i from first-free below first-desc-number do
+	    (setf (aref buffer i) #o0707070707))
+	  (unless (= n-free (- first-desc-number first-free))
+	    (error "The number of free words on this page is inconsistent"))
+	  (dotimes (i page-header-size)
+	    (setf (aref buffer i) 0))
+	  (setf (data-page-type-code buffer) (data-page-type-code page))
+	  (setf (data-page-page-number buffer) (data-page-page-number page))
+	  (setf (data-page-segment-id buffer) (data-page-segment-id page))
+	  (setf (data-page-n-free buffer) n-free)
+	  (setf (data-page-first-free buffer) first-free)
+	  (setf (data-page-first-desc-number buffer) first-desc-number)
+	  (when clustered-p
+	    (setf (cluster-page-cluster-bset buffer) (cluster-page-cluster-bset page)))
+	  (copy-array-contents buffer page)))))
+
+(defparameter *placeholder-desc* (make-desc :start 1))
+
+;;; Try to speed up expt calls since they all use fixnums
+(defun fixnum-expt (base-number power-number)
+  (cond ((zerop power-number) 1)
+	((= power-number 1) base-number)
+	(t (loop with result = base-number
+		 repeat (1- power-number)
+		 do (setq result (* result base-number))
+		 finally (return result)))))
+
+;;; Free a block in the data page.  The caller guarantees that
+;;; there's an existing, non-indirect desc at this desc-number.
+;;; If keep-the-desc is given, the desc should not be freed.
+(defun free-block (page desc-number page-size &optional keep-the-desc)
+  (let* ((desc (aref page desc-number))
+	 (block-start (desc-start desc))
+	 (block-size (desc-size desc)))
+    ;; Is this block adjacent to the gap?
+    (when (= (data-page-first-free page) (+ block-start block-size))
+      (setf (data-page-first-free page) block-start))
+    ;; Is this desc adjacent to the gap?
+    (when (and (not keep-the-desc)
+	       (= desc-number (data-page-first-desc-number page)))
+      (let ((new-fdn (loop for dn from (1+ desc-number) below page-size do
+		       (unless (zerop (aref page dn))
+			 (return dn))
+			   finally (return page-size))))
+	(setf (data-page-first-desc-number page) new-fdn)
+	(incf (data-page-n-free page) (- new-fdn desc-number))))
+    (incf (data-page-n-free page) block-size)
+    (setf (aref page desc-number)
+	  (if keep-the-desc *placeholder-desc* 0))))
+
+;;; Free a descriptor word in a data page.  The caller guarantees that
+;;; there is an existing desc at this desc number.  This is used for
+;;; deleting indirect descriptor words.
+(defun free-desc (page desc-number page-size)
+  ;; Is this desc adjacent to the gap?
+  (when (= desc-number (data-page-first-desc-number page))
+    (let ((new-fdn (loop for dn from (1+ desc-number) below page-size do
+		     (unless (zerop (aref page dn))
+		       (return dn))
+			 finally (return page-size))))
+      (setf (data-page-first-desc-number page) new-fdn)
+      (incf (data-page-n-free page) (- new-fdn desc-number))))
+  (setf (aref page desc-number) 0))
+
+;;; Set the size of the block to the new size given.  The caller
+;;; guarantees that there's an existing, non-indirect desc at this
+;;; desc-number.  Return T if successful, NIL if there's no room.
+;;; This modifies the desc, both size and sometimes start, so if
+;;; you are holding onto those things in variables, drop them!
+(defun set-block-size (page desc-number new-size page-size)
+  (let* ((desc (aref page desc-number))
+	 (block-start (desc-start desc))
+	 (block-size (desc-size desc))
+	 (delta (- new-size block-size))
+	 (first-free (data-page-first-free page))
+	 (first-desc-number (data-page-first-desc-number page))
+	 (gap-size (- first-desc-number first-free)))
+    (when (> delta (data-page-n-free page))
+      (return-from set-block-size nil))
+    (cond ((plusp delta)
+	   ;; Grow the block.
+	   (cond ((and (= first-free (+ block-start block-size))
+		       ( delta gap-size))
+		  ;; The block is adjacent to the gap and the gap has room,
+		  ;; so we can grow the block in place.
+		  (incf (data-page-first-free page) delta))
+		 (( new-size gap-size)
+		  ;; The new block can be built in the gap, avoiding the
+		  ;; need for an intermediate copy operation.
+		  (setf (desc-start desc) first-free)
+		  (copy-array-portion page block-start (+ block-start block-size)
+				      page first-free (+ first-free block-size))
+		  (incf (data-page-first-free page) new-size))
+		 (t
+		  ;; Last resort: copy and compress.
+		  (using-resource (buffer utility-vector block-size)
+		    (copy-array-portion page block-start (+ block-start block-size)
+					buffer 0 block-size)
+		    (free-block page desc-number page-size t)
+		    (compress-page page page-size)
+		    (setq first-free (data-page-first-free page))
+		    (setf (desc-start desc) first-free)
+		    (setf (desc-size desc) new-size)
+		    (setf (aref page desc-number) desc)
+		    (fix-open-record-addressors page)
+		    (setf (data-page-first-free page) (+ first-free new-size))
+		    (decf (data-page-n-free page) block-size)
+		    (copy-array-portion buffer 0 block-size
+					page first-free (+ first-free block-size))))))
+	  (t
+	   ;; Shrink the block.
+	   (when (= first-free (+ block-start block-size))
+	     ;; The block is adjacent to the gap, so we can enlarge the gap.
+	     (incf (data-page-first-free page) delta))))
+    (setf (desc-size desc) new-size)
+    (setf (aref page desc-number) desc)
+    (decf (data-page-n-free page) delta))
+  t)
+
+;;; Region headers.
+
+;;; Initialize a fresh page as the zeroth region header.
+(defun initialize-region-header-zero (page page-size segment-id)
+  (dotimes (i page-size) (setf (aref page i) 0))
+  (setf (rh-header-type-code page) *region-header-page-code*)
+  (setf (rh-header-page-number page) 0)
+  (setf (rh-header-segment-id page) segment-id)
+  (setf (rh-header-version page) 1)
+  (setf (rh-header-page-size page) page-size)
+  (setf (rh-header-root-rid page) 0)
+  (setf (rh-header-area-map page) 0)
+  (setf (rh-header-n-regions page) 1)
+  (setf (rh-header-mbz-0 page) 0)
+  (setf (rh-header-mbz-1 page) 0)
+  (setf (rh-header-mbz-2 page) 0)
+  (setf (rh-header-mbz-3 page) 0)
+  (loop with max = (1+ (- page-size *data-page-header-size*))
+	for factor in '((.0 .05) (.10 .15) (.20 .30) (.50 1.0)
+			(1.0 1.0) (1.0 1.0) (1.0 1.0) (1.0 1.0))
+	for i below 8 do
+    (setf (aref page (+ *rh-header-map-offset* i))
+	  (sys:%logdpb (floor (* max (second factor)))
+		       (byte 16 16)
+		       (floor (* max (first factor))))))
+  (setf (aref page *rh-header-size*)
+	(make-rh-page :type-code *region-header-page-code*))		      
+  t)
+
+;;; Does this page appear to be a valid RH0 for a database?
+(defun file-appears-to-be-valid (page page-size)
+  (and (= (rh-header-type-code page) *region-header-page-code*)
+       (= (rh-header-page-number page) 0)
+       (= (rh-header-version page) 1)
+       (= (rh-header-page-size page) page-size)))
+
+;;; Initialize a fresh page as the region header other than
+;;; the zeroth.
+(defun initialize-region-header-non-zero (page page-number page-size rh0)
+  (dotimes (i page-size) (setf (aref page i) 0))
+  (setf (rh-header-type-code page) *region-header-page-code*)
+  (setf (rh-header-page-number page) page-number)
+  (setf (rh-header-segment-id page) (rh-header-segment-id rh0))
+  (setf (rh-header-page-size page) page-size)
+  (setf (aref page *rh-header-size*)
+	(make-rh-page :type-code *region-header-page-code*))		      
+  t)
+
+;;; Internal function.  Given a record size, return the depth of the
+;;; tree of blocks that we'll need to represent the record.
+(defun compute-depth-from-size (size max-block-size)
+  (loop for max = max-block-size then (* max max-block-size)
+	for depth from 0 to 3 do
+    (when ( size max)
+      (return depth))
+    finally (error "The record size ~S exceeds the limit of ~S"
+		   size (fixnum-expt max-block-size 4))))
+
+(defconstant *cluster-bset-initial-size* 5)
+
+;;; Calls function once for each page in rid's cluster (if it is
+;;; clustered), with one arg (page number).
+(defun map-over-pages-in-cluster (opening rid function)
+  (declare (sys:downward-funarg function))
+  (let ((page (dbfs:read-page opening (rid-page-number rid))))
+    (when (= (data-page-type-code page) *cluster-page-code*)
+      (map-over-bset opening (cluster-page-cluster-bset page) function))))
+
+;;; Return t if rid is on a clustered page.
+(defun clustered-p (opening rid)
+  (= (data-page-type-code (dbfs:read-page opening (rid-page-number rid))) *cluster-page-code*))
+
+;;; Make a new record in this file, of the given size.  If :area is
+;;; provided, use that area; otherwise use area 1.
+
+;;; near is nil or a clustered-rid.  If there isn't enough room on any
+;;; of those pages, then we allocate a new one, and add it to the "near"
+;;; b-set-index.  If near is not a rid of a clustered page, then just
+;;; allocate the new record anywhere.  A value of t for near means to
+;;; create a new cluster.
+(defun make-record (opening size &key near (area 1))
+  (let* ((rh0 (read-rh0 opening))
+	 (page-size (rh-header-page-size rh0))
+	 (mbs (max-block-size page-size :clustered-p near)))
+    (if near
+	(if (not (= area 1))
+	    (error "Both :NEAR and :AREA specified")
+	    (if (eq near t)
+		(setq near (make-bset-index opening
+					    :expected-size *cluster-bset-initial-size*))
+		(let* ((pn (rid-page-number near))
+		       (near-page (dbfs:read-page opening (rid-page-number near))))
+		  (cond ((= (data-page-type-code near-page) *cluster-page-code*)
+			 (check-page near-page pn *cluster-page-code* opening rh0)
+			 (setq near (cluster-page-cluster-bset near-page)))
+			(t
+			 (check-page near-page pn *data-page-code* opening rh0)
+			 (setq near nil))))))
+	(check-area-number area))
+    (allocate-words size (compute-depth-from-size size mbs) t area 
+		    mbs rh0 opening page-size near)))
+
+(defvar *record-allocation-retries* 0)
+
+(defparameter *record-allocation-retries-allowed* 10)
+
+;;; Allocate n words.  Return an RID to a direct desc, external if this
+;;; is the top-level call.  Note that we need a page with size+1 words
+;;; because we need one extra for the descriptor word.
+(defun allocate-words (n depth top area max-block-size rh0 opening page-size near)
+  (labels ((alloc (n depth top)
+	     (let* ((chunk (fixnum-expt max-block-size depth))
+		    (size (ceiling n chunk))
+		    (page-number (if near
+				     (find-cluster-page rh0 (1+ size) near opening page-size)
+				     (find-data-page rh0 (1+ size) area opening page-size)))
+		    (page (dbfs:write-page opening page-number))
+		    (desc-number (loop named found-desc-number
+				       repeat *record-allocation-retries-allowed* do
+				   (let ((value (allocate-block page size page-size)))
+				     (when value (return-from found-desc-number value))
+				     (update-rh page-number page area rh0 opening page-size)
+				     (incf *record-allocation-retries*)
+				     (setf page-number
+					   (if near
+					       (find-cluster-page rh0 (1+ size) near opening
+								  page-size)
+					     (find-data-page rh0 (1+ size) area opening
+							     page-size)))
+				     (setf page (dbfs:write-page opening page-number)))
+				   finally
+				     (signal-error-with-information
+				       rh0 size area opening page-number page)))
+		    (desc-offset (- page-size desc-number)))
+	       ;; recache since allocate-block can cause bset to mutate.
+	       (when near
+		 (setq near (cluster-page-cluster-bset page)))
+	       (check-page
+		 page page-number (if near *cluster-page-code* *data-page-code*) opening rh0)
+	       (update-rh page-number page area rh0 opening page-size)
+	       (when (plusp depth)
+		 (setf (desc-depth (aref page desc-number)) depth)
+		 (loop with depth-1 = (1- depth)
+		       for index from 0
+		       for words-left from n by chunk above 0 do
+		   (let ((rid (alloc (min chunk words-left) depth-1 nil)))
+		     (setf (aref page (+ index (desc-start (aref page desc-number))))
+			   rid))))
+	       (when top
+		 (setf (desc-external (aref page desc-number)) 1))
+	       (make-rid :page-number page-number :desc-offset desc-offset))))
+    (alloc n depth top)))
+
+;;; Temporary kludge to help locate a certain bug that happens in the
+;;; above function.  It manifests itself by having the rh data be out of
+;;; synch with the data-page-n-free info in the header of the data page.
+;;; As a result, find-data-page returns a page which it thinks has
+;;; enough space on it, but when allocate-block goes to do it's job, it
+;;; can't because the n-free words says there isn't enough there.
+(defun signal-error-with-information (rh0 size area opening page-number page)
+  (multiple-value-bind (offset remainder) (floor page-number 2)
+    (let* ((rh-word (aref rh0 (+ offset *rh-header-size*)))
+	   (byte-spec (if (zerop remainder) (byte 16 0) (byte 16 16)))
+	   (rh-page (sys:%logldb byte-spec rh-word))
+	   (n-free (data-page-n-free page))
+	   (first-free (data-page-first-free page))
+	   (first-free-desc (data-page-first-desc-number page)))
+      (error (format nil
+		     "Wierd bug has occurred!~@
+                      Please call Symbolics to investigate this.~@
+                      Trying to allocate ~A words (actually (1+ ~A)) in area ~A~@
+                      of database ~A~@
+                      rh-page=~A (type-code=~A, range-code=~A, area=~A)~@
+                      n-free=~A, first-free=~A, first-free-desc=~A~@
+                      Contents of RH0:~@
+                        ~A~@
+                      Contents of data-page:~@
+                        ~A"
+		     size size area opening
+		     rh-page (rh-page-type-code rh-page) (rh-page-range-code rh-page)
+		     (rh-page-area rh-page) n-free first-free first-free-desc
+		     (zl:listarray rh0) (zl:listarray page))))))
+
+;;; Map over all records in area, calling function with the rid of each
+;;; record.  Too bad we can't use the area-map.  It only tells us about
+;;; free space in an area, not space which has already been used in an
+;;; area.  That is, pages of an area might exist in a region, but if
+;;; they are filled up, the range code is 0, and so there will be no
+;;; am-word in the area map.
+
+;;; Might want to modify the area map so that it can contain the 0
+;;; range codes.
+(defun map-over-area (opening area function)
+  (declare (sys:downward-funarg function))
+  (let* ((rh0 (read-rh0 opening))
+	 (page-size (rh-header-page-size rh0))
+	 (ppr (pages-per-region page-size)))
+    (macrolet ((desc-mask (&rest fields &environment env)
+		 (eval `(let ((mask 0))
+			  ,@(loop for field in fields
+				  collect `(setf (,field mask) -1))
+			  mask)
+		       env)))
+      (labels ((map-over-page (pn rh-page-desc)
+		 ;; map over all records on a page
+		 (let ((page (dbfs:read-page opening pn)))
+		   (declare (sys:array-register page))
+		   (check-page page pn (rh-page-type-code rh-page-desc) opening rh0)
+		   (loop for i from (data-page-first-desc-number page) below page-size do
+		     (let ((desc (aref page i)))
+		       (when (logtest desc (desc-mask desc-indirect desc-external))
+			 (funcall function (make-rid :page-number pn
+						     :desc-offset (- page-size i))))))))
+	       (map-over-region (region)
+		 ;; map over all pages in a region
+		 (let* ((rh-page (* ppr region))
+			(page (if (zerop region)
+				  rh0
+				  (let ((page (dbfs:read-page opening rh-page)))
+				    (check-page page rh-page
+						*region-header-page-code* opening rh0)
+				    page))))
+		   (declare (sys:array-register page))
+		   (loop for i from *rh-header-size* below page-size do
+		     (let* ((rh-word (aref page i))
+			    (left-half (sys:%logldb (byte 16 0) rh-word))
+			    (right-half (sys:%logldb (byte 16 16) rh-word)))
+		       (when (and (= (rh-page-area left-half) area)
+				  (sys:bit-member (rh-page-type-code left-half)
+						  (logior (lsh 1 *data-page-code*)
+							  (lsh 1 *cluster-page-code*))))
+			 (map-over-page (+ (* (- i *rh-header-size*) 2) rh-page)
+					left-half))
+		       (when (and (= (rh-page-area right-half) area)
+				  (sys:bit-member (rh-page-type-code right-half)
+						  (logior (lsh 1 *data-page-code*)
+							  (lsh 1 *cluster-page-code*))))
+			 (map-over-page (+ (* (- i *rh-header-size*) 2) rh-page 1)
+					right-half)))))))
+	(check-area-number area)
+	(dotimes (region (rh-header-n-regions rh0))
+	  (map-over-region region))))))
+
+;;; Return a boolean array consed on the data stack with each element
+;;; being t if the corresponding area has any records in it, and nil if
+;;; it has none.  Array element 0 (area 0) is always t.  The caller is
+;;; responsible for doing a sys:with-data-stack before calling this.
+;;; Second value returned is that highest "used" area.
+(defun find-unused-areas (opening)
+  (declare (values stack-array max-area))
+  (let* ((rh0 (read-rh0 opening))
+	 (page-size (rh-header-page-size rh0))
+	 (area-map (rh-header-area-map rh0))
+	 (area-array (sys:make-stack-array (1+ *max-area-number*) :element-type 'boolean))
+	 (max-area 0))
+    ;; (declare (sys:array-register area-array))  ; can't handle this case yet?
+    (cond ((zerop area-map)
+	   ;; no area-map yet.  Look at words in rh0
+	   (let ((rh0 rh0))
+	     (declare (sys:array-register rh0))
+	     (loop for i from *rh-header-size* below page-size do
+	       (let* ((rh-word (aref rh0 i))
+		      (left-area (rh-page-area (sys:%logldb (byte 16 0) rh-word)))
+		      (right-area (rh-page-area (sys:%logldb (byte 16 16) rh-word))))
+		 (setq max-area (max max-area left-area right-area))
+		 (setf (aref area-array left-area) t)
+		 (setf (aref area-array right-area) t)))))
+	  (t
+	   ;; area map exists.  use it.
+	   (map-over-set area-map
+			 opening
+			 page-size
+			 #'(lambda (amw)
+			     (let ((area (am-word-area amw)))
+			       (setq max-area (max max-area area))
+			       (setf (aref area-array area) t))))))
+    (values area-array max-area)))
+
+(defun delete-record (opening rid)
+  (let* ((rh0 (write-rh0 opening))
+	 (page-number (rid-page-number rid))
+	 (rid-page (dbfs:write-page opening page-number))
+	 (cluster-bid (when (= (data-page-type-code rid-page) *cluster-page-code*)
+			(cluster-page-cluster-bset rid-page)))
+	 (page-size (rh-header-page-size rh0))
+	 (desc-number (- page-size (rid-desc-offset rid))))
+    (check-page rid-page
+		page-number
+		(if cluster-bid *cluster-page-code* *data-page-code*)
+		opening
+		rh0)
+    (when (= rid (rh-header-root-rid rh0))
+      (error "Attempt to delete the root RID, namely ~S" rid))
+    (unless (and ( (data-page-first-desc-number rid-page) desc-number)
+		 (< desc-number page-size))
+      (error "~S is not a valid RID value; the desc-number is out of bounds" rid))
+    (let ((desc (aref rid-page desc-number)))
+      (cond ((zerop (desc-indirect desc))
+	     (delete-tree (desc-depth desc) page-number rid-page desc-number t
+			  opening rh0 page-size cluster-bid))
+	    (t
+	     (let* ((irid (desc-rid desc))
+		    (irid-page-number (rid-page-number irid))
+		    (irid-page (dbfs:write-page opening irid-page-number))
+		    (idesc-number (- page-size (rid-desc-offset irid)))
+		    (idesc (aref irid-page idesc-number))
+		    (area (area-of-page irid-page-number rh0 opening page-size)))
+	       (check-page irid-page
+			   irid-page-number
+			   (if cluster-bid *cluster-page-code* *data-page-code*)
+			   opening
+			   rh0)
+	       (delete-tree (desc-depth idesc) irid-page-number irid-page idesc-number nil
+			    opening rh0 page-size cluster-bid)
+	       (free-desc rid-page desc-number page-size)
+	       (update-rh irid-page-number irid-page area rh0 opening page-size)))))))
+
+;;; Internal function to delete a tree of blocks.  The depth of the tree
+;;; is depth.  The top block is on the given page, pointed to by the
+;;; given desc, which is not indirect.  page is locked for writing.  If
+;;; top-p is true, this block is the top of a whole record, and so the
+;;; desc should be external.
+(defun delete-tree (depth page-number page desc-number top-p opening rh0 page-size clustered-p)
+  (let ((area (area-of-page page-number rh0 opening page-size)))
+    (labels ((deltree (depth page-number page desc-number top-p)
+	       (let ((descr (aref page desc-number)))
+		 (unless (zerop (desc-indirect descr))
+		   (error "There should not be an indirect desc here: ~S" descr))
+		 (if top-p
+		     (when (zerop (desc-external descr))
+		       (error "The desc ~S should be external" descr))
+		     (unless (zerop (desc-external descr))
+		       (error "The desc ~S should be internal" descr)))
+		 (when (plusp depth)
+		   (loop with depth-1 = (- depth 1)
+			 for i from (desc-start descr)
+			 repeat (desc-size descr) do
+		     (let ((rid (aref page i)))
+		       (let* ((dpage-number (rid-page-number rid))
+			      (dpage (dbfs:write-page opening dpage-number)))
+			 (check-page dpage
+				     dpage-number
+				     (if clustered-p *cluster-page-code* *data-page-code*)
+				     opening
+				     rh0)
+			 (deltree depth-1
+				  (rid-page-number rid)
+				  dpage
+				  (- page-size (rid-desc-offset rid))
+				  nil)))))
+		 (free-block page desc-number page-size)
+		 (update-rh page-number page area rh0 opening page-size))))
+      (deltree depth page-number page desc-number top-p))))
+
+;;; Find a data page in the given area in which a block of size words
+;;; can be allocated.  If there is no such page, add a new data page to
+;;; the file, in the given area.  Must really search for size+1 words to
+;;; make sure there's room for the descriptor word.  Return the page
+;;; number.
+(defun find-data-page (rh0 size area opening page-size)
+  (unless (plusp area) (error "The area, ~S, was not a positive number" area))
+  (let ((range-code (get-range-code size rh0))
+	(area-map (rh-header-area-map rh0)))
+    (or
+      ;; Try to find an existing page with enough room on it.
+      (cond ((zerop area-map)
+	     ;; There is only one region in the file.  Look for a page
+	     ;; in the region that has room.
+	     (find-page-in-region rh0 0 range-code area page-size))
+	    (t
+	     (block find-page
+	       (map-over-range
+		 (make-am-word :area area)
+		 (if (< area *max-area-number*)
+		     (make-am-word :area (1+ area))
+		     nil)
+		 area-map opening page-size
+		 #'(lambda (amw)
+		     (when ( range-code (am-word-range-code amw))
+		       (let* ((region (am-word-region amw))
+			      (rh-page-number (* region (pages-per-region page-size)))
+			      (rh (cond ((zerop region)
+					 rh0)
+					(t
+					 (let ((page (dbfs:read-page opening rh-page-number)))
+					   (check-page page rh-page-number
+						       *region-header-page-code* opening rh0)
+					   page))))
+			      (page (find-page-in-region rh rh-page-number
+							 range-code area page-size)))
+			 (when page
+			   (return-from find-page page))))))
+	       nil)))
+      ;; No existing page has enough room.  Allocate a new one.
+      (multiple-value-bind (page-number page)
+	  (allocate-page rh0 *data-page-code* opening area)
+	(setf (data-page-n-free page) (- page-size *data-page-header-size*))
+	(setf (data-page-first-free page) *data-page-header-size*)
+	(setf (data-page-first-desc-number page) page-size)
+	page-number))))
+
+;;; Find a data page in the given area in which a block of size words
+;;; can be allocated.  If there is no such page, add a new data page to
+;;; the file, and the cluster.  Must really search for size+1 words to
+;;; make sure there's room for the descriptor word.  Return the page
+;;; number.
+(defun find-cluster-page (rh0 size near opening page-size)
+  (let* ((range-code (get-range-code size rh0))
+	 (ppr (pages-per-region page-size)))
+    ;; Try to find an existing page in the cluster b-set with enough
+    ;; room on it.
+    (or (block found-page
+	  (map-over-bset
+	    opening near
+	    #'(lambda (pn)
+		(multiple-value-bind (region rel-page-number) (floor pn ppr)
+		  ;; ++ clean this up so that we don't re-read the rh each time
+		  (let* ((rh-page-number (* region ppr))
+			 (rh (cond ((zerop region) rh0)
+				   (t
+				    (let ((page (dbfs:read-page opening rh-page-number)))
+				      (check-page page rh-page-number
+						  *region-header-page-code* opening rh0)
+				      page))))
+			 (rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+			 (rh-byte-spec
+			   (if (evenp rel-page-number) (byte 16 0) (byte 16 16)))
+			 (rh-page-desc
+			   (sys:%logldb rh-byte-spec (aref rh rh-word-number))))
+		    ;; ++ do we only want to head for a page if we D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")know
+0		    ;; that there is enough room?  Or would we like to
+		    ;; give a page a try if there 1might0 be enough room.
+		    (when (< range-code (rh-page-range-code rh-page-desc))
+		      (return-from found-page pn)))))))
+	;; No existing page has enough room.  Allocate a new one.
+	(multiple-value-bind (page-number page)
+	    (allocate-page rh0 *cluster-page-code* opening 1)
+	  (setf (cluster-page-n-free page) (- page-size *cluster-page-header-size*))
+	  (setf (cluster-page-first-free page) *cluster-page-header-size*)
+	  (setf (cluster-page-first-desc-number page) page-size)
+	  (setf (cluster-page-cluster-bset page) near)
+	  (sys:with-stack-list* (*allocated-pages-queue*
+				  page-number *allocated-pages-queue*)
+	    (let ((new-cluster-bid (insert-bset-key opening near page-number))
+		  (open-record-addressors *open-record-addressors*))
+	      ;; if the cluster-bid mutated or split, then we need to make
+	      ;; note of this in all of the cluster-page headers of this
+	      ;; cluster.
+	      (unless (= new-cluster-bid near)
+		(map-over-bset
+		  opening new-cluster-bid
+		  #'(lambda (pn)
+		      (dolist (addressor open-record-addressors)
+			(when (eql (record-addressor-cluster-bid addressor) near)
+			  (setf (record-addressor-cluster-bid addressor) new-cluster-bid)))
+		      (setf (cluster-page-cluster-bset (dbfs:write-page opening pn))
+			    new-cluster-bid))))))
+	  page-number))))
+
+;;; Look for an existing data page within this region that's in the
+;;; specified area, and whose amount of free space is greater than
+;;; range-code.  Return the page number, or nil if none found.
+(defun find-page-in-region (rh-page rh-page-number range-code area page-size)
+  (let ((rh-page rh-page))
+    (declare (sys:array-register rh-page))
+    (loop for i from *rh-header-size* below page-size do
+      (let ((word (aref rh-page i)))
+	(let ((rhp (sys:%logldb (byte 16 0) word)))
+	  (when (and (= (rh-page-type-code rhp) *data-page-code*)
+		     (= (rh-page-area rhp) area)
+		     (> (rh-page-range-code rhp) range-code))
+	    (return (+ (* 2 (- i *rh-header-size*)) rh-page-number))))
+	(let ((rhp (sys:%logldb (byte 16 16) word)))
+	  (when (and (= (rh-page-type-code rhp) *data-page-code*)
+		     (= (rh-page-area rhp) area)
+		     (> (rh-page-range-code rhp) range-code))
+	    (return (+ (* 2 (- i *rh-header-size*)) rh-page-number 1))))))))
+      
+(defvar *tawp* nil)				;Trace flag, for debugging only.
+
+;;; Locate a page in the database which is free.  Do not update the
+;;; region header, or the area map.  allocate-page-in-region will update
+;;; the area map to indicate that the region from which the page is
+;;; taken has no more free pages (if the page was the last free), but
+;;; that is not a problem since the most damage that can do is
+;;; deallocate pages (through delete-key).  Put the page number of the
+;;; page allocated on the *allocated-pages-queue* so that we may later
+;;; update the rh and the area map (if any).
+
+;;; This could be made simpler by just adding a new page on the end of
+;;; the file, but it seems like a short extension to look through the
+;;; area map for a region with a free page using area 0.
+
+;;; Return the page and page-number of the new page.
+(defun find-any-free-page-in-database (opening)
+  (declare (values page page-number))
+  (let* ((rh0 (read-rh0 opening))
+	 (page-size (rh-header-page-size rh0))
+	 (area-map (rh-header-area-map rh0))
+	 page-number)
+    (cond ((zerop area-map)
+	   ;; no area map yet.  Look through rh0 to find a free page
+	   (when *tawp*
+	     (format t "~&*allocation*: No area map."))
+	   (setq page-number
+		 (or (allocate-page-in-region rh0 0 rh0 opening)
+		     ;; no free page in region 0.  Allocate a new rh and region.
+		     ;; This code should really make sure that the call to
+		     ;; allocate-page-in-region returns a page.  But that is
+		     ;; very unlikely to happen.
+		     (let* ((region-n (rh-header-n-regions rh0))
+			    (ppr (pages-per-region page-size))
+			    (rh-page-number (* ppr region-n))
+			    (rh (dbfs:create-page opening rh-page-number :if-exists :create)))
+		       ;; Initialize the new region header.
+		       (unless (member rh-page-number *allocated-pages-queue*)
+			 (initialize-region-header-non-zero rh rh-page-number page-size rh0)
+			 (push rh-page-number *allocated-pages-queue*))
+		       (allocate-page-in-region rh rh-page-number rh0 opening))))
+	   (when *tawp*
+	     (format t "~&*allocation*: Allocated page ~A" page-number)))
+	  (t
+	   ;; an area map exists.  Take a walk through area 0 to see what regions
+	   ;; have free pages.
+	   (when *tawp*
+	     (format t "~&*allocation*: Area map exists"))
+	   (or (block nil
+		 (map-over-range
+		   (make-am-word :area 0)
+		   (make-am-word :area 1)
+		   area-map
+		   opening
+		   page-size
+		   #'(lambda (amw)
+		       (let* ((region-n (am-word-region amw))
+			      (ppr (pages-per-region page-size))
+			      (rh-page-number (* region-n ppr))
+			      (rh (cond ((zerop region-n)
+					 rh0)
+					(t
+					 (let ((page (dbfs:read-page opening rh-page-number)))
+					   (check-page page rh-page-number
+						       *region-header-page-code* opening rh0)
+					   page)))))
+			 (when *tawp*
+			   (format t "~&*allocation*: Trying in region ~A" region-n))
+			 (when (setq page-number
+				     (allocate-page-in-region rh rh-page-number rh0 opening))
+			   (when *tawp*
+			     (format t "~&Found page ~A in region ~A" page-number region-n))
+			   (return-from nil t))))))
+	       ;; No free page found in any region listed as having free pages
+	       ;; in the area-map (this could happen if all the free ones were
+	       ;; already on the *allocated-pages-queue* list).  We have to
+	       ;; fire up a new region and get our page from it.
+	       (let* ((region-n (rh-header-n-regions rh0))
+		      (ppr (pages-per-region page-size))
+		      (rh-page-number (* ppr region-n))
+		      (rh (dbfs:create-page opening rh-page-number :if-exists :create)))
+		 ;; Initialize the new region header.
+		 (when *tawp*
+		   (format t "~&*allocation*: Creating a new region ~A" region-n))
+		 (unless (member rh-page-number *allocated-pages-queue*)
+		   (format t "~&Not on allocated list, so initializing it")
+		   (initialize-region-header-non-zero rh rh-page-number page-size rh0)
+		   (push rh-page-number *allocated-pages-queue*))
+		 (setq page-number
+		       (allocate-page-in-region rh rh-page-number rh0 opening))
+		 (when *tawp*
+		   (format t "~&*allocation*: Found page ~A in region ~A"
+			   page-number region-n))))))
+    (push page-number *allocated-pages-queue*)
+    (values (dbfs:create-page opening page-number :if-exists :create)
+	    page-number)))
+
+(defun cleanup-page-queue (opening)
+  (loop while (or *allocated-pages-queue* *deallocated-pages-queue*) do
+    (let* ((rh0 (read-rh0 opening))
+	   (page-size (rh-header-page-size rh0))
+	   (ppr (pages-per-region page-size)))
+      (loop for page-number in *allocated-pages-queue* do
+	(multiple-value-bind (region-n rel-page-number)
+	    (floor page-number ppr)
+	  (cond ((zerop rel-page-number)
+		 ;; this is a region header that we allocated.  Update the
+		 ;; area map to include this region as having free pages.
+		 (when *tawp*
+		   (format t "~&  Clean: Page ~A is a rh.  Updating area-map" page-number))
+		 (insert-key (rh-header-area-map rh0)
+			     opening
+			     (make-am-word :area 0 :range-code 1 :region region-n)
+			     page-size))
+		;; Just a regular page.  Update it's region header.
+		(t
+		 (let* ((rh-page-number (* region-n ppr))
+			(rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+			(rh (cond ((zerop region-n)
+				   (write-rh0 opening))
+				  (t
+				   (let ((page (dbfs:write-page opening rh-page-number)))
+				     (check-page page rh-page-number
+						 *region-header-page-code* opening rh0)
+				     page))))
+			(rh-byte-spec (if (evenp rel-page-number) (byte 16 0) (byte 16 16))))
+		   (when (zerop (sys:%logldb rh-byte-spec (aref rh rh-word-number)))
+		     (let* ((page (dbfs:read-page opening page-number))
+			    (page-type-code (data-page-type-code page)))
+		       (cond ((= page-type-code *cluster-page-code*)
+			      (when *tawp*
+				(format t "~&  Clean: Page ~A is a cluster page.  Updating rh"
+					page-number))
+			      (setf (aref rh rh-word-number)
+				    (sys:%logdpb (make-rh-page :type-code *cluster-page-code*
+							       :range-code 1
+							       :area 1)
+						 rh-byte-spec
+						 (aref rh rh-word-number))))
+			     (t
+			      (when *tawp*
+				(format t "~&  Clean: Page ~A is a b-set page.  Updating rh"
+					page-number))
+			      (setf (aref rh rh-word-number)
+				    (sys:%logdpb (make-rh-page :type-code *b-set-page-code*
+							       :range-code 1
+							       :area 0)
+						 rh-byte-spec
+						 (aref rh rh-word-number)))))))))))
+	(setq *allocated-pages-queue* (delete page-number *allocated-pages-queue*)))
+      (loop for page-number in *deallocated-pages-queue* do
+	(deallocate-whole-page opening page-number)
+	(setq *deallocated-pages-queue* (delete page-number *deallocated-pages-queue*))))))
+
+
+(defun queue-page-deallocation (opening page-number)
+  (declare (ignore opening))
+  (push page-number *deallocated-pages-queue*))
+
+(defmacro with-delayed-storage-management ((opening) &body body)
+  `(let* ((*allocation-function* #'find-any-free-page-in-database)
+	  (*deallocation-function* #'queue-page-deallocation)
+	  (*allocated-pages-queue* *allocated-pages-queue*)
+	  (*deallocated-pages-queue* *deallocated-pages-queue*))
+     (multiple-value-prog1
+       (progn . ,body)
+       (cleanup-page-queue ,opening))))
+
+
+;;; Allocate an entire non-data page.  Give it the appropriate type
+;;; code, and return the page and the page number.  This can be called
+;;; from external points, such as B-tree page allocation.
+(defun allocate-whole-page (opening type-code)
+  (declare (values page page-number))
+  (let ((rh0 (read-rh0 opening)))
+    (multiple-value-bind (page-number page rh rh-page-number)
+	(allocate-page rh0 type-code opening)
+      (declare (ignore rh))
+      (let* ((page-size (rh-header-page-size rh0))
+	     (rh (dbfs:write-page opening rh-page-number))
+	     (ppr (pages-per-region page-size))
+	     (rel-page-number (rem page-number ppr))
+	     (rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+	     (rh-byte-spec (if (evenp rel-page-number) (byte 16 0) (byte 16 16))))
+	(setf (aref rh rh-word-number)
+	      (sys:%logdpb (make-rh-page :type-code type-code :range-code 1 :area 0)
+			   rh-byte-spec
+			   (aref rh rh-word-number))))
+      (values page page-number))))
+
+;;; Find a free page and allocate it, with the given type-code.  It sets
+;;; up the common header fields and leaves the rest of the page
+;;; uninitialized and write-locked.  Return the page number, the page,
+;;; the region header page for the page, and the rh page number.  The
+;;; caller is responsible for updating the region header, and the area
+;;; map if the new page is a data page.
+(defun allocate-page (rh0 type-code opening &optional (area 0))
+  (declare (values page-number page rh rh-page-number))
+  (when (and (= type-code *data-page-code*) (zerop area))
+    (error "Attempt to allocate a data page in area zero"))
+  (let* ((area-map (rh-header-area-map rh0))
+	 (page-size (rh-header-page-size rh0))
+	 (ppr (pages-per-region page-size)))
+    (multiple-value-bind (page-number rh rh-page-number)
+	(block found-a-page
+	  (when (zerop area-map)
+	    ;; There's only one region.  Look for a page in that region.
+	    (let ((p (allocate-page-in-region rh0 0 rh0 opening)))
+	      (when p
+		(when *tawp*
+		  (format t "~%Found page ~S in region zero." p))
+		(return-from found-a-page (values p rh0 0))))
+	    ;; No room in the region.  Make an area map and drop through.
+	    (when *tawp* (format t "~%Making a new area map."))
+	    (setq area-map (make-area-map opening)))
+	  ;; Search through the regions.
+	  ;; If it's a data page, first try the regions that already have some
+	  ;; pages in this area.  Otherwise try out all the regions.
+	  (using-resource (regions utility-vector-with-fill-pointer 30)
+	    ;; Find all regions that have some free pages.
+	    (map-over-range
+	      (make-am-word :area 0)
+	      (make-am-word :area 1)
+	      area-map opening page-size
+	      #'(lambda (amw)
+		  (vector-push-extend (am-word-region amw) regions)))
+	    (when *tawp*
+	      (format t "~%Made regions array, length ~S" (length regions)))
+	    (when (= type-code *data-page-code*)
+	      ;; Try all regions that have some pages in this area.
+	      (map-over-range
+		(make-am-word :area area)
+		(if (< area *max-area-number*)
+		    (make-am-word :area (1+ area))
+		    nil)
+		area-map opening page-size
+		#'(lambda (amw)
+		    (let* ((region (am-word-region amw))
+			   (pos (position region regions)))
+		      (when pos
+			;; This region has some pages of this area in it.
+			(setf (aref regions pos) nil)	;Mark that we've thought about it.
+			(let* ((rh-page-number (* region ppr))
+			       (rh (cond ((zerop region)
+					 rh0)
+					(t
+					 (let ((page (dbfs:read-page opening rh-page-number)))
+					   (check-page page rh-page-number
+						       *region-header-page-code* opening rh0)
+					   page))))
+			       (page-num (allocate-page-in-region
+					   rh rh-page-number rh0 opening)))
+			  (when page-num
+			    (when *tawp*
+			      (format t "~%Found page on region with area, page# ~S"
+				      page-num))
+			    (return-from found-a-page
+			      (values page-num rh rh-page-number)))))))))
+	    ;; Try all regions that we haven't already tried.
+	    (loop for region being the array-elements of regions do
+	      (when region
+		(let* ((rh-page-number (* region ppr))
+		       (rh (cond ((zerop region)
+				  rh0)
+				 (t
+				  (let ((page (dbfs:read-page opening rh-page-number)))
+				    (check-page page rh-page-number
+						*region-header-page-code* opening rh0)
+				    page))))
+		       (page-num (allocate-page-in-region rh rh-page-number rh0 opening)))
+		  (when page-num
+		    (when *tawp*
+		      (format t "~%Found page on region without area, page# ~S"
+			      page-num))
+		    (return-from found-a-page (values page-num rh rh-page-number)))))))
+	  ;; No region found.  Make a new region and allocate a page in it.
+	  (when *tawp* (format t "~%No region found."))
+	  (write-rh0 opening)
+	  (let* ((region-n (rh-header-n-regions rh0))
+		 (rh-page-number (* ppr region-n))
+		 (rh (dbfs:create-page opening rh-page-number :if-exists :create)))
+	    ;; Initialize the new region header.
+	    (initialize-region-header-non-zero rh rh-page-number page-size rh0)
+	    ;; Note in the area map that the new region has some free pages.
+	    (let ((new-area-map
+		    (with-delayed-storage-management (opening)
+		      (setf *allocated-pages-queue* (cons rh-page-number
+							 *allocated-pages-queue*))
+		      (insert-key area-map
+				  opening
+				  (make-am-word :area 0 :range-code 1 :region region-n)
+				  page-size))))
+	      (setf (rh-header-area-map rh0) new-area-map))
+	    (when *tawp* (format t "~%Setting n-regions to ~S." (1+ region-n)))
+	    (setf (rh-header-n-regions rh0) (1+ region-n))
+	    (when *tawp* (format t " New region, #~S, page# ~S" region-n rh-page-number))
+	    (values
+	      (allocate-page-in-region rh rh-page-number rh0 opening) rh rh-page-number)))
+      ;; New page found.  Set it up.
+      (let ((page (dbfs:create-page opening page-number :if-exists :create)))
+	(setf (data-page-type-code page) type-code)
+	(setf (data-page-page-number page) page-number)
+	(setf (data-page-segment-id page) (rh-header-segment-id rh0))
+	(values page-number page rh rh-page-number)))))
+
+;;; Allocate a free page within this region.  Return the page number, or
+;;; nil if no free page is found.  The caller is responsible for
+;;; invoking DBFS to get the page, and must arrange for it to be created
+;;; if it is not extant.  The caller is responsible for updating the
+;;; rh-page in the region header for this page, and for updating the
+;;; area-map to be consistent with the change the region header.
+;;; allocate-page-in-region updates the area map, if necessary, to show
+;;; that there's no longer a free page here.
+(defun allocate-page-in-region (rh-page rh-page-number rh0 opening)
+  (declare (values page-number))
+  (let ((rh-page rh-page)
+	(page-size (rh-header-page-size rh0))
+	(page-number nil))
+    (declare (sys:array-register rh-page))
+    (loop for i from *rh-header-size* below page-size
+	  for pn from rh-page-number by 2 do
+      (let ((word (aref rh-page i)))
+	(let ((rhp (sys:%logldb (byte 16 0) word)))
+	  (when (and (zerop rhp) (not (member pn *allocated-pages-queue*)))
+	    (cond ((null page-number)
+		   (setq page-number pn))
+		  (t (return nil)))))
+	(let ((rhp (sys:%logldb (byte 16 16) word))
+	      (pn (1+ pn)))
+	  (when (and (zerop rhp) (not (member pn *allocated-pages-queue*)))
+	    (cond ((null page-number)
+		   (setq page-number pn))
+		  (t (return nil))))))
+      finally
+	(when page-number
+	  ;; We have found the last free page in this region.  If there is an
+	  ;; area map, remove the entry that says that there are free pages here.
+	  (let ((area-map (rh-header-area-map rh0)))
+	    (when (plusp area-map)
+	      (let ((new-area-map
+		      (delete-key area-map
+				  opening
+				  (make-am-word :area 0
+						:range-code 1
+						:region (/ rh-page-number
+							   (pages-per-region page-size)))
+				  page-size)))
+		(unless (= area-map new-area-map)
+		  (write-rh0 opening)
+		  (setf (rh-header-area-map rh0) new-area-map)))))))
+    page-number))
+
+;;; The database has no area map.  Make one.
+(defun make-area-map (opening)
+  (let* ((rh0 (write-rh0 opening))
+	 (page-size (rh-header-page-size rh0))
+	 (ppr (pages-per-region page-size))
+	 (rh1 (dbfs:create-page opening ppr :if-exists :create))
+	 (area-map (1+ ppr))
+	 (area-map-page (dbfs:create-page opening area-map :if-exists :create)))
+    (initialize-region-header-non-zero rh1 ppr page-size rh0)
+    (setf (aref rh1 *rh-header-size*)
+	  (sys:%logdpb (make-rh-page :type-code *b-set-page-code*)
+		       (byte 16 16)
+		       (aref rh1 *rh-header-size*)))
+    (let ((*allocation-function*
+	    #'(lambda (opening)
+		(declare (sys:downward-function))
+		opening
+		(values area-map-page area-map))))
+      (make-node-x opening *leaf* (rh-header-segment-id rh0)))
+    ;; Make entries to describe the current state of region 0.
+    (let ((*allocation-function* #'find-any-free-page-in-database)
+	  (*allocated-pages-queue* nil))
+      (loop for (area max-range-code) in (make-list-of-maxes rh0 page-size) do
+	(setq area-map
+	      (insert-key area-map
+			  opening
+			  (make-am-word :area area
+					:range-code max-range-code
+					:region 0)
+			  page-size)))
+      ;; Make an entry to say that there are some free pages in region 1.
+      (setq area-map
+	    (insert-key area-map
+			opening
+			(make-am-word :area 0
+				      :range-code 1
+				      :region 1)
+			page-size))
+      (cleanup-page-queue opening))
+    (setf (rh-header-n-regions rh0) 2)
+    (setf (rh-header-area-map rh0) area-map)))
+
+;;; Scan the region header, and return a list, each of whose elements is
+;;; (<area> <max-range-code>).  There's one element for each area that's
+;;; mentioned in the region header.  There's also an element for area=0,
+;;; if there are any free pages in the region, and the "max-range-code"
+;;; for area 0 would always be 1.
+(defun make-list-of-maxes (rh page-size)
+  (let ((maxes nil)
+	(free-pages-exist nil))
+    (loop for i from 0 below (- page-size *rh-header-size*) do
+      (let ((word (aref rh (+ i *rh-header-size*))))
+	(flet ((note-rh-page (rh-page)
+		 (cond ((zerop rh-page)
+			(setq free-pages-exist t))
+		       ((= (rh-page-type-code rh-page) *data-page-code*)
+			(let* ((area (rh-page-area rh-page))
+			       (range-code (rh-page-range-code rh-page))
+			       (elt (assoc area maxes)))
+			  (cond ((null elt)
+				 (unless (zerop range-code)
+				   (push (list area range-code) maxes)))
+				((> range-code (second elt))
+				 (setf (second elt) range-code))))))))
+	  (note-rh-page (sys:%logldb (byte 16 0) word))
+	  (note-rh-page (sys:%logldb (byte 16 16) word)))))
+    (if free-pages-exist
+	(cons '(0 1) maxes)
+	maxes)))
+
+;;; Deallocate this page.
+(defun deallocate-whole-page (opening page-number)
+  (let* ((rh0 (read-rh0 opening))
+	 (page (dbfs:write-page opening page-number))
+	 (page-size (rh-header-page-size rh0))
+	 (ppr (pages-per-region page-size))
+	 (region-number (floor page-number ppr))
+	 (rh-page-number (* region-number ppr))
+	 (rh (cond ((zerop region-number)
+		    (write-rh0 opening))
+		   (t
+		    (let ((page (dbfs:write-page opening rh-page-number)))
+		      (check-page page rh-page-number *region-header-page-code* opening rh0)
+		      page))))
+	 (rel-page-number (- page-number rh-page-number))
+	 (rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+	 (rh-byte-spec (if (evenp rel-page-number) (byte 16 0) (byte 16 16))))
+    (check-page page page-number nil opening rh0)
+    ;; Mark the page as free.
+    (setf (data-page-type-code page) 0)
+    ;; If there is an area map, and this is the first free page in this
+    ;; region, then the area map needs to be updated.
+    (let ((area-map (rh-header-area-map rh0)))
+      (when (plusp area-map)
+	(loop for i from *rh-header-size* below page-size do
+	  (let ((word (aref rh i)))
+	    (when (zerop (sys:%logldb (byte 16 0) word))
+	      (return nil))
+	    (when (zerop (sys:%logldb (byte 16 16) word))
+	      (return nil)))
+	  finally
+	    ;; There are no free pages yet.  This will be the first one.
+	    (let* ((*allocation-function* #'find-any-free-page-in-database)
+		   (*allocated-pages-queue* *allocated-pages-queue*)
+		   ;;If we see our callers *deallocated-pages-queue*, we'll
+		   ;;recurse until stack space runs out.
+		   (*deallocated-pages-queue* nil)
+		   (new-area-map
+		     (insert-key area-map
+				 opening
+				 (make-am-word :area 0 :range-code 1
+					       :region region-number)
+				 page-size)))
+	      (unless (eql area-map new-area-map)
+		(write-rh0 opening)
+		(setf (rh-header-area-map rh0) new-area-map))
+	      (cleanup-page-queue opening)))))
+    ;; Mark the page as free in the region header.
+    (setf (aref rh rh-word-number)
+	  (sys:%logdpb 0 rh-byte-spec (aref rh rh-word-number))))
+  t)
+
+;;; page-number,page is a data page, write-locked.  Update the
+;;; rh-page-desc describing that page, because words have been allocated
+;;; or deallocated.  Also update the area map, if any, accordingly.  If
+;;; this page is a data page that has become empty, convert it into an
+;;; empty page.
+(defun update-rh (page-number page area rh0 opening page-size)
+  (let* ((ppr (pages-per-region page-size))
+	 (region-number (floor page-number ppr))
+	 (rh-page-number (* region-number ppr))
+	 (rh (cond ((zerop region-number)
+		    rh0)
+		   (t
+		    (let ((page (dbfs:read-page opening rh-page-number)))
+		      (check-page page rh-page-number *region-header-page-code* opening rh0)
+		      page))))
+	 (rel-page-number (- page-number rh-page-number))
+	 (rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+	 (rh-byte-spec (if (evenp rel-page-number) (byte 16 0) (byte 16 16)))
+	 (rh-page-desc (sys:%logldb rh-byte-spec (aref rh rh-word-number)))
+	 (old-range-code (rh-page-range-code rh-page-desc))
+	 (type-code (data-page-type-code page))
+	 (cluster-bid (and (= type-code *cluster-page-code*)
+			   (cluster-page-cluster-bset page)))
+	 (new-n-free (data-page-n-free page))
+	 (free-page (= (+ new-n-free (if cluster-bid
+					 *cluster-page-header-size*
+					 *data-page-header-size*))
+		       page-size))
+	 (just-allocated (zerop rh-page-desc))
+	 (new-range-code (get-range-code new-n-free rh0)))
+    (when (or just-allocated
+	      free-page
+	      ( old-range-code new-range-code))
+      ;; The range code value has changed, or this page was just allocated.
+      ;; Write the new value into the region header.
+      (dbfs:write-page opening rh-page-number)
+      (cond (free-page
+	     ;; The page is now empty.  Set its rh-page to zero.
+	     (setf (aref rh rh-word-number) 
+		   (sys:%logdpb 0 rh-byte-spec (aref rh rh-word-number)))
+	     ;; Mark the page as free.
+	     (setf (data-page-type-code page) 0)
+	     (when cluster-bid
+	       (let ((new-cluster-bid (delete-bset-key opening cluster-bid page-number))
+		     (open-record-addressors *open-record-addressors*))
+		 ;; if the cluster-bid mutated or split, then we need to make
+		 ;; note of this in all of the cluster-page headers of this
+		 ;; cluster.
+		 (unless (= new-cluster-bid cluster-bid)
+		   (map-over-bset
+		     opening new-cluster-bid
+		     #'(lambda (pn)
+			 (dolist (addressor open-record-addressors)
+			   (when (eql (record-addressor-cluster-bid addressor) cluster-bid)
+			     (setf (record-addressor-cluster-bid addressor) new-cluster-bid)))
+			 (setf (cluster-page-cluster-bset (dbfs:write-page opening pn))
+			       new-cluster-bid))))
+		 (when (zerop (count-bset-values opening new-cluster-bid))
+		   (delete-bset-index opening new-cluster-bid)))))
+	    (just-allocated
+	     ;; The page was just allocated.  Make and store a new rh-page.
+	     (setf (aref rh rh-word-number)
+		   (sys:%logdpb (make-rh-page :type-code type-code
+					      :range-code new-range-code
+					      :area area)
+				rh-byte-spec
+				(aref rh rh-word-number))))
+	    (t
+	     ;; The page has a different range code.  Store it in the rh-page.
+	     (setf (rh-page-range-code rh-page-desc) new-range-code)
+	     (setf (aref rh rh-word-number) 
+		   (sys:%logdpb rh-page-desc rh-byte-spec (aref rh rh-word-number))))))
+    ;; Update the area map, if any.
+    (let ((area-map (rh-header-area-map rh0)))
+      (when (plusp area-map)
+	;; There is an area map.  See whether the entry in the area map that
+	;; describes this <area, region>, if any, needs to be updated.  Also
+	;; see if we have just freed a page on a region that has no free pages.
+	(let ((threshold (max new-range-code old-range-code))
+	      (rh rh))
+	  (declare (sys:array-register rh))
+	  ;; Look through the region header, now that we have written
+	  ;; the new rh-page, and see what the new maximum is.  Note
+	  ;; that if we encounter a range code greater than threshold,
+	  ;; we can be sure that the maximum range code for this
+	  ;; <area, region> has not changed; this saves some
+	  ;; computrons.  If free-page, we also need to find out
+	  ;; whether we have introduced the first free page to this
+	  ;; region, in which case the area map needs to be told.
+	  (loop with new-max-code = 0
+		with n-free = 0
+		for i from *rh-header-size* below page-size do
+	    (let ((word (aref rh i)))
+	      (macrolet
+		((test-byte (pos)
+		   `(let ((rhp (sys:%logldb (byte 16 ,pos) word)))
+		      (cond ((and (= (rh-page-type-code rhp) *data-page-code*)
+				  (= (rh-page-area rhp) area))
+			     (let ((code (rh-page-range-code rhp)))
+			       (when (and (> code threshold)
+					  (not just-allocated))
+				 ;; The maximum code could not possibly have
+				 ;; changed as a result of this operation.
+				 (when (or (null free-page)
+					   (> n-free 1))
+				   ;; It's OK to stop, we don't have
+				   ;; to look for more free pages.
+				   (return nil)))
+			       (setq new-max-code (max code new-max-code))))
+			    ((zerop rhp)
+			     (incf n-free))))))
+		(test-byte 0)
+		(test-byte 16)))
+		finally
+		  ;; Look in the area map to see what the previous max code was.
+		  (let* ((old-amw
+			   (block found
+			     (map-over-range (make-am-word :area area)
+					     (if (< area *max-area-number*)
+						 (make-am-word :area (1+ area))
+						 nil)
+					     area-map
+					     opening
+					     page-size
+					     #'(lambda (amw)
+						 (when (= (am-word-region amw)
+							  region-number)
+						   (return-from found amw))))))
+			 (range-code-changed
+			   (and old-amw ( (am-word-range-code old-amw) new-max-code))))
+		    (when range-code-changed
+		      ;; There is an existing am-word, and it's not
+		      ;; right any more.  Delete it.
+		      (with-delayed-storage-management (opening)
+			(let ((new-area-map
+				(delete-key area-map opening old-amw page-size)))
+			  (unless (eql area-map new-area-map)
+			    (write-rh0 opening)
+			    (setf (rh-header-area-map rh0) new-area-map))))
+		      (setq area-map (rh-header-area-map rh0)))
+		    (when (and (or (null old-amw) range-code-changed)
+			       (plusp new-max-code))
+		      ;; Insert the new am-word.
+		      (with-delayed-storage-management (opening)
+			(let ((new-area-map
+				(insert-key area-map
+					    opening
+					    (make-am-word :area area
+							  :range-code new-max-code
+							  :region region-number)
+					    page-size)))
+			  (unless (eql area-map new-area-map)
+			    (write-rh0 opening)
+			    (setf (rh-header-area-map rh0) new-area-map))))
+		      (setq area-map (rh-header-area-map rh0)))
+		    ;; If we just made the first free page in this region,
+		    ;; update the area map to say so.
+		    (when (and free-page (= n-free 1))
+		      (with-delayed-storage-management (opening)
+			(let ((new-area-map
+				(insert-key area-map
+					    opening
+					    (make-am-word :area 0
+							  :range-code 1
+							  :region region-number)
+					    page-size)))
+			  (unless (eql area-map new-area-map)
+			    (write-rh0 opening)
+			    (setf (rh-header-area-map rh0) new-area-map))))
+		      ;;Be careful if you add anything here.  The AREA-MAP local
+		      ;;variable may be out of date at this point.
+		      ))))))))
+
+;;; Given a page number of a data page, return the area the page is in.
+(defun area-of-page (page-number rh0 opening page-size)
+  (let* ((ppr (pages-per-region page-size))
+	 (region-number (floor page-number ppr))
+	 (rh-page-number (* region-number ppr))
+	 (rh (cond ((zerop region-number)
+		    rh0)
+		   (t
+		    (let ((page (dbfs:read-page opening rh-page-number)))
+		      (check-page page rh-page-number *region-header-page-code* opening rh0)
+		      page))))
+	 (rel-page-number (- page-number rh-page-number))
+	 (rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+	 (rh-byte-spec (if (evenp rel-page-number) (byte 16 0) (byte 16 16))))
+    (rh-page-area (sys:%logldb rh-byte-spec (aref rh rh-word-number)))))
+
+;;; Encode size as a range code value.
+(defun get-range-code (size rh0)
+  (let ((rh0 rh0))
+    (declare (sys:array-register rh0))
+    (dotimes (i 8)
+      (let ((x (aref rh0 (+ i *rh-header-map-offset*))))
+	(when (< size (sys:%logldb (byte 16 0) x))
+	  (return (1- (* 2 i))))
+	(when (< size (sys:%logldb (byte 16 16) x))
+	  (return (* 2 i)))))))
+
+;;; Record addressors.
+
+(defun allocate-record-addressor ()
+  (or (without-interrupts
+	(let* ((pool *record-addressor-pool*)
+	       (fillp (fill-pointer pool)))
+	  (when (plusp fillp)
+	    (setf (fill-pointer pool) (1- fillp))
+	    (aref pool (1- fillp)))))
+      (make-instance 'record-addressor)))
+
+(defun deallocate-record-addressor (addressor)
+  (without-interrupts
+    (let* ((pool *record-addressor-pool*)
+	   (fillp (fill-pointer pool))
+	   (len *record-addressor-pool-length*))
+      (cond ((< fillp len)
+	     (setf (aref pool fillp) addressor)
+	     (setf (fill-pointer pool) (1+ fillp)))
+	    (t
+	     (vector-push-extend addressor pool)
+	     (setq *record-addressor-pool-length* (zl:array-length pool)))))))
+
+
+(defmacro with-record ((variable opening rid mode) &body body)
+  `(let ((,variable (allocate-record-addressor)))
+     (with-stack-list* (*open-record-addressors* ,variable *open-record-addressors*)
+       (unwind-protect
+	   (progn
+	     (open-record ,variable ,opening ,rid ,mode)
+	     . ,body)
+	 (when ,variable
+	   (deallocate-record-addressor ,variable))))))
+
+(defmethod (open-record record-addressor) (new-opening rid new-mode)
+  (setq opening new-opening)
+  (setq mode new-mode)
+  (setq page-size (dbfs:file-page-size opening))
+  (setq page-number (rid-page-number rid))
+  (setq desc-number (- page-size (rid-desc-offset rid)))
+  (setq rid-page
+	(ecase mode
+	    (:write (dbfs:write-page opening page-number))
+	    (:read (dbfs:read-page opening page-number))))
+  (setq cluster-bid (when (= (data-page-type-code rid-page) *cluster-page-code*)
+		      (cluster-page-cluster-bset rid-page)))
+  (setq max-block-size (max-block-size page-size :clustered-p cluster-bid))
+  (check-page rid-page
+	      page-number
+	      (if cluster-bid *cluster-page-code* *data-page-code*)
+	      opening)
+  (setq desc (aref rid-page desc-number))
+  (let ((direct-p (zerop (desc-indirect desc))))
+    (when (and (not direct-p) (eq mode :write))
+      (dbfs:write-page opening (rid-page-number (desc-rid desc))))
+    (when (and direct-p (zerop (desc-external desc)))
+      (error 'bad-rid :rid rid)))) 
+
+;;; The blocks on this page have been moved around.  Fix up the instance
+;;; variables of all open record addressors.
+(defun fix-open-record-addressors (page)
+  (dolist (record-addressor *open-record-addressors*)
+    (fix-record-addressor record-addressor page)))
+
+(defmethod (fix-record-addressor record-addressor) (page)
+  (when (eq rid-page page)
+    ;; Our page is the one that's been shuffled.
+    (setq desc (aref rid-page desc-number))))  
+
+(defmethod (upgrade-record-mode record-addressor) (new-mode)
+  (unless (eq new-mode :write)
+    (error "Attempt to upgrade to ~S, but you can only upgrade to :WRITE." new-mode))
+  (dbfs:write-page opening page-number)
+  (setq mode :write))
+
+(defun-in-flavor (access-record-word record-addressor) (index new-value &key buffer-p)
+  (when (minusp index) 
+    (error "The index ~S is negative" index))
+  (let ((page-function (if new-value #'dbfs:write-page #'dbfs:read-page)))
+    (labels (;; page and desc-number designate a desc to use.
+	     (read-word (depth offset page desc-offset)
+	       (let ((descr (aref page (- page-size desc-offset)))
+		     (chunk (fixnum-expt max-block-size depth)))
+		 (multiple-value-bind (chunkn chunko)
+		     (floor offset chunk)
+		   (unless (zerop (desc-indirect descr))
+		     (error "There should not be an indirect desc here: ~S" descr))
+		   (unless (or (< chunkn (desc-size descr)) buffer-p)
+		     (error "The index ~S is out of the boundaries of record ~S" index self))
+		   (cond ((zerop depth)
+			  (let ((start (desc-start descr)))
+			    (cond (buffer-p
+				   (let ((size (desc-size descr)))
+				     (incf next-word (- size chunkn))
+				     (values page
+					     (+ start chunkn)
+					     (+ start size))))
+				  (t
+				   (if new-value
+				       (setf (aref page (+ (desc-start descr) chunkn))
+					     new-value)
+				       (aref page (+ (desc-start descr) chunkn)))))))
+			 (t
+			  ;; The word is an RID, pointing to a further desc.
+			  (let* ((new-rid (aref page (+ (desc-start descr) chunkn)))
+				 (new-page-number (rid-page-number new-rid))
+				 (new-page (funcall page-function opening new-page-number)))
+			    (check-page new-page
+					new-page-number
+					(if cluster-bid *cluster-page-code* *data-page-code*)
+					opening)
+			    (read-word (1- depth)
+				       chunko
+				       new-page
+				       (rid-desc-offset new-rid)))))))))
+      (cond ((zerop (desc-indirect desc))
+	     (read-word (desc-depth desc) index rid-page (- page-size desc-number)))
+	    (t
+	     (let* ((irid (desc-rid desc))
+		    (ipage-number (rid-page-number irid))
+		    (ipage (funcall page-function opening ipage-number))
+		    (idesc-offset (rid-desc-offset irid)))
+	       (check-page ipage
+			   ipage-number
+			   (if cluster-bid *cluster-page-code* *data-page-code*)
+			   opening)
+	       (read-word (desc-depth (aref ipage (- page-size idesc-offset)))
+			  index
+			  ipage
+			  idesc-offset)))))))
+
+(defmethod (read-record-word record-addressor) (index &key buffer-p)
+  (cond ((and (zerop (desc-indirect desc)) (zerop (desc-depth desc)))
+	 ;; This clause is an optimized version for the common simple case.
+	 (let ((size (desc-size desc)))
+	   (when (minusp index) 
+	     (error "The index ~S is negative" index))
+	   (unless (or (< index size) buffer-p)
+	     (error "The index ~S is out of the boundaries of record ~S" index self))
+	   (if buffer-p
+	       (let ((start (desc-start desc)))
+		 (incf next-word (- size index))
+		 (values rid-page (+ start index) (+ start size)))
+	       (aref rid-page (+ (desc-start desc) index)))))
+	(t
+	 (access-record-word index nil :buffer-p buffer-p))))
+
+(defmethod (write-record-word record-addressor) (index new-value &key buffer-p)
+  (check-type new-value fixnum)
+  (cond ((and (zerop (desc-indirect desc)) (zerop (desc-depth desc)))
+	 ;; This clause is an optimized version for the common simple case.
+	 (let ((size (desc-size desc)))
+	   (when (minusp index) 
+	     (error "The index ~S is negative" index))
+	   (unless (or (< index size) buffer-p)
+	     (error "The index ~S is out of the boundaries of record ~S" index self))
+	   (unless (eq mode :write)
+	     (error "The record addressor is read-only"))
+	   (if buffer-p
+	       (let ((start (desc-start desc)))
+		 (incf next-word (- size index))
+		 (values rid-page (+ start index) (+ start size)))
+	       (setf (aref rid-page (+ (desc-start desc) index)) new-value))))
+	(t
+	 (access-record-word index new-value :buffer-p buffer-p))))
+
+;;; This needs better error checking for end-index being out of bounds,
+;;; but I can't see how to do that very well right now.  It's not
+;;; hurting anything at the moment though since it will only leave the
+;;; extra elements along (as 0's) on read and not do anything on write.
+(defun-in-flavor (access-multiple-record-word record-addressor)
+		 (start-index end-index new-value &key into into-start)
+  (when (or (minusp start-index) (minusp end-index))
+    (error "One of the indexes is negative (start index: ~S; end-index: ~S"
+	   start-index end-index))
+  (when (> start-index end-index)
+    (error "Start index > End index (start index: ~S; end-index: ~S"
+	   start-index end-index))
+  (unless into-start (setq into-start 0))
+  (let* ((n-words (- end-index start-index))
+	 (array-index 0)
+	 (page-function (if new-value #'dbfs:write-page #'dbfs:read-page))
+	 array)
+    (unless new-value
+      (setq array (or into (sys:make-stack-array n-words :type 'zl:art-fixnum))))
+    (labels ((read-words (depth start-offset page desc-offset)
+	       ;; read words into array using array-index, starting at start-offset
+	       ;; in the record and ending at end-offset.
+	       (let* ((descr (aref page (- page-size desc-offset)))
+		      (descr-size (desc-size descr))
+		      (chunk (fixnum-expt max-block-size depth)))
+		 (multiple-value-bind (chunkn chunko)
+		     (floor start-offset chunk)
+		   (unless (zerop (desc-indirect descr))
+		     (error "There should not be an indirect desc here: ~S" descr))
+		   (unless (< chunkn descr-size)
+		     (error "The index ~S is out of the boundaries of record ~S"
+			    start-offset self))
+		   (cond ((zerop depth)
+			  (let ((ds (desc-start descr)))
+			    (loop for i from (+ ds chunkn) below (+ ds descr-size) do 
+			      (if new-value
+				  (setf (aref page i) (aref new-value array-index))
+				  (setf (aref array (+ array-index into-start)) (aref page i)))
+			      (incf array-index)
+				  when ( array-index n-words)
+				    do (loop-finish))))
+			 (t
+			  ;; The word is an RID, pointing to a further desc.
+			  (let ((descr-start (desc-start descr)))
+			    (loop for i from (+ descr-start chunkn)
+					below (+ descr-start descr-size)
+			          for new-rid = (aref page i)
+				  for first = t then nil do
+			      (let* ((new-page-number (rid-page-number new-rid))
+				     (new-page (funcall page-function
+							opening new-page-number)))
+				(check-page new-page
+					    new-page-number
+					    (if cluster-bid
+						*cluster-page-code*
+						*data-page-code*)
+					    opening)
+				(read-words (1- depth)
+					    (if first chunko 0)
+					    new-page
+					    (rid-desc-offset new-rid)))
+				  when ( array-index n-words)
+				    do (loop-finish)))))))))
+      (cond ((zerop (desc-indirect desc))
+	     (read-words (desc-depth desc)
+			 start-index
+			 rid-page
+			 (- page-size desc-number)))
+	    (t
+	     (let* ((irid (desc-rid desc))
+		    (ipage-number (rid-page-number irid))
+		    (ipage (funcall page-function opening ipage-number))
+		    (idesc-offset (rid-desc-offset irid)))
+	       (check-page ipage
+			   ipage-number
+			   (if cluster-bid
+			       *cluster-page-code*
+			       *data-page-code*)
+			   opening)
+	       (read-words (desc-depth (aref ipage (- page-size idesc-offset)))
+			   start-index
+			   ipage
+			   idesc-offset))))
+      (when (> (1- n-words) array-index)
+	(error "Asked for ~S words, but only got ~S" n-words array-index))
+      array)))
+
+(defmethod (read-multiple-record-word record-addressor)
+	   (start-index end-index &key into into-start)
+  (declare (values stack-array))
+  (cond ((and (zerop (desc-indirect desc)) (zerop (desc-depth desc)))
+	 ;; This clause is an optimized version for the common simple case.
+	 (let ((size (desc-size desc))
+	       (n-words (- end-index start-index)))
+	   (unless (<= end-index size)
+	     (error "The index ~S is out of the boundaries of record ~S" end-index self))
+	   (let ((array (or into (sys:make-stack-array n-words :type 'zl:art-fixnum))))
+	     (declare (sys:array-register array))
+	     (loop for desc-index from (+ (desc-start desc) start-index)
+		   for array-index from (or into-start 0)
+		   repeat n-words do
+	       (setf (aref array array-index)
+		     (aref rid-page desc-index)))
+	     array)))
+	(t
+	 (access-multiple-record-word
+	   start-index end-index nil :into into :into-start into-start))))
+
+(defmethod (write-multiple-record-word record-addressor) (start-index end-index new-value)
+  (check-type new-value array)
+  (unless (eq mode :write)
+    (error "The record addressor is read-only"))
+  (access-multiple-record-word start-index end-index new-value))
+
+(defun read-multiple-record-word-given-rid
+       (opening rid start-index end-index &key into into-start)
+  (declare (values stack-array))
+  (let* ((page-number (rid-page-number rid))
+	 (desc-number (- (dbfs:file-page-size opening) (rid-desc-offset rid)))
+	 (rid-page (dbfs:read-page opening page-number))
+	 (desc (aref rid-page desc-number)))
+    (check-page rid-page
+		page-number
+		(if (= (data-page-type-code rid-page) *cluster-page-code*)
+		    *cluster-page-code*
+		    *data-page-code*)
+		opening)
+    (cond ((and (zerop (desc-indirect desc)) (zerop (desc-depth desc)))
+	   ;; This clause is an optimized version for the common simple case.
+	   (let ((size (desc-size desc))
+		 (n-words (- end-index start-index)))
+	     (unless (<= end-index size)
+	       (error "The index ~S is out of the boundaries of record ~S" end-index rid))
+	     (let ((array (or into (sys:make-stack-array n-words :type 'zl:art-fixnum))))
+	       (declare (sys:array-register array))
+	       (loop for desc-index from (+ (desc-start desc) start-index)
+		     for array-index from (or into-start 0)
+		     repeat n-words do
+		 (setf (aref array array-index)
+		       (aref rid-page desc-index)))
+	       array)))
+	  (t
+	   (with-record (rec opening rid :read)
+	     (read-multiple-record-word
+	       rec start-index end-index :into into :into-start into-start))))))
+
+(defmethod (get-record-size record-addressor) ()
+  (cond ((and (zerop (desc-indirect desc))
+	      (zerop (desc-depth desc)))
+	 ;; Do the most common case fast.
+	 (desc-size desc))
+	(t
+	 (let ((page-num page-number)
+	       (page rid-page)
+	       (desc-num desc-number)
+	       (descr desc))
+	   (unless (zerop (desc-indirect desc))
+	     (let ((irid (desc-rid desc)))
+	       (setq page-num (rid-page-number irid))
+	       (setq page (dbfs:read-page opening page-num))
+	       (check-page page
+			   page-num
+			   (if cluster-bid
+			       *cluster-page-code*
+			       *data-page-code*)
+			   opening)
+	       (setq desc-num (- page-size (rid-desc-offset irid)))
+	       (setq descr (aref page desc-num))))
+	   (unless (zerop (desc-indirect descr))
+	     (error "There should not be an indirect desc here: ~S" descr))
+	   (loop for chunk = (fixnum-expt max-block-size (desc-depth descr))
+			   then (/ chunk max-block-size)
+		 with answer = 0
+		 when (= chunk 1)
+		   return (+ answer (desc-size descr)) do
+	     (let* ((size-1 (1- (desc-size descr)))
+		    (next-rid (aref page (+ (desc-start descr) size-1))))
+	       (incf answer (* chunk size-1))
+	       (setq page-num (rid-page-number next-rid))
+	       (setq page (dbfs:read-page opening page-num))
+	       (check-page page
+			   page-num
+			   (if cluster-bid *cluster-page-code* *data-page-code*)
+			   opening)
+	       (setq desc-num (- page-size (rid-desc-offset next-rid)))
+	       (setq descr (aref page desc-num))))))))
+
+;;; I originally tried to put in some extra hair so that if an indirect
+;;; block was relocated to a new page, it would try to bring the block
+;;; back home.  Unfortunately the modularity is awkward, since you want
+;;; to allocate a block but NOT allocate a desc, since you want to reuse
+;;; the existing desc.  For now I'm just going to omit this hack; we can
+;;; put it back later if we want to and we think it will make any
+;;; difference.
+
+;;; top-status is a multi-purpose argument value, passed down
+;;; recursively.  It has four possible values: :direct, :indirect,
+;;; :special, and nil.  The first two mean that this desc is the one
+;;; that was the original top-level argument to set-record-size.
+;;; :direct means that it's a direct desc, and :indirect means that the
+;;; original argument was actually an indirect desc pointing at this
+;;; one.
+
+;;; top-direct means that the block being passed as an argument is the
+;;; top-level block of the original call, and the original desc was
+;;; direct, not indirect.  It means that this block's desc slot must be
+;;; preserved, even if the block itself is deleted.
+
+1;;; It is important to not cache the cluster-bset iv in a local anywhere
+;;; in this method.  There are several places where it can get
+;;; side-effected by various calls to allocate-words and what not.
+
+0(defmethod (set-record-size record-addressor) (new-size)
+  (unless (eq mode :write)
+    (error "The record addressor is read-only"))
+  (let* ((rh0 (write-rh0 opening))
+	 (area (area-of-page page-number rh0 opening page-size))
+	 (target-depth (compute-depth-from-size new-size max-block-size)))
+    (labels ((set-size (n new-depth old-depth page-num page desc-num top-direct deeper)
+	       ;; page-num,page,desc-num indicate a desc of a block.  If
+	       ;; the new-depth is greater than the old-depth, set-size
+	       ;; will build a new block that will point at the old
+	       ;; block, and return an RID to the new block.  If
+	       ;; new-depth is less than old-depth, set-size will free a
+	       ;; block and return an RID to the next-level-down block.
+	       ;; Else it calls set-size-1 and returns its RID (q.v.).
+	       ;; top-direct is explained above.
+	       (cond ((= new-depth old-depth)
+		      ;; The depths are equalized, proceed to the next phase.
+		      (set-size-1 n old-depth page-num page desc-num top-direct deeper))
+		     ((> new-depth old-depth)
+		      ;; Add a level of block.
+		      (let* ((new-depth-1 (1- new-depth))
+			     (chunk (fixnum-expt max-block-size new-depth))
+			     (nchunks (ceiling n chunk))
+			     (new-page-num
+			       (if cluster-bid
+				   (find-cluster-page
+				     rh0 nchunks cluster-bid opening page-size)
+				   (find-data-page rh0 nchunks area opening page-size)))
+			     (new-page (dbfs:write-page opening new-page-num))
+			     (new-desc-num (allocate-block new-page nchunks page-size)))
+			(check-page new-page
+				    new-page-num
+				    (if cluster-bid *cluster-page-code* *data-page-code*)
+				    opening
+				    rh0)
+			(update-rh new-page-num new-page area rh0 opening page-size)
+			;; Set the desc-depth of the new block.  Note that we must
+			;; not keep the descriptor word in a local variable, because
+			;; it could change, if allocate-words compresses the page!
+			(setf (desc-depth (aref new-page new-desc-num)) new-depth)
+			;; Fill all but the first chunk with words.
+			(loop for i from 1
+			      for words-left from (- n chunk) by chunk above 0 do
+                          (let ((new-rid (allocate-words (min chunk words-left) new-depth-1
+							 nil area max-block-size
+							 rh0 opening page-size
+							 cluster-bid)))
+			    (setf (aref new-page
+					(+ i (desc-start (aref new-page new-desc-num))))
+				  new-rid)))
+			;; Recursive call for the first chunk.
+			(setf (aref new-page (desc-start (aref new-page new-desc-num)))
+			      (set-size chunk new-depth-1 old-depth
+					page-num page desc-num top-direct t))
+			;; Return an RID pointing at the new descriptor word.
+			(make-rid :page-number new-page-num
+				  :desc-offset (- page-size new-desc-num))))
+		     (t
+		      ;; Remove a level of block.
+		      (let* ((new-depth-1 (1- new-depth))
+			     (descr (aref page desc-num))
+			     (next-rid (aref page (desc-start descr))))
+			;; Deallocate all but the first chunk.
+			(loop for i from (+ 1 (desc-start descr))
+			      repeat (1- (desc-size descr)) do
+			  (let ((rid (aref page i)))
+			    (let* ((dpage-number (rid-page-number rid))
+				   (dpage (dbfs:write-page opening dpage-number)))
+			      (check-page dpage
+					  dpage-number
+					  (if cluster-bid *cluster-page-code* *data-page-code*)
+					  opening
+					  rh0)
+			      (delete-tree new-depth-1
+					   (rid-page-number rid)
+					   dpage
+					   (- page-size (rid-desc-offset rid))
+					   nil
+					   opening
+					   rh0
+					   page-size
+					   cluster-bid))))
+			;; Free up the block itself.
+			(cond (top-direct
+			       ;; We can't actually free it, because we can't deallocate
+			       ;; its desc.  So just make it zero-length.
+			       (set-block-size page desc-num 0 page-size))
+			      (t
+			       (free-block page desc-num page-size)))
+			(update-rh page-num page area rh0 opening page-size)
+			;; Recursive call for the first chunk.
+			(let* ((spage-number (rid-page-number next-rid))
+			       (spage (dbfs:write-page opening spage-number)))
+			  (check-page spage
+				      spage-number
+				      (if cluster-bid *cluster-page-code* *data-page-code*)
+				      opening
+				      rh0)
+			  (set-size n new-depth (1- old-depth)
+				    (rid-page-number next-rid)
+				    (dbfs:write-page opening (rid-page-number next-rid))
+				    (- page-size (rid-desc-offset next-rid))
+				    nil
+				    nil))))))
+	     
+	     (set-size-1 (n depth page-num page desc-num top-direct deeper)
+	       ;; At this point, we're at the right depth.
+	       ;; page-num,page,desc-num indicate a desc of a block.  The
+	       ;; block might have to be relocated to another page, if it
+	       ;; grows and the page it's on is too crowded.  If this
+	       ;; happens, set-size-1 will deallocate the old block,
+	       ;; zero its desc, build a new block on a new page, pick a
+	       ;; desc-number, build the desc, store it, and return an RID
+	       ;; pointing to the new desc.  Else return the RID
+	       ;; of the original desc, from the original arguments.
+	       (let* ((chunk (fixnum-expt max-block-size depth)) ; Size of chunk in words.
+		      (new-nchunks (ceiling n chunk))	; Block will be this size.
+		      (descr (aref page desc-num))	; Desc of the block.
+		      (old-nchunks (desc-size descr))	; Block is now this size.
+		      (depth-1 (- depth 1))
+		      (new-page-num page-num)		; Returned value.
+		      (new-page page)			; Returned value.
+		      (new-desc-num desc-num))		; Returned value.
+		 (unless (zerop (desc-indirect descr))
+		   (error "There should not be an indirect desc here: ~S" descr))
+		 (when (and (plusp depth) (> old-nchunks new-nchunks))
+		   ;; We're making the record smaller.  Purge entire subtrees.
+		   (loop for i from new-nchunks below old-nchunks do
+		     (let ((rid (aref page (+ i (desc-start descr)))))
+		       (let* ((dpage-number (rid-page-number rid))
+			      (dpage (dbfs:write-page opening dpage-number)))
+			 (check-page dpage
+				     dpage-number
+				     (if cluster-bid *cluster-page-code* *data-page-code*)
+				     opening
+				     rh0)
+			 (delete-tree depth-1
+				      (rid-page-number rid)
+				      dpage
+				      (- page-size (rid-desc-offset rid))
+				      nil
+				      opening
+				      rh0
+				      page-size
+				      cluster-bid)))))
+		 ;; Now set the size of the block itself.
+		 (cond ((and (not (and deeper top-direct))
+			     ;; if deeper and top-direct, don't try to grow the top block
+			     ;; to fill the page, because we'll also need a desc there.
+			     (set-block-size page desc-num new-nchunks page-size))
+			(setq descr (aref page desc-num))
+			(update-rh page-num page area rh0 opening page-size))
+		       (t
+			;; Didn't fit, must relocate to a new page.  So
+			;; we're growing the record.
+			(setq new-page-num
+			      (if cluster-bid
+				  (find-cluster-page
+				    rh0 new-nchunks cluster-bid opening page-size)
+				  (find-data-page rh0 new-nchunks area opening page-size)))
+			(setq new-page (dbfs:write-page opening new-page-num))
+			(check-page new-page
+				    new-page-num
+				    (if cluster-bid *cluster-page-code* *data-page-code*)
+				    opening
+				    rh0)
+			(setq new-desc-num (allocate-block new-page new-nchunks page-size))
+			(update-rh new-page-num new-page area rh0 opening page-size)
+			(let ((new-descr (aref new-page new-desc-num)))
+			  ;; Set the desc-depth field of the new descriptor.
+			  (setf (desc-depth new-descr) depth)
+			  (setf (aref new-page new-desc-num) new-descr)
+			  ;; Copy the contents from the old page to the new.
+			  (loop for source from (desc-start descr)
+				for dest from (desc-start new-descr)
+				repeat old-nchunks do
+			    (setf (aref new-page dest) (aref page source)))
+			  ;; Get rid of the old block.  If top-direct,
+			  ;; then the top level is going to store back
+			  ;; into this desc, so don't deallocate the
+			  ;; desc itself.
+			  (free-block page desc-num page-size top-direct)
+			  (update-rh page-num page area rh0 opening page-size)
+			  (setq page new-page desc-num new-desc-num
+				page-num new-page-num descr new-descr))))
+		 (when (plusp depth)
+		   (when (< old-nchunks new-nchunks)
+		     ;; We're making the record larger.  Create entire subtrees.
+		     (loop for i from old-nchunks
+			   for words-left from (- n (* old-nchunks chunk)) by chunk above 0 do
+		       ;; Since allocate words can side effect the
+		       ;; descriptor contained in descr, we have to get
+		       ;; it everytime around the loop.  This is also
+		       ;; the reason why the allocate words must be
+		       ;; performed before the (setf) form.  The words
+		       ;; that we allocate could come from the same page
+		       ;; that descr is taken from.  Hence,
+		       ;; allocate-words could compress-page the
+		       ;; descr-start out from underneath us.
+		       (let ((rid (allocate-words (min chunk words-left) depth-1 nil area
+						  max-block-size rh0 opening page-size
+						  cluster-bid)))
+			 (setf (aref page (+ i (desc-start (setq descr (aref page desc-num)))))
+			       rid))))
+
+		   (let* ((i (+ (min new-nchunks old-nchunks) -1))
+			  (rid (aref page (+ i (desc-start descr))))
+			  (spage-number (rid-page-number rid))
+			  (spage (dbfs:write-page opening spage-number)))
+		     (check-page spage
+				 spage-number
+				 (if cluster-bid
+				     *cluster-page-code*
+				     *data-page-code*)
+				 opening
+				 rh0)
+		     (let ((rid (set-size-1 (if (< old-nchunks new-nchunks)
+						chunk
+						(1+ (mod (1- n) chunk)))
+					    depth-1
+					    (rid-page-number rid)
+					    spage
+					    (- page-size (rid-desc-offset rid))
+					    nil
+					    nil)))
+		       (setf (aref page (+ i (desc-start (aref page desc-num)))) rid))))
+		 ;; Return an RID to the possibly-new block.
+		 (make-rid :page-number new-page-num
+			   :desc-offset (- page-size new-desc-num)))))
+
+
+      ;; Main body.
+      (let ((new-rid (if (zerop (desc-indirect desc))
+			 (set-size new-size target-depth (desc-depth desc)
+				   page-number rid-page desc-number t nil)
+			 (let* ((irid (desc-rid desc))
+				(ipage-number (rid-page-number irid))
+				(ipage (dbfs:write-page opening ipage-number))
+				(idesc-number (- page-size (rid-desc-offset irid))))
+			   (check-page ipage
+				       ipage-number
+				       (if cluster-bid
+					   *cluster-page-code*
+					   *data-page-code*)
+				       opening
+				       rh0)
+			   (set-size new-size
+				     target-depth
+				     (desc-depth (aref ipage idesc-number))
+				     ipage-number
+				     ipage
+				     idesc-number
+				     nil
+				     nil)))))
+
+	;; Check for a bug.
+	(when (> (data-page-first-desc-number rid-page) desc-number)
+	  (format t "~%WARNING: DESC NUMBER DEALLOCATED!! ~S ~S"
+		  (data-page-first-desc-number rid-page) desc-number))
+
+	;; new-rid points to the "dereferenced" desc location,
+	;; that is, the location after the indirection, if any.
+	(cond ((and (= page-number (rid-page-number new-rid))
+		    (= desc-number (- page-size (rid-desc-offset new-rid))))
+	       (setq desc (aref rid-page desc-number)))
+	      (t
+	       (setf (desc-indirect desc) 1)
+	       (setf (desc-rid desc) new-rid)
+	       (setf (aref rid-page desc-number) desc)))
+	;; Fix all open record addressors.  Note that self is not
+	;; necessarily the only addressor addressing this record!
+	(fix-open-record-addressors rid-page)))))
+
+;   (format t "~2&Contents:")
+;   (loop for i from (desc-start descr) repeat (desc-size descr) do
+;     (let ((rid (aref page i)))
+;       (format t "~&~S/ ~S  ~S ~S" i rid (rid-page-number rid) (rid-desc-offset rid))))
+;   (terpri)
+
+;;; Not most efficient thing conceivable.  Sue me.  We'll meter
+;;; later and see if it makes any difference.
+(defmethod (adjust-record-size record-addressor) (delta-size)
+  (unless (zerop delta-size)
+    (let ((new-size (+ (get-record-size self) delta-size)))
+      (set-record-size self new-size)
+      new-size)))
+
+(defmethod (get-addressor-rid record-addressor) ()
+  (make-rid :page-number page-number :desc-offset (- page-size desc-number)))
+
+(defsetf read-record-word write-record-word)
+
+(defun get-root-rid (opening)
+  (rh-header-root-rid (read-rh0 opening)))
+
+(defun set-root-rid (opening rid)
+  (setf (rh-header-root-rid (write-rh0 opening)) rid))
+
+(defun validate-rid (opening n)
+  (declare (values valid-p reason))
+  (let* ((rh0 (read-rh0 opening))
+	 (page-size (rh-header-page-size rh0))
+	 (page-number (rid-page-number n))
+	 (desc-number (- page-size (rid-desc-offset n)))
+	 (ppr (pages-per-region page-size))
+	 (region-number (floor page-number ppr))
+	 (rh-page-number (* region-number ppr))
+	 (rel-page-number (- page-number rh-page-number))
+	 (rh-word-number (+ *rh-header-size* (floor rel-page-number 2)))
+	 (rh-byte-spec (if (evenp rel-page-number) (byte 16 0) (byte 16 16))))
+    ;; First make sure the header for this page number exists.
+    (if (< region-number (rh-header-n-regions rh0))
+	;; OK, read in the header and take a look at it.
+	(let* ((rh (cond ((zerop region-number)
+			  rh0)
+			 (t
+			  (let ((page (dbfs:read-page opening rh-page-number)))
+			    (check-page page rh-page-number *region-header-page-code*
+					opening rh0)
+			    page))))
+	       (rh-page-desc (sys:%logldb rh-byte-spec (aref rh rh-word-number))))
+	  ;; What does it say about our page number?
+	  (if (let ((tc (rh-page-type-code rh-page-desc)))
+		(or (= tc *data-page-code*) (= tc *cluster-page-code*)))
+	      ;; OK, it's a data page.  Look at it.
+	      (let ((page (dbfs:read-page opening page-number)))
+		(if (= (data-page-type-code page) *cluster-page-code*)
+		    (check-page page page-number *cluster-page-code* opening)
+		    (check-page page page-number *data-page-code* opening))
+		;; Is our desc-number at all valid?
+		(if (and ( desc-number (data-page-first-desc-number page))
+			 (< desc-number page-size))
+		    ;; Yes.  Look at the desc word.
+		    (let ((desc (aref page desc-number)))
+		      ;; If it is indirect, or direct and external, then this is a record.
+		      (or (= (desc-indirect desc) 1) (= (desc-external desc) 1)
+			  (values nil :not-indirect-or-external)))
+		    (values nil :descriptor-out-of-range)))
+	      (values nil :not-data-page-in-rh)))
+	(values nil :region-number-too-big))))
+
+;;; Record addressor stream operations
+
+;;; These methods are defined on addressors so that bin:dumping and
+;;; bin:loading can write directly into records and avoid some copying.
+;;; That is, the buffer that bin: reads/writes from is the actual page
+;;; array.  We can ignore the :advance-xxx-buffer since the bin: stuff
+;;; is actually using the record as the buffer.
+
+(defmethod (:element-type record-addressor) ()
+  '(unsigned-byte 32))
+
+;;; must have :tyi :tyo :untyi so that  check-type stream on record-addressor
+;;; doesn't give an error
+
+(defmethod (:tyi record-addressor) (&rest ignore))
+
+(defmethod (:untyi record-addressor) (&rest ignore))
+
+(defmethod (:tyo record-addressor) (&rest ignore))
+
+(defmethod (:set-pointer record-addressor) (new-pointer)
+  (setq next-word new-pointer))
+
+(defmethod (:read-pointer record-addressor) ()
+  next-word)
+
+(defmethod (:advance-output-buffer record-addressor) (&optional index)
+  ;; buffer is the page array, so no need to copy buffer out
+  (declare (ignore index)))
+
+(defmethod (:get-output-buffer record-addressor) ()
+  (declare (values buffer start end))
+  (write-record-word self next-word 0 :buffer-p t))
+
+(defmethod (:read-input-buffer record-addressor) (&optional eof no-hang-p)
+  (declare (values buffer start end))
+  eof no-hang-p					;we won't bother to implement these
+  (read-record-word self next-word :buffer-p t))    
+
+(defmethod (:advance-input-buffer record-addressor) (&optional new-pointer)
+  ;; buffer is the page array, so no need to copy buffer anywhere
+  (declare (ignore new-pointer)))
+
+
+;;; File manipulation
+
+(defun init-file (opening create-p portal)
+  (let ((page-size (dbfs:file-page-size opening)))
+    (cond (create-p
+	   (initialize-region-header-zero
+	     (create-rh0 opening :if-exists :create)
+	     page-size
+	     (multiple-value-bind (uid-1 uid-2 uid-3)
+		 (uid:unique-id)
+	       (logxor uid-1 uid-2 uid-3))))
+	  (t
+	   (unless (file-appears-to-be-valid (read-rh0 opening) page-size)
+	     (error "The file ~S does not appear to be a valid Statice database" portal))))))
+
+(compile-flavor-methods record-addressor checkwords-error)
+
+;;; Interfaces to b-sets
+
+;;; "Real" B-Sets are sorted sets built on top of records and "B-Sets"
+;;; (from b-set.lisp).  They are built with this dual representation for
+;;; space efficiency.  That is, certain things may not need to store
+;;; many elements, so using a whole page for a full fledged b-set would
+;;; be wasteful.  Hence, a record is used for the smaller
+;;; representation.  B-Sets differ from regular records in that they may
+;;; have different rids and it is the caller's responsibility to keep
+;;; the last one used (that storage level returned).  This allows us to
+;;; dereference descriptors which are indirect and pointing off to
+;;; another descriptor.
+
+;;; A B-Set can start off in either representation, depending on what
+;;; :expected-size is.  If it's :unknown, then it starts in the "real"
+;;; b-set representation.  If it's less than (max-block-size page-size),
+;;; then it starts out as a record of (+ 2 expected-size) words, the 2
+;;; being for the must-always-be-zero and fill-pointer words.  The
+;;; must-always-be-zero is needed since we are defining a record here,
+;;; and we must always be able to distinguish record types within the
+;;; system.  This is probably a slight unmodularity here since this mabz
+;;; field is really a model level entity and not storage level.  Sigh.
+;;; The fill-pointer word indicates how many keys are stored in the
+;;; record.  The keys are always stored in sorted order since it is
+;;; assumed that retrieval will happen more often than updating.  Hence,
+;;; better to sort once than once for every time the b-set is accessed.
+;;; If a b-set grows to need more than max-block-size, it mutates to a
+;;; "real" b-set.  Currently, it doesn't mutate back down to a record if
+;;; elements are deleted.  "We didn't tune it for deletion."  It's the
+;;; same old song and dance.
+
+(defconstant *b-set-record-header-size* 2)
+(defconstant *b-set-record-growth-factor* 4)
+
+;;; define these right here instead of making them model-level
+;;; define-record's.
+(defsubst b-set-record-mabz (record-addressor)
+  (read-record-word record-addressor 0))
+
+(defsubst b-set-record-fill-pointer (record-addressor)
+  (read-record-word record-addressor 1))
+
+;;; Create a new b-set index and return a unique identifier (the root page
+;;; number).
+(defun make-bset-index (opening &key (expected-size :unknown))
+  (declare (values bid))
+  (let (rh0)
+    (cond ((or (eq expected-size :unknown)
+	       (> expected-size (- (max-block-size (rh-header-page-size
+						     (setq rh0 (read-rh0 opening)))
+						   :clustered-p nil)
+				   *b-set-record-header-size*)))
+	   ;; unknown or known to be bigger than a block
+	   (multiple-value-bind (page page-number)
+	       (allocate-whole-page opening *b-set-page-code*)
+	     (let ((*allocation-function*
+		     #'(lambda (opening)
+			 (declare (sys:downward-function))
+			 opening
+			 (values page page-number)))
+		   (rh0 (or rh0 (read-rh0 opening))))
+	       (make-node-x opening *leaf* (rh-header-segment-id rh0)))
+	     (make-rid :page-number page-number :desc-offset 0)))
+	  ;; try starting with a record and growing later
+	  (t (let ((rec (make-record opening (+ *b-set-record-header-size*
+						expected-size))))
+	       ;; initialize record-type word and fill pointer to 0
+	       (with-record (r opening rec :write)
+		 (setf (b-set-record-mabz r) 0)
+		 (setf (b-set-record-fill-pointer r) 0))
+	       rec)))))
+
+;;; Delete the b-set index specified by the bid.  All pages used by the b-set
+;;; are freed and made available for re-use.
+(defun delete-bset-index (opening bid)
+  (let ((mbs (max-branch-size (rh-header-page-size (read-rh0 opening)))))
+    (labels ((map-node (page-number)
+	       (let ((node (dbfs:read-page opening page-number)))
+		 (cond ((= (node-kind node) *branch*)
+			(loop for i from 0 to (node-count node) do
+			  (let ((child-pn (aref node (pidx i))))
+			    (map-node child-pn)
+			    (deallocate-whole-page opening child-pn))))
+		       (t (deallocate-whole-page opening page-number))))))
+      (if (zerop (rid-desc-offset bid))
+	  ;; it's a bset
+	  (map-node (rid-page-number bid))
+	  ;; no, it's a record.
+	  (delete-record opening bid)))))
+
+(defun binary-search-array (array start end key)
+  (declare (values found-p index))
+  (let ((array array))
+    (declare (sys:array-register array))
+    (loop with lower = start
+	  with upper = (1- end) do
+      (when (> lower upper)			; Key not found
+	(return (values nil lower)))
+      (let* ((i (sys:%logldb (byte 31. 1) (+ lower upper)))	; Fast / 2 for small positive fixnums.
+	     (key-i (aref array i)))
+	(cond ((< key key-i)
+	       (setq upper (1- i)))
+	      ((> key key-i)
+	       (setq lower (1+ i)))
+	      (t
+	       (return (values t i))))))))
+
+;;; Insert a key into the b-set index.  If key was already present in
+;;; the index then no change to the index is made and t is returned.  If
+;;; the key is new, then it is inserted and the function returns nil.
+(defun insert-bset-key (opening bid key)
+  (declare (values bid already-exists-p))
+  (let ((page-size (rh-header-page-size (read-rh0 opening)))
+	(desc-offset (rid-desc-offset bid))
+	(page-number (rid-page-number bid)))
+    (cond ((zerop desc-offset)
+	   ;; bid points to a bset root page.
+	   (let* ((*allocation-function*
+		    #'(lambda (opening)
+			(declare (sys:downward-function))
+			(allocate-whole-page opening *b-set-page-code*))))
+	     (multiple-value-bind (new-root already-exists-p)
+		 (insert-key page-number opening key page-size)
+	       (setf (rid-page-number bid) new-root)
+	       (setf (rid-desc-offset bid) 0)
+	       (values bid already-exists-p))))
+	  (t
+	   ;; bset is a record
+	   (let* ((page (dbfs:write-page opening page-number))
+		  (desc-index (- page-size desc-offset))
+		  (desc (aref page desc-index))
+		  (desc-start (desc-start desc))
+		  (record-size (desc-size desc))
+		  (fill-pointer (aref page (1+ desc-start))))
+	     ;; grow record (if nec) prior to inserting this key
+	     (when ( (- (desc-size desc) *b-set-record-header-size*) fill-pointer)
+	       (let ((new-record-size (* record-size *b-set-record-growth-factor*)))
+		 (when (> new-record-size (max-block-size page-size :clustered-p nil))
+		   ;; too big to fit in one block.  mutate to a bset
+		   (let ((record-bid bid)
+			 (bset-bid (make-bset-index opening :expected-size :unknown)))
+		     (let ((root-pn (rid-page-number bset-bid)))
+		       (loop for i from (+ desc-start *b-set-record-header-size*)
+			     repeat fill-pointer do
+			 ;; copy old into new
+			 (setq root-pn
+			       (insert-key root-pn opening (aref page i) page-size)))
+		       (delete-record opening record-bid)
+		       (multiple-value-bind (root-pn already-exists-p)
+			   (insert-key root-pn opening key page-size)
+			 (setf (rid-page-number bset-bid) root-pn)
+			 (setf (rid-desc-offset bset-bid) 0)
+			 (return-from insert-bset-key
+			   (values bset-bid already-exists-p))))))
+		 (with-record (bsr opening bid :write)
+		   (set-record-size bsr new-record-size)))
+	       (let ((desc (aref page desc-index)))	;get the "new" desc
+		 (when (= 1 (desc-indirect desc))
+		   ;; record went indirect during set-record-size. 
+		   ;; convert dereference the indirect and return that.
+		   (setf (aref page desc-index) 0)	;make old rid "deleted"
+		   (setq bid (desc-rid desc))
+		   (setq page (dbfs:write-page opening (rid-page-number bid)))
+		   (setq desc (aref page (- page-size (rid-desc-offset bid)))))
+		 (setf (desc-external (aref page (- page-size (rid-desc-offset bid)))) 1)
+		 (setq desc-start (desc-start desc))))
+	     (let* ((data-start (+ desc-start *b-set-record-header-size*))
+		    (fill-pointer (aref page (1+ desc-start)))
+		    (data-end (+ fill-pointer data-start)))
+	       (if (zerop fill-pointer)
+		   (setf (aref page data-start) key)
+		   (multiple-value-bind (found-p index)
+		       (binary-search-array page data-start data-end key)
+		     (when found-p
+		       (return-from insert-bset-key (values bid t)))
+		     ;; not present. space allocated. slide data down.
+		     (cond ((= index data-end)
+			    (setf (aref page data-end) key))
+			   (t
+			    (loop for i from (1- data-end) downto index do
+			      (setf (aref page (1+ i)) (aref page i)))
+			    (setf (aref page index) key)))))
+	       (incf (aref page (1+ desc-start)))
+	       (values bid nil)))))))
+
+;;; Removes key from the b-set index.  The first value returned is the new
+;;; bid.  It may or may not change.  However, if it does change, it is the
+;;; responsibility of the caller to call with the new bid on subsequent
+;;; calls.  If it did not exist in the index, t is returned as the second
+;;; value, and the b-set is left unchanged.  If the key was found, it is
+;;; removed and nil is returned as the second value.
+(defun delete-bset-key (opening bid key)
+  (declare (values bid not-found-p))
+  (let ((page-size (rh-header-page-size (read-rh0 opening))))
+    (cond ((zerop (rid-desc-offset bid))
+	   ;; bset is a real bset
+	   (with-delayed-storage-management (opening)
+	     (multiple-value-bind (root-pn not-found-in-set)
+		 (delete-key (rid-page-number bid) opening key page-size)
+	       (setf (rid-page-number root-pn) root-pn)
+	       (setf (rid-desc-offset root-pn) 0)
+	       (values root-pn not-found-in-set))))
+	  (t
+	   ;; bset is a record
+	   (let* ((page (dbfs:write-page opening (rid-page-number bid)))
+		  (desc (aref page (- page-size (rid-desc-offset bid))))
+		  (desc-start (desc-start desc))
+		  (data-start (+ desc-start *b-set-record-header-size*))
+		  (fp-index (1+ desc-start))
+		  (fill-pointer (aref page fp-index))
+		  (data-end (+ data-start fill-pointer)))
+	     (decf (aref page fp-index))
+	     (multiple-value-bind (found-p index)
+		 (binary-search-array page data-start data-end key)
+	       (unless found-p
+		 (return-from delete-bset-key (values bid t)))
+	       (loop for i from index below data-end do
+		 (setf (aref page i) (aref page (1+ i))))))
+	   bid))))
+
+;;; Returns a stack array of all the values in the b-set.  The caller should
+;;; do a sys:with-data-stack before calling this.  The elements of the array
+;;; are returned in ascending order.
+(defun lookup-bset-values (opening bid)
+  (declare (values stack-array))
+  (let ((desc-offset (rid-desc-offset bid))
+	(page-size (rh-header-page-size (read-rh0 opening))))
+    (cond ((zerop desc-offset)
+	   (let* ((bid (rid-page-number bid))
+		  (rid-array (sys:make-stack-array (bset-count bid opening page-size)
+						   :type 'zl:art-fixnum
+						   :fill-pointer 0)))
+	     (map-over-set bid
+			   opening
+			   page-size
+			   #'(lambda (key)
+			       (vector-push-extend key rid-array)))
+	     rid-array))
+	  ;; bid is actually a rid
+	  (t
+	   (let* ((page (dbfs:read-page opening (rid-page-number bid)))
+		  (desc (aref page (- page-size desc-offset)))
+		  (desc-start (desc-start desc))
+		  (fill-pointer (aref page (1+ desc-start)))
+		  (rid-array (sys:make-stack-array fill-pointer
+						   :type 'zl:art-fixnum)))
+	     (loop for i from 0 below fill-pointer
+		   for j from (+ desc-start *b-set-record-header-size*) do
+	       (setf (aref rid-array i) (aref page j)))
+	     rid-array)))))
+
+;;; Count the values in a mutating B-Set.
+(defun count-bset-values (opening bid)
+  (declare (values count))
+  (let ((desc-offset (rid-desc-offset bid))
+	(page-size (rh-header-page-size (read-rh0 opening))))
+    (cond ((zerop desc-offset)
+	   (bset-count (rid-page-number bid) opening page-size))
+	  (t
+	   (let ((page (dbfs:read-page opening (rid-page-number bid))))
+	     (aref page (1+ (desc-start (aref page (- page-size desc-offset))))))))))
+
+;;; Calls function with each key in the bset specified by opening and
+;;; bid.
+(defun map-over-bset (opening bid function)
+  (declare (sys:downward-funarg function))
+  (let ((page-size (rh-header-page-size (read-rh0 opening)))
+	(desc-offset (rid-desc-offset bid)))
+    (cond ((zerop desc-offset)
+	   ;; a real b-set
+	   (map-over-set (rid-page-number bid) opening page-size function))
+	  (t
+	   ;; it's currently in record form
+	   (let* ((page (dbfs:read-page opening (rid-page-number bid)))
+		  (desc (aref page (- page-size desc-offset)))
+		  (desc-start (desc-start desc))
+		  (fill-pointer (aref page (1+ desc-start)))
+		  last-key)
+	     (loop for i from (+ desc-start *b-set-record-header-size*)
+		   for first = t then nil
+		   repeat fill-pointer do
+	       (unless first
+		 (unless (= last-key (aref page (1- i)))
+		   ;; some updating has been done.  bag this
+		   (map-bset-range opening bid (1+ last-key) nil function)
+		   (loop-finish)))
+	       (funcall function (setq last-key (aref page i)))))))))
+
+;;; Returns a stack array of all elements such that low-key  element <
+;;; high-key.  The caller should do a sys:with-data-stack before calling
+;;; this.  The elements of the array are returned in ascending order.  If
+;;; high-key is nil, then all elements above low-key (inclusive) are
+;;; returned.
+(defun scan-bset-range (opening bid low-key high-key)
+  (declare (values stack-array))
+  (let ((desc-offset (rid-desc-offset bid))
+	(page-size (rh-header-page-size (read-rh0 opening))))
+    (cond ((zerop desc-offset)
+	   ;; it's in b-set form
+	   (let* ((bid (rid-page-number bid))
+		  (rid-array (sys:make-stack-array (bset-count bid opening page-size)
+						   :type 'zl:art-fixnum
+						   :fill-pointer 0)))
+	     (map-over-range
+	       low-key high-key bid opening page-size #'(lambda (key)
+							  (vector-push-extend key rid-array)))
+	     rid-array))
+	  (t
+	   ;; it's in record format.
+	   (let* ((page (dbfs:read-page opening (rid-page-number bid)))
+		  (desc (aref page (- page-size desc-offset)))
+		  (desc-start (desc-start desc))
+		  (data-start (+ desc-start *b-set-record-header-size*))
+		  (data-end (+ data-start (aref page (1+ desc-start)))))
+	     (multiple-value-bind (ignore low-index)
+		 (binary-search-array page data-start data-end low-key)
+	       (let ((high-index
+		       (if high-key
+			   (multiple-value-bind (ignore index)
+			       (binary-search-array page data-start data-end high-key)
+			     (if (= index data-end)
+				 (1+ data-end)
+				 index))
+			   data-end)))
+		 (let ((array (sys:make-stack-array (- high-index low-index)
+						    :type zl:art-fixnum)))
+		   (loop for i from low-index below high-index
+			 for j from 0 do
+		     (setf (aref array j) (aref page i)))
+		   array))))))))
+
+;;; Calls function with each key in the bset between low-key and
+;;; high-key.
+(defun map-bset-range (opening bid low-key high-key function)
+  (declare (sys:downward-funarg function))
+  (let ((page-size (rh-header-page-size (read-rh0 opening)))
+	(desc-offset (rid-desc-offset bid)))
+    (cond ((zerop desc-offset)
+	   ;; bid points to a bset
+	   (map-over-range low-key high-key (rid-page-number bid) opening page-size function))
+	  (t
+	   ;; it's in record format.
+	   (let ((page (dbfs:read-page opening (rid-page-number bid))))
+	     (loop
+	       (block retry
+		 (let* ((desc (aref page (- page-size desc-offset)))
+			(desc-start (desc-start desc))
+			(data-start (+ desc-start *b-set-record-header-size*))
+			(data-end (+ data-start (aref page (1+ desc-start))))
+			(last-key low-key))
+		   (multiple-value-bind (ignore low-index)
+		       (binary-search-array page data-start data-end low-key)
+		     (let ((high-index
+			     (if high-key
+				 (multiple-value-bind (ignore index)
+				     (binary-search-array page data-start data-end high-key)
+				   (if (= index data-end)
+				       (1+ data-end)
+				       index))
+				 data-end)))
+		       (loop for i from low-index below high-index
+			     for first = t then nil do
+			 (unless first
+			   (unless (= (aref page (1- i)) last-key)
+			     (incf last-key)
+			     (return-from retry nil)))
+			 (funcall function (setq last-key (aref page i))))
+		       (return-from map-bset-range nil)))))))))))
+
+;;; Returns t or nil depending on whether the key exists in the b-set.
+(defun lookup-bset-value (opening bid key)
+  (declare (values found-p))
+  (let ((page-size (rh-header-page-size (read-rh0 opening)))
+	(desc-offset (rid-desc-offset bid)))
+    (cond ((zerop desc-offset)
+	   ;; bid points to a real bset
+	   (lookup-key (rid-page-number bid) opening key page-size))
+	  (t
+	   ;; points at a record
+	   (let* ((page (dbfs:read-page opening (rid-page-number bid)))
+		  (desc (aref page (- page-size desc-offset)))
+		  (desc-start (desc-start desc))
+		  (data-start (+ desc-start *b-set-record-header-size*))
+		  (data-end (+ data-start (aref page (1+ desc-start)))))
+	     (binary-search-array page data-start data-end key))))))
+
+#||
+(defvar *portal* statice-tests::*dbno*)
+
+;;; some make records and some make cluster records
+(defun test (&optional (portal *portal*))
+  (statice:with-transaction ()
+    (init-file portal t portal))
+  (statice:with-transaction ()
+    (let* ((root (make-record portal 10 :near t)))
+      (tv:dotimes-noting-progress (i 100 "blort")
+	(loop for i from 10 by 10 repeat 10
+	      for j from 5 by 10 do
+	  (make-record portal j)
+	  (make-record portal i :near root))
+	(loop for i from 111 by -10 repeat 10
+	      for j from 57 by -5 do
+	  (make-record portal j)
+	  (make-record portal i :near root))))))
+
+(defstruct (record-info)
+  rid
+  size
+  root
+  contents)
+
+(defstruct (cluster-info)
+  root
+  table-of-records)
+
+;;; same as above, but we do some set-record-sizes on the records
+(defun test2 (&key (n 100) (portal *portal*) (transaction-size 50) (max-record-size 110))
+  (statice:with-transaction ()
+    (init-file portal t portal))
+  (let* ((n-clusters 20)
+	 (max-rid 0)
+	 (data-records (make-hash-table :locking nil :test 'eql)))
+    (sys:with-stack-array (clusters n-clusters)
+      (declare (sys:array-register clusters))
+      (tv:dotimes-noting-progress (i n "blorting")
+	(flet ((make-cluster-record (&key size cluster)
+		 (let ((clusters clusters))
+		   (declare (sys:array-register clusters))
+		   (let* ((cluster-info
+			    (or (aref clusters cluster)
+				(setf (aref clusters cluster)
+				      (make-cluster-info
+					:root (make-record portal 10 :near t)
+					:table-of-records
+					(make-hash-table :locking nil :test 'eql)))))
+			  (rid (make-record portal size
+					    :near (cluster-info-root cluster-info)))
+			  (contents (random size))
+			  (record-info (make-record-info :rid rid :size size
+							 :root (cluster-info-root cluster-info)
+							 :contents contents)))
+		     (when (> rid max-rid)
+		       (setq max-rid rid))
+		     (setf (gethash rid (cluster-info-table-of-records cluster-info))
+			   record-info)
+		     (sys:with-stack-array (init size :initial-element contents)
+		       (with-record (rec portal rid :write)
+			 (write-multiple-record-word rec 0 size init))))))
+	       (make-data-record (&key size)
+		 (let* ((rid (make-record portal size))
+			(contents (random size))
+			(record-info (make-record-info :rid rid :size size
+						       :root nil :contents contents)))
+		   (when (> rid max-rid)
+		     (setq max-rid rid))
+		   (setf (gethash rid data-records) record-info)
+		   (sys:with-stack-array (init size :initial-element contents)
+		     (with-record (rec portal rid :write)
+		       (write-multiple-record-word rec 0 size init))))))
+	  (statice:with-transaction ()
+	    (dotimes (i transaction-size)
+	      (make-cluster-record :size (1+ (random max-record-size))
+				   :cluster (random n-clusters))
+	      (make-data-record :size (1+ (random max-record-size)))))))
+      (tv:dotimes-noting-progress (i n "munging")
+	(statice:with-transaction ()
+	  (let ((clusters clusters))
+	    (declare (sys:array-register clusters))
+	    (let* ((cluster-n (random n-clusters))
+		   (cluster-info (aref clusters cluster-n))
+		   (tbl-of-recs (cluster-info-table-of-records cluster-info)))
+	      (maphash #'(lambda (key value)
+			   key
+			   (let* ((rid (record-info-rid value))
+				  (size (record-info-size value))
+				  (contents (record-info-contents value)))
+			     (when (zerop (random 3))
+			       (let ((new-size (if (zerop (random 2))
+						   (ceiling size (1+ (random 3)))
+						   (* size (1+ (random 3))))))
+				 (setf (record-info-size value) new-size)
+				 (with-record (rec portal rid :write)
+				   (set-record-size rec new-size)
+				   (sys:with-stack-array (init new-size :initial-element contents)
+				     (write-multiple-record-word rec 0 new-size init)))))))
+		       tbl-of-recs)))))
+      ;; verify the info
+      ;; first the data records
+      (statice:with-transaction ()
+	(maphash #'(lambda (key value)
+		     (let ((size (record-info-size value))
+			   (contents (record-info-contents value)))
+		       (with-record (rec portal key :read)
+			 (unless (= (get-record-size rec) size)
+			   (error "sizes don't match on data records"))
+			 (sys:with-data-stack
+			   (let ((words (read-multiple-record-word rec 0 size)))
+			     (declare (sys:array-register words))
+			     (dotimes (i size)
+			       (unless (= (aref words i) contents)
+				 (error "Contents don't match on data page"))))))))
+		 data-records))
+      (sys:with-stack-array (page-vector (1+ (rid-page-number max-rid)) :element-type 'boolean)
+	(tv:dotimes-noting-progress (i n-clusters "checking")
+	  (statice:with-transaction ()
+	    (let* ((clusters clusters)
+		   (rh0 (read-rh0 portal))
+		   (ppr (pages-per-region (rh-header-page-size rh0))))
+	      (declare (sys:array-register clusters))
+	      (sys:with-data-stack
+		(let ((cluster-info (aref clusters i)))
+		  (when cluster-info
+		    (let* ((root-rid (cluster-info-root cluster-info))
+			   (cluster-bid (cluster-page-cluster-bset
+					  (dbfs:read-page portal (rid-page-number root-rid))))
+			   (tbl-of-recs (cluster-info-table-of-records cluster-info))
+			   (cluster-elements (lookup-bset-values portal cluster-bid)))
+		      (declare (sys:array-register cluster-elements))
+		      (loop for ri being the hash-elements of tbl-of-recs do
+			(setf (aref page-vector (rid-page-number (record-info-rid ri))) t))
+		      (dotimes (i (length cluster-elements))
+			(let* ((pn (aref cluster-elements i))
+			       (page (dbfs:read-page portal pn)))
+			  (check-page page pn *cluster-page-code* portal)
+			  (multiple-value-bind (region rel-page-number) (floor pn ppr)
+			    ;; ++ clean this up so that we don't re-read the rh each time
+			    (let* ((range-code (get-range-code (data-page-n-free page) rh0))
+				   (rh-page-number (* region ppr))
+				   (rh (cond ((zerop region) rh0)
+					     (t
+					      (let ((page (dbfs:read-page
+							    portal rh-page-number)))
+						(check-page page rh-page-number
+							    *region-header-page-code*
+							    portal rh0)
+						page))))
+				   (rh-word-number (+ *rh-header-size*
+						      (floor rel-page-number 2)))
+				   (rh-byte-spec
+				     (if (evenp rel-page-number) (byte 16 0) (byte 16 16)))
+				   (rh-page-desc
+				     (sys:%logldb rh-byte-spec (aref rh rh-word-number))))
+			      (unless (= range-code (rh-page-range-code rh-page-desc))
+				(error "range-code mismatch"))))
+			  (when (< pn (length page-vector))
+			    (unless (aref page-vector pn)
+			      (when (loop for desc-offset from 287 above
+					      (data-page-first-desc-number page)
+					  thereis
+					    (= (desc-external (aref page desc-offset)) 1))
+				(error
+				  "Page ~S is in the cluster-bset, but not in any of the rids"
+				  pn)))
+			    (setf (aref page-vector pn) nil))
+			  (unless (= (cluster-page-cluster-bset page) cluster-bid)
+			    (error "cluster-bset on page ~S isn't consistent" pn))))
+		      ;; everything in the page-vector should be nil now
+		      (dotimes (i (length page-vector))
+			(when (aref page-vector i)
+			  (error "Page #~S is in the set of rids, but not in the cluster-bset"
+				 i)))
+		      ;; verify that none of the data pages are in the cluster-bset
+		      (maphash #'(lambda (key value)
+				   value
+				   (when (find (rid-page-number key) cluster-elements)
+				     (error "Data page ~S is in the cluster-bset"
+					    (rid-page-number key))))
+			       data-records)
+		      ;; check all the records to see that they have the right values
+		      (maphash #'(lambda (key element)
+				   key
+				   (with-record (rec portal (record-info-rid element) :read)
+				     (let ((size (record-info-size element))
+					   (contents (record-info-contents element)))
+				       (unless (= (get-record-size rec) size)
+					 (error "Sizes don't match on record"))
+				       (sys:with-data-stack
+					 (let ((words (read-multiple-record-word rec 0 size)))
+					   (declare (sys:array-register words))
+					   (dotimes (i size)
+					     (unless (= (aref words i) contents)
+					       (error "contents don't match"))))))))
+			       tbl-of-recs)))))))))
+      t)))
+
+;;; same as above, but we do some set-record-size and some delete-records
+(defun test3 (&key (n 100) (portal *portal*) (transaction-size 50) (max-record-size 110))
+  (statice:with-transaction ()
+    (init-file portal t portal))
+  (let* ((n-clusters 20)
+	 (max-rid 0)
+	 (data-records (make-hash-table :locking nil :test 'eql))
+	 (data-creates 0)
+	 (data-deletes 0)
+	 (cluster-creates 0)
+	 (cluster-deletes 0))
+    (sys:with-stack-array (clusters n-clusters)
+      (declare (sys:array-register clusters))
+      (tv:dotimes-noting-progress (i n "blorting")
+	(flet ((make-cluster-record (&key size cluster)
+		 (let ((clusters clusters))
+		   (declare (sys:array-register clusters))
+		   (let* ((cluster-info
+			    (or (aref clusters cluster)
+				(setf (aref clusters cluster)
+				      (make-cluster-info
+					:root (make-record portal 10 :near t)
+					:table-of-records
+					(make-hash-table :locking nil :test 'eql)))))
+			  (rid (make-record portal size
+					    :near (cluster-info-root cluster-info)))
+			  (contents (random size))
+			  (record-info (make-record-info :rid rid :size size
+							 :root (cluster-info-root cluster-info)
+							 :contents contents)))
+		     (incf cluster-creates)
+		     (when (> rid max-rid)
+		       (setq max-rid rid))
+		     (setf (gethash rid (cluster-info-table-of-records cluster-info))
+			   record-info)
+		     (sys:with-stack-array (init size :initial-element contents)
+		       (with-record (rec portal rid :write)
+			 (write-multiple-record-word rec 0 size init))))))
+	       (maybe-delete-cluster-record ()
+		 (let ((clusters clusters))
+		   (declare (sys:array-register clusters))
+		   (when (zerop (random 4))
+		     (let* ((cluster-info (let* ((try-this (random n-clusters)))
+					    (or (aref clusters try-this)
+						(loop for i from try-this below n-clusters
+						      when (aref clusters i) return it)
+						(loop for i from try-this downto 0
+						      when (aref clusters i) return it)
+						;; no clusters yet
+						(return-from maybe-delete-cluster-record
+						  nil))))
+			    (tbl-of-records (cluster-info-table-of-records cluster-info))
+			    (rec-number (random (1+ (hash-table-count tbl-of-records))))
+			    (count 0))
+		       (unless (zerop rec-number)
+			 (remhash (block delete-a-record
+				    (maphash #'(lambda (key value)
+						 (when (= count rec-number)
+						   (delete-record
+						     portal (record-info-rid value))
+						   (incf cluster-deletes)
+						   (return-from delete-a-record key))
+						 (incf count))
+					     tbl-of-records))
+				  tbl-of-records))))))
+	       (make-data-record (&key size)
+		 (let* ((rid (make-record portal size))
+			(contents (random size))
+			(record-info (make-record-info :rid rid :size size
+						       :root nil :contents contents)))
+		   (incf data-creates)
+		   (when (> rid max-rid)
+		     (setq max-rid rid))
+		   (setf (gethash rid data-records) record-info)
+		   (sys:with-stack-array (init size :initial-element contents)
+		     (with-record (rec portal rid :write)
+		       (write-multiple-record-word rec 0 size init)))))
+	       (maybe-delete-data-record ()
+		 (when (zerop (random 4))
+		   (let* ((record-number (random (1+ (hash-table-count data-records))))
+			  (count 0))
+		     (unless (zerop record-number)
+		       (remhash (block delete-a-record
+				  (maphash #'(lambda (key value)
+					       (when (= count record-number)
+						 (delete-record portal (record-info-rid value))
+						 (incf data-deletes)
+						 (return-from delete-a-record key))
+					       (incf count))
+					   data-records))
+				data-records))))))
+	  (statice:with-transaction ()
+	    (dotimes (i transaction-size)
+	      (make-cluster-record :size (1+ (random max-record-size))
+				   :cluster (random n-clusters))
+	      (maybe-delete-cluster-record)
+	      (make-data-record :size (1+ (random max-record-size)))
+	      (maybe-delete-data-record)))))
+      (tv:dotimes-noting-progress (i n "munging")
+	(statice:with-transaction ()
+	  (let ((clusters clusters))
+	    (declare (sys:array-register clusters))
+	    (let* ((cluster-n (random n-clusters))
+		   (cluster-info (aref clusters cluster-n))
+		   (tbl-of-recs (cluster-info-table-of-records cluster-info)))
+	      (maphash #'(lambda (key value)
+			   key
+			   (let* ((rid (record-info-rid value))
+				  (size (record-info-size value))
+				  (contents (record-info-contents value)))
+			     (when (zerop (random 3))
+			       (let ((new-size (if (zerop (random 2))
+						   (ceiling size (1+ (random 3)))
+						   (* size (1+ (random 3))))))
+				 (setf (record-info-size value) new-size)
+				 (with-record (rec portal rid :write)
+				   (set-record-size rec new-size)
+				   (sys:with-stack-array (init new-size
+							       :initial-element contents)
+				     (write-multiple-record-word rec 0 new-size init)))))))
+		       tbl-of-recs)))))
+      ;; verify the info
+      ;; first the data records
+      (statice:with-transaction ()
+	(maphash #'(lambda (key value)
+		     (let ((size (record-info-size value))
+			   (contents (record-info-contents value)))
+		       (with-record (rec portal key :read)
+			 (unless (= (get-record-size rec) size)
+			   (error "sizes don't match on data records"))
+			 (sys:with-data-stack
+			   (let ((words (read-multiple-record-word rec 0 size)))
+			     (declare (sys:array-register words))
+			     (dotimes (i size)
+			       (unless (= (aref words i) contents)
+				 (error "Contents don't match on data page"))))))))
+		 data-records))
+      (sys:with-stack-array (page-vector (1+ (rid-page-number max-rid)) :element-type 'boolean)
+	(tv:dotimes-noting-progress (i n-clusters "checking")
+	  (statice:with-transaction ()
+	    (let* ((clusters clusters)
+		   (rh0 (read-rh0 portal))
+		   (ppr (pages-per-region (rh-header-page-size rh0))))
+	      (declare (sys:array-register clusters))
+	      (sys:with-data-stack
+		(let ((cluster-info (aref clusters i)))
+		  (when cluster-info
+		    (let* ((root-rid (cluster-info-root cluster-info))
+			   (cluster-bid (cluster-page-cluster-bset
+					  (dbfs:read-page portal (rid-page-number root-rid))))
+			   (tbl-of-recs (cluster-info-table-of-records cluster-info))
+			   (cluster-elements (lookup-bset-values portal cluster-bid)))
+		      (declare (sys:array-register cluster-elements))
+		      (loop for ri being the hash-elements of tbl-of-recs do
+			(setf (aref page-vector (rid-page-number (record-info-rid ri))) t))
+		      (dotimes (i (length cluster-elements))
+			(let* ((pn (aref cluster-elements i))
+			       (page (dbfs:read-page portal pn)))
+			  (check-page page pn *cluster-page-code* portal)
+			  (multiple-value-bind (region rel-page-number) (floor pn ppr)
+			    ;; ++ clean this up so that we don't re-read the rh each time
+			    (let* ((range-code (get-range-code (data-page-n-free page) rh0))
+				   (rh-page-number (* region ppr))
+				   (rh (cond ((zerop region) rh0)
+					     (t
+					      (let ((page (dbfs:read-page
+							    portal rh-page-number)))
+						(check-page page rh-page-number
+							    *region-header-page-code*
+							    portal rh0)
+						page))))
+				   (rh-word-number (+ *rh-header-size*
+						      (floor rel-page-number 2)))
+				   (rh-byte-spec
+				     (if (evenp rel-page-number) (byte 16 0) (byte 16 16)))
+				   (rh-page-desc
+				     (sys:%logldb rh-byte-spec (aref rh rh-word-number))))
+			      (unless (= range-code (rh-page-range-code rh-page-desc))
+				(error "range-code mismatch"))))
+			  (when (< pn (length page-vector))
+			    (unless (aref page-vector pn)
+			      (when (loop for desc-offset from 287 above
+					      (data-page-first-desc-number page)
+					  thereis
+					    (= (desc-external (aref page desc-offset)) 1))
+				(error
+				  "Page ~S is in the cluster-bset, but not in any of the rids"
+				  pn)))
+			    (setf (aref page-vector pn) nil))
+			  (unless (= (cluster-page-cluster-bset page) cluster-bid)
+			    (error "cluster-bset on page ~S isn't consistent" pn))))
+		      ;; everything in the page-vector should be nil now
+		      (dotimes (i (length page-vector))
+			(when (aref page-vector i)
+			  (error "Page #~S is in the set of rids, but not in the cluster-bset"
+				 i)))
+		      ;; verify that none of the data pages are in the cluster-bset
+		      (maphash #'(lambda (key value)
+				   value
+				   (when (find (rid-page-number key) cluster-elements)
+				     (error "Data page ~S is in the cluster-bset"
+					    (rid-page-number key))))
+			       data-records)
+		      ;; check all the records to see that they have the right values
+		      (maphash #'(lambda (key element)
+				   key
+				   (with-record (rec portal (record-info-rid element) :read)
+				     (let ((size (record-info-size element))
+					   (contents (record-info-contents element)))
+				       (unless (= (get-record-size rec) size)
+					 (error "Sizes don't match on record"))
+				       (sys:with-data-stack
+					 (let ((words (read-multiple-record-word rec 0 size)))
+					   (declare (sys:array-register words))
+					   (dotimes (i size)
+					     (unless (= (aref words i) contents)
+					       (error "contents don't match"))))))))
+			       tbl-of-recs)))))))))
+      (format t "~&Created ~S data and ~S cluster; Deleted ~S data and ~S cluster"
+	      data-creates cluster-creates data-deletes cluster-deletes))))
+||#

@@ -1,0 +1,1421 @@
+;;; -*- Mode: lisp; Syntax: common-lisp; Package: statice-storage; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; B-sets.  See q:>dlw>design-of-b-set.lisp.
+
+;;; The insertion algorithm does not result in very good packing when
+;;; you do sequential inserts.  This is because a node and its l-node
+;;; become full, and then the next insert results in a split, which
+;;; leaves behind a third node that's only 2/3 full and cannot be
+;;; touched by further sequential inserts.  Is there anything we can
+;;; do about this?   Yes, we can institute sharing with the ll-node
+;;; during insertion.  Consider doing this.  It'll break some of the
+;;; deletion tests though.
+
+;;; TO DO: aref => xx-aref, keep a table of the locking states, and make
+;;; sure we never write into read-only pages.
+
+;;; TO DO: slide-down can probably be recoded using sys:%block-gc-copy.
+;;; Moon: Only the function sys:transport-trap is allowed to call it; it doesn't do
+;;; the transport-trap checking that normal memory reads do.  Since the long
+;;; planned %block-copy function that D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")does0 check for transport traps still
+;;; hasn't been implemented, it's okay for you to use it as long as you're
+;;; sure you're only doing fixnums.  Put in a comment so someone doesn't see
+;;; that code and copy it.
+;;; Re moving backward, Moon says:
+;;; I don't think microcode for backwards copying could go much faster than
+;;; what you can write yourself using sys:%p-contents-pointer-decrement.
+;;; The hardware only helps for forwards copying.  For large backward copies
+;;; you could copy small chunks forward, using %block-copy, with the chunk
+;;; addresses decreasing, and again microcode couldn't do it much faster.
+
+;;; Lots of l-nodes and r-nodes are being locked and never unlocked.
+;;; Make a pass through all of this checking for that.  Improve the
+;;; scaffolding to test that all locking and unlocking matches.  The
+;;; page should only be unlocked if it was not modified.  I've asked
+;;; DanG about putting this into the real DBFS.
+
+;;; A branch node consists of a header, followed by slots for
+;;; max-branch-size key values, followed by max-branch-size+1 slots for
+;;; pointer values.  There are actually node-count key values and
+;;; node-count+1 pointer values in any particular node.  An entry is
+;;; identified by a number called index, and refers to the index'th key
+;;; value and the index+1'st pointer value, taken as a pair.  See the
+;;; functions kidx and pidx.
+
+#||
+
+B* tree of order M:
+Every node, except the root, has  M sons.
+Every node, except the root, has  (2M - 1) / 3 sons.
+The root (if a branch) has at least 2 and at most 1 + 2 * FLOOR((2M - 2) / 3) sons.
+A branch with K sons contains K - 1 keys.
+
+In our scheme, the level below the root is at minimal level when there
+are two siblings holding exactly mbs-1 keys.  When we are deleting, and
+we see this situation on the way down, then we reduce the height of the
+tree by one.
+
+The minimal number of keys in a branch is generally (floor (1- 2mbs) 3),
+which is produced by a split.  If the number is smaller than that, try
+to borrow from a sibling.  If neither has enough to donate, then merge
+the node with all three siblings.  If there is only one sibling, then
+you need to find the next sibling in the row and you need to know how
+to borrow from him if he has enough to spare, and otherwise you
+merge all three.  If there is no next sibling, that means that
+there are only two siblings, which means we're under the root
+and it's a special case.  If no siblings at all, we ARE the root,
+which is another special case.
+
+The minimal allowable leaf size is (floor (* 2 mls) 3).  If you find
+a leaf as small as that, you can't just delete from it; you have to
+borrow or merge.
+
+||#
+
+;;; The header of a node of a b-set.
+(defstruct (node (:type :array)
+		 (:constructor nil)
+		 (:size-symbol *node-header-size*))
+  ((header-word-1)
+   (type-code 0 :byte (byte 4 28))
+   (page-number 0 :byte (byte 28 0)))
+  segment-id
+  ((header-word-3)
+   (type 0 :byte (byte 4 0))
+   (kind 0 :byte (byte 1 0))
+   (count 0 :byte (byte 12 1))))
+
+;;; Maximum number of entries in a branch node.
+(defsubst max-branch-size (page-size)
+  (floor (- page-size *node-header-size* 1) 2))
+
+;;; Maximum number of entries in a leaf node.
+(defsubst max-leaf-size (page-size)
+  (- page-size *node-header-size*))
+
+(defsubst copy-node-keys (from-node from-start from-end to-node to-start to-end)
+  (copy-array-portion from-node
+		      (+ from-start *node-header-size*)
+		      (+ from-end *node-header-size*)
+		      to-node
+		      (+ to-start *node-header-size*)
+		      (+ to-end *node-header-size*)))
+
+;;; Kludge; must bind mbs around this.
+(defmacro copy-node-ptrs (from-node from-start from-end to-node to-start to-end)
+  `(copy-array-portion ,from-node
+		       (+ ,from-start *node-header-size* mbs)
+		       (+ ,from-end *node-header-size* mbs)
+		       ,to-node
+		       (+ ,to-start *node-header-size* mbs)
+		       (+ ,to-end *node-header-size* mbs)))
+
+(defmacro kidx (i)
+  `(+ ,i *node-header-size*))
+
+(defmacro pidx (i)				; Kludge; must bind mbs around this.
+  `(+ ,i *node-header-size* mbs))
+
+;;; There's no dbfs:unlock-page entrypoint yet.  And I'm not sure I
+;;; believe our unlock policy anyway.
+(defun fake-unlock-page (opening page-number) opening page-number nil)
+
+;;; Utilties
+
+;;; Move a consecutive subsequence of words in the given array.
+;;; source-start must be less than destination-start.
+(defun slide-up (array source-start destination-start n-words)
+  (let ((array-reg array))
+    (declare (sys:array-register array-reg))
+    (loop for source from (1- (+ source-start n-words)) downto source-start
+	  for destination downfrom (1- (+ destination-start n-words)) do
+      (setf (aref array-reg destination) (aref array-reg source)))))
+
+(defsubst slide-keys-up (node source-start destination-start n-words)
+  (slide-up node
+	    (+ source-start *node-header-size*)
+	    (+ destination-start *node-header-size*)
+	    n-words))
+
+(defmacro slide-ptrs-up (node source-start destination-start n-words)
+  `(slide-up ,node
+	     (+ ,source-start *node-header-size* mbs)
+	     (+ ,destination-start *node-header-size* mbs)
+	     ,n-words))
+
+;;; Move a consecutive subsequence of words in the given array.
+;;; source-start must be greater than destination-start.
+(defun slide-down (array source-start destination-start n-words)
+  (let ((array-reg array))
+    (declare (sys:array-register array-reg))
+    (loop for source from source-start below (+ source-start n-words)
+	  for destination from destination-start do
+      (setf (aref array-reg destination) (aref array-reg source)))))
+
+(defsubst slide-keys-down (node source-start destination-start n-words)
+  (slide-down node
+	      (+ source-start *node-header-size*)
+	      (+ destination-start *node-header-size*)
+	      n-words))
+
+(defmacro slide-ptrs-down (node source-start destination-start n-words)
+  `(slide-down ,node
+	       (+ ,source-start *node-header-size* mbs)
+	       (+ ,destination-start *node-header-size* mbs)
+	       ,n-words))
+
+;;; The main program.
+
+(defun make-node-x (opening kind segment-id)
+  (declare (values page page-pn))
+  (multiple-value-bind (page page-pn)
+      (funcall *allocation-function* opening)
+    (setf (node-type-code page) *b-set-page-code*)
+    (setf (node-page-number page) page-pn)
+    (setf (node-segment-id page) segment-id)
+    (setf (node-kind page) kind)
+    (setf (node-count page) 0)
+    (values page page-pn)))
+
+;;; Lookup key in the b-set specified by root-pn.  found-p means there was
+;;; a direct match.
+(defun lookup-key (root-pn opening key page-size)
+  (declare (values found-p))
+  (let* ((mbs (max-branch-size page-size))
+	 (node-pn root-pn)
+	 (root-node (dbfs:read-page opening node-pn))
+	 (node root-node))
+    (check-page node node-pn *b-set-page-code* opening)
+    (loop until (= (node-kind node) *leaf*) do
+      (let ((child-pn (aref node (pidx (multiple-value-bind (found-p key-index)
+					   (search-node node key)
+					 (when found-p
+					   (return-from lookup-key t))
+					 (- key-index *node-header-size*))))))
+	(setq node (dbfs:read-page opening child-pn))
+	(check-page node child-pn *b-set-page-code* opening root-node)
+	(fake-unlock-page opening node-pn)
+	(setq node-pn child-pn)))
+    (search-node node key)))
+
+;;; Binary search the node for the key.  This works equally well for
+;;; branch nodes and leaf nodes, because both of them start with an
+;;; array of keys values, whose current length is kept in node-count.
+;;; If key is found, index is the obvious thing, but if key is not
+;;; found, then index points to the lowest value greater than key.  That
+;;; is, it points "just above the gap".  If the key value is greater
+;;; than every value in the array, it points past the top of the array.
+;;; By the way, this doesn't use microcoded linear search because the
+;;; microcode can only search for equality, whereas the key value might
+;;; not be found and we need to know what "gap" it lies in.
+(defun search-node (node key)
+  (declare (values found-p index))
+  (loop with lower = *node-header-size*
+	with upper = (1- (+ (node-count node) *node-header-size*)) do
+    (when (> lower upper)			; Key not found
+      (return (values nil lower)))
+    (let* ((i (ldb (byte 31. 1) (+ lower upper)))	; Fast / 2 for small positive fixnums.
+	   (key-i (aref node i)))
+      (cond ((< key key-i)
+	     (setq upper (1- i)))
+	    ((> key key-i)
+	     (setq lower (1+ i)))
+	    (t
+	     (return (values t i)))))))
+
+;;; Insert the key into the node, in sorted place.  Increment the
+;;; node-count.  Shift up all keys greater than key.  The caller
+;;; must have a write-lock on node.
+(defun insert-into-leaf (node key)
+  (let ((array-reg node))
+    (declare (sys:array-register array-reg))
+    (loop for i from (+ (node-count array-reg) *node-header-size*)
+	      above *node-header-size*
+	  for j = (1- i)
+	  for j-key = (aref array-reg j)
+	  until (< j-key key) do
+      (setf (aref array-reg i) j-key)
+	  finally (setf (aref array-reg i) key))
+    (incf (node-count array-reg))))
+
+;;; Variant of insert-into-leaf.  The caller has removed a key from
+;;; element 0, and this new key is to replace it.  This time the keys
+;;; are shifted down instead of up.  The caller must have a write-lock
+;;; on node.
+(defun insert-into-leaf-reversed (node key)
+  (let ((array-reg node))
+    (declare (sys:array-register array-reg))
+   (loop for i from *node-header-size*
+		below (+ (node-count array-reg) -1 *node-header-size*)
+	  for j = (1+ i)
+	  for j-key = (aref array-reg j)
+	  until (> j-key key) do
+      (setf (aref array-reg i) j-key)
+	  finally (setf (aref array-reg i) key))))
+
+;;; Insert the key into the branch node, in sorted place, and insert the
+;;; corresponding pointer in location i+1.  Increment the node-count.  Shift up
+;;; all keys greater than key, and their corresponding pointers.  The caller
+;;; must have a write-lock on node.  Note that this will never affect pointer 0.
+(defun insert-into-branch (node key ptr page-size)
+  (let ((array-reg node)
+	(mbs+1 (1+ (max-branch-size page-size))))
+    (declare (sys:array-register array-reg))
+    (loop for i from (+ (node-count array-reg) *node-header-size*)
+	      above *node-header-size*
+	  for j = (1- i)
+	  for j-key = (aref array-reg j)
+	  until (< j-key key) do
+      (setf (aref array-reg i) j-key)
+      (setf (aref array-reg (+ i mbs+1)) (aref array-reg (+ j mbs+1)))
+	  finally (setf (aref array-reg i) key)
+		  (setf (aref array-reg (+ i mbs+1)) ptr))
+    (incf (node-count array-reg))))
+
+;;; Insert a key into the set.  The first returned value is the new root page
+;;; number, because it can change if the tree grows.  If the key is already in
+;;; the set, do nothing, and return t as the second value.
+(defun insert-key (root-pn opening key page-size)
+  (declare (values root-pn already-in-set))
+  ;; check if we are currently walking over this bset, and if so, signal
+  ;; to the map-over-xxx function that a re-trace down the tree is
+  ;; necessary.
+  (let* ((node-pn root-pn)
+	 (root-node (dbfs:read-page opening node-pn :probable-write t))
+	 (node root-node)
+	 (parent-pn 0)
+	 (parent-node nil)
+	 (ptr-index nil)			;includes header, excludes mbs
+	 (owner-pn 0)
+	 (owner-node nil)
+	 (owner-index nil)
+	 (mbs (max-branch-size page-size)))
+    (check-page node node-pn *b-set-page-code* opening)
+    (loop for ipl on *ip-list*
+	  for (op pn) in *ip-list* do
+      (when (and (= root-pn pn) (eq op opening)) (setf (third (first ipl)) nil)))
+    (loop until (= (node-kind node) *leaf*) do
+      (when (= (node-count node) mbs)
+	(let ((new-root-pn
+		(make-room-in-branch node-pn node key parent-pn parent-node ptr-index
+				     owner-pn owner-node owner-index
+				     opening page-size)))
+	  ;; At this point, the owner might be in a higher-up block,
+	  ;; because we might have shifted a key into its l-node.  So just
+	  ;; play it simple and start all over again.
+	  (fake-unlock-page opening node-pn)
+	  (when (and owner-node (not (= owner-pn parent-pn)))
+	    (fake-unlock-page opening owner-pn))
+	  (when parent-node
+	    (fake-unlock-page opening parent-pn))
+	  (return-from insert-key
+	    (insert-key (or new-root-pn root-pn) opening key page-size))))
+      (multiple-value-bind (found-p key-index)
+	  (search-node node key)
+	(setq ptr-index (+ key-index (if found-p 1 0)))
+	(when (> ptr-index *node-header-size*)
+	  ;; Set owner-node to node.  But first, unlock the old one, if
+	  ;; there is an old one.  If the old one is the parent, it will
+	  ;; get unlocked slightly later, so don't unlock it now.
+	  (when (and owner-node (not (= owner-pn parent-pn)))
+	    (fake-unlock-page opening owner-pn))
+	  (setq owner-pn node-pn
+		owner-node node
+		owner-index (1- ptr-index)))
+	(when parent-node
+	  (fake-unlock-page opening parent-pn))
+	(setq parent-node node)
+	(setq parent-pn node-pn)
+	(setq node-pn (aref node (+ ptr-index mbs)))
+	(setq node (dbfs:read-page opening node-pn :probable-write t))
+	(check-page node node-pn *b-set-page-code* opening root-node)))      
+    (cond ((search-node node key)
+	   ;; The key is already in the node.
+	   (values root-pn t))
+	  ((< (node-count node) (max-leaf-size page-size))
+	   (dbfs:write-page opening node-pn)
+	   (insert-into-leaf node key)
+	   (fake-unlock-page opening node-pn)
+	   root-pn)
+	  (t
+	   ;; The node is full, and key is not in it.
+	   (let ((new-root-pn
+		   (insert-into-full-leaf node-pn node key parent-pn parent-node ptr-index
+					  owner-pn owner-node owner-index
+					  opening page-size)))
+	     (when (and owner-node (not (= owner-pn parent-pn)))
+	       (fake-unlock-page opening owner-pn))
+	     (when parent-node
+	       (fake-unlock-page opening parent-pn))
+	     ;; changed the root.  make a note of it for map-over-xxx
+	     (loop for ipl on *ip-list*
+		   for (op pn) in *ip-list* do
+	       (when (and (= root-pn pn) (eq op opening))
+		 (setf (fourth (first ipl)) (or new-root-pn root-pn))))
+	     (fake-unlock-page opening node-pn)
+	     (or new-root-pn root-pn))))))
+
+;;; Insert key into node.  Node is full.  parent-pn/parent-node is the
+;;; parent of this node.  owner-pn/owner-node/owner-index is the entry
+;;; that owns node.  All three nodes are read-locked.  owner-node can be
+;;; nil, if this is the leftmost node.  parent-node can be nil if this
+;;; is the root.  ptr-index is where the pointer to node came from, in
+;;; the parent, and so it is also the key index of the key that owns
+;;; node's right sibling, if any; it includes header but excludes mbs.
+;;; If there is a new root node, return its page number; otherwise return nil.
+(defun insert-into-full-leaf (node-pn node key parent-pn parent-node ptr-index
+			      owner-pn owner-node owner-index opening page-size)
+  (dbfs:write-page opening node-pn)
+  (let* ((mls (max-leaf-size page-size))
+	 (mls-1 (1- mls))
+	 (mbs (max-branch-size page-size))
+	 (l-node-pn (when (and parent-node (> ptr-index *node-header-size*))
+		      (aref parent-node (+ ptr-index -1 mbs))))
+	 (r-node-pn (when (and parent-node (< ptr-index (+ (node-count parent-node)
+							   *node-header-size*)))
+		      (aref parent-node (+ ptr-index 1 mbs)))))
+    (when l-node-pn
+      ;; The node has a left neighboor.  This ensures that it has an owner.
+      (let* ((l-node (dbfs:read-page opening l-node-pn :probable-write t))
+	     (l-count (node-count l-node)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(when (and (< l-count mls)
+		   (not (and (= l-count mls-1)
+			     (< key (aref node (kidx 0))))))
+	  ;; There is a left node and it is not full.  Share the keys
+	  ;; evenly between the two nodes, and put the new key value
+	  ;; where it belongs.
+	  (dbfs:write-page opening l-node-pn)
+	  (dbfs:write-page opening owner-pn)
+	  ;; n-keys is the number of keys to move from node to l-node.
+	  (let* ((new-l-count (ceiling (+ l-count mls) 2))
+		 (n-moved (- new-l-count l-count))
+		 (new-count (- mls n-moved)))
+	    (copy-node-keys node 0 n-moved l-node l-count new-l-count)
+	    (setf (node-count l-node) new-l-count)
+	    (slide-keys-down node n-moved 0 new-count)
+	    (setf (node-count node) new-count)
+	    (insert-into-leaf (if (< key (aref l-node (kidx (1- new-l-count))))
+				  l-node node)
+			      key)
+	    (setf (aref owner-node owner-index) (aref node (kidx 0))))
+	  (return-from insert-into-full-leaf nil))))
+    (when r-node-pn
+      (let* ((r-node (dbfs:read-page opening r-node-pn :probable-write t))
+	     (r-count (node-count r-node)))
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(when (and (< r-count mls)
+		   (not (and (= r-count mls-1)
+			     ( key (aref node (kidx mls-1))))))
+	  ;; There is a left node and it is not full.  Share the keys
+	  ;; evenly between the two nodes, and put the new key value
+	  ;; where it belongs.
+	  (dbfs:write-page opening r-node-pn)
+	  (dbfs:write-page opening parent-pn)
+	  ;; n-keys is the number of keys to move from node to r-node.
+	  (let* ((new-r-count (ceiling (+ r-count mls) 2))
+		 (n-moved (- new-r-count r-count)))
+	    (slide-keys-up r-node 0 n-moved r-count)
+	    (copy-node-keys node (- mls n-moved) mls r-node 0 n-moved)
+	    (setf (node-count r-node) new-r-count)
+	    (setf (node-count node) (- mls n-moved))
+	    (insert-into-leaf (if (< key (aref r-node (kidx 0))) node r-node) key)
+	    (setf (aref parent-node ptr-index) (aref r-node (kidx 0))))
+	  (return-from insert-into-full-leaf nil))))
+    ;; No room in neighboors.  Split.
+    (cond ((and (null l-node-pn) (null r-node-pn))
+	   ;; This node is the root.
+	   (split-leaf-root node-pn node key opening page-size mls))
+	  ((null l-node-pn)
+	   (split-leaf node (dbfs:write-page opening r-node-pn)
+		       key parent-pn parent-node ptr-index opening page-size mls))
+	  (t
+	   (split-leaf (dbfs:write-page opening l-node-pn) node 
+		       key owner-pn owner-node owner-index opening page-size mls)))))
+
+;;; l-node and r-node are siblings.  Usually both are full, but
+;;; sometimes one is full and one is full-1, due to a special case.
+;;; Create new-node in between them, do a split, and insert key.  l-node
+;;; and r-node are both locked for writing.  owner is the owner of
+;;; r-node; owner-node is not necessarily locked.
+(defun split-leaf (l-node r-node key owner-pn owner-node owner-index opening page-size mls)
+  (multiple-value-bind (new-node new-node-pn)
+      (make-node-x opening *leaf* (node-segment-id l-node))
+    (let* ((2mls (+ mls mls))
+	   (l-count (node-count l-node))
+	   (r-count (node-count r-node))
+	   (new-l-count (floor 2mls 3))
+	   (new-count (floor (1+ 2mls) 3))
+	   (new-r-count (floor (+ 2 2mls) 3))
+	   (l-moved (- mls new-l-count))
+	   (r-moved (- mls new-r-count)))
+      (decf new-l-count (- mls l-count))
+      (decf new-r-count (- mls r-count))
+      ;; Shuffle the keys in the leaves, and adjust the counts of the leaves.
+      (copy-node-keys l-node new-l-count l-count new-node 0 l-moved)
+      (copy-node-keys r-node 0 r-moved new-node l-moved (+ l-moved r-moved))
+      (slide-keys-down r-node r-moved 0 new-r-count)
+      (setf (node-count l-node) new-l-count)
+      (setf (node-count new-node) new-count)
+      (setf (node-count r-node) new-r-count)
+      ;; Update the owner of r-node.
+      (let ((new-boundary-key (aref new-node (kidx 0)))
+	    (r-boundary-key (aref r-node (kidx 0))))
+	(dbfs:write-page opening owner-pn)
+	(setf (aref owner-node owner-index) r-boundary-key)
+	;; Insert the new key into the appropriate leaf.
+	(insert-into-leaf (cond ((< key new-boundary-key) l-node)
+				((< key r-boundary-key) new-node)
+				(t r-node))
+			  key)
+	;; Insert a new branch entry, which will be the owner of
+	;; new-node.  Since the new node has a left sibling, namely
+	;; node, the owner must live in the parent node.  The parent
+	;; cannot be full, because we made room on the way down.
+	(insert-into-branch owner-node new-boundary-key new-node-pn page-size))))
+  nil)
+
+;;; node is a leaf, is the root, is full, and is locked.  Split it into
+;;; two new leaves, return a new branch node that will be the new root.
+(defun split-leaf-root (node-pn node key opening page-size mls)
+  (multiple-value-bind (new-root new-root-pn)
+      (make-node-x opening *branch* (node-segment-id node))
+    (multiple-value-bind (r-node r-node-pn)
+	(make-node-x opening *leaf* (node-segment-id node))
+      (let* ((mbs (max-branch-size page-size))
+	     (n-moved (floor mls 2))
+	     (new-count (- mls n-moved)))
+	(copy-node-keys node new-count mls r-node 0 n-moved)
+	(setf (node-count node) new-count)
+	(setf (node-count r-node) n-moved)
+	(let ((boundary-key (aref r-node *node-header-size*)))
+	  (setf (aref new-root *node-header-size*) boundary-key)
+	  (insert-into-leaf (if (< key boundary-key) node r-node) key))
+	(setf (aref new-root (+ mbs *node-header-size*)) node-pn)
+	(setf (aref new-root (+ 1 mbs *node-header-size*)) r-node-pn)
+	(setf (node-count new-root) 1)
+	new-root-pn))))
+
+;;; This is called by insert-key while it's walking down the tree, if it
+;;; encounters a full branch node.  We must make room in the branch
+;;; node, by moving entries into the neighboors or by splitting the
+;;; node.  When this is called, all the nodes that are arguments are
+;;; locked for reading.  parent can be nil and owner can be nil.  The
+;;; caller guarantees that neither parent nor owner is a full node.
+;;; Returns the new value of root-pn if it creates a new root, else nil.
+(defun make-room-in-branch (node-pn node key parent-pn parent-node ptr-index
+			    owner-pn owner-node owner-index
+			    opening page-size)
+  (dbfs:write-page opening node-pn)
+  (let* ((mbs (max-branch-size page-size))
+	 (mbs-1 (1- mbs))
+	 (l-node-pn (when (and parent-node (> ptr-index *node-header-size*))
+		      (aref parent-node (+ ptr-index mbs-1))))
+	 (r-node-pn (when (and parent-node (< ptr-index (+ (node-count parent-node)
+							   *node-header-size*)))
+		      (aref parent-node (+ ptr-index 1 mbs)))))
+    (when (null parent-node)
+      ;; This node is the root, and it's full.  Make a new root.
+      (return-from make-room-in-branch
+	(split-branch-root node-pn node opening mbs)))
+    (when l-node-pn
+      ;; The node has a left neighboor.
+      (let* ((l-node (dbfs:read-page opening l-node-pn :probable-write t))
+	     (l-count (node-count l-node)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	;; Check to make sure that there's some room in l-node.  Also,
+	;; don't use l-node if there's only one space left, and our key
+	;; is in that space, because we'll just see a full branch again.
+	(when (and (< l-count mbs)
+		   (not (and (= l-count mbs-1)
+			     (< key (aref node (kidx 0))))))
+	  ;; There is a left node and it is not full.  Share the keys
+	  ;; evenly between the two nodes, rotating the old owner key
+	  ;; into l-node and providing a new owner key from node.  Note
+	  ;; that since node has a left node, owner-node must be the
+	  ;; parent, and owner-index is the index of the key that refers
+	  ;; to node.  n-moved is the number of keys moved into l-node,
+	  ;; and the number moved out of node, although one fewer go
+	  ;; directly from node to l-node.
+	  (dbfs:write-page opening l-node-pn)
+	  (dbfs:write-page opening owner-pn)
+	  (let* ((new-l-count (ceiling (+ l-count mbs) 2))
+		 (n-moved (- new-l-count l-count))
+		 (new-count (- mbs n-moved)))
+	    (setf (aref l-node (kidx l-count)) (aref owner-node owner-index))
+	    (setf (aref owner-node owner-index) (aref node (kidx (1- n-moved))))
+	    (copy-node-keys node 0 (1- n-moved) l-node (1+ l-count) (+ l-count n-moved))
+	    (copy-node-ptrs node 0 n-moved l-node (1+ l-count) (+ l-count n-moved 1))
+	    (setf (node-count l-node) new-l-count)
+	    (slide-keys-down node n-moved 0 new-count)
+	    (slide-ptrs-down node n-moved 0 (1+ new-count))
+	    (setf (node-count node) new-count))
+	  (return-from make-room-in-branch nil))))
+    (when r-node-pn
+      (let* ((r-node (dbfs:read-page opening r-node-pn :probable-write t))
+	     (r-count (node-count r-node)))
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	;; Check to make sure that there's some room in r-node.  Also,
+	;; don't use r-node if there's only one space left, and our key
+	;; is in that space, because we'll just see a full branch again.
+	(when (and (< r-count mbs)
+		   (not (and (= r-count mbs-1)
+			     ( key (aref node (kidx mbs-1))))))
+	  ;; There is a right node and it is not full.  Share the keys
+	  ;; evenly between the two nodes, rotating the old owner key
+	  ;; into l-node and providing a new owner key from node.
+	  ;; n-moved is the number of keys moved into r-node,
+	  ;; and the number moved out of node, although one fewer go
+	  ;; directly from node to r-node.
+	  (dbfs:write-page opening r-node-pn)
+	  (dbfs:write-page opening parent-pn)
+	  (let* ((new-r-count (ceiling (+ r-count mbs) 2))
+		 (n-moved (- new-r-count r-count))
+		 (new-count (- mbs n-moved)))
+	    (slide-keys-up r-node 0 n-moved new-count)
+	    (slide-ptrs-up r-node 0 n-moved (1+ new-count))
+	    (setf (aref r-node (kidx (1- n-moved)))  (aref parent-node ptr-index))
+	    (setf (aref parent-node ptr-index) (aref node (kidx new-count)))
+	    (copy-node-keys node (1+ new-count) mbs r-node 0 (1- n-moved))
+	    (copy-node-ptrs node (1+ new-count) (1+ mbs) r-node 0 n-moved)
+	    (setf (node-count r-node) new-r-count)
+	    (setf (node-count node) new-count))
+	  (return-from make-room-in-branch nil))))
+    ;; No room in neighboors.  Make a new node.
+    (cond ((null l-node-pn)
+	   (split-branch node (dbfs:write-page opening r-node-pn)
+			 parent-pn parent-node ptr-index opening page-size mbs))
+	  (t
+	   (split-branch (dbfs:write-page opening l-node-pn) node 
+			 owner-pn owner-node owner-index opening page-size mbs)))))
+
+;;; l-node and r-node are siblings, both full.  Create new-node in
+;;; between them and do a split.  l-node and r-node are both locked for
+;;; writing.  owner is the owner of r-node; owner-node is not
+;;; necessarily locked for writing.
+(defun split-branch (l-node r-node owner-pn owner-node owner-index opening page-size mbs)
+  (dbfs:write-page opening owner-pn)
+  (multiple-value-bind (new-node new-node-pn)
+      (make-node-x opening *branch* (node-segment-id l-node))
+    ;; The new-count variables are the new values for node-count of each
+    ;; of the three nodes.  l-moved and r-moved are the number of keys
+    ;; moved into new-node from l-node and r-node respectively; one is
+    ;; subtracted because one key ends up in the owner node, which in
+    ;; turn contributes one key to new-node.
+    (let* ((2mbs (+ mbs mbs))
+	   (l-count (node-count l-node))
+	   (r-count (node-count r-node))
+	   (new-l-count (floor (1- 2mbs) 3))
+	   (new-count (floor 2mbs 3))
+	   (new-r-count (floor (1+ 2mbs) 3)))
+      (when (< l-count mbs)
+	;; If l-count is smaller than usual, then reverse the bias so
+	;; that new-l-count is higher and new-r-count is lower.
+	(rotatef new-l-count new-r-count))
+      (let ((l-moved (- mbs new-l-count 1))
+	    (r-moved (- mbs new-r-count 1)))
+	(decf new-l-count (- mbs l-count))
+	(decf new-r-count (- mbs r-count))
+	(let ((l-key (aref l-node (kidx new-l-count)))
+	      (r-key (aref r-node (kidx r-moved))))
+	  ;; Shuffle the keys in the leaves, and adjust the counts of the leaves.
+	  (copy-node-keys l-node (1+ new-l-count) l-count new-node 0 l-moved)
+	  (copy-node-ptrs l-node (1+ new-l-count) (1+ l-count) new-node 0 (1+ l-moved))
+	  (copy-node-keys r-node 0 r-moved new-node (1+ l-moved) (+ 1 l-moved r-moved))
+	  (copy-node-ptrs r-node 0 (1+ r-moved) new-node (1+ l-moved) (+ 2 l-moved r-moved))
+	  (slide-keys-down r-node (1+ r-moved) 0 new-r-count)
+	  (slide-ptrs-down r-node (1+ r-moved) 0 (1+ new-r-count))
+	  (setf (node-count l-node) new-l-count)
+	  (setf (node-count new-node) new-count)
+	  (setf (node-count r-node) new-r-count)
+	  ;; Rotate keys.
+	  (setf (aref new-node (kidx l-moved)) (aref owner-node owner-index))
+	  (setf (aref owner-node owner-index) r-key)
+	  (insert-into-branch owner-node l-key new-node-pn page-size)))))
+  nil)
+
+;;; node is a branch, is the root, is full, and is locked for writing.
+;;; Split it into two new leaves, return the pn of a new branch node
+;;; that will be the new root.
+(defun split-branch-root (node-pn node opening mbs)
+  (multiple-value-bind (new-root new-root-pn)
+      (make-node-x opening *branch* (node-segment-id node))
+    (multiple-value-bind (r-node r-node-pn)
+	(make-node-x opening *branch* (node-segment-id node))
+      ;; Move n-moved keys out of node into r-node, and move one
+      ;; key out of node into new-root.
+      (let* ((n-moved (floor mbs 2))
+	     (new-count (- mbs n-moved 1)))
+	(copy-node-keys node (1+ new-count) mbs r-node 0 n-moved)
+	(copy-node-ptrs node (1+ new-count) (1+ mbs) r-node 0 (1+ n-moved))
+	(setf (node-count node) new-count)
+	(setf (node-count r-node) n-moved)
+	(setf (aref new-root (kidx 0)) (aref node (kidx new-count)))
+	(setf (aref new-root (pidx 0)) node-pn)
+	(setf (aref new-root (pidx 1)) r-node-pn)
+	(setf (node-count new-root) 1)
+	new-root-pn))))
+
+;;;; Deletion.
+
+;;; Delete a key from the set.  The first returned value is the new root page
+;;; number, because it can change if the tree shrinks.  If the key is not in
+;;; the set, do nothing, and return t as the second value.
+(defun delete-key (root-pn opening key page-size)
+  (declare (values root-pn not-found-in-set))
+  ;; check if we are currently walking over this bset, and if so, signal
+  ;; to the map-over-xxx function that a re-trace down the tree is
+  ;; necessary.
+  (let* ((node-pn root-pn)
+	 (root-node (dbfs:read-page opening node-pn :probable-write t))
+	 (node root-node)
+	 (parent-pn 0)
+	 (parent-node nil)
+	 (ptr-index nil)			;includes header, excludes mbs
+	 (owner-pn 0)
+	 (owner-node nil)
+	 (owner-index nil)
+	 (mls (max-leaf-size page-size))
+	 (mbs (max-branch-size page-size))
+	 (minbs (floor (1- (* 2 mbs)) 3))
+	 (turminbs (floor (1- mbs) 2)))
+    (check-page node node-pn *b-set-page-code* opening)
+    (loop for ipl on *ip-list*
+	  for (op pn) in *ip-list* do
+      (when (and (= root-pn pn) (eq op opening))
+	(setf (third (first ipl)) nil)))
+    (loop until (= (node-kind node) *leaf*) do
+      (when (and ( (node-count node)
+		    (if (and (= parent-pn root-pn) (= (node-count parent-node) 1))
+			turminbs
+			minbs))
+		 ( node-pn root-pn))
+	(let ((new-root-pn
+		(repopulate-branch node-pn node parent-pn parent-node ptr-index
+				   root-pn opening page-size)))
+	  ;; At this point, the owner might be in a higher-up block,
+	  ;; because we might have shifted a key into its l-node.  So just
+	  ;; play it simple and start all over again.
+	  (fake-unlock-page opening node-pn)
+	  (when (and owner-node (not (= owner-pn parent-pn)))
+	    (fake-unlock-page opening owner-pn))
+	  (when parent-node
+	    (fake-unlock-page opening parent-pn))
+	  (return-from delete-key
+	    (delete-key (or new-root-pn root-pn) opening key page-size))))
+      (multiple-value-bind (found-p key-index)
+	  (search-node node key)
+	(setq ptr-index (+ key-index (if found-p 1 0)))
+	(when (> ptr-index *node-header-size*)
+	  ;; Set owner-node to node.  But first, unlock the old one, if
+	  ;; there is an old one.  If the old one is the parent, it will
+	  ;; get unlocked slightly later, so don't unlock it now.
+	  (when (and owner-node (not (= owner-pn parent-pn)))
+	    (fake-unlock-page opening owner-pn))
+	  (setq owner-pn node-pn
+		owner-node node
+		owner-index (1- ptr-index)))
+	(when parent-node
+	  (fake-unlock-page opening parent-pn))
+	(setq parent-node node)
+	(setq parent-pn node-pn)
+	(setq node-pn (aref node (+ ptr-index mbs)))
+	(setq node (dbfs:read-page opening node-pn :probable-write t))
+	(check-page node node-pn *b-set-page-code* opening root-node)))
+    (multiple-value-bind (found-p location)
+	(search-node node key)
+      (cond ((not found-p)
+	     ;; The key is not in the node.
+	     (values root-pn t))
+	    (t
+	     ;; Delete the key from the node.
+	     (dbfs:write-page opening node-pn)
+	     (slide-down node (1+ location) location (- (+ *node-header-size* mls)
+							location 1))
+	     (decf (node-count node))
+	     (when (and (= location *node-header-size*) owner-node)
+	       (dbfs:write-page opening owner-pn)
+	       (setf (aref owner-node owner-index) (aref node (kidx 0))))
+	     (let ((new-root-pn
+		     (cond ((or ( (node-count node) (floor (* 2 mls) 3))
+				(= root-pn node-pn))
+			    root-pn)
+			   (t
+			    (or (repopulate-leaf node-pn node
+						 parent-pn parent-node ptr-index
+						 opening page-size)
+				root-pn)))))
+	       (when (and owner-node (not (= owner-pn parent-pn)))
+		 (fake-unlock-page opening owner-pn))
+	       (when parent-node
+		 (fake-unlock-page opening parent-pn))
+	       (loop for ipl on *ip-list*
+		     for (op pn) in *ip-list* do
+		 (when (and (= root-pn pn) (eq op opening))
+		   (setf (fourth (first ipl)) new-root-pn)))
+	       (fake-unlock-page opening node-pn)
+	       new-root-pn))))))
+
+;;; Node is sparse, which means that it is less than the minimum
+;;; allowable leaf size.  node is locked for writing.  node is not the
+;;; root.  parent-pn/parent-node is the parent of this node, and is read
+;;; locked.  ptr-index is where the pointer to node came from, in the
+;;; parent, and so it is also the key index of the key that owns node's
+;;; right sibling, if any; it includes header but excludes mbs.  If
+;;; there is a new root node, return its page number; otherwise return
+;;; nil.
+(defun repopulate-leaf (node-pn node
+			parent-pn parent-node ptr-index
+			opening page-size)
+  (let* ((count (node-count node))
+	 (parent-count (node-count parent-node))
+	 (two-under-root-p (= parent-count 1))
+	 (mls (max-leaf-size page-size))
+	 (minls (floor (* 2 mls) 3))
+	 (turminls (floor mls 2))
+	 (mbs (max-branch-size page-size))
+	 (l-node-pn (when (and parent-node (> ptr-index *node-header-size*))
+		      (aref parent-node (+ ptr-index -1 mbs))))
+	 (r-node-pn (when (and parent-node (< ptr-index (+ parent-count *node-header-size*)))
+		      (aref parent-node (+ ptr-index 1 mbs)))))
+    (when (and two-under-root-p ( count turminls))
+      (return-from repopulate-leaf nil))
+    ;; Note that count = minls-1 in the canonical case, but maybe not if
+    ;; node is the root or directly under the root.
+    (when l-node-pn
+      (let* ((l-node (dbfs:read-page opening l-node-pn :probable-write t))
+	     (l-count (node-count l-node)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(when (> l-count (if two-under-root-p turminls minls))
+	  ;; There is a left node and it is not sparse.  Share the keys
+	  ;; evenly between the two nodes, and put the new key value
+	  ;; where it belongs.
+	  (dbfs:write-page opening l-node-pn)
+	  (dbfs:write-page opening parent-pn)
+	  ;; n-keys is the number of keys to move from l-node to node.
+	  (let* ((new-l-count (floor (+ l-count count) 2))
+		 (n-moved (- l-count new-l-count))
+		 (new-count (+ count n-moved)))
+	    (slide-keys-up node 0 n-moved count)
+	    (copy-node-keys l-node new-l-count l-count node 0 n-moved)
+	    (setf (node-count l-node) new-l-count)
+	    (setf (node-count node) new-count)
+	    (setf (aref parent-node (1- ptr-index)) (aref node (kidx 0))))
+	  (return-from repopulate-leaf nil))))
+    (when r-node-pn
+      (let* ((r-node (dbfs:read-page opening r-node-pn :probable-write t))
+	     (r-count (node-count r-node)))
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(when (> r-count (if two-under-root-p turminls minls))
+	  ;; There is a right node and it is not sparse.  Share the keys
+	  ;; evenly between the two nodes, and put the new key value
+	  ;; where it belongs.
+	  (dbfs:write-page opening r-node-pn)
+	  (dbfs:write-page opening parent-pn)
+	  ;; n-keys is the number of keys to move from r-node to node.
+	  (let* ((new-r-count (floor (+ r-count count) 2))
+		 (n-moved (- r-count new-r-count))
+		 (new-count (+ count n-moved)))
+	    (copy-node-keys r-node 0 n-moved node count new-count)
+	    (slide-keys-down r-node n-moved 0 new-r-count)
+	    (setf (node-count r-node) new-r-count)
+	    (setf (node-count node) new-count)
+	    (setf (aref parent-node ptr-index) (aref r-node (kidx 0))))
+	  (return-from repopulate-leaf nil))))
+    (when (and l-node-pn (> (1- ptr-index) *node-header-size*))
+      (let* ((ll-node-pn (aref parent-node (+ ptr-index -2 mbs)))
+	     (l-node (dbfs:read-page opening l-node-pn :probable-write t))
+	     (ll-node (dbfs:read-page opening ll-node-pn :probable-write t))
+	     (l-count (node-count l-node))
+	     (ll-count (node-count ll-node))
+	     (total-count (+ ll-count l-count count)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(check-page ll-node ll-node-pn *b-set-page-code* opening node)
+	(dbfs:write-page opening l-node-pn)
+	(dbfs:write-page opening ll-node-pn)
+	(dbfs:write-page opening parent-pn)
+	(cond ((< total-count (* 3 minls))
+	       (merge-leaves ll-node l-node node node-pn
+			     parent-node (- ptr-index 2) opening page-size))
+	      (t
+	       ;; Redistribute keys through the three leaves.
+	       (let* ((new-ll-count (floor total-count 3))
+		      (new-l-count (floor (+ 1 total-count) 3))
+		      (new-count (floor (+ 2 total-count) 3))
+		      (n-moved-from-l (- new-count count))
+		      (n-moved-from-ll (- ll-count new-ll-count))
+		      (int-l-count (- l-count n-moved-from-l)))
+		 (slide-keys-up node 0 n-moved-from-l count)
+		 (copy-node-keys l-node int-l-count l-count node 0 n-moved-from-l)
+		 (slide-keys-up l-node 0 n-moved-from-ll int-l-count)
+		 (copy-node-keys ll-node new-ll-count ll-count l-node 0 n-moved-from-ll)
+		 (setf (node-count ll-node) new-ll-count)
+		 (setf (node-count l-node) new-l-count)
+		 (setf (node-count node) new-count)
+		 (setf (aref parent-node (1- ptr-index)) (aref node (kidx 0)))
+		 (setf (aref parent-node (- ptr-index 2)) (aref l-node (kidx 0)))))))
+      (return-from repopulate-leaf nil))
+    (when (and r-node-pn (< (1+ ptr-index) (+ parent-count *node-header-size*)))
+      (let* ((rr-node-pn (aref parent-node (+ ptr-index 2 mbs)))
+	     (r-node (dbfs:read-page opening r-node-pn :probable-write t))
+	     (rr-node (dbfs:read-page opening rr-node-pn :probable-write t))
+	     (r-count (node-count r-node))
+	     (rr-count (node-count rr-node))
+	     (total-count (+ rr-count r-count count)))
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(check-page rr-node rr-node-pn *b-set-page-code* opening node)
+	(dbfs:write-page opening r-node-pn)
+	(dbfs:write-page opening rr-node-pn)
+	(dbfs:write-page opening parent-pn)
+	(cond ((< total-count (* 3 minls))
+	       (merge-leaves node r-node rr-node rr-node-pn
+			     parent-node ptr-index opening page-size))
+	      (t
+	       ;; Redistribute keys through the three leaves.
+	       (let* ((new-rr-count (floor total-count 3))
+		      (new-r-count (floor (+ 1 total-count) 3))
+		      (new-count (floor (+ 2 total-count) 3))
+		      (n-moved-from-r (- new-count count))
+		      (n-moved-from-rr (- rr-count new-rr-count))
+		      (int-r-count (- r-count n-moved-from-r)))
+		 (copy-node-keys r-node 0 n-moved-from-r node count new-count)
+		 (slide-keys-down r-node n-moved-from-r 0 int-r-count)
+		 (copy-node-keys rr-node 0 n-moved-from-rr r-node int-r-count new-r-count)
+		 (slide-keys-down rr-node n-moved-from-rr 0 new-rr-count)
+		 (setf (node-count rr-node) new-rr-count)
+		 (setf (node-count r-node) new-r-count)
+		 (setf (node-count node) new-count)
+		 (setf (aref parent-node ptr-index) (aref r-node (kidx 0)))
+		 (setf (aref parent-node (1+ ptr-index)) (aref rr-node (kidx 0)))))))
+      (return-from repopulate-leaf nil))
+    (when (and r-node-pn l-node-pn)
+      ;; Both siblings exist.  If either one of them had more than minls
+      ;; keys, we would have been finished by now.  Therefore we can
+      ;; merge with both of them.
+      (let ((l-node (dbfs:write-page opening l-node-pn))
+	    (r-node (dbfs:write-page opening r-node-pn)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(dbfs:write-page opening parent-pn)
+	(merge-leaves l-node node r-node r-node-pn
+		      parent-node (1- ptr-index) opening page-size)
+	(return-from repopulate-leaf nil)))
+    ;; The only way we could get this far is if there are only two
+    ;; leaves under this branch, which means they are immediately under
+    ;; the root, and the other leaf is sparse even by the special
+    ;; standards that apply to this special case, namely, fewer than
+    ;; turminls keys.  Merge the two leaves and make this leaf the root.
+    (unless two-under-root-p
+      (error "Impossible case encountered in deleting a key from a b-set"))
+    (let* ((a-node (if l-node-pn
+		       (dbfs:write-page opening l-node-pn)
+		       node))
+	   (b-node (if r-node-pn
+		       (dbfs:write-page opening r-node-pn)
+		       node))
+	   (a-count (node-count a-node))
+	   (b-count (node-count b-node))
+	   (new-a-count (+ a-count b-count)))
+      (copy-node-keys b-node 0 b-count a-node a-count new-a-count)
+      (setf (node-count a-node) new-a-count)
+      (funcall *deallocation-function* opening (or r-node-pn node-pn))
+      (funcall *deallocation-function* opening parent-pn)
+      (or l-node-pn node-pn))))
+
+;;; All four nodes exist and are locked for writing.
+(defun merge-leaves (a-node b-node c-node c-node-pn
+		     parent-node ptr-index opening page-size)
+  (let* ((a-count (node-count a-node))
+	 (b-count (node-count b-node))
+	 (c-count (node-count c-node))
+	 (total-count (+ a-count b-count c-count))
+	 (new-a-count (floor total-count 2))
+	 (new-b-count (- total-count new-a-count)))
+    (cond ((> new-a-count a-count)
+	   ;; Keys go from b-node to a-node.
+	   (let* ((n-moved-to-a (- new-a-count a-count))
+		  (int-b-count (- b-count n-moved-to-a)))
+	     (copy-node-keys b-node 0 n-moved-to-a a-node a-count new-a-count)
+	     (slide-keys-down b-node n-moved-to-a 0 int-b-count)
+	     (copy-node-keys c-node 0 c-count b-node int-b-count new-b-count)))
+	  (t
+	   ;; Keys go from a-node to b-node.
+	   (let* ((n-moved-from-a (- a-count new-a-count))
+		  (int-b-count (+ b-count n-moved-from-a)))
+	     (slide-keys-up b-node 0 n-moved-from-a b-count)
+	     (copy-node-keys a-node new-a-count a-count b-node 0 n-moved-from-a)
+	     (copy-node-keys c-node 0 c-count b-node int-b-count new-b-count))))
+    (setf (node-count a-node) new-a-count)
+    (setf (node-count b-node) new-b-count)
+    (funcall *deallocation-function* opening c-node-pn)
+    (setf (aref parent-node ptr-index) (aref b-node (kidx 0)))
+    ;; Delete branch entry whose key is at (+ ptr-index 1).
+    (let ((parent-count (node-count parent-node))
+	  (k (- (+ ptr-index 1) *node-header-size*))
+	  (mbs (max-branch-size page-size)))
+      (slide-keys-down parent-node (1+ k) k (- parent-count (1+ k)))
+      (slide-ptrs-down parent-node (+ k 2) (+ k 1) (- parent-count (1+ k)))
+      (setf (node-count parent-node) (1- parent-count)))))
+
+;;; node is a sparse branch node, locked for reading, not the root.
+;;; sparse means that it is at (or below) the minimum size.
+;;; parent-node is locked for reading.  If node is one of two under the
+;;; root, then its count must be less then turminbs.
+(defun repopulate-branch (node-pn node
+			  parent-pn parent-node ptr-index
+			  root-pn opening page-size)
+  (let* ((count (node-count node))
+	 (parent-count (node-count parent-node))
+	 (two-under-root-p (and (= parent-count 1) (= parent-pn root-pn)))
+	 (mbs (max-branch-size page-size))
+	 (minbs (floor (1- (* 2 mbs)) 3))
+	 (turminbs (floor (1- mbs) 2))
+	 (l-node-pn (when (and parent-node (> ptr-index *node-header-size*))
+		      (aref parent-node (+ ptr-index -1 mbs))))
+	 (r-node-pn (when (and parent-node (< ptr-index (+ parent-count *node-header-size*)))
+		      (aref parent-node (+ ptr-index 1 mbs)))))
+    (dbfs:write-page opening node-pn)
+    (when l-node-pn
+      (let* ((l-node (dbfs:read-page opening l-node-pn :probable-write t))
+	     (l-count (node-count l-node)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(when (> l-count (if two-under-root-p turminbs minbs))
+	  ;; There is a left node and it is not sparse.  Share the keys
+	  ;; evenly between the two nodes.
+	  (dbfs:write-page opening l-node-pn)
+	  (dbfs:write-page opening parent-pn)
+	  ;; n-keys is the number of keys to move out of l-node, of which
+	  ;; all but one go to node.
+	  (let* ((new-l-count (floor (+ l-count count) 2))
+		 (n-moved (- l-count new-l-count))
+		 (new-count (+ count n-moved)))
+	    (slide-keys-up node 0 n-moved new-l-count)
+	    (slide-ptrs-up node 0 n-moved (1+ new-l-count))
+	    (setf (aref node (kidx (1- n-moved))) (aref parent-node (1- ptr-index)))
+	    (setf (aref parent-node (1- ptr-index)) (aref l-node (kidx new-l-count)))
+	    (copy-node-keys l-node (1+ new-l-count) l-count node 0 (1- n-moved))
+	    (copy-node-ptrs l-node (1+ new-l-count) (1+ l-count) node 0 n-moved)
+	    (setf (node-count l-node) new-l-count)
+	    (setf (node-count node) new-count))
+	  (return-from repopulate-branch nil))))
+    (when r-node-pn
+      (let* ((r-node (dbfs:read-page opening r-node-pn :probable-write t))
+	     (r-count (node-count r-node)))
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(when (> r-count (if two-under-root-p turminbs minbs))
+	  ;; There is a right node and it is not sparse.  Share the keys
+	  ;; evenly between the two nodes.
+	  (dbfs:write-page opening r-node-pn)
+	  (dbfs:write-page opening parent-pn)
+	  ;; n-keys is the number of keys to move out of r-node, of which
+	  ;; all but one go to node.
+	  (let* ((new-r-count (floor (+ r-count count) 2))
+		 (n-moved (- r-count new-r-count))
+		 (new-count (+ count n-moved)))
+	    (setf (aref node (kidx count)) (aref parent-node ptr-index))
+	    (setf (aref parent-node ptr-index) (aref r-node (kidx (1- n-moved))))
+	    (copy-node-keys r-node 0 (1- n-moved) node (1+ count) new-count)
+	    (copy-node-ptrs r-node 0 n-moved node (1+ count) (1+ new-count))
+	    (slide-keys-down r-node n-moved 0 new-r-count)
+	    (slide-ptrs-down r-node n-moved 0 (1+ new-r-count))
+	    (setf (node-count r-node) new-r-count)
+	    (setf (node-count node) new-count))
+	  (return-from repopulate-branch nil))))
+    (when (and l-node-pn (> (1- ptr-index) *node-header-size*))
+      (let* ((ll-node-pn (aref parent-node (+ ptr-index -2 mbs)))
+	     (l-node (dbfs:read-page opening l-node-pn :probable-write t))
+	     (ll-node (dbfs:read-page opening ll-node-pn :probable-write t))
+	     (l-count (node-count l-node))
+	     (ll-count (node-count ll-node))
+	     (total-count (+ ll-count l-count count)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(check-page ll-node ll-node-pn *b-set-page-code* opening node)
+	(dbfs:write-page opening l-node-pn)
+	(dbfs:write-page opening ll-node-pn)
+	(dbfs:write-page opening parent-pn)
+	(cond (( total-count (* 3 minbs))
+	       (merge-branches ll-node l-node node node-pn
+			       parent-node (- ptr-index 2) opening page-size))
+	      (t
+	       ;; Redistribute keys through the three branches.
+	       (let* ((new-ll-count (floor total-count 3))
+		      (new-l-count (floor (+ 1 total-count) 3))
+		      (new-count (floor (+ 2 total-count) 3))
+		      (n-moved-from-l (- new-count count))
+		      (n-moved-from-ll (- ll-count new-ll-count))
+		      (int-l-count (- l-count n-moved-from-l)))
+		 (slide-keys-up node 0 n-moved-from-l count)
+		 (slide-ptrs-up node 0 n-moved-from-l (1+ count))
+		 (setf (aref node (kidx (1- n-moved-from-l)))
+		       (aref parent-node (1- ptr-index)))
+		 (copy-node-keys l-node (1+ int-l-count) l-count node 0 (1- n-moved-from-l))
+		 (copy-node-ptrs l-node (1+ int-l-count) (1+ l-count) node 0 n-moved-from-l)
+		 (setf (aref parent-node (1- ptr-index)) (aref l-node (kidx int-l-count)))
+		 (slide-keys-up l-node 0 n-moved-from-ll int-l-count)
+		 (slide-ptrs-up l-node 0 n-moved-from-ll (1+ int-l-count))
+		 (setf (aref l-node (kidx (1- n-moved-from-ll)))
+		       (aref parent-node (- ptr-index 2)))
+		 (copy-node-keys ll-node (1+ new-ll-count) ll-count
+				 l-node 0 (1- n-moved-from-ll))
+		 (copy-node-ptrs ll-node (1+ new-ll-count) (1+ ll-count)
+				 l-node 0 n-moved-from-ll)
+		 (setf (aref parent-node (- ptr-index 2)) (aref ll-node (kidx new-ll-count)))
+		 (setf (node-count ll-node) new-ll-count)
+		 (setf (node-count l-node) new-l-count)
+		 (setf (node-count node) new-count)))))
+      (return-from repopulate-branch nil))
+    (when (and r-node-pn (< (1+ ptr-index) (+ parent-count *node-header-size*)))
+      (let* ((rr-node-pn (aref parent-node (+ ptr-index 2 mbs)))
+	     (r-node (dbfs:read-page opening r-node-pn :probable-write t))
+	     (rr-node (dbfs:read-page opening rr-node-pn :probable-write t))
+	     (r-count (node-count r-node))
+	     (rr-count (node-count rr-node))
+	     (total-count (+ rr-count r-count count)))
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(check-page rr-node rr-node-pn *b-set-page-code* opening node)
+	(dbfs:write-page opening r-node-pn)
+	(dbfs:write-page opening rr-node-pn)
+	(dbfs:write-page opening parent-pn)
+	(cond (( total-count (* 3 minbs))
+	       (merge-branches node r-node rr-node rr-node-pn
+			       parent-node ptr-index opening page-size))
+	      (t
+	       ;; Redistribute keys through the three leaves.
+	       (let* ((new-rr-count (floor total-count 3))
+		      (new-r-count (floor (+ 1 total-count) 3))
+		      (new-count (floor (+ 2 total-count) 3))
+		      (n-moved-from-r (- new-count count))
+		      (n-moved-from-rr (- rr-count new-rr-count))
+		      (int-r-count (- r-count n-moved-from-r)))
+		 (setf (aref node (kidx count)) (aref parent-node ptr-index))
+		 (copy-node-keys r-node 0 (1- n-moved-from-r) node (1+ count) new-count)
+		 (copy-node-ptrs r-node 0 n-moved-from-r node (1+ count) (1+ new-count))
+ 		 (setf (aref parent-node ptr-index) (aref r-node (kidx (1- n-moved-from-r))))
+		 (slide-keys-down r-node n-moved-from-r 0 int-r-count)
+		 (slide-ptrs-down r-node n-moved-from-r 0 (1+ int-r-count))
+		 (setf (aref r-node (kidx int-r-count)) (aref parent-node (1+ ptr-index)))
+		 (copy-node-keys rr-node 0 (1- n-moved-from-rr)
+				 r-node (1+ int-r-count) new-r-count)
+		 (copy-node-ptrs rr-node 0 n-moved-from-rr
+				 r-node (1+ int-r-count) (1+ new-r-count))
+		 (setf (aref parent-node (1+ ptr-index))
+		       (aref rr-node (kidx (1- n-moved-from-rr))))
+		 (slide-keys-down rr-node n-moved-from-rr 0 new-rr-count)
+		 (slide-ptrs-down rr-node n-moved-from-rr 0 (1+ new-rr-count))
+		 (setf (node-count rr-node) new-rr-count)
+		 (setf (node-count r-node) new-r-count)
+		 (setf (node-count node) new-count)))))
+      (return-from repopulate-branch nil))
+    (when (and r-node-pn l-node-pn)
+      ;; Both siblings exist.  If either one of them had more than minbs
+      ;; keys, we would have been finished by now.  Therefore we can
+      ;; merge with both of them.
+      (let ((l-node (dbfs:write-page opening l-node-pn))
+	    (r-node (dbfs:write-page opening r-node-pn)))
+	(check-page l-node l-node-pn *b-set-page-code* opening node)
+	(check-page r-node r-node-pn *b-set-page-code* opening node)
+	(dbfs:write-page opening parent-pn)
+	(merge-branches l-node node r-node r-node-pn
+			parent-node (1- ptr-index) opening page-size)
+	(return-from repopulate-branch nil)))
+    ;; The only way we could get this far is if there are only two
+    ;; branches under this branch, which means they are immediately under
+    ;; the root, and the other branch is sparse even by the special
+    ;; standards that apply to this special case, namely, fewer than
+    ;; turminbs keys.  Merge the two branches and make this branch the root.
+    (unless two-under-root-p
+      (error "Impossible case encountered in deleting a key from a b-set"))
+    (let* ((a-node (if l-node-pn
+		       (dbfs:write-page opening l-node-pn)
+		       node))
+	   (b-node (if r-node-pn
+		       (dbfs:write-page opening r-node-pn)
+		       node))
+	   (a-count (node-count a-node))
+	   (b-count (node-count b-node))
+	   (new-a-count (+ a-count b-count 1)))
+      (setf (aref a-node (kidx a-count)) (aref parent-node (kidx 0)))
+      (copy-node-keys b-node 0 b-count a-node (1+ a-count) new-a-count)
+      (copy-node-ptrs b-node 0 (1+ b-count) a-node (1+ a-count) (1+ new-a-count))
+      (setf (node-count a-node) new-a-count)
+      (funcall *deallocation-function* opening (or r-node-pn node-pn))
+      (funcall *deallocation-function* opening parent-pn)
+      (or l-node-pn node-pn))))
+
+;;; All four nodes exist and are locked for writing.
+(defun merge-branches (a-node b-node c-node c-node-pn
+		       parent-node ptr-index opening page-size)
+  (let* ((mbs (max-branch-size page-size))
+	 (a-count (node-count a-node))
+	 (b-count (node-count b-node))
+	 (c-count (node-count c-node))
+	 (total-count (+ a-count b-count c-count 1))
+	 (new-a-count (floor total-count 2))
+	 (new-b-count (- total-count new-a-count)))
+    (cond ((> new-a-count a-count)
+	   ;; Keys go from b-node to a-node.
+	   (let* ((n-moved-to-a (- new-a-count a-count))
+		  (int-b-count (- b-count n-moved-to-a)))
+	     (setf (aref a-node (kidx a-count)) (aref parent-node ptr-index))
+	     (copy-node-keys b-node 0 (1- n-moved-to-a) a-node (1+ a-count) new-a-count)
+	     (copy-node-ptrs b-node 0 n-moved-to-a a-node (1+ a-count) (1+ new-a-count))
+	     (setf (aref parent-node ptr-index) (aref b-node (kidx (1- n-moved-to-a))))
+	     (slide-keys-down b-node n-moved-to-a 0 int-b-count)
+	     (slide-ptrs-down b-node n-moved-to-a 0 (1+ int-b-count))
+	     (setf (aref b-node (kidx int-b-count)) (aref parent-node (1+ ptr-index)))
+	     (copy-node-keys c-node 0 c-count b-node (1+ int-b-count) new-b-count)
+	     (copy-node-ptrs c-node 0 (1+ c-count) b-node (1+ int-b-count) (1+ new-b-count))))
+	  (t
+	   ;; Keys go from a-node to b-node.
+	   (let* ((n-moved-from-a (- a-count new-a-count))
+		  (int-b-count (+ b-count n-moved-from-a)))
+	     (slide-keys-up b-node 0 n-moved-from-a b-count)
+	     (slide-ptrs-up b-node 0 n-moved-from-a (1+ b-count))
+	     (setf (aref b-node (kidx (1- n-moved-from-a))) (aref parent-node ptr-index))
+	     (setf (aref parent-node ptr-index) (aref a-node (kidx new-a-count)))
+	     (copy-node-keys a-node (1+ new-a-count) a-count b-node 0 (1- n-moved-from-a))
+	     (copy-node-ptrs a-node (1+ new-a-count) (1+ a-count) b-node 0 n-moved-from-a)
+	     (copy-node-keys c-node 0 c-count b-node (1+ int-b-count) new-b-count)
+	     (copy-node-ptrs c-node 0 (1+ c-count) b-node (1+ int-b-count) (1+ new-b-count))
+	     )))
+    (setf (node-count a-node) new-a-count)
+    (setf (node-count b-node) new-b-count)
+    (funcall *deallocation-function* opening c-node-pn)
+    ;; Delete branch entry whose key is at (+ ptr-index 1).
+    (let ((parent-count (node-count parent-node))
+	  (k (- (+ ptr-index 1) *node-header-size*))
+	  (mbs (max-branch-size page-size)))
+      (slide-keys-down parent-node (1+ k) k (- parent-count (1+ k)))
+      (slide-ptrs-down parent-node (+ k 2) (+ k 1) (- parent-count (1+ k)))
+      (setf (node-count parent-node) (1- parent-count)))))
+
+;;; Count the elements in the b-set
+(defun bset-count (root-pn opening page-size)
+  (let ((mbs (max-branch-size page-size))
+	(count 0))
+    (labels ((count-node (node node-pn)
+	       (check-page node node-pn *b-set-page-code* opening)
+	       (cond ((= (node-kind node) *branch*)
+		      (loop for i from 0 to (node-count node) do
+			(let ((child-pn (aref node (pidx i))))
+			  (count-node (dbfs:read-page opening child-pn) child-pn)
+			  (fake-unlock-page opening child-pn))))
+		     (t
+		      (incf count (node-count node))))))
+      (count-node (dbfs:read-page opening root-pn) root-pn)
+      (fake-unlock-page opening root-pn))
+    count))
+
+;;; An index pointer (a list of which is maintained in *ip-list*) is an
+;;; opening, a page-number, an aref into that page (representing the
+;;; current key that is being looked at on that b-set node), and a "new
+;;; root page number".  If insert-key or delete-key get called on a bset
+;;; that is currently being walked over, then they signal back to the
+;;; mapping function by making the index into the root node nil.  The
+;;; mapper then knows that a change has occurred and that it should
+;;; rewalk the whole tree using the last key + 1 as the low bound.  If
+;;; the root-pn changes in insert-key or delete-key, then they change
+;;; the fourth element of the ip list (the "new root-pn") to be the new
+;;; root.  Summarizing, the *ip-list* is a stack list of stack lists
+;;; which are in the format (opening root-pn index new-root-pn).
+
+;;; This is a little naive since it is possible to figure out whether
+;;; the change really requires walking the whole tree again (using
+;;; map-over-range).  It is conceivable that insert-key could just
+;;; modify the ip for the page that it modified and let the map-over-xxx
+;;; function continue as if nothing happened.  Hence, the code puts all
+;;; of the pages and aref indexes which are in the current path through
+;;; the tree on the *ip-list*.  Not completely necessary as it stands
+;;; now.  We might want to change this later if some insert/delete-key
+;;; intensive application needs it.  For now, though.
+
+;;; Apply function to each element of the set, in order.  If there is
+;;; some sort of modification to this bset, then, just back out of this
+;;; mapping call and let map-over-range do the work for us.
+(defun map-over-set (root-pn opening page-size function)
+  (declare (sys:downward-funarg function))
+  (let ((mbs (max-branch-size page-size))
+	(root-pn root-pn)
+	(last-key-touched nil))
+    (when (block retry
+	    (labels ((map-node (node pn)
+		       (check-page node pn *b-set-page-code* opening)
+		       (with-stack-list (ip opening pn 0 pn)
+			 (with-stack-list* (*ip-list* ip *ip-list*)
+			   (cond ((= (node-kind node) *branch*)
+				  (loop for i = (third ip)
+					while ( i (node-count node)) do
+				    (let ((child-pn (aref node (pidx i))))
+				      (map-node (dbfs:read-page opening child-pn) child-pn)
+				      (let ((ip (find root-pn *ip-list*
+						      :test
+						      #'(lambda (ignore ip)
+							  (and (eq (first ip) opening)
+							       (= (second ip) root-pn))))))
+					(unless (third ip)
+					  (setq root-pn (fourth ip))
+					  (return-from retry t)))
+				      (incf (third ip))
+				      (fake-unlock-page opening child-pn))))
+				 (t
+				  (loop for i = (third ip)
+					while (< i  (node-count node)) do
+				    (funcall function (setq last-key-touched
+							    (aref node (kidx i))))
+				    (let ((ip (find root-pn *ip-list*
+						    :test
+						    #'(lambda (ignore ip)
+							(and (eq (first ip) opening)
+							     (= (second ip) root-pn))))))
+				      (unless (third ip)
+					(setq root-pn (fourth ip))
+					(return-from retry t)))
+				    (incf (third ip)))))))))
+	      (map-node (dbfs:read-page opening root-pn) root-pn)))
+      (map-over-range (1+ last-key-touched) nil root-pn opening page-size function))
+    (fake-unlock-page opening root-pn))
+  nil)
+
+;;; (defun search-node (node key))
+;;; If key is found, index is the obvious thing, but
+;;; if key is not found, then index points to the lowest value greater
+;;; than key.  That is, it points "just above the gap".
+;;; RESULT INCLUDES HEADER!
+;;; But it's a key index, not a pointer index.
+
+;;; from-p: If key is found, first pointer is the one just to the right
+;;; of key in the picture, which really means (1+ index).  If key is not
+;;; found, then index is above the gap, so use index.
+
+;;; below-p: If key is found, first non-pointer is the one two to the
+;;; right of index.  If key is not found, then index is above the gap,
+;;; so use one above.
+
+;;; I no longer understand the following question.  Sigh.
+;;; what is there ISN'T any value greater than key??  range 11-12 in my picture?
+;;; Then it will point OFF the END.  Check all callers of search-node
+;;; and make sure this is copacetic.
+
+;;; Apply function to each element of the set in the range
+;;; from-key  key < below-key, in order.  If below-key if nil,
+;;; then just go from-key  key < 
+(defun map-over-range (from-key below-key root-pn opening page-size function)
+  (declare (sys:downward-funarg function))
+  (let ((mbs (max-branch-size page-size))
+	(last-key from-key)
+	(root-pn root-pn))
+    (loop while
+	    (block retry
+	      (labels ((map-range (node pn)
+			 (check-page node pn *b-set-page-code* opening)
+			 (let ((count (node-count node)))
+			   (cond ((= (node-kind node) *branch*)
+				  (let ((from-p (if (< last-key (aref node (kidx 0)))
+						    0
+						    (multiple-value-bind (found-p index)
+							(search-node node last-key)
+						      (+ (- index *node-header-size*)
+							 (if found-p 1 0)))))
+					(below-p
+					  (if (or (null below-key)
+						  (> below-key (aref node (kidx (1- count)))))
+					      (1+ count)
+					      (multiple-value-bind (found-p index)
+						  (search-node node below-key)
+						(+ (- index *node-header-size*)
+						   (if found-p 2 1))))))
+				    (with-stack-list (ip opening pn from-p pn)
+				      (with-stack-list* (*ip-list* ip *ip-list*)
+					(loop for i = (third ip)
+					      while (< i below-p) do
+					  (let ((child-pn (aref node (pidx i))))
+					    (map-range (dbfs:read-page opening child-pn)
+						       child-pn)
+					    (let ((ip (find root-pn *ip-list*
+							    :test
+							    #'(lambda (ignore ip)
+								(and (eq (first ip) opening)
+								     (= (second ip)
+									root-pn))))))
+					      (unless (third ip)
+						(setq root-pn (fourth ip))
+						(incf last-key)
+						(return-from retry t)))
+					    (incf (third ip))))))))
+				 (t
+				  ;; *leaf* node
+				  (multiple-value-bind (nil from-i)
+				      (search-node node last-key)
+				    (multiple-value-bind (nil below-i)
+					(if below-key
+					    (search-node node below-key)
+					    (values nil (+ 3 count)))
+				      (with-stack-list (ip opening pn from-i pn)
+					(with-stack-list* (*ip-list* ip *ip-list*)
+					  (loop for i = (third ip)
+						while (< i below-i) do
+					    (funcall function (setq last-key (aref node i)))
+					    (let ((ip (find root-pn *ip-list*
+							    :test
+							    #'(lambda (ignore ip)
+								(and (eq (first ip) opening)
+								     (= (second ip)
+									root-pn))))))
+					      (unless (third ip)
+						(setq root-pn (fourth ip))
+						(incf last-key)
+						(return-from retry t)))
+					    (incf (third ip))))))))))
+			 nil))
+		(map-range (dbfs:read-page opening root-pn) root-pn))))))

@@ -1,0 +1,388 @@
+/*-*- Mode: C; Package: C-USER; Search-List: RPC; Tab-width: 4 -*- */
+/*>
+ *> *****************************************************************************************
+ *> ** (c) Copyright 1993-1990 Symbolics, Inc.  All rights reserved.
+ *> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+ *>
+ *>    The software, data, and information contained herein are proprietary 
+ *> to, and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+ *> to keep such software, data, and information confidential and to preserve 
+ *> them as trade secrets.  They are given in confidence by Symbolics pursuant 
+ *> to a written license agreement, and may be used, copied, transmitted, and 
+ *> stored only in accordance with the terms of such license.
+ *> 
+ *> Symbolics, Symbolics 3600, Symbolics 3670 (R), Symbolics 3675 (R), Symbolics
+ *> 3630, Symbolics 3640, Symbolics 3645 (R), Symbolics 3650 (R), Symbolics 3653,
+ *> Symbolics 3620 (R), Symbolics 3610 (R), Symbolics Common Lisp (R),
+ *> Symbolics-Lisp (R), Zetalisp (R), Genera (R), Wheels (R), Dynamic Windows (R),
+ *> SmartStore (R), Semanticue (R), Frame-Up (R), Firewall (R), Document Examiner (R),
+ *> Delivery Document Examiner, "Your Next Step in Computing" (R), Ivory, MacIvory,
+ *> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+ *> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal (R),
+ *> Symbolics Prolog, Symbolics Fortran (R), CLOE (R), CLOE Application Generator,
+ *> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia, Joshua,
+ *> Statice (R), and Minima are trademarks of Symbolics, Inc.
+ *> 
+ *> RESTRICTED RIGHTS LEGEND
+ *>    Use, duplication, and disclosure by the Government are subject to restrictions 
+ *> as set forth in subdivision (c)(1)(ii) of the Rights in Technical Data and Computer 
+ *> Software Clause at DFAR 52.227-7013.
+ *> 
+ *>      Symbolics, Inc.
+ *>      6 Concord Farms
+ *>      555 Virginia Road
+ *>      Concord, Massachusetts 01742-2727
+ *>      United States of America
+ *>      508-287-1000
+ *>
+ *> *****************************************************************************************
+ *>
+ */
+
+/* This file is SYS:EMBEDDING;RPC;UNIX;DGAGENT.C.
+ *
+ * Datagram agents are like byte stream agents, except:
+ *     . They assume one XDR block per datagram, and so flush
+ *       the in-stream block headers
+ *     . They can serve multiple clients in one process, and so
+ *       must use specially-generated internal transaction IDs and
+ *       maintain a table of internal ID to <external ID, client>
+ *       to direct replies to the proper client.
+ *
+ * $Log:	dgagent.c,v $
+ * Revision 2.5.1.2  93/02/01  12:55:37  kaufman
+ * Update copyright notices
+ * 
+ * Revision 2.5.1.1  93/02/01  11:51:25  kaufman
+ * Baseline for distributed software
+ * 
+ * Revision 2.5  93/02/01  11:39:55  kaufman
+ * Baseline for Genera 8.3
+ * 
+ *
+ */
+
+#ifndef lint
+static char *rcsid = "@(#)$Header: /usr/share/local/symbolics/src/RCS/dgagent.c,v 2.5.1.2 93/02/01 12:55:37 kaufman Rel $";
+#endif
+
+#include <stdio.h>		/* For stderr in DeallocateID() */
+#include "dgagent.h"
+#include "error.h"
+
+/* Receive an XDRBlock.  Like BSReceiveBlock(), except that the in-stream
+ * block header is replaced by a third argument that tells how long the 
+ * block is.  We also allocate enough space off the end of the block
+ * to cache the name of the client who sent this block. */
+OSErr DGReceiveBlock(agent, ret_block, n_bytes)
+  DG_XDRAgent* agent;
+  XDRBlock* ret_block;
+  LongInt n_bytes;
+{
+  XDRBlock block;
+  unsigned LongInt count;
+  OSErr err;
+  
+  *ret_block = NULL;
+  count = n_bytes;
+  err  = AllocateBlock(agent, (n_bytes >> 2) + DG_XDRAgent_name_size(agent), &block);
+  if ( err ) return ( err );
+  err = DG_XDRAgent_input(agent, &count, block);
+  if ( err == noErr && count != n_bytes) err = rpc_transmission_failed_error;
+  if ( err == noErr ) *ret_block = block;
+  return (err);
+}
+
+/* Send an XDRBlock.  Like BSSendBlock(), but doesn't send the in-stream block header. */
+OSErr DGSendBlock(agent, block)
+  DG_XDRAgent* agent;
+  XDRBlock block;
+{
+  unsigned LongInt n_bytes = XDRDataSize(((struct XDRAgentRecord *)agent), block) << 2;
+  LongInt count;
+  OSErr err;
+  
+  SetupAgentA4(agent);
+  count = n_bytes;
+  err = DG_XDRAgent_output(agent, &count,
+			   XDRDataPointer(((struct XDRAgentRecord *)agent), block), true);
+  if ( err == noErr && count != n_bytes) err = rpc_transmission_failed_error;
+  XDRReleaseBlock(((struct XDRAgentRecord *)agent), block);
+  RestoreAgentA4();
+  return (err);
+}
+
+/* Differs from BSPoll() because it needs to pass a third argument to DGReceiveBlock(). */
+OSErr DGPoll(agent, ret_block)
+  DG_XDRAgent* agent;
+  XDRBlock* ret_block;
+{
+  LongInt count;
+  OSErr err;
+  
+  SetupAgentA4(agent);
+  *ret_block = NULL;
+  err = DG_XDRAgent_listen(agent, &count);
+  if ( err == noErr && count >= 4 ) 
+    err = DGReceiveBlock(agent, ret_block, count);
+  RestoreAgentA4();
+  return(err);
+}
+
+/* Like DataSize(), but compensates for the extra space off the end of the block */
+LongInt DGDataSize(agent, block)
+  DG_XDRAgent *agent;
+  XDRBlock block;
+{
+  /* Match arg to AllocateBlock */
+  return((AllocatedSize(block) >> 2) - 1 -
+	 (agent->ConnectedP == FALSE ? DG_XDRAgent_name_size(agent) : 0));
+}
+
+/* Like PollForCall(), except we translate the transaction ID to a unique
+ * internal ID, and log external ID and the name of the peer who sent it. */
+OSErr DGPollForCall(agent, ret_block, ret_pointer, ret_limit,
+		    ret_module_number, ret_module_version, ret_entry_number,
+		    ret_transaction_id)
+  XDRAgent agent;
+  XDRBlock* ret_block;
+  LongInt** ret_pointer;
+  LongInt** ret_limit;
+  LongInt* ret_module_number;
+  LongInt* ret_module_version;
+  LongInt* ret_entry_number;
+  LongInt* ret_transaction_id;
+{ OSErr err;
+  XDRBlock block;
+  LongInt size;
+  int i;
+  register RPCCallHeader* h;
+
+  SetupAgentA4(agent);
+  *ret_block = NULL;
+  err = PollAgent(agent, &block);
+  if ( err )
+    { RestoreAgentA4();
+	  return(err); }
+  if ( block != NULL )
+    { h = (RPCCallHeader*)XDRDataPointer(agent, block);
+      if ( h->RPCMessageType == 0 )             /* Call */
+        { /* ---if ( h -> RPCVersion != 2 ) barf; */
+	  *ret_block = block;
+	  size = XDRDataSize(agent, block);
+          *ret_pointer = (LongInt*)h;
+          *ret_limit = *ret_pointer + size;
+          *ret_module_number = h->ModuleNumber;
+          *ret_module_version = h->ModuleVersion;
+          *ret_entry_number = h->EntryNumber;
+          h->TransactionID = AllocateID(agent, h->TransactionID,
+					XDRDGNamePointer(agent,block));
+	  *ret_transaction_id = h->TransactionID;
+          RestoreAgentA4();
+          return(noErr);
+        }
+      else if ( h->RPCMessageType == 1 )	/* Reply */
+		{ for(i = 0; i < MAX_PENDING_CALLS; i++)
+			if ( agent->pending_calls[i].call_waiting
+			     && agent->pending_calls[i].transaction_id == h->TransactionID 
+				 && agent->pending_calls[i].reply_block == NULL )
+			  { agent->pending_calls[i].reply_block = block;
+				RestoreAgentA4();
+				return(noErr);
+			  };
+		};
+	  /* Get here for unexpected replies and for garbage blocks */
+	  XDRReleaseBlock(agent, block);
+	}
+  RestoreAgentA4();
+  return(noErr);
+}
+
+/* Like InitiateReply(), except we allocate extra space off the XDRBlock, and
+ * backtranslate the internal transaction ID to an external id, name pair. */
+OSErr DGInitiateReply(agent, TransactionID, size, ret_block, ret_pointer, ret_limit)
+  DG_XDRAgent *agent;
+  LongInt TransactionID, size;
+  XDRBlock* ret_block;
+  LongInt** ret_pointer;
+  LongInt** ret_limit;
+{
+  XDRBlock block;
+  LongInt* pointer;
+  LongInt* limit;
+  register RPCReplyHeader* h;
+  OSErr err;
+
+  SetupAgentA4(agent);
+  err = XDRAllocateBlock(((struct XDRAgentRecord *)agent),
+			 RPCReplyHeaderLength + size + DG_XDRAgent_name_size(agent),
+			 &block);
+  if ( err )
+    { RestoreAgentA4();
+	  return ( err ); }
+  pointer = XDRDataPointer(((struct XDRAgentRecord *)agent), block);
+  limit = pointer + RPCReplyHeaderLength + size;
+  h = (RPCReplyHeader*)pointer;
+
+  h->TransactionID = DeallocateID(agent, TransactionID,
+				  XDRDGNamePointer(((struct XDRAgentRecord *)agent),block));
+  h->RPCMessageType = 1;
+  h->ReplyStatus = 0;
+  h->VerificationFlavor = 0;
+  h->VerificationLength = 0;
+  h->AcceptStatus = SUCCESS;
+
+  *ret_block = block;
+  *ret_pointer = pointer + RPCReplyHeaderLength;
+  *ret_limit = limit;
+  RestoreAgentA4();
+  return (noErr);
+}
+
+/* Like InitiateError(), except we allocate extra space off the XDRBlock, and
+ * backtranslate the internal transaction ID to an external id, name pair. */
+OSErr DGInitiateError(agent, CallXDRBlock, ActualModuleVersion, error_number, size,
+		      ret_block, ret_pointer, ret_limit)
+  DG_XDRAgent *agent;
+  XDRBlock CallXDRBlock;
+  LongInt ActualModuleVersion, error_number, size;
+  XDRBlock* ret_block;
+  LongInt** ret_pointer;
+  LongInt** ret_limit;
+{
+  XDRBlock block;
+  LongInt* pointer;
+  LongInt* limit;
+  register RPCCallHeader* ch =
+    (RPCCallHeader*)XDRDataPointer(((struct XDRAgentRecord *)agent), CallXDRBlock);
+  register RPCErrorReplyHeader* h;
+  OSErr err;
+
+  SetupAgentA4(agent);
+  err = XDRAllocateBlock(((struct XDRAgentRecord *)agent), RPCErrorReplyHeaderLength + size
+			 + DG_XDRAgent_name_size(agent), &block);
+  if ( err )
+    { RestoreAgentA4();
+	  return ( err ); }
+  pointer = XDRDataPointer(((struct XDRAgentRecord *)agent), block);
+  limit = pointer + RPCErrorReplyHeaderLength + size;
+  h = (RPCErrorReplyHeader*)pointer;
+
+  h->TransactionID = DeallocateID(agent, ch->TransactionID,
+				  XDRDGNamePointer(((struct XDRAgentRecord *)agent),block));
+  h->RPCMessageType = 1;
+  h->ReplyStatus = 0;
+  h->VerificationFlavor = 0;
+  h->VerificationLength = 0;
+  h->AcceptStatus = REMOTE_ERROR;
+  h->LowestModuleVersion = ActualModuleVersion;			/* real value not known */
+  h->HighestModuleVersion = ActualModuleVersion;		/* real value not known */
+  h->ModuleNumber = ch->ModuleNumber;
+  h->ModuleVersion = ch->ModuleVersion;
+  h->EntryNumber = ch->EntryNumber;
+  h->ActualModuleVersion = ActualModuleVersion;
+  h->ErrorCode = error_number;
+
+  *ret_block = block;
+  *ret_pointer = pointer + RPCErrorReplyHeaderLength;
+  *ret_limit = limit;
+  RestoreAgentA4();
+  return (noErr);
+}
+
+
+/* Routines to manage the transaction ID table */
+
+#define IDTABLE_SIZE_INCREMENT 20
+
+AllocateID (agent, AnExternalID, AnExternalName)
+     DG_XDRAgent *agent;
+     LongInt AnExternalID;
+     char *AnExternalName;
+{
+  register int i;
+  IDPair *id = NULL;
+
+  /* Search for an empty entry */
+  for (i = 0; i < agent->IDTableSize; i++)
+    if (agent->IDTable[i].InternalID == 0) {
+      id = &agent->IDTable[i];
+      break;
+    }
+
+  if (id == NULL) {
+    /* Grow the table */
+    i = agent->IDTableSize;
+    agent->IDTableSize += IDTABLE_SIZE_INCREMENT;
+    if (agent->IDTable == NULL)
+      agent->IDTable = (IDPair *) malloc(agent->IDTableSize * sizeof(IDPair));
+    else
+      agent->IDTable = (IDPair *) realloc((char *) agent->IDTable,
+					  agent->IDTableSize * sizeof(IDPair));
+
+    /* Primitive error checking for primitive errors */
+    if (agent->IDTable == NULL) {
+      fprintf(stderr, "Couldn't allocate memory for transcation ID table\n");
+      abort();
+    }
+
+    /* Zero new entries, use the first one */
+    id = &agent->IDTable[i];
+    for (; i < agent->IDTableSize; i++) {
+      agent->IDTable[i].InternalID = 0;
+      agent->IDTable[i].ExternalName = (char *) malloc(agent->NameLength);
+    }
+  }
+
+  /* Set up the entry */
+  id->InternalID = agent->InternalIDCounter++;
+  id->ExternalID = AnExternalID;
+  bcopy(AnExternalName, id->ExternalName, agent->NameLength);
+
+  /* Look out for wraparound */
+  if (agent->InternalIDCounter == 0)
+    agent->InternalIDCounter++;
+
+  /* Return the internal ID */
+  return(id->InternalID);
+}
+
+DeallocateID (agent, AnInternalID, AnExternalName)
+     DG_XDRAgent *agent;
+     LongInt AnInternalID;
+     char *AnExternalName;
+{
+  register int i;
+
+  for (i = 0; i < agent->IDTableSize; i++)
+    if (agent->IDTable[i].InternalID == AnInternalID) {
+      agent->IDTable[i].InternalID = 0;
+      bcopy(agent->IDTable[i].ExternalName, AnExternalName, agent->NameLength);
+      return(agent->IDTable[i].ExternalID);
+    }
+
+  /* Should never get here */
+  fprintf(stderr, "Failed to backtranslate internal transaction ID 0x%x\n", AnInternalID);
+  abort();
+}
+
+
+
+void DG_XDRAgent_fill_handlers(agent)
+  DG_XDRAgent *agent;
+{
+  Std_XDRAgent_fill_handlers(agent);
+  /* agent->close must be provided by a more specific "flavor" */
+  agent->SendBlock = (void*)DGSendBlock ;
+  agent->Poll = (void*)DGPoll;
+  agent->DataSize = (void*)DGDataSize;
+  agent->PollForCall = DGPollForCall;
+  agent->InitiateReply = (void*)DGInitiateReply;
+  agent->InitiateError = (void*)DGInitiateError;
+  /* Set up Transaction ID table */
+  agent->InternalIDCounter = 1;
+  agent->IDTableSize = 0;
+  agent->IDTable = NULL;
+  agent->ConnectedP = FALSE;
+}
+

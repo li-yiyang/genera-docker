@@ -1,0 +1,356 @@
+;;; -*- Mode: Lisp; Syntax: Common-lisp; Package: DBFS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;
+;;; rework of sys:statice;file;locks
+;;;
+
+
+;;; this is bogus!
+(defmacro atomically (&body body)
+  ;; Currently, just use without-interrupts.  Might change this to use a
+  ;; smaller hammer later if the need arises.
+  "Used around small pieces of code to do the operation atomically.  Should
+   not be used around anything which blocks."
+  `(without-interrupts
+     ,@body))
+
+
+;;; Stuff for debugging new locks
+
+;;; cf lelijkerd
+(defvar *test-function-frame* nil)
+(defmacro current-stack-function-list ()
+  `(loop with frame = (sys:%stack-frame-pointer)	    ;Skip this frame.
+	 do (setq frame (dbg:frame-previous-active-frame frame))
+	 while (and frame (neq frame *test-function-frame*))
+	 collect (sys:frame-function frame)))
+
+(defvar *lock-events* (make-hash-table))
+
+(defun note-lock-event (lock event)
+  (ignore lock event)
+  #+ignore
+  (when (string-equal (process::lock-name lock) "Page Latch")
+    (when (and (eq event :before-lock) (holding-lock lock))
+      (error "recursive-page-lock"))
+    (let ((backtrace (loop repeat 3 for fun in (current-stack-function-list) collect fun)))
+      (setf (gethash lock *lock-events*)
+	    (nconc (gethash lock *lock-events*)
+		   (list (list event si:current-process
+			       (process::decode-lock-for-debugger lock)
+;			       (condition-case (err)
+;				    (write-to-string (process::decode-lock-for-debugger lock)
+;						     :circle t
+;						     :pretty nil)
+;				  (error "Error"))
+
+			       backtrace
+			       (incf *event-number*))))))))
+
+(defun dump-lock-history (lock &optional show-only-last-n)
+  (let* ((events (gethash lock *lock-events*))
+	 (skip-first-n (if (null show-only-last-n) 0 (- (length events) show-only-last-n))))
+    (loop for event in (nthcdr skip-first-n events)  do
+      (format t "~&~A by ~A state ~S ~S ~S" (first event) (second event) (third event)
+	      (fourth event) (fifth event)))))
+
+;;;
+;;; new locks.  there appear to be two capabilities that statice uses
+;;; locks for, other than the obvious one of interlocking.  One is for
+;;; queueing, which it calls fifo locks, and the other is ordered-ness.
+;;; the first we get for free, with the system's queued-lock mixins, the
+;;; second we do here.
+;;;
+
+;;; for ordered locks, the "current" lock for this process.  a lock
+;;; instance, not a lock number.
+(sys:defvar-resettable *process-holding-lock* nil)
+
+(defflavor ordered-lock-mixin (number) ()
+  :abstract-flavor	
+  (:conc-name lock-)
+  (:required-flavors process::basic-lock)
+  (:readable-instance-variables number)
+  (:initable-instance-variables number)
+  (:required-init-keywords :number))
+
+(defflavor nonordered-lock-mixin () ()
+  :abstract-flavor
+  (:required-flavors process::basic-lock))
+
+;;; this mixin implements the don't block-inside-process-wait
+;;; functionality that this stuff depends on.
+(defflavor block-only-when-safe-mixin
+	()
+	()
+  )
+
+(defwhopper (process::lock-internal block-only-when-safe-mixin) (lock-argument)
+  (cond ((process:safe-to-process-wait-p *current-process*)
+	 (continue-whopper lock-argument)
+	 t)
+	(t
+	 nil)))
+
+
+
+;;; These two replace the normal ordered and nonordered locks.  
+(defflavor ordered-fifo-lock
+	()
+	(ordered-lock-mixin 
+	 block-only-when-safe-mixin
+	 process::multiple-reader-single-writer-lock-mixin
+	 process::recursive-lock-mixin
+	 process::basic-lock)
+  ;; (:constructor nil)
+  )
+
+(defflavor nonordered-fifo-lock
+	()
+	(nonordered-lock-mixin 
+	 block-only-when-safe-mixin
+	 process::multiple-reader-single-writer-lock-mixin
+	 process::recursive-lock-mixin
+	 process::basic-lock)
+  ;; (:constructor nil)
+  )
+
+;;; these two are the same thing, but non-queued
+
+(defflavor ordered-simple-lock
+	()
+	(ordered-lock-mixin
+	 block-only-when-safe-mixin
+	 process::simple-lock-mixin
+	 process::recursive-lock-mixin
+	 process::basic-lock)
+  )
+
+(defflavor nonordered-simple-lock
+	()
+	(nonordered-lock-mixin
+	 block-only-when-safe-mixin
+	 process::simple-lock-mixin
+	 process::recursive-lock-mixin
+	 process::basic-lock)
+  )
+
+;;; macros to lock 'em.  
+(defmacro with-ordered-lock ((lock) &body body &environment env)
+  (once-only (lock &environment env)
+    `(progn
+       (unless (typep ,lock 'ordered-lock-mixin)
+	 (error "~S is not an ordered lock!" ,lock))
+       (when (and *process-holding-lock*
+		  ( (lock-number ,lock)
+		     (lock-number *process-holding-lock*)))
+	 (error "Lock out of order: Trying to lock ~A while holding ~A"
+		,lock *process-holding-lock*))
+       (let ((*process-holding-lock* ,lock))
+	 (process:with-lock (,lock)
+	   (note-lock-event ,lock :lock)
+	   (multiple-value-prog1 
+	     (progn ,@body)
+	     (note-lock-event ,lock :unlock)))))))
+
+;;; kludge, statice mostly calls it this...
+(defmacro with-lock ((lock) &body body)
+  `(with-ordered-lock (,lock) ,@body))
+
+(defmacro with-nonordered-lock ((lock) &body body &environment env)
+  (once-only (lock &environment env)
+    `(progn
+       (unless (typep ,lock 'nonordered-lock-mixin)
+	 (error "~S is not a nonordered lock!" ,lock))
+       (process:with-lock (,lock)
+	 (note-lock-event ,lock :lock)
+	 (multiple-value-prog1 
+	   (progn ,@body)
+	   (note-lock-event ,lock :unlock))))))
+
+;;; these lock operations used to be in methods.  just inline the
+;;; ordered part, then call the rest of the locking mechanism
+(defmacro ordered-lock (lock lock-arg)
+  (once-only (lock)
+    `(progn 
+       (unless (typep ,lock 'ordered-lock-mixin)
+	 (error "~S is not an ordered lock!" ,lock))
+       (when (and *process-holding-lock*
+		  ( (lock-number ,lock)
+		     (lock-number *process-holding-lock*)))
+	 (error "Lock out of order: Trying to lock ~A while holding ~A"
+		,lock *process-holding-lock*))
+       (prog1
+	 (process:lock ,lock ;;(process::make-lock-argument ,lock)
+		       ,lock-arg)
+	 (note-lock-event ,lock :lock)))))
+
+(defmacro nonordered-lock (lock lock-arg)
+  (once-only (lock)
+    `(progn 
+       (unless (typep ,lock 'nonordered-lock-mixin)
+	 (error "~S is not a nonordered lock!" ,lock))
+       (prog1
+	 (process:lock ,lock ,lock-arg)
+	 (note-lock-event ,lock :unlock)))))
+
+(defmacro unlock (lock &optional (lock-arg `(process::lock-holder ,lock)))
+  `(prog1
+     (progn (note-lock-event ,lock :before-unlock)
+	    (without-interrupts
+	      (unless (holding-lock ,lock)
+		(error "Trying to unlock lock ~S, which you don't hold!" ,lock))
+	      (process:unlock ,lock ,lock-arg)))
+     (note-lock-event ,lock :unlock)))
+
+;;; kludge, for determining who's holding the lock.
+(defmethod (process::lock-holder process::basic-lock) ()
+  (process::decode-lock-for-debugger self))
+
+(defmacro holding-lock (lock) 
+  `(let ((lock-arg (process::lock-holder ,lock)))
+     (and lock-arg (listp lock-arg)
+	  (eq (process::lock-argument-process lock-arg) *current-process*))))
+
+
+(defmacro abort-lock (lock &optional (lock-arg `(process::lock-holder ,lock)))
+  `(progn (without-interrupts 
+	    (unless (holding-lock ,lock)
+	      (error "Attempt to abort lock ~S which we don't own!" ,lock))
+	    (loop while (holding-lock ,lock)
+		  do (process::abort-lock ,lock ,lock-arg)))
+	  (note-lock-event ,lock :abort)))
+
+
+(defmacro reset-lock (lock)
+  `(process:reset-lock ,lock))
+
+;;; a few places in statice want to attempt to lock, but lose if failed,
+;;; instead of waiting.
+(defsubst lock-no-hang (lock &optional lock-argument)
+  (and (store-conditional (locf (process::lock-simple-latch lock)) nil
+			  (or lock-argument (process::make-lock-argument lock)))
+       (progn (note-lock-event lock ':lock-no-hang)
+	      t)
+       lock))
+
+(defmacro with-lock-no-hang ((lock) &body body)
+  `(stack-let ((lock-argument (process::make-lock-argument ,lock)))
+     (unwind-protect-case ()
+	 (when (lock-no-hang ,lock lock-argument)
+	   ,@body)
+       (:normal
+	 (process::unlock ,lock lock-argument))
+       (:abort
+	 (process::abort-lock ,lock lock-argument)))))
+
+
+(defmacro with-lock-when-no-hang ((lock) &body body &environment env)
+  (declare (values body-value got-lock))
+  (once-only (lock &environment env)
+    `(let ((acquired-lock nil))
+       (process::with-stack-lock-argument (.arg. ,lock)
+	 (unwind-protect 
+	     (progn (without-interrupts
+		      (setf acquired-lock (lock-no-hang ,lock .arg.)))
+		    (if acquired-lock
+			(values (progn . ,body) T)
+			(values nil nil)))
+	   (when acquired-lock (unlock ,lock .arg.)))))))
+
+;;; hooks for making them
+(defun make-simple-lock (name)
+  (make-instance 'nonordered-simple-lock :name name))
+
+(defun make-ordered-simple-lock (name number)
+  (make-instance 'ordered-simple-lock :name name :number number))
+
+(defun make-ordered-fifo-lock (name number)
+  (make-instance 'ordered-fifo-lock :name name :number number))
+
+(defun make-ordered-lock (name number)
+  (make-ordered-fifo-lock name number))
+
+;;Note: This is *not* process:without-lock!!
+;;The absence of the unwind-protect is intentional!
+(defmacro with-lock-suspended ((lock) &body body &environment env)
+  (once-only (lock &environment env)
+    `(let ((.lock-argument. (process::lock-holder ,lock)))
+       (process:unlock ,lock .lock-argument.)
+       (prog1 
+	 (progn . ,body)
+	 (process:lock ,lock .lock-argument.)))))
+
+;;Macro which cleanly grabs a transaction lock without waiting.  If it
+;;gets the lock (or if it already has it), then the body is run.  If it
+;;had grabbed the lock, and didn't own the lock before, then it is sure
+;;to release the lock, even if aborts happen.
+(defmacro with-victim-locked-no-hang ((victim currently-active-transaction) &body body)
+  `(let ((already-holding-victim-lock (holding-lock (transaction-lock ,victim)))
+	 (acquired-victim-lock nil))
+     (process::with-stack-lock-argument (.arg. (transaction-lock ,victim))
+       (unwind-protect 
+	   (when (or (eq ,victim ,currently-active-transaction)
+		     already-holding-victim-lock
+		     (atomically (setf acquired-victim-lock (lock-no-hang
+							      (transaction-lock ,victim)
+							      .arg.))))
+	     . ,body)
+	 (when (and (not already-holding-victim-lock)
+		    acquired-victim-lock)
+	   (unlock (transaction-lock ,victim) .arg.))))))
+
+(compile-flavor-methods ordered-fifo-lock nonordered-fifo-lock
+			ordered-simple-lock nonordered-simple-lock)

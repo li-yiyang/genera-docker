@@ -1,0 +1,986 @@
+;;; -*- Mode: Lisp; Base: 10; Package: Mailer; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;; SMTP support for the LISP Machine.
+;; Written by C. Hornig, June 1983.
+
+;; Still to do:
+;; Server:
+;;  Really parse the paths.
+;; User:
+
+
+(defvar *smtp-debug-flag* nil "Trace SMTP operation")
+
+(defun log-smtp-debugging-event (log process-id herald format-string &rest format-args)
+  (declare (special *mailer-log*))
+  (when *smtp-debug-flag*
+    (let ((log (cond (log)
+		     ((and (variable-boundp su:*log*) su:*log*))
+		     ((and (variable-boundp *mailer-log*) *mailer-log*))
+		     (t nil))))
+      (cl:apply
+	'su:debug-with-log-or-trace-output log process-id herald format-string format-args))))
+
+
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");;; Server side
+
+0(defflavor smtp-server-timeout
+	(host
+	 operation
+	 (reply-code)
+	 (reply-text)
+	 timeout)
+	(mailer-timeout)
+  :initable-instance-variables)
+
+(defmethod (dbg:report smtp-server-timeout) (stream)
+  (format stream "SMTP timed out~@[ after ~A~] while serving host ~A:~@
+		  ~4@T~A~@[: ~D ~~A~~]"
+	  (and timeout (time:seconds-to-interval-string (floor timeout 60)))
+	  (send host :mail-name)
+	  operation
+	  reply-code reply-text))
+
+(compile-flavor-methods smtp-server-timeout)
+
+
+1;;; Stream that is used to read the message --
+;;;    "Strips" leading periods if the next character on the line is also period as
+;;;    required by 0RFC8211.
+
+0(defflavor smtp-server-stream
+	((line (make-array 80 :type 'art-string))
+	 (continuation)
+	 stream)
+	(si:buffered-input-character-stream)
+  (:initable-instance-variables stream)
+  (:writable-instance-variables stream))
+
+(defmethod (:next-input-buffer smtp-server-stream) (&optional ignore)
+  (multiple-value-bind (length eof not-eol)
+      (condition-case ()
+	   (with-stream-timeout (stream :input *network-reception-timeout*)
+	     (send stream :string-line-in t line 0 79))	1;Allow room to add a newline.
+0	 (neti:protocol-timeout
+	   (log-smtp-debugging-event nil nil "read" "~&Timed out reading message body")
+	   (error 'smtp-server-timeout :host (send stream :foreign-host)
+				       :operation "Reading message body"
+				       :timeout *network-reception-timeout*)))
+    (let ((start (if (and (plusp length) (char= (aref line 0) #/.) (not continuation))
+		     1 0)))
+      (if (or not-eol eof)
+	  (setf continuation t)
+	  (progn (setf (aref line length) #\Return)
+		 (incf length)
+		 (setf continuation nil)))
+      (when (or (zerop start) not-eol (> length 2))
+	(values line start length)))))
+
+(defmethod (:discard-input-buffer smtp-server-stream) (ignore))
+
+(compile-flavor-methods smtp-server-stream)
+
+(defresource smtp-server-stream (stream)
+  :constructor (make-instance 'smtp-server-stream :stream stream)
+  :matcher (progn (ignore object) t)
+  :initializer (setf (smtp-server-stream-stream object) stream)
+  :deinitializer (setf (smtp-server-stream-stream object) nil))
+
+
+1;; The server itself
+
+0(defflavor (2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")smtp-server
+0	(stream
+	 network
+	 network-search-rules
+	 foreign-host
+	 (claimed-host)
+	 (transaction-in-progress)
+	 sender
+	 recipients
+	 character-type-mappings
+	 (mailer)
+	 (mail-stream))
+	(neti:byte-stream-server)
+  (:functions smtp-ok smtp-reply smtp-received-line
+	      clear-transaction-in-progress start-smtp-transaction process-smtp-transaction
+	      read-and-parse-smtp-command-line execute-smtp-command
+	      hello-smtp-command
+	      mail-smtp-command
+	      recipient-smtp-command
+	      data-smtp-command
+	      reset-smtp-command
+	      send-smtp-command
+	      send-or-mail-smtp-command
+	      turn-smtp-command
+	      verify-smtp-command
+	      expand-smtp-command
+	      help-smtp-command
+	      noop-smtp-command
+	      quit-smtp-command
+	      character-type-mappings-smtp-command))
+
+(defmethod (make-instance smtp-server) (&rest ignore)
+  (setq stream (send self :stream)
+	network (send self :network)
+	network-search-rules (send network :search-rules)
+	foreign-host (send self :foreign-host))
+  (clear-transaction-in-progress))
+
+(defmethod (:server-top-level smtp-server) ()
+  (unwind-protect
+      (fs:with-automatic-login-to-sys-host
+	(when net:*system-secured*
+	  (neti:login-server :smtp foreign-host
+			     *local-mailer-user-id* nil :no-password-required t))
+	(condition-case-if (not neti:*server-debug-flag*) (error)
+	     (catch 'exit-smtp-server
+	       (smtp-reply 220 "~A SMTP service ready."
+			   (smtp-unparse-host *local-host* network-search-rules))
+	       (cl:loop
+		  (catch 'smtp-transaction-completed
+		    (multiple-value-bind (command arguments)
+			(read-and-parse-smtp-command-line)
+		      (execute-smtp-command command arguments)))))
+	   (mailer-error
+	     (smtp-reply 421 "~A" error)
+	     (send stream :finish))
+	   ((sys:remote-network-error sys:end-of-file))))
+    (when net:*system-secured*
+      (neti:logout-server :smtp foreign-host))))
+
+(defun-in-flavor (read-and-parse-smtp-command-line smtp-server) ()
+  (multiple-value-bind (line eof)
+      (condition-case ()
+	   (with-stream-timeout (stream :input *network-reception-timeout*)
+	     (send stream :line-in))
+	 (neti:protocol-timeout (values nil nil)))
+    (cond (eof
+	   (error 'sys:end-of-file :stream stream))
+	  ((null line)
+	   (log-smtp-debugging-event nil nil "read" "~&Timed out reading command line")
+	   (error 'smtp-server-timeout :host foreign-host
+				       :operation "Reading command line"
+				       :timeout *network-reception-timeout*))
+	  (t
+	   (log-smtp-debugging-event nil nil "rcvd" "~&~A" line)
+	   (let ((space-index (or (string-search-char #\Space line) (string-length line))))
+	     (values (substring line 0 space-index)
+		     (string-left-trim '(#\Space) (substring line space-index))))))))
+
+(defun-in-flavor (execute-smtp-command smtp-server) (command-name arguments)
+  (labels ((unimplemented-smtp-command (ignore)
+	     (smtp-reply 502 "~A is not implemented." command-name)))
+    (let ((command (selector command-name string-equal
+		     ("HELO" #'hello-smtp-command)
+		     ("MAIL" #'mail-smtp-command)
+		     ("RCPT" #'recipient-smtp-command)
+		     ("DATA" #'data-smtp-command)
+		     ("RSET" #'reset-smtp-command)
+		     ("SEND" #'send-smtp-command)
+		     ("SAML" #'unimplemented-smtp-command)
+		     ("SOML" #'send-or-mail-smtp-command)
+		     ("VRFY" #'verify-smtp-command)
+		     ("EXPN" #'expand-smtp-command)
+		     ("HELP" #'help-smtp-command)
+		     ("NOOP" #'noop-smtp-command)
+		     ("QUIT" #'quit-smtp-command)
+		     ("TURN" #'turn-smtp-command)
+		     ("XCTM" #'character-type-mappings-smtp-command))))
+      (if command
+	  (condition-case-if (not neti:*server-debug-flag*) (error)
+	       (funcall command arguments)
+	     (mailer-error
+	       (smtp-reply (if (typep error 'mailer-temporary-error) 450 550) "~A" error))
+	     (error (smtp-reply 451 "~A" error)))
+	(smtp-reply 500 "Unknown command ~A." command-name)))))
+
+(defun-in-flavor (smtp-reply smtp-server) (code format-string &rest format-args)
+  (let ((message (cl:apply #'format nil format-string format-args)))
+    (condition-case ()
+	 (with-stream-timeout (stream :output *network-reception-timeout*)
+	   (loop for start = 0 then (1+ eol-index)
+		 as eol-index = (string-search-char #\Return message start)
+		 as text = (format nil "~3D~:[ ~;-~] ~A"
+				   code eol-index (substring message start eol-index))
+		 do (send stream :line-out text)
+		    (log-smtp-debugging-event nil nil "sent" "~&~A" text)
+		 while eol-index)
+	   (send stream :force-output))
+       (neti:protocol-timeout
+	 (log-smtp-debugging-event nil nil "send" "~&Timed out sending ~D reply" code)
+	 (error 'smtp-server-timeout :host foreign-host
+				     :operation "Sending reply"
+				     :reply-code code
+				     :reply-text message
+				     :timeout *network-reception-timeout*)))))
+
+(defun-in-flavor (smtp-ok smtp-server) ()
+  (smtp-reply 250 "OK"))
+
+(defun-in-flavor (smtp-received-line smtp-server) ()
+  (labels ((mail-name (host)
+	     (if (stringp host)
+		 host
+		 (send host :mail-name))))
+    (let ((*namespace-search-list* network-search-rules)
+	  (claimed-host-mail-name (mail-name claimed-host))
+	  (foreign-host-mail-name (mail-name foreign-host)))
+      (format nil
+	      "Received: from ~A~:[ (~A)~;~*~] by ~A~@[ via ~A~] with SMTP~~@[ id ~~D~~]; ~A~%"
+	      claimed-host-mail-name
+	      (or (and (typep claimed-host 'host)
+		       (typep foreign-host 'host)
+		       (neti:ns-eq claimed-host foreign-host))
+		  (string-equal claimed-host-mail-name foreign-host-mail-name))
+	      foreign-host-mail-name
+	      (send *local-host* :mail-name)
+	      network
+	      (with-output-to-string (string)
+		(zwei:print-date (cl:get-universal-time) string :rfc822 t nil t t))))))
+
+(defun-in-flavor (clear-transaction-in-progress smtp-server) ()
+  (setq transaction-in-progress nil
+	sender nil
+	recipients nil
+	character-type-mappings nil))
+
+(defun-in-flavor (start-smtp-transaction smtp-server) (type sender-string)
+  (clear-transaction-in-progress)		1;Assure all state is properly set.
+0  (let ((sender-object (smtp-parse-path "FROM" sender-string network-search-rules t)))
+    (if (stringp sender-object)
+	(smtp-reply 501 "Bad reverse path: ~A." sender-string)
+      (setq transaction-in-progress type
+	    sender sender-object)))
+  transaction-in-progress)
+
+(defun-in-flavor (process-smtp-transaction smtp-server) (local-mailer)
+  (using-resource (period-stripping-stream smtp-server-stream stream)
+    (letf ((mailer local-mailer)
+	   (mail-stream period-stripping-stream))
+      (catch 'smtp-transaction-completed
+	(cl:loop
+	   (multiple-value-bind (command arguments)
+	       (read-and-parse-smtp-command-line)
+	     (execute-smtp-command command arguments)))))))
+
+(defun-in-flavor 2(hello-smtp-command smtp-server)0 (arguments)
+  (if (string-equal arguments "")
+      (smtp-reply 501 "A host name must be supplied.")
+    (setf claimed-host (or (smtp-parse-host arguments network network-search-rules)
+			   arguments))
+    (smtp-reply 250 "~A" (smtp-unparse-host *local-host* network-search-rules))))
+
+(defun-in-flavor 2(mail-smtp-command smtp-server)0 (arguments)
+  (cond (transaction-in-progress
+	 (smtp-reply 503 "~A transaction already in progress." transaction-in-progress))
+	((null claimed-host)
+	 (smtp-reply 503 "Please give a HELO command first."))
+	(t
+	 1;; Must have a store and forward mailer to proceed.
+0	 (with-local-mailer (local-mailer)
+	   (if (null local-mailer)
+	       (smtp-reply 502 "No local mailer.")
+	     (when (start-smtp-transaction :mail arguments)
+	       (send local-mailer :start-message sender)
+	       (smtp-ok)
+	       (process-smtp-transaction local-mailer)))))))
+
+(defun-in-flavor (recipient-smtp-command smtp-server) (arguments)
+  (let ((recipient (smtp-parse-path "TO" arguments network-search-rules nil)))
+    (cond ((null transaction-in-progress)
+	   (smtp-reply 503 "No transaction in progress."))
+	  ((stringp recipient)
+	   (smtp-reply 501 "Bad forward path: ~A." recipient))
+	  (t
+	   (cl:ecase transaction-in-progress
+	     (:mail
+	       (send mailer :verify-recipient recipient)
+	       (push recipient recipients)
+	       (smtp-ok))
+	     ((:send :soml)
+	       (let ((converse-rejection (zwei:converse-reject-message-p recipient t)))
+		 (if converse-rejection
+		     (smtp-reply 550 "~A" converse-rejection)
+		   (push recipient recipients)
+		   (smtp-ok)))))))))
+
+(defun-in-flavor (data-smtp-command smtp-server) (arguments)
+  (ignore arguments)
+  (cond ((null transaction-in-progress)
+	 (smtp-reply 503 "No transaction in progress."))
+	((null recipients)
+	 (smtp-reply 503 "No recipients specified."))
+	(t
+	 (smtp-reply 354 "Message: (end with .)")
+	 (cl:ecase transaction-in-progress
+	   (:mail
+	     (send mailer :receive-message (smtp-received-line) mail-stream)
+	     (smtp-ok)
+	     (send mailer :finish-message))
+	   ((:send :soml)
+	     (let ((text (with-output-to-string (text-stream)
+			   (stream-copy-until-eof mail-stream text-stream))))
+	       (when character-type-mappings
+		 1;; We've got some character type mappings -- Convert the text if possible.
+0		 (zwei:with-zmail-epsilon-decoding-handlers
+		     ()
+		     (ignore)
+		   (let ((converting-interval (zwei:create-interval text)))
+		     (zwei:font-convert-lines-interval character-type-mappings
+						       converting-interval)
+		     (setq text converting-interval))))
+	       (zwei:converse-process-incoming-message :date (time:get-universal-time)
+						       :from sender :text text)
+	       (smtp-ok))))))
+  (clear-transaction-in-progress)
+  (throw 'smtp-transaction-completed nil))
+
+(defun-in-flavor (reset-smtp-command smtp-server) (arguments)
+  (ignore arguments)
+  (when mailer
+    (send mailer :reset))
+  (clear-transaction-in-progress)
+  (smtp-ok)
+  (throw 'smtp-transaction-completed nil))	1;Back to top level if necessary.
+
+0(defun-in-flavor (send-smtp-command smtp-server) (arguments)
+  (cond (transaction-in-progress
+	 (smtp-reply 503 "~A transaction already in progress." transaction-in-progress))
+	((null claimed-host)
+	 (smtp-reply 503 "Please give a HELO command first."))
+	(t
+	 (when (start-smtp-transaction :send arguments)
+	   (smtp-ok)
+	   (process-smtp-transaction nil)))))
+
+1;;; Partial implementation --
+;;;    We won't convert it into mail if we can't send it; we'll just reject it.
+0(defun-in-flavor (send-or-mail-smtp-command smtp-server) (arguments)
+  (cond (transaction-in-progress
+	 (smtp-reply 503 "~A transaction already in progress." transaction-in-progress))
+	((null claimed-host)
+	 (smtp-reply 503 "Please give a HELO command first."))
+	(t
+	 (when (start-smtp-transaction :soml arguments)
+	   (smtp-ok)
+	   (process-smtp-transaction nil)))))
+
+(defun-in-flavor (verify-smtp-command smtp-server) (arguments)
+  (condition-case (user)
+       (neti:find-object-named :user arguments)
+     (object-not-found
+       (smtp-reply 550 "~A" user))
+     (:no-error
+       (smtp-reply  250 (smtp-unparse-path `(:user ,user) network-search-rules)))))
+
+(defun-in-flavor (expand-smtp-command smtp-server) (arguments)
+  1;; Requires the mailer for proper operation.
+0  (with-local-mailer (local-mailer)
+    (let ((recipients (send local-mailer :expand-recipient arguments)))
+      (if (symbolp recipients)
+	  (smtp-reply 550 "No such mailbox.")
+	(smtp-reply 250 "~{~A~^~%~}" (loop for recipient in recipients
+					   collect
+					     (smtp-unparse-path recipient
+								network-search-rules)))))))
+
+(defun-in-flavor (help-smtp-command smtp-server) (arguments)
+  (ignore arguments)
+  (labels ((version-string (system)
+	     (multiple-value-bind (major minor status)
+		 (sct:get-system-version system)
+	       (let ((status (when status
+			       (let ((string (second (assq status sct:system-status-alist))))
+				 (if (string-equal string "") nil string)))))
+		 (format nil "~@[~A ~]~A~@[ ~D.~D~]" status system major minor)))))
+    (let* ((zmail-version-string (version-string "Zmail"))
+	   (mailer-version-string (when (sct:find-system-named "Mailer" nil t nil)
+				    (version-string "Mailer")))
+	   (version-string (format nil "; ~A~@[, ~A~]." zmail-version-string
+				   mailer-version-string)))
+      (smtp-reply 214 "Symbolics Lisp Machine SMTP server~A~@
+		       Protocol is RFC 821.~@
+		       Commands supported are HELO, MAIL, RCPT, DATA, RSET, SEND, ~
+		       SOML, VRFY, EXPN, HELP, NOOP, QUIT, and XCTM."
+		  version-string))))
+
+(defun-in-flavor (noop-smtp-command smtp-server) (arguments)
+  (ignore arguments)
+  (smtp-ok))
+
+1;;; This is a bit of a kludge.  We say that we don't implement the TURN command but when we
+;;; are running a mailer, this will cause us to do a probe-hosts on the sending host to cause
+;;; any queued mail to get sent to the requesting host.  We achieve the same effect without
+;;; having to change us from a server to a client.
+0(defun-in-flavor 2(turn-smtp-command smtp-server)0 (arguments)
+  (ignore arguments)
+  (smtp-reply 502 "TURN is not implemented.")
+  1;; We only do this when we are running a mailer
+0  (when (eq transaction-in-progress :mail)
+    (with-local-mailer (local-mailer)
+      (when (typep local-mailer 'mailer-access-path)	1;Make sure we are really a mailer
+0	(send local-mailer :probe-one-host foreign-host)))))
+
+(defun-in-flavor (quit-smtp-command smtp-server) (arguments)
+  (ignore arguments)
+  (smtp-reply 221 "Goodbye.")
+  1;; Don't close the stream here as the user side will also try to close it --
+0  1;;    Otherwise, on networks like the CHAOSNET, both ends would hang waiting for the
+0  1;;    other side to ACK its EOF.  Therefore, assume that the user side will do the
+0  1;;    normal style close and we will do an abort close.
+0  (ignore-errors
+    (send stream :finish))
+  (throw 'exit-smtp-server nil))
+
+(defun-in-flavor (character-type-mappings-smtp-command smtp-server) (arguments)
+  (if transaction-in-progress
+      (condition-case (error)
+	   (progn
+	     (setq character-type-mappings (zwei:parse-lisp-expressions arguments 0))
+	     (smtp-ok))
+	 (sys:read-error
+	   (smtp-reply 501 "~A" error)))
+    (smtp-reply 503 "No transaction in progress.")))
+
+(compile-flavor-methods smtp-server)
+
+(define-server :smtp (:medium :byte-stream
+		      :flavor smtp-server
+		      :stream (nil :ascii-translation t)
+		      :who-line t :no-eof t
+		      :reject-unless-trusted nil
+		      :network network :host host
+		      :error-disposition :notify))
+
+(chaos:add-contact-name-for-protocol :smtp)
+
+;; User side
+
+;;; Errors
+
+(defflavor smtp-error
+	(host
+	 command
+	 expected-reply-code
+	 response-reply-code
+	 response-reply-text)
+	(mailer-error)
+  :abstract-flavor
+  :initable-instance-variables)
+
+(defmethod (make-instance smtp-error) (&rest ignore)
+  (unless (cl:listp expected-reply-code)
+    (setf expected-reply-code (list expected-reply-code))))
+
+(defmethod (:report smtp-error) (stream)
+  (format stream "SMTP error from host ~A:~@[~@
+		  ~4@TCommand issued: ~A~]~@
+		  ~4@TExpected repl~:[y~;ies~]: ~{~D~@{, ~D~}~}~@
+		  ~:[~4@TNo reply received~;~
+		     ~4@TReceived reply: ~~:*~A~~]"
+	  (send host :mail-name)
+	  command
+	  (> (length expected-reply-code) 1) expected-reply-code
+	  (or response-reply-text response-reply-code)))
+
+(defmacro define-smtp-error-codes (&body errors)
+  `(progn 'compile
+	  (defconst *smtp-error-alist* ',errors)
+	  . ,(loop for (nil tcp-err sys-err) in errors
+		   nconc `((defflavor ,tcp-err () (smtp-error ,sys-err))
+			   (compile-flavor-methods ,tcp-err)))))
+
+(define-smtp-error-codes
+  (421 smtp-host-not-available mailer-temporary-error)
+  (450 smtp-mailbox-unavailable mailer-temporary-error)
+  (451 smtp-local-error mailer-temporary-error)
+  (452 smtp-insufficient-system-storage mailer-temporary-error)
+  (500 smtp-unrecognized-command mailer-protocol-error)
+  (501 smtp-syntax-error mailer-protocol-error)
+  (502 smtp-unimplemented-command mailer-protocol-error)
+  (503 smtp-bad-command-sequence mailer-protocol-error)
+  (504 smtp-unimplemented-parameter mailer-protocol-error)
+  (550 smtp-mailbox-not-found mailer-permanent-error)
+  (551 smtp-mailbox-not-local mailer-permanent-error)
+  (552 smtp-no-more-room mailer-permanent-error)
+  (553 smtp-invalid-mailbox-name mailer-permanent-error)
+  (554 smtp-transaction-failed mailer-permanent-error))
+
+(defflavor smtp-protocol-violation
+	()
+	(smtp-error mailer-protocol-error))
+
+(compile-flavor-methods smtp-protocol-violation)
+
+(defflavor smtp-transaction-timeout
+	()
+	(smtp-error mailer-timeout))
+
+(defmethod (dbg:report smtp-transaction-timeout) (stream)
+  (format stream "SMTP timed out~@[ after ~A~] while using host ~A:"
+	  (and timeout (time:seconds-to-interval-string (floor timeout 60)))
+	  (send host :mail-name))
+  (cond (command
+	 (format stream "~&~4@T~:[Sending~;Waiting for reply to~] command: ~A"
+		 (eq direction :input) command))
+	(expected-reply-code
+	 (format stream "~&~4@TWaiting for ~:[initial greeting~;reply to message body~]"
+		 (= (first expected-reply-code) 250)))
+	(t
+	 (format stream "~&~4@TSending message body"))))
+
+(compile-flavor-methods smtp-transaction-timeout)
+
+;;; The actual code
+
+(defflavor smtp-user
+	(stream
+	 host
+	 (smtp-command "MAIL")
+	 network-search-rules)
+	(mail-access-path)
+  (:initable-instance-variables stream host smtp-command))
+
+(defun-in-flavor (init-smtp-user-session smtp-user) ()
+  (smtp-check-reply stream 220 timeout)
+  (setq network-search-rules (if (send stream :operation-handled-p :network)
+				 (send (send stream :network) :search-rules)
+				 *namespace-search-list*))
+  (smtp-check-reply stream 250 timeout "HELO ~A"
+		    (smtp-unparse-host *local-host* network-search-rules)))
+
+(defmethod (:init smtp-user) (ignore)
+  (init-smtp-user-session))
+
+(defmethod (:need-return-path smtp-user) () t)
+
+(defmethod (:start-message smtp-user) (&rest ignore)
+  (smtp-check-reply stream 250 timeout "~A From:~A"
+   smtp-command
+   (smtp-unparse-path
+     (add-host-to-route net:*local-host* return-path) network-search-rules)))
+
+(defmethod (:verify-recipient smtp-user) (recipient)
+  (smtp-check-reply stream '(250 251) timeout "RCPT To:~A"
+   (smtp-unparse-path recipient network-search-rules)))
+
+(defmethod (:expand-recipient smtp-user) (recipient &optional collect-errors)
+  (multiple-value-bind (nil reply)
+      (smtp-check-reply stream 250 timeout "EXPN ~A" (get (locf recipient) :name))
+    (let ((zwei:*default-host-when-parsing* host))
+      (zwei:parse-addresses-in-smtp-reply reply collect-errors))))
+
+(defmethod (:character-type-mappings smtp-user) (character-type-mappings)
+  (let ((reply (smtp-check-reply stream '(250 500 502 504) timeout
+				 "XCTM ~{~S ~}" character-type-mappings)))
+    (= reply 250)))
+
+(defmethod (:receive-message smtp-user) (trace-line header-stream &optional body-stream)
+  (smtp-check-reply stream 354 timeout "DATA")
+  (multiple-value-bind (transmission-timeout processing-timeout)
+      (compute-receive-message-timeout timeout stream header-stream body-stream
+						      count-of-verified-recipients)
+    (condition-case ()
+	 (with-stream-timeout (stream :output transmission-timeout)	1;Handle timeouts below.
+0	   (when trace-line (format stream trace-line nil))
+	   (smtp-user-copy header-stream stream)
+	   (when body-stream (smtp-user-copy body-stream stream))
+	   (send stream :line-out ".")
+	   (send stream :force-output))
+       (neti:protocol-timeout
+	 (log-smtp-debugging-event nil nil "send" "~&Timed out sending message body")
+	 (error 'smtp-transaction-timeout :direction :output
+					  :host host
+					  :command nil
+					  :expected-reply-code nil
+					  :timeout transmission-timeout)))
+    (smtp-check-reply stream 250 processing-timeout)))
+
+(defmethod (:connected-p smtp-user) ()
+  (condition-case ()
+      (and stream
+	   (send stream :connected-p)
+	   (smtp-check-reply stream 250 timeout "NOOP"))
+    (error (send self :close :abort) nil)
+    (:no-error t)))
+
+(defmethod (:close smtp-user) (&optional abortp)
+  (when stream
+    (cond (abortp (send stream :close :abort))
+	  (t (condition-case ()
+		 (send self :quit)
+	       (error (send stream :close :abort)))))
+    (setf stream nil)))
+
+(defmethod (:quit smtp-user) (&optional reset)
+  (when stream
+    (when reset
+      (smtp-check-reply stream 250 timeout "RSET"))
+    1;; Use the TURN command to get the receiving mailer to send us any queued mail by
+    ;; side-effect.  We only do this when we are running a mailer
+0    (with-local-mailer (local-mailer)
+      (when (and (typep local-mailer 'mailer-access-path)
+		 (string-equal (send net:*local-site* :user-get :mailer-uses-SMTP-TURN) "Yes"))
+	(smtp-check-reply stream '(221 502) timeout "TURN")))
+    (smtp-check-reply stream 221 timeout "QUIT")
+    (send stream :close :abort))		;abort is for Chaos streams to close properly
+  (setf stream nil))
+
+(defun smtp-user-copy (from-stream to-stream)
+  (loop doing
+    (multiple-value-bind (line eof)
+	(send from-stream :line-in)
+      (when line
+	(when (and (> (string-length line) 0) (char= (aref line 0) #/.))
+	  (send to-stream :tyo #/.))
+	(when (or (not eof) (plusp (string-length line)))
+	  (send to-stream :line-out line)))
+      (when eof
+	(return)))))
+
+(defun smtp-check-reply (stream expected timeout &optional format-string &rest format-args)
+  (declare (values reply-code reply-text))
+  (let ((command (when format-string
+2		   0(let ((*print-pretty* nil))
+		     (cl:apply #'format nil format-string format-args))))
+	(reply-received))
+    (unwind-protect
+	(progn
+	  (when command
+	    (condition-case ()
+		 (with-stream-timeout (stream :output timeout)	1;Handle timeouts below...
+0		   (send stream :line-out command)
+		   (log-smtp-debugging-event nil nil "sent" "~&~A" command)
+		   (send stream :finish))
+	       (neti:protocol-timeout
+		 (log-smtp-debugging-event nil nil "send" "~&Timed out sending command")
+		 (error 'smtp-transaction-timeout :direction :output
+						  :host (send stream :foreign-host)
+						  :command command
+						  :expected-reply-code nil
+						  :timeout timeout))))
+	  (with-stream-timeout (stream :input timeout)	1;Handle timeouts below...
+0	    (let ((reply-text (make-array 95. :type 'art-string :fill-pointer 0)))
+	      (values
+		(with-output-to-string (reply-stream reply-text)
+		  (loop with (line eof)
+			with (reply-code delim)
+			do (multiple-value (line eof)
+			     (condition-case ()
+				  (send stream :line-in)
+				(neti:protocol-timeout (values nil nil))))
+			   (cond (eof
+				  (error 'sys:end-of-file :stream stream))
+				 ((null line)
+				  (log-smtp-debugging-event nil nil "read"
+							    "~&Timed out waiting for reply")
+				  (error 'smtp-transaction-timeout :direction :input
+								   :host (send stream
+									       :foreign-host)
+								   :command command
+								   :expected-reply-code
+								     expected
+								   :timeout timeout))
+				 (t
+				  (log-smtp-debugging-event nil nil "rcvd" "~&~A" line)
+				  (format reply-stream "~&~A" line)))
+			do (multiple-value (reply-code delim) (parse-number line))
+			unless reply-code
+			  do (error 'smtp-protocol-violation :host (send stream :foreign-host)
+							     :command command
+							     :expected-reply-code expected
+							     :response-reply-code nil
+							     :response-reply-text reply-text)
+			until (char-equal (aref line delim) #\Space)
+			finally
+			  (setf reply-received t)
+			  (when (if (listp expected)
+				    (member reply-code expected)
+				    (= reply-code expected))
+			    (return (values reply-code)))
+			  (let ((etype (assoc reply-code *smtp-error-alist*)))
+			    (error (or (second etype)
+				       'smtp-protocol-violation)	1;Unknown error.
+0				   :host (send stream :foreign-host)
+				   :command command
+				   :expected-reply-code expected
+				   :response-reply-code reply-code
+				   :response-reply-text reply-text))))
+		reply-text))))
+      (unless reply-received
+	(send stream :close :abort)
+	(setf stream nil)))))
+
+;;; SEND user
+
+(define-protocol :smtp (:send :byte-stream)
+  (:desirability .75)
+  (:invoke (path)
+    (smtp-send-internal path)))
+
+(defun smtp-send-internal (path)
+  (let* ((plist (locf (neti:service-access-path-args path)))
+	 (host (neti:service-access-path-host path)))
+    (with-open-stream (mailer (make-instance 'smtp-user :host host :smtp-command "SEND"
+					     :stream (get-connection-for-service
+						       path :ascii-translation t)))
+      (unwind-protect-case ()
+	  (progn
+	    (send mailer :start-message (get plist :from))
+	    (send mailer :verify-recipient (get plist :to))
+	    (using-resource (encoding-stream
+			      si:epsilon-encoding-output-stream nil
+								:flavor
+								  'zwei:zmail-msg-saving-stream
+								:dumping-fat t)
+	      (let* ((text (get plist :text))
+		     (text-interval (zwei:text-as-interval text)))
+		(multiple-value-bind (character-type-mappings diagrams-present)
+		    (zwei:compute-interval-character-type-mappings text-interval nil nil
+								   encoding-stream)
+		  (when (and (null character-type-mappings) diagrams-present)
+		    (setf character-type-mappings (list
+						    (zwei:character-type-mapping-for-type-0))))
+		  (when character-type-mappings
+		    (unless (send mailer :character-type-mappings character-type-mappings)
+		      1;; Remote host doesn't support Character-Type-Mappings --
+0		      1;;    Signal the standard Converse error which will allow 2zwei:send-msg
+0		      1;;    to print an appropriate warning and retry without fat characters.
+0		      1;;    However, we may not be invoked from 2zwei:send-msg1.  Therefore,
+0		      1;;    we'll setup a default handler that allows us to continue but
+0		      1;;    without printing a warning.  (Sigh)
+0		      (condition-bind-default ((zwei:remote-converse-error
+						 #'(lambda (ignore)
+						     (throw 'continue-ourself ()))))
+			(catch 'continue-ourself
+			  (error 'zwei:remote-converse-error
+				 :string (format nil
+						 "~A doesn't support Character-Type-Mappings."
+						 (send host :mail-name))
+				 :to (get plist :to))))
+		      (setq character-type-mappings nil
+			    text (condition-case ()
+				      (string-thin (zwei:text-as-string text) :error-if :fat)
+				    (error
+				      (error 'zwei:remote-converse-error
+					     :string (format nil "Message contains characters ~
+								  that can not be sent to ~A"
+							     (send host :mail-name))
+					     :to (get plist :to)))))))
+		  (with-input-from-string
+		    (stream (string-append
+			      (with-output-to-string (stream)
+				(zwei:output-headers stream
+						     `(:headers (:date ,(get plist :date)
+								 :from (,(get plist :from))
+								 :to ,(get plist :recipients))
+						       :header-format :internet
+						       :internet-format t
+						       :force-numeric-timezone t)
+						     t))
+			      (if (null character-type-mappings)
+				  (zwei:text-as-string text)
+				(with-output-to-string (stream)
+				  (send encoding-stream :set-stream stream :reset-mappings nil
+									   :dumping-fat t)
+				  (stream-copy-until-eof (zwei:open-interval-stream
+							   text-interval)
+							 encoding-stream)
+				  (send encoding-stream :force-output)))))
+		    (send mailer :receive-message nil stream))
+		  (send mailer :finish-message)))))
+	(:abort
+	  (ignore-errors
+	    (send mailer :quit t)))))))
+
+;;; MAIL user
+
+(define-protocol :smtp (:store-and-forward-mail :byte-stream)
+  (:desirability .75)
+  (:invoke (path)
+   (smtp-user-internal path)))
+
+(define-protocol :smtp (:mail-to-user :byte-stream)
+  (:desirability .75)
+  (:invoke (path)
+   (smtp-user-internal path)))
+
+(define-protocol :smtp (:expand-mail-recipient :byte-stream)
+  (:desirability .75)
+  (:invoke (path)
+   (smtp-user-internal path)))
+
+(defun smtp-user-internal (path)
+  ;; Can blow out in the init method if the other end isn't available for service,
+  ;; or gives an error to HELO.
+  (let ((stream nil))
+    (unwind-protect
+      (progn
+	(setq stream (get-connection-for-service path :ascii-translation t))
+	(prog1
+	  (lexpr-funcall #'make-instance 'smtp-user
+			 :host (neti:service-access-path-host path)
+			 :stream stream
+			 (neti:service-access-path-args path))
+	  (setq stream nil)))
+      (when stream
+	(send stream :close :abort)))))
+
+(defun smtp-unparse-host (host search-rules)
+  (let ((*namespace-search-list* search-rules))
+    (send host :mail-name)))
+
+(defun 2smtp-parse-host0 (string network search-rules)
+  (ignore network)
+  (let ((zwei:*allow-namespace-server-parsing-host* t)	1;Ask namespace and local domain cache.
+0	(*namespace-search-list* search-rules))
+    (condition-bind ((zwei:domain-syntax-parse-error
+		       #'(lambda (error)
+			   (when (typep (send error :contained-error) 'object-not-found)
+			     (return-from smtp-parse-host nil))
+			   nil)))
+      (let ((spec (zwei:parse-domain-or-host string)))
+	(if (eq (first spec) :object)
+	    (second spec)
+	    nil)))))
+
+(defun smtp-unparse-path (recip search-rules)
+  (or (let ((*namespace-search-list* search-rules))
+	(zwei:string-from-header recip :route))
+      "<>"))
+
+(defun smtp-parse-path (type path search-rules allow-zero)	;parse mail path
+  (let ((*namespace-search-list* search-rules)
+	(tl (string-length type))
+	(pl (string-length path)))
+    (if (not (and ( pl (+ 3 tl))
+		  (string-equal type (substring path 0 tl))
+		  (char-equal (aref path tl) #/:)
+		  ;;I don't know why this clause should be here at all -- Kalman
+		  ;;I added the OR because I encountered a mailer that had a space
+		  ;;between the FROM: and the angle bracket, but shouldn't the
+		  ;;parse-one-address call be checking these things?
+		  (or 
+		    (char-equal (aref path (1+ tl)) #/<)
+		    (and (char-equal (aref path (1+ tl)) #/space)
+			 (char-equal (aref path (+ 2 tl)) #/<)))
+		  (char-equal (aref path (1- pl)) #/>)))
+	"Badly formatted path."
+	(condition-case (error)
+	    (zwei:parse-one-address path (1+ tl) pl allow-zero)
+	  (zwei:parse-error (send error :report-string))))))
+
+1;;; Add the given host as the first hop of the supplied address unless its redundant --
+;;;    If the host is already the first hop, adding it again is redundant.
+;;;    If the host is in the same domain as the first hop and we can determine that all
+;;;       mail forwards between hosts in that domain, adding the host is redundant.
+;;;    If we can tell for certain that the host doesn't offer mail service, adding it isn't
+;;;       redundant but would ensure that return mail would fail.
+0(defun 2add-host-to-route0 (host address)
+  (when address
+    (multiple-value-bind (first-hop-host first-hop-host-string route)
+	(address-first-hop-raw address)
+      (labels ((add-host ()
+		 (cl:setf address (copytree address)
+			  (cl:getf address :route) (list* `(:object ,host) route)))
+	       (host-in-mail-area-p (site host)
+		 (let ((host-site (send host :site)))
+		   (or (neti:ns-eq site host-site)
+		       (loop for a-site in (neti:get-other-sites-in-mail-area site)
+			     thereis (neti:ns-eq a-site host-site)))))
+	       (domain-in-mail-area-p (site domain)
+		 (let* ((components (zwei:pdoh-parse-into-components domain
+								     0 (string-length domain)))
+			(superior (mapcar #'zwei:pdoh-string-from-component (cdr components)))
+			(domain-superior (and superior
+					      (zwei:string-from-host `(:domain ,@superior)
+								     :retain-common-tails))))
+		   (flet ((try (site)
+			    (let ((site-domain
+				    (send (send site :local-namespace) :internet-domain-name)))
+			      (and site-domain
+				   (string-equal site-domain domain-superior)))))
+		     (and domain-superior
+			  (or (try site)
+			      (loop for a-site in (neti:get-other-sites-in-mail-area site)
+				    thereis (try a-site))))))))
+	(cond ((and (not (send host :uninterned-p))
+		    (not (neti:ns-eq neti:*domain-namespace*
+				     (send (send host :primary-name) :namespace)))
+		    (null (cl:assoc :store-and-forward-mail (send host :service)))))
+	      (first-hop-host
+	       (cond ((neti:ns-eq host first-hop-host))
+		     ((let ((site (send host :site)))
+			(and site
+			     (neti:all-mail-addresses-forward-at-site site)
+			     (host-in-mail-area-p site first-hop-host))))
+		     ((string-equal (send host :mail-name) (send first-hop-host :mail-name)))
+		     (t
+		      (add-host))))
+	      (first-hop-host-string
+	       (cond ((let ((site (send host :site)))
+			(and site
+			     (neti:all-mail-addresses-forward-at-site site)
+			     (domain-in-mail-area-p site first-hop-host-string))))
+		     ((string-equal (send host :mail-name) first-hop-host-string))
+		     (t
+		      (add-host))))
+	      (t
+	       (add-host))))))
+  address)
+
+(compile-flavor-methods smtp-user)

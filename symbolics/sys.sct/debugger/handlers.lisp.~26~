@@ -1,0 +1,480 @@
+;;; -*- Mode: Lisp; Package: Debugger; Base: 8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; This is used by condition macros
+;;; It used to use COMPILER:EVAL-AT-LOAD-TIME-MARKER, but that caused problems
+;;; because the condition macros might be expanding to code to be -run- at compile
+;;; time rather than code to be -compiled- at compile time.
+;;; Instead, anything made this way should have a :FASD-FORM method.
+;;; Normally these are acquired through FASD-OPTIONS-MIXIN.
+(DEFUN INSTANCE-FOR-FASD (&REST ARGS)
+  (APPLY #'MAKE-INSTANCE ARGS))
+
+(DEFUN BOOTSTRAP-FASD-INSTANCES ()
+  (SETF SI:*CAN-MAKE-INSTANCES* T)
+  (FLET ((UPDATE-IT (LOC &OPTIONAL (VAL (LOCATION-CONTENTS LOC)))
+	   (WHEN (AND (LISTP VAL)
+		      (EQ (CAR VAL) SI:*COLD-MAKE-INSTANCE-MARKER*))
+	     (SETF (LOCATION-CONTENTS LOC) (APPLY #'MAKE-INSTANCE (CDR VAL)))
+	     #+VLM (%COPROCESSOR-WRITE LOC %COPROCESSOR-REGISTER-FLUSH-CACHES-FOR-VMA))))
+    (SI:MAP-COMPILED-FUNCTIONS T NIL NIL
+      #'(LAMBDA (FUNCTION IGNORE)
+	  (SI:DO-FUNCTION-CONSTANTS (VAL LOC) FUNCTION
+	    (UPDATE-IT LOC VAL))))
+    (DOLIST (H *RESTART-HANDLERS*)
+      (WHEN (TYPEP H :CLOSURE)
+	(UPDATE-IT (%MAKE-POINTER DTP-LOCATIVE H))))
+    NIL))
+
+;;;
+
+(DEFFLAVOR FASD-OPTIONS-MIXIN () ()
+  (:METHOD-COMBINATION :FASD-OPTIONS (:APPEND :MOST-SPECIFIC-LAST)))
+
+(DEFMETHOD (:FASD-FORM FASD-OPTIONS-MIXIN) ()
+  `(MAKE-INSTANCE ',(TYPEP SELF)
+		  ,@(MAPCAR #'(LAMBDA (X) `',X) (SEND SELF :FASD-OPTIONS))))
+
+;; The default includes all initable instance variables
+(DEFMETHOD (:FASD-OPTIONS FASD-OPTIONS-MIXIN) ()
+  (LOOP FOR COMPONENT IN (FLAVOR:FLAVOR-ALL-COMPONENTS (%INSTANCE-FLAVOR SELF))
+	NCONC (LOOP FOR (KEYWORD VARIABLE)
+			IN (FLAVOR::FLAVOR-LOCAL-INITABLE-INSTANCE-VARIABLES
+			     (FLAVOR:FIND-FLAVOR COMPONENT))
+		    COLLECT KEYWORD
+		    COLLECT (SYMEVAL-IN-INSTANCE SELF VARIABLE))))
+
+
+
+(DEFUN EQUAL-SET (LIST1 LIST2)
+  (AND (= (CL:LENGTH LIST1) (CL:LENGTH LIST2))
+       (LOOP FOR ELEM IN LIST1 ALWAYS (CL:MEMBER ELEM LIST2))
+       (LOOP FOR ELEM IN LIST2 ALWAYS (CL:MEMBER ELEM LIST1))))
+
+;; Make handlers in PERMANENT-STORAGE-AREA so flipping WORKING-STORAGE-AREA
+;; doesn't cause compiled functions to be modified.
+(DEFFLAVOR BASIC-HANDLER () (FASD-OPTIONS-MIXIN)
+  (:REQUIRED-METHODS :HANDLE-CONDITION :HANDLE-CONDITION-P :DESCRIBE-SELF-BRIEFLY
+		     HANDLER-EQUAL)
+  (:DEFAULT-INIT-PLIST :AREA PERMANENT-STORAGE-AREA))
+
+(DEFGENERIC MAP-OVER-INSTANCE-CALLEES
+	    (INSTANCE REAL-CALLER FUNARG
+		      &REST OPTIONS
+		      &KEY EXTERNAL-REFERENCES DEBUGGING-INFO
+		      INSTRUCTIONS MAP-OVER-INTERNAL-FUNCTIONS-TOO)
+  (DECLARE (SYS:DOWNWARD-FUNARG FUNARG)))
+
+;;;
+
+(DEFFLAVOR BIND-HANDLER (FLAVOR-ALIST) (BASIC-HANDLER)
+  :READABLE-INSTANCE-VARIABLES
+  :INITABLE-INSTANCE-VARIABLES)
+
+(DEFMETHOD (HANDLER-EQUAL BIND-HANDLER) (OTHER-HANDLER)
+  (LET ((OTHER-FLAVOR-ALIST (BIND-HANDLER-FLAVOR-ALIST OTHER-HANDLER)))
+    (AND (= (LENGTH FLAVOR-ALIST) (LENGTH OTHER-FLAVOR-ALIST))
+	 (LOOP FOR (FLAVORS1 FUNCTION1) IN FLAVOR-ALIST
+	       FOR (FLAVORS2 FUNCTION2) IN OTHER-FLAVOR-ALIST
+	       ALWAYS (AND (EQUAL-SET FLAVORS1 FLAVORS2)
+			   (EQ FUNCTION1 FUNCTION2))))))
+
+;; No *CATCH is automatically set up for CONDITION-BIND.
+(DEFMETHOD (:HANDLE-CONDITION BIND-HANDLER) (CONDITION IGNORE)
+  (LOOP FOR (FLAVORS FUNCTION) IN FLAVOR-ALIST
+	WHEN (LOOP FOR FLAVOR IN FLAVORS THEREIS (SI:TYPEP-FLAVOR CONDITION FLAVOR))
+	  DO (STACK-LET ((VALUES (MULTIPLE-VALUE-LIST (FUNCALL FUNCTION CONDITION))))
+	       (COND ((CAR VALUES)
+		      (RETURN (VALUES-LIST VALUES)))))))
+
+(DEFMETHOD (:HANDLE-CONDITION-P BIND-HANDLER) (CONDITION)
+  (LOOP NAMED TOP FOR (FLAVORS) IN FLAVOR-ALIST DOING
+	(LOOP FOR FLAVOR IN FLAVORS
+	      WHEN (SI:TYPEP-FLAVOR CONDITION FLAVOR)
+	        DO (RETURN-FROM TOP ':MAYBE))))
+
+(DEFMETHOD (:DESCRIBE-SELF-BRIEFLY BIND-HANDLER) ()
+  (PRINC "CONDITION-BIND handler for ")
+  (FORMAT:PRINT-LIST T "~S" (APPLY #'APPEND (MAPCAR #'CAR FLAVOR-ALIST))))
+
+(DEFMETHOD (:FIND-CALLERS-OF-SYMBOLS-IN-CONSTANT BIND-HANDLER) (SYMBOLS FUNCTION CALLER)
+  (LOOP FOR (FLAVORS HANDLER) IN FLAVOR-ALIST
+	DO (LOOP FOR FLAVOR IN FLAVORS
+		 DO (WHEN (MEMQ FLAVOR SYMBOLS)
+		      (FUNCALL FUNCTION CALLER FLAVOR ':CONDITION)))
+	   (WHEN (MEMQ HANDLER SYMBOLS)
+	     (FUNCALL FUNCTION CALLER HANDLER ':FUNCTION))))
+
+;; This handler is generated by CONDITION-BINDs whose arguments must be evaluated.
+;; Although obsolete, user code may still call this.
+(LOCAL-DECLARE ((ERROR-REPORTER T))
+(DEFSELECT EVALUATING-BIND-HANDLER
+  (:HANDLE-CONDITION (CONDITION IGNORE)
+   (CL:LOCALLY
+     (DECLARE (SPECIAL .EVALUATING.BIND.LIST.))
+     (LOOP FOR (FLAVORS FUNCTION) ON .EVALUATING.BIND.LIST. BY 'CDDR
+	   WHEN (LOOP FOR FLAVOR IN FLAVORS THEREIS (SI:TYPEP-FLAVOR CONDITION FLAVOR))
+	     DO (STACK-LET ((VALUES (MULTIPLE-VALUE-LIST (FUNCALL FUNCTION CONDITION))))
+		  (COND ((CAR VALUES)
+			 (RETURN (VALUES-LIST VALUES))))))))
+  (:HANDLE-CONDITION-P (CONDITION)
+   (CL:LOCALLY
+     (DECLARE (SPECIAL .EVALUATING.BIND.LIST.))
+     (LOOP NAMED TOP FOR FLAVORS IN .EVALUATING.BIND.LIST. BY 'CDDR DOING
+       (LOOP FOR FLAVOR IN FLAVORS
+	     WHEN (SI:TYPEP-FLAVOR CONDITION FLAVOR)
+	       DO (RETURN-FROM TOP ':MAYBE)))))
+  (:DESCRIBE-SELF-BRIEFLY ()
+   (CL:LOCALLY
+     (DECLARE (SPECIAL .EVALUATING.BIND.LIST.))
+     (PRINC "CONDITION-BIND handler for ")
+     (FORMAT:PRINT-LIST T "~S"
+			(LOOP FOR FLAVORS IN .EVALUATING.BIND.LIST. BY 'CDDR
+			      APPEND FLAVORS)))))
+)
+
+;; Calls to this are generated by the new lexical-closure-based CONDITION-BIND's.
+(LOCAL-DECLARE ((ERROR-REPORTER T))
+(DEFSELECT CONDITION-BIND-HANDLER
+  (:HANDLE-CONDITION (CONDLIST CONDITION IGNORE)
+   (LOOP FOR (FLAVORS FUNCTION) ON CONDLIST BY 'CDDR
+	 WHEN (LOOP FOR FLAVOR IN FLAVORS THEREIS (SI:TYPEP-FLAVOR CONDITION FLAVOR))
+	   DO (STACK-LET ((VALUES (MULTIPLE-VALUE-LIST (FUNCALL FUNCTION CONDITION))))
+		(COND ((CAR VALUES)
+		       (RETURN (VALUES-LIST VALUES)))))))
+  (:HANDLE-CONDITION-P (CONDLIST CONDITION)
+   (LOOP NAMED TOP FOR FLAVORS IN CONDLIST BY 'CDDR DOING
+	 (LOOP FOR FLAVOR IN FLAVORS
+	       WHEN (SI:TYPEP-FLAVOR CONDITION FLAVOR)
+	         DO (RETURN-FROM TOP ':MAYBE))))
+  (:DESCRIBE-SELF-BRIEFLY (CONDLIST)
+   (PRINC "CONDITION-BIND handler for ")
+   (FORMAT:PRINT-LIST T "~S"
+	(LOOP FOR FLAVORS IN CONDLIST BY 'CDDR APPEND FLAVORS))))
+)
+
+(DEFMETHOD (MAP-OVER-INSTANCE-CALLEES BIND-HANDLER)
+	   (REAL-CALLER FUNARG
+			&REST OPTIONS
+			&KEY MAP-OVER-INTERNAL-FUNCTIONS-TOO
+			&ALLOW-OTHER-KEYS)
+  (LOOP FOR (FLAVORS HANDLER) IN FLAVOR-ALIST DO
+    (DOLIST (FLAVOR FLAVORS)
+      (FUNCALL FUNARG REAL-CALLER FLAVOR ':CONDITION))
+    (WHEN (AND MAP-OVER-INTERNAL-FUNCTIONS-TOO
+	       (TYPEP HANDLER :COMPILED-FUNCTION))
+      (LEXPR-FUNCALL #'SI:MAP-OVER-COMPILED-FUNCTION-CALLEES HANDLER FUNARG OPTIONS))))
+
+;;;
+
+(DEFFLAVOR CASE-HANDLER (FLAVOR-LIST) (BASIC-HANDLER)
+  :READABLE-INSTANCE-VARIABLES
+  :INITABLE-INSTANCE-VARIABLES)
+
+(DEFMETHOD (HANDLER-EQUAL CASE-HANDLER) (OTHER-HANDLER)
+  (EQUAL-SET (CASE-HANDLER-FLAVOR-LIST OTHER-HANDLER) FLAVOR-LIST))
+
+(DEFMETHOD (:HANDLE-CONDITION CASE-HANDLER) (CONDITION TAG)
+  (LOOP FOR FLAVOR IN FLAVOR-LIST
+	WHEN (SI:TYPEP-FLAVOR CONDITION FLAVOR)
+	  DO (IF (SI:VALID-THROW-TAG-P TAG)
+		 (THROW TAG (VALUES CONDITION T))
+		 (RETURN NIL))))
+
+(DEFMETHOD (:HANDLE-CONDITION-P CASE-HANDLER) (CONDITION)
+  (LOOP FOR FLAVOR IN FLAVOR-LIST
+	THEREIS (SI:TYPEP-FLAVOR CONDITION FLAVOR)))
+
+(DEFMETHOD (:DESCRIBE-SELF-BRIEFLY CASE-HANDLER) ()
+  (PRINC "CONDITION-CASE handler for ")
+  (FORMAT:PRINT-LIST T "~S" FLAVOR-LIST))
+
+(DEFMETHOD (:FIND-CALLERS-OF-SYMBOLS-IN-CONSTANT CASE-HANDLER) (SYMBOLS FUNCTION CALLER)
+  (LOOP FOR FLAVOR IN FLAVOR-LIST
+	DO (WHEN (MEMQ FLAVOR SYMBOLS)
+	     (FUNCALL FUNCTION CALLER FLAVOR ':CONDITION))))
+
+(DEFMETHOD (MAP-OVER-INSTANCE-CALLEES CASE-HANDLER)
+	   (REAL-CALLER FUNARG &REST IGNORE)
+  (DOLIST (FLAVOR FLAVOR-LIST)
+    (FUNCALL FUNARG REAL-CALLER FLAVOR ':CONDITION)))
+
+;;;
+
+(DEFFLAVOR CALL-HANDLER (PREDICATE-ALIST) (BASIC-HANDLER)
+  :READABLE-INSTANCE-VARIABLES
+  :INITABLE-INSTANCE-VARIABLES)
+
+(DEFMETHOD (HANDLER-EQUAL CALL-HANDLER) (OTHER-HANDLER)
+  (EQUAL (CALL-HANDLER-PREDICATE-ALIST OTHER-HANDLER) PREDICATE-ALIST))
+
+(DEFMETHOD (:HANDLE-CONDITION CALL-HANDLER) (CONDITION TAG)
+  (LOOP FOR (PREDICATE MARKER) IN PREDICATE-ALIST
+	WHEN (FUNCALL PREDICATE CONDITION)
+	  DO (IF (SI:VALID-THROW-TAG-P TAG)
+		 (THROW TAG (VALUES CONDITION MARKER))
+		 (RETURN NIL))))
+
+(DEFMETHOD (:HANDLE-CONDITION-P CALL-HANDLER) (CONDITION)
+  (LOOP FOR (PREDICATE) IN PREDICATE-ALIST
+	THEREIS (FUNCALL PREDICATE CONDITION)))
+
+(DEFMETHOD (:DESCRIBE-SELF-BRIEFLY CALL-HANDLER) ()
+  (PRINC "CONDITION-CALL handler with predicates ")
+  (FORMAT:PRINT-LIST T "~S" (MAPCAR 'CAR PREDICATE-ALIST)))
+
+(DEFMETHOD (:FIND-CALLERS-OF-SYMBOLS-IN-CONSTANT CALL-HANDLER) (SYMBOLS FUNCTION CALLER)
+  (LOOP FOR (PREDICATE) IN PREDICATE-ALIST
+	DO (WHEN (MEMQ PREDICATE SYMBOLS)
+	     (FUNCALL FUNCTION CALLER PREDICATE ':FUNCTION))))
+
+(DEFMETHOD (MAP-OVER-INSTANCE-CALLEES CALL-HANDLER)
+	   (REAL-CALLER FUNARG &REST IGNORE)
+  (DOLIST (STUFF PREDICATE-ALIST)
+    (FUNCALL FUNARG REAL-CALLER (FIRST STUFF) ':FUNCTION)))
+
+;;;
+
+(DEFFLAVOR GLOBAL-HANDLER (NAME FLAVOR-LIST FUNCTION) (BASIC-HANDLER)
+  (:GETTABLE-INSTANCE-VARIABLES NAME)
+  :INITABLE-INSTANCE-VARIABLES)
+
+(DEFMETHOD (HANDLER-EQUAL GLOBAL-HANDLER) (OTHER-HANDLER)
+  (EQ SELF OTHER-HANDLER))
+
+(DEFMETHOD (:HANDLE-CONDITION-P GLOBAL-HANDLER) (CONDITION)
+  (DOLIST (FLAVOR FLAVOR-LIST)
+    (WHEN (SI:TYPEP-FLAVOR CONDITION FLAVOR)
+      (RETURN :MAYBE))))
+
+(DEFMETHOD (:DESCRIBE-SELF-BRIEFLY GLOBAL-HANDLER) ()
+  (PRINC "Global handler for ")
+  (FORMAT:PRINT-LIST T "~S" FLAVOR-LIST))
+
+(DEFMETHOD (:DESCRIBE-SELF-VERBOSELY GLOBAL-HANDLER) ()
+  (SEND SELF :DESCRIBE-SELF-BRIEFLY)
+  (WHEN (SYMBOLP FUNCTION)
+    (FORMAT T "  ~S" FUNCTION)))
+
+(DEFMETHOD (:HANDLE-CONDITION GLOBAL-HANDLER) (CONDITION IGNORE)
+  (WHEN (LOOP FOR FLAVOR IN FLAVOR-LIST THEREIS (SI:TYPEP-FLAVOR CONDITION FLAVOR))
+    (FUNCALL FUNCTION CONDITION)))
+
+(DEFMETHOD (:FIND-CALLERS-OF-SYMBOLS-IN-CONSTANT GLOBAL-HANDLER) (SYMBOLS FCN CALLER)
+  (LOOP FOR FLAVOR IN FLAVOR-LIST
+	DO (WHEN (MEMQ FLAVOR SYMBOLS)
+	     (FUNCALL FCN CALLER FLAVOR ':CONDITION))))
+
+(DEFUN DESCRIBE-GLOBAL-HANDLERS ()
+  (DOLIST (HANDLER *GLOBAL-HANDLERS*)
+    (SEND STANDARD-OUTPUT :FRESH-LINE)
+    (SEND HANDLER :DESCRIBE-SELF-VERBOSELY))
+  NIL)
+
+(DEFUN DEFINE-GLOBAL-HANDLER-1 (NAME CONDITIONS)
+  (REMOVE-GLOBAL-HANDLER-INTERNAL NAME)
+  (PUSH (MAKE-INSTANCE 'GLOBAL-HANDLER
+		       :NAME NAME
+		       :FLAVOR-LIST CONDITIONS
+		       :FUNCTION NAME)
+	*GLOBAL-HANDLERS*)
+  NIL)
+
+;;; Return T if it does remove a handler.  Otherwise signal 
+;;; DBG:PROCEEDABLE-FERROR, and if proceeded, return NIL.
+(DEFUN REMOVE-GLOBAL-HANDLER (NAME)
+  (OR (REMOVE-GLOBAL-HANDLER-INTERNAL NAME)
+      (FSIGNAL "No global handler named ~S is currently in effect." NAME)
+      NIL))
+
+;;; Internal function.  Returns T if there was a handler, else NIL.
+(DEFUN REMOVE-GLOBAL-HANDLER-INTERNAL (NAME)
+  (DOLIST (HANDLER *GLOBAL-HANDLERS*)
+    (WHEN (EQ NAME (SEND HANDLER :NAME))
+      (SETQ *GLOBAL-HANDLERS* (DELQ HANDLER *GLOBAL-HANDLERS*))
+      (RETURN T))))
+
+;;;
+
+(DEFFLAVOR ERROR-RESTART-HANDLER (FLAVORS) (BASIC-HANDLER)
+  :READABLE-INSTANCE-VARIABLES
+  :INITABLE-INSTANCE-VARIABLES)
+
+(DEFMETHOD (HANDLER-EQUAL ERROR-RESTART-HANDLER) (OTHER-HANDLER)
+  (EQUAL-SET (ERROR-RESTART-HANDLER-FLAVORS OTHER-HANDLER) FLAVORS))
+
+(DEFMETHOD (:HANDLE-CONDITION ERROR-RESTART-HANDLER) (CONDITION TAG)
+  (AND (SEND SELF ':HANDLE-CONDITION-P CONDITION)
+       (SI:VALID-THROW-TAG-P TAG)
+       (THROW TAG (VALUES NIL T))))
+
+;; The debugger uses this.
+;; I think this points to a basic problem with having RESTART-HANDLERS
+;; be a normal handlers list.
+(DEFMETHOD (:FAKE-RESTART ERROR-RESTART-HANDLER) (TAG)
+  (THROW TAG (VALUES NIL T)))
+
+(DEFMETHOD (:HANDLE-CONDITION-P ERROR-RESTART-HANDLER) (CONDITION)
+  (LOOP FOR FLAVOR IN FLAVORS THEREIS (SI:TYPEP-FLAVOR CONDITION FLAVOR)))
+
+(DEFMETHOD (:HANDLE-CONDITION-FLAVORS-P ERROR-RESTART-HANDLER) (FLAVS)
+  (LOOP FOR FLAVOR IN FLAVORS
+	AS FL = (FLAVOR:FIND-FLAVOR FLAVOR NIL)
+	AS FL-COMPONENTS = (IF (FLAVOR::FLAVOR-COMPONENTS-COMPOSED FL)
+			       (FLAVOR:FLAVOR-ALL-COMPONENTS FL)
+			       (FLAVOR::COMPOSE-FLAVOR-COMPONENTS (FLAVOR:FLAVOR-NAME FL)))
+	THEREIS (AND FL (LOOP FOR FLAV IN FLAVS
+			      THEREIS (MEMQ FLAV FL-COMPONENTS)))))
+
+(DEFMETHOD (:DESCRIBE-RESTART ERROR-RESTART-HANDLER) (STREAM)
+  (DECLARE (SPECIAL .RESTART.DESCRIPTION.))
+  (LEXPR-FUNCALL #'FORMAT STREAM .RESTART.DESCRIPTION.))
+
+(DEFMETHOD (:DESCRIBE-SELF-BRIEFLY ERROR-RESTART-HANDLER) ()
+  (PRINC "ERROR-RESTART: ")
+  (SEND SELF ':DESCRIBE-RESTART STANDARD-OUTPUT))
+
+(DEFMETHOD (:FIND-CALLERS-OF-SYMBOLS-IN-CONSTANT ERROR-RESTART-HANDLER)
+	   (SYMBOLS FUNCTION CALLER)
+  (LOOP FOR FLAVOR IN FLAVORS
+	DO (WHEN (MEMQ FLAVOR SYMBOLS)
+	     (FUNCALL FUNCTION CALLER FLAVOR ':CONDITION))))
+
+(DEFMETHOD (MAP-OVER-INSTANCE-CALLEES ERROR-RESTART-HANDLER)
+	   (REAL-CALLER FUNARG &REST IGNORE)
+  (DOLIST (FLAVOR FLAVORS)
+    (FUNCALL FUNARG REAL-CALLER FLAVOR ':CONDITION)))
+
+;;;
+
+(defflavor private-restart-command-handler () (error-restart-handler))
+
+;; This should never get called
+(defmethod (:handle-condition private-restart-command-handler) (condition tag)
+  (declare (special .restart.function.))
+  (and (send self :handle-condition-p condition)
+       (funcall (car .restart.function.))
+       (throw tag (values nil t))))
+
+(defmethod (:fake-restart private-restart-command-handler) (tag)
+  (declare (special .restart.function.))
+  (funcall (car .restart.function.))
+  (throw tag (values nil t)))
+
+(defmethod (:describe-self-briefly private-restart-command-handler) ()
+  (princ "PRIVATE-RESTART-COMMAND: ")
+  (send self :describe-restart standard-output))
+
+
+;;--- Building this on ERROR-RESTART-HANDLER is wrong, this should really act
+;;--- like a true special command, but since special commands are built on
+;;--- conditions instead of handlers, we can't use that technique.
+(defflavor private-special-command-handler () (error-restart-handler))
+
+(defmethod (:handle-condition private-special-command-handler) (condition tag)
+  (declare (special .restart.function.))
+  (ignore tag)
+  (and (send self :handle-condition-p condition)
+       (funcall (car .restart.function.))
+       ;;--- Kludge to throw out of EXECUTE-RESTART
+       (throw 'private-special-command nil)))
+
+(defmethod (:fake-restart private-special-command-handler) (tag)
+  (declare (special .restart.function.))
+  (ignore tag)
+  (funcall (car .restart.function.))
+  ;;--- Kludge to throw out of EXECUTE-RESTART
+  (throw 'private-special-command nil))
+
+(defmethod (:describe-self-briefly private-special-command-handler) ()
+  (princ "PRIVATE-SPECIAL-COMMAND: ")
+  (send self :describe-restart standard-output))
+
+;;;
+
+(DEFVAR REPORT-IGNORED-ERRORS NIL)
+
+(DEFSELECT IGNORE-ERRORS-HANDLER
+  (:HANDLE-CONDITION (CONDITION TAG)
+   (WHEN (ERRORP CONDITION)
+     (WHEN (SI:VALID-THROW-TAG-P TAG)
+       (WHEN REPORT-IGNORED-ERRORS
+	 (FORMAT ERROR-OUTPUT "~&>>~A: ~A" (CONDITION-TYPE CONDITION) CONDITION))
+       (THROW TAG (VALUES NIL T)))))
+  (:HANDLE-CONDITION-P (COND) (ERRORP COND))
+  (:DESCRIBE-SELF-BRIEFLY () (PRINC "IGNORE-ERRORS handler"))
+  )
+
+;;;
+
+(LOCAL-DECLARE ((ERROR-REPORTER T))
+(DEFSELECT DEBUGGER-HANDLER
+  (:HANDLE-CONDITION . DEBUGGER-HANDLER-HANDLE-CONDITION)
+  (:HANDLE-CONDITION-P (COND) (TYPEP COND 'CONDITIONS:SERIOUS-CONDITION))
+  (:DESCRIBE-SELF-BRIEFLY () (PRINC "Enters the debugger")))
+)
+
+(DEFUN DEBUGGER-HANDLER-HANDLE-CONDITION (IGNORE COND IGNORE)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (AND (TYPEP COND 'DEBUGGER-CONDITION)
+       (ENTER-DEBUGGER COND)))
+
+;;;
+
+(COMPILE-FLAVOR-METHODS BIND-HANDLER CASE-HANDLER CALL-HANDLER
+			GLOBAL-HANDLER
+			ERROR-RESTART-HANDLER
+			PRIVATE-RESTART-COMMAND-HANDLER PRIVATE-SPECIAL-COMMAND-HANDLER)
+
+(ADD-INITIALIZATION "Bootstrap Handlers" '(BOOTSTRAP-FASD-INSTANCES) '(ONCE))

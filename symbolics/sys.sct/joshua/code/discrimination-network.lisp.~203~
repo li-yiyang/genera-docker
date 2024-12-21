@@ -1,0 +1,572 @@
+;;; -*- Mode: Joshua; Package: JI; Syntax: Joshua; Base: 10; Lowercase: T; Vsp: 0 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Created 12/19/85 13:17:50 by sgr running on GROUSE at SCRC.
+
+;;;
+;;; Simple discrimination net for Joshua.  This is for predications, not
+;;; rule trigger patterns.  Predications have a ratio of update to access
+;;; that can be near 1, hence this graph-interpreting algorithm.
+;;; Contrast with the compiler approach for rule trigger patterns.
+;;;
+;;; Cribbed from AMORD and from D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")Artificial0 1Intelligence Programming0, by
+;;; Charniak, Riesbeck, & McDermott.  Many sources talk about complicated 
+;;; ideas that I think would just slow this down; I tried to go for simplicity.
+;;;
+;;; The 8-fold way of discrimination nets (CR&M, ch. 14):
+;;;
+;;; [1] Are variables allowed in the data patterns? Yes
+;;; [2] Are variables allowed in the query patterns? Yes
+;;; [3] Does one keep track of variable bindings during fetching? No.
+;;; [4] Should one return a list or stream of possibilities? Pass closure down into dn fetcher.
+;;; [5] Should one use CAR or CAR-CDR indexing? CAR.  (Except for tail variables.)
+;;; [6] Should one uniquify subexpressions? Yes, simplifies variable  predication match.
+;;; [7] Should one completely discriminate the data? Yes.
+;;; [8] Should one use multiple indexing? No.
+;;;
+;;; Note that if we answer CAR to 5 and Yes to 6, we don't need
+;;; *BEGIN-PREDICATION* markers, since they all go through the root node,
+;;; where it's implicit.  However, we do need *END-PREDICATION* markers,
+;;; so that [IS NOT] and [IS NOT EITHER] end in different places.
+;;; (Otherwise, the node for EITHER would both contain [IS NOT] and be
+;;; non-terminal.  We could hack that, but it hairs up the code.  Maybe
+;;; later, since it 1does0 compress the network.  But it requires splitting
+;;; the info-or-table slot in two.)
+;;;
+;;; Also note that since segment variables are only allowed in tail position,
+;;; the seg-var-link field of a discrimination-net-node could just contain terminals.  For now,
+;;; it contains a *segment-variable* node for clarity, which costs us an extra
+;;; link traversal in the case of a tail variable.
+;;;
+;;; These discrimination nets are collections of nodes supporting 
+;;; the following protocol:
+;;;
+;;; [1] (dn-tell dn predication) -- adds predication, creating nodes as necessary
+;;; [2] (dn-ask  dn predication continuation) -- funcalls continuation on each node it finds
+;;; [3] (dn-clear  dn)           -- flushes everything in the dn
+;;; [4] (dn-graph  dn)           -- draws a pretty picture of the dn (for debugging the dn)
+;;;
+;;;
+(2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")
+0;;;
+;;; Faster tables.  These are implemented as defstructs instead of flavors
+;;; for speed (aref is faster than instance-ref, no method table lookup overhead, etc.).
+;;;
+;;; Entrypoints: make-dn-table, dn-table-clear, dn-table-get, (setf dn-table-get),
+;;;              dn-table-size, dn-table-map, dn-table-keys, dn-table-values
+;;;
+
+(defconstant *dn-table-crossover-size* 18.
+  ;; this number was generated using the tools in sys:joshua;tests;time-dn-tables.
+  "Below this number of elements, an alist is faster than a hash table.")
+
+(defstruct (dn-table)
+  "Fast, adaptive table."
+  (alist-p t) ;plist would be faster, but this needs EQUAL (sigh)
+  (current-size 0.)
+  (data nil))
+
+(defsubst is-dn-table-p (x)
+  ;;
+  ;; Stryker (tm) Metering revealed this as a bottleneck, believe it or not!
+  ;;
+  ;; much faster than dn-table-p as defined by the above defstruct,
+  ;; since it doesn't call typep-structure.  typep-structure is slow
+  ;; because it tries to hack defstruct inheritance and so on, none
+  ;; of which we use.
+  (and (arrayp x)
+       ;; even faster than name-structure-p, named-structure-symbol, etc.
+       (eq (aref x 0) 'dn-table)))
+
+;;;
+;;; Functions defined on dn-tables.
+;;;
+
+(defun dn-table-clear (dn-table)
+  "Makes dn-table empty."
+  (setf (dn-table-alist-p dn-table)      t
+	(dn-table-current-size dn-table) 0.
+	(dn-table-data dn-table)         nil))
+
+(defsubst assoc-equal (item alist)
+  "Open-coding of (assoc item alist :test #'equal)."
+  (loop for cell in alist when (equal item (car cell)) return cell))
+
+(defsubst dn-table-get (key dn-table)
+  "Gets data associated with key in dn-table."
+  (cond ((dn-table-alist-p dn-table)
+	 ;; implemented as an alist
+	 (cdr (assoc-equal key (dn-table-data dn-table))))
+	(t
+	  ;; implemented as a hash table
+	  (cli::fast-table-get (dn-table-data dn-table) key))))
+
+(defun dn-table-put (key dn-table value)
+  "Put data into dn-table, indexed under key."
+  (cond ((dn-table-alist-p dn-table)
+	 ;; implemented as an alist
+	 (let ((cell (assoc-equal key (dn-table-data dn-table))))
+	   (cond (cell
+		   ;; found a cell
+		   (rplacd cell value))
+		 (t
+		   ;; no cell for key, so add it
+		   (push (cons key value) (dn-table-data dn-table))
+		   (incf (dn-table-current-size dn-table))
+		   (when (> (dn-table-current-size dn-table)
+			    *dn-table-crossover-size*)
+		     ;; time to change into a hash table
+		     (loop with table = (make-hash-table :test #'equal) ;give some of the sexy new args?
+			   for (existing-key . existing-value) in (dn-table-data dn-table)
+			   doing (setf (gethash existing-key table) existing-value)
+			   finally (setf (dn-table-data dn-table) table
+					 (dn-table-alist-p dn-table) nil)))))))
+	(t
+	  ;; implemented as a hash table
+	  (setf (gethash key (dn-table-data dn-table)) value)))
+  ;; return value
+  value)
+
+;;; "How to store into a dn-table."
+(defsetf dn-table-get dn-table-put)
+
+(defun dn-table-size (dn-table)
+  "How many elements there are in the table now."
+  (if (dn-table-alist-p dn-table)
+      (dn-table-current-size dn-table)
+      (hash-table-count (dn-table-data dn-table))))
+
+;;; There's no iteration path because of this complexity.
+(defun dn-table-map (dn-table function)
+  "Map a function over all the key-datum pairs."
+  (declare (sys:downward-funarg function))
+  (if (dn-table-alist-p dn-table)
+      ;; loop over the alist
+      (loop for cell in (dn-table-data dn-table)
+	    doing (funcall function (car cell) (cdr cell)))
+      ;; let the hash table do it
+      (maphash function (dn-table-data dn-table))))
+
+(defun dn-table-keys (dn-table)
+  "Return a list of all the keys in the table."
+  (if (dn-table-alist-p dn-table)
+      (loop for (key) in (dn-table-data dn-table) collecting key)
+      (loop for datum being the hash-elements of (dn-table-data dn-table) with-key key
+	    do (ignore datum)
+	    collecting key)))
+
+(defun dn-table-values (dn-table)
+  "Return a list of all the values in the table."
+  (if (dn-table-alist-p dn-table)
+      (loop for (nil . datum) in (dn-table-data dn-table)
+	    collecting datum)
+      (loop for datum being the hash-elements of (dn-table-data dn-table)
+	    collecting datum)))
+
+
+(defsubst discrimination-net-node-terminal-p (node)
+  "Whether or not this node is terminal."
+  (eq (discrimination-net-node-token node) '*END-PREDICATION*))
+
+(defun discrimination-net-node-children (node)
+  "Return list of children of this node."
+  ;; called by the grapher
+  (let ((kidz nil)
+	(table (discrimination-net-node-info-or-table node)))
+    ;; union of things in table, var-link, and seg-var-link
+    (when (is-dn-table-p table)
+      (setq kidz (dn-table-values table)))
+    (when (discrimination-net-node-var-link node)
+      (push (discrimination-net-node-var-link node) kidz))
+    (when (discrimination-net-node-seg-var-link node)
+      (push (discrimination-net-node-seg-var-link node) kidz))
+    kidz))
+
+;;;;;;;;;; Tell protocol
+
+(defun dn-tell-token (token from-node)
+  ;; Walks token to next node of dn.  Token is neither predication, variable, nor segment variable.
+  (declare (dbg:invisible-frame joshua-internals))
+  (cond ((null (discrimination-net-node-info-or-table from-node))
+	 ;; this node has never sprouted a token, so give it a table
+	 (setf (discrimination-net-node-info-or-table from-node) (make-dn-table))
+	 (let ((new-node (make-discrimination-net-node :token token)))
+	   ;; tell the old node about the new one and return the new one
+	   (setf (dn-table-get token (discrimination-net-node-info-or-table from-node)) new-node)
+	   new-node))
+	;; see if this node knows about this token
+	((dn-table-get token (discrimination-net-node-info-or-table from-node)))
+	(t
+	  ;; doesn't know about this token, so teach it
+	  (let ((new-node (make-discrimination-net-node :token token)))
+	    ;; tell the old node about the new one, and return the new one
+	    (setf (dn-table-get token (discrimination-net-node-info-or-table from-node)) new-node)
+	    new-node))))
+
+(defsubst dn-tell-variable (from-node)
+  ;; Walks a canonicalized variable from from-node.  Token was a simple variable.
+  (cond ((discrimination-net-node-var-link from-node)) ;already one there, just return it
+	(t
+	  ;; this node has never sprouted a variable, so put a node there
+	  (let ((new-node (make-discrimination-net-node :token '*variable*)))
+	    ;; tell parent about its new kid and return the kid
+	    (setf (discrimination-net-node-var-link from-node) new-node)
+	    new-node))))
+
+(defsubst dn-tell-segment-variable (from-node)
+  ;; Walks a canonicalized segment variable from from-node.  Token was a segment variable.
+  (cond ((discrimination-net-node-seg-var-link from-node)) ;already one there, just return it
+	(t
+	  ;; this node has never sprouted a segment variable, so put a node there
+	  (let ((new-node (make-discrimination-net-node :token '*segment-variable*)))
+	    ;; tell parent about its new kid and return the kid
+	    (setf (discrimination-net-node-seg-var-link from-node) new-node)
+	    new-node))))
+
+(defsubst dn-tell-embedded-list (node)
+  ;; discriminate a constant token that marks this
+  (dn-tell-token '*EMBEDDED-LIST* node))
+
+(defun dn-tell-predication (predication root-node)
+  ;; Walks an predication through dn.  Embedded subpredications get re-discriminated from root.
+  (declare (dbg:invisible-frame joshua-internals))
+  (loop	for node = root-node
+		 then (typecase token
+			(predication
+			  ;; this token is a subpredication, so walk it from the root
+			  ;; and use the resulting node as a token
+			  (dn-tell-token (dn-tell-predication token root-node) node))
+			(unbound-logic-variable
+			  ;; non-tail variable
+			  (dn-tell-variable node))
+			(cons
+			  ;; embedded list
+			  (dn-tell-embedded-list node))
+			(otherwise
+			  ;; just an ordinary token, go talk to the table
+			  (dn-tell-token token node)))
+	for rest-tokens = (predication-statement predication) then (cdr rest-tokens)
+	while (consp rest-tokens)
+	for token = (car rest-tokens)
+	finally
+	  (when rest-tokens
+	    ;; tail variable
+	    (setq node (dn-tell-segment-variable node)))
+	  ;; now walk the closing *END-PREDICATION* and return that node
+	  (return (dn-tell-token '*END-PREDICATION* node))))
+
+(defun discrimination-net-insert (root-node predication)
+  "Adds a predication to the discrimination net.  Returns canonicalized predication."
+  ;; Note that insert can effectively ignore variables in the db!
+  ;; find the terminal node corresponding to this predication
+  (loop with terminal-node = (dn-tell-predication predication root-node)
+	;; open-code (find predication (discrimination-net-node-info-or-table terminal-node) :test #'variant)
+	for this-one in (discrimination-net-node-info-or-table terminal-node)
+	when (variant predication this-one)
+	  ;; already there, so return the canonical version
+	  return (values this-one nil)
+	finally
+	  ;; not already there, so stick it in
+	  (let ((database-predication (copy-object-if-necessary predication)))
+	    (push database-predication (discrimination-net-node-info-or-table terminal-node))
+	    ;; and return this version, which is now the canonical one
+	    (return (values database-predication t)))))
+
+(defun discrimination-net-uninsert (root-node database-predication)
+  "Removes a database predication from the discrimination net.  Returns canonicalized predication."
+  (loop with terminal-node = (dn-tell-predication database-predication root-node)
+	for stuff = (locf (discrimination-net-node-info-or-table terminal-node)) then (cdr stuff)
+	while stuff
+	when (eql database-predication (cadr stuff))
+	;; it's there, so get rid of the canonical version
+	  do (setf (cdr stuff) (cddr stuff))
+	     ;; and return this version, which is now the canonical one
+	     (return (values))))
+
+;;;;;;;;;; Ask protocol
+
+(defun dn-ask-token-variables (root-node current-node predication generator-state collector-function)
+  ;; select children along variable links matching this non-variable, non-segment-variable token
+  (declare (dbg:invisible-frame joshua-internals)
+	   (sys:downward-funarg collector-function))
+  (when (discrimination-net-node-var-link current-node)
+    ;; has a var-link, so recurse on it
+    (dn-ask-next root-node (discrimination-net-node-var-link current-node) predication generator-state
+		 collector-function))
+  (when (discrimination-net-node-seg-var-link current-node)
+    ;; has a seg-var link, so accept its fringe
+    (dn-ask-segment-variable (discrimination-net-node-seg-var-link current-node) collector-function)))
+
+(defun dn-ask-token (root-node current-node predication generator-state collector-function
+			       token do-variables-p)
+  ;; select children matching this non-variable, non-segment-variable token
+  (declare (dbg:invisible-frame joshua-internals)
+	   (sys:downward-funarg collector-function))
+  (when (is-dn-table-p (discrimination-net-node-info-or-table current-node))
+    ;; this node has a table, so look up the token in it
+    (let ((next-node (dn-table-get token (discrimination-net-node-info-or-table current-node))))
+      (when next-node
+	;; found one, so recurse on it
+	(dn-ask-next root-node next-node predication generator-state collector-function))))
+  (when do-variables-p
+    ;; dn-ask-next binds this to NIL when doing embedded subpredications, so that
+    ;; it ends up following variables exactly once.
+    (dn-ask-token-variables root-node current-node predication generator-state collector-function)))
+
+(defun dn-ask-*END-PREDICATION* (current-node collector-function)
+  ;; just like dn-ask-token, except it asks the constant token *END-PREDICATION*,
+  ;; ignores regular variables in the data, and only returns terminal nodes.
+  (declare (dbg:invisible-frame joshua-internals)
+	   (sys:downward-funarg collector-function))
+  (when (is-dn-table-p (discrimination-net-node-info-or-table current-node))
+    ;; current node has a table, so look for *END-PREDICATION*'s in it
+    (let ((next-node (dn-table-get '*END-PREDICATION* (discrimination-net-node-info-or-table current-node))))
+      (when next-node
+	;; found one, so collect it
+	(funcall collector-function next-node))))
+  (when (discrimination-net-node-seg-var-link current-node)
+    ;; has a seg-var link, so accept its fringe
+    (dn-ask-segment-variable (discrimination-net-node-seg-var-link current-node) collector-function)))
+
+(defun dn-ask-variable (root-node current-node predication generator-state collector-function)
+  ;; a variable in the query pattern means to skip a level.  Since we canonicalize
+  ;; sub-predications, this just means to recurse on the kids of current-node
+  (declare (dbg:invisible-frame joshua-internals)
+	   (sys:downward-funarg collector-function))
+  (when (is-dn-table-p (discrimination-net-node-info-or-table current-node))
+    ;; recurse on all nodes in the table
+    (dn-table-map (discrimination-net-node-info-or-table current-node)
+		  #'(lambda (token child-node)
+		      (ignore token)
+		      (dn-ask-next root-node child-node predication generator-state
+				   collector-function))))
+  (when (discrimination-net-node-var-link current-node)
+    ;; recurse on the var-link if it's present
+    (dn-ask-next root-node (discrimination-net-node-var-link current-node) predication generator-state
+		 collector-function))
+  (when (discrimination-net-node-seg-var-link current-node)
+    ;; has a seg-var link, so accept its fringe
+    (dn-ask-segment-variable (discrimination-net-node-seg-var-link current-node) collector-function)))
+
+;;; This should be called dn-ask-tail-variable.
+(defun dn-ask-segment-variable (current-node collector-function)
+  ;; a tail segment variable (in either query or data) 
+  ;; means collect this node's fringe
+  (declare (dbg:invisible-frame joshua-internals)
+	   (sys:downward-funarg collector-function))
+  (when (is-dn-table-p (discrimination-net-node-info-or-table current-node))
+    ;; this node has a table, so look at each entry
+    (dn-table-map (discrimination-net-node-info-or-table current-node)
+		  #'(lambda (token kid)
+		      (ignore token)
+		      (if (discrimination-net-node-terminal-p kid)
+			  ;; terminal node, so collect it
+			  (funcall collector-function kid)
+			  ;; non-terminal node, so recurse on it
+			  (dn-ask-segment-variable kid collector-function)))))
+  (when (discrimination-net-node-var-link current-node)
+    ;; this node has a data variable, so recurse on it
+    (dn-ask-segment-variable (discrimination-net-node-var-link current-node) collector-function))
+  (when (discrimination-net-node-seg-var-link current-node)
+    ;; has a seg-var link, so accept its fringe
+    (dn-ask-segment-variable (discrimination-net-node-seg-var-link current-node) collector-function)))
+
+(defsubst dn-ask-predication (root-node predication collector-function)
+  ;; find nodes matching a predication and collect 'em
+  (declare (sys:downward-funarg collector-function)) ;evidently doesn't work in a subst!
+  (dn-ask-next root-node root-node predication (predication-statement predication)
+	       collector-function))
+
+(defsubst dn-ask-embedded-list (root-node current-node predication generator-state collector-function)
+  ;; discriminate the constant token *EMBEDDED-LIST*, on the theory that this
+  ;; doesn't happen very often and we can punt until unify time.
+  (declare (sys:downward-funarg collector-function))
+  (dn-ask-token root-node current-node predication generator-state collector-function
+		'*EMBEDDED-LIST* t))
+
+(defun dn-ask-next (root-node current-node predication generator-state collector-function)
+  ;; dispatch on type of next token to walk it
+  (declare (dbg:invisible-frame joshua-internals)
+	   (sys:downward-funarg collector-function))
+  (cond ((null generator-state)
+	 ;; no more tokens go get, call collector-function on terminal kids
+	 (dn-ask-*END-PREDICATION* current-node collector-function))
+	((atom generator-state)
+	 ;; tail segment variable
+	 (dn-ask-segment-variable current-node collector-function))
+	(t
+	  ;; still some left
+	  (let ((next-token (pop generator-state)))
+	    ;; dispatch on the type of the next token
+	    (typecase next-token
+	      (unbound-logic-variable
+		;; regular variable
+		(dn-ask-variable root-node current-node predication generator-state collector-function))
+	      (cons
+		;; embedded list
+		(dn-ask-embedded-list root-node current-node predication generator-state
+				      collector-function))
+	      (predication
+		;; embedded sub-predication, so tokenize it (note this could succeed many times...)
+		(let ((nodes nil))
+		  ;; look for matches, putting them in a recursive collector
+		  (dn-ask-predication root-node next-token
+				      #'(lambda (x)
+					  (declare (sys:downward-function)) ;why is this necessary?
+					  (push x nodes)))
+		  ;; now ask the question again, using the nodes in recursive-collector as tokenized
+		  ;; versions
+		  (loop for node in nodes do
+		    ;; use it to further discriminate, but DON'T DO VARIABLES -- otherwise,
+		    ;; we'd do the variables multiple times, once for each element of the
+		    ;; recursive stack collector.  That's a fix for the following BUG:
+		    ;; the embedded sub-predication might not be in the dn, whereas the pattern
+		    ;; we're matching against might still accept it by having a variable there.
+		    ;; Example: suppose
+		    ;;      [inform speaker auditor info] is in the dn, and we want to match 
+		    ;;      [inform wendy    sgr      [is wendy in-england]] against it.
+		    ;; This fails, but shouldn't.
+		    (dn-ask-token root-node current-node predication generator-state
+				  collector-function node nil)))
+		;; NOW do the variables, just once.
+		(dn-ask-token-variables root-node current-node predication generator-state
+					collector-function))
+	      (otherwise
+		;; random token
+		(dn-ask-token root-node current-node predication generator-state collector-function
+			      next-token t)))))))
+
+(defun discrimination-net-fetch (root-node predication continuation)
+  (declare (sys:downward-funarg continuation))
+  ;; in order to save stack depth, collect nodes from all over the net,
+  ;; then call the continuation
+  (let ((nodes nil))
+    (dn-ask-predication root-node predication
+			#'(lambda (node)
+			    ;; have to put this declaration in here, in spite of the
+			    ;; sys:downard-funarg declaration in dn-ask, because dn-ask
+			    ;; gets compiled later and the declaration won't have been seen here.
+			    (declare (sys:downward-function))
+			    (push node nodes)))
+    (loop for node in nodes do
+      (loop for predication in (discrimination-net-node-info-or-table node)
+	    doing (funcall continuation predication)))))
+
+;;;;;;;;;; Clear protocol
+
+(defun discrimination-net-clear (root-node)
+  "Clear the dn."
+  ;; all nodes below the root are just cut off, to hang twisting in the breeze
+  ;; using a resource would fix that, at the expense of some speed
+  ;; But since this is done relatively seldom, punt the resource.
+  (setf (discrimination-net-node-info-or-table root-node) nil
+	(discrimination-net-node-var-link root-node)      nil
+	(discrimination-net-node-seg-var-link root-node)  nil))
+
+;;;;;;;;;; Graph protocol
+
+(defun area-name-of (object)
+  "Given an object, return the name of the area it's consed in."
+  (si:area-name (si:%area-number object)))
+
+(defvar *dn-graph-token-alist* '((*embedded-list* "List")
+				 (*variable*      "Var")
+				 (*segment-variable* "Tail Var"))
+  "Alist used by the dn grapher to compress some of the output.")
+
+(defun graph-discrimination-net (root-node &optional (stream *standard-output*))
+  "Graphs the discrimination net."
+  (flet ((node-printer (node stream)
+	   ;; first, make sure the presentation is of the node
+	   (dw:with-output-as-presentation (:stream stream
+					    :object node
+					    :type (type-of node))
+	     (cond ((discrimination-net-node-terminal-p node)
+		    ;; terminal node, print its contents.
+		    (cond ((discrimination-net-node-info-or-table node)
+			   ;; non-empty, so it's really a terminal -- print table of contents
+			   (formatting-table (stream)
+			     (formatting-column-headings (stream :underline-p t)
+			       (formatting-cell (stream :align :center)
+				 (with-character-face (:italic stream)
+				   (princ "Contents" stream))))
+			     (formatting-row (stream)
+			       (loop for item in (discrimination-net-node-info-or-table node)
+				     doing (formatting-cell (stream) (prin1 item stream))))))
+			  (t
+			    ;; empty -- this is just a placeholder node
+			    (with-character-face (:italic stream) (princ "Empty" stream)))))
+		   ((discrimination-net-node-p (discrimination-net-node-token node))
+		    ;; non-terminal which discriminates a nested subpredication;
+		    ;; annotate it and hack the token
+		    (with-character-face (:italic stream) (princ "Nested predication" stream)))
+		   ((eq node root-node)
+		    (with-character-face (:italic stream) (princ "Root" stream)))
+		   (t
+		     ;; terminal node
+		     (let ((short-version (cadr (assoc (discrimination-net-node-token node) *dn-graph-token-alist*))))
+		       (if short-version
+			   ;; this is a special token for which there's a short string
+			   (with-character-face (:italic stream) (princ short-version stream))
+			   ;; regular token
+			   (prin1 (discrimination-net-node-token node) stream))))))))
+    (fresh-line stream)
+    (format-graph-from-root
+      root-node
+      #'node-printer
+      #'discrimination-net-node-children
+      :stream stream
+      :dont-draw-duplicates t
+      :orientation :horizontal
+      :default-drawing-mode :arrow
+      :border :oval)))

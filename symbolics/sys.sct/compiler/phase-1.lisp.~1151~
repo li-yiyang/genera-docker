@@ -1,0 +1,4246 @@
+;;; -*- Mode: Lisp; Package: COMPILER; Lowercase: T; Base: 8 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; 
+
+;;; The main function in this file is phase-1.  Its contract is to compile "form",
+;;; emitting byte lap instructions, such that the resulting code does what
+;;; "destination" says to do regarding where to leave its values.
+
+;;;; Phase 1 top level.
+
+(defmacro collecting-interval-instruction ((destination) &body body)
+  `(emit-split ,destination #'(lambda () ,@body)))
+
+(defmacro with-phase-1-environment (() &body body)
+  `(let ((*unknown-variable-names* nil)
+	 (*pc-tags* nil)
+	 (*special-variables* nil)
+	 (*instance-variables* nil)
+	 (*compiler-generated-lexical-list* nil)
+	 (*parent-function-offset-list* nil)
+	 (*interpreter-lexical-environment* nil)
+	 (*function-declared-downward* nil)
+	 (*source-locator* nil)
+	 (default-warning-function nil)
+	 (default-warning-definition-type 'defun)
+	 (*phase-1-form* nil)
+	 (*optimize-slot-value* nil))
+     (with-optimize-form-cache
+       ,@body)))
+
+;;; Convert a form into the abstract Byte Lap for that form.  This
+;;; function is actually only useful for debugging, since it compiles a
+;;; form that is not in any function.  It returns an interval of Byte
+;;; Lap, suitable for being examined by debugging tools.
+(defun run-phase-1 (form)
+  (let ((*function-list* nil))
+    (with-phase-1-environment ()
+      (let ((*function* nil)
+	    (*functions-transformed* nil)
+	    (*constants-open-coded* nil)
+	    (*transformations-before-phase-1* nil))
+	(prog1 (collect-interval (phase-1 form *destination-stack* nil))
+	       (do-final-error-checks))))))
+
+;;; Convert a function definition into a function. lambda-list is the
+;;; lambda-list, and body is the body.  Return an external function
+;;; object.
+(defun run-phase-1-function (lambda-list body &optional environment)
+  (with-phase-1-environment ()
+    (setq *interpreter-lexical-environment* environment)
+    (let ((error-message-hook
+	    #'(lambda ()
+		(declare (sys:downward-function))
+		(when default-warning-function
+		  (format t "~&While compiling ~S" default-warning-function)))))
+      (let ((function (make-external-function)))
+	(compute-args-info function lambda-list)
+	(phase-1-function-definition function lambda-list body)
+	(setf (function-internal-function-offsets function)
+	      (nreverse *parent-function-offset-list*))
+	(do-final-error-checks)
+	(phase-1-optimize-debug-info)
+	function))))
+
+(defmacro with-lisp-source-locator ((form lisp-source-locator) &body body &environment env)
+  (let ((sym (gensym)))
+    (once-only (form lisp-source-locator &environment env)
+      `(let ((,sym (with-lisp-source-locator-1 ,form ,lisp-source-locator)))
+	 (let-if ,sym ((*source-locator* ,sym))
+	   . ,body)))))
+
+(defun with-lisp-source-locator-1 (form lisp-source-locator)
+  (when (memq *use-source-locators* '(:lisp-list :lisp-bp))
+    (let ((locator (find-form-in-correspondences
+		     form *read-correspondences* lisp-source-locator)))
+      (when (null locator)
+	(let ((entry (loop for x in *transformations-before-phase-1*
+			   when (eq (third x) form) return x)))
+	  (when entry
+	    (setf `(,form ,lisp-source-locator transformed-form) entry)
+	    (setq locator (find-form-in-correspondences
+			    form *read-correspondences* lisp-source-locator)))))
+      (when locator
+	(selectq *use-source-locators*
+	  ((:lisp-bp)
+	   locator)
+	  ((:lisp-list)
+	   (cond ((eq form (car lisp-source-locator)) lisp-source-locator)
+		 ((listp form) (list form)))))))))
+
+(defun find-form-in-correspondences (form correspondences lisp-source-locator)
+  (declare (values start-bp end-bp))
+  (if (listp form)
+      (loop for entry in correspondences
+	    when (eq form (si:correspondence-entry-list entry))
+	      return (values-list (si:correspondence-entry-interval entry)))
+    (and lisp-source-locator
+	 (loop named top
+	       for entry in correspondences
+	       doing (loop for forms = (si:correspondence-entry-list entry)
+				     then (cdr forms)
+			   until (atom forms)
+			   as intervals = (si:correspondence-entry-inferiors entry)
+					then (cdr intervals)
+			   when (eq forms lisp-source-locator)
+			     do (return-from top (values-list (first intervals))))))))
+
+(defun build-form-correspondence-tables (correspondences
+					 &optional (list-table (cl:make-hash-table))
+						   (atom-table (cl:make-hash-table)))
+  (dolist (entry correspondences)
+    (setf (gethash (si:correspondence-entry-list entry) list-table)
+	  (si:correspondence-entry-interval entry))
+    (loop for forms = (si:correspondence-entry-list entry) then (cdr forms) until (atom forms)
+	  as intervals = (si:correspondence-entry-inferiors entry) then (cdr intervals)
+	  do (when (atom (car forms))
+	       (setf (gethash forms atom-table) (first intervals)))))
+  (values list-table atom-table))
+
+(defun find-form-in-correspondences-tables (form lisp-source-locator list-table atom-table)
+  (values-list (if (listp form)
+		   (gethash form list-table)
+		   (gethash lisp-source-locator atom-table))))
+
+(defun check-types-compatible (destination type)
+  (let ((dest-type (destination-type destination 0)))
+    (when (and (not (eq dest-type t))
+	       (types-disjoint-p dest-type type))
+      (warn nil "~S is required to be of type ~S but is in fact of type ~S."
+	    *phase-1-form* dest-type type))))
+
+(defun types-disjoint-p (type-1 type-2)
+  (and (atom type-1)
+       (atom type-2)
+       (multiple-value-bind (sub-1 known-1)
+	   (cl:subtypep type-1 type-2)
+	 (and known-1
+	      (not sub-1)
+	      (multiple-value-bind (sub-2 known-2)
+		  (cl:subtypep type-2 type-1)
+		(and known-2
+		     (not sub-2)))))))
+
+;;; Compile form into destination, emitting abstract Byte Lap.
+;;; If do-transform is nil, do not run the "transform"
+;;; function over the form, because it has already been transformed.
+;;; lisp-source-locator is the list from the code whose car is form.  This
+;;; is used to find the unique position of an atomic form.
+(defun phase-1 (form destination lisp-source-locator
+		&optional 
+		(do-transform t) (form-is-argument-p nil)
+		(destination-dcls nil)		; typically things like dynamic-extent
+						;  decls, when initializing local vars.
+		)
+  (let ((*phase-1-form* form)
+	class info lambda-list)
+    (with-lisp-source-locator (form lisp-source-locator)
+      (loop doing
+	(setq form				;If get an error, use a different form.
+	      (catch 'phase-1
+
+		;; Run transformations and get classification.
+		(if do-transform
+		    (multiple-value (form class info lambda-list)
+		      (transform form destination t *phase-1-optimize-p* nil destination-dcls))
+		    (multiple-value (class info lambda-list)
+		      (classify-form form)))
+		
+		(if (atom form)
+		    
+		    ;; Atom
+		    (if (or (not (symbolp form))
+			    (self-evaluating-symbol-p form))
+			;; A constant; send to destination.
+			(phase-1-constant form destination)
+			;; A variable; send its value to destination.
+			(phase-1-variable form destination))
+		    
+		    (let ((sym (first form)))
+		      (cond ((symbolp sym)
+			     (cond ((eq sym 'quote)
+				    ;; Handle the common case here.
+				    (if (= (length form) 2)
+					(phase-1-constant (second form) destination)
+					(phase-1-bad-form)))
+				   ((si:local-function-definition sym *interpreter-lexical-environment*)
+				    (collecting-interval-instruction (destination)
+				      (phase-1-function-call
+					*compiler*
+					sym (rest1 form) destination class info lambda-list)))
+				   ((null sym)
+				    (phase-1-bad-form))
+				   ;; If not locally named
+				   ((eq sym 'function)
+				    (if (= (length form) 2)
+					(phase-1-function (second form) destination 
+							  form-is-argument-p)
+					(phase-1-bad-form)))
+				   (t
+				    (let ((handler (get-phase-1-handler *compiler* sym)))
+				      ;; If there is a phase-1 property, then the function knows
+				      ;; all about how to handle this form.  Let it do so.
+				      (if (not (null handler))
+					  (funcall handler (rest1 form) destination)
+					  ;; There is no handler.
+					  (let ((hook (get-phase-1-hook *compiler* sym)))
+					    ;; If there is no hook, this is a function call.  If
+					    ;; there is a hook, let it run and decide whether this
+					    ;; is a function call.  A hook should return NIL if
+					    ;; it wants the form to be processed as a function
+					    ;; call, T if the hook compiles everything itself.
+					    (if (or (null hook)
+						    (not (si:env-declarations-inline-p sym *interpreter-lexical-environment*))
+						    (not (funcall hook (rest1 form) destination)))
+						(collecting-interval-instruction (destination)
+						  (phase-1-function-call
+						    *compiler*
+						    sym (rest1 form) destination
+						    class info lambda-list)))))))))
+			    (t
+			     (collecting-interval-instruction (destination)
+			       (if (si:interpreted-lambda-p sym)
+				   (destructuring-bind (var-list &rest body)
+				       (si:interpreted-lambda-lambda-list-and-body sym)
+				     (phase-1-lambda-combination *compiler* nil var-list (rest1 form) body destination))
+				   (phase-1-bad-form)))))))
+		(return nil)))))))
+
+(defun emitting-one-value-if-necessary-1 (continuation destination)
+  (declare (sys:downward-funarg continuation))
+  (cond ((null (destination-usage destination 0))
+	 (reconcile-destinations *destination-ignore* destination))
+	(t
+	 (funcall continuation)
+	 (pop-into-destination destination))))
+
+(defun phase-1-constant (val destination &key (read-only t) (sharable t))
+  (let ((dest-type (destination-type destination 0)))
+    (unless (cl:typep val dest-type)
+      (warn nil "~S is required to be of type ~S but is in fact of type ~S."
+	    val dest-type (cl:type-of val))))
+  (emitting-one-value-if-necessary (destination)
+    (emit-const val :read-only read-only :sharable sharable)))
+
+(defun phase-1-variable (form destination)
+  (let ((var (lookup-variable form)))
+    (emitting-one-value-if-necessary (destination)
+      (if (and (eq (variable-type var) 'lexical)
+	       (eql (lexical-size var) 0))
+	  (emit-const nil)
+	  (emit-var var)))))
+
+
+;;;; Error reporting.
+
+;;; Interface to compiler warnings stuff
+(defun llc-error (&rest args)
+  (declare (dbg:error-reporter))
+  (lexpr-funcall #'warn '(:fatal t) args))
+
+;;; Call this when things are so bad that we cannot proceed to compile this
+;;; form.  It throws and the form gets compiled as a NIL.  Note that it only
+;;; throws back to the latest call to phase-1, not out of the whole function
+;;; being compiled.  This is so we can try to squeeze out more diagnostics.
+(defun phase-1-bad-form (&optional (format-control-string "(Invalid form.)")
+			 &rest format-arguments)
+  (lexpr-funcall #'phase-1-warning format-control-string format-arguments)
+  (throw 'phase-1 ''nil))
+       
+;;; Call this to just mention something to the user.  This does NOT throw.
+(defun phase-1-warning (&optional (format-control-string "(Invalid form.)")
+			&rest format-arguments)
+  (with-stack-list (options :form *phase-1-form*)
+    (lexpr-funcall #'warn options format-control-string format-arguments)))
+
+;;; Complain about the number of args to a function
+;;; args are function name, and body
+(defun phase-1-wrong-num-args (fun body)
+  (phase-1-bad-form "Wrong number of arguments to function /"~S/" in expression ~S"
+		    fun
+		    (cons fun body)))
+
+;;; This is called at the end of processing a top-level form.  It should
+;;; call any functions that do error checks that run after everything is
+;;; finished; add new ones here.
+(defun do-final-error-checks ()
+  (warn-about-unused-variables))
+
+(defconst *debug-info-removed-from-internals*
+	  '(downward-function downward-funarg
+	    lt:inline-form lt:side-effects lt:arg-template lt:replicability))
+
+(defun phase-1-optimize-debug-info ()
+  ;; Remove all debugging info from internal functions which will not be needed again.
+  (dolist (function *function-list*)
+    (when (eq (function-type function) 'internal)
+      (setf (function-user-declares function)
+	    (cl:delete-if #'(lambda (element)
+			      (memq (car element) *debug-info-removed-from-internals*))
+			  (function-user-declares function))))))
+
+
+;;;; Transformations: Macros, transforms, optimizers, and style-checking.
+
+;--- Remaining problems:
+;  Macros are looked up in the compile time environment twice, once
+;   by classify-form and once by macroexpand-1.  I don't understand "class".
+
+;;; This function runs transformations, expands macros, and runs optimizations
+;;;  (if they are turned on).  It also checks for too few and too many arguments
+;;;  in a function call.  It returns the form, plus the first three things returned
+;;;  by classify-form (q.v.) for the returned form.
+;;; optimize-p means optimize all levels of nested forms as long as they are
+;;;  function-calls rather than special forms
+;;; recursive-p means we are transforming arguments to a regular function from inside
+;;;  transform, not from phase-1 of the form itself.  The value of recursive-p,
+;;;  if non-nil, is the tail of the arglist whose car is the argument.
+(defun transform (form destination
+		  &optional (transform-p t) (optimize-p *phase-1-optimize-p*) recursive-p
+		  target-declarations)
+  (declare (values form class info lambda-list))
+  
+  ;; Run style-checkers, macro expanders, and optimizers
+  (let ((env *interpreter-lexical-environment*))
+    (si:with-interpreter-environment
+      (env *interpreter-lexical-environment* (pop env) (pop env) (pop env) (pop env) (pop env))
+      (push local-declarations (si:env-declarations env))
+      (setf form
+	    (optimize-form form env
+			   :compile optimize-p :do-style-checking optimize-p
+			   :do-compile-only-optimizers t
+			   :destination destination
+			   :target-declarations target-declarations))
+
+      (let ((*transform-destination* destination)
+	    (*transform-environment* env)
+	    (tran-cache nil))
+	(tagbody
+      
+	  restart
+      
+	     ;; Now transform it.
+	     (if (atom form)
+	  
+		 (return-from transform (values form 'simple))
+	  
+		 (let ((function (first form)))
+		   (multiple-value-bind (class info lambda-list delay-check)
+		       (classify-form form)
+	      
+		     ;; Count arguments
+		     (when (eq class 'function-call)
+		       ;; This is a function call.
+		       ;; Check number of arguments.  This used to skip running optimizers and
+		       ;; transforming subforms, which seems wrong.
+		       (check-number-of-arguments form info lambda-list delay-check))
+	      
+		     (when transform-p
+		       ;; Transformers on functions (but not special forms)
+		       ;; should see the arguments pre-transformed.  If
+		       ;; transforming an argument changes it, must cons a new
+		       ;; form.  If argument was already optimized, transform it
+		       ;; but don't optimize it again.  If we're not going to
+		       ;; call any transformers, we still have to optimize it
+		       ;; because a higher level will assume later that it has
+		       ;; already been optimized.
+		       (when (eq class 'function-call)
+			 (do ((l (cdr form) (cdr l))
+			      (i 1 (1+ i))
+			      (copyflag nil))
+			     ((null l))
+			   (unless (memq (car l) tran-cache)	;Already transformed on previous pass?
+			     (let ((new (transform (car l) *destination-stack* transform-p nil l)))
+			       (push new tran-cache)	;Won't need to be looked at again
+			       (unless (eq new (car l))	;If it changed, insert into form
+				 (unless copyflag
+				   (setq form (copylist form))
+				   (setq l (nthcdr i form))
+				   (setq copyflag t))
+				 (setf (car l) new))))))
+		
+		       ;; Run transformers.
+		       ;; Arguments have already been transformed and optimized.
+		       (when (symbolp function)
+			 (let ((local-def (si:local-function-definition function env)))
+			   (when (and (null local-def)
+				      (or (eq class 'special)
+					  (si:env-declarations-inline-p function env)))
+			     (dolist (tfm (get-transformers *compiler* function))
+			       (let ((new-form (funcall tfm form)))
+				 (unless (eq form new-form)
+				   (note-macroexpansion form new-form (not (eq class 'special)) nil
+							recursive-p)
+				   (setq form new-form)
+				   (go restart)))))
+			   (when (and (listp local-def)
+				      (eq (first local-def) 'defun-in-flavor))
+			     (unless (eq form (setf form (call-defun-in-flavor *compiler* local-def form)))
+			       (go restart))))))
+	      
+		     ;; Form not changing any more.
+		     (return-from transform (values form class info lambda-list))))))))))
+
+(defprop do-not-record-macroexpansions t si:debug-info)
+
+;;; Called when a function call changes due to macroexpansion or optimizers.
+;;; (form is still an atom when called from some places.)
+(defun note-macroexpansion (form expansion &optional optimization-p record-it-anyway
+			    recursive-p)
+  record-it-anyway				;obsolete
+  (when (and recursive-p (memq *use-source-locators* '(:lisp-list :lisp-bp)))
+    ;; If things are transformed before they are used, need to remember the original
+    ;; form from the source and what it turns into so that original can be recorded
+    ;; instead.
+    (unless (assq form *transformations-before-phase-1*)
+      (let ((entry (loop for x in *transformations-before-phase-1*
+			 when (eq (third x) form) return x)))
+	;; This was an output, chain together
+	(if entry
+	    (setf (third entry) expansion)
+	    (when (find-form-in-correspondences form *read-correspondences* recursive-p)
+	      ;; This form came from the source, remember expansion
+	      (push (list form recursive-p expansion) *transformations-before-phase-1*))))))
+  (if (eq optimization-p 'defconstant)
+      ;; The expansion-recorder is somewhat bankrupt for expanded symbols.
+      ;; Due to popular request, we're going to record this use anyway.
+      (when (and (variable-boundp *constants-open-coded*)
+		 (not (cl:get form 'do-not-record-open-coding)))
+	(unless (assq form *constants-open-coded*)
+	  (push (cons form (constant-evaluator expansion)) *constants-open-coded*)))
+      (let ((function (if (atom form) form (car form))))
+	(when (if (symbolp function)
+		  (and (variable-boundp *functions-transformed*)
+		       (not (memq function *functions-transformed*))	;Already recorded
+		       (not (assq 'do-not-record-macroexpansions (debugging-info function)))
+		       (not (get function 'synonym-function))
+		       (not (get function 'cli::cl-function-link))
+		       (not (do-not-record-declaration-p function))
+		       (or (not optimization-p)
+			   ;; For the time being, don't record optimizers.
+			   #||
+			   (and (not (atom expansion))
+				(let ((expanded-function (car expansion)))
+				  (and (not (eq expanded-function function))
+				       #+IGNORE
+				       (memq expanded-function (get function 'optimized-into))
+				       (not (get expanded-function 'built-in)))))
+			   ||#))
+		  ;; List-named function such as a defsubst-in-flavor
+		  (and (si:validate-function-spec function)	;Filters out LAMBDA, etc.
+		       (variable-boundp *functions-transformed*)
+		       (not (member function *functions-transformed*))	;Already recorded
+		       (not (assq 'do-not-record-macroexpansions (debugging-info function)))))
+	  (push function *functions-transformed*))))
+  nil)
+
+(defun do-not-record-declaration-p (symbol)
+  (si:cached-local-declaration #'do-not-record-declaration-p-internal symbol))
+
+(defun do-not-record-declaration-p-internal (symbol)
+  (loop for (kind . rest) in local-declarations
+	do (selectq kind
+	     (do-not-record-these-macros
+	      (when (memq symbol rest)
+		(return t))))))
+
+(defvar *inhibit-keyword-argument-warnings* nil)
+
+(defun check-number-of-arguments (form info &optional lambda-list delay-check)
+  (unless (cl:listp (cdr form))
+    (phase-1-bad-form))
+  (unless inhibit-wrong-number-of-arguments-warning-switch
+    (let ((nargs (length (cdr form)))
+	  (function-type nil))
+      (cond ((> nargs (ldb system:%%arg-desc-max-args info))
+	     (cond ((ldb-test system:%%arg-desc-rest-arg info)
+		    (unless *inhibit-keyword-argument-warnings*
+		      (when (and delay-check (null lambda-list))
+			;; Get the lambda-list if we don't have it already.  Use the declared
+			;; lambda-list rather than the actual lambda-list for keyword checking,
+			;; for the benefit of functions like graphics:draw-rectangle that use
+			;; an &rest argument to receive their keyword arguments, and so that
+			;; we will still check when the called function is encapsulated.
+			;; If the function is a globally defined generic function, we will
+			;; always come through this path, and thus set function-type.
+			(multiple-value (lambda-list nil function-type)
+			  (arglist (declared-definition (first form)))))
+		      (when (memq '&key lambda-list)
+			(let ((number-of-positional-arguments
+				;; (ldb system:%%arg-desc-max-args info) might not match the
+				;; declared lambda-list, so compute it afresh
+				(loop for item in lambda-list
+				      until (memq item '(&rest &key))
+				      count (not (memq item lambda-list-keywords)))))
+			  (when (oddp (- nargs number-of-positional-arguments))
+			    (warn "The keyword-arguments portion of ~S~@
+			           contains ~D form~:P where an even number ~
+				   of forms is required."
+				  form (- nargs number-of-positional-arguments)))
+			  (multiple-value-bind (invalid-keywords valid-keywords)
+			      (check-keyword-arguments form lambda-list function-type)
+			    (when invalid-keywords
+			      (warn-1 'invalid-keyword-arguments-warning
+				      :form form :lambda-list lambda-list
+				      :invalid-keywords invalid-keywords
+				      :valid-keywords valid-keywords
+				      :delayed delay-check)))))))
+		   (t (warn-1 'too-many-arguments-warning
+			      :form form :delayed delay-check))))
+	    ((< nargs (ldb system:%%arg-desc-min-args info))
+	     (warn-1 'too-few-arguments-warning
+		     :form form :delayed delay-check))))))
+
+(defun check-keyword-arguments (form lambda-list function-type)
+  ;; The second value is only computed if the first value is non-nil, to save time
+  (declare (values invalid-keywords valid-keywords))
+  (labels ((keyword-argument-name (item)
+	     (cond ((atom item) (intern (string item) pkg-keyword-package))
+		   ((atom (car item)) (intern (string (car item)) pkg-keyword-package))
+		   (t (caar item)))))
+    (let ((lambda-tail (memq '&key lambda-list)))
+      (when lambda-tail
+	(let ((number-of-positional-arguments
+		(loop for item in lambda-list
+		      until (memq item '(&rest &key))
+		      count (not (memq item lambda-list-keywords)))))
+	  (when (> (length (cdr form)) number-of-positional-arguments)
+	    ;; Function takes keyword arguments and at least one keyword argument was supplied
+	    (setq lambda-tail (cdr lambda-tail))
+	    (unless (memq '&allow-other-keys lambda-tail)
+	      (let ((form-tail (nthcdr (1+ number-of-positional-arguments) form))
+		    (have-keywords nil))
+		(selectq function-type
+		  (clos:generic-function
+		   ;; Improve lambda-tail by looking at what keywords the methods accept
+		   ;; Assuming no specialized arguments are constant, we don't know which
+		   ;; methods will be applicable so be conservative and look at them all
+		   (let ((gf (clos-internals::fdefinition-in-environment (car form) nil)))
+		     (when (clos-internals::generic-function-p gf)
+		       (setq have-keywords t)
+		       (setq lambda-tail (mapcar #'keyword-argument-name lambda-tail))
+		       (dolist (method (clos:generic-function-methods gf))
+			 (multiple-value-bind (keywords allow-other-keys)
+			     (clos:function-keywords method)
+			   (when allow-other-keys
+			     (return-from check-keyword-arguments nil))
+			   (setq lambda-tail (union keywords lambda-tail))))))))
+		(let ((invalid-keywords
+			;; form has been optimized, so no worry about macros nor environment
+			(loop for key in form-tail by #'cddr
+			      when (cl:typecase key
+				     ((or keyword (cl:member t nil)) t)
+				     (cons (when (eq (car key) 'quote)
+					     (setq key (second key))
+					     t))
+				     (symbol nil)
+				     (otherwise t))
+				when (if have-keywords
+					 (not (memq key lambda-tail))
+					 (loop for item in lambda-tail
+					       until (eq item '&aux)
+					       never (unless (memq item lambda-list-keywords)
+						       (eq key (keyword-argument-name item)))))
+				  do (when (eq key ':allow-other-keys) (return nil))
+				  and collect key)))
+		  (when invalid-keywords
+		    (values invalid-keywords
+			    (if have-keywords lambda-tail
+				(loop for item in lambda-tail
+				      until (eq item '&aux)
+				      unless (memq item lambda-list-keywords)
+					collect (keyword-argument-name item))))))))))))))
+
+;;; add-transformer and add-optimizer are in INNER for the sake of flavors and whatever else.
+
+;;;; Compilation of function calls.
+
+;;; This generates code that follows a call to a quick internal function.  real-dest
+;;; is the destination to which the body of the function was compiled, and so it
+;;; represents what you really have on the stack.  desired-dest is the destination
+;;; to which this function call was compiled, and so it represents what we would
+;;; like to have on the stack.  The real-dest was originally computed as the "max"
+;;; (in a sense) of all of the desired-dest's of all the calls to the function;
+;;; see the build-quick-destination function.
+;;; This function and build-quick-destinations must agree about what pairs of
+;;; destinations are accepted; if you change this, change that too.
+(defun reconcile-destinations (real-dest desired-dest)
+  (unless (destination-for-return real-dest)
+    (let ((desired-n-values (destination-n-values desired-dest))
+	  (real-n-values (destination-n-values real-dest)))
+      (if (destination-for-return desired-dest)
+	  (if (eql 0 desired-n-values)
+	      (emit-return-nil)
+	      (emit-return (or real-n-values 'multiple)))
+	  (if (null real-n-values)
+	      ;; In complex cases, build-quick-destination makes the quick-destination
+	      ;; be multiple.  Thus, it is our responsibility to generate working code
+	      ;; for any desired-dest at this point -- we must be able to convert a pile
+	      ;; of multiple values, with fixnum N on top, into any other form.  Mostly
+	      ;; the take-values Byte Lap instruction is set up to do just this.
+	      (selectq desired-n-values
+		((nil))
+		((0) (emit-pop 'multiple))
+		(otherwise (emit-take-values desired-n-values)))
+	      (cond ((null desired-n-values)
+		     (emit-const real-n-values)
+		     ;; This constant is now a multiple group and should not interface with stack level.
+		     (emit-kludge-stack (- (1+ real-n-values))))
+		    (t
+		     (if (< desired-n-values real-n-values)
+			 (emit-pop (- real-n-values desired-n-values))
+			 (loop repeat (- desired-n-values real-n-values) do
+			   (emit-const nil)))))))))
+  nil)
+
+;;; This figures out the function-quick-destination of an internal function.
+;;; if this function gets made quick, to what destination should its body be compiled?
+;;; This is called on a function, and on a new destination that it gets called on.
+;;; In a sense, this finds the "maximum" of the existing quick-destination and the
+;;; new destination provided by the caller, and stores the new value back as the
+;;; new quick-destination of the function.  See comments at reconciled-destinations.
+;;; This function and reconcile-destinations must agree about what pairs of
+;;; destinations are accepted; if you change this, change that too.
+(defun build-quick-destination (function destination)
+  (when (not (destination-for-return destination))
+    (selectq (destination-n-values destination)
+      ((0))
+      ((1)
+       (when (eql 0 (destination-n-values (function-quick-destination function)))
+	 (setf (function-quick-destination function) *destination-stack*)))
+      (otherwise
+       (setf (function-quick-destination function) *destination-multiple*)))
+    (when (destination-for-return (function-quick-destination function))
+      (setf (function-quick-destination function)
+	    (remake-destination (function-quick-destination function) :for-return nil))))
+  nil)
+
+;;;; Argument checking.
+
+;;; When the compiler compiles a call to a function that it does
+;;; not know specially about, it needs to know about how that
+;;; function takes its arguments.  For real functions, it needs
+;;; to know how many required, optional, and rest arguments there
+;;; are.  The compiler represents this using fixnums of the format
+;;; returned by ARGS-INFO in the real machine.  For functions that
+;;; are really "special functions", it also needs to know which
+;;; arguments are "quoted"; for this we just use lambda lists.
+
+;;; The lambda-list is defined to be meaningless if the args-info
+;;; fixnum shows that this is a regular function.
+
+;;; To override any other info about a given function, give it
+;;; an override-arg-info property being a cons of the fixnum
+;;; and the lambda list.
+
+
+(defconst *any-args* (dpb -1 system:%%arg-desc-max-args 0))
+
+;;; Given any Lisp form, figure out what kind of form it is.  This returns
+;;; between one and four values.  The second value is an args-info fixnum
+;;; and the third is a lambda-list, but these are only returned where
+;;; applicable.  The first value is a symbol.  Here are the possibilities,
+;;; followed by the number of returned values in that case.
+;;;  simple (1) The form is atomic and not a symbol macro.
+;;;  function-call (4) The form is a real normal function call.
+;;;                    The third value is the lambda-list if it can be computed easily, 
+;;;		       which includes all cases where the definition being accessed is
+;;;		       not the global definition, and is nil otherwise.
+;;;		       If the fourth value is true, then the args-info should be rechecked
+;;;                    at the end of the compilation because the user might have redefined it.
+;;;		       The fourth value is false if the definition being accessed is
+;;;		       not the global definition.
+;;;  special (1) This is a special form.
+;;;  macro (1) This is a macro.
+;;;  lambda-combination (3) The lambda may or may not be a special function.
+;;;  error (1) We don't believe this is a valid Lisp form.
+(defun classify-form (form)
+  (declare (values class info lambda-list delay-check))
+  (if (atom form)
+      'simple
+      (let ((function-name (first form)))
+	(cond ((symbolp function-name)
+	       ;; The car of the form is a symbol, which we call "function-name".
+	       (let (tem tem2)
+		 (cond ((and (setq tem (si:local-function-definition function-name *interpreter-lexical-environment*))
+			     (listp tem))
+			(cl:ecase (first tem)
+			  (special
+			    'macro)
+			  (defun-in-flavor
+			    (let ((info (dpb 1 %%arg-desc-rest-arg 0))
+				  (ll '(&rest args))
+				  (fcnloc (third tem)))
+			      (when (location-boundp fcnloc)
+				(let* ((fcn (location-contents fcnloc))
+				       (info (args-info fcn))
+				       (ll (arglist fcn)))
+				  ;; Remove the self and self-mapping-table implicit args
+				  (setf info
+					(dpb (max 0 (- (ldb %%arg-desc-min-args info) 2))
+					     %%arg-desc-min-args
+					     (dpb (max 0 (- (ldb %%arg-desc-max-args info) 2))
+						  %%arg-desc-max-args
+						  info)))
+				  (setf ll (rest2 ll))))
+			      (values 'function-call info ll)))))
+		       (tem
+			;; It is a lexically containing function or macro.
+			(values 'function-call
+				(function-args-info tem)
+				(function-lambda-list tem)))
+		       ((setq tem (get function-name 'override-arg-info))
+			;; It has been explicitly declared.
+			(values 'function-call (car tem)))
+		       ((and (setq tem (declared-definition function-name))
+			     (listp tem)
+			     (eq (car tem) 'special))
+			(if (third tem)
+			    ;; Special form (even if it has a macro expander, too)
+			    'special
+			    ;; New-style macro
+			    'macro))
+		       ((and (variable-boundp external-functions-args-info)
+			     (not (null external-functions-args-info))
+			     (setq tem2 (gethash function-name external-functions-args-info)))
+			;; It is a function that was defined earlier in this compilation
+			(values 'function-call (car tem2) (cdr tem2) t))
+		       (tem
+			;; We don't know specifically; check the Lisp environment.
+			(values 'function-call (args-info tem) nil t))
+		       (t
+			;; Unknown symbol.  Assume the user knows what he is doing.
+			(values 'function-call *any-args* nil t)))))
+	      ((si:interpreted-lambda-p function-name)
+	       (values 'lambda-combination (args-info function-name) (second form)))
+	      (t
+	       'error)))))
+
+;;;; Serial and parallel binding.
+
+(defvar *delayed-local-declarations*)
+(defvar *delayed-lexical-variables*)
+(defvar *delayed-bindings*)
+(defvar *lexical-names-used*)
+(defvar *special-names-used*)
+(defvar *pushed-variables*)
+
+;;; Returns a list of variables that have been NAMED (and therefore possibly pushed)
+;;; on the control stack, and variables that have been BOUND (and therefore pushed
+;;; on the binding stack), so that a pop-vars instruction can be created to undo
+;;; this letting.
+(defmacro with-letting (&body body)
+  `(let ((*delayed-local-declarations* nil)
+	 (*delayed-lexical-variables* nil)
+	 (*delayed-bindings* nil)
+	 (*lexical-names-used* nil)
+	 (*special-names-used* nil)
+	 (*pushed-variables* nil))
+     (catch 'phase-1 (progn . ,body))
+     (do-delayed-letting)
+     *pushed-variables*))
+
+(defun do-delayed-letting ()
+  (loop for (special-var . lexical-var) in *delayed-bindings* do
+	(incf (variable-usage-count lexical-var))   ; Since we didn't use lookup-variable...
+	(emit-var lexical-var)
+	(emit-bind special-var))
+  (setf (si:env-variables *interpreter-lexical-environment*)
+	(nconc *delayed-local-declarations*
+	       (si:env-variables *interpreter-lexical-environment*)))
+  (setq *delayed-local-declarations* nil
+	*delayed-bindings* nil)) 
+
+;;; Returns the var.  (Note: most callers don't care about the returned value but some do.)
+;;; The do-not-emit-code option is primarily for process-arg, because the arguments
+;;; are passed by the function-calling mechanism and are already there.
+(defun serial-let (var-name var-declaration var-class var-lisp-locator
+		   check-duplicates &optional do-not-emit-code var-dcls
+		   lexical-variable-size lexical-variable-offset)
+  (selectq var-declaration
+    (lexical
+     (create-lexical-variable var-name var-class check-duplicates do-not-emit-code nil
+			      var-lisp-locator var-dcls 
+			      lexical-variable-size lexical-variable-offset))
+    (special
+     (when (or (eq var-class 'array-register)
+	       (eq var-class 'array-register-1d))
+       	(phase-1-warning "~S is declared special, array register declaration ignored."
+			 var-name))
+     (let ((var (lookup-special-variable var-name)))
+       (cond ((not (variable-ignored-p var))
+	      (cond (check-duplicates
+		     (if (memq var-name *special-names-used*)
+			 (phase-1-bad-form "Attempt to bind special variable ~S twice"
+					   var-name))
+		     (push var-name *special-names-used*)))
+	      (if (not do-not-emit-code) (emit-bind var))
+	      (push var *pushed-variables*)
+	      (push (cons var-name var) (si:env-variables *interpreter-lexical-environment*)))
+	     (t
+	      ;; If variable is ignored, its value should be flushed from the stack.
+	      (if (not do-not-emit-code) (emit-pop))))
+       var))
+    (otherwise
+     (llc-error "Bad declaration ~S for ~S" var-declaration var-name))))
+
+(defun parallel-let (var-name var-declaration var-class var-lisp-locator
+		     check-duplicates &optional do-not-emit-name var-dcls 
+		     lexical-variable-size lexical-variable-offset)
+  (selectq var-declaration
+    (lexical
+     (create-lexical-variable var-name var-class check-duplicates do-not-emit-name t
+			      var-lisp-locator var-dcls 
+			      lexical-variable-size lexical-variable-offset))
+    (special
+     (when (or (eq var-class 'array-register)
+	       (eq var-class 'array-register-1d))
+       	(phase-1-warning "~S is declared special, array register declaration ignored."
+			 var-name))
+     (let* ((var (lookup-special-variable var-name))
+	    (ivar-name (make-symbol (string-append var-name "-initialization")))
+	    (ivar (make-variable ivar-name do-not-emit-name)))
+       (push ivar *pushed-variables*)
+       (cond ((not (variable-ignored-p var))
+	      (push (cons ivar-name ivar) *delayed-local-declarations*)
+	      (push (cons var ivar) *delayed-bindings*)
+	      (cond (check-duplicates
+		     (if (memq var-name *special-names-used*)
+			 (phase-1-bad-form "Attempt to bind special variable ~S twice"
+					   var-name))
+		     (push var-name *special-names-used*)))
+	      (push var *pushed-variables*)
+	      (push (cons var-name var) *delayed-local-declarations*)))
+       var))
+    (otherwise
+     (llc-error "Bad declaration ~S for ~S" var-declaration var-name))))
+
+(defun create-lexical-variable (var-name var-class check-duplicates do-not-emit-code
+				delayed-p var-lisp-locator &optional var-dcls 
+				size offset)
+  (let* ((ignored-p (check-ignored-p-dcl var-name var-dcls))
+	 (var (make-variable var-name do-not-emit-code var-class var-lisp-locator ignored-p
+			     (cdr (assq 'future-common-lisp:dynamic-extent
+					(cdr (assq var-name var-dcls)))))))
+    (when size
+      (setf (lexical-size var) size))
+    (when offset
+      (setf (lexical-offset var) offset))
+    (when (variable-inlinable var-name var-dcls)
+      (setf (lexical-variable-inlinable var) t))
+    (push var *pushed-variables*)
+    (when (or ignored-p
+	      (not (variable-ignored-p var)))
+      (when check-duplicates
+	(cond ((memq var-name *lexical-names-used*)
+	       (phase-1-warning "Lexical variable ~S bound twice -- earlier binding will be shadowed"
+				var-name)
+	       (setf (variable-ignored-p (cl:find var-name (cdr *pushed-variables*)
+						  :key #'variable-name))
+		     t))
+	      (t
+	       (push var-name *lexical-names-used*))))
+      (cond (delayed-p
+	     (push (cons var-name var) *delayed-local-declarations*))
+	    (t
+	     (push (cons var-name var) (si:env-variables *interpreter-lexical-environment*)))))
+    var))
+
+(defun add-unbound-declarations (var-dcls fun-dcls vars funs)
+  (dolist (entry var-dcls)
+    (let ((var-name (car entry)))
+      (unless (memq var-name vars)
+	(dolist (entry (cdr entry))
+	  (selectq (car entry)
+	    ((special)
+	     (when (cdr entry)
+	       (push (cons var-name (lookup-special-variable var-name))
+		     (si:env-variables *interpreter-lexical-environment*)))))))))
+  (dolist (entry fun-dcls)
+    (let ((fun-name (car entry)))
+      (unless (member fun-name funs)
+	(dolist (entry (cdr entry))
+	  (selectq (car entry)
+	    ((cl:inline)
+	     (let ((old-fcn (assoc fun-name
+				   (si:env-functions *interpreter-lexical-environment*))))
+	       (push (list* fun-name (second old-fcn) 'cl:inline (cdr entry) (cddr old-fcn))
+		     (si:env-functions *interpreter-lexical-environment*))))))))))
+
+;;; List of pnames that name ignored variables.
+(defconst *ignores* '(ignore ignored))
+
+(defvar *treat-ignore-normally-syntaxes* '(:ansi-common-lisp))
+
+(defun spelled-ignore-or-ignored (var-name)
+  (selectq var-name
+    ;;Special case SCL:IGNORE using EQ-ness for sake of macro expansions. Since
+    ;; it's out of our universe, no problem should result.
+    ((ignore) t)
+    ((future-common-lisp:ignore) nil)
+    (otherwise
+     (and (not (memq (si:lisp-syntax-name-symbol (si:current-lisp-syntax))
+		     *treat-ignore-normally-syntaxes*))
+	  (mem #'samepnamep var-name *ignores*)))))
+
+(defvar *ignore-variable-test* 'spelled-ignore-or-ignored)
+
+;;; Create a new lexical variable.  Emit a NAME instruction, unless second arg.
+(defun make-variable (var-name &optional do-not-emit-name (class 'normal) var-lisp-locator
+		      ignored-p dynamic-extent)
+  (unless ignored-p
+    (setf ignored-p (funcall *ignore-variable-test* var-name)))
+  (let ((uid (setq *lexical-uid* (1+ *lexical-uid*)))
+	(gensym-p (null (symbol-package var-name)))
+	var)
+    (setq var (selectq class
+		(normal
+		 (make-normal-lexical-variable :variable-name var-name
+					       :variable-ignored-p (eq ignored-p t)
+					       :lexical-referencing-functions nil
+					       :lexical-uid uid
+					       :lexical-multiple-count *multiple-count*
+					       :lexical-multiple-mismatch-p nil
+					       :lexical-gensym-p gensym-p
+					       :lexical-source-locator var-lisp-locator
+					       :lexical-dynamic-extent dynamic-extent
+					       ))
+		(logic-variable
+		 (make-logic-lexical-variable :variable-name var-name
+					      :variable-ignored-p (eq ignored-p t)
+					      :lexical-referencing-functions nil
+					      :lexical-uid uid
+					      :lexical-multiple-count *multiple-count*
+					      :lexical-multiple-mismatch-p nil
+					      :lexical-gensym-p gensym-p
+					      :lexical-source-locator var-lisp-locator
+					      :lexical-dynamic-extent dynamic-extent
+					      ))
+		(function-cell
+		 (make-function-cell-lexical-variable :variable-name var-name
+						      :variable-ignored-p (eq ignored-p t)
+						      :lexical-referencing-functions nil
+						      :lexical-uid uid
+						      :lexical-multiple-count *multiple-count*
+						      :lexical-multiple-mismatch-p nil
+						      :lexical-gensym-p gensym-p
+						      :lexical-dynamic-extent dynamic-extent
+						      ))
+		((array-register)
+		 (let ((var (make-array-register-lexical-variable
+			      :variable-name var-name
+			      :variable-ignored-p (eq ignored-p t)
+			      :lexical-referencing-functions nil
+			      :lexical-uid uid
+			      :lexical-multiple-count *multiple-count*
+			      :lexical-multiple-mismatch-p nil
+			      :lexical-gensym-p gensym-p
+			      :lexical-source-locator var-lisp-locator
+			      :lexical-size 4)))
+		   (emit-setup-array var)
+		   var))
+		((array-register-implicit)
+		 (let ((var (make-array-register-lexical-variable
+			      :variable-name var-name
+			      :variable-ignored-p (eq ignored-p t)
+			      :lexical-referencing-functions nil
+			      :lexical-uid uid
+			      :lexical-multiple-count *multiple-count*
+			      :lexical-multiple-mismatch-p nil
+			      :lexical-gensym-p gensym-p
+			      :lexical-source-locator var-lisp-locator
+			      :lexical-size 4
+			      :array-register-warn nil)))
+		   (emit-setup-array var)
+		   var))
+		(array-register-1d
+		 (let ((var (make-array-register-lexical-variable
+			      :variable-name var-name
+			      :variable-ignored-p (eq ignored-p t)
+			      :lexical-referencing-functions nil
+			      :lexical-uid uid
+			      :lexical-multiple-count *multiple-count*
+			      :lexical-multiple-mismatch-p nil
+			      :lexical-gensym-p gensym-p
+			      :lexical-source-locator var-lisp-locator
+			      :lexical-size 4
+			      :array-register-type 'force-1d)))
+		   (emit-setup-array var)
+		   var))
+		(otherwise (llc-error "No such class of variable ~S" class))))
+    (when (eq ignored-p 'future-common-lisp:ignorable)
+      (incf (variable-usage-count var)))
+    (push var (function-lexical-variables *function*))
+    (if (not do-not-emit-name)
+	(emit-name (list var) *looping*))
+    var))
+
+(defun (%push-logic-variable phase-1-handler) (body destination)
+  (unless (and (eql 1 (destination-n-values destination))
+	       (not (destination-for-return destination)))
+    (llc-error "%PUSH-LOGIC-VARIABLE not to stack"))
+  (matchp body
+    ((name)
+     (unless (symbolp name)
+       (phase-1-bad-form))
+     (emit-push-logic-variable name))
+    (*
+      (phase-1-bad-form))))
+
+(defun (with-unbound-logic-variables phase-1-handler) (body destination)
+  (if (and (cl:consp body) (cl:listp (first body)))
+      (phase-1-let `(,(mapcar #'(lambda (variable)
+				  `(,variable (%push-logic-variable ,variable)))
+			      (first body))
+		     (declare (logic-variable ,@(first body)))
+		     ,@(cl:rest body))
+		   destination nil)
+      (phase-1-bad-form)))
+
+;;;; Compilation of let, let*, and lambda-combinations.
+
+(defun (let phase-1-handler) (body destination)
+  (phase-1-let body destination t))
+
+(defun (let* phase-1-handler) (body destination)
+  (phase-1-let body destination nil))
+
+(defun phase-1-let (body destination parallel-p)
+  ;; Check the overall syntax.
+  (collecting-interval-instruction (destination)
+    (matchp body
+      ((vvlist . body)
+       ;; Strip off any "declare" forms from the front of the body.
+       (multiple-value-bind (local-dcls body var-dcls nil nil specials unspecials fun-dcls)
+	   (parse-declares body)
+	 (with-lexical-contour
+	   (let ((var-list (process-vvlist vvlist parallel-p local-dcls var-dcls specials
+					   unspecials fun-dcls)))
+	     (if vvlist
+		 (with-new-control-stack-state
+		   (phase-1-progn body destination)
+		   (unless (destination-for-return destination)
+		     (emit-pop-vars var-list destination)))
+		 (progn (phase-1-progn body destination)
+			(unless (destination-for-return destination)
+			  (emit-pop-vars var-list destination))))))))
+      (* (phase-1-bad-form)))))
+
+;;; Take a variables-and-values list as in LET, LET*, PROG, or PROG*.
+;;; Compile the value forms and do LET on the variables.  This just
+;;; sets *lexical-variables* and local-declarations; the caller should
+;;; bind them if it wants to establish a lexical contour.  The
+;;; new-local-declarations are the local-declarations from
+;;; outside plus the declare forms from the front of the body;
+;;; this is used to figure out the declarations of the variables.
+;;; Upon return, the value of local-declarations will have been setq'ed
+;;; to new-local-declarations augmented by declarations for the variable bindings.
+;;; init-form-local-declarations are the local-declarations in which
+;;; the initial-value forms are to be compiled.  These never include
+;;; the declare forms from the front of the body, but do include declarations
+;;; of preceding variables when doing serial binding.
+;;; Returns a list of all variables dealt with, for emit-pop-vars.
+(defun process-vvlist (vvlist parallel-p new-local-declarations &optional var-dcls specials unspecials fun-dcls)
+  (unless (cl:listp vvlist)
+    (phase-1-bad-form))
+  ;; Turn parallel bindings into serial bindings if it doesn't matter.
+  ;; This is a kludgey way of avoiding creation of spurious "FOO-internal"
+  ;; variables, and also makes life a little easier for phase-3.
+  (when (and parallel-p
+	     (or (= (length vvlist) 1)
+		 (loop for vv in vvlist
+		       always (or (atom vv)
+				  (null (cdr vv))
+						;Overly conservative since (cadr vv) has not
+						;been optimized yet (might be a defconstant).
+				  (constant-form-p (cadr vv))
+				  (eq (car vv) (cadr vv))))))
+    (setq parallel-p nil))
+  (with-letting
+    (let ((let-function (if parallel-p #'parallel-let #'serial-let)))
+      (loop for vvl on vvlist
+	    as vv = (first vvl)
+	    do (let ((variable-name) (value-form ''nil)
+		     (lisp-locator vvl) (init-lisp-locator)
+		     (*phase-1-variable-size* nil)
+		     (*phase-1-variable-offset* nil))
+		 (matchp vv
+		   ((var val) (setq variable-name var value-form val
+				    lisp-locator vv init-lisp-locator (cdr vv)))
+		   ((var) (setq variable-name var
+				lisp-locator vv))
+		   (var (setq variable-name var)))
+		 (if (not (symbolp variable-name))
+		     (phase-1-bad-form "~S is not a valid LET clause" vv))
+		 (validate-var-name variable-name "bind" vvlist)
+		 
+		 (phase-1 value-form *destination-stack* init-lisp-locator t nil (cdr (assoc variable-name var-dcls)))
+		 
+		 (funcall let-function variable-name
+			  (binding-special-variable-p variable-name specials unspecials)
+			  (variable-class variable-name var-dcls)
+			  lisp-locator parallel-p nil var-dcls
+			  *phase-1-variable-size*
+			  *phase-1-variable-offset*))))
+    (setq local-declarations new-local-declarations)
+    (add-unbound-declarations var-dcls fun-dcls
+			      (mapcar #'variable-name *pushed-variables*) ())))
+
+;; Pushing a syntax name onto this list means the compiler should not warn
+;; about non-pervasive specials in that syntax.
+(defvar *non-pervasive-specials-ok-syntax-list* '())
+
+(defun binding-special-variable-p (variable-name specials unspecials)
+  (let ((special-p (si:special-variable-p variable-name nil specials unspecials)))
+    ;; Check for Zetalisp/Common Lisp incompatibity.
+    (when (if (let ((si:*special-declarations-are-pervasive*
+		      (not si:*special-declarations-are-pervasive*)))
+		(si:special-variable-p variable-name nil specials unspecials))
+	      (not special-p)
+	      special-p)
+     (unless (and (not si:*special-declarations-are-pervasive*)
+		  (memq (si:lisp-syntax-name-symbol (si:current-lisp-syntax))
+			*non-pervasive-specials-ok-syntax-list*))
+       ;; When we've asked for non-pervasive specials and we're in a syntax where
+       ;; that's the normal thing to ask for, these warnings would be gratuitous.
+      (if si:*special-declarations-are-pervasive*
+	  (phase-1-warning "The binding of ~S will ~:[not ~]be special.  In an upcoming version of Symbolics Common Lisp it will ~:[~;not ~]be special.~%You should add explicit declarations to this form to make the intent clear."
+			   variable-name special-p special-p)
+	  (phase-1-warning "The binding of ~S will ~:[not ~]be special.  In previous versions of Symbolics Common Lisp it was ~:[~;not ~]special.~%You should add explicit declarations to this form to make the intent clear."
+			   variable-name special-p special-p))))
+    (when special-p
+      (let ((reason (lt:variable-obsolete-p variable-name *interpreter-lexical-environment*)))
+	(when reason
+	  (warn '(:obsolete t) "~S is an obsolete variable~:[; ~A.~;.~%~A~]"
+		variable-name (string-search-set '(#\newline #\.) reason) reason))))
+    (if special-p
+	'special
+	'lexical)))
+
+(defun check-ignored-p-dcl (variable-name var-dcls &aux entry)
+  (and (setq entry (cdr (assq variable-name var-dcls)))
+       D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; old way
+0       (or (cdr (assq 'ignore entry))
+	   1;; handle future common lisp
+0	   (eq 'future-common-lisp:ignore (cdr (assq 'future-common-lisp:type entry))))))
+
+(defun variable-inlinable (variable-name var-dcls)
+  (assq 'variable-inlinable (cdr (assq variable-name var-dcls))))
+
+;;;; Decoding of lambda lists.
+
+;;; Take a lambda-list with &-keywords and call a function for each variable.
+
+;;; If values-p is true, then val-list is a list of forms whose values
+;;; are associated with variables (this is for internal LAMBDAs).  Otherwise
+;;; val-list should be nil.
+
+;;; The function is called on the following arguments:
+;;;  The variable name, a symbol.
+;;;  The value form, any form.
+;;;  NIL if the value was from an init form, T if from val-list.
+;;;  The declaration, a symbol (see variable-declaration).
+;;;  The class, a symbol (see variable-class)
+;;;  requiredness: required, optional, rest, aux, or key
+;;;  evaledness: eval, quote.
+;;;  supplied-p: nil or the name of an attached supplied-p variable
+;;;  supplied-p-declaration: declaration for the supplied-p variable (class is always normal)
+;;;  keyword: nil or the keyword if requiredness is key
+;;;  and the "arguments" passed to us.
+;;;  The lisp locator (see phase-1) for any variable initialization.
+;;;  The lisp locator for any supplied-p variable.
+;;; The value returned is allow-other-keys-p
+(defun decode-&keyword-list (var-list values-p val-list local-dcls-for-var
+			     var-dcls specials unspecials
+			     function &rest arguments)
+  (declare (special var-dcls))
+  (declare (sys:downward-funarg function))
+  (if (not (cl:listp var-list))
+      (phase-1-bad-form))
+  (if (not (cl:listp val-list))
+      (phase-1-bad-form))
+  ;; default-declaration is set by seeing &special or &lexical in the list.
+  (let ((default-declaration nil)
+	(requiredness 'required)
+	(evaledness 'eval)
+	(keys-p nil)
+	(allow-other-keys-p nil)
+	(keyword-arglist nil)
+	(keywords-used nil))
+    (loop for vars on var-list
+	  as var = (first vars)
+	  doing
+      (block var
+	(let (variable-name
+	      (keyword-name nil)
+	      (value-form ''nil)
+	      (init-form ''nil)
+	      (value-form-from-val-list-p nil)
+	      (declaration default-declaration)
+	      (variable-lisp-locator vars)
+	      (variable-init-lisp-locator nil)
+	      (supplied-p-variable-name nil)
+	      (supplied-p-variable-declaration default-declaration)
+	      (supplied-p-variable-lisp-locator nil))
+	  ;; Analyze var.  If it is just a keyword, change state and GO to continue
+	  ;; the loop.  Else set up var, val, and declaration.
+	  (matchp var
+	    (((*or* keyword &special &lexical &local) ivar)
+	     (setq declaration (if (eq keyword '&special) 'special 'lexical)
+		   var ivar)))
+	  (matchp var
+	    ((ivar . init-and-spec)
+	     (if (memq requiredness '(required rest))
+		 (phase-1-bad-form "Initialization given for ~A argument ~S"
+				   requiredness var))
+	     (setq variable-name ivar)
+	     (when (and (eq requiredness 'key) (listp variable-name))
+	       (unless (= (length variable-name) 2)
+		 (phase-1-bad-form
+		   "&KEY ~S: supposed to be a list of keyword and variable name"
+		   variable-name))
+	       (setq keyword-name (first variable-name)
+		     variable-name (second variable-name)))
+	     (setq variable-lisp-locator var
+		   variable-init-lisp-locator init-and-spec)
+	     (setq init-form
+		   (prog1 (pop init-and-spec)	;NIL if no init-form present
+			  (when init-and-spec
+			    (setq supplied-p-variable-name (pop init-and-spec))
+			    (validate-var-name supplied-p-variable-name "bind" var-list)
+			    (or (null init-and-spec)
+				(phase-1-bad-form "~S extraneous after supplied-p variable"
+						  init-and-spec))))))
+	    ((*eval* ivar (and (atom ivar) (not (memq ivar lambda-list-keywords))))
+	     (setq variable-name ivar))
+	    ('&optional
+	     (if (and (neq requiredness 'required)
+		      (neq requiredness 'key))	;Allow old syntax &key &optional
+		 (phase-1-bad-form "Misplaced &OPTIONAL in ~S" var-list))
+	     (setq requiredness 'optional)
+	     (return-from var))
+	    ('&rest
+	     (selectq requiredness
+	       ((required optional))
+	       ((key)
+		(phase-1-warning "&REST should not follow &KEY in ~S;~@
+				  this lambda-list will not work in interpreted code"
+				 var-list))
+	       (otherwise
+		 (phase-1-bad-form "Misplaced &REST in ~S" var-list)))
+	     (setq requiredness 'rest)
+	     (return-from var))
+	    ('&key
+	     ;; Have to allow &KEY to come after &REST, since that is the only combination
+	     ;; that works in the A machine compiler, so you have to write your code that way.
+	     ;; &KEY implies &OPTIONAL always now
+	     (or (memq requiredness '(required optional after-rest))
+		 (phase-1-bad-form "Misplaced &KEY in ~S" var-list))
+	     (setf keys-p t)
+	     (setq keyword-arglist val-list)
+	     (setq requiredness 'key)
+	     (return-from var))
+	    ('&aux
+	     (setq requiredness 'aux)
+	     (return-from var))
+	    ('&special
+	     (setq default-declaration 'special)
+	     (return-from var))
+	    ((*or* ignore &lexical &local)
+	     (setq default-declaration 'lexical)
+	     (return-from var))
+	    ('&unspecial
+	     (setq default-declaration nil)
+	     (return-from var))
+	    ('&quote
+	     (setq evaledness 'quote)
+	     (return-from var))
+	    ('&eval
+	     (setq evaledness 'eval)
+	     (return-from var))
+	    ('&functional
+	     ;; Ignore this for now.
+	     (return-from var))
+	    ('&allow-other-keys
+	     ;; Kludge somewhat
+	     (unless (eq requiredness 'key)
+	       (phase-1-warning "&ALLOW-OTHER-KEYS must follow &KEY."))
+	     (setq allow-other-keys-p t)
+	     (return-from var))
+	    (keyword
+	     (phase-1-warning "The keyword ~S does not make sense in this context" keyword)
+	     (return-from var)))
+	  
+	  ;; Here we have a variable to bind, possibly with a supplied-p and an init-form
+	  (if (eq requiredness 'after-rest)
+	      (phase-1-bad-form "There was more than one &REST variable in ~S" var-list))
+	  (validate-var-name variable-name "bind" var-list)
+	  (let ((local-declarations local-dcls-for-var))
+	    (unless declaration
+	      (setq declaration (binding-special-variable-p variable-name specials unspecials)))
+	    (and supplied-p-variable-name
+		 (not supplied-p-variable-declaration)
+		 (setq supplied-p-variable-declaration
+		       (binding-special-variable-p supplied-p-variable-name
+						   specials unspecials))))
+	  (and (eq requiredness 'required)
+	       values-p
+	       (null val-list)
+	       (phase-1-warning "Too few arguments to internal LAMBDA; binding ~S to NIL"
+				variable-name))
+	  (and (eq requiredness 'key)
+	       (not keyword-name)
+	       (setq keyword-name (intern (string variable-name) pkg-keyword-package)))
+	  
+	  ;; Decide what value to bind it to
+	  (cond ((or (not values-p) (null val-list) (eq requiredness 'aux))
+		 (setq value-form init-form))
+		((eq requiredness 'key)
+		 (loop for (key-form arg-form) on val-list by 'cddr
+		       when (or (eq key-form keyword-name)
+				(and (listp key-form)
+				     (eq (car key-form) 'quote)
+				     (eq (cadr key-form) keyword-name)))
+			 return (setq keywords-used (cons key-form keywords-used)
+				      value-form-from-val-list-p t
+				      value-form arg-form)
+		       finally (setq value-form init-form)))
+		((eq requiredness 'rest)
+		 (setq value-form-from-val-list-p t)
+		 (setq value-form `(list . ,val-list))
+		 (setq val-list nil))
+		(t
+		 (setq value-form-from-val-list-p t)
+		 (setq value-form (pop val-list))))
+	  
+	  (lexpr-funcall function
+			 variable-name
+			 value-form
+			 value-form-from-val-list-p
+			 declaration (variable-class variable-name var-dcls)
+			 requiredness
+			 evaledness
+			 supplied-p-variable-name
+			 supplied-p-variable-declaration
+			 keyword-name
+			 variable-lisp-locator variable-init-lisp-locator
+			 supplied-p-variable-lisp-locator
+			 arguments)
+	  (if (eq requiredness 'rest)
+	      (setq requiredness 'after-rest)))))
+    (cond ((not values-p))
+	  (keyword-arglist
+	   (loop for (key-form arg-form) on keyword-arglist by 'cddr do
+	     (cond ((memq key-form keywords-used))
+		   ((not allow-other-keys-p)
+		    (phase-1-warning "~S ~S extraneous keyword argument in internal LAMBDA;~@
+				      the argument is being completely ignored."
+				     key-form arg-form)))))
+	  ((and values-p
+		(not (null val-list)))
+	   (phase-1-warning "Too many arguments to internal LAMBDA; ignoring ~S" val-list)))
+    (values allow-other-keys-p keys-p)))
+
+;;;; Variable management.
+(defun variable-declaration (symbol)
+  (si:cached-local-declaration 'variable-declaration-internal symbol))
+
+;;; Return the current declaration of this symbol, or NIL if undeclared.
+;;; Note: special-pkg-list is a complete crock, and all-special-switch is probably
+;;; never used by anyone.
+(defun variable-declaration-internal (symbol)
+  ;; Look on local-declarations
+  (loop for (kwd . var-list) in local-declarations
+	do (if (and (memq kwd '(special zl:unspecial))
+		    (memq symbol var-list))
+	       ;; Found a local declaration.
+	       (return-from variable-declaration-internal
+		 (selectq kwd
+		   (special 'special)
+		   (zl:unspecial 'lexical)))))
+  (when (and si:*special-declarations-are-pervasive*
+	     (memq symbol *unknown-variable-names*))
+    ;; We once encountered this name and told the user "Barf, declared special".
+    ;; It's still special; don't hassle the user.
+    (return-from variable-declaration-internal 'special))
+  ;; See if it's an obsolete variable.  We don't test for obsolescence when it's
+  ;; locally declared, because that would complicate the code, and why would something
+  ;; be locally declared special if it was obsolete?
+  (let ((reason (lt:variable-obsolete-p symbol *interpreter-lexical-environment*)))
+    (when reason
+      (warn '(:obsolete t) "~S is an obsolete variable~:[; ~A.~;.~%~A~]"
+	    symbol (string-search-set '(#\newline #\.) reason) reason)
+      (push symbol *unknown-variable-names*)))	;Suppress multiple warnings
+  ;; Look for global declarations
+  (when (or (lt:global-special-variable-p symbol *interpreter-lexical-environment*)
+	    (lt:named-constant-p symbol *interpreter-lexical-environment*))
+    (return-from variable-declaration-internal 'special))
+  nil)
+
+(defun variable-class (variable-name var-dcls)
+  (let ((entry (assq variable-name var-dcls)))
+    (when entry
+      (let ((entry (assq 'variable-class (cdr entry))))
+	(when entry
+	  (return-from variable-class (cdr entry))))
+      (let ((entry (assq 'cl:type (cdr entry))))
+	(when (and entry
+		   (condition-case ()
+			(cl:subtypep (cdr entry) 'cl:vector)
+		      (error nil)))
+	  (return-from variable-class 'array-register-implicit)))))
+  `normal)
+
+;;; Given a Lisp object that is supposed to be a variable name, make
+;;; sure it is really a symbol and neither T nor NIL.  The second
+;;; and third arguments are to be printed in warnings.
+(defun validate-var-name (var-name verb &optional (within nil within-p))
+  (when (not (symbolp var-name))
+    (phase-1-bad-form "~S is not a symbol~:[~*~; in ~S~]" var-name within-p within))
+  (when (self-evaluating-symbol-p var-name)
+    (phase-1-bad-form "Attempt to ~A ~S~:[~*~; in ~S~]" verb var-name within-p within))
+  (when (lt:named-constant-p var-name *interpreter-lexical-environment*)
+    (phase-1-bad-form "Attempt to ~A named constant ~S~:[~*~; in ~S~]"
+		      verb var-name within-p within))
+  (when (and (symbolp var-name)
+	     (let ((string (get-pname var-name)))
+	       (and (plusp (string-length string))
+		    (char-equal (aref string 0) #/&))))
+    (phase-1-warning
+      (if (memq var-name lambda-list-keywords)
+	  "The compiler assumes ~S a variable, because &-keywords are not allowed here"
+	  "~S may be a mis-spelled &-keyword; the compiler assumes it is a variable")
+      var-name)))
+
+(defun deal-with-outward-reference-from-internal (var)
+  (flet ((note-ref (var)
+	   (when (and (eq (function-type *function*) 'internal)
+		      (neq *function* (lexical-function var)))
+	     ;; Assume during Phase 1 that *function* is not a quick internal -
+	     ;; which means that var will be a captive variable.  Phase 2, which
+	     ;; knows the function's quickness, may undo what is done here if
+	     ;; all of *function*'s free lexical references are to variables
+	     ;; of its frame's owner - which would mean that these variables
+	     ;; would not need to be captive and that *function* does not need
+	     ;; to be implemented as a lexical closure.
+	     (setf (lexical-captive-p var) 't)
+	     ;; Now loop through the function and all of its lexical predecessors
+	     ;; these functions refer lexically.
+	     (loop for f first *function* then (function-parent-function f)
+		   until (or (neq (function-type f) 'internal)
+			     (eq f (lexical-function var)))
+		   do
+	       (setf (function-refers-lexically-p f) 't)
+	       (push* var (function-free-lexical-variables f))
+	       (push* f (lexical-referencing-functions var))))))
+    (note-ref var)
+    (let ((info (lexical-mapping-table-info var)))
+      (when info
+	(note-ref (mapped-access-information-self-mapping-table-variable info))))))
+
+(defmethod (note-variable-reference lexical-variable) (&optional (inc-usage t) ignored-ok)
+  (when (and (not ignored-ok) variable-ignored-p)
+    (phase-1-warning "The ignored variable ~S was referenced." variable-name))
+  (cl:pushnew *control-stack-state* lexical-referencing-control-stack-states)
+  ;; If there are multiple groups between us and the variable, take note.
+  (unless (= *multiple-count* lexical-multiple-count)
+    (setf lexical-multiple-mismatch-p t))
+  ;; If this function is internal and referencing outward, take note.
+  (deal-with-outward-reference-from-internal self)
+  ;; Note that the variable has been referenced.
+  (when inc-usage (incf variable-usage-count)))
+
+;;; Given a variable name, return the corresponding variable.  If you know the
+;;; declaration that should be used, pass it as "specified-declaration"; otherwise
+;;; the current pending declaration for that name will be used.  Everything that
+;;; uses variables calls through here; for example, evaluating the variable, SETQing
+;;; it with SETQ or MULTIPLE-VALUE, or VARIABLE-LOCATION-ing it.  This function
+;;; is therefore ideally suited to collect information on behavior of variables
+;;; that will allow phase 2 to figure out how to classify each variable and internal function.
+(defun lookup-variable (var-name &optional specified-declaration (inc-usage t) ignored-ok)
+  (declare (ignore specified-declaration))
+  ;; Treat compiler-generated variables specially
+  (when (memq var-name *compiler-generated-lexical-list*)
+    (let ((var (or (find-lexical-variable-named *function* var-name nil)
+		   (make-lexical-variable-named var-name *function* nil nil))))
+      (deal-with-outward-reference-from-internal var)
+      (incf (variable-usage-count var))
+      (return-from lookup-variable var)))
+  (let ((var (let ((entry (assq var-name
+				(si:env-variables *interpreter-lexical-environment*))))
+	       (cond ((null entry)
+		      (unless (or (lt::global-special-variable-p var-name *interpreter-lexical-environment*)
+				  (memq var-name *unknown-variable-names*))
+			(phase-1-warning
+			  "The variable ~S is unknown and has been assumed SPECIAL" var-name)
+			(push var-name *unknown-variable-names*))
+		      (lookup-special-variable var-name))
+		     ((typep (cdr entry) 'variable)
+		      (cdr entry))
+		     (T (llc-error "Malformed environment entry."))))))
+    (selectq (variable-type var)
+      (lexical
+       (note-variable-reference var inc-usage ignored-ok))
+      (instance
+       ;; Variable is an instance var.  Make sure we have a self-mapping-table to
+       ;; address it with.  Return var, or make one if there isn't one already.
+       (function-needs-mapping-table *function*)
+       ;; Note that the variable has been referenced.
+       (when inc-usage (incf (variable-usage-count var))))
+      (otherwise
+       (when (and (not ignored-ok) (variable-ignored-p var))
+	 (phase-1-warning "The ignored variable ~S was referenced." var-name))
+       (when inc-usage (incf (variable-usage-count var)))))
+    var))
+
+(defun lookup-special-variable (var-name)
+  ;; Variable is special.  Return var, or make one if there isn't one already.
+  (let ((var (cdr (assq var-name *special-variables*))))
+    (cond ((null var)
+	   (setq var (make-special-variable :variable-name var-name))
+	   (push (cons var-name var) *special-variables*))
+	  ((variable-ignored-p var)
+	   (phase-1-warning "The ignored variable ~S was referenced." var-name)))
+    var))
+
+(defun lookup-instance-variable (var-name)
+  (let ((var (cdr (assq var-name *instance-variables*))))
+    (cond ((null var)
+	   (setq var (make-instance-variable :variable-name var-name))
+	   (push (cons var-name var) *instance-variables*))
+	  ((variable-ignored-p var)
+	   (phase-1-warning "The ignored variable ~S was referenced." var-name)))
+    var))
+
+;;; This is called at the end of processing a top-level form.
+(defun warn-about-unused-variables ()
+  (dolist (function *function-list*)
+    (dolist (var (function-lexical-variables function))
+      (when (and (zerop (variable-usage-count var))
+		 (not (variable-ignored-p var)))
+	(with-stack-list (options :source-locator (warning-source-locator
+						    (lexical-source-locator var))
+				  :bad-style t)
+	  (if (eq (lexical-class var) 'function-cell)
+	      (let ((fcn (function-cell-function var)))
+		(unless (function-used fcn)
+		  (warn options "The lexical function ~S can never be called."
+			(function-label fcn))))
+	      (let* ((internalp (neq (function-type function) 'external))
+		     (internal-fspec (and internalp (function-spec function))))
+		(warn options
+		      (if internalp
+			  (if internal-fspec
+			      "The value of variable ~S (defined by local function ~S) was never used."
+			      "The value of variable ~S (defined by an internal function) was never used.")
+			  "The value of variable ~S was never used.")
+		      (variable-name var)
+		      internal-fspec))))))))
+
+;;;; Utility functions.
+
+;;; The Common Lisp string-out function.
+(defun string-out (string &optional (stream standard-output) (start 0) end)
+  (if (null end) (setq end (string-length string)))
+  (send stream ':string-out string start end))
+
+(defvar *generate-symbol-counter* 0)
+
+(defun generate-symbol (prefix)
+  (make-symbol (format nil "~A-~D" prefix (incf *generate-symbol-counter*))))
+
+;;; Is this a form that obviously evaluates to non-NIL with no side-effects?
+;;; form has already been optimized
+(defun true-form-p (form)
+  (and (constant-form-p form)
+       (constant-evaluator form)))
+	   
+;;; Is this a form that obviously evaluates to NIL with no side-effects?
+;;; form has already been optimized
+(defun false-form-p (form)
+  (null form))					;'nil has been optimized already
+
+;;; Is this a form that always evaluates to the specified value?
+;;; form has already been optimized
+(defun eql-form-p (form value)
+  (and (constant-form-p form)
+       (eql (constant-evaluator form) value)))
+
+;;; Is this function a quick internal function?
+(defun quick-internal-function-p (function)
+  (and (eq (function-type function) 'internal)
+       (eq 't (function-quick-p function))))
+
+;;; Call this function after you have compiled a value to the stack
+;;; and want it to go to the given destination.  This function
+;;; generates code that will pop the value off the stack and then
+;;; send it to the appropriate place.
+(defun pop-into-destination (destination)
+  (reconcile-destinations *destination-stack* destination))
+
+;;; Make a "function" structure for the definition associated with
+;;; the given function spec.
+(defun external-function (spec)
+  (make-function-reference :function-spec spec))
+
+(defprop return-type t si:debug-info)
+
+;;; Remove "declare" forms from the front of a body.  Return a new
+;;; local-declarations that reflects these declarations as well, and
+;;; also return the remains of the body.  If a lambda-list argument
+;;; is supplied, this is a function and we strip off its documentation
+;;; and debugging-info as well.
+;--- Maybe this function should go away and instead call SI:PARSE-BODY-DECLARATIONS
+;--- directly, after we get rid of LOCAL-DECLARATIONS ?
+(defun parse-declares (body &optional (lambda-list nil lambda-list-p))
+  (declare (values local-declarations body var-dcls documentation debugging-info
+		   specials unspecials fun-dcls))
+  (multiple-value-bind (declarations specials body documentation debugging-info var-dcls
+			unspecials fun-dcls)
+      (if lambda-list-p
+	  (si:parse-body-declarations body *interpreter-lexical-environment* lambda-list)
+	  (si:parse-body-declarations body *interpreter-lexical-environment*))
+    ;; I'm not sure about this yet.
+    ;; Warn about unknown declarations
+    (dolist (dcl declarations)
+      (unless (cli::valid-declaration-p (first dcl))
+	(phase-1-warning "The declaration ~S is not recognized." dcl)))
+    ;; Unfortunate kludge
+    (when lambda-list-p
+      (dolist (d local-declarations)
+        (when (and (listp d)
+		   (get (first d) 'si:debug-info))
+	  (push d debugging-info))))
+    (values (nconc declarations local-declarations)
+	    body var-dcls documentation debugging-info specials unspecials fun-dcls)))
+
+;;;; Compilation of function definitions.
+
+;;; To create an internal function:  Do a make-internal-function.  Set up the
+;;; function-label, function-args-info, function-lambda-list.  Otherwise bind
+;;; the lexical environment as you want to.  Call phase-1-function-definition
+;;; on the function, lambda list, and body.  Furthermore, if you want it to be
+;;; quick, set function-quick-p to t and set up function-quick-destination.
+
+;;; To create an external function, do the same except set up the function-spec
+;;; instead of the function-label.
+
+;;; Should be given an external or internal function.  Returns the function
+;;; after filling in all fields shared between these two structures, and adds
+;;; the new function to *function-list*.  The caller
+;;; is responsible for fields that are not shared.
+(defun phase-1-function-definition (function lambda-list body &key (block-name nil block-p))
+  (si:check-lambda-list-syntax lambda-list)
+  (push function *function-list*)
+  (let ((*function* function)
+	(*internal-function-uid* 0)
+	(*functions-transformed* nil)
+	(*constants-open-coded* nil)
+	(*transformations-before-phase-1* nil)
+	(*function-extra-intervals* nil)
+	(*multiple-count* 0)
+	(*control-stack-state* (make-control-stack-state))
+	(*nested-unwind-protects* 0)
+	(*pframe* nil)
+	(*dbs-pframe* nil)
+	(*looping* nil)
+	(argument-list nil)
+	(aux-list nil)
+	(keyed-list nil)
+	(keys-p nil)
+	(allow-other-keys-p nil))
+    (declare (special argument-list aux-list keyed-list))
+    (setf (function-control-stack-state function) *control-stack-state*)
+    (multiple-value-bind (local-dcls body var-dcls documentation debugging-info
+			  specials unspecials fun-dcls)
+	(parse-declares body lambda-list)
+      (setf (function-documentation-string function) documentation)
+      (let ((definition-type nil))
+	(let ((name-pair (cl:assoc 'sys:function-name debugging-info)))
+	  (when name-pair
+	    (setq debugging-info (cl:delete name-pair debugging-info))
+	    (setf definition-type (third name-pair))
+	    (let ((name (second name-pair)))
+	      (selectq (function-type function)
+		((external reference)
+		 (setf (function-spec function) name))
+		(internal
+		 (setf (function-label function) name))))))
+	(flet ((note-function (name type)
+		 (let ((note (let ((cl:*print-pretty* nil))
+			       (format nil "Compiling ~@[~A ~]~S"
+				       (and (not (eq type 'defun)) type) name))))
+		   (tv:alter-progress-note-text note)
+		   (when compiler-verbose
+		     (format t "~A" note)))
+		 (unless (or compiling-whole-file-p
+			     (null *reset-function-definition-warnings*))
+		   (reset-function-warnings name type))
+		 (setf default-warning-function name)
+		 (setf default-warning-definition-type type)
+		 (selectq type
+		   ((defun)
+		    (function-defined name)
+		    (when (variable-boundp external-functions-args-info)
+		      (when (null external-functions-args-info)
+			(setq external-functions-args-info
+			      (scl:make-hash-table :test #'cl:equal
+						   :size (if compiling-whole-file-p
+							     (if (variable-boundp sct:*system*)
+								 1000
+								 100)
+							     20)
+						   :locking nil
+						   :growth-factor 2.0s0
+						   :area working-storage-area)))
+		      (setf (gethash name external-functions-args-info)
+			    (cons (function-args-info function)
+				  (let ((declared-arglist (assoc 'arglist debugging-info)))
+				    (if declared-arglist (cdr declared-arglist)
+					lambda-list)))))))))
+	  (selectq (function-type function)
+	    ((external reference)
+	     (let ((name (function-spec function)))
+	       (cond ((null name)
+		      (tv:alter-progress-note-text "Compiling an unnamed function")
+		      (when compiler-verbose (format t "Compiling an unnamed function")))
+		     (t
+		      (note-function name (or definition-type 'defun))))))
+	    ((internal)
+	     (let ((name (function-label function)))
+	       (when (and name
+			  definition-type
+			  (null (function-pr (function-parent-function function))))
+		 (note-function name definition-type)))))))
+      ;; Canonicalize the storage-category debugging info now.  Ensure that
+      ;; any declarations inherited from the parent function are kept.
+      (setf (function-user-declares function)
+	    (si:canonicalize-storage-category-debugging-info
+	      debugging-info
+	      (and (typep function 'internal-function)
+		   (multiple-value-bind (category disable-reference-validation)
+		       (si:decode-storage-category-debugging-info
+			 (function-user-declares
+			   (function-parent-function function)))
+		     (and (not disable-reference-validation)
+			  category)))))
+      ;; Ensure any function storage category declarations are in the file declarations.
+      (when (function-spec function)
+	(let ((category (si:decode-storage-category-debugging-info
+			  (function-user-declares function))))
+	  (when category
+	    (si:declare-storage-category-compile :function (function-spec function)
+						 category))))
+      (let ((area-declaration (assq 'area debugging-info)))
+	(when (and (null area-declaration)
+		   (typep function 'internal-function))
+	  (let ((area-declaration
+		  (assq 'area
+			(function-user-declares (function-parent-function function)))))
+	    (when area-declaration
+	      (push area-declaration (function-user-declares function))))))
+      (dolist (x debugging-info)
+	(let ((style-checker (get (car x) 'debugging-info-style-checker)))
+	  (when style-checker
+	    (funcall style-checker x))))
+      (when (assq 'sys:downward-function debugging-info)
+	(when (eq (function-type function) 'internal)
+	  (setq *function-declared-downward* 't)
+	  (setf (function-use-stack-closure-p function) 't)))
+      ;; Ensure all downward-funarg declarations are in the file-declarations
+      (let ((downward-funarg-declarations (assq 'sys:downward-funarg debugging-info)))
+	(when downward-funarg-declarations
+	  (file-declare (function-spec function)
+			'sys:downward-funarg (cdr downward-funarg-declarations))))
+      (let ((return-type (let ((entry (assq 'return-type debugging-info)))
+			   (cond (entry
+				  (let ((type (or (second entry) :no-value)))
+				    (file-declare (function-spec function)
+						  'return-type
+						  type)
+				    type))
+				 (t '(values &rest t))))))
+	(cond ((quick-internal-function-p function)
+	       ;; For now, quick internal functions may not have any arguments.
+	       (if (not (null lambda-list)) (llc-error "Quick function with arguments!"))
+	       (let ((dest (function-quick-destination function)))
+		 (setf (function-interval function)
+		       (collect-interval
+			 (phase-1-progn body dest)
+			 (unless (destination-for-return dest)
+			   (let ((save-n (destination-size dest)))
+			     (emit-unwind-quick-internal save-n)
+			     (emit-popj save-n)))))))
+	      (t
+	       ;; Not a quick internal function; treat normally.
+	       (with-lexical-contour
+		 ;; Handle DEFUN-IN-FLAVOR, something like MACROLET
+		 (let ((instance-variables (assq 'sys:instance-variables local-dcls)))
+		   (when instance-variables
+		     (setf local-dcls (remq instance-variables local-dcls))
+		     (push `((function-flavor ,(second instance-variables)))
+			   (si:env-declarations *interpreter-lexical-environment*))
+		     (dolist (var-name (rest2 instance-variables))
+		       (push (cons var-name (lookup-instance-variable var-name))
+			     (si:env-variables *interpreter-lexical-environment*)))))
+		 (let ((flavor-local-functions (assq 'flavor:local-functions local-dcls)))
+		   (when flavor-local-functions
+		     (setq local-dcls (remq flavor-local-functions local-dcls))
+		     (loop for (name def) in (cdr flavor-local-functions) do
+		       (push (make-flavor-local-function-expander name def)
+			     (si:env-functions *interpreter-lexical-environment*)))))
+		 ;; Environment established, compile the function
+		 (setf (function-interval function)
+		       (collect-interval
+			 (with-letting
+			   (let ((n-required 0)
+				 (n-optional 0)
+				 (rest-arg nil)
+				 (location 0))
+			     (declare (special n-required n-optional rest-arg location))
+			     (let ((*optimize-slot-value* nil))
+			       (catch 'phase-1	;In case of errors
+				 (multiple-value (allow-other-keys-p keys-p)
+				   (decode-&keyword-list lambda-list nil nil
+							 local-declarations
+							 var-dcls specials unspecials
+							 #'process-arg)))
+			       ;; &KEY functions must take a &REST argument
+			       (when (and keys-p (null rest-arg))
+				 (let ((var-dcls var-dcls))
+				   (declare (special var-dcls))
+				   (let ((name (generate-symbol "KEY-REST")))
+				     (push `(,name (future-common-lisp:dynamic-extent . t))
+					   var-dcls)
+				     (process-arg name
+						  ''nil nil 'lexical 'normal 'rest 'eval
+						  nil nil nil nil nil nil))))
+			       (take-arguments (nreverse argument-list))
+			       (setf (function-argument-block-size function) location)
+			       (emit-allocate-local-block))
+			     (when keys-p
+			       (catch 'phase-1
+				 (process-key-variables (nreverse keyed-list)
+							allow-other-keys-p rest-arg
+							var-dcls)))
+			     (let-aux-variables (nreverse aux-list) var-dcls))
+			   (setf local-declarations local-dcls)
+			   (add-unbound-declarations
+			     var-dcls fun-dcls (mapcar #'variable-name *pushed-variables*) ())
+			   (let ((dest *destination-return*))
+			     (when (eq return-type :no-value)
+			       (setf dest *destination-return-dont-care*))
+			     (with-new-control-stack-state
+			       ;; Wrap a BLOCK around the body if we have been told
+			       ;; to do so.
+			       (if block-p 
+				   (phase-1-block (list* block-name body) dest)
+				   (phase-1-progn body dest))))))))))))
+    (when *function-extra-intervals*
+      (lexpr-funcall #'nconc-intervals
+		     (function-interval function)
+		     *function-extra-intervals*))
+    (when (or *functions-transformed* *constants-open-coded*)
+      (setf (function-user-declares function)
+	    (append (function-user-declares function)
+		    (and *functions-transformed*
+			 `((:macros-expanded ,*functions-transformed*)))
+		    (and *constants-open-coded*
+			 `((:constants-open-coded ,*constants-open-coded*)))))))
+  function)
+
+(defun make-flavor-local-function-expander (name def)
+  ;; Distinguish between defun/subst-in-flavor and defmacro-in-flavor
+  (cl:ecase (first def)
+    (flavor:defun-in-flavor
+      `(,name ,def))
+    (special					;DEFMACRO-IN-FLAVOR
+      ;; Macroexpander that calls the real expander but records the call
+      (let ((expander (second def)))
+	`(,name (special ,(lambda (form env)
+			    (let ((expansion (funcall expander form env)))
+			      (note-macroexpansion (cons (function-name expander) (cdr form))
+						   expansion)
+			      expansion))))))))
+
+;;; This function is called once for each argument in the argument list.
+;;; It builds the list of "argument" structures that
+;;; will be passed to take-arguments.  As part of this, it adds the arguments to
+;;; the variable environment, and it runs phase-1 over the initialization forms.
+;;; It also builds the values of the n-required (et. al.) variables, and builds
+;;; a list of &aux variables to be LETed after arguments are accepted.
+(defun process-arg (var-name init-form from-val-list-p declaration class
+		    requiredness evaledness
+		    supplied-p-variable supplied-p-declaration keyword
+		    var-loc var-init-loc supplied-p-var-loc)
+  (declare (special argument-list aux-list keyed-list n-required n-optional rest-arg
+		    var-dcls))
+  from-val-list-p evaledness			;unused
+  (cond ((eq requiredness 'aux)
+	 (push (make-aux :aux-name var-name
+			 :aux-form init-form
+			 :aux-declaration declaration
+			 :aux-class class
+			 :aux-lisp-locator var-loc
+			 :aux-init-lisp-locator var-init-loc)
+	       aux-list))
+	((eq requiredness 'key)
+	 (push (make-keyed :keyed-name var-name
+			   :keyed-keyword keyword
+			   :keyed-form init-form
+			   :keyed-declaration declaration
+			   :keyed-supplied-p-variable supplied-p-variable
+			   :keyed-supplied-p-declaration supplied-p-declaration
+			   :keyed-lisp-locator var-loc
+			   :keyed-init-lisp-locator var-init-loc
+			   :keyed-supplied-p-loc supplied-p-var-loc)
+	       keyed-list))
+	(t
+	 ;; It is an argument.
+	 (let ((argument (make-argument)))
+	   (selectq requiredness
+	     (required
+	      (incf n-required))
+	     (optional
+	      (incf n-optional)
+	      (setf (argument-init-interval argument)
+		    (collect-interval
+		      (phase-1 init-form *destination-stack* var-init-loc))))
+	     (rest
+	      )
+	     (otherwise (llc-error "Unknown requiredness ~S" requiredness)))
+	   
+	   (when (memq class '(array-register array-register-1d))
+	     (phase-1-warning "~S is an argument, array-register declaration ignored"
+			      var-name))
+
+	   (let* ((var (serial-let var-name declaration 'normal var-loc t t var-dcls))
+		  (xvar var))
+	     (setf (argument-var argument) var)
+	     (setf (argument-usage-count argument) (variable-usage-count var))
+	     (setf (argument-requiredness argument) requiredness)
+	     (when (eq (variable-type var) 'special)
+	       ;; Make an internal lexical variable to hold the init value.
+	       (let* ((ivar-name (make-symbol (string-append var-name
+							     "-initialization")))
+		      (ivar (make-variable ivar-name t 'normal var-loc)))
+		 (setf (lexical-free-p ivar) t)
+		 (push (cons ivar-name ivar)
+		       (si:env-variables *interpreter-lexical-environment*))
+		 (setf (argument-ivar argument) ivar)
+		 (setq xvar ivar)))
+	     (when (eq requiredness 'rest)
+	       (setq rest-arg xvar)
+	       (setf (lexical-rest-arg-p xvar) 't))
+	     (push argument argument-list))
+	   (when supplied-p-variable
+	     (let ((var (serial-let supplied-p-variable supplied-p-declaration
+				    'normal supplied-p-var-loc t t var-dcls)))
+	       (setf (argument-supplied-p-var argument) var)
+	       (setf (argument-supplied-p-var-usage-count argument)
+		     (variable-usage-count var))))))))
+
+;;; Use either the simple or the general form of argument taking, depending on whether
+;;; there are hairy dependencies.  To call this function, bind the three special
+;;; variables declared below, and pass in a list of "argument" structures, one for
+;;; each argument.  This emits the take-args instruction, and associated instructions
+;;; for computing initial values, supplied-p variables, and binding arguments that
+;;; are special variables.  Note that it is the caller that runs phase-1 over the
+;;; init forms and that adds the arguments to the variable environment.  This function
+;;; must always emit as its first inst either a take-args or a require-args instruction,
+;;; so that the compiled code object will start with an entry instruction.
+(defun take-arguments (argument-list)
+  (declare (special n-required n-optional rest-arg))
+  (cond ((loop for argument in argument-list do
+	   (let ((var (argument-var argument))
+		 (supplied-p-var (argument-supplied-p-var argument)))
+	     (if (or
+		   ;; If the argument is special and got used,
+		   (and (eq (variable-type var) 'special)
+			(> (variable-usage-count var)
+			   (argument-usage-count argument)))
+		   ;; or there is a supplied-p variable and it got used,
+		   (and (not (null supplied-p-var))
+			(> (variable-usage-count supplied-p-var)
+			   (argument-supplied-p-var-usage-count argument))))
+		 ;; then we cannot use the simple form of argument taking.
+		 (return nil)))
+	       finally (return t))
+	 ;; This is the simple form, in which we can use the take-args instruction with
+	 ;; its built-in dispatch because none of the init forms care that the special
+	 ;; binds and supplied-p variables have not been done yet.  If there are four
+	 ;; or fewer arguments and no rest argument, the take-args instruction is not
+	 ;; actually generated (the special dispatch in function-calling is used instead
+	 ;; for speed), but that is handled by the assembler (pass 4).
+	 ;; First emit a take-args instruction for the arguments, and a name
+	 ;; instruction for those arguments.  Use an internal name for special variables.
+	 (loop for argument in argument-list
+	       collect (or (argument-ivar argument) (argument-var argument)) into ivars
+	       when (eq (argument-requiredness argument) 'optional)
+		 collect (argument-init-interval argument) into init-intervals
+	       finally
+		 (cond ((and (not (null init-intervals))
+			     rest-arg)
+			;; (See note in DEFS where the take-args instruction is defined.)
+			(nconc init-intervals
+			       (ncons (collect-interval
+					(emit-const 'nil))))))
+		 (emit-take-args n-required n-optional (not (null rest-arg)) init-intervals)
+		 (emit-name ivars)
+		 (mapc #'note-argument-lexical ivars))
+	 ;; If there were specials, generate push/bind pairs to bind them.  The value
+	 ;; just sits around on the stack, unused, with the internal name, until the end
+	 ;; of the function; there's no point wasting time to get rid of it.  Also, if
+	 ;; there were supplied-p variables, create lexical ones and bind special ones
+	 ;; (internal variables are not needed here since they are done one at a time).
+	 (loop for argument in argument-list
+	       for argument-number from 0 do
+	   (let ((ivar (argument-ivar argument)))
+	     (cond ((not (null ivar))
+		    (emit-var ivar)
+		    (incf (variable-usage-count ivar))
+		    (emit-bind (argument-var argument)))))
+	   (let ((supplied-p-var (argument-supplied-p-var argument)))
+	     (cond ((not (null supplied-p-var))
+		    (emit-supplied-p *compiler* argument argument-number)
+		    (selectq (variable-type supplied-p-var)
+		      (lexical
+		       (note-argument-lexical supplied-p-var)
+		       (emit-name (list supplied-p-var)))
+		      (special
+		       (emit-bind supplied-p-var))
+		      (instance
+		       (phase-1-bad-form
+			 "Supplied-p variables may not be instance variables: ~S"
+			 supplied-p-var))
+		      (otherwise
+		       (llc-error "Bad variable type for ~S" supplied-p-var))))))))
+	(t (general-take-args *compiler* argument-list))))
+
+(defun note-argument-lexical (lexical-variable)
+  (note-argument-lexical-internal *compiler* lexical-variable))
+
+(defun let-aux-variables (aux-list &optional var-dcls)
+  (loop for aux in aux-list
+	for name = (aux-name aux)
+	for decl = (aux-declaration aux)
+	for class = (aux-class aux)
+	do
+    (phase-1 (aux-form aux) *destination-stack* (aux-init-lisp-locator aux))
+    (serial-let name decl class (aux-lisp-locator aux) nil nil var-dcls)))
+
+(defun no-side-effects (transformed-and-optimized-form)
+  (or (symbolp transformed-and-optimized-form)
+      (constant-form-p transformed-and-optimized-form)
+      (and (cl:consp transformed-and-optimized-form)
+	   (eq (first transformed-and-optimized-form)
+	       'progn)
+	   (loop for subform in transformed-and-optimized-form
+		 always (no-side-effects subform)))))
+
+(defun process-key-variables (keyed-list allow-other-keys-p rest-arg-var var-dcls)
+  (if allow-other-keys-p
+      (emit-call-sequence *compiler*
+			  (external-function 'si:validate-keywords-internal-allow-other-keys)
+			  #'(lambda ()
+			      (when (lexical-gensym-p rest-arg-var)
+				(incf (variable-usage-count rest-arg-var)))
+			      (emit-var rest-arg-var))
+			  1 *destination-ignore*)
+      (emit-call-sequence *compiler* (external-function 'si:validate-keywords-internal)
+			  #'(lambda ()
+			      (phase-1-constant (mapcar #'keyed-keyword keyed-list)
+						*destination-stack*)
+			      (when (lexical-gensym-p rest-arg-var)
+				(incf (variable-usage-count rest-arg-var)))
+			      (emit-var rest-arg-var))
+			  2 *destination-ignore*))
+  (dolist (keyed keyed-list)
+    (let* ((keyword-name (keyed-name keyed))
+	   (keyword-ignored (and (eq t (check-ignored-p-dcl keyword-name var-dcls))
+				 (eq (keyed-declaration keyed) 'lexical)))
+	   (default (transform (keyed-form keyed) (if keyword-ignored *destination-ignore* *destination-stack*)))
+	   (default-no-side-effects (no-side-effects default))
+	   (supplied-p-name (keyed-supplied-p-variable keyed))
+	   (supplied-p-ignored (or (null supplied-p-name)
+				   (and (eq t (check-ignored-p-dcl supplied-p-name var-dcls))
+					(eq (keyed-supplied-p-declaration keyed) 'lexical))))
+	   (loc (keyed-lisp-locator keyed)))
+      (with-lisp-source-locator ((car loc) loc)
+	#+imach
+	(unless (and keyword-ignored default-no-side-effects supplied-p-ignored)
+	  (phase-1-constant (keyed-keyword keyed) *destination-stack*)
+	  (emit-var rest-arg-var)
+	  (emit-call (external-function 'rgetf) 2 *destination-stack-double* t)
+	  (cond ((or (null default)
+		     (and keyword-ignored
+			  default-no-side-effects))
+		 (if supplied-p-ignored
+		     ;; the UNLESS above guarantees that we have (not keyword-ignored)
+		     (emit-pop 1)		;pop the supplied-p guy
+		     (let ((loc (keyed-supplied-p-loc keyed)))
+		       (with-lisp-source-locator ((car loc) loc)
+			 (emit-const (i-lisp-compiler::compute-type-member-operand
+				       '(dtp-list dtp-list-instance)))	;CL:CONSP
+			 (emit-call (external-function 'type-member-internal)
+				    2 *destination-stack* t))
+		       (when keyword-ignored
+			 (emit-pop 1 1)))))
+		((and keyword-ignored
+		      (not default-no-side-effects))
+		 ;; need to evaluate the default for side-effects
+		 (let ((no-init-tag (make-tag))
+		       (done-tag (make-tag)))
+		   (emit-jump 'true no-init-tag 2
+			      (if supplied-p-ignored 2 1))	;leave a NIL for supplied-p
+		   (phase-1 default *destination-ignore* (keyed-init-lisp-locator keyed) nil)
+		   (emit-jump 'always done-tag)
+		   (emit-tag no-init-tag)
+		   (unless supplied-p-ignored
+		     (let ((loc (keyed-supplied-p-loc keyed)))
+		       (with-lisp-source-locator ((car loc) loc)
+			 (emit-const t))))
+		   (emit-tag done-tag)))
+		(t
+		 ;; need the default for value
+		 (let ((no-init-tag (make-tag))
+		       (done-tag (make-tag)))
+		   (emit-jump 'true no-init-tag 1 2)
+		   (phase-1 default *destination-stack* (keyed-init-lisp-locator keyed) nil)
+		   (unless supplied-p-ignored
+		     (let ((loc (keyed-supplied-p-loc keyed)))
+		       (with-lisp-source-locator ((car loc) loc)
+			 (emit-const nil))))
+		   (emit-jump 'always done-tag)
+		   (emit-tag no-init-tag)
+		   (unless supplied-p-ignored
+		     (let ((loc (keyed-supplied-p-loc keyed)))
+		       (with-lisp-source-locator ((car loc) loc)
+			 (emit-const t))))
+		   (emit-tag done-tag)))))
+	#+3600
+	(unless (and keyword-ignored default-no-side-effects supplied-p-ignored)
+	  (cond (keyword-ignored
+		 (let ((done-tag (make-tag)))
+		   (phase-1-constant (keyed-keyword keyed) *destination-stack*)
+		   (emit-take-keyword-argument
+		     rest-arg-var
+		     (collect-interval
+		       (phase-1 default *destination-ignore*
+				(keyed-init-lisp-locator keyed) nil)
+		       (unless supplied-p-ignored
+			 (let ((loc (keyed-supplied-p-loc keyed)))
+			   (with-lisp-source-locator ((car loc) loc)
+			     (emit-const nil))))
+		       (emit-jump 'always done-tag)))
+		   (emit-pop 1)			;get rid of the key value
+		   (unless supplied-p-ignored
+		     (let ((loc (keyed-supplied-p-loc keyed)))
+		       (with-lisp-source-locator ((car loc) loc)
+			 (emit-const t))))
+		   (emit-tag done-tag)))
+		(supplied-p-ignored
+		 (phase-1-constant (keyed-keyword keyed) *destination-stack*)
+		 (emit-take-keyword-argument
+		   rest-arg-var
+		   (collect-interval (phase-1 default *destination-stack*
+					      (keyed-init-lisp-locator keyed) nil))))
+		(t
+		 (let ((done-tag (make-tag)))
+		   (phase-1-constant (keyed-keyword keyed) *destination-stack*)
+		   (emit-take-keyword-argument
+		     rest-arg-var
+		     (collect-interval
+		       (phase-1 default *destination-stack*
+				(keyed-init-lisp-locator keyed) nil)
+		       (let ((loc (keyed-supplied-p-loc keyed)))
+			 (with-lisp-source-locator ((car loc) loc)
+			   (emit-const nil)))
+		       (emit-jump 'always done-tag)))
+		   (let ((loc (keyed-supplied-p-loc keyed)))
+		     (with-lisp-source-locator ((car loc) loc)
+		       (emit-const t)))
+		   (emit-tag done-tag)))))
+	(with-letting
+	  (let ((var (parallel-let keyword-name (keyed-declaration keyed)
+				   'normal loc t t var-dcls)))
+	    (when (and var (eq (variable-type var) 'lexical)
+		       (variable-ignored-p var))
+	      (setf (lexical-size var) 0)))
+	  (when supplied-p-name
+	    (let ((var (parallel-let supplied-p-name
+				     (keyed-supplied-p-declaration keyed)
+				     'normal loc t t var-dcls)))
+	      (when (and var (eq (variable-type var) 'lexical)
+			 (variable-ignored-p var))
+		(setf (lexical-size var) 0))))
+	  (emit-name (reverse (cl:remove-if #'(lambda (variable)
+						(or (not (eq (variable-type variable)
+							     'lexical))
+						    (eql (lexical-size variable) 0)))
+					    *pushed-variables*))))))))
+
+;;;; Computation of args-info.
+
+(defun compute-args-info (function lambda-list)
+  "This function examines lambda-list, and fills in the function-args-info and
+  function-lambda-list slots of function based on what it finds."
+  (let ((*function* function)
+	(args-info 0)
+	(args-count 0))
+    (declare (special args-info args-count))
+    ;; Call compute-arg-info on each argument.  This function modifies args-info
+    ;; for that argument, and uses args-count to keep track of how many arguments
+    ;; there are and complain if there were too many.
+    (catch 'phase-1				;In case of garbage arguments
+      (multiple-value-bind (nil keys-p)
+	  (decode-&keyword-list lambda-list nil nil nil
+				nil nil nil
+				#'compute-arg-info)
+	(when keys-p
+	  (setf (ldb sys:%%arg-desc-rest-arg args-info) 1))))
+    (setf (function-args-info function) args-info)
+    (setf (function-lambda-list function) lambda-list)
+    function))
+
+(defconst *required-arg-info* (dpb 1 system:%%arg-desc-min-args
+				   (dpb 1 system:%%arg-desc-max-args 0))
+  "This gets added to args-info for each required argument.")
+
+(defconst *optional-arg-info* (dpb 1 system:%%arg-desc-max-args 0)
+  "This gets added to args-info for each optional argument.")
+
+(defconst *max-nargs* (ldb system:%%arg-desc-min-args -1)
+  "This is the maximum number of arguments that a function can take.")
+
+(defun compute-arg-info (var-name init-form from-val-list-p
+			 declaration class requiredness evaledness
+			 supplied-p-variable supplied-p-declaration keyword
+			 var-loc var-init-loc supplied-p-var-loc)
+  "This is an internal function of compute-args-info.  It is called once
+  for each variable in the lambda-list, by the decoder.  For each argument,
+  it suitably updates the special variable args-info.  It also makes sure
+  that there aren't too many arguments."
+  (declare (special args-info args-count))
+  var-name init-form from-val-list-p		;unused
+  declaration class evaledness			;unused
+  supplied-p-variable supplied-p-declaration keyword	;also unused
+  var-loc var-init-loc supplied-p-var-loc	;ditto
+  (selectq requiredness
+    ((required optional rest)
+     ;; It is a non-&key argument (as opposed to a supplied-p or aux).
+     (incf args-count)
+     (if (> args-count *max-nargs*)
+	 (phase-1-bad-form "Implementation restriction: too many arguments."))
+     (selectq requiredness
+       (required
+	(incf args-info *required-arg-info*))
+       (optional
+	(incf args-info *optional-arg-info*))
+       (rest
+	(setq args-info (dpb 1 system:%%arg-desc-rest-arg args-info)))))))
+
+;;; Computation of argument map for functions that use require-args instead of take-args.
+(defun compute-argument-map-debugging-info ()
+  (let ((args-list nil)
+	(args-count 0))
+    (declare (special args-list args-count))
+    (catch 'phase-1
+      (decode-&keyword-list (function-lambda-list *function*) nil nil nil
+			    nil nil nil
+			    #'compute-argument-map-debugging-info-1))
+    (push (cons ':argument-map (nreverse args-list)) (function-user-declares *function*))))
+
+(defun compute-argument-map-debugging-info-1 (var-name init-form from-val-list-p
+			    declaration class requiredness evaledness
+			    supplied-p-variable supplied-p-declaration keyword
+			    var-loc var-init-loc supplied-p-var-loc)
+  (declare (special args-list args-count))
+  init-form from-val-list-p
+  declaration class evaledness
+  supplied-p-variable supplied-p-declaration keyword
+  var-loc var-init-loc supplied-p-var-loc
+  (when (memq requiredness '(required optional rest))
+    (push `(,(if (eq requiredness 'rest) ':rest args-count) . ,var-name)
+	  args-list)
+    (incf args-count)))
+
+;;;; Compilation of forms that deal with internal functions.
+
+(defun (future-common-lisp:labels phase-1-handler) (body destination)
+  (phase-1-lexical-function-definition body destination t nil))
+
+(defun (future-common-lisp:flet phase-1-handler) (body destination)
+  (phase-1-lexical-function-definition body destination nil nil))
+
+(defun (clos:generic-labels phase-1-handler) (body destination)
+  (phase-1-lexical-function-definition body destination t t))
+
+(defun (clos:generic-flet phase-1-handler) (body destination)
+  (phase-1-lexical-function-definition body destination nil t))
+
+(defun lexical-function-cell-name (name)
+  (intern (format nil ".~S-FUNCTION-CELL." name)))
+
+(defun cant-call-lexical-function (&rest ignore)
+  (ferror "You can't call lexically-defined funtions until run time."))
+
+(defun phase-1-lexical-function-definition (body destination labels-p &optional generic)
+  (matchp body
+    ((lexical-functions-list . body)
+     (if (not (cl:listp lexical-functions-list)) (phase-1-bad-form))
+     ;; Strip off any "declare" forms from the front of the body.
+     (multiple-value-bind (local-dcls body var-dcls nil nil nil nil fun-dcls)
+	 (if generic
+	     (values nil body)
+	     (si:with-fake-function-bindings (lexical-functions-list
+					      *interpreter-lexical-environment*)
+               (parse-declares body)))
+       (labels ((inline-p (name)
+		  (cdr (assq 'cl:inline (rest1 (assoc name fun-dcls)))))
+		(add-to-environment (function)
+		  (let* ((name (function-label function))
+			 (inline (inline-p name)))
+		    (push `(,name ,function ,@(and inline `(cl:inline ,inline)))
+			  (si:env-functions *interpreter-lexical-environment*)))))
+	 (declare (cl:inline inline-p add-to-environment))
+	 (with-lexical-contour
+	   (let ((functions nil)
+		 (internal-cross-references nil)
+		 (lexical-contour (si:env-variables *interpreter-lexical-environment*)))
+	     (with-optimize-form-cache
+	       ;; Make the first pass over the functions.  Check for duplicate names, create
+	       ;; function structures, and compute args-info.  This creates an environment
+	       ;; in which all of the labelled functions can be called.
+	       (with-letting
+		 (dolist (label lexical-functions-list)
+		   (matchp label
+		     ((name lambda-list . ignore)
+		      (when (not (si:function-let-valid-name-p name))
+			(phase-1-bad-form "~S is not a valid name for an internal function" name))
+		      (when (cl:member name functions :test #'cl:equal :key #'function-label)
+			(phase-1-warning "The name ~S was used twice in the same ~:[FLET~;LABELS~] form" name labels-p)
+			;;        Mark the previous version of the function as ignored.  This
+			;;        suppresses blowing up in WARN-ABOUT-UNUSED-VARIABLES as well
+			;;        allowing a warning about an ignored variable being referenced
+			;;        if we somehow manage to reference the previous version.
+			(setf (variable-ignored-p (cl:find (lexical-function-cell-name name)
+							   *pushed-variables*
+							   :key #'variable-name))
+			      t))
+		      (when (and (si:special-form-p name)
+				 (not (si:macro-function name)))
+			(phase-1-warning "~:[FLET~;LABELS~] of the ~S special form -- good luck."
+					 labels-p name))
+		      ;; Add a local to the top level function - will be captured if we have
+		      ;; mutually recursive functions.  We'd like to emit-fun the function
+		      ;; here, but we don't yet know if we'll be using a stack closure, so
+		      ;; we can't yet.
+		      (let* ((var (create-lexical-variable (lexical-function-cell-name name)
+							   'function-cell nil 't
+							   (not labels-p) nil nil))
+			     (function (make-internal-function
+					 :function-label name
+					 :function-use-stack-closure-p t
+					 ;;---give it a spec of its name so it gets a block.
+					 :function-spec name
+					 :function-cell-var var)))
+			;; Save the name of the internal function
+			(setf (lexical-function-cell-p var) name)
+			(selectq (check-ignored-p-dcl name fun-dcls)
+			  ((t)
+			   (setf (variable-ignored-p var) t))
+			  ((future-common-lisp:ignorable)
+			   (incf (variable-usage-count var))))
+			(setf (function-cell-function var) function)
+			(compute-args-info function lambda-list)
+			(push function functions)
+			(unless generic
+			  (push function *parent-function-offset-list*))))
+		     (* (phase-1-bad-form))))
+		 (setq functions (nreverse functions))
+		 ;; If this is LABELS, add function name to environment, so that other
+		 ;; functions can reference it.
+		 (when labels-p
+		   (mapc #'add-to-environment functions))
+		 ;; Set up inline form definitions.
+		 (unless generic
+		   (loop for label in lexical-functions-list
+			 for function in functions do
+		     (matchp label
+		       ((name lambda-list . body)
+			(when (eq (inline-p name) 'cl:inline)
+			  (condition-case (error)
+			       (multiple-value-bind (block-name foundp)
+				   (si:divine-suitable-block-name name)
+				 (setf (function-inline-form-method function)
+				       (if foundp
+					   (lt:construct-inline-form
+					     name lambda-list body
+					     *interpreter-lexical-environment*
+					     :block-name block-name)
+					   (lt:construct-inline-form
+					     name lambda-list body
+					     *interpreter-lexical-environment*))))
+			     (error
+			       (warn "Error while inlining internal function:~%~A" error)))))
+		       (* (phase-1-bad-form)))))
+		 ;; Now the environment is set up: compile the internal functions.
+		 (loop for label in lexical-functions-list
+		       for function in functions do
+		   (matchp label
+		     ((name lambda-list . body)
+		      (if generic
+			  (multiple-value-bind (lambda-list generic-function-class keys method-forms)
+			      (clos-internals::parse-defgeneric nil lambda-list body *interpreter-lexical-environment*)
+			    (setf (function-interval function)
+				  (collect-interval
+				    (phase-1 `(clos:make-instance ',generic-function-class
+								  :lambda-list ',lambda-list
+								  ,@method-forms
+								  ,@keys)
+					     *destination-stack* nil))))
+			  (let* ((var (function-cell-var function))
+				 (count (variable-usage-count var))
+				 (*function-declared-downward* t))	;simulate function-of-lambda
+			    (multiple-value-bind (block-name foundp)
+				(si:divine-suitable-block-name name)
+			      (if foundp
+				  (phase-1-function-definition
+				    function lambda-list body :block-name block-name)
+				  (phase-1-function-definition function lambda-list body)))
+			    ;; References from inside the function don't count
+			    (setf (variable-usage-count var) count)))
+		      (when labels-p
+			(let ((refs (loop for function in functions
+					  as var = (function-cell-var function)
+					  as count = (variable-usage-count var)
+					  when (> count 0)
+					    collect `(,function . ,count)
+					  do (setf (variable-usage-count var) 0))))
+			  (when refs
+			    (push `(,function ,@refs) internal-cross-references))))
+		      (setf (function-lexical-contour function) (si:env-variables *interpreter-lexical-environment*))
+		      (let ((entry (assq name fun-dcls)))
+			(when (and entry (assq 'future-common-lisp:dynamic-extent (cdr entry)))
+			  (setf (function-use-stack-closure-p function) t))))
+		     (* (phase-1-bad-form)))))
+	       ;; If this is FLET, make the function names known.
+	       (unless labels-p
+		 (mapc #'add-to-environment functions))
+	       (setf local-declarations local-dcls)
+	       (add-unbound-declarations var-dcls fun-dcls
+					 () (mapcar #'function-label functions))
+	       ;; And with the environment set up correctly compile the body.
+	       (with-new-control-stack-state
+		 (let ((body (collect-interval (phase-1-progn body destination))))
+		   (when labels-p
+		     ;; fix up internal usage counts
+		     (let* ((stuff-to-count nil)
+			    (tail-pointer (locf stuff-to-count)))
+		       ;; include all the functions called from the body
+		       (dolist (function functions)
+			 (let ((var (function-cell-var function)))
+			   (when (> (variable-usage-count var) 0)
+			     (let ((entry (cl:assoc function internal-cross-references)))
+			       (when entry
+				 (let ((cons (cons entry nil)))
+				   (setf (location-contents tail-pointer) cons)
+				   (setf tail-pointer (locf (cdr cons)))))))))
+		       ;; add in counts for functions called by internal functions
+		       (loop with stuff-to-process = stuff-to-count
+			     while stuff-to-process
+			     as (nil . entries) = (car stuff-to-process)
+			     do (loop for (function-called . count) in entries do
+				  (unless (cl:assoc function-called stuff-to-count)
+				    ;; not called by anybody so far, so include it
+				    (let ((entry (cl:assoc function-called
+							   internal-cross-references)))
+				      (when entry
+					(let ((cons (cons entry nil)))
+					  (setf (location-contents tail-pointer) cons)
+					  (setf tail-pointer (locf (cdr cons)))))))
+				  (incf (variable-usage-count (function-cell-var
+								function-called))
+					count))
+				(pop stuff-to-process))))
+		   (labels ((function-not-really-used (function)
+			      (let ((var (function-cell-var function)))
+				(and var (zerop (variable-usage-count var)))))
+			    (function-or-parent (x y)
+			      (or (eql x y)
+				  (and (eq (function-type y) 'internal)
+				       (function-or-parent x
+							   (function-parent-function y))))))
+		     (declare (cl:inline function-not-really-used))
+		     (dolist (function functions)
+		       (when (function-not-really-used function)
+			 (setf functions (cl:remove function functions))
+			 (setf *parent-function-offset-list*
+			       (cl:remove function *parent-function-offset-list*))
+			 ;; remove functions whose parents are being removed
+			 (setf *function-list* (cl:remove function *function-list*
+							  :test #'function-or-parent))))
+		     (let ((vars (mapcar #'function-cell-var functions)))
+		       (if generic
+			   (dolist (fun functions)
+			     (emit-interval (function-interval fun)))
+			   (mapc #'emit-fun functions))
+		       (emit-name vars *looping* lexical-contour)
+		       (when labels-p
+			 ;; If this is LABELS, push a pseudo-instruction that will cause the
+			 ;; mutually recursive closures environments to get fixed up should
+			 ;; that be necessary.
+			 (emit (make-fixup-labels-instruction :fixup-labels-fcell-vars vars)))
+		       (emit-interval body)
+		       (unless (destination-for-return destination)
+			 (emit-pop-vars (reverse vars) destination))))))))))))
+    (* (phase-1-bad-form))))
+
+(defun phase-1-macrolet (body destination macrolet environment)
+  (matchp body
+    ((macro-list . body)
+     (if (not (cl:listp macro-list)) (phase-1-bad-form))
+     (let ((names nil))
+       (with-lexical-contour
+	 (with-optimize-form-cache
+	   (dolist (macro macro-list)
+	     (matchp macro
+	       ((name * . *)
+		(when (not (symbolp name))
+		  (phase-1-bad-form "~S is not a valid name for an internal function" name))
+		(when (memq name names)
+		  (phase-1-bad-form "The name ~S was used twice in the same ~s form"
+				    macrolet name))
+		(when (and (si:special-form-p name)
+			   (not (si:macro-function name)))
+		  (phase-1-warning "~s of the ~S special form -- good luck." macrolet name))
+		(push (si:digest-macrolet-macro macro environment)
+		      (si:env-functions *interpreter-lexical-environment*))
+		(push name names))
+	       (* (phase-1-bad-form)))))
+	 (phase-1-progn body destination))))
+    (* (phase-1-bad-form))))
+
+(defun (macrolet phase-1-handler) (body destination)
+  (phase-1-macrolet body destination 'macrolet nil))
+
+(defun (future-common-lisp:macrolet phase-1-handler) (body destination)
+  (phase-1-macrolet body destination 'future-common-lisp:macrolet
+		    *interpreter-lexical-environment*))
+
+(defun (future-common-lisp:symbol-macrolet phase-1-handler) (body destination)
+  (matchp body
+    ((bindings . body)
+     (unless (cl:listp bindings) (phase-1-bad-form))
+     ;; Strip off any "declare" forms from the front of the body.
+     (multiple-value-bind (local-dcls body var-dcls nil nil specials unspecials fun-dcls)
+	 (parse-declares body)
+       (with-lexical-contour
+	 (let ((names nil))
+	   (dolist (binding bindings)
+	     (matchp binding
+	       ((name expansion)
+		(si:check-symbol-setability name 'future-common-lisp:symbol-macrolet)
+		(when (memq name names)
+		  (phase-1-bad-form
+		    "The name ~S was used twice in the same SYMBOL-MACROLET form."
+		    name))
+		(push name names)
+		(when (or (memq name specials) (memq name unspecials))
+		  (phase-1-bad-form "The ~S binding of ~S cannot be declared ~S or ~S."
+				    'future-common-lisp:symbol-macrolet
+				    name 'special 'unspecial))
+		(let ((type (assq 'cl:type (cdr (assq name var-dcls)))))
+		  (when type
+		    (setf expansion `(cl:the ,(cdr type) ,expansion))))
+		(push (list name expansion t)
+		      (si:env-variables *interpreter-lexical-environment*)))
+	       (* (phase-1-bad-form "Bad bindings for SYMBOL-MACROLET"))))
+	   (setf local-declarations local-dcls)
+	   (add-unbound-declarations var-dcls fun-dcls names ())
+	   (phase-1-progn body destination)))))))
+
+;;;; Compilation of progn, prog1, values, values-list, the
+
+;;; Compile a progn.  "forms" should be a list at least one long.  
+(defun phase-1-progn (forms destination &optional (transform-p t))
+  (if (null forms)
+      (phase-1-constant nil destination)
+      (phase-1-progn-internal forms destination transform-p)))
+
+;;; All forms but last to IGNORE, last to destination.
+(defun phase-1-progn-internal (forms destination &optional (transform-p t))
+  (loop for forms on forms
+	as form = (first forms)
+	doing (phase-1 form (if (rest1 forms) *destination-ignore* destination) forms
+		       transform-p)))
+
+;;; All forms to stack
+(defun phase-1-forms-to-stack (forms &optional (transform-p t))
+  (loop for forms on forms
+	as form = (first forms)
+	doing (phase-1 form *destination-stack* forms transform-p)))
+
+;;; A progn to inhibit progn optimizers which remove otherwise unused variables.
+(defun (referencing-variables-progn phase-1-handler) (body destination)
+  (phase-1-progn body destination))
+
+(defun (progn phase-1-handler) (body destination)
+  (phase-1-progn body destination))
+
+(defun (prog1 phase-1-handler) (body destination)
+  (if (null body)
+      (phase-1-bad-form "There was a PROG1 with no body."))
+  (phase-1-prog1 body destination))
+
+;;; Compile a prog1.  If "forms" is NIL, compile a NIL to the destination.
+(defun phase-1-prog1 (forms destination)
+  (cond ((null forms)
+	 (phase-1-constant nil destination))
+	((null (destination-usage destination 0))
+	 (phase-1-progn forms *destination-ignore* nil)
+	 (reconcile-destinations *destination-ignore* destination))
+	((and (null (rest1 forms))
+	      (eql 1 (destination-n-values destination)))
+	 (phase-1 (first forms) destination forms nil))
+	(t					;stack, stack-predicate, return, or multiple
+	 (phase-1 (first forms) (remake-destination destination :n-values 1 :for-return nil)
+	  forms nil)
+	 (phase-1-progn-internal (rest1 forms) *destination-ignore* nil)
+	 (pop-into-destination destination))))
+
+;;; Given a list of forms, compile all the forms and then adjust
+;;; the stack so that there are n results on the stack.
+(defun phase-1-n-to-stack (forms n &optional (transform-p t))
+  (let ((n-forms (length forms)))
+    (cond ((> n-forms n)
+	   (loop for forms on forms
+		 as form = (first forms)
+		 for i downfrom n do
+	     (phase-1 form (if (> i 0) *destination-stack* *destination-ignore*) forms transform-p)))
+	  (t
+	   (phase-1-forms-to-stack forms transform-p)
+	   (loop repeat (- n n-forms) do (emit-const nil))))))
+
+(defun (values phase-1-handler) (body destination)
+  (phase-1-values body destination))
+
+(defun phase-1-values (body destination)
+  (selectq (destination-n-values destination)
+    ((0)
+     ;; No values desired; just compile each subform for effect.
+     (phase-1-progn-internal body destination nil))
+    ((1)
+     ;; One value desired; send it to the stack, and compile the rest for effect.
+     (phase-1-prog1 body destination))
+    ((nil)
+     (cond ((destination-for-return destination)
+	    ;; Compile each form to the stack, and return all of the values so gotten.
+	    (phase-1-forms-to-stack body nil)
+	    (emit-return (length body)))
+	   (t
+	    ;; Compile each form to the stack, and push a fixnum N on top of them.
+	    ;; Emit saving and restoration of level, so that the multiple value
+	    ;; group does not appear in part of the level in phase 2.
+	    (let ((saver (make-level-saver)))
+	      (emit-save-level saver)
+	      (phase-1-forms-to-stack body nil)
+	      (emit-const (length body))
+	      (emit-restore-level saver)))))
+    (otherwise
+     (phase-1-n-to-stack body (destination-n-values destination)))))
+
+;;; Note: values-list is just a function.
+
+(defun (cl:the phase-1-handler) (body destination)
+  (matchp body
+    ((type form)
+     (check-types-compatible destination type)
+     (phase-1 form destination nil))
+    (* (phase-1-bad-form))))
+
+;;; This is actually special-cased by PHASE-1.
+(defun (quote phase-1-handler) (form destination)
+  (if (= (length form) 2)
+      (phase-1-constant (second form) destination)
+      (phase-1-bad-form)))
+
+;;; a form for controlling compiler reference warnings
+(defun (invisible-references phase-1-handler) (body destination)
+  (matchp body
+    ((names . body)
+     ;; collect info about lexicals
+     (let ((vars-counts-and-ignores
+	     (loop for name in names
+		   as variable = (lookup-variable name nil nil t)
+		   collect `(,variable
+			     ,(variable-usage-count variable)
+			     ,(variable-ignored-p variable))
+		   do (setf (variable-ignored-p variable) nil))))
+       (phase-1-progn body destination)
+       ;; restore info
+       (loop for (variable count ignored-p) in vars-counts-and-ignores
+	     do (setf (variable-usage-count variable) count)
+		(setf (variable-ignored-p variable) ignored-p))))
+    (* (phase-1-bad-form))))
+
+;;; a form to force the compiler to generate code, whether or not the value is used
+(defun (for-effect phase-1-handler) (body destination)
+  ;; just like PROGN, but transform as if you need all the values
+  (if (null body)
+      (phase-1-constant nil destination)
+      (loop for forms on body
+	    as form = (transform (first forms) *destination-multiple*)
+	    doing (phase-1 form (if (rest1 forms) *destination-ignore* destination) forms nil))))
+
+(defun (load-time-value-1 phase-1-handler) (body destination)
+  (unless (<= 2 (length body) 3)
+    (phase-1-bad-form))
+  (destructuring-bind (value &optional read-only) (rest1 body)
+    (phase-1-constant (if (funcall *compile-function* :to-core-p)
+			  (eval value)
+			  (cons eval-at-load-time-marker
+				(funcall *compile-function* :optimize-top-level-form
+					 value nil)))
+		      destination
+		      :sharable body
+		      :read-only (cl:case read-only
+				   ((t nil) read-only)
+				   (otherwise (phase-1-bad-form))))))
+
+;;;; Compilation of cond.
+
+(defun (cond phase-1-handler) (body destination)
+  (when (and body (atom body))
+    ;; It's reasonable for a macro to generate a null body...
+    (phase-1-bad-form "The atom ~S is not a valid COND body" body))
+  (let ((end-tag (make-tag))
+	(pop-tag (make-tag))
+	(pop-tag-used-p nil)
+	(usage (destination-usage destination 0)))
+    ;; If you have really fulfilled the "destination", just jump to end-tag.
+    ;; If you have just compiled to "stack" for all non-ignore cases, set the
+    ;; pop-tag-used-p and jump to pop-tag, which will fix things up.
+    (loop for clauses on body
+	  as (clause . rest-of-clauses) = clauses
+	  when (atom clause)
+	    do (phase-1-warning "The atom ~S is not a valid COND clause (ignoring it)."
+				clause)
+	  else
+	    do (with-lisp-source-locator (clause clauses)
+		 (let ((predicate (first clause))
+		       (consequents (rest1 clause)))
+		   (cond ((not (null consequents))
+			  ;; The clause is not a predicate-only clause.
+			  (setq predicate (transform-predicate predicate *destination-stack-predicate*))
+			  (cond ((true-form-p predicate)
+				 ;; The predicate is clearly always true.  Compile the
+				 ;; consequents, and forget about the rest of the COND.
+				 (phase-1-progn consequents destination)
+				 (return))
+				((false-form-p predicate)
+				 ;; The predicate is clearly always false.  QCP2 comments claim
+				 ;; that its DO expander can produce this.  Do nothing.
+				 )
+				(t
+				 ;; The predicate is nothing simple.
+				 (let ((next-tag (make-tag)))
+				   (phase-1 predicate *destination-stack-predicate* clause nil)
+				   (emit-jump 'false next-tag)
+				   (phase-1-progn consequents destination)
+				   (unless (destination-for-return destination)
+				     (emit-jump 'always end-tag))
+				   (emit-tag next-tag)))))
+			 ((not (null rest-of-clauses))
+			  ;; The clause is just a predicate, but there are more clauses.
+			  (phase-1 predicate
+				   (selectq usage
+				     ((nil boolean) *destination-stack-predicate*)
+				     (otherwise *destination-stack*))
+				   clause)
+			  (cond ((null usage)
+				 ;; Just test the value.
+				 (emit-jump 'true end-tag))
+				(t
+				 ;; Get the value returned if it is true.
+				 (setq pop-tag-used-p t)
+				 (emit-jump 'true pop-tag 0))))
+			 ;; The clause is just a predicate and it is the last clause.
+			 ((null usage)
+			  (phase-1 predicate destination clause)
+			  (return))
+			 (t
+			  (phase-1 predicate *destination-stack* clause)	;take one value
+			  (pop-into-destination destination)
+			  (return)))))
+	  finally
+	    ;; This COND might drop off the end; return NIL in that case.
+	    (phase-1-constant nil destination))
+    (when pop-tag-used-p 
+      (unless (or (destination-for-return destination)
+		  (eql 1 (destination-n-values destination)))
+	(emit-jump 'always end-tag))
+      (emit-tag pop-tag)
+      (pop-into-destination destination))
+    (unless (destination-for-return destination)
+      (emit-tag end-tag))))
+
+;Given a form that is definitely being evaluated as a predicate, transform it, check
+;for "obvious" errors, and return the new form (not the other values of transform).
+(defun transform-predicate (form destination)
+  (let ((new-form (transform form destination)))
+    (when (and (cl:consp new-form)
+	       (symbolp (first new-form))
+	       (function-return-type-subtypep
+		 (function-return-type (first new-form)) 'cl:integer))
+      (phase-1-warning "~S isn't a predicate; you may have forgotten (NOT (ZEROP ...))"
+		       form))
+    new-form))
+
+;;;; Compilation of and, or, if.
+
+(defun (and phase-1-handler) (body destination)
+  (p1andor body destination t))
+
+(defun (or phase-1-handler) (body destination)
+  (p1andor body destination nil))
+
+(defvar ---find-and-or-bug--- nil)
+
+;;; Phase 1 handler for both "and" and "or".
+(defun p1andor (body destination and-p)
+  (matchp body
+    ('()
+     ;; The body has no forms.  Compile the identity value.
+     (phase-1-constant and-p destination))
+    ((form)
+     ;; The body only has one form; just compile that form.
+     (phase-1 form destination body))
+    (*
+      (let ((end-tag (make-tag))
+	    (join-tag (make-tag))
+	    (pop-if-successful (and (not (destination-for-return destination))
+				    (eql 0 (destination-n-values destination))))
+	    (condition (if and-p 'false 'true))
+	    (join-tag-used nil)
+	    (end-tag-used nil))
+	;; Non-last forms get compiled to stack and followed by the
+	;; APPROPRIATE JUMP.  If destination is ignore, we end up
+	;; at join-tag with nothing on stack, else with one thing on stack.
+	(loop for forms on body
+	      as form = (first forms)
+	      when (cdr forms)
+		do (let* ((form-destination
+			    (if (or and-p (eql 0 (destination-n-values destination)))
+				*destination-stack-predicate*
+				;; OR might return the (non-null) value
+				*destination-stack*))
+			  (transformed (transform-predicate form form-destination))
+			  (always-true-p (true-form-p transformed))
+			  (always-false-p (false-form-p transformed))
+			  (form-redundant-p (if and-p always-true-p always-false-p))
+			  (form-always-causes-exit (if and-p always-false-p always-true-p)))
+		     (when (not form-redundant-p)
+		       (if form-always-causes-exit
+			   (progn (when (and pop-if-successful ---find-and-or-bug---)
+				    (warn "Form ~S ticked the p1andor bug"
+					  `(,(if and-p 'and 'or) ,@body)))
+				  (unless pop-if-successful
+				    (phase-1 transformed form-destination forms nil)
+				    (pop-into-destination destination))
+				  (when join-tag-used
+				    (emit-jump 'always end-tag)
+				    (setf end-tag-used t))
+				  (return))
+			   (progn (phase-1 transformed form-destination forms nil)
+				  (emit-jump condition join-tag (if pop-if-successful 1 0))
+				  (setf join-tag-used t)))))
+	      else do
+		     ;; Do the last form, propagating multiple values,
+		     ;; and jump over the common code.
+		     (phase-1 form destination forms)
+		     (unless (or (destination-for-return destination)
+				 (member (destination-n-values destination) '(0 1)))
+		       (emit-jump 'always end-tag)
+		       (setf end-tag-used t)))
+	;; This is where all of the non-last forms jumped to.
+	(when join-tag-used
+	  (emit-tag join-tag)
+	  (unless pop-if-successful
+	    (pop-into-destination destination)))
+	(when end-tag-used
+	  (emit-tag end-tag))))))
+
+(defun (if phase-1-handler) (body destination)
+  (matchp body
+    ((test-form then-form . else-forms)
+     ;; Else clauses are optional.  They are an implied PROGN.
+     (let ((else-tag (make-tag))
+	   (end-tag (make-tag))
+	   (test-form (transform-predicate test-form *destination-stack-predicate*)))
+       (cond ((true-form-p test-form)
+	      ;; The test-form is clearly always true.  Compile the
+	      ;; then-form and forget about the rest of the COND.
+	      (phase-1 then-form destination (cdr body)))
+	     ((false-form-p test-form)
+	      ;; The test-form is always false.  Compile only the else-forms.
+	      (phase-1-progn else-forms destination))
+	     (t
+	      (phase-1 test-form *destination-stack-predicate* body nil)
+	      (emit-jump 'false else-tag)
+	      (phase-1 then-form destination (cdr body))
+	      (unless (destination-for-return destination)
+		(emit-jump 'always end-tag))
+	      (emit-tag else-tag)
+	      (phase-1-progn else-forms destination)
+	      (emit-tag end-tag)))))
+
+    (*
+     (phase-1-bad-form "The form ~S is not valid." `(if . ,body)))))
+
+;;;; Compilation of setq, variable-location
+
+(defun (setq phase-1-handler) (body destination)
+  (if (null body)
+      (phase-1-constant nil destination)
+      (loop doing
+	(matchp body
+	  ((var-name form . rest-of-body)
+	   (validate-var-name var-name "set")
+	   (let ((var (lookup-variable var-name nil nil)))
+	     (if (and (eq (variable-type var) 'lexical)
+		      (eql (lexical-size var) 0))
+		 (when (null rest-of-body)
+		   (phase-1-constant nil destination))
+		 (emit-setq-sequence *compiler*
+				     var 
+				     form
+				     (cdr body)
+				     (if rest-of-body *destination-ignore* destination))))
+	   (when (null rest-of-body)
+	     (return nil))
+	   (setq body rest-of-body))
+	  (*
+	    (phase-1-bad-form "Odd number of subforms to SETQ"))))))
+
+(defun phase-1-variable-location (var-name destination)
+  (let* ((var (lookup-variable var-name))
+	 (type (variable-type var)))
+    (when (and (eq type 'lexical)
+	       (not (memq (lexical-class var) '(normal logic))))
+      (phase-1-bad-form "~S is a ~S class of variable" var-name (lexical-class var)))
+    (emitting-one-value-if-necessary (destination)
+      (cond ((and (eq type 'lexical)
+		  (eql (lexical-size var) 0))
+	     (emit-const nil))
+	    (t
+	     (emit-var-location var)
+	     (when (eq type 'lexical)
+	       (setf (lexical-variable-location-p var) t)))))))
+
+(defun (variable-location phase-1-handler) (body destination)
+  (matchp body
+    ((var-name)
+     (validate-var-name var-name "get the variable-location of")
+     (phase-1-variable-location var-name destination))
+    (*
+      (phase-1-bad-form))))
+
+
+
+;;;; Miscellaneous phase-1-hooks
+(defun (closure phase-1-hook) (body destination)
+  destination ;ignored
+  (matchp body
+    ((('quote var-list) . ignore)
+     (dolist (var var-list)
+       (validate-var-name var "close over")
+       (unless (eq 'special (variable-type (lookup-variable var nil nil)))
+	 (phase-1-warning "Note: variable ~S is not declared special." var)))))
+  nil)
+
+(defun (ar-1 phase-1-hook) (body destination)
+  (phase-1-array-register-aref 'ar-1 body destination))
+
+(defun (%1d-aref phase-1-hook) (body destination)
+  (phase-1-array-register-aref '%1d-aref body destination))
+
+(defun phase-1-array-register-aref (fun body destination)
+  (matchp body
+    ((var-name index)
+     (when (symbolp var-name)
+       (when (self-evaluating-symbol-p var-name)
+	 (phase-1-bad-form "~S cannot be an array." var-name))
+       (let ((var (lookup-variable var-name)))
+	 (when (eq (variable-type var) 'lexical)
+	   (let ((fast-aref-begin-inst (emit-fast-aref-begin fun)))
+	     (phase-1 index *destination-stack-fixnum* (cdr body) nil)
+	     (setf (fast-aref-begin-inst fast-aref-begin-inst) (emit-fast-aref var))
+	     (pop-into-destination destination))
+	   t))))
+    (* (phase-1-wrong-num-args fun body)
+       nil)))
+
+(defun phase-1-array-register-aset (fun body destination)
+  (matchp body
+    ((value var-name index)
+     (when (symbolp var-name)
+      (let* ((var (lookup-variable var-name))
+	     (value-constant (constant-form-p value))
+	     (need-value (and (not value-constant)
+			      (destination-usage destination 0))))
+	 (when (eq (variable-type var) 'lexical)
+	   (when need-value
+	     (phase-1 value *destination-stack* body nil))
+	   (let ((fast-aset-begin-inst (emit-fast-aset-begin fun)))
+	     (if (not need-value)
+		 (phase-1 value *destination-stack* body nil)
+		 (emit-copy))
+	     (setf (fast-aset-last-value-inst fast-aset-begin-inst)
+		   (emit-tag (make-tag)))
+	     (phase-1 index *destination-stack-fixnum* (cddr body) nil)
+	     (setf (fast-aset-begin-inst fast-aset-begin-inst)
+		   (emit-fast-aset var)))
+	   (if (destination-usage destination 0)
+	       (if value-constant
+		   (phase-1-constant value destination)
+		   (pop-into-destination destination))
+	       (phase-1-constant nil destination))
+	   t))))
+    (* (phase-1-wrong-num-args fun body)
+       nil)))
+
+;;;; Compilation of multiple-value, multiple-value-bind.
+
+(defun (multiple-value phase-1-handler) (body destination)
+  (matchp body
+    ((var-list form)
+     (if (not (cl:listp var-list))
+	 (phase-1-bad-form))
+     (let ((usage (mapcar #'(lambda (var-name) (not (null var-name))) var-list)))
+       (when (null (first usage))
+	 (setf (first usage) (destination-usage destination 0)))
+       (let* ((length (1+ (or (cl:position nil usage :test-not #'eql :from-end t)
+			      -1)))
+	      (transform-destination (make-destination :n-values length :usage usage))
+	      (transformed-form (transform form transform-destination))
+	      (optimize (and (cl:consp transformed-form)
+			     (eq (first transformed-form) 'values))))
+	 (if optimize
+	     (loop with dest-list = usage
+		   for value-cons on (cl:rest transformed-form)
+		   do (phase-1 (car value-cons)
+			       (cl:case (pop dest-list)
+				 ((nil) *destination-ignore*)
+				 ((t) *destination-stack*)
+				 ((boolean) *destination-stack-predicate*))
+			    
+			       value-cons
+			       nil)
+		   finally (loop while dest-list do
+			     (phase-1-constant nil
+					       (cl:case (pop dest-list)
+						 ((nil) *destination-ignore*)
+						 ((t) *destination-stack*)
+						 ((boolean) *destination-stack-predicate*))
+					       )))
+	     (phase-1 transformed-form transform-destination (cdr body) nil))
+	 (loop for var-name being the elements of (reverse var-list) using rest-of-vars do
+	   ;; The var-list may contain NILs for values that should not be used
+	   ;; to set any variable, but should just be ignored.
+	   (cond ((not (null var-name))
+		  (validate-var-name var-name "set")
+		  (emit-setq (lookup-variable var-name nil nil))))
+	   (cond ((null rest-of-vars)		;first var
+		  (unless (and optimize (null var-name)
+			       (not (destination-usage destination 0)))
+		    (pop-into-destination destination)))
+		 (t
+		  (unless (and optimize (null var-name))
+		    (emit-pop))))))))
+    (* (phase-1-bad-form))))
+
+(defun (multiple-value-bind phase-1-handler) (body DESTINATION)
+  (collecting-interval-instruction (destination)
+    (matchp body
+      ((var-list form . body)
+       (if (not (cl:listp var-list)) (phase-1-bad-form))
+       (multiple-value-bind (local-decs body var-dcls nil nil specials unspecials fun-dcls)
+	   (parse-declares body)
+	 (flet ((var-needed (var-name)
+		  (not (or (cl:member var-name '(nil ignore ignored))
+			   (and (eq t (check-ignored-p-dcl var-name var-dcls))
+				(not (si:special-variable-p var-name nil specials unspecials)))))))
+	   (let* ((usage (mapcar #'var-needed var-list))
+		  (length (1+ (or (cl:position nil usage :test-not #'eql :from-end t)
+				  -1)))
+		  (transform-destination
+		    (make-destination :n-values length :usage usage))
+		  (transformed-form (transform form transform-destination))
+		  (optimize (and (cl:consp transformed-form)
+				 (eq (first transformed-form) 'values)
+				 (not (si:local-function-definition
+					'values *interpreter-lexical-environment*)))))
+	     (if optimize
+		 (loop with dest-list = usage
+		       for value-cons on (cl:rest transformed-form)
+		       do (phase-1 (car value-cons)
+				   (if (pop dest-list) *destination-stack* *destination-ignore*)				  
+				   value-cons
+				   nil)
+		       finally (loop while dest-list do
+				 (phase-1-constant nil
+						   (if (pop dest-list)
+						       *destination-stack* *destination-ignore*)
+						  )))
+		 (phase-1 transformed-form transform-destination (cdr body) nil))
+	     (with-lexical-contour
+	       (let ((var-list (with-letting
+				 (let ((contour (si:env-variables *interpreter-lexical-environment*)))
+				   (loop for vars on var-list
+					 for usage in usage
+					 counting t into var-num
+					 as var-name = (or (first vars) 'ignore)
+					 doing
+				     (unless (null usage)
+				       (validate-var-name var-name "bind" var-list))
+				     (unless (and optimize (null usage))
+				       (let ((var (parallel-let var-name
+								(binding-special-variable-p
+								  var-name specials unspecials)
+								'normal
+								vars t t var-dcls)))
+					 (when (and var
+						    (eq (variable-type var) 'lexical)
+						    (variable-ignored-p var)
+						    (or optimize
+							(> var-num length)))
+					   (setf (lexical-size var) 0)))))
+				   ;; The following is something of a kludge.
+				   ;; Before the delayed bindings are done, we must name
+				   ;; the variables.  For every special in var-list there
+				   ;; is a corresponding lexical ivar in *pushed-variables*.
+				   (emit-name (reverse
+						(subset #'(lambda (v)
+							    (and (eq (variable-type v) 'lexical)
+								 (not (eql (lexical-size v) 0))))
+							*pushed-variables*))
+					      *looping* contour)))))
+		 (setf local-declarations local-decs)
+		 (add-unbound-declarations var-dcls fun-dcls var-list ())
+		 (with-new-control-stack-state
+		   (phase-1-progn body destination)
+		   (unless (destination-for-return destination)
+		     (emit-pop-vars (subset #'(lambda (v)
+						(not (and (eq (variable-type v) 'lexical)
+							  (eql (lexical-size v) 0))))
+					    var-list)
+				    destination)))))))))
+      (* (phase-1-bad-form)))))
+
+(defun (sys:multiple-value-call phase-1-handler) (body destination)
+  (phase-1-multiple-value-call body destination nil))
+
+(defun (multiple-value-apply phase-1-handler) (body destination)
+  (phase-1-multiple-value-call body destination t))
+
+;;; Common Lisp multiple-value-prog1
+(defun (multiple-value-prog1 phase-1-handler) (body destination)
+  (cond ((eql 0 (destination-n-values destination))
+	 (phase-1-progn-internal body destination t))
+	(t
+	 (let* ((first (transform (car body) destination))
+		(n-values (fixed-number-of-values first))
+		(first-dest (if n-values (values-destination n-values) destination))
+		(mult? (null (destination-n-values first-dest)))
+		(mpframe (when mult? (make-multiple-pframe))))
+	   (when (and (cdr body)	;0 or 1 subform
+		      (destination-for-return first-dest))
+	     (setf first-dest (remake-destination first-dest :for-return nil)))
+	   ;; If we're pushing a multiple group, we need a new pframe, so that the multiple
+	   ;; group will get unwound correctly if need be.
+	   (when mult?
+	     (emit-start-multiple mpframe))
+	   (phase-1 first first-dest body nil)
+	   (when mult?
+	     (emit-end-multiple mpframe))
+	   (let-if mult?
+		   ((*pframe* mpframe))
+	     (with-new-control-stack-state
+	       (when mult?
+		 (note-unknown-group *control-stack-state*))
+	       (let ((*multiple-count* (if mult? (1+ *multiple-count*) *multiple-count*)))
+		 (phase-1-progn-internal (cdr body) *destination-ignore* t))
+	       (when (cdr body)
+		 (reconcile-destinations first-dest destination))))))))
+
+(defun fixed-number-of-values (transformed-form)
+  (labels ((combine-values (a b)
+	     (cond ((eql a 'go) b)
+		   ((eql b 'go) a)
+		   ((eql a b) a)
+		   (t nil)))
+	   (number-of-values (form)
+	     (if (cl:consp form)
+		 (let ((function (car form)))
+		   (and (symbolp function)
+			(not (si:local-function-definition function *interpreter-lexical-environment*))
+			(cl:case function
+			  ((function quote prog1 byte setq) 1)
+			  ((values)
+			   (length (cdr form)))
+			  ((progn let let* multiple-value-bind)
+			   ;; flet, etc. aren't included, since they could be binding VALUES
+			   (number-of-values (car (last (cdr form)))))
+			  ((multiple-value-prog1 unwind-protect)
+			   (number-of-values (second form)))
+			  ((if)
+			   (let ((n-values (number-of-values (third form))))
+			     (and n-values
+				  (combine-values (number-of-values (car (last (cdddr form))))
+						  n-values))))
+			  ((cond)
+			   (flet ((clause-n-values (clause)
+				    (if ( (length clause) 1)
+					1
+					(number-of-values (car (last (cdr clause)))))))
+			     (declare (cl:inline clause-n-values))
+			     (let* ((last-clause (car (last (cdr form))))
+				    (fall-through-p (not (and (cl:consp last-clause)
+							      (cl:member (car last-clause)
+									 '(t otherwise)))))
+				    (n-values (if fall-through-p
+						  1
+						  (clause-n-values last-clause))))
+			       (loop for clause in (cdr form)
+				     while n-values
+				     do (setq n-values
+					      (combine-values n-values
+							      (clause-n-values clause))))
+			       n-values)))
+			  ((and or)
+			   (if (null (cddr form))
+			       (number-of-values (second form))
+			       (combine-values (number-of-values (car (last (cdr form))))
+					       1)))
+			  ((go return-from throw)
+			   'go)
+			  (otherwise
+			    (let ((builtins (get-built-in *compiler* function nil)))
+			      (and builtins
+				   (let ((n-values (built-in-n-values (first builtins))))
+				     ;; 0 means the instruction doesn't return anything, but
+				     ;; see phase-1-return-special-value for how the
+				     ;; function might
+				     (and (cl:integerp n-values)
+					  (not (eql n-values 0))
+					  (loop for builtin in (cdr builtins)
+						always (eql n-values
+							    (built-in-n-values builtin)))
+					  n-values))))))))
+		 1)))
+    (declare (cl:inline combine-values))
+    (let ((n-values (number-of-values transformed-form)))
+      (and (fixp n-values) n-values))))
+
+(defun produces-single-value (transformed-form)
+  (eql (fixed-number-of-values transformed-form) 1))
+
+;;; This would be a transformer if they could look at the destination
+(defun (let-value phase-1-handler) (body destination)
+  (destructuring-bind (variable value effect) body
+    (phase-1 (if (null (destination-usage destination 0))
+		 (subst value variable effect)
+		 `(let ((,variable ,value))
+		    ,effect
+		    ,variable))
+	     destination body)))
+
+;;;; Compilation of prog, go, return, et. al.
+
+(defun compiler-generated-lexical (id format-constructor-string)
+  (let ((name (make-symbol (format nil format-constructor-string id))))
+    (push* name *compiler-generated-lexical-list*)
+    name))
+
+;;;
+
+(defun lookup-tag (tag-name)
+  (dolist (entry (si:env-tagbodies *interpreter-lexical-environment*))
+    (let ((position (member tag-name (first entry))))
+      (when position
+	(return-from lookup-tag
+	  (values (second entry) position)))))
+  (phase-1-bad-form "Tag ~S not found." tag-name))
+
+(defun (tagbody phase-1-handler) (body destination)
+  (collecting-interval-instruction (destination)
+    (let* ((*pframe* (make-tagbody-pframe :nlg-looping *looping*))
+	   (first-tag (make-tag 'go))
+	   (tags (list first-tag)))
+      (with-lexical-contour
+	;; Create the tags and put them on *tags*.
+	(let ((tag-names nil)
+	      (tag first-tag))
+	  (dolist (name body)
+	    (if (or (symbolp name) (fixp name))
+		(cond ((cl:member name tag-names)
+		       (phase-1-warning "Tag name ~S used more than once" name))
+		      (t
+		       (push name tag-names)
+		       (when (null tag)
+			 (setf tag (make-tag 'go name))
+			 (push tag tags))
+		       (push (list (list name) tag)
+			     (si:env-tagbodies *interpreter-lexical-environment*))))
+		(setf tag nil))))
+	(setf (nlg-catch-var *pframe*)
+	      (first (with-letting
+		       (serial-let (compiler-generated-lexical (pframe-uid *pframe*)
+							       ".INTERNAL-CATCH-FOR-TAGBODY-~D.")
+				   'lexical 'normal nil nil t nil))))
+	(setf (variable-ignored-p (nlg-catch-var *pframe*)) t)
+	(let ((tag-names nil))
+	  (emit-tagbody destination
+			#'(lambda ()
+			    (with-lexical-contour
+			      (let ((*looping* *looping*))
+				(emit-tag first-tag)
+				(loop for body on body
+				      for x = (first body)
+				      with tag = first-tag
+				      do
+				  (cond ((or (symbolp x) (fixp x))
+					 (unless (cl:member x tag-names)
+					   (push x tag-names)
+					   (setf *looping* t)
+					   (when (null tag)
+					     (setf tag (lookup-tag x))
+					     (emit-tag tag))))
+					(t
+					 (phase-1 x *destination-ignore* body)
+					 (setf tag nil)))))
+			      (phase-1-constant nil destination)))
+			*pframe*
+			(nreverse tags)))))))
+
+(defun (:property go phase-1-handler) (body destination)
+  (matchp body
+    ((tag-name)
+     (unless (or (symbolp tag-name) (fixp tag-name))
+       (phase-1-bad-form "The tag ~S was not a symbol" tag-name))
+     (multiple-value-bind (tag subform)
+	 (lookup-tag tag-name)
+       (if (tagp tag)
+	   (let* ((pframe (tag-pframe tag))
+		  (non-local (or (not (eq *function* (nlg-function pframe)))
+				 (not (eql *nested-unwind-protects*
+					   (nlg-nested-unwind-protects pframe)))))
+		  (*pframe* (make-nlg-transfer-pframe :nlg-transfer-target pframe
+						      :nlg-transfer-non-local non-local)))
+	     (when non-local
+	       (setf (nlg-non-local-reference-p pframe) t)
+	       (setf (tag-non-local-target-p tag) t))
+	     (when (nlg-catch-var pframe)
+	       (deal-with-outward-reference-from-internal (nlg-catch-var pframe)))
+	     (emit-go tag))
+	   (phase-1 `(throw ',tag ',subform) destination nil))))
+    (* (phase-1-bad-form))))
+
+(defun (:property computed-go phase-1-handler) (body destination)
+  destination				;ignored
+  (matchp body
+    ((value default-tag-name . tag-names)
+     (let* ((default-tag (lookup-tag default-tag-name))
+	    (pframe (tag-pframe default-tag))
+	    (tags (mapcar #'lookup-tag tag-names)))
+       (unless (cl:every #'(lambda (tag) (eq (tag-pframe tag) pframe)) tags)
+	 (phase-1-bad-form "Not all tags are from the same TAGBODY."))
+       (let* ((non-local (or (not (eq *function* (nlg-function pframe)))
+			     (not (eql *nested-unwind-protects*
+				       (nlg-nested-unwind-protects pframe)))))
+	      (*pframe* (make-nlg-transfer-pframe :nlg-transfer-target pframe
+						  :nlg-transfer-non-local non-local)))
+	 (when non-local
+	   (setf (nlg-non-local-reference-p pframe) t)
+	   (dolist (tag tags)
+	     (setf (tag-non-local-target-p tag) t)))
+	 (deal-with-outward-reference-from-internal (nlg-catch-var pframe))
+	 (emit-computed-go
+	   #'(lambda ()
+	       (emit-call-sequence
+		 *compiler* (external-function 'si:%dispatch-elt)
+		 #'(lambda ()
+		     (phase-1 value *destination-stack-fixnum* body)
+		     (emit-push-pc-array tags default-tag)
+		     (emit-const (length tags)))
+		 3 *destination-stack*))
+	   tags))))
+    (* (phase-1-bad-form))))
+
+;;;
+
+(defun (block phase-1-handler) (body destination)
+  (phase-1-block body destination))
+
+(defun phase-1-block (body destination)
+  (when (null body) (phase-1-bad-form))
+  (collecting-interval-instruction (destination)
+    (let* ((name (pop body))
+	   (local-return-tag (make-tag))
+	   (nonlocal-return-tag (make-tag))
+	   (*pframe* (make-block-pframe :nlg-looping *looping*
+					:block-destination destination
+					:block-name name
+					:block-local-return-tag local-return-tag
+					:catch-internal-tag nonlocal-return-tag)))
+      (unless (symbolp name)
+	(phase-1-bad-form "BLOCK name must be a symbol."))
+      (with-lexical-contour
+	(push (list name *pframe*) (si:env-blocks *interpreter-lexical-environment*))
+	(setf (nlg-catch-var *pframe*)
+	      (first (with-letting
+		       (serial-let (compiler-generated-lexical (pframe-uid *pframe*)
+							       ".INTERNAL-CATCH-FOR-BLOCK-~D.")
+				   'lexical 'normal nil nil t nil))))
+	(setf (variable-ignored-p (nlg-catch-var *pframe*)) t)
+	(emit-block #'(lambda ()
+			(with-lexical-contour
+			  (phase-1-progn body destination)))
+		    *pframe*)))))
+
+(defun find-frame (prog-name)
+  (let ((frame (assq prog-name (si:env-blocks *interpreter-lexical-environment*))))
+    (when (null frame)
+      (phase-1-bad-form "There is no surrounding BLOCK named ~S" prog-name))
+    (second frame)))
+
+(defconst *return-style-checker-on* nil)
+
+(defun (return-from phase-1-handler) (body destination)
+  (matchp body
+    ((prog-name . forms)
+     (unless (symbolp prog-name)
+       (phase-1-bad-form "The name, ~S, was not a symbol" prog-name))
+     (let ((frame (find-frame prog-name))
+	   form)
+       (let ((n-forms (length forms)))
+	 (cond ((zerop n-forms)
+		(when *return-style-checker-on*
+		  (when (destination-usage destination 0)
+		    (warn '(:bad-style t)
+			  "(~S ~S) now returns one value: NIL.~@
+		     If you want zero values returned, use (~2:*~S ~S (VALUES))."
+			  'return-from prog-name)))
+		(setf form nil))
+	       ((= 1 n-forms)
+		(setf form (first forms)))
+	       (t
+		(warn '(:bad-style t)
+		      "(~S ~S~{ ~S~}) is no longer legal; ~@
+		 you should write it as (~3:*~S ~S (VALUES~{ ~S~}))."
+		      'return-from prog-name forms)
+		(setf form `(values ,@forms)))))
+       (if (typep frame 'pframe)
+	   (let ((destination (block-destination frame))
+		 (non-local (or (not (eq *function* (nlg-function frame)))
+				(not (eql *nested-unwind-protects*
+					  (nlg-nested-unwind-protects frame))))))
+	     (cond
+	       ;; Returning from a top-level function can be compiled more efficiently if we know
+	       ;; that frame-splitting will not happen.  Some esoteric programs depend on this,
+	       ;; and bind *FRAME-SPLITTING-ENABLED* with COMPILER-LET.
+	       ((and (not non-local)
+		     (not *enable-frame-splitting*)
+		     (destination-for-return destination)
+		     (loop for pframe first *pframe* then (pframe-parent pframe)
+			   until (eq pframe frame)
+			   never (eq (pframe-type pframe) 'open-call)))
+		(phase-1 form destination forms))
+	       (t
+		(deal-with-outward-reference-from-internal (nlg-catch-var frame))
+		(let ((*pframe* (make-nlg-transfer-pframe :nlg-transfer-target frame
+							  :nlg-transfer-non-local non-local)))
+		  (when non-local
+		    (setf (nlg-non-local-reference-p frame) t))
+		  (when (destination-for-return destination)
+		    (setf destination (remake-destination destination :for-return nil)))
+		  (emit-return-from destination
+				    #'(lambda ()
+					(phase-1 form destination forms)))))))
+	   (phase-1 `(throw ',frame ,form) destination nil))))
+    (* (phase-1-bad-form))))
+
+;;;; Compilation of catch, throw, and %with-binding-stack-level.
+
+;;; The catch special form has the following new meaning:
+;;; (catch tag-form . body)
+;;; First evaluate tag-form.  Then evaluate body, and return all the values
+;;; of the last form in body.  However, if a matching throw is done during
+;;; the evaluation of body, return all of the values thrown instead.
+(defun (catch phase-1-handler) (body destination)
+  (matchp body
+    ((tag-form . body)
+     (with-new-control-stack-state
+       (note-catch-block *control-stack-state*)
+       (phase-1 tag-form *destination-stack* body)
+       (let ((*pframe* (make-catch-pframe :catch-internal-tag (make-tag)
+					  :catch-or-unwind 'catch))
+	     (n-values (destination-n-values destination)))
+	 (selectq n-values
+	   ((0 1 nil)
+	    (emit-start-catch *pframe* destination)
+	    (phase-1-progn body destination)
+	    (unless (destination-for-return destination)
+	      (emit-end-catch *pframe* destination)
+	      (emit-tag (catch-internal-tag *pframe*))))
+	   (otherwise
+	    ;; Cannot compile a catch directly to this destination, because
+	    ;; the destination gets physically encoded into the catch-frame
+	    ;; at run-time.  Use multiple instead and fix at end with take-values.
+	    (emit-start-catch *pframe* *destination-multiple*)
+	    (phase-1-progn body *destination-multiple*)
+	    (emit-end-catch *pframe* *destination-multiple*)
+	    (emit-tag (catch-internal-tag *pframe*))
+	    (emit-take-values n-values))))))
+    (* (phase-1-bad-form))))
+
+(defun (unwind-protect phase-1-handler) (body destination)
+  (matchp body
+    ((protected-form . handler-body)
+     (let ((tag (make-tag)))
+       (push (collect-interval
+	       (emit-tag tag)
+	       (with-new-control-stack-state
+		 (note-unknown-group *control-stack-state*)
+		 (let ((*multiple-count* (1+ *multiple-count*))
+		       (*nested-unwind-protects* (1+ *nested-unwind-protects*)))
+		   (phase-1-progn handler-body *destination-ignore* t))
+		 (emit-popj 0)))
+	     *function-extra-intervals*)
+       (let ((*pframe* (make-catch-pframe :catch-or-unwind 'unwind)))
+	 (with-new-control-stack-state
+	   (note-catch-block *control-stack-state*)
+	   (emit-start-unwind-protect *pframe* tag)
+	   (phase-1 protected-form destination body)
+	   (unless (destination-for-return destination)
+	     (emit-end-catch *pframe* destination))))))	; Note: this calls the handler.
+    (* (phase-1-bad-form))))
+
+;;; This special form is generated by the compiler when it expands a PROGV or PROGW.
+;;; Inside its body, %bind-location may be used to dynamically manipulate the binding stack.
+;;; The PROGV turns into code that saves and restores the level of the binding
+;;; stack; this special form tells the compiler that the level was so saved, so
+;;; that when it tries to compute the stack levels in phase 2 it will know what
+;;; is going on.
+(defun (%with-binding-stack-level phase-1-handler) (body destination)
+  (if (not (cl:listp body)) (phase-1-bad-form))
+  (let* ((continue (not (destination-for-return destination)))
+	 (*pframe* (make-dbs-pframe
+		     :dbs-destination destination
+		     :dbs-save-binding-stack continue))
+	 (*dbs-pframe* *pframe*))
+    (emit-start-dbs *pframe*)
+    (phase-1-progn body destination)
+    (when continue
+      (emit-end-dbs *pframe*))))
+
+;;; Use of the %BIND-LOCATION "function" should be noted if inside of a dbs-pframe
+(defun (%bind-location phase-1-handler) (body destination)
+  (unless (and (eql 0 (destination-n-values destination))
+	       (not (destination-for-return destination)))
+    (phase-1-bad-form "%BIND-LOCATION does not return a value."))
+  (unless (= (length body) 2)
+    (phase-1-bad-form "Incorrect arguments to %BIND-LOCATION."))
+  (cond ((null *dbs-pframe*)
+	 (phase-1-warning "%BIND-LOCATION may only be used inside %WITH-BINDING-STACK-LEVEL."))
+	((dbs-specials-bound *dbs-pframe*)
+	 (phase-1-warning "Special variables block the use of %BIND-LOCATION here."))
+	(t
+	 (setf (dbs-bind-p *dbs-pframe*) t)))
+  (phase-1-forms-to-stack body)
+  (emit-bind nil t)
+  (emit-kludge-stack -1 t)
+  (let ((bindings (bindings-in-control-stack *compiler*)))
+    (when (plusp bindings)
+      (emit-kludge-stack (- bindings))
+      (note-unknown-group *control-stack-state*))))
+
+(defun (%unbind phase-1-handler) (body destination)
+  (unless (and (eql 0 (destination-n-values destination))
+	       (not (destination-for-return destination)))
+    (phase-1-bad-form "%BIND-LOCATION does not return a value."))
+  (cond ((null *dbs-pframe*)
+	 (phase-1-warning "%UNBIND may only be used inside %WITH-BINDING-STACK-LEVEL."))
+	((dbs-specials-bound *dbs-pframe*)
+	 (phase-1-warning "Special variables block the use of %UNBIND here."))
+	(t
+	 (setf (dbs-bind-p *dbs-pframe*) t)))
+  (matchp body
+    (()
+     (emit-kludge-stack 1 t)
+     (emit-unbind 1)
+     (let ((bindings (bindings-in-control-stack *compiler*)))
+       (when (plusp bindings)
+	 (emit-kludge-stack bindings)
+	 (emit-pop bindings))))
+    (* (phase-1-bad-form))))
+
+;;;; Randomness: compiler-let, function, %push, %pop, %finish-function-call.
+
+;;; Handle compiler-let.  Much simpler than the A-machine compiler since
+;;; internal lambdas are compiled recursively, and since the compiler-let
+;;; bindings are not needed in subsequent phases after phase-1.
+(defun (compiler-let phase-1-handler) (body destination)
+  (matchp body
+    ((vvlist . forms)
+     (progv (mapcar #'(lambda (x)
+			(if (atom x) x (car x)))
+		    vvlist)
+	    (mapcar #'(lambda (x)
+			(if (atom x) nil (eval (cadr x))))
+		    vvlist)
+       (phase-1
+	(cond ((null forms) ''nil)
+	      ((null (cdr forms)) (car forms))
+	      (t `(progn . ,forms)))
+	destination forms)))
+    (* (phase-1-bad-form))))
+
+(defun phase-1-function (function destination &optional (argument-p nil))
+  (let ((ignore-p (eql 0 (destination-n-values destination))))
+    (unless (and ignore-p
+		 (not (symbolp function)))
+      (if (si:interpreted-lambda-p function)
+	  (let ((lambda-list-and-body (si:interpreted-lambda-lambda-list-and-body function)))
+	    (function-of-lambda nil (car lambda-list-and-body) (cdr lambda-list-and-body) argument-p))
+	  (matchp function
+	    ;; This is because property lists can get copied.
+	    ((':property prop val)
+	     (emit-call-sequence *compiler* (external-function 'get)
+				 (lambda ()
+				   (emit-const prop)
+				   (emit-const val))
+				 2 destination))
+	    (fun
+	      (let ((local-function (si:local-function-definition fun *interpreter-lexical-environment*)))
+		(cond (local-function
+		       (selectq (function-type local-function)
+			 (internal
+			  (let ((var
+				  (lookup-variable
+				    (lexical-function-cell-name (function-label local-function)))))
+			    (unless ignore-p
+			      (unless (or (assq 'sys:downward-function
+						(function-user-declares local-function))
+					  (and argument-p (downward-funarg-p)))
+				(setf (function-use-stack-closure-p local-function) nil))
+			      ;; If this is a call to a lexical function which is not defined by the current
+			      ;; function, save it on the list of lexical functions that have to be fixed up
+			      ;; if the current function's lexical-closure cannot be consed on the stack.
+			      (when (and (eq (function-type *function*) 'internal)
+					 (neq (function-parent-function local-function) *function*))
+				(push* local-function (function-lexical-functions-called *function*)))
+			      (emit-var var))))
+			 (interpreter
+			  (emit-fun local-function))
+			 (otherwise
+			  (phase-1-bad-form "You cannot take (FUNCTION ~S), as ~S is not a function." fun fun))))
+		      (t (unless ignore-p
+			   (function-referenced fun)
+			   (if (si:definition-has-location-p function)
+			       (emit-fun (external-function fun))
+			       (emit-call-sequence *compiler*
+						   (external-function 'fdefinition)
+						   (lambda () (emit-const function))
+						   1 destination)))))))))
+      (unless ignore-p
+	(pop-into-destination destination)))))
+
+;; Here for completeness.  FUNCTION is special-cased by PHASE-1.
+(defun (function phase-1-handler) (body destination)
+  (phase-1-function body destination))
+
+(defun (si:function-location phase-1-handler) (body destination)
+  (cond ((eql 0 (destination-n-values destination))
+	 (reconcile-destinations *destination-ignore* destination))
+	(t
+	 (let ((function (car body)))
+	   (unless (symbolp function) (phase-1-bad-form))
+	   (let ((local-function (si:local-function-definition function *interpreter-lexical-environment*)))
+	     (cond (local-function
+		    (selectq (function-type local-function)
+		      (internal
+		       (fixup-stack-closure-function local-function)
+		       (phase-1-variable-location (lexical-function-cell-name
+						    (function-label local-function))
+						  destination))
+		      (interpreter
+		       (phase-1-constant (interpreter-function-location local-function)
+					 destination))
+		      (otherwise
+		       (phase-1-bad-form "You cannot take (FUNCTION-LOCATION ~S), as ~S is not a function."
+					 function function))))
+		   (t (function-referenced function)
+		      (emit-const (follow-cell-forwarding (fdefinition-location function) nil))
+		      (pop-into-destination destination))))))))
+
+(defun function-return-type (fspec)
+  (declare (values type for-effect))
+  (block return-type
+    (let ((declaration (file-declaration fspec 'return-type)))
+      (when declaration
+	(return-from return-type (if (eq declaration :no-value)
+				     (values t t)
+				     declaration))))
+    (when (fdefinedp fspec)
+      (let ((entry (si:debugging-info-user-entry (fdefinition fspec) 'return-type)))
+	(when entry
+	  (return-from return-type (if (second entry)
+				       (second entry)
+				       (values t t))))))
+    '(values &rest t)))
+
+(defun function-return-type-subtypep (frtype type)
+  (if (and (cl:consp frtype)
+	   (eq (car frtype) 'values))
+      nil
+      (cl:subtypep frtype type)))
+
+(defun downward-funarg-p ()
+  (when (and (variable-boundp *function-name*)
+	     (variable-boundp *argno*))
+    (or (callee-accepts-downward-funarg-p *function-name* *argno*)
+	(and (eq *function-name* 'multiple-value-call)
+	     (zerop *argno*))
+	;; See if this is FUNCALL or APPLY
+	(and (memq *function-name* '(funcall cl:apply))
+	     (or (= *argno* 0)
+		 (let ((callee (car *function-call-subforms*)))
+		   (or (and (listp callee)
+			    (eq (car callee) 'function)
+			    (callee-accepts-downward-funarg-p (cadr callee) (1- *argno*)))
+		       (and (typep callee :generic-function)
+			    (> *argno* 1)
+			    (callee-accepts-downward-funarg-p callee (- *argno* 2))))))))))
+
+(defun callee-accepts-downward-funarg-p (callee argno)
+  (let ((funarg-info
+	  (block get-info
+	    (unless (cl:typep callee 'sys:generic-function)
+	      (let ((lexical-function (si:local-function-definition
+					callee *interpreter-lexical-environment*)))
+		(when lexical-function
+		  (return-from get-info
+		    (second (cl:assoc 'sys:downward-funarg
+				      (function-user-declares lexical-function)))))))
+	    (or (car (file-declaration callee 'sys:downward-funarg))
+		(let ((generic (file-declaration callee 'flavor:generic)))
+		  (when generic
+		    (return-from get-info
+		      (second (cl:assoc 'sys:downward-funarg (debugging-info generic))))))
+		(multiple-value-bind (definition found)
+		    (file-declaration callee 'fdefinition)
+		  (cond (found
+			 (unless (funcallable-instance-p definition)
+			   (return-from callee-accepts-downward-funarg-p nil))
+			 (second (cl:assoc 'sys:downward-funarg (debugging-info definition))))
+			((multiple-value-bind (nil found)
+			     (file-declaration callee 'def)
+			   found)
+			 ;; In the compilation environment without downward information
+			 (return-from callee-accepts-downward-funarg-p nil))
+			(t
+			 ;; Go with the global information
+			 (cl:typecase callee
+			   ((sys:generic-function)
+			    (second (cl:assoc 'sys:downward-funarg (debugging-info callee))))
+			   (otherwise
+			     (if (fdefinedp callee)
+				 (second (si:debugging-info-user-entry (fdefinition callee)
+								       'sys:downward-funarg))
+				 (return-from callee-accepts-downward-funarg-p nil)))))))))))
+    (and funarg-info
+	 (or (minusp (car funarg-info))
+	     (mem #'= argno funarg-info)))))
+
+;;; Create and compile an internal function,
+;;; and generate code to leave a pointer to that function on the stack.
+(defun function-of-lambda (name lambda-list body &optional (argument-p nil))
+  (let* ((function (make-internal-function :function-label name
+					   :function-lexical-contour (si:env-variables *interpreter-lexical-environment*)))
+	 (*function-declared-downward* nil))
+    (compute-args-info function lambda-list)
+    (phase-1-function-definition function lambda-list body)
+    (push function *parent-function-offset-list*)
+    (setf (function-use-stack-closure-p function)
+	  (and (function-refers-lexically-p function)
+	       (and (or *function-declared-downward*
+			(and argument-p (downward-funarg-p))))))
+    (emit-fun function)))
+
+(defun function-has-mapping-table (function)
+  (selectq (function-type function)
+    ((external reference) t)
+    (internal (or (eq (function-quick-p function) 't)
+		  (function-mapping-table-p function)))
+    (otherwise nil)))
+
+(defun function-needs-mapping-table (function)
+  (selectq (function-type function)
+    ((external) t)
+    (internal (if (eq (function-quick-p function) 't)
+		  (function-needs-mapping-table (function-parent-function function))
+		  (when (null (function-mapping-table-p function))
+		    ;; Set this before potential recursive call...
+		    (setf (function-mapping-table-p function) t)
+		    ;; Force capture of SELF and SELF-MAPPING-TABLE, for access to I.V.'s.
+		    (lookup-variable 'self)
+		    (lookup-variable 'self-mapping-table))
+		  t))
+    (otherwise (llc-error "unexpected type of function"))))
+
+(defun (%note-unknown-group phase-1-handler) (body destination)
+  body
+  (unless (eql 0 (destination-n-values destination))
+    (phase-1-bad-form "%NOTE-UNKNOWN-GROUP does not produce a value"))
+  (note-unknown-group *control-stack-state*)
+  (reconcile-destinations *destination-ignore* destination))
+
+(defun (system:%push phase-1-handler) (body destination)
+  (unless (eql 0 (destination-n-values destination))
+    (phase-1-bad-form "%PUSH does not produce a value"))
+  (note-unknown-group *control-stack-state*)
+  (matchp body
+    ((form)
+     (phase-1 form *destination-stack* t body nil)
+     (emit-kludge-stack -1))
+    (* (phase-1-bad-form)))
+  (reconcile-destinations *destination-ignore* destination))
+
+;;; "Eval" a form and "return" the number of values it pushed.
+(defun (system:%multiple-value-push phase-1-handler) (body destination)
+  (matchp body
+    ((form)
+     (phase-1 form *destination-multiple* body)
+     (emit-kludge-stack 1)
+     (pop-into-destination destination)
+     ;; There is still the rest of the multiple group on the stack, and we cannot
+     ;; know where it will get popped, so increment the count and hope for the best!
+     (note-unknown-group *control-stack-state*)
+     (incf *multiple-count*))
+    (* (phase-1-bad-form))))
+
+(defun (system:%pop phase-1-handler) (body destination)
+  (note-unknown-group *control-stack-state*)
+  (if (not (null body)) (phase-1-bad-form))
+  (emit-kludge-stack 1)
+  (pop-into-destination destination))
+
+(defun (system:%multiple-value-pop phase-1-handler) (body destination)
+  (if (not (null body)) (phase-1-bad-form))
+  (note-unknown-group *control-stack-state*)
+  ;;(incf *multiple-count*)			;who knows what's on the stack?
+  (reconcile-destinations *destination-multiple* destination))
+
+(defun (system:%finish-function-call phase-1-handler) (body destination)
+  (matchp body
+    ((function udestination n-arguments lexpr)
+     function					; ignored here
+     ;; Check user destination for consistency.
+     (unless (selectq (destination-n-values destination)
+	       ((0)
+		(eq udestination nil))
+	       ((1)
+		(eq udestination t))
+	       (otherwise
+		(if (destination-for-return destination)
+		    (eq udestination 'return)
+		    t)))
+       (phase-1-warning "Destination of %FINISH-FUNCTION-CALL does not agree with its use."))
+     ;; Push number of arguments and call the function.
+     (phase-1 n-arguments *destination-stack-fixnum* (cddr body))
+     (emit-call (external-function (if lexpr 'compiler:%lexpr-funcall-n 'compiler:%funcall-n))
+		1 destination 'cl:inline))
+    (* (phase-1-bad-form "Wrong number of args to %finish-function-call"))))
+
+(defun (flavor:get-flavor-mapping-table-for-instance phase-1-handler) (body destination)
+  (matchp body
+    ((instance-form flavor-form)
+     (cond ((and (eq instance-form 'self)
+		 (assq 'self-mapping-table
+		       (si:env-variables *interpreter-lexical-environment*))
+		 (listp flavor-form)
+		 (eq (first flavor-form) 'quote)
+		 (eql 1 (destination-n-values destination)))
+	    (let ((flavor (second flavor-form))
+		  (function-flavor
+		    (dolist (declarations (si:env-declarations
+					    *interpreter-lexical-environment*))
+		      (let ((declaration (cl:assoc 'function-flavor declarations)))
+			(when declaration
+			  (return (second declaration))))))) 
+	      (cond ((eq flavor function-flavor)
+		     (phase-1-variable 'self-mapping-table destination))
+		    (t
+		     (function-needs-mapping-table *function*)
+		     (phase-1-variable 'self-mapping-table *destination-stack*)
+		     (emit-flavor-mapping-table flavor)
+		     (pop-into-destination destination)))))
+	   (t
+	    (emit-call-sequence
+	      *compiler*
+	      (external-function 'flavor:get-flavor-mapping-table-for-instance)
+	      (lambda ()
+		(phase-1 instance-form *destination-stack* t body nil)
+		(phase-1 flavor-form *destination-stack* t (cdr body) nil))
+	      2 destination))))
+    (* (phase-1-bad-form "Wrong number of args to GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE"))))
+
+(defun (system:with-stack-list phase-1-handler) (body destination)
+  (phase-1-with-stack-list body destination nil))
+
+(defun (system:with-stack-list* phase-1-handler) (body destination)
+  (phase-1-with-stack-list body destination t))
+
+(defun phase-1-with-stack-list (whole-body destination dotted)
+  (matchp whole-body
+    (((var . forms) . body)
+     (let ((n (length forms)))
+       (cond ((= n 0)
+	      (phase-1 `(let ((,var 'nil)) . ,body) destination nil))
+	     ((and (= n 1) dotted)
+	      (phase-1 `(let ((,var ,(car forms))) . ,body) destination nil))
+	     (t
+	      (collecting-interval-instruction (destination)
+		(with-lexical-contour
+		  (validate-var-name var "bind")
+		  (phase-1-forms-to-stack forms)
+		  (phase-1 (list (if dotted
+				     'system:%finish-stack-list*
+				     'system:%finish-stack-list)
+				 (1- n))
+			   *destination-stack* nil)
+		  (let ((vars (with-letting
+				(serial-let var (or (variable-declaration var) 'lexical)
+					    'normal (car whole-body) nil nil))))
+		    (with-new-control-stack-state
+		      (phase-1-progn body destination)
+		      (cond ((not (destination-for-return destination))
+			     (emit-pop-vars vars destination)
+			     (emit-pop n (destination-size destination))))))))))))
+    (* (phase-1-bad-form "Wrong arguments to WITH-STACK-LIST"))))
+
+
+;;;
+;;; More hooks like above, for generating stack-lists for things that
+;;; are bound locals declared dynamic-extent.  See the optimizer for
+;;; LIST.
+;;;
+(defun (make-stack-list phase-1-handler) (form destination)
+  (phase-1-make-stack-list form destination nil))
+
+(defun (make-stack-list* phase-1-handler) (form destination)
+  (phase-1-make-stack-list form destination t))
+
+(defun phase-1-make-stack-list (args destination dotted)
+  ;; no need to matchp; ARGS is just a list of list elts
+  (let* ((n (length args)))			; n elts to be stack-consed
+    (cond ((= n 0)
+	   (phase-1 nil destination nil))
+	  ((and (= n 1) dotted)
+	   (phase-1 (car args) destination nil))
+	  (t
+	   (unless (boundp '*phase-1-variable-size*)
+	     (error "Illegal context"))
+	   (setq *phase-1-variable-size* (1+ (length args)))
+	   (setq *phase-1-variable-offset* (length args))
+	   (collecting-interval-instruction (destination)
+	     (with-lexical-contour
+	       (phase-1-forms-to-stack args)	; get values onto the stack
+	       (phase-1 (list (if dotted
+				  'system:%finish-stack-list*
+				  'system:%finish-stack-list)
+			      (1- n))		; generate pointer to the list
+			destination nil)))))))
+
+(defun (%stack-location-internal phase-1-handler) (body destination)
+  (matchp body
+    ((n)
+     (emit-relative-push-address n)
+     (pop-into-destination destination))
+    (*
+     (phase-1-bad-form))))
+
+(defun (%error-when-retry phase-1-handler) (body destination)
+  (phase-1-error-branches body destination t t))
+
+(defun (%error-unless-retry phase-1-handler) (body destination)
+  (phase-1-error-branches body destination nil t))
+
+(defun (%error-when phase-1-handler) (body destination)
+  (phase-1-error-branches body destination t nil))
+
+(defun (%error-unless phase-1-handler) (body destination)
+  (phase-1-error-branches body destination nil nil))
+
+;;; Errors are of the form (%error-{when,unless}{-retry} (test-form) . ,recovery-forms)
+;;; The value of the form is always the value of the test form if we are retrying
+;;; If we do not retry the test form, then it is the value of test form if it
+;;; is successful, otherwise it is the value of the recovery form
+(defun phase-1-error-branches (body destination true-is-error retry-test)
+  (matchp body
+    ((test-form . recovery-body)
+     (let* ((retry-tag (make-tag))
+	    (recovery-tag (make-tag))
+	    (recovery-interval
+	      (let ((*looping* (or retry-test *looping*)))
+		(collect-interval
+		  (emit-tag recovery-tag)
+		  (phase-1-progn recovery-body
+				 (if retry-test
+				     *destination-ignore*
+				     destination)
+				)
+		  (emit-jump 'always retry-tag)))))
+       (push recovery-interval *function-extra-intervals*)
+       (when retry-test
+	 (emit-tag retry-tag))
+       (phase-1 (transform-predicate test-form *destination-stack-predicate*)
+		*destination-stack-predicate* body nil)
+       (emit-jump (if true-is-error 'true 'false) recovery-tag
+		  1 (if (destination-needed destination 0) 0 1))
+       (when (destination-needed destination 0)
+	 (pop-into-destination destination))
+       (unless retry-test
+	 (emit-tag retry-tag))))
+    (* (phase-1-bad-form))))
+
+(defun (%error-if phase-1-handler) (body destination)
+  (matchp body
+    ((form function var . info)
+     (let ((tag (make-tag)))
+       (emit-tag tag)
+       (phase-1 (transform-predicate form *destination-stack-predicate*)
+		*destination-stack-predicate* body nil)
+       (cond ((null var))
+	     ((symbolp var) (setq var (lookup-variable var)))
+	     (t (phase-1-bad-form)))
+       (emit-jump 'true tag 1 1 (make-error-info :error-variable var
+						 :error-function function
+						 :error-info info))
+       (phase-1-constant nil destination)))
+    (* (phase-1-bad-form))))
+
+(defun (si:source-locator phase-1-handler) (body destination)
+  (let ((*source-locator* (first body)))
+    (phase-1 (second body) destination (rest1 body))))
+
+;;;
+
+(defun (si:%label-pc phase-1-handler) (body ignore ignore)
+  (matchp body
+    ((label)
+     (let ((tag (or (cdr (assoc label *pc-tags*))
+		    (let ((tag (make-tag 'pc label)))
+		      (push `(,label . ,tag) *pc-tags*)
+		      tag))))
+       (emit-tag tag)))
+    (* (phase-1-bad-form "Bad %LABEL-PC form"))))
+
+(defun (si:%pc phase-1-handler) (body destination)
+  (matchp body
+    ((label)
+     (let ((tag (or (cdr (assoc label *pc-tags*))
+		    (let ((tag (make-tag 'pc label)))
+		      (push `(,label . ,tag) *pc-tags*)
+		      tag))))
+       (emit-push-pc tag)
+       (pop-into-destination destination)))
+    (* (phase-1-bad-form "Bad %PC form"))))
+
+(defun (clos-internals:with-mapped-slot-access phase-1-handler) (body destination)
+  (matchp body
+    (((variables mapping-variable-name) . body)
+     (let ((do-mapped-access t))
+       (when (> (length variables)
+		(lsh 1 (byte-size clos-internals:%%map-bits-class)))
+	 (setq do-mapped-access nil))
+       (when (function-has-mapped-slot-access *function*)
+	 (setq do-mapped-access nil))
+       (when do-mapped-access
+	 (setf (function-has-mapped-slot-access *function*) *function*)
+	 (let ((family (clos-internals:make-mapping-table-family)))
+	   (loop for i from 0
+		 for variable-name in variables
+		 for variable = (and variable-name (lookup-variable variable-name nil nil))
+		 doing
+	     (cond ((null variable))
+		   ((and (eq (variable-type variable) 'lexical)
+			 (not (variable-ignored-p variable))
+			 (null (lexical-mapping-table-info variable)))
+		    (setf (lexical-mapping-table-info variable)
+			  (make-instance
+			    'mapped-access-information
+			    :self-mapping-table-variable
+			    (lookup-variable mapping-variable-name nil t)
+			    :family family
+			    :variables variables
+			    :class-index i)))))))
+       (let-if do-mapped-access
+	       ((*optimize-slot-value* *function*))
+	 (phase-1-progn body destination))))
+    (* (phase-1-bad-form))))
+
+
+
+;;; A few functions which are needed by various phases to deal with lexical scoping
+;;; >>> These may not all belong here. <<<
+
+(defun make-kludge-lexical-variable (name &optional (function *function*))
+  (let* ((*function* function)
+	 (*multiple-count* 0)
+	 (*looping* nil)
+	 (variable (make-variable name t)))
+    (setf (lexical-kludge-p variable) t)
+    variable))
+
+(defun make-lexical-variable-named (name function lexical-location arg-p)
+  ;; [Ed. note: this is a kludge used for setting up variables used by the compiler
+  ;; to implement lexical scoping (for example the lexical environment pointer).
+  ;; Don't use this function unless you know what you are doing - pushing a variable
+  ;; onto *compiler-generated-lexical-list* has a lot of side-effects further down the
+  ;; road.]
+  (let ((var (make-kludge-lexical-variable name function)))
+    (setf (lexical-location var) lexical-location)
+    (setf (lexical-argument-p var) arg-p)
+    (push* name *compiler-generated-lexical-list*)
+    var))
+
+(defun make-environment-pointer-variable (function)
+  (make-lexical-variable-named '.lexical-environment-pointer. function -1 t))
+
+;;; This is a lot like LOOKUP-VARIABLE, but doesn't require so many specials to be
+;;; bound.
+;;; >>> At some point, just use LOOKUP-VARIABLE.  <<<
+(defun find-function-lexical-variable-named (function name &optional (errorp t))
+  (loop for v in (function-lexical-variables function)
+	do
+    (when (and (eq (variable-name v) name)
+	       ;; Phase-3a may make a copy of the environment variable.  The original
+	       ;; variable must be used in the entry vector, the copy elsewhere.  The
+	       ;; copy will have been pushed onto function-lexical-variables, so we
+	       ;; are guaranteed to find the copy first.  Sorry, I used up the last
+	       ;; barf bag thinking of this.
+	       (or (not (eq (lexical-kludge-p v) ':copy))
+		   (not *dispatch-interval-p*)))
+      (return-from find-function-lexical-variable-named v))
+	finally (and errorp
+		     (ferror "Function ~S does not have a local variable named ~S"
+			     function name)))) 
+
+(defun find-lexical-variable-named (start-function name &optional (errorp t))
+  "This function searches a function and all of its ancestor functions' lexical variables
+for a variable named NAME.  If the variable is found, it returns it; if not, it either
+returns NIL or ferrors."
+  (loop for f first start-function then (function-parent-function f)
+	for var = (find-function-lexical-variable-named f name nil)
+	until (or var (not f) (neq (function-type f) 'internal))
+	finally (if var (return var)
+		    (and errorp (ferror "Variable name ~S not found" name)))))
+
+(defun get-function-captive-block-pointer (function &optional (errorp t))
+  (get-lexical-pointer function '.lexical-captive-block-pointer. errorp))
+
+(defun get-environment-list-pointer (function &optional (errorp t))
+  (get-lexical-pointer function '.lexical-environment-pointer. errorp))
+
+(defun get-lexical-pointer (function variable &optional (errorp t))
+  (if (and (eq (function-type function) 'internal)
+	   (function-quick-p function))
+      ;; If the function is a quick internal, it will not have a pointer of its own.
+      (find-function-lexical-variable-named (function-frame-owner function) variable errorp)
+      ;; In all other cases, the function should have 
+      (find-function-lexical-variable-named function variable errorp)))
+
+
+;If this uninterned symbol is seen as the car of a list, and the cadr of the
+;list is a named-lambda, it will be compiled.
+(defvar functional-constant-marker (cl:copy-symbol 'functional-constant-marker nil))
+
+;Make it the same as FUNCTION for when the interpreter or compiler sees it.
+;Do NOT make it a displacing macro!
+(fset functional-constant-marker
+      '(special (lambda (x ignore) (cons 'function (cdr x)))))

@@ -1,0 +1,671 @@
+;;; -*- Mode: LISP; Package: CLI; Lowercase: Yes; Syntax: Common-lisp -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+
+;;; Coroutine Streams
+
+;;; SuperScript Improvements:
+;;; 1. Make coroutine output streams actually work by making them eof and close properly.
+;;;    Correct overloaded use of other-stack-group variable so eof can work.
+;;;    Implement a coroutine calling regime which works on nested coroutine streams by
+;;;    explicitly remembering which stack group called on which stream to resume.
+;;; 2. Make a process running a coroutine stream abort properly from any stack group.
+;;;    Make the serving stack group inherit *terminal-io* from the initiating stack group.
+;;; 3. Implement a make-instance interface so streams which combine with coroutine streams
+;;;    can initialize transparently without having to call open-coroutine-stream.  Make
+;;;    open-coroutine-stream call make-instance. Move stack group initialization into 
+;;;    the :restart method and buffer initializations into the input/output mixins.
+;;; 4. Make coroutine streams restartable (:restart) so :set-buffer-pointer 0
+;;;    can be implemented to support :set-pointer 0 from input-pointer-remembering.
+;;; 5. Implement indirect coroutine streams (so coroutine streams can encapsulate other
+;;;    streams, including other indirect coroutine streams).
+;;; 6. Build some test functions for coroutine and indirect coroutine streams.
+;;; [Note: Why isn't this file called coroutine-streams.lisp? Move pipes elsewhere...]
+
+;;; Coroutine Streams
+
+;;; Why use coroutine streams?  When a stream with some complex processing behavior is
+;;; needed and it is not convenient or modular to implement all the state as instance 
+;;; variables, coroutine streams are a good technique.  Program state can reside in stack
+;;; groups or lexical environments instead.
+
+(defflavor basic-coroutine-stream
+	(other-stream
+	 (other-stream-state :closed)		;allowed values: :open, :eof, :aborted, :close
+	 (other-stack-group nil)
+	 (stack-group-role :initiating)		;other valid state is :serving
+	 coroutine-function)			;remember for :RESTART
+	()
+  :writable-instance-variables
+  (:init-keywords :direction :serving-stream-flavor :characters :element-type :buffer-size)
+  (:default-init-plist :direction :input :serving-stream-flavor 'coroutine-stream
+		       :element-type 'character :characters t
+		       :buffer-size 1024 :allow-other-keys)
+  (:initable-instance-variables other-stream coroutine-function stack-group-role)
+  (:required-init-keywords :coroutine-function)	;not meaningful without it
+  ;; The default method for input-pointer-remembering is specified incorrectly, so
+  ;; make up for it here.
+  (:method-combination :set-buffer-pointer (:daemon :most-specific-last))
+  (:conc-name coroutine-stream-)
+  :abstract-flavor
+  (:documentation :base-flavor "All coroutine streams are built on this flavor."))
+
+;;; Provide a make-instance interface so flavors depending on coroutine streams can be
+;;; initialized transparently. The purpose of this method is to create a serving stream
+;;; and connect the two streams to each other.  Buffers are allocated by the more specific
+;;; input and output mixins below.  Additional args can be passed to make-instance of the
+;;; serving stream.
+(defmethod (make-instance basic-coroutine-stream)
+	   (&rest arg-list
+	    &key direction serving-stream-flavor element-type
+	    &allow-other-keys)
+  (assert (and direction serving-stream-flavor element-type))	;must be specified
+  (check-type direction (member :input :output :io))
+  (unless (eq :serving stack-group-role)	;already initialized by initiator
+    (si:with-rem-keywords (arg-list* arg-list '(:serving-stream-flavor :direction))
+      (setq other-stream
+	    (apply #'make-instance serving-stream-flavor
+		   :direction (ecase direction (:input :output) (:output :input) (:io :io))
+		   :characters (subtypep element-type 'character)
+		   :stack-group-role :serving
+		   :other-stream self
+		   :allow-other-keys t
+		   arg-list*))))
+    self)
+
+;;; Now setup the stack group.
+(defmethod (make-instance basic-coroutine-stream :after) (&rest ignore)
+  (when (eq stack-group-role :initiating)
+    (send self :restart))
+  self)
+
+;;; [Historical Note: Previously, the role of the stack group was determined by it's name.
+;;;   This isn't good enough, since with indirect-coroutine-streams, 
+;;;   one coroutine stream can encapsulate another.  Thus each coroutine stream must
+;;;   declare the role of it's stack group.  Further, for eof to work, the stack group
+;;;   variable cannot be replaced by a status symbol, since it is necessary to distinguish
+;;;   :eof from :open status, and still funcall the other stack group.]
+
+;;; Restart the stack group associated with the coroutine stream.  Note
+;;; that when coroutine streams are nested, the stack group in which the
+;;; serving stack group is preset and the one ultimately called are not
+;;; necessarily the same (thus the setting of si:sg-safe to 0).
+(defmethod (:restart basic-coroutine-stream) ()
+  (unless coroutine-function
+    (error "Coroutine stream can't be reset because there is no coroutine-function."))
+  (when (eq stack-group-role :serving)
+    (error "Coroutine stream can't be reset from the serving side."))
+  (unless (and (typep other-stack-group 'stack-group)
+	       (eq (sg-name other-stack-group) 'coroutine-stream))
+    (setq other-stack-group (allocate-resource 'stack-group 'coroutine-stream))
+    (setf (si:sg-safe other-stack-group) 0))	;make nested coroutine streams work
+  (setf (coroutine-stream-other-stack-group other-stream) sys:%current-stack-group)
+  (setf (coroutine-stream-other-stream-state other-stream) :open)
+  (setq other-stream-state :open)
+  ;; Let the other stack group use the current value of *terminal-io* for a background stream.
+  (stack-group-preset other-stack-group 'coroutine-stream-top-level
+		      coroutine-function other-stream *terminal-io*))
+
+;;; Coroutine stack group top level --
+;;;    Always closes the stream to insure that the final :send-output-buffer or
+;;;    :discard-output-buffer is done as appropriate.
+;;; The coroutine stack group should never be called once the streams are closed.
+;;; terminial-io is supplied so the initiating application's type-out window can be used.
+
+(defun coroutine-stream-top-level (function stream coroutine-terminal-io)
+  (catch 'kill-sg
+    (let ((*terminal-io* coroutine-terminal-io))	;use the application's typeout window
+    (unwind-protect-case (aborted)
+	(block execute
+	  (catch-error-restart ((error sys:abort) "Restart main stack group.")
+	    (return-from execute (funcall function stream)))
+	  ;; If we get here, this stack group is being flushed ...
+	  (throw 'kill-sg t))
+      (:always
+	(si:process-flush-background-stream)
+	(close stream :abort aborted)))))	;close must be last because it may not return
+  ;; Can't rely on defacto stack-group-return to resume the correct stack-group
+  ;; (in the case of nested coroutine streams), so we must be explicit about it.
+  (stack-group-resume (coroutine-stream-other-stack-group stream) nil)
+  ;; If we get here, somebody is trying to call a closed stream.  Provide error indication.
+  (setf (coroutine-stream-other-stream-state (coroutine-stream-other-stream stream))
+	:protocol-error)
+  ;; Give a chance for an error to happen in the other stack group
+  (stack-group-resume (coroutine-stream-other-stack-group stream) nil)
+  (error "Coroutine stream protocol violation."))
+
+;;; Coroutine funcall convention: (should this be stack-group-resume rather than funcall??)
+(defsubst-in-flavor (coroutine-funcall basic-coroutine-stream) ()
+  ;; Always record which stack-group called.
+  (setf (coroutine-stream-other-stack-group other-stream) sys:%current-stack-group)
+  (unless (typep other-stack-group 'stack-group)
+    (error "The value of other-stack-group in ~S is not a stack group." self))
+  ;; Use s-g-resume rather than funcall since no one should depend on resumer value.
+  (stack-group-resume other-stack-group nil))
+
+;;; Make restart accessible to the outside world.
+(defmethod (:reset basic-coroutine-stream :before) ()
+  (send self :restart))
+
+;;; It's not obvious that reseting the stack group is universally right, 
+;;; but it is suitable for many things, in particular, this supports input-pointer-remembering.
+(defmethod (:set-buffer-pointer basic-coroutine-stream) (new-pointer)
+  (unless (zerop new-pointer)
+    (error "Coroutine streams can only :set-buffer-pointer to 0."))
+  (send self :restart)
+  0)
+
+(defsubst-in-flavor (coroutine-stream-state-error basic-coroutine-stream) ()
+  (error "The value of other-stream-state ~S of stream ~S is not valid."
+	 other-stream-state self))
+
+;;; A :close can be initiated from either the initiating or serving ends.  In either
+;;; case, the other side is called once to allow it to finish up (in the normal case)
+;;; or abort.  If the program using the coroutine stream wants to terminate prematurely
+;;; (that is, before the normal eof), it should call :close with an argument T (abort) so
+;;; that the serving stack group can clean up properly.
+
+(defmethod (:close basic-coroutine-stream :before) (&optional abort-p)
+  (case other-stream-state
+    ((:aborted :closed))
+    (:eof
+      (setq other-stream-state :closed))
+    (:open
+      (setf (coroutine-stream-other-stream-state other-stream) (if abort-p :aborted :eof))
+      (case stack-group-role
+	(:serving
+	  (setq other-stream-state (if abort-p :aborted :closed))
+	  (stack-group-resume other-stack-group nil))
+	(:initiating
+	  (coroutine-funcall)		;let the other end process :eof or :aborted
+	  (setq other-stream-state :closed))
+	(otherwise
+	  (error "Inconsistent coroutine stream ~S in that neither end has ~
+			 stack-group-role value :serving." self))))
+    (otherwise
+      (coroutine-stream-state-error))))
+
+;;; old comment; no longer relevant? -- jrd
+;;; other-stack-group can have one of three values --
+;;;    If the stream is open on both sides, then it is the stack group to resume.
+;;;    If the other side has closed the stream, then it is :eof which means that this side
+;;;       has reached EOF.
+;;;    If this side has closed the stream, then it is :closed.
+;;; The other-stream links are never destroyed, since the streams are never deallocated.
+
+(defmethod (:close basic-coroutine-stream :after) (&optional ignore)
+  ;; Setting this is critical in a multiply nested context.
+  (setf (coroutine-stream-other-stack-group other-stream) sys:%current-stack-group)
+  (when (and other-stack-group (eq stack-group-role :initiating))
+    (deallocate-resource 'stack-group other-stack-group)
+    (setq other-stack-group nil)))
+
+;;; Buffered Coroutine Streams
+
+(defresource coroutine-stream-buffer (size element-type)
+  :constructor (make-array size :element-type element-type :fill-pointer 0)
+  :matcher (and ;; Really need a type-equalp predicate here ...
+		(equal element-type (array-element-type object))
+		( size (array-total-size object))))
+
+;;; Input Coroutine Streams
+
+(defflavor coroutine-input-stream-mixin
+	(input-buffer)
+	()
+  (:required-flavors basic-coroutine-stream si:buffered-input-stream)
+  (:writable-instance-variables (coroutine-input-stream-buffer input-buffer))
+  (:documentation :mixture "Input coroutine streams are built with this flavor."))
+
+(defmethod (make-instance coroutine-input-stream-mixin :after)
+	   (&key element-type buffer-size &allow-other-keys)
+  (assert (and element-type buffer-size))	;must be specified
+  (when (eq stack-group-role :initiating)
+    (setq input-buffer
+	  (allocate-resource 'coroutine-stream-buffer buffer-size element-type))
+    (setf (coroutine-output-stream-buffer other-stream) input-buffer))
+  self)
+
+(defmethod (:set-buffer-pointer coroutine-input-stream-mixin :after) (ignore)
+  (when input-buffer
+    (setf (fill-pointer input-buffer) 0)))
+
+(defmethod (:byte-size coroutine-input-stream-mixin :default) ()
+  (if input-buffer (array-element-size input-buffer) 8))
+
+(defmethod (:close coroutine-input-stream-mixin :after) (&optional ignore)
+  (when input-buffer
+    (setf (coroutine-output-stream-buffer other-stream) nil)
+    (deallocate-resource 'coroutine-stream-buffer
+			 (prog1 input-buffer (setq input-buffer nil)))))
+
+(defsubst-in-flavor (check-coroutine-input-stream coroutine-input-stream-mixin) ()
+  (case other-stream-state
+    ((:open :eof))				;ok, just pass
+    (:aborted
+      (process:abort *current-process*))
+    (:closed
+      (error "Attempt to read from ~S, which is closed." self))
+    (otherwise
+      (coroutine-stream-state-error))))
+
+;;; The messages :next-input-buffer and :discard-input-buffer are always sent alternately --
+;;; :next-input-buffer is never sent twice in sequence, so we don't have to deal with more
+;;; than one input buffer.  :discard-input-buffer must reset the fill-pointer since
+;;; sometimes we may resume the other stack group, but it won't do anything except
+;;; finish.
+
+(defmethod (:next-input-buffer coroutine-input-stream-mixin) (&optional ignore)
+  (loop when (eq other-stream-state :eof)		;keep on returning nil until closed
+	  return nil
+	do (check-coroutine-input-stream)
+	   (coroutine-funcall)
+	when (and input-buffer (not (zerop (fill-pointer input-buffer))))
+	  return (values input-buffer 0 (fill-pointer input-buffer))))
+
+(defmethod (:discard-input-buffer coroutine-input-stream-mixin) (ignore)
+  (check-coroutine-input-stream)
+  (when input-buffer
+    (setf (fill-pointer input-buffer) 0)))
+
+;;; Output coroutine streams
+
+(defflavor coroutine-output-stream-mixin
+	(output-buffer)
+	()
+  (:required-flavors basic-coroutine-stream si:buffered-output-stream)
+  (:writable-instance-variables (coroutine-output-stream-buffer output-buffer))
+  (:documentation :mixture "Output coroutine streams are built with this flavor."))
+
+(defmethod (make-instance coroutine-output-stream-mixin :after)
+	   (&key element-type buffer-size &allow-other-keys)
+  (assert (and element-type buffer-size))	;must be specified
+  (when (eq stack-group-role :initiating)
+    (setq output-buffer
+	  (allocate-resource 'coroutine-stream-buffer buffer-size element-type))
+    (setf (coroutine-input-stream-buffer other-stream) output-buffer))
+  self)
+
+(defmethod (:set-buffer-pointer coroutine-output-stream-mixin :after) (ignore)
+  (when output-buffer
+    (setf (fill-pointer output-buffer) 0)))
+
+(defmethod (:byte-size coroutine-output-stream-mixin :default) ()
+  (if output-buffer (array-element-size output-buffer) 8))
+
+(defmethod (:close coroutine-output-stream-mixin :after) (&optional ignore)
+  (when output-buffer
+    (setf (coroutine-input-stream-buffer other-stream) nil)
+    (deallocate-resource 'coroutine-stream-buffer
+			 (prog1 output-buffer (setq output-buffer nil)))))
+
+(defsubst-in-flavor (check-coroutine-output-stream coroutine-output-stream-mixin) ()
+  (case other-stream-state
+    (:open)
+    (:aborted
+      (process:abort *current-process*))
+    (:eof
+      (when (eql stack-group-role :initiating)
+	(error "Attempt to write to ~S, which has been closed by the other side." self)))
+    (:closed
+     (error "Attempt to write to ~S, which is closed." self))
+    (otherwise
+      (coroutine-stream-state-error))))
+
+;;; :new-output-buffer will not be sent a second time until after a :discard-output-buffer.
+
+(defmethod (:new-output-buffer coroutine-output-stream-mixin) ()
+  (check-coroutine-output-stream)
+  (when output-buffer
+    (values output-buffer 0 (array-total-size output-buffer))))
+
+(defmethod (:send-output-buffer coroutine-output-stream-mixin) (buffer end ignore)
+  (unless (eq buffer output-buffer)
+    (error "Coroutine output buffer ~S is not the one provided ~S." buffer output-buffer))
+  (unless (and (integerp end) ( end (array-total-size output-buffer)))
+    (error "Buffer end pointer ~D is beyond the length of the buffer ~D"
+	   end (array-total-size output-buffer)))
+  (when output-buffer
+    (setf (fill-pointer output-buffer) end))
+  (loop do (check-coroutine-output-stream)
+	   (coroutine-funcall)
+	when (or (eq other-stream-state :eof)
+		 (and output-buffer (zerop (fill-pointer output-buffer))))
+	  return nil))
+
+;;; Must be defined but doesn't do anything?
+(defmethod (:discard-output-buffer coroutine-output-stream-mixin) (ignore)
+  )
+
+;;; Bidirectional coroutine streams
+
+(defflavor coroutine-bidirectional-stream-mixin
+	()
+	(coroutine-input-stream-mixin coroutine-output-stream-mixin)
+  (:required-flavors si:bidirectional-stream)
+  (:documentation :mixture "Bidirectional coroutine streams are built with this flavor."))
+
+
+;;; The main flavor --
+;;;    Generates the real flavors via the :mixture FlavorD,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI") option.
+
+0(defflavor coroutine-stream
+	()
+	(basic-coroutine-stream)
+  :abstract-flavor
+  (:init-keywords :direction :characters)
+  (:mixture
+   (:direction
+     (:input coroutine-input-stream-mixin
+      (:characters
+	(t si:buffered-input-character-stream)
+	(nil si:buffered-input-binary-stream)))
+     (:output coroutine-output-stream-mixin
+      (:characters
+	(t si:buffered-output-character-stream)
+	(nil si:buffered-output-binary-stream)))
+     (:io coroutine-bidirectional-stream-mixin
+      (:characters
+	(t si:buffered-character-stream)
+	(nil si:buffered-binary-stream))))))
+
+(compile-flavor-methods coroutine-stream)
+
+
+
+;;; External interfaces
+
+(defun open-coroutine-stream (function &rest arg-list)
+  (declare (arglist function
+		    &key (direction :input) (buffer-size 1024) (element-type 'character)
+		    (serving-stream-flavor 'coroutine-stream) &allow-other-keys))
+  (apply #'make-instance 'coroutine-stream :coroutine-function function
+	 :allow-other-keys t arg-list))
+
+;;; Compatability with prior releases ... [still desirable??]
+
+(defun make-coroutine-input-stream (function &rest arguments)
+  (open-coroutine-stream (lambda (stream) (apply function stream arguments))
+			 :direction :input :element-type '(unsigned-byte 8)))
+
+(defun make-coroutine-output-stream (function &rest arguments)
+  (open-coroutine-stream (lambda (stream) (apply function stream arguments))
+			 :direction :output :element-type '(unsigned-byte 8)))
+
+(defun make-coroutine-bidirectional-stream (function &rest arguments)
+  (open-coroutine-stream (lambda (stream) (apply function stream arguments))
+			 :direction :io :element-type '(unsigned-byte 8)))
+
+
+#||
+;;; Routine for testing aborts, etc.
+(defun test-coroutine-stream (&key (filename "sys:io;useful-streams.lisp") (direction :input))
+  (with-open-file (file-stream filename :direction :input)
+    (with-open-file (output-stream (fs:merge-pathnames ".outz" filename) :direction :output)
+      (with-open-stream (co-stream (open-coroutine-stream
+				     (lambda (str)
+				       (format t "~2%~'iCoroutine stack group started.~~2%")
+				       (ecase direction
+					 (:input (stream-copy-until-eof file-stream str))
+					 (:output (stream-copy-until-eof str output-stream))
+					 (:io (format T "~%Bidirectional test NYI."))))
+				     :direction direction))
+	(ecase direction
+	  (:input (stream-copy-until-eof co-stream output-stream))
+	  (:output (stream-copy-until-eof file-stream co-stream))
+	  (:io (format T "~%Bidirectional test NYI.")))))))
+||#
+
+
+
+
+;; These flavors define the various sorts of pipe streams.
+;; They route any messages they receive to the appropriate pipe-buffer.
+;; All the useful work is done by the pipe-buffer's.
+
+(defflavor basic-pipe-stream () ()
+  (:documentation :base-flavor "All pipe streams are built on this flavor.")
+  (:method-combination :pipe-close (:progn :most-specific-last))
+  (:required-methods :pipe-close))
+
+(defmethod (:close basic-pipe-stream) (&optional abort-p)
+  (send self :pipe-close abort-p))
+
+(defmethod (:foreign-host basic-pipe-stream) ()
+  net:*local-host*)
+
+;;;
+
+(defflavor pipe-input-stream-mixin (input-buffer) ()
+  (:initable-instance-variables input-buffer)
+  (:documentation :mixin "Input side of a pipe stream.")
+  (:required-flavors si:basic-buffered-input-stream basic-pipe-stream))
+
+(defmethod (:pipe-close pipe-input-stream-mixin) (&optional abort-p)
+  (send input-buffer :close-input abort-p))
+
+(defmethod (:next-input-buffer pipe-input-stream-mixin) (&optional no-hang-p)
+  (send input-buffer :next-input-buffer no-hang-p))
+
+(defmethod (:discard-input-buffer pipe-input-stream-mixin) (buffer)
+  (send input-buffer :discard-input-buffer buffer))
+
+;;;
+
+(defflavor pipe-output-stream-mixin (output-buffer) ()
+  (:initable-instance-variables output-buffer)
+  (:documentation :mixin "Output side of a pipe stream.")
+  (:required-flavors basic-pipe-stream si:basic-buffered-output-stream))
+
+(defmethod (:pipe-close pipe-output-stream-mixin) (&optional abort-p)
+  (when (null abort-p) (send output-buffer :finish))
+  (send output-buffer :close-output abort-p))
+
+(defmethod (:finish pipe-output-stream-mixin) ()
+  (send output-buffer :finish))
+
+(defmethod (:new-output-buffer pipe-output-stream-mixin) ()
+  (send output-buffer :new-output-buffer))
+
+(defmethod (:send-output-buffer pipe-output-stream-mixin) (buffer end explicit)
+  (send output-buffer :send-output-buffer buffer end explicit))
+
+(defmethod (:discard-output-buffer pipe-output-stream-mixin) (buffer)
+  (send output-buffer :discard-output-buffer buffer))
+
+;;;
+
+(defflavor pipe-bidirectional-stream-mixin ()
+  (pipe-input-stream-mixin pipe-output-stream-mixin))
+
+;;;
+
+(defflavor pipe-stream ()
+  (basic-pipe-stream)
+  :abstract-flavor
+  (:init-keywords :characters :direction :input-buffer :output-buffer)
+  (:mixture (:direction
+	     (:input pipe-input-stream-mixin
+	      (:characters
+	       (nil si:buffered-input-stream)
+	       (t si:buffered-input-character-stream)))
+	     (:output pipe-output-stream-mixin
+	      (:characters
+	       (nil si:buffered-output-stream)
+	       (t si:buffered-output-character-stream)))
+	     (:bidirectional pipe-bidirectional-stream-mixin
+	      (:characters
+	       (nil si:buffered-stream)
+	       (t si:buffered-character-stream))))))
+
+(compile-flavor-methods pipe-stream)
+
+;;;
+
+;; This flavor defines the actual pipe.
+
+(defflavor pipe-buffer
+	((lock (process:make-lock "Pipe Lock"))
+	 (buffer-size 1000)
+	 buffer
+	 (last-sent 0)
+	 (last-given-in 0)
+	 (last-read 0)
+	 (input-closed nil)
+	 (output-closed nil)
+	 (reading-process *current-process*)
+	 (writing-process *current-process*))
+  ()
+  (:init-keywords :element-type)
+  (:initable-instance-variables buffer-size))
+
+(defmacro with-pipe-locked (&body forms)
+  `(process:with-lock (lock) ,@forms))
+
+(defun-in-flavor (pipe-check-open pipe-buffer) ()
+  (when (or input-closed output-closed)
+    (error "Other side of pipe is closed.")))
+
+(defmethod (make-instance pipe-buffer) (&key element-type &allow-other-keys)
+  (setq buffer (make-array buffer-size :element-type element-type)))
+
+(defmethod (:close-input pipe-buffer) (&optional ignore)
+  (with-pipe-locked
+    (setq input-closed t))
+  (process:wakeup reading-process)
+  (process:wakeup writing-process))
+
+(defmethod (:close-output pipe-buffer) (&optional abort-p)
+  (with-pipe-locked
+    (setq output-closed (if abort-p :abort t)))
+  (process:wakeup reading-process)
+  (process:wakeup writing-process))
+
+(defmethod (:finish pipe-buffer) ()
+  (setf writing-process *current-process*)
+  (process:block-process "Pipe Finish" #'send self :finished-p)
+  (with-pipe-locked
+    (when (plusp last-sent)
+      (pipe-check-open))))
+
+(defmethod (:finished-p pipe-buffer) ()
+  (or input-closed (not (null output-closed)) (not (plusp last-sent))))
+
+(defmethod (:new-output-buffer pipe-buffer) ()
+  (setf writing-process *current-process*)
+  (process:block-process "Pipe Out" #'send self :output-space-p)
+  (with-pipe-locked
+    (pipe-check-open)
+    (values buffer last-sent buffer-size)))
+
+(defmethod (:output-space-p pipe-buffer) ()
+  (or input-closed (not (null output-closed)) ( last-sent buffer-size)))
+
+(defmethod (:send-output-buffer pipe-buffer) (ignore end ignore)
+  (with-pipe-locked
+    (pipe-check-open)
+    (setq last-sent end))
+  (process:wakeup reading-process))
+
+(defmethod (:discard-output-buffer pipe-buffer) (ignore))
+
+(defmethod (:input-available pipe-buffer) ()
+  (or input-closed (not (null output-closed)) (> last-sent last-given-in)))
+
+(defmethod (:next-input-buffer pipe-buffer) (no-hang-p)
+  (setf reading-process *current-process*)
+  (unless no-hang-p (process:block-process "Pipe In" #'send self :input-available))
+  (when (send self :input-available)
+    (with-pipe-locked
+      (if (and (null input-closed) (eq output-closed t))
+	  (values nil nil nil t)
+	  (pipe-check-open)
+	  (let ((old-given last-given-in))
+	    (setq last-given-in last-sent)
+	    (when (> last-sent old-given)
+	      (values buffer old-given last-sent nil)))))))
+
+(defmethod (:discard-input-buffer pipe-buffer) (ignore)
+  (with-pipe-locked
+    (setq last-read last-given-in)
+    (when (= last-read last-sent)
+      (setq last-read 0)
+      (setq last-given-in 0)
+      (setq last-sent 0)))
+  (process:wakeup writing-process))
+
+(compile-flavor-methods pipe-buffer)
+
+;; These functions provide the actual user interface to the above.
+
+(defun make-unidirectional-pipe (&key (buffer-size 1000) (element-type 'character))
+  (declare (values input-stream output-stream))
+  (let ((buffer (make-instance 'pipe-buffer
+			       :buffer-size buffer-size :element-type element-type))
+	(characters (subtypep element-type 'character)))
+    (values (make-instance 'pipe-stream :direction :input :characters characters
+			   :input-buffer buffer)
+	    (make-instance 'pipe-stream :direction :output :characters characters
+			   :output-buffer buffer))))
+
+(defun make-bidirectional-pipe (&key (buffer-size 1000) (element-type 'character))
+  (let ((buffer1 (make-instance 'pipe-buffer
+				:buffer-size buffer-size :element-type element-type))
+	(buffer2 (make-instance 'pipe-buffer
+				:buffer-size buffer-size :element-type element-type))
+	(characters (subtypep element-type 'character)))
+    (values (make-instance 'pipe-stream :direction :bidirectional :characters characters
+			   :input-buffer buffer1 :output-buffer buffer2)
+	    (make-instance 'pipe-stream :direction :bidirectional :characters characters
+			   :input-buffer buffer2 :output-buffer buffer1))))

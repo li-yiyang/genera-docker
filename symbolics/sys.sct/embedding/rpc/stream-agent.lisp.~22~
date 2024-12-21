@@ -1,0 +1,242 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Package: RPC; Base: 10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;; Byte stream transport agent
+
+(DEFFLAVOR BYTE-STREAM-TRANSPORT-AGENT (STREAM
+					(LOCK NIL)
+					(NETWORK-AGENT-P T))
+	   (ARRAYS-FOR-XDR-BLOCKS SERVER-PROCESS-MIXIN STD-TRANSPORT-AGENT)
+  (:INITABLE-INSTANCE-VARIABLES STREAM NETWORK-AGENT-P)
+  (:READABLE-INSTANCE-VARIABLES NETWORK-AGENT-P)
+  :ABSTRACT-FLAVOR)
+
+;;; Byte stream transport agents have to do their own byte swapping
+;;; Embedded communication area transport agents have hardware to do it
+
+;;; This one talks the SUN standard
+(DEFFLAVOR BIG-ENDER-BYTE-STREAM-TRANSPORT-AGENT ()
+	   (STD-BIG-ENDER-ARRAY-TRANSPORT-AGENT BYTE-STREAM-TRANSPORT-AGENT))
+
+;;; This one uses less byte-swapping when talking to a like-minded machine
+(DEFFLAVOR LITTLE-ENDER-BYTE-STREAM-TRANSPORT-AGENT ()
+	   (STD-LITTLE-ENDER-ARRAY-TRANSPORT-AGENT BYTE-STREAM-TRANSPORT-AGENT))
+
+;;; Only one lock for both input and output in case the two sides interact internally
+;;; as might happen in networks
+(DEFMACRO-IN-FLAVOR (WITH-STREAM-LOCK BYTE-STREAM-TRANSPORT-AGENT) (&BODY BODY)
+  `(SI:WITH-PROCESS-LOCK ((LOCF LOCK) "RPC Lock")
+     (WITHOUT-ABORTS ("I/O is being performed on the RPC stream.~@
+		       Aborting this will probably unsynchronize the record formatting~@
+		       in the stream and cause RPC to stop working completely.")
+       ,@BODY)))
+
+(DEFMETHOD (:CLOSE BYTE-STREAM-TRANSPORT-AGENT) (&OPTIONAL ABORT-P)
+  (CLOSE STREAM :ABORT ABORT-P))
+
+(DEFMETHOD (HIGH-LATENCY-P BYTE-STREAM-TRANSPORT-AGENT) () T)
+
+(DEFMETHOD (SEND-XDR-BLOCK BYTE-STREAM-TRANSPORT-AGENT) (BLOCK &OPTIONAL DONT-RELEASE)
+  (UNWIND-PROTECT 
+      (LET ((N-BYTES (* (XDR-BLOCK-DATA-SIZE SELF BLOCK) 4)))
+	(STACK-LET ((ARRAY (MAKE-ARRAY N-BYTES :ELEMENT-TYPE '(UNSIGNED-BYTE 8)
+				       :DISPLACED-TO BLOCK)))
+	  (WITH-STREAM-LOCK
+	    ;; only one fragment
+	    (WRITE-BYTE (DPB 1 (BYTE 1 7) (LDB (BYTE 8 24) N-BYTES)) STREAM)
+	    (WRITE-BYTE (LDB (BYTE 8 16) N-BYTES) STREAM)
+	    (WRITE-BYTE (LDB (BYTE 8 8) N-BYTES) STREAM)
+	    (WRITE-BYTE (LDB (BYTE 8 0) N-BYTES) STREAM)
+	    (SEND STREAM :STRING-OUT ARRAY)
+	    (FORCE-OUTPUT STREAM))))
+    (UNLESS DONT-RELEASE
+      (RELEASE-XDR-BLOCK SELF BLOCK))))
+
+(DEFMETHOD (RECEIVE-XDR-BLOCK BYTE-STREAM-TRANSPORT-AGENT) ()
+  (LOOP		;loop if after locking the lock there is no input after all
+    ;; Wait for input to arrive without locking the lock
+    (SI:STREAM-INPUT-BLOCK STREAM "Await Remote Call")
+    (WITH-STREAM-LOCK
+      (LET ((BYTE1 (SEND STREAM :TYI-NO-HANG)))
+	(WHEN BYTE1
+	  (LET ((N-BYTES (%LOGDPB BYTE1 (BYTE 8 24)
+				  (%LOGDPB (READ-BYTE STREAM) (BYTE 8 16)
+					   (%LOGDPB (READ-BYTE STREAM) (BYTE 8 8)
+						    (READ-BYTE STREAM))))))
+	    (UNLESS (MINUSP N-BYTES)
+	      (ERROR "---code for multi-fragment RPC records not written yet"))
+	    (SETQ N-BYTES (%LOGDPB 0 (BYTE 1 31) N-BYTES))
+	    ;; I don't see any good alternative to consing these, as they are passed
+	    ;; from process to process
+	    (LET ((BLOCK (ALLOCATE-XDR-BLOCK SELF (CEILING N-BYTES 4))))
+	      (STACK-LET ((ARRAY (MAKE-ARRAY N-BYTES :ELEMENT-TYPE '(UNSIGNED-BYTE 8)
+						     :DISPLACED-TO BLOCK)))
+		(SEND STREAM :STRING-IN "EOF in middle of RPC record" ARRAY)
+		(RETURN-FROM RECEIVE-XDR-BLOCK BLOCK)))))))))
+
+(DEFMETHOD (RPC-DISPATCH-PROCESS-PRIORITY BYTE-STREAM-TRANSPORT-AGENT) ()
+  (PROCESS:MAKE-PROCESS-PRIORITY :FG 7 :PREEMPTIVE T))
+
+(DEFMETHOD (REMOTE-HOST BYTE-STREAM-TRANSPORT-AGENT) ()
+  (SEND-IF-HANDLES STREAM :FOREIGN-HOST))
+
+(DEFMETHOD (AGENT-CONNECTED-P BYTE-STREAM-TRANSPORT-AGENT) ()
+  (OR (NOT (OPERATION-HANDLED-P STREAM :CONNECTED-P))	;Assume connected if can't tell
+      (SEND STREAM :CONNECTED-P)))
+
+(DEFWHOPPER (REPORT-ERROR-WHILE-EXECUTING-SERVER BYTE-STREAM-TRANSPORT-AGENT)
+	    (TRANSACTION-ID MODULE-NUMBER MODULE-VERSION ENTRY-NUMBER DESCRIPTION
+			    &OPTIONAL VERIFIER DONT-STACK-ALLOCATE)
+  (CONDITION-CASE ()
+       (CONTINUE-WHOPPER
+	 TRANSACTION-ID MODULE-NUMBER MODULE-VERSION ENTRY-NUMBER DESCRIPTION
+	 VERIFIER DONT-STACK-ALLOCATE)
+     ((REMOTE-NETWORK-ERROR NETWORK-STREAM-CLOSED END-OF-FILE FATAL-ERROR))))
+
+(COMPILE-FLAVOR-METHODS BYTE-STREAM-TRANSPORT-AGENT
+			LITTLE-ENDER-BYTE-STREAM-TRANSPORT-AGENT
+			BIG-ENDER-BYTE-STREAM-TRANSPORT-AGENT)
+
+;;; Specific byte stream based agents
+
+;;; Serial line, usually from 3600 console to nearby Macintosh
+
+(EVAL-WHEN (COMPILE LOAD)
+  (COMPILER:FUNCTION-DEFINED 'SI:MAKE-SERIAL-STREAM))
+
+(DEFUN OPEN-SERIAL-AGENT (&KEY (UNIT 0) (BAUD 9600) RELIABLE RTS-CTS-PROTOCOL)
+  (LET ((STREAM (SI:MAKE-SERIAL-STREAM :UNIT UNIT :BAUD BAUD
+				       :GENERATE-XON-XOFF NIL :XON-XOFF-PROTOCOL NIL
+				       :PARITY NIL :RTS-CTS-PROTOCOL RTS-CTS-PROTOCOL
+				       :NUMBER-OF-DATA-BITS 8 :NUMBER-OF-STOP-BITS 1)))
+    (WHEN RELIABLE
+      (SETQ STREAM (CLI::MAKE-RELIABLE-ENCAPSULATING-STREAM STREAM)))
+    (SETQ *DEFAULT-TRANSPORT-AGENT*
+	  ;; Always big-ender, since the other end is not likely to be a Lispm
+	  (MAKE-INSTANCE 'BIG-ENDER-BYTE-STREAM-TRANSPORT-AGENT
+			 :STREAM STREAM :NETWORK-AGENT-P NIL))))
+
+
+;;; Network (TCP & Chaosnet)
+
+;--- still to do: agents could automatically re-open if connection
+;--- goes away between calls
+
+(NET:DEFINE-PROTOCOL :RPC (:RPC :BYTE-STREAM)
+  (:DESIRABILITY 0.8)	;big ender is less desirable than little ender
+  (:INVOKE-WITH-STREAM ((STREAM :CHARACTERS NIL) &KEY (PROCESS T))
+    (MAKE-INSTANCE 'BIG-ENDER-BYTE-STREAM-TRANSPORT-AGENT
+		   :STREAM STREAM :PROCESS PROCESS)))
+
+(NET:DEFINE-PROTOCOL :RPC-LITTLE-ENDER (:RPC :BYTE-STREAM)
+  (:DESIRABILITY 0.9)	;little ender is more desirable than big ender
+  (:INVOKE-WITH-STREAM ((STREAM :CHARACTERS NIL) &KEY (PROCESS T))
+    (MAKE-INSTANCE 'LITTLE-ENDER-BYTE-STREAM-TRANSPORT-AGENT
+		   :STREAM STREAM :PROCESS PROCESS)))
+
+(NET:DEFINE-SERVER :RPC
+    (:MEDIUM :BYTE-STREAM
+     :STREAM (STREAM :CHARACTERS NIL)
+     :PROCESS-NAME "RPC server"
+     :WHO-LINE NIL
+     :ERROR-DISPOSITION (:IGNORE REMOTE-NETWORK-ERROR NETWORK-STREAM-CLOSED END-OF-FILE))
+   (WITH-OPEN-STREAM (AGENT (MAKE-INSTANCE 'BIG-ENDER-BYTE-STREAM-TRANSPORT-AGENT
+					   :STREAM STREAM
+					   :PROCESS NIL))
+     (SERVER-TOP-LEVEL AGENT)))
+
+(NET:DEFINE-SERVER :RPC-LITTLE-ENDER
+    (:MEDIUM :BYTE-STREAM
+     :STREAM (STREAM :CHARACTERS NIL)
+     :PROCESS-NAME "RPC server"
+     :WHO-LINE NIL
+     :ERROR-DISPOSITION (:IGNORE REMOTE-NETWORK-ERROR NETWORK-STREAM-CLOSED END-OF-FILE))
+   (WITH-OPEN-STREAM (AGENT (MAKE-INSTANCE 'LITTLE-ENDER-BYTE-STREAM-TRANSPORT-AGENT
+					   :STREAM STREAM
+					   :PROCESS NIL))
+     (SERVER-TOP-LEVEL AGENT)))
+
+;--- I don't know how I'm supposed to pick these.  Don't worry, be happy.
+(WHEN (VARIABLE-BOUNDP #'TCP:ADD-TCP-PORT-FOR-PROTOCOL)
+  (TCP:ADD-TCP-PORT-FOR-PROTOCOL :RPC 6259)
+  (TCP:ADD-TCP-PORT-FOR-PROTOCOL :RPC-LITTLE-ENDER 6257))
+
+(DEFUN OPEN-TCP-AGENT (HOST)
+  (SETQ *DEFAULT-TRANSPORT-AGENT* (NET:INVOKE-SERVICE-ON-HOST :RPC (NET:PARSE-HOST HOST))))
+
+(DEFFLAVOR BIG-IN-LITTLE-BYTE-STREAM-TRANSPORT-AGENT ()
+	   (BIG-IN-LITTLE-BYTES-DATA LITTLE-ENDER-BYTE-STREAM-TRANSPORT-AGENT))
+
+(NET:DEFINE-SERVER :RPC-BIG-IN-LITTLE-BYTES
+    (:MEDIUM :BYTE-STREAM
+     :STREAM (STREAM :CHARACTERS NIL)
+     :PROCESS-NAME "RPC server"
+     :WHO-LINE NIL
+     :ERROR-DISPOSITION (:IGNORE REMOTE-NETWORK-ERROR NETWORK-STREAM-CLOSED END-OF-FILE))
+   (WITH-OPEN-STREAM (AGENT (MAKE-INSTANCE 'BIG-IN-LITTLE-BYTE-STREAM-TRANSPORT-AGENT
+					   :STREAM STREAM
+					   :PROCESS NIL))
+     (SERVER-TOP-LEVEL AGENT)))
+
+;CHAOSnet is totally screwed up little ender
+(CHAOS:ADD-CONTACT-NAME-FOR-PROTOCOL :RPC-BIG-IN-LITTLE-BYTES "RPC")
+
+(DEFUN OPEN-CHAOS-AGENT (&OPTIONAL HOST)
+  (LET ((STREAM (IF HOST
+		    (CHAOS:OPEN-STREAM HOST "RPC" :CHARACTERS NIL :BYTE-SIZE 8)
+		    (LET ((CONN (CHAOS:LISTEN "RPC")))
+		      (CHAOS:ACCEPT CONN)
+		      (CHAOS:MAKE-STREAM CONN :CHARACTERS NIL :BYTE-SIZE 8)))))
+    (SETQ *DEFAULT-TRANSPORT-AGENT* (MAKE-INSTANCE 'BIG-IN-LITTLE-BYTE-STREAM-TRANSPORT-AGENT
+						   :STREAM STREAM))))

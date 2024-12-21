@@ -1,0 +1,714 @@
+;;; -*- Mode: Lisp; Base: 8; Package: System-Internals; Syntax: Zetalisp -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Mark-Sweep GC for Symbolics computers
+;;; "We put the poles in the holes"
+
+;; To do:
+;;  -- Improve prefetching.  (explicit?  sequential-paging?)
+;;  -- Improve use of IMach primitives.
+;;  -- Progress notes
+;;  -- Invalid pointers should store back SI:INVALID-POINTER-REMOVED-BY-GARBAGE-COLLECTOR.
+;;  -- Integrate better with documented interfaces.
+;;  -- Precalculate if there's enough room to cons internal tables.
+
+;; This exists so programs can unconditionally override the query, except
+;; when there's insufficient memory.
+(DEFVAR *GC-IN-PLACE-DEFAULT-QUERY-P* T)
+
+(DEFUN GC-IN-PLACE (&KEY STATIC (QUERY-P *GC-IN-PLACE-DEFAULT-QUERY-P*) BACKGROUND)
+  (GC-IN-PLACE-INTERNAL (IF STATIC
+			#'REGION-PREDICATE-STATIC-OR-DYNAMIC-NEW-OR-COPYSPACE
+			#'REGION-PREDICATE-DYNAMIC-NEW-OR-COPYSPACE)
+			QUERY-P
+			BACKGROUND))
+
+(DEFUN GC-IN-PLACE-AREA (AREA &OPTIONAL STATIC (QUERY-P *GC-IN-PLACE-DEFAULT-QUERY-P*))
+  (LET ((AREAS-TO-GC (CL:ETYPECASE AREA
+		       (CL:SYMBOL (LIST (SYMEVAL AREA)))
+		       (CL:INTEGER (LIST AREA))
+		       (CL:LIST (MAPCAR #'SYMEVAL AREA)))))
+    (GC-IN-PLACE-INTERNAL
+      (LAMBDA (REGION)
+	(AND (MEMQ (REGION-AREA REGION) AREAS-TO-GC)
+	     (IF STATIC
+		 (REGION-PREDICATE-STATIC-OR-DYNAMIC-NEW-OR-COPYSPACE REGION)
+		 (REGION-PREDICATE-DYNAMIC-NEW-OR-COPYSPACE REGION))))
+      QUERY-P)))
+
+(DEFUN REGION-PREDICATE-DYNAMIC-NEW-OR-COPYSPACE (REGION)
+  (LET ((REGION-BITS (REGION-BITS REGION)))
+    (AND (OR (= (LDB %%REGION-SPACE-TYPE REGION-BITS) %REGION-SPACE-NEW)
+	     (= (LDB %%REGION-SPACE-TYPE REGION-BITS) %REGION-SPACE-COPY))
+	 ( (LEVEL-TYPE (LDB %%REGION-LEVEL REGION-BITS)) %LEVEL-TYPE-DYNAMIC))))
+
+(DEFUN REGION-PREDICATE-STATIC-OR-DYNAMIC-NEW-OR-COPYSPACE (REGION)
+  (LET ((REGION-BITS (REGION-BITS REGION)))
+    (AND (OR (= (LDB %%REGION-SPACE-TYPE REGION-BITS) %REGION-SPACE-NEW)
+	     (= (LDB %%REGION-SPACE-TYPE REGION-BITS) %REGION-SPACE-COPY))
+	 ( (LEVEL-TYPE (LDB %%REGION-LEVEL REGION-BITS)) %LEVEL-TYPE-STATIC))))
+
+(DEFUN GC-IN-PLACE-TEMPORARY-STORAGE-ESTIMATE
+       (&OPTIONAL (REGION-PREDICATE #'REGION-PREDICATE-DYNAMIC-NEW-OR-COPYSPACE))
+  (DECLARE (VALUES TEMPORARY-SPACE-REQUIRED
+		   SCAVENGEABLE-SPACE
+		   SPACE-SUBJECT-TO-GC
+		   FREE-SPACE)
+	   (DOWNWARD-FUNARG REGION-PREDICATE))
+  (MULTIPLE-VALUE-BIND (NIL NIL FREE)
+      (GC-GET-SPACE-SIZES)
+    (LET ((SCAV 0) (GC 0))
+      (LOOP FOR REGION BELOW (N-REGIONS)
+	    WHEN (LDB-TEST %%REGION-SCAVENGE-ENABLE (REGION-BITS REGION))
+	      DO (INCF SCAV (REGION-FREE-POINTER REGION))
+	    WHEN (FUNCALL REGION-PREDICATE REGION)
+	      DO (INCF GC (REGION-FREE-POINTER REGION)))
+      (VALUES  (+ NUMBER-OF-REGIONS		;Mark bits
+		  NUMBER-OF-REGIONS		;Hole Tree
+		  NUMBER-OF-REGIONS		;Small holes
+		  (FLOOR NUMBER-OF-REGIONS 4)	;Save Swapin
+		  (FLOOR NUMBER-OF-REGIONS 32.)	;Needs Relocation
+		  (FLOOR GC 32.)		;Region mark arrays
+		  15000.			;Minimum Mark Stack
+		  10000.			;Array headers, region roundoff
+		  )
+	       SCAV GC FREE))))
+
+;; Kludges to allow GC-IN-PLACE-INTERNAL to fit in one frame.
+(DEFVAR-SAFEGUARDED *GC-IN-PLACE-INIT-STACK-DEPTH*)
+(DEFVAR-SAFEGUARDED *GC-IN-PLACE-TEMP-WORDS*)
+(DEFVAR-SAFEGUARDED *GC-IN-PLACE-START-PAGE-TIME*)
+
+(COMPILER-LET ((COMPILER:*ENABLE-FRAME-SPLITTING* NIL))
+(DEFUN GC-IN-PLACE-INTERNAL (REGION-PREDICATE QUERY-P &OPTIONAL BACKGROUND)
+  (DECLARE (SAFEGUARDED-FUNCTION)
+	   (UNSAFEGUARDED-REFERENCE FORMAT
+				    CL:YES-OR-NO-P
+				    CL:*STANDARD-OUTPUT*
+				    :FINISH
+				    *SYSTEM-TEMPORARY-AREA-LOCK*
+				    SYSTEM-TEMPORARY-AREA
+				    RESET-TEMPORARY-AREA
+				    PROCESS::LOCK-INTERNAL
+				    PROCESS::UNLOCK-INTERNAL
+				    PROCESS::ABORT-LOCK
+				    GC-RECLAIM-OLDSPACE
+				    GC-IN-PLACE-TEMPORARY-STORAGE-ESTIMATE
+				    MAKE-ARRAY :AREA :TYPE
+				    SIMPLE-MAKE-ARRAY-NSS-AREA
+				    SIMPLE-MAKE-ARRAY-TYPE-LL-FP-AREA
+				    SIMPLE-MAKE-ARRAY-TYPE-AREA
+				    ARRAY-POP
+				    %FIND-STRUCTURE-EXTENT
+				    CL:LOGCOUNT
+				    %MAKE-BIGNUM-FROM-FIXNUM-COMPONENTS
+				    ROUND
+				    TV:NOTIFY
+				    CL:SLEEP
+				    MAYBE-WARN-ABOUT-SWAP-MIGRATION
+				    TERPRI
+				    :STRING-OUT
+				    GC-GET-SPACE-SIZES)
+	   (DOWNWARD-FUNARG REGION-PREDICATE))
+
+  (MULTIPLE-VALUE-BIND (REQUIRED SCAV GC FREE)
+      (GC-IN-PLACE-TEMPORARY-STORAGE-ESTIMATE REGION-PREDICATE)
+    (UNLESS BACKGROUND
+      (FORMAT T "~&*** Symbolics GC-IN-PLACE Mark-Sweep Garbage Collector ***~%~@
+		 In-Place Garbage Collection disables I//O for the entire~@
+		 time of the GC, which can last many hours depending on machine~@
+		 configuration and the amount of work being done.~%~@
+		 Total Scavengeable Memory:~40T~12:D~@
+		 Total Subject to GC:~40T~12:D~@
+		 Total Free Memory:~40T~12:D~@
+		 Estimated memory required for GC:~40T~12:D~%~@
+		 ~'bWarning:  Warm-Booting is not likely to work from the time GC~@
+		 starts until it completes!~~%"
+	      SCAV GC FREE REQUIRED))
+    (UNLESS BACKGROUND
+      (MAYBE-WARN-ABOUT-SWAP-MIGRATION)
+      (WHEN (> FREE GC)
+	(FORMAT T "~%Note:  The free memory available exceeds the amount of memory~@
+		   subject to GC.  In this case, a normal GC is recommended, since~@
+		   it will be faster, interruptable, and will result in better~@
+		   localization of objects in memory.  Refer to the documentation~@
+		   for more details.~%")))
+    (WHEN (> REQUIRED FREE)
+      (FORMAT T "~%~'bWarning:  The estimated memory required for In-Place Garbage Collection~@
+		 exceeds available free memory.  Proceeding will likely cause you to~@
+		 run out of memory.  You may be able to succeed if you GC only~@
+		 selected areas.~~%"))
+    (UNLESS BACKGROUND (TERPRI))
+    (WHEN (AND (OR (> REQUIRED FREE) QUERY-P)
+	       (NOT (CL:YES-OR-NO-P "Perform In-Place Garbage Collection? ")))
+      (RETURN-FROM GC-IN-PLACE-INTERNAL NIL)))
+
+  (IF BACKGROUND
+      (PROGN
+	(TV:NOTIFY NIL "Starting In-Place Garbage Collection.~@
+                        I//O is disabled; warm-booting is unlikely to work for the duration.")
+	(CL:SLEEP 10))
+    (FORMAT T "~2&Starting In-Place Garbage Collection at ~\DATIME\ ...")
+    (SEND CL:*STANDARD-OUTPUT* :FINISH))
+  (MACROLET ((USING-GC-IN-PLACE-EXTRA-SPACE (&BODY BODY)
+	       `(USING-SYSTEM-TEMPORARY-AREA . ,BODY))
+	     (MAKE-GC-IN-PLACE-ARRAY (SIZE &REST REST)
+	       `(MAKE-ARRAY ,SIZE :AREA SYSTEM-TEMPORARY-AREA . ,REST))
+	     (KEEP-TIME (PHASE)
+	       `(MULTIPLE-VALUE (,(FINTERN "~A-TIME-L" PHASE)
+				 ,(FINTERN "~A-TIME-H" PHASE))
+		  (TIME:FULL-MICROSECOND-TIME)))
+	     (SECONDS (TIME-L TIME-H FROM-L FROM-H)
+	       `(ROUND (- (%MAKE-BIGNUM-FROM-FIXNUM-COMPONENTS 0 2 ,TIME-L ,TIME-H)
+			  (%MAKE-BIGNUM-FROM-FIXNUM-COMPONENTS 0 2 ,FROM-L ,FROM-H))
+		       1000000.))
+	     (PAGE-TIME ()
+		`(+ *MS-TIME-PAGE-FAULT* #+3600 *MS-TIME-SEQUENCE-BREAK*))
+	     ;; These macros define the structure of the relocation tree
+	     ;; Large nodes form a binary tree, words are left son, right son, list
+	     ;; of small nodes immediately above, relocation distance, and if cdr-next #words.
+	     ;; All "pointers" are fixnums so the relocation phase won't relocate them
+	     (NODE-LEFT (NODE)
+	       `(CDR (%MAKE-POINTER DTP-LOCATIVE ,NODE)))	;--- #+IMach %MEMORY-READ?
+	     (NODE-RIGHT (NODE)
+	       `(CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 1)))
+	     (NODE-SMALL-LIST (NODE)
+	       `(CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 2)))
+	     (NODE-DISTANCE (NODE)
+	       `(CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 3)))
+	     (NODE-SIZE (NODE)
+	       `(IF (= (%P-CDR-CODE (+ ,NODE 3)) CDR-NEXT)
+		    (CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 4))
+		    4))
+	     (SET-NODE-LEFT (NODE SON)
+	       `(%P-STORE-CDR-AND-CONTENTS ,NODE ,SON CDR-NEXT))
+	     (SET-NODE-RIGHT (NODE SON)
+	       `(%P-STORE-CDR-AND-CONTENTS (1+ ,NODE) ,SON CDR-NEXT))
+	     (SET-NODE-SMALL-LIST (NODE SNODE)
+	       `(%P-STORE-CDR-AND-CONTENTS (+ ,NODE 2) ,SNODE CDR-NEXT))
+	     (SET-NODE-SIZE-AND-DISTANCE (NODE SIZE DISTANCE)
+	       `(PROGN (%P-STORE-CDR-AND-CONTENTS (+ ,NODE 3) ,DISTANCE
+						  (IF (> ,SIZE 4) CDR-NEXT CDR-NIL))
+		       (WHEN (> ,SIZE 4)
+			 (%P-STORE-CDR-AND-CONTENTS (+ ,NODE 4) ,SIZE CDR-NIL))))
+	     ;; Small nodes fill holes less than four words and contain next small node
+	     ;; above, and if cdr-next #words.
+	     (SNODE-NEXT (SNODE)
+	       `(CDR (%MAKE-POINTER DTP-LOCATIVE ,SNODE)))	;--- #+IMach %MEMORY-READ?
+	     (SNODE-SIZE (SNODE)
+	       `(IF (= (%P-CDR-CODE ,SNODE) CDR-NEXT)
+		    (CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,SNODE 1))
+		    1))
+	     (SET-SNODE-NEXT (SNODE NEXT)
+	       `(%P-STORE-CONTENTS ,SNODE ,NEXT))	;Preserve cdr code
+	     (SET-SNODE-SIZE-AND-NEXT (SNODE SIZE NEXT)
+	       `(PROGN (%P-STORE-CDR-AND-CONTENTS ,SNODE ,NEXT
+						  (IF (> ,SIZE 1) CDR-NEXT CDR-NIL))
+		       (WHEN (> ,SIZE 1)
+			 (%P-STORE-CDR-AND-CONTENTS (1+ ,SNODE) ,SIZE CDR-NIL)))))
+
+    (LET (START-TIME-H START-TIME-L		;Statistics variables
+	  MARK-TIME-H MARK-TIME-L TREE-TIME-H TREE-TIME-L
+	  RELOCATE-TIME-H RELOCATE-TIME-L SHIFT-TIME-H SHIFT-TIME-L
+	  (START-PAGE-FETCHES *COUNT-PAGE-FETCHES*)
+	  (START-PAGE-PREFETCHES *COUNT-PAGE-PREFETCHES*)
+	  (START-DISCARDED-PREFETCHED-PATCHES *COUNT-DISCARDED-PREFETCHED-PAGES*)
+	  (WORDS-GCED 0)
+	  (WORDS-RECLAIMED 0)
+	  MAX-STACK-DEPTH
+	  (MAX-TREE-DEPTH 0)
+	  (SUM-TREE-DEPTH 0)
+	  (COUNT-TREE-DEPTH 0))
+  
+      (SETQ *GC-IN-PLACE-START-PAGE-TIME* (PAGE-TIME))
+
+      (USING-GC-IN-PLACE-EXTRA-SPACE
+	;; WITHOUT-PREEMPTION because storage is totally inconsistent during later portions
+	;; of this operation, and because the mark phase can't tolerate anybody moving
+	;; object references around.
+	(PROCESS:WITHOUT-PREEMPTION
+	 ;; Disable the wired scheduler, since it can write things behind our back.
+	 (LET ((*WIRED-SCHEDULER-ENABLED* NIL))
+	  (KEEP-TIME START)
+	  (GC-RECLAIM-OLDSPACE)	;Don't get confused by oldspace regions
+	  #+IGNORE (SET-SAFEGUARD-BITS)
+	  (CLEAR-CONS-CACHES)
+	  #+3600 (%CLEAR-CACHES)
+	  (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+	  (%FUNCALL-IN-AUX-STACK #'%INHIBIT-READ-ONLY)
+	  (SETQ GC-PAGE-CONS-ALARM-MARK (ROT 1 -1))
+	  ;; Decide regions to be GC'ed and build the data structures we will need
+	  (LET* ((REGION-MARK-BITS (MAKE-GC-IN-PLACE-ARRAY NUMBER-OF-REGIONS))
+		 (REGION-HOLE-TREE (MAKE-GC-IN-PLACE-ARRAY NUMBER-OF-REGIONS))
+		 (REGION-SMALL-HOLES (MAKE-GC-IN-PLACE-ARRAY NUMBER-OF-REGIONS))
+		 (REGION-SAVE-SWAPIN (MAKE-GC-IN-PLACE-ARRAY NUMBER-OF-REGIONS :TYPE ART-8B))
+		 (REGION-NEEDS-RELOCATION (MAKE-GC-IN-PLACE-ARRAY NUMBER-OF-REGIONS
+							      :TYPE ART-BOOLEAN))
+		 (*INHIBIT-CONSING-FLAG* *INHIBIT-CONSING-FLAG*)
+		 MARK-STACK)
+	    (DECLARE (ARRAY-REGISTER REGIONS-ORDERED-BY-ADDRESS REGION-MARK-BITS
+				     REGION-SMALL-HOLES REGION-SAVE-SWAPIN REGION-HOLE-TREE
+				     REGION-NEEDS-RELOCATION))
+	    (DOTIMES (REGION (N-REGIONS))
+	      (UNLESS ( (LEVEL-TYPE (LDB %%REGION-LEVEL (REGION-BITS REGION)))
+			 %LEVEL-TYPE-SAFEGUARDED)
+		(UNLESS (ZEROP (REGION-FREE-POINTER REGION))
+		  (WHEN (FUNCALL REGION-PREDICATE REGION)
+		    (SHORTEN-REGION REGION)
+		    (SETF (AREF REGION-MARK-BITS REGION)
+			  (MAKE-GC-IN-PLACE-ARRAY (REGION-FREE-POINTER REGION) :TYPE ART-1B))
+		    (INCF WORDS-GCED (REGION-FREE-POINTER REGION))))))
+	    (UNLESS (PLUSP WORDS-GCED)
+	      (RETURN-FROM GC-IN-PLACE-INTERNAL "No GC'able regions"))	;Stop early if oops
+	    ;; Make this last so it's expandable
+	    (SETQ MARK-STACK (MAKE-GC-IN-PLACE-ARRAY 15000. :FILL-POINTER 0))
+	    (SETQ *INHIBIT-CONSING-FLAG* T)	;Don't want region-free-pointers changing
+	    (CLEAR-CONS-CACHES)			;Enforce the ban on consing.
+	    (DOTIMES (REGION (N-REGIONS))
+	      (LET ((BITS (REGION-BITS REGION)))
+		(SETF (AREF REGION-SAVE-SWAPIN REGION) (LDB %%REGION-SWAPIN-QUANTUM BITS))
+		(SETF (LDB %%REGION-SWAPIN-QUANTUM BITS) 4)
+		(SETF (REGION-BITS REGION) BITS)))
+  
+	    ;; Mark phase -- find all in-use objects in the regions being GC'ed
+	    ;; First preload the MARK-STACK with all the root regions
+	    (FLET ((MARK-STACK-PUSH (MARK-STACK OBJECT)
+		     (DECLARE (UNSAFEGUARDED-FUNCTION))
+		     ;; A special version of ARRAY-PUSH-EXTEND for use only on the mark stack,
+		     ;; necessary because consing is disabled.
+		     (OR (ARRAY-PUSH MARK-STACK OBJECT)
+			 (LET ((*INHIBIT-CONSING-FLAG* NIL))
+			   (ADJUST-ARRAY-SIZE MARK-STACK
+					      (CEILING (* (ARRAY-LENGTH MARK-STACK) 5) 4))
+			   (PROG1 (ARRAY-PUSH MARK-STACK OBJECT)
+				  (CLEAR-CONS-CACHES))))))
+	      (DOTIMES (REGION (N-REGIONS))
+		(UNLESS (AREF REGION-MARK-BITS REGION)	;Unless this region is being GC'ed
+		  (LET ((BITS (REGION-BITS REGION)))
+		    (SELECTOR (LDB %%REGION-SPACE-TYPE BITS) =
+		      ((%REGION-SPACE-NEW %REGION-SPACE-COPY %REGION-SPACE-WEAK)
+		       (WHEN (LDB-TEST %%REGION-SCAVENGE-ENABLE BITS)
+			 (MARK-STACK-PUSH MARK-STACK (REGION-ORIGIN REGION))
+			 (MARK-STACK-PUSH MARK-STACK (REGION-FREE-POINTER REGION))))
+		      (OTHERWISE
+		       (WHEN (LDB-TEST %%REGION-STACK BITS)
+			 (LOOP WITH ADDRESS = (REGION-ORIGIN REGION)
+			       WITH LIMIT = (+ (REGION-ORIGIN REGION)
+					       (REGION-FREE-POINTER REGION))
+			       WHILE (%POINTER-LESSP ADDRESS LIMIT) DO
+			   (MULTIPLE-VALUE-BIND (STACK-BASE STACK-ACTIVE-SIZE STACK-TOTAL-SIZE)
+			       (DECODE-STACK-ADDRESS ADDRESS)
+			     (COND ((NULL STACK-BASE) (INCF ADDRESS))
+				   (T (MARK-STACK-PUSH MARK-STACK (%POINTER STACK-BASE))
+				      (MARK-STACK-PUSH MARK-STACK STACK-ACTIVE-SIZE)
+				      (SETQ ADDRESS (+ (%POINTER STACK-BASE) STACK-TOTAL-SIZE))
+				      ))))))))))
+	      (SETQ MAX-STACK-DEPTH (SETQ *GC-IN-PLACE-INIT-STACK-DEPTH* (FILL-POINTER MARK-STACK)))
+	      ;; Commence marking
+	      (LET ((POINTER-TYPE-P *POINTER-TYPE-P*))
+		(DECLARE (SYS:ARRAY-REGISTER POINTER-TYPE-P))
+		(LOOP UNTIL (ZEROP (FILL-POINTER MARK-STACK))
+		      AS COUNT = (ARRAY-POP MARK-STACK)
+		      AS ADDRESS = (ARRAY-POP MARK-STACK)
+		      AS FROM-REGION = (%REGION-NUMBER ADDRESS) DO
+		  (LOOP WHILE (PLUSP COUNT) DO
+		    (DECF COUNT)
+		    (IF (NOT (AREF POINTER-TYPE-P (%P-DATA-TYPE ADDRESS)))
+			(INCF ADDRESS)
+			(LET* ((POINTER (%P-POINTER ADDRESS))
+			       (REGION (%REGION-NUMBER POINTER))
+			       (ORIGIN (AND REGION (REGION-ORIGIN REGION)))
+			       (MARK-BITS (AND ORIGIN (AREF REGION-MARK-BITS REGION)))
+			       (INDEX (%POINTER-DIFFERENCE POINTER ORIGIN)))
+			  (INCF ADDRESS)
+			  ;; If the pointer is beyond the end of a region, just leave it alone.
+			  (WHEN (AND MARK-BITS (< INDEX (ARRAY-LENGTH MARK-BITS)))
+			    (SETF (AREF REGION-NEEDS-RELOCATION FROM-REGION) T)
+			    (WHEN (ZEROP (AREF MARK-BITS (%POINTER-DIFFERENCE POINTER ORIGIN)))
+			      ;; Found a reference to an object that needs to be protected
+			      (MULTIPLE-VALUE-BIND (NIL LEADER SIZE)
+				  (%FIND-STRUCTURE-EXTENT POINTER)
+				(LOOP FOR INDEX FROM (%POINTER-DIFFERENCE LEADER ORIGIN)
+				      REPEAT SIZE
+				      DO (SETF (AREF MARK-BITS INDEX) 1))
+				(WHEN (PLUSP COUNT)
+				  (MARK-STACK-PUSH MARK-STACK ADDRESS)
+				  (MARK-STACK-PUSH MARK-STACK COUNT)
+				  (SETQ MAX-STACK-DEPTH (MAX MAX-STACK-DEPTH
+							     (FILL-POINTER MARK-STACK))))
+				(SETQ ADDRESS (%POINTER LEADER)
+				      COUNT SIZE
+				      FROM-REGION (%REGION-NUMBER ADDRESS)))))))))))
+	    (KEEP-TIME MARK)
+
+	    ;; Build relocation tables in the holes left by reclaimed objects
+	    ;; Large nodes form a binary tree, words are left son, right son, list
+	    ;; of small nodes immediately above, relocation distance, and if cdr-next #words.
+	    ;; Small nodes fill holes less than four words and contain next small node
+	    ;; above, and if cdr-next #words.
+	    ;; Since nodes are inserted into the tree in ascending order, a bizarre
+	    ;; bit counting hack suffices to keep the tree both ordered and balanced.
+	    (DOTIMES (REGION (N-REGIONS))	
+	      (LET ((MARK-BITS (AREF REGION-MARK-BITS REGION)))
+		(WHEN MARK-BITS
+		  (LOOP WITH ORIGIN = (REGION-ORIGIN REGION)
+			WITH LAST-LARGE-NODE = NIL
+			WITH LAST-SMALL-NODE = NIL
+			WITH TREE-HEAD = NIL
+			WITH LENGTH = (ARRAY-LENGTH MARK-BITS)
+			WITH DISTANCE = 0
+			WITH SERIAL = 0
+			FOR I BELOW LENGTH DO
+		    ;; Scan forward to start of next hole
+		    (WHEN (ZEROP (AREF MARK-BITS I))
+		      (LOOP FOR J FROM (1+ I) BELOW LENGTH
+			    WHILE (ZEROP (AREF MARK-BITS J))
+			    FINALLY	;Found a hole from I below J
+			      (LET ((NODE (+ I ORIGIN))
+				    (SIZE (- J I)))
+				(INCF DISTANCE SIZE)	;How much stuff above here will shift
+				(INCF WORDS-RECLAIMED SIZE)
+				(COND ((< SIZE 4)
+				       (SET-SNODE-SIZE-AND-NEXT NODE SIZE NIL)
+				       (COND (LAST-SMALL-NODE
+					      (SET-SNODE-NEXT LAST-SMALL-NODE NODE))
+					     (LAST-LARGE-NODE
+					      (SET-NODE-SMALL-LIST LAST-LARGE-NODE NODE))
+					     (T
+					      (SETF (AREF REGION-SMALL-HOLES REGION) NODE)))
+				       (SETQ LAST-SMALL-NODE NODE))
+				      (T
+				       (SET-NODE-LEFT NODE NIL)
+				       (SET-NODE-RIGHT NODE NIL)
+				       (SET-NODE-SMALL-LIST NODE NIL)
+				       (SET-NODE-SIZE-AND-DISTANCE NODE SIZE DISTANCE)
+				       (WHEN (> SIZE 5)
+					 (%BLOCK-STORE-CDR-AND-CONTENTS	;Relocate speed bum
+					   (+ NODE 5) (- SIZE 5) CDR-NIL 0 0))
+				       (SETQ LAST-LARGE-NODE NODE LAST-SMALL-NODE NIL)
+				       (INCF SERIAL)
+				       (COND ((NULL TREE-HEAD) (SETQ TREE-HEAD NODE))
+					     ((= (LOGAND SERIAL (- SERIAL)) SERIAL)
+					      ;; SERIAL is a power of 2, time to rebalance
+					      (SET-NODE-LEFT NODE TREE-HEAD)
+					      (SETQ TREE-HEAD NODE))
+					     ((ODDP SERIAL)
+					      ;; SERIAL is odd, fill right fringe
+					      (LOOP FOR AT = TREE-HEAD THEN RIGHT
+						    AS RIGHT = (NODE-RIGHT AT)
+						    UNTIL (NULL RIGHT)
+						    FINALLY (SET-NODE-RIGHT AT NODE)))
+					     (T
+					      ;; SERIAL is even, move several right then
+					      ;; push that subtree to the left
+					      (LOOP FOR AT = TREE-HEAD THEN RIGHT
+						    AS RIGHT = (NODE-RIGHT AT)
+						    REPEAT (- (CL:LOGCOUNT SERIAL) 2)
+						    FINALLY
+						      (SET-NODE-LEFT NODE RIGHT)
+						      (SET-NODE-RIGHT AT NODE))))))
+				(SETQ I J))))
+		    FINALLY
+		      (SETF (AREF REGION-HOLE-TREE REGION) TREE-HEAD)))))
+	    (KEEP-TIME TREE)
+  
+	    ;; Update GC generation numbers to reflect object relocations
+	    (INCF %GC-GENERATION-NUMBER)
+	    (INCF %GC-DYNAMIC-GENERATION-NUMBER)
+	    (DOTIMES (REGION (N-REGIONS))
+	      (WHEN (AREF REGION-MARK-BITS REGION)
+		(WHEN ( (LEVEL-TYPE (LDB %%REGION-LEVEL (REGION-BITS REGION)))
+			 %LEVEL-TYPE-STATIC)
+		  (RETURN (INCF %GC-STATIC-GENERATION-NUMBER)))))
+  
+	    ;; Relocate references to objects that will be moved
+	    (FLET ((RELOCATE (ADDRESS COUNT)
+		     (LET ((REGION-MARK-BITS REGION-MARK-BITS)	;Compiler deficiency
+			   (REGION-HOLE-TREE REGION-HOLE-TREE)
+			   (REGION-SMALL-HOLES REGION-SMALL-HOLES)
+			   (POINTER-TYPE-P *POINTER-TYPE-P*))
+		      (DECLARE (ARRAY-REGISTER REGION-MARK-BITS REGION-HOLE-TREE
+					       REGION-SMALL-HOLES POINTER-TYPE-P))
+		      (WITH-FAST-STORAGE-ACCESSORS (REGION-FREE-POINTER REGION-ORIGIN)
+		       (LOOP REPEAT COUNT WITH DISTANCE DO
+			 (WHEN (AREF POINTER-TYPE-P (%P-DATA-TYPE ADDRESS))
+			   (LET* ((POINTER (%P-POINTER ADDRESS))
+				  (REGION (%REGION-NUMBER POINTER)))
+			     (WHEN (AND REGION (AREF REGION-MARK-BITS REGION))
+			       ;; Found a reference to an object that will be shifted
+			       ;; Find its relocation distance in the tree
+			       (IF (< (%POINTER-DIFFERENCE POINTER (REGION-ORIGIN REGION))
+				      (REGION-FREE-POINTER REGION))
+				   (LOOP WITH NODE = (AREF REGION-HOLE-TREE REGION)
+					 WITH LEFT = NIL   ;Rightmost node to left of POINTER
+					 FOR DEPTH FROM 0 DOING
+				     (COND ((NULL NODE)
+					    ;; Search the small nodes from here then return
+					    (MULTIPLE-VALUE (NODE DISTANCE)
+					      (IF LEFT (VALUES (NODE-SMALL-LIST LEFT)
+							       (NODE-DISTANCE LEFT))
+						  (VALUES (AREF REGION-SMALL-HOLES REGION) 0)))
+					    (LOOP WHILE (AND NODE (%POINTER-LESSP NODE POINTER)) DO
+					      (INCF DEPTH)
+					      (INCF DISTANCE (SNODE-SIZE NODE))
+					      (SETQ NODE (SNODE-NEXT NODE)))
+					    (INCF COUNT-TREE-DEPTH)
+					    (INCF SUM-TREE-DEPTH DEPTH)
+					    (SETQ MAX-TREE-DEPTH (MAX MAX-TREE-DEPTH DEPTH))
+					    (LOOP-FINISH))
+					   ((%POINTER-LESSP POINTER NODE)	;Go left
+					    (SETQ NODE (NODE-LEFT NODE)))
+					   (T	;Go right
+					    (SETQ LEFT NODE)
+					    (SETQ NODE (NODE-RIGHT NODE))))
+					 FINALLY
+					   (UNLESS (ZEROP DISTANCE)
+					     (%P-STORE-POINTER ADDRESS (- POINTER DISTANCE))))
+				 (%P-STORE-CONTENTS ADDRESS
+				   'INVALID-POINTER-REMOVED-BY-GARBAGE-COLLECTOR)
+				 (INCF* TRANSPORTER-INVALID-POINTERS)))))
+			   (INCF ADDRESS))))))
+	      (DOTIMES (REGION (N-REGIONS))
+		(WHEN (AREF REGION-NEEDS-RELOCATION REGION)
+		  (IF (NOT (LDB-TEST %%REGION-STACK (REGION-BITS REGION)))
+		      (RELOCATE (REGION-ORIGIN REGION) (REGION-FREE-POINTER REGION))
+		      (LOOP WITH ADDRESS = (REGION-ORIGIN REGION)
+			    WITH LIMIT = (+ ADDRESS (REGION-FREE-POINTER REGION))
+			    WHILE (%POINTER-LESSP ADDRESS LIMIT) DO
+			(MULTIPLE-VALUE-BIND (STACK-BASE STACK-ACTIVE-SIZE STACK-TOTAL-SIZE)
+			    (DECODE-STACK-ADDRESS ADDRESS)
+			  (COND ((NULL STACK-BASE) (INCF ADDRESS))
+				(T (RELOCATE (%POINTER STACK-BASE) STACK-ACTIVE-SIZE)
+				   (SETQ ADDRESS (+ (%POINTER STACK-BASE)
+						    STACK-TOTAL-SIZE))))))))))
+	    (KEEP-TIME RELOCATE)
+
+	    ;; Shift objects down to fill in the holes
+	    (DOTIMES (REGION (N-REGIONS))
+	      (WHEN (AREF REGION-MARK-BITS REGION)	;This region is being GC'ed
+		(LET ((ORIGIN (REGION-ORIGIN REGION))
+		      (PREV-ADDRESS NIL) PREV-DISTANCE)
+		  (LABELS ((CHASE-SMALL (DISTANCE NODE)
+			     (LOOP WHILE NODE
+				   WHEN (AND PREV-ADDRESS
+					     (NOT (%POINTER-LESSP
+						    (- PREV-ADDRESS PREV-DISTANCE) NODE)))
+				     DO (WIRED-FERROR :FATAL "Slow GC error")
+				   AS SIZE = (SNODE-SIZE NODE)
+				   AS ADDRESS = (+ NODE SIZE)
+				   DO (SETQ NODE (SNODE-NEXT NODE))
+				      (INCF DISTANCE SIZE)
+				      (SHIFT ADDRESS DISTANCE)))
+			   (CHASE-LARGE (NODE)
+			     (WHEN NODE
+			       (WHEN (AND PREV-ADDRESS
+					  (NOT (%POINTER-LESSP
+						 (- PREV-ADDRESS PREV-DISTANCE) NODE)))
+				 (WIRED-FERROR :FATAL "Slow GC error"))
+			       (CHASE-LARGE (NODE-LEFT NODE))
+			       (LET* ((RIGHT (NODE-RIGHT NODE))	;Copy before bashing over
+				      (SMALL (NODE-SMALL-LIST NODE))
+				      (DISTANCE (NODE-DISTANCE NODE))
+				      (SIZE (NODE-SIZE NODE))
+				      (ADDRESS (+ NODE SIZE)))
+				 (SHIFT ADDRESS DISTANCE)
+				 (CHASE-SMALL DISTANCE SMALL)
+				 (CHASE-LARGE RIGHT))))
+			   (SHIFT (ADDRESS DISTANCE)
+			     (WHEN PREV-ADDRESS
+			       ;; Don't ask me, I just transcribed it from the lower loop.
+			       (INHIBIT-STYLE-WARNINGS
+				 (%BLOCK-GC-COPY PREV-ADDRESS
+						 (- PREV-ADDRESS PREV-DISTANCE)
+						 (- (- ADDRESS DISTANCE)
+						    (- PREV-ADDRESS PREV-DISTANCE))))
+			       #+SLOW
+			       (LOOP FOR FROM FROM PREV-ADDRESS
+				     FOR TO FROM (- PREV-ADDRESS PREV-DISTANCE)
+					    BELOW (- ADDRESS DISTANCE)
+				     DO (%P-COPY-Q FROM TO)))
+			     (SETQ PREV-ADDRESS ADDRESS
+				   PREV-DISTANCE DISTANCE)))
+		    (CHASE-SMALL 0 (AREF REGION-SMALL-HOLES REGION))
+		    (CHASE-LARGE (AREF REGION-HOLE-TREE REGION))
+		    (WHEN PREV-ADDRESS
+		      (SHIFT (+ (REGION-FREE-POINTER REGION) ORIGIN) PREV-DISTANCE)
+		      (LET ((FP (- (REGION-FREE-POINTER REGION) PREV-DISTANCE)))
+			(SETF (REGION-FREE-POINTER REGION) FP)
+			(SHORTEN-REGION REGION)
+			(WHEN (PLUSP FP)
+			  (%BLOCK-STORE-TAG-AND-POINTER (+ (REGION-FREE-POINTER REGION) ORIGIN)
+							(- (REGION-CREATED-PAGES REGION)
+							   (REGION-FREE-POINTER REGION))
+							DTP-NULL
+							(+ (REGION-FREE-POINTER REGION) ORIGIN)
+							1))))))))
+	    (KEEP-TIME SHIFT)
+
+	    (UPDATE-CONS-CACHE-REGION-FREE-POINTERS)
+	    (SETQ *GC-IN-PLACE-TEMP-WORDS* 0)
+	    (DO-AREA-REGIONS (REGION SYSTEM-TEMPORARY-AREA)
+	      (INCF *GC-IN-PLACE-TEMP-WORDS* (REGION-FREE-POINTER REGION)))
+	    (%FUNCALL-IN-AUX-STACK #'%PERMIT-READ-ONLY)
+  
+	    (DOTIMES (REGION (N-REGIONS))
+	      (LET ((BITS (REGION-BITS REGION)))
+		(SETF (LDB %%REGION-SWAPIN-QUANTUM BITS) (AREF REGION-SAVE-SWAPIN REGION))
+		(SETF (REGION-BITS REGION) BITS)))))))
+  
+      ;; Report statistics
+      (MULTIPLE-VALUE-BIND (NIL NIL FREE)
+	  (GC-GET-SPACE-SIZES)
+       (IF BACKGROUND
+	   (TV:NOTIFY NIL "Symbolics GC-IN-PLACE Mark-Sweep Garbage Collection is complete.~@
+			   GC'ed ~:D words down to ~:D words, reclaimed ~:D words (~D%).~@
+			   There are now ~:D words of free space remaining."
+		      WORDS-GCED (- WORDS-GCED WORDS-RECLAIMED) WORDS-RECLAIMED
+		      (ROUND (* 100. WORDS-RECLAIMED) WORDS-GCED) FREE)
+	 (FORMAT T
+	   "~&GC'ed ~:D words down to ~:D words, reclaimed ~:D words (~D%).~@
+	    There are now ~:D words of free space remaining.~%~@
+	    Temporary storage ~:D words.  Maximum mark stack depth ~D + ~D roots.~@
+	    Tree depth ~D maximum, ~D average over ~:D probes.~@
+	    GC took ~\time-interval\.~@
+	    ~:D page fetches, ~:D prefetches, ~:D useless prefetches.  Paging time ~$%.~@
+	    Mark phase took ~\time-interval\, build tree phase took ~\time-interval\,~@
+	    relocate phase took ~\time-interval\, shift phase took ~\time-interval\."
+	   WORDS-GCED (- WORDS-GCED WORDS-RECLAIMED) WORDS-RECLAIMED
+	   (ROUND (* 100. WORDS-RECLAIMED) WORDS-GCED) FREE
+	   *GC-IN-PLACE-TEMP-WORDS*
+	   (// (- MAX-STACK-DEPTH *GC-IN-PLACE-INIT-STACK-DEPTH*) 2)
+	   (// *GC-IN-PLACE-INIT-STACK-DEPTH* 2) MAX-TREE-DEPTH
+	   (IF (ZEROP COUNT-TREE-DEPTH) 0 (// (FLOAT SUM-TREE-DEPTH) COUNT-TREE-DEPTH))
+	   COUNT-TREE-DEPTH
+	   (SECONDS SHIFT-TIME-L SHIFT-TIME-H START-TIME-L START-TIME-H)
+	   (- *COUNT-PAGE-FETCHES* START-PAGE-FETCHES)
+	   (- *COUNT-PAGE-PREFETCHES* START-PAGE-PREFETCHES)
+	   (- *COUNT-DISCARDED-PREFETCHED-PAGES* START-DISCARDED-PREFETCHED-PATCHES)
+	   (// (* (- (PAGE-TIME) *GC-IN-PLACE-START-PAGE-TIME*) 1E-1)
+	       (SECONDS SHIFT-TIME-L SHIFT-TIME-H START-TIME-L START-TIME-H))
+	   (SECONDS MARK-TIME-L MARK-TIME-H START-TIME-L START-TIME-H)
+	   (SECONDS TREE-TIME-L TREE-TIME-H MARK-TIME-L MARK-TIME-H)
+	   (SECONDS RELOCATE-TIME-L RELOCATE-TIME-H TREE-TIME-L TREE-TIME-H)
+	   (SECONDS SHIFT-TIME-L SHIFT-TIME-H RELOCATE-TIME-L RELOCATE-TIME-H)))))))
+)
+
+
+#| Debugging code for balanced tree construction algorithm |
+
+(DEFUN TST (N)
+  (LET ((HEAD NIL))
+    (LOOP FOR SERIAL FROM 1 TO N
+	  AS NODE = (LIST NIL NIL SERIAL) DO
+      (COND ((NULL HEAD) (SETQ HEAD NODE))
+	    ((= (LOGAND SERIAL (- SERIAL)) SERIAL)
+	     ;; SERIAL is a power of 2, time to rebalance
+	     (SETF (FIRST NODE) HEAD)
+	     (SETQ HEAD NODE))
+	    ((ODDP SERIAL)
+	     ;; SERIAL is odd, fill right fringe
+	     (LOOP FOR AT = HEAD THEN (SECOND AT) WHILE (SECOND AT)
+		   FINALLY (SETF (SECOND AT) NODE)))
+	    (T
+	     ;; SERIAL is even, move several right then push that subtree to left
+	     (LOOP FOR AT = HEAD THEN (SECOND AT) REPEAT (- (CL:LOGCOUNT SERIAL) 2)
+		   FINALLY (SETF (FIRST NODE) (SECOND AT))
+			   (SETF (SECOND AT) NODE)))))
+    (CL:FRESH-LINE)
+    (FORMAT-GRAPH-FROM-ROOT HEAD
+			    (LAMBDA (NODE STREAM) (PRIN1 (THIRD NODE) STREAM))
+			    (LAMBDA (NODE) (APPEND (AND (FIRST NODE) (LIST (FIRST NODE)))
+						   (AND (SECOND NODE) (LIST (SECOND NODE)))))
+			    :ORIENTATION :HORIZONTAL)))
+
+(DEFUN DISPLAY-GC-IN-PLACE-TREE (NODE)
+  (MACROLET (;; These macros define the structure of the relocation tree
+	     ;; Large nodes form a binary tree, words are left son, right son, list
+	     ;; of small nodes immediately above, relocation distance, and if cdr-next #words.
+	     ;; All "pointers" are fixnums so the relocation phase won't relocate them
+	     (NODE-LEFT (NODE)
+	       `(CDR (%MAKE-POINTER DTP-LOCATIVE ,NODE)))	;--- #+IMach %MEMORY-READ?
+	     (NODE-RIGHT (NODE)
+	       `(CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 1)))
+	     (NODE-SMALL-LIST (NODE)
+	       `(CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 2)))
+	     (NODE-DISTANCE (NODE)
+	       `(CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 3)))
+	     (NODE-SIZE (NODE)
+	       `(IF (= (%P-CDR-CODE (+ ,NODE 3)) CDR-NEXT)
+		    (CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,NODE 4))
+		    4))
+	     ;; Small nodes fill holes less than four words and contain next small node
+	     ;; above, and if cdr-next #words.
+	     (SNODE-NEXT (SNODE)
+	       `(CDR (%MAKE-POINTER DTP-LOCATIVE ,SNODE)))	;--- #+IMach %MEMORY-READ?
+	     (SNODE-SIZE (SNODE)
+	       `(IF (= (%P-CDR-CODE ,SNODE) CDR-NEXT)
+		    (CDR (%MAKE-POINTER-OFFSET DTP-LOCATIVE ,SNODE 1))
+		    1)))
+    (CL:FRESH-LINE)
+    (FORMAT-GRAPH-FROM-ROOT NODE
+			    (LAMBDA (NODE STREAM)
+			      (FORMAT STREAM "~O[~O~O]"
+				      NODE (NODE-SIZE NODE) (NODE-DISTANCE NODE))
+			      (WHEN (NODE-SMALL-LIST NODE)
+				(FORMAT STREAM " +~D"
+					(LOOP FOR SNODE = (NODE-SMALL-LIST NODE)
+							THEN (SNODE-NEXT SNODE)
+					      WHILE SNODE COUNT T))))
+			    (LAMBDA (NODE)
+			      (APPEND (AND (NODE-LEFT NODE) (LIST (NODE-LEFT NODE)))
+				      (AND (NODE-RIGHT NODE) (LIST (NODE-RIGHT NODE)))))
+			    :ORIENTATION :HORIZONTAL)))
+
+||#

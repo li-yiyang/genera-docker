@@ -1,0 +1,685 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SYSTEM-INTERNALS; Base: 8  -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; 3600 Page Tracing
+;;; This program is adapted from prototypes by Daves Andre, Moon, and Plummer,
+;;; and Dan Gerson.
+
+;;; User Interface:
+;;;
+;;; To do a page trace:
+;;;
+;;;	Function PAGE-TRACE-EVAL (form &optional (print-summary t)
+;;;						 page-out-first
+;;;						 run-without-interrupts)
+;;;	Function PAGE-TRACE-SYSTEM-OVERHEAD ()
+;;;	Function ENABLE-KEYBOARD-PAGE-TRACE (&optional (enable t))
+;;;	   Keyboard Function-( starts page-trace
+;;;	   Keyboard Function-) ends page-trace
+;;;	Macro WITH-PAGE-TRACE ((&optional buffer-var n-entries) &body body)
+;;;	Function ENABLE-PAGE-TRACE ()
+;;;	Function DISABLE-PAGE-TRACE ()
+;;;
+;;; To grok the results of a page trace:
+;;;
+;;;	Function SUMMARIZE-PAGE-TRACE (&key (stream standard-output)
+;;;					    (buffer *last-page-trace-buffer*))
+;;;
+;;;	Function PAGE-TRACE-REPORT (&key (fault-mask :choose)	  ;A fixnum or :CHOOSE
+;;;					 areas
+;;;					 object-predicate
+;;;					 function-predicate
+;;;					 (stream standard-output)
+;;;					 (display :all)		  ;:ALL, :OBJECT, :FUNCTION
+;;;					 (display-list nil)
+;;;					 (buffer *last-page-trace-buffer*))
+;;;
+;;; To change parameters of page tracing:
+;;;
+;;; 	Function CHOOSE-PAGE-TRACE-ENABLES is a menu interface to *PAGE-TRACE-ENABLES*.
+;;;	Function SET-DEFAULT-PAGE-TRACE-BUFFER-SIZE (new-size)
+;;;
+;;; To do:
+;;;
+;;;	Clean up the output of SUMMARIZE-PAGE-TRACE
+;;;	- often times you're only interested in statsitics on a subset of the data;
+;;;	  add filter arguments like in PAGE-TRACE-REPORT.
+;;;	- Make the statistics more meaningful.  Right now its easy to get confused
+;;;	  that an area with prefetch is paging more than it should be, when really
+;;;	  the count is including prefetches.  Note also that flushes are usually not
+;;;	  what you're interested in.
+;;;	- Matrix representation of page statistics?  (Class vs Area)
+;;;
+;;;	Window Interface
+;;;	- See >dla>residue>metering-interface-ideas.text
+;;;
+;;;	Debugger Interface
+;;;	- It should be easy to encapsulate any portion of code in a page trace.
+;;;
+;;;	Single-Stack page trace option
+;;;	- This can be done by binding instead of setting the page-trace-array.
+;;;	- Statistics will have to be hacked a little differently.
+;;;
+;;;	GC Interface
+;;;	- This currently loses when GC is on, since the pointers stored in the
+;;;	  page trace array can get lost.  This mainly only affects pointers to
+;;;	  WORKING-STORAGE-AREA
+
+(DEFVAR *PAGE-TRACE-BUFFER-AREA* PERMANENT-STORAGE-AREA)
+;; IMach can only support 65535 entries due to AREF trapping on the aux stack.
+(DEFVAR *DEFAULT-PAGE-TRACE-BUFFER-ENTRIES* #+3600 200000. #+IMach 65535.)
+
+(DEFRESOURCE PAGE-TRACE-BUFFER (&OPTIONAL (ENTRIES *DEFAULT-PAGE-TRACE-BUFFER-ENTRIES*))
+  :CONSTRUCTOR (MAKE-ARRAY ENTRIES :LEADER-LENGTH 2
+				   :AREA *PAGE-TRACE-BUFFER-AREA*)
+  :MATCHER (= ENTRIES (ARRAY-LENGTH OBJECT)))
+
+(DEFVAR *PAGE-TRACE-BUFFER* NIL)
+(DEFVAR *LAST-PAGE-TRACE-BUFFER* NIL)
+
+(DEFMACRO WITH-PAGE-TRACE ((&OPTIONAL VARIABLE ENTRIES) &BODY BODY)
+  (DECLARE (ARGLIST (VARIABLE &OPTIONAL ENTRIES) &BODY BODY))
+  (UNLESS VARIABLE (SETQ VARIABLE (GENSYM)))
+  `(LET (,VARIABLE)
+     (WHEN METERING:*METERING-SYSTEM-IS-LOADED*
+       (METERING:SET-PAGE-TRACING-TYPE :TRACE))
+     (UNWIND-PROTECT
+	 (PROGN (WITHOUT-INTERRUPTS
+		  (SETQ ,VARIABLE (ALLOCATE-RESOURCE 'PAGE-TRACE-BUFFER
+						     . ,(AND ENTRIES (LIST ENTRIES))))
+		  (WIRE-STRUCTURE ,VARIABLE)
+		  (SETQ *PAGE-TRACE-IN-PROGRESS* 0)
+		  (PAGE-TRACE ,VARIABLE))
+		. ,BODY)
+       (WITHOUT-INTERRUPTS
+	 (SETQ *PAGE-TRACE-ARRAY* NIL)
+	 (WHEN ,VARIABLE
+	   (UNWIRE-STRUCTURE ,VARIABLE)
+	   (DEALLOCATE-RESOURCE 'PAGE-TRACE-BUFFER ,VARIABLE)
+	   (SETQ *LAST-PAGE-TRACE-BUFFER* ,VARIABLE)
+	   (SETQ ,VARIABLE NIL))))))
+
+(DEFUN ENABLE-PAGE-TRACE ()
+  (WHEN METERING:*METERING-SYSTEM-IS-LOADED*
+    (METERING:SET-PAGE-TRACING-TYPE :TRACE))
+  (WITHOUT-INTERRUPTS
+    (UNLESS *PAGE-TRACE-BUFFER*
+      (SETQ *PAGE-TRACE-BUFFER* (ALLOCATE-RESOURCE 'PAGE-TRACE-BUFFER))
+      (WIRE-STRUCTURE *PAGE-TRACE-BUFFER*)))
+  (SETQ *PAGE-TRACE-IN-PROGRESS* 0)
+  (PAGE-TRACE *PAGE-TRACE-BUFFER*))
+
+(DEFUN DISABLE-PAGE-TRACE ()
+  (WITHOUT-INTERRUPTS
+    (SETQ *PAGE-TRACE-ARRAY* NIL)
+    (WHEN *PAGE-TRACE-BUFFER*
+      (UNWIRE-STRUCTURE *PAGE-TRACE-BUFFER*)
+      (DEALLOCATE-RESOURCE 'PAGE-TRACE-BUFFER *PAGE-TRACE-BUFFER*)
+      (SETQ *LAST-PAGE-TRACE-BUFFER* *PAGE-TRACE-BUFFER*)
+      (SETQ *PAGE-TRACE-BUFFER* NIL))))
+
+(DEFUN KEYBOARD-DISABLE-PAGE-TRACE (IGNORE) (DISABLE-PAGE-TRACE))
+(DEFUN KEYBOARD-ENABLE-PAGE-TRACE (IGNORE) (ENABLE-PAGE-TRACE))
+
+(DEFUN ENABLE-KEYBOARD-PAGE-TRACE (&OPTIONAL (ENABLE T))
+  (SETQ TV:*FUNCTION-KEYS*
+	(DELQ (ASSQ #/( TV:*FUNCTION-KEYS*)
+	      (DELQ (ASSQ #/) TV:*FUNCTION-KEYS*)
+		    TV:*FUNCTION-KEYS*)))
+  (WHEN ENABLE
+    (TV:ADD-FUNCTION-KEY #/( 'KEYBOARD-ENABLE-PAGE-TRACE "Turn on page-fault tracing."
+			 :KEYBOARD-PROCESS)
+    (TV:ADD-FUNCTION-KEY #/) 'KEYBOARD-DISABLE-PAGE-TRACE "Turn off page-fault tracing."
+			 :KEYBOARD-PROCESS))
+  ENABLE)
+
+(DEFUN RESET-PAGE-TRACE-BUFFERS ()
+  (MAP-RESOURCE 'PAGE-TRACE-BUFFER
+    #'(LAMBDA (BUFFER &REST IGNORE)
+	(FILL-ARRAY BUFFER NIL NIL)
+	(SETF (FILL-POINTER BUFFER) (ARRAY-LENGTH BUFFER))	; Just for grins
+	(SETF (PAGE-TRACE-INDEX BUFFER) 0))))
+
+(ADD-INITIALIZATION "clear page trace buffer" '(RESET-PAGE-TRACE-BUFFERS) '(FULL-GC))
+
+(DEFUN PAGE-TRACE-EVAL (FORM &OPTIONAL (PRINT-SUMMARY T)
+				       (PAGE-OUT-FIRST NIL)
+				       (RUN-WITHOUT-INTERRUPTS NIL))
+  (LET* ((OLD-INHIBIT-SCHEDULING-FLAG INHIBIT-SCHEDULING-FLAG)
+	 (INHIBIT-SCHEDULING-FLAG T))
+    (WHEN PAGE-OUT-FIRST
+      (FLUSH-ALL-MAIN-MEMORY-PAGES)
+      (UNLESS RUN-WITHOUT-INTERRUPTS
+	(BEEP) ;done paging out
+	(PROCESS-SLEEP 1200. "Page In Scheduler")))
+    (WITH-PAGE-TRACE ()
+      (UNLESS RUN-WITHOUT-INTERRUPTS
+	(SETQ INHIBIT-SCHEDULING-FLAG OLD-INHIBIT-SCHEDULING-FLAG))
+      (EVAL FORM))
+    (WHEN PRINT-SUMMARY (SUMMARIZE-PAGE-TRACE))))
+
+(DEFUN PAGE-TRACE-SYSTEM-OVERHEAD (&OPTIONAL (PRINT-SUMMARY T))
+  (LET ((OLD-INHIBIT-SCHEDULING-FLAG INHIBIT-SCHEDULING-FLAG)
+	(INHIBIT-SCHEDULING-FLAG T))
+    (FLUSH-ALL-MAIN-MEMORY-PAGES)
+    (WITH-PAGE-TRACE ()
+      (SETQ INHIBIT-SCHEDULING-FLAG OLD-INHIBIT-SCHEDULING-FLAG)
+      (BEEP)
+      (PROCESS-SLEEP 1800.)))
+  (WHEN PRINT-SUMMARY (SUMMARIZE-PAGE-TRACE)))
+
+(DEFUN PAGE-TRACE-BREAK (&OPTIONAL (PRINT-SUMMARY T))
+  (LET ((OLD-INHIBIT-SCHEDULING-FLAG INHIBIT-SCHEDULING-FLAG)
+	(INHIBIT-SCHEDULING-FLAG T))
+    (FLUSH-ALL-MAIN-MEMORY-PAGES)
+    (SETQ INHIBIT-SCHEDULING-FLAG OLD-INHIBIT-SCHEDULING-FLAG)
+    (PROCESS-SLEEP (* 5. 60.))
+    (WITH-PAGE-TRACE ()
+      (BREAK "Now do something...")))
+  (WHEN PRINT-SUMMARY (SUMMARIZE-PAGE-TRACE)))
+
+(DEFCONST *PAGE-TRACE-ENABLES-ITEM-LIST*
+  '(("All"		     :VALUE -1
+     			     :DOCUMENTATION "Enable page trace for all page faults")
+    ("Replace"		     :VALUE #,(LSH 1 %PAGE-TRACE-REPLACE)
+     			     :DOCUMENTATION "Page replaced by another page")
+    ("Write"		     :VALUE #,(LSH 1 %PAGE-TRACE-WRITE)
+     			     :DOCUMENTATION "Write to paging file")
+    ("Fetch"		     :VALUE #,(LSH 1 %PAGE-TRACE-FETCH)
+     			     :DOCUMENTATION "Fetch from paging file")
+    ("Prefetch"		     :VALUE #,(LSH 1 %PAGE-TRACE-PREFETCH)
+     			     :DOCUMENTATION "Prefetch from paging file")
+    ("Prefetch Mark"	     :VALUE #,(LSH 1 %PAGE-TRACE-PREFETCH-MARK)
+     			     :DOCUMENTATION "Prefetch from paging file, setting mark (sequential region)")
+    ("Fetch Load"	     :VALUE #,(LSH 1 %PAGE-TRACE-FETCH-LOAD)
+     			     :DOCUMENTATION "Fetch from load file")
+    ("Prefetch Load"	     :VALUE #,(LSH 1 %PAGE-TRACE-PREFETCH-LOAD)
+     			     :DOCUMENTATION "Prefetch from load file")
+    ("Prefetch Load Mark"    :VALUE #,(LSH 1 %PAGE-TRACE-PREFETCH-LOAD-MARK)
+     			     :DOCUMENTATION "Prefetch from load file, setting mark (sequential region)")
+    ("Create Page"	     :VALUE #,(LSH 1 %PAGE-TRACE-CREATE-PAGE)
+     			     :DOCUMENTATION "Page allocation from %ALLOCATE-MEMORY")
+    ("Flushable Page Fault"  :VALUE #,(LSH 1 %PAGE-TRACE-FLUSHABLE-PAGE-FAULT)
+     			     :DOCUMENTATION "Reference to a resident page marked flushable")
+    ("Prefetched Page Fault" :VALUE #,(LSH 1 %PAGE-TRACE-PREFETCHED-PAGE-FAULT)
+     			     :DOCUMENTATION "Reference to a prefetched page")
+    ("Flush"		     :VALUE #,(LSH 1 %PAGE-TRACE-FLUSH-FRAME)
+			     :DOCUMENTATION "Page marked as replaceable")
+    ))
+
+(DEFVAR *CHOOSE-PAGE-TRACE-ENABLES-MENU* NIL)
+
+(DEFUN CHOOSE-PAGE-TRACE-ENABLES (&OPTIONAL (SET-DEFAULT T) &AUX CHOICES VALUE)
+  (UNLESS *CHOOSE-PAGE-TRACE-ENABLES-MENU*
+    (SETQ *CHOOSE-PAGE-TRACE-ENABLES-MENU*
+	  (TV:MAKE-WINDOW 'TV:MOMENTARY-MULTIPLE-MENU
+			  :ITEM-LIST *PAGE-TRACE-ENABLES-ITEM-LIST*
+;			  :FONT-MAP (LIST FONTS:CPTFONT FONTS:HL12I)
+			  )))
+  (WHEN (SETQ CHOICES (SEND *CHOOSE-PAGE-TRACE-ENABLES-MENU* :CHOOSE))
+    (PROG1 (SETQ VALUE
+		 (LOOP WITH IOR = 0
+		       FOR BIT IN CHOICES
+		       DO (SETQ IOR (LOGIOR IOR BIT))
+		       FINALLY (RETURN IOR)))
+	   (WHEN SET-DEFAULT (SETQ *PAGE-TRACE-ENABLES* VALUE)))))
+#+3600
+(DEFUN COLLECT-MICROCODE-ESCAPE-ROUTINES ()
+  (COPYLIST
+    (LOOP FOR X BEING THE LOCAL-INTERNED-SYMBOLS IN PKG-SYSTEM-PACKAGE
+	  WHEN (AND (BOUNDP X)
+		    (STRING-SEARCH "-ESCAPE-PC" X)
+		    (OR (= (%DATA-TYPE (SYMEVAL X)) DTP-EVEN-PC)
+			(= (%DATA-TYPE (SYMEVAL X)) DTP-ODD-PC)))
+	    COLLECT X)
+    PERMANENT-STORAGE-AREA))
+
+#+3600
+(DEFVAR *MICROCODE-ESCAPE-ROUTINES* (COLLECT-MICROCODE-ESCAPE-ROUTINES))
+#+3600
+(DEFUN LOOKUP-MICROCODE-ESCAPE-ROUTINE (ROUTINE)
+  (WHEN (ARRAYP ROUTINE)
+    (SETQ ROUTINE (%MAKE-POINTER-OFFSET DTP-EVEN-PC ROUTINE (ARRAY-DATA-OFFSET ROUTINE))))
+  (LOOP FOR F IN *MICROCODE-ESCAPE-ROUTINES*
+	WHEN (EQ (SYMEVAL F) ROUTINE)
+	  RETURN F))
+
+(DEFUN PAGE-TRACE-REPORT (&KEY (FAULT-MASK :CHOOSE)
+			       (AREAS NIL)
+			       (OBJECT-PREDICATE NIL)
+			       (FUNCTION-PREDICATE NIL)
+			       (STREAM STANDARD-OUTPUT)
+			       (DISPLAY :ALL)
+			       (DISPLAY-LIST NIL)
+			       (BUFFER *LAST-PAGE-TRACE-BUFFER*)
+			  &AUX LINEP (CL:*PRINT-PRETTY* NIL) STREAM-WIDTH)
+  (SETQ STREAM-WIDTH (SEND STREAM :SEND-IF-HANDLES :SIZE-IN-CHARACTERS))
+  (WHEN (OR (NULL STREAM-WIDTH)
+	    (< STREAM-WIDTH 90.))
+    (SETQ STREAM-WIDTH 132.))
+  (BLOCK PAGE-TRACE-REPORT
+    (UNLESS BUFFER
+      (RETURN-FROM PAGE-TRACE-REPORT (FORMAT STREAM "~&No page trace buffer.")))
+    (UNLESS (PLUSP (PAGE-TRACE-INDEX BUFFER))
+      (RETURN-FROM PAGE-TRACE-REPORT (FORMAT STREAM "~&Page trace buffer empty.")))
+    (CHECK-ARG DISPLAY (MEMQ DISPLAY '(:FUNCTION :OBJECT :ALL))
+	       "one of :FUNCTION, :OBJECT, or :ALL")
+    (SETQ AREAS (LOOP FOR AREA IN (IF (CL:LISTP AREAS) AREAS (LIST AREAS))
+		      COLLECT (IF (NUMBERP AREA) (AREA-NAME AREA) AREA)))
+    (WHEN (EQ FAULT-MASK :CHOOSE)
+      (SETQ FAULT-MASK (LOOP WHEN (CHOOSE-PAGE-TRACE-ENABLES NIL) RETURN IT)))
+    (SETQ LINEP (SEND STREAM :OPERATION-HANDLED-P :DRAW-LINE))
+    (FORMAT STREAM "
+  run T page T   Page# Rep    Area                    Fault                 Function//Object")
+    (WHEN LINEP
+      (MULTIPLE-VALUE-BIND (NIL Y) (SEND STREAM :READ-CURSORPOS :PIXEL)
+	(INCF Y (- (SEND STREAM :LINE-HEIGHT) (SEND STREAM :VSP)))
+	(SEND STREAM :DRAW-LINE 0 Y (SEND STREAM :INSIDE-WIDTH) Y)))
+    (LOOP WITH INDEX = 0
+	  WITH (LAST-UPPER LAST-LOWER OBJECT BASE-TIME LAST-TIME FCN
+			   PC TIME DELTA-TIME ENTRIES CCA FCN-NAME) DO
+      ;; Decode the entry
+      (MULTIPLE-VALUE (INDEX PC TIME DELTA-TIME ENTRIES)
+	(PAGE-TRACE-DECODE-ENTRY BUFFER INDEX))
+      (WHEN (NULL INDEX) (RETURN NIL))
+      ;; Update base-time to the time of the first entry
+      (UNLESS BASE-TIME (SETQ BASE-TIME TIME))
+      ;; Calculate the function and pc
+      (MULTIPLE-VALUE (FCN CCA) (%FIND-STRUCTURE-EXTENT PC))
+      (IF #+imach FCN #-imach T
+	  (PROGN
+	    (SETQ PC (+ (* (%POINTER-DIFFERENCE PC FCN) 2)
+			(IF (= (%DATA-TYPE PC) DTP-ODD-PC) 1 0)))
+	    (TYPECASE FCN
+	      (:COMPILED-FUNCTION
+		(SETQ FCN-NAME (COMPILED-FUNCTION-NAME-FOR-DEBUGGING FCN)))
+	      #+3600
+	      (:ARRAY
+		(SETQ FCN-NAME (OR (LOOKUP-MICROCODE-ESCAPE-ROUTINE FCN) FCN)
+		      CCA NIL))
+	      ;; kludge-return-helper will end up here.
+	      (OTHERWISE
+		(SETQ FCN-NAME FCN CCA NIL))))
+	  #+IMACH
+	  (IF (AND (SI:%POINTER- SYS:%TRAP-VECTOR-BASE PC)
+		   (SI:%POINTER-< PC (SYS:%POINTER-PLUS SYS:%TRAP-VECTOR-BASE
+							SYS:%TRAP-VECTOR-LENGTH)))
+	      (SETQ FCN (SI:%MAKE-POINTER SI:DTP-LOCATIVE SYS:%TRAP-VECTOR-BASE)
+		    FCN-NAME 'SYS:%TRAP-VECTOR-BASE
+		    PC (SYS:%POINTER-DIFFERENCE PC SYS:%TRAP-VECTOR-BASE))
+	      (SETQ FCN-NAME FCN CCA NIL)))
+      ;; Iterate over all the sub-entries
+      (LOOP WITH (HEADER-PRINTED AREA SPACE REP)
+	    FOR (CLASS . VMA) IN ENTRIES DO
+	(MULTIPLE-VALUE (AREA SPACE REP) (ADDRESS-AREA-INFO VMA))
+	(WHEN (AND (BIT-TEST (ASH 1 CLASS) FAULT-MASK)
+		   (OR (NULL AREAS) (MEMQ AREA AREAS))
+		   (OR (NULL OBJECT-PREDICATE)
+		       (FUNCALL OBJECT-PREDICATE (%FIND-STRUCTURE-HEADER VMA)))
+		   (OR (NULL FUNCTION-PREDICATE)
+		       (FUNCALL FUNCTION-PREDICATE FCN-NAME)))
+	  (IF HEADER-PRINTED
+	      (FORMAT STREAM "~%~15@T")
+	      (FORMAT STREAM "~%~:[~8@T~;~:*~8D~]~7D"
+		      (AND LAST-TIME (%32-BIT-DIFFERENCE TIME LAST-TIME))
+		      DELTA-TIME)
+	      (SETQ HEADER-PRINTED T))
+	  (FORMAT STREAM " ~7O ~6A ~23A ~21A"
+		  (LDB %%VMA-PAGE-NUM VMA) REP AREA
+		  (SELECT CLASS
+		    (%PAGE-TRACE-REPLACE "Replace")
+		    (%PAGE-TRACE-WRITE "Write")
+		    (%PAGE-TRACE-FETCH "Fetch")
+		    (%PAGE-TRACE-PREFETCH "Prefetch")
+		    (%PAGE-TRACE-PREFETCH-MARK "Prefetch Mark")
+		    (%PAGE-TRACE-FETCH-LOAD "Fetch Load")
+		    (%PAGE-TRACE-PREFETCH-LOAD "Prefetch Load")
+		    (%PAGE-TRACE-PREFETCH-LOAD-MARK "Prefetch Load Mark")
+		    (%PAGE-TRACE-CREATE-PAGE "Create Page")
+		    (%PAGE-TRACE-FLUSHABLE-PAGE-FAULT "Flushable Page Fault")
+		    (%PAGE-TRACE-PREFETCHED-PAGE-FAULT "Prefetched Page Fault")
+		    (%PAGE-TRACE-FLUSH-FRAME "Flush")
+		    (otherwise "Unknown")))
+	  (FLET ((DISPLAY-OBJECT (FORMAT-STRING)
+		   (WHEN (AND (OR DISPLAY-LIST (EQ REP 'STRUCT))
+			      (NOT (EQ SPACE 'STACK)))
+		     (SELECT CLASS
+		       ((%PAGE-TRACE-FETCH
+			 %PAGE-TRACE-FETCH-LOAD
+			 %PAGE-TRACE-PREFETCHED-PAGE-FAULT
+			 %PAGE-TRACE-FLUSHABLE-PAGE-FAULT)
+			  (WHEN (OR (NULL LAST-LOWER)
+				    (NOT (AND ( LAST-LOWER VMA) (< VMA LAST-UPPER))))
+			    (MULTIPLE-VALUE (OBJECT LAST-LOWER LAST-UPPER)
+			      (%FIND-STRUCTURE-EXTENT VMA))
+			    (WHEN LAST-LOWER
+			      (SETQ LAST-LOWER (%POINTER LAST-LOWER)
+				    LAST-UPPER (+ LAST-LOWER LAST-UPPER)))
+			    (FORMAT STREAM FORMAT-STRING)
+			    (LET ((OBJECT-STRING (CONDITION-CASE ()
+						      (WITH-OUTPUT-TO-STRING (S)
+							(LET ((PRINLEVEL 3) (PRINLENGTH 7))
+							  (PRIN1 OBJECT S)))
+						    ((ERROR)
+						     "#<Error printing object>"))))
+			      (DW:WITH-OUTPUT-AS-PRESENTATION (:STREAM STREAM :OBJECT OBJECT
+								       :TYPE 'EXPRESSION)
+				(SEND STREAM :STRING-OUT OBJECT-STRING
+				      0 (MIN (STRING-LENGTH OBJECT-STRING)
+					     (- STREAM-WIDTH 77.))))))))))
+		 (DISPLAY-FUNCTION ()
+		   (FORMAT STREAM " ~S|~O~@[ (~A)~]" FCN-NAME PC
+			 (AND CCA
+			      #+3600 (AREF L-LISP-COMPILER:*INSTRUCTION-NAME*
+					   (L-LISP-COMPILER:GET-UNIVERSAL-OPCODE
+					     (CCA-INSTRUCTION CCA PC)))
+			      #+IMach (DBG:PC-INFO
+					(%SET-TAG (%POINTER-PLUS FCN (%FIXNUM-FLOOR PC 2))
+						  (DPB PC (BYTE 1 0) DTP-EVEN-PC)))))))
+	    (CL:ECASE DISPLAY
+	      (:FUNCTION
+		(DISPLAY-FUNCTION))
+	      (:OBJECT
+		(DISPLAY-OBJECT " "))
+	      (:ALL
+		(DISPLAY-FUNCTION)
+		(TERPRI STREAM)
+		(DISPLAY-OBJECT "~77@T")
+		(WHEN LINEP
+		     (MULTIPLE-VALUE-BIND (NIL Y) (SEND STREAM :READ-CURSORPOS :PIXEL)
+		       (INCF Y (- (SEND STREAM :LINE-HEIGHT) (SEND STREAM :VSP)))
+		       (SEND STREAM :DRAW-LINE 0 Y (SEND STREAM :INSIDE-WIDTH) Y))))))))
+      (SETQ LAST-TIME (%32-BIT-PLUS TIME DELTA-TIME)))))
+
+;Given an address, returns three values: area-name, space-type, representation-type
+(DEFUN ADDRESS-AREA-INFO (ADDRESS &AUX AREA REGION NAME-OF-AREA SPACE-TYPE REPRESENTATION-TYPE)
+  (IF (OR (NULL (SETQ AREA (%AREA-NUMBER ADDRESS)))
+	  (NULL (SETQ REGION (%REGION-NUMBER ADDRESS)))
+	  ( (%POINTER-DIFFERENCE ADDRESS (REGION-ORIGIN REGION)) (REGION-FREE-POINTER REGION)))
+      ;; Should only happen for -1 = free memory (if you left GC on)
+      ;; Call it free memory even if it is allocated to some area, but not yet allocated
+      ;; to objects, to avoid blowing out later in %find-structure-extent.
+      (SETQ NAME-OF-AREA 'NOT-IN-ANY-AREA SPACE-TYPE 'FREE REPRESENTATION-TYPE 'FREE)
+      ;; Normal case
+      (SETQ NAME-OF-AREA (SYS:AREA-NAME AREA)
+	    SPACE-TYPE (SELECT (LDB SYS:%%REGION-SPACE-TYPE
+				    (SYS:REGION-BITS (SYS:%REGION-NUMBER ADDRESS)))
+			 (SYS:%REGION-SPACE-FREE 'FREE)
+			 (SYS:%REGION-SPACE-OLD 'OLD)
+			 (SYS:%REGION-SPACE-NEW 'NEW)
+			 (SYS:%REGION-SPACE-COPY 'COPY)
+			 (SYS:%REGION-SPACE-WEAK 'WEAK)
+			 (SYS:%REGION-SPACE-STACK 'STACK)
+			 #+IMach (SYS:%REGION-SPACE-CONTROL-STACK 'CONTROL-STACK)
+			 #+IMach (SYS:%REGION-SPACE-BINDING-STACK 'BINDING-STACK)
+			 #+IMach (SYS:%REGION-SPACE-STRUCTURE-STACK 'STRUCTURE-STACK)
+			 (OTHERWISE 'MISC))
+	    REPRESENTATION-TYPE (SELECT (LDB %%REGION-REPRESENTATION-TYPE
+					     (REGION-BITS (%REGION-NUMBER ADDRESS)))
+				  (%REGION-REPRESENTATION-TYPE-LIST 'LIST)
+				  (%REGION-REPRESENTATION-TYPE-STRUCTURE 'STRUCT)
+				  (OTHERWISE 'UNKNOWN-REPRESENTATION-TYPE))))
+  (VALUES NAME-OF-AREA SPACE-TYPE REPRESENTATION-TYPE))
+
+(DEFUN SUMMARIZE-PAGE-TRACE (&KEY (STREAM STANDARD-OUTPUT) (BUFFER *LAST-PAGE-TRACE-BUFFER*))
+  (UNLESS BUFFER
+    (RETURN-FROM SUMMARIZE-PAGE-TRACE (FORMAT STREAM "~&No page trace buffer.")))
+  (UNLESS (PLUSP (PAGE-TRACE-INDEX BUFFER))
+    (RETURN-FROM SUMMARIZE-PAGE-TRACE (FORMAT STREAM "~&Page trace buffer empty.")))
+  (LET ((INDEX 0)
+	(END-INDEX (PAGE-TRACE-INDEX BUFFER))
+	(HASH (CL:MAKE-HASH-TABLE))
+	(ENTRIES 0)
+	TEMP FIRST-TIME LAST-TIME (TOTAL-PAGING-TIME 0))
+    (IF (NULL INDEX)
+	(FORMAT STREAM "~%The page-trace buffer is empty.")
+	(WITH-STACK-ARRAY (COUNTS 20 :INITIAL-VALUE 0)
+	  (DECLARE (SYS:ARRAY-REGISTER COUNTS))
+	  (WITH-STACK-ARRAY (AREAS (N-AREAS) :INITIAL-VALUE 0)
+	    (DECLARE (SYS:ARRAY-REGISTER AREAS))
+	    (LOOP UNTIL (= INDEX END-INDEX) DO
+	      ;; Decode the entry
+	      (MULTIPLE-VALUE-BIND (NEXT-INDEX IGNORE TIME PAGING-TIME ENTRIES-LIST)
+		  (PAGE-TRACE-DECODE-ENTRY BUFFER INDEX)
+		(WHEN (NULL NEXT-INDEX) (RETURN NIL))
+		(UNLESS FIRST-TIME (SETQ FIRST-TIME TIME))
+		(SETQ LAST-TIME (+ TIME PAGING-TIME))
+		(INCF TOTAL-PAGING-TIME PAGING-TIME)
+		;; Iterate over all the sub-entries
+		(LOOP FOR (CLASS . VMA) IN ENTRIES-LIST
+		      AS PAGE = (LDB %%VMA-PAGE-NUM VMA)
+		      AS AREA = (%AREA-NUMBER VMA)
+		      WHEN AREA DO (INCF (AREF AREAS AREA))
+		      DO (INCF ENTRIES)
+			 (INCF (AREF COUNTS CLASS))
+			 (PUSH (SELECT CLASS	;Canonicalize
+				 (%PAGE-TRACE-FETCH-LOAD %PAGE-TRACE-FETCH)
+				 (%PAGE-TRACE-PREFETCH-LOAD %PAGE-TRACE-PREFETCH)
+				 (%PAGE-TRACE-PREFETCH-LOAD-MARK %PAGE-TRACE-PREFETCH-MARK)
+				 (OTHERWISE CLASS))
+			       (CL:GETHASH PAGE HASH)))
+		(SETQ INDEX NEXT-INDEX)))
+	    (FORMAT STREAM "~&Total elapsed time ~8D us~@
+			      Total paging time  ~8D us (~D%)"
+		    (%32-BIT-DIFFERENCE LAST-TIME FIRST-TIME)
+		    TOTAL-PAGING-TIME
+		    (ROUND (* TOTAL-PAGING-TIME 100.)
+			   (%32-BIT-DIFFERENCE LAST-TIME FIRST-TIME)))
+	    (FORMAT STREAM "~2%Class                  Count (  %)")
+	    (FORMAT STREAM "~%----------------------------------")
+	    (LOOP FOR CLASS IN *PAGE-TRACE-CLASSES*
+		  UNLESS (EQ CLASS '%PAGE-TRACE-END)
+		    DO (FORMAT STREAM "~%~21A  ~5D (~2D%)"
+			       (STRING-CAPITALIZE-WORDS (SUBSTRING CLASS 14))
+			       (SETQ TEMP (AREF COUNTS (SYMEVAL CLASS)))
+			       (ROUND (* TEMP 100.) ENTRIES)))
+	    
+	    (FORMAT STREAM "~%")
+	    (FORMAT STREAM "~%~21A  ~5D (~2D%)" "Total Fetch"
+		    (SETQ TEMP (+ (AREF COUNTS %PAGE-TRACE-FETCH)
+				  (AREF COUNTS %PAGE-TRACE-FETCH-LOAD)))
+		    (ROUND (* TEMP 100.) ENTRIES))
+	    (FORMAT STREAM "~%~21A  ~5D (~2D%)" "Total Prefetch"
+		    (SETQ TEMP (+ (AREF COUNTS %PAGE-TRACE-PREFETCH)
+				  (AREF COUNTS %PAGE-TRACE-PREFETCH-LOAD)))
+		    (ROUND (* TEMP 100.) ENTRIES))
+	    (FORMAT STREAM "~%~21A  ~5D (~2D%)" "Total Prefetch Mark"
+		    (SETQ TEMP (+ (AREF COUNTS %PAGE-TRACE-PREFETCH-MARK)
+				  (AREF COUNTS %PAGE-TRACE-PREFETCH-LOAD-MARK)))
+		    (ROUND (* TEMP 100.) ENTRIES))
+	    
+	    ;;-- This should maybe restrict itself to "real" page faults.
+	    ;;-- Better yet, it should sort on time.
+	    (FORMAT STREAM "~2%Area                             Count (  %)")
+	    (FORMAT STREAM "~%--------------------------------------------")
+	    (LOOP FOR I BELOW (ARRAY-ACTIVE-LENGTH AREAS)
+		  AS COUNT = (AREF AREAS I)
+		  WHEN (PLUSP COUNT)
+		    COLLECT (LIST COUNT (AREA-NAME I)) INTO FROB
+		  FINALLY (SETQ FROB (SORTCAR FROB #'>))
+			  (LOOP FOR (COUNT AREA) IN FROB DO
+			    (FORMAT STREAM "~%~31A  ~5D (~2D%)"
+				    AREA COUNT (ROUND (* COUNT 100.) ENTRIES))))
+	    
+	    (LET ((TABLE NIL))
+	      (CL:MAPHASH #'(LAMBDA (KEY VALUE)
+			      KEY		; not used
+			      (WHEN (> (LENGTH VALUE) 1)
+				(LET* ((R (%REVERSE-AND-CDR-CODE VALUE))
+				       (E (ASSOC R TABLE)))
+				  (IF E
+				      (INCF (CADR E))
+				      (PUSH (LIST R 1) TABLE)))))
+			  HASH)
+	      (WHEN TABLE
+		(SETQ TABLE (SORT (COPYLIST TABLE) #'CADR-GREATERP))
+		(FORMAT STREAM "~2%Page Fault Sequences Counts for individual pages ~
+				     (ignoring load//page differences):")
+		(LOOP FOR (SEQUENCE COUNT) IN TABLE DO
+		  (FORMAT STREAM "~%~4D  ~{~A~^, ~}"
+			  COUNT
+			  (LOOP FOR ELEMENT IN SEQUENCE
+				COLLECT
+				  (STRING-CAPITALIZE-WORDS
+				    (SUBSTRING (NTH ELEMENT *PAGE-TRACE-CLASSES*) 14))))))))))))
+
+(DEFUN PAGE-TRACE-DECODE-ENTRY (ARRAY INDEX)
+  (DECLARE (VALUES NEXT-ENTRY-INDEX PC ENTER-TIME DELTA-TIME ((CLASS . VMA) ...)))
+  (MACROLET ((GET-VALUE (I)
+	       (ONCE-ONLY (I)
+		 `(IF (< ,I MAX)
+		      (AREF ARRAY ,I)
+		      (RETURN-FROM PAGE-TRACE-DECODE-ENTRY NIL)))))
+    (LET ((ARRAY ARRAY)
+	  MAX PC ENTER-TIME ENTRIES DELTA-TIME)
+      (DECLARE (SYS:ARRAY-REGISTER ARRAY))
+      (BLOCK PAGE-TRACE-DECODE-ENTRY
+	(SETQ MAX (PAGE-TRACE-INDEX ARRAY)
+	      PC (GET-VALUE INDEX)
+	      ENTER-TIME (GET-VALUE (INCF INDEX))
+	      ENTRIES (LOOP AS ENTRY = (GET-VALUE (INCF INDEX))
+			    AS TYPE = #+3600  (%LOGLDB (BYTE 4 28.) ENTRY)
+				      #+IMACH (LDB (BYTE 4 0) (%TAG ENTRY))
+			    UNTIL (= TYPE %PAGE-TRACE-END)
+			    COLLECT (CONS TYPE #+3600 (LDB (BYTE 28. 0) ENTRY)
+					       #+IMACH (%FIXNUM ENTRY)))
+	      DELTA-TIME #+3600 (LDB (BYTE 28. 0) (GET-VALUE INDEX))
+			 #+IMACH (%FIXNUM (GET-VALUE INDEX)))
+	(VALUES (1+ INDEX) PC ENTER-TIME DELTA-TIME ENTRIES)))))
+
+
+;;;+++ Kludge.
+
+(DEFMACRO OUTPUT-TO-HARDCOPY (&BODY BODY)
+  `(CONDITION-BIND ((HARDCOPY-OUTSIDE-OF-BOUNDING-BOX
+		      #'SIMPLE-FORMATTER-EXCEPTION-INTERCEPTOR))
+     (LET ((STANDARD-OUTPUT
+	     (MAKE-HARDCOPY-STREAM SI:*DEFAULT-HARDCOPY-DEVICE*
+				   ':TITLE "Page Trace"
+				   ':NEW-PAGE-HOOK #'HARDCOPY-PRINT-PAGE-HEADING
+				   ':HEADER-FONT-P T
+				   ':PRESS-FONTS '(("FIX" "" 6))))
+	   (*HEADING-INFO* NIL))
+       (DECLARE (SPECIAL *HEADING-INFO*))
+       (SETQ *HEADING-INFO* (HARDCOPY-HEADING-INFO standard-output))
+       ,@BODY
+       (SEND STANDARD-OUTPUT :CLOSE))))
+
+
+#||;; This stuff is just musings by DanG.
+
+(DEFVAR *PHASE-LIST*)
+
+(DEFUN ANALYZE-PHASE-TRANSITIONS (&KEY (STREAM STANDARD-OUTPUT)
+				  (BUFFER *LAST-PAGE-TRACE-BUFFER*)
+				  (RUN-TIME-LIMIT 500.))
+  (LET ((INDEX 0)
+	(END-INDEX (PAGE-TRACE-INDEX BUFFER)))
+    (SETQ *PHASE-LIST* NIL)
+    (IF (NULL INDEX)
+	(FORMAT STREAM "~%Page trace buffer is empty.")
+	(LOOP WITH (LAST-TIME CURRENT-PHASE)
+	      UNTIL (= INDEX END-INDEX) DO
+	  (MULTIPLE-VALUE-BIND (NEXT-INDEX IGNORE ENTER-TIME PAGING-TIME ENTRIES-LIST)
+	      (PAGE-TRACE-DECODE-ENTRY BUFFER INDEX)
+	    (LET ((RUN-TIME (IF LAST-TIME (%32-BIT-DIFFERENCE ENTER-TIME LAST-TIME) 0)))
+	      (WHEN (AND (> RUN-TIME RUN-TIME-LIMIT)
+			 CURRENT-PHASE)
+		(SETQ CURRENT-PHASE (SORT CURRENT-PHASE #'))
+		(PUSH CURRENT-PHASE *PHASE-LIST*)
+		(SETQ CURRENT-PHASE NIL))
+	      (LOOP FOR (CLASS . VMA) IN ENTRIES-LIST
+		    WHEN (MEMQ CLASS `(,%PAGE-TRACE-FETCH ,%PAGE-TRACE-PREFETCH
+				       ,%PAGE-TRACE-PREFETCH-MARK ,%PAGE-TRACE-FETCH-LOAD
+				       ,%PAGE-TRACE-PREFETCH-LOAD))
+		      DO (PUSH (LDB %%VMA-PAGE-NUM VMA) CURRENT-PHASE)))
+	    (SETQ INDEX NEXT-INDEX
+		  LAST-TIME (%32-BIT-PLUS ENTER-TIME PAGING-TIME)))
+	      FINALLY (WHEN CURRENT-PHASE
+			(SETQ CURRENT-PHASE (SORT CURRENT-PHASE #'))
+			(PUSH CURRENT-PHASE *PHASE-LIST*)))
+	(SETQ *PHASE-LIST* (NREVERSE *PHASE-LIST*)))))
+
+(DEFUN ANALYZE-PFF (&KEY (STREAM STANDARD-OUTPUT)
+		    (BUFFER *LAST-PAGE-TRACE-BUFFER*))
+  (LET ((INDEX 0)
+	(END-INDEX (PAGE-TRACE-INDEX BUFFER))
+	(N-FETCHES 0)
+	(PFF 0)
+	(PFF-1 0)
+	(PFF-2 0)
+	(PFF-3 0)
+	(PFF-4 0))
+    (IF (NULL INDEX)
+	(FORMAT STREAM "~%Page trace buffer is empty.")
+	(LOOP WITH LAST-TIME
+	      UNTIL (= INDEX END-INDEX) DO
+	  (MULTIPLE-VALUE-BIND (NEXT-INDEX IGNORE ENTER-TIME PAGING-TIME ENTRIES-LIST)
+	      (PAGE-TRACE-DECODE-ENTRY BUFFER INDEX)
+	    (LET ((RUN-TIME (IF LAST-TIME (%32-BIT-DIFFERENCE ENTER-TIME LAST-TIME) 0)))
+	      (SETQ PFF (// (+ PFF RUN-TIME) 2.0))
+	      (SETQ PFF-1 (// (+ PFF-1 PFF) 2.0))
+	      (SETQ PFF-2 (// (+ PFF-2 PFF-1) 2.0))
+	      (SETQ PFF-3 (// (+ PFF-3 PFF-3 RUN-TIME) 3.0))
+	      (SETQ PFF-4 (// (+ PFF-4 (MIN RUN-TIME (+ PFF-4 1000.))) 2.0))
+	      (LOOP FOR (CLASS) IN ENTRIES-LIST
+		    WHEN (MEMQ CLASS `(,%PAGE-TRACE-FETCH ,%PAGE-TRACE-PREFETCH
+				       ,%PAGE-TRACE-PREFETCH-MARK ,%PAGE-TRACE-FETCH-LOAD
+				       ,%PAGE-TRACE-PREFETCH-LOAD))
+		      DO (INCF N-FETCHES))
+	      (FORMAT STREAM "~%~8D ~1,,8$ ~1,,8$ ~1,,8$ ~1,,8$ ~1,,8$ ~6D"
+		      RUN-TIME PFF PFF-1 PFF-2 PFF-3 PFF-4 N-FETCHES))
+	    (SETQ INDEX NEXT-INDEX
+		  LAST-TIME (%32-BIT-PLUS ENTER-TIME PAGING-TIME)))))))
+||#

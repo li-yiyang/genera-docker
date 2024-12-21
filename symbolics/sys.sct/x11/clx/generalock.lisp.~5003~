@@ -1,0 +1,124 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: PROCESS; Base: 10; Lowercase: Yes -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;
+;;; Permission is granted to any individual or institution to use, copy, modify,
+;;; and distribute this software, provided that this complete copyright and
+;;; permission notice is maintained, intact, in all copies and supporting
+;;; documentation.
+;;;
+;;; Symbolics, Inc. provides this software "as is" without
+;;; express or implied warranty.
+
+(defflavor xlib::clx-lock () (simple-recursive-normal-lock)
+  (:init-keywords :flavor))
+
+(defwhopper (lock-internal xlib::clx-lock) (lock-argument)
+  (catch 'timeout
+    (continue-whopper lock-argument)))
+
+(defmethod (lock-block-internal xlib::clx-lock) (lock-argument)
+  (declare (dbg:locking-function describe-process-lock-for-debugger self))
+  (when (null waiter-queue)
+    (setf waiter-queue (make-scheduler-queue :name name))
+    (setf timer (create-timer-call #'lock-timer-expired `(,self) :name name)))
+  (let ((process (lock-argument-process lock-argument)))
+    (unwind-protect
+	(progn
+	  (lock-map-over-conflicting-owners
+	    self lock-argument
+	    #'(lambda (other-lock-arg)
+		(add-promotion process lock-argument
+			       (lock-argument-process other-lock-arg) other-lock-arg)))
+	  (unless (timer-pending-p timer)
+	    (when (and (safe-to-use-timers %real-current-process)
+		       (not dbg:*debugger-might-have-system-problems*))
+	      (reset-timer-relative-timer-units timer *lock-timer-interval*)))
+	  (assert (store-conditional (locf latch) process nil))
+	  (sys:with-aborts-enabled (lock-latch)
+	    (let ((timeout (lock-argument-getf lock-argument :timeout nil)))
+	      (cond ((null timeout)
+		     (promotion-block waiter-queue #-VLM name #+VLM nil
+				      #'lock-lockable self lock-argument))
+		    ((and (plusp timeout)
+			  (using-resource (timer process-block-timers)
+			    ;; Yeah, we know about the internal representation
+			    ;; of timers here.
+			    (setf (car (timer-args timer)) %real-current-process)
+			    (with-scheduler-locked
+			      (reset-timer-relative timer timeout)
+			      (flet ((lock-lockable-or-timeout (timer lock lock-argument)
+				       (or (not (timer-pending-p timer))
+					   (lock-lockable lock lock-argument))))
+				(let ((priority (process-process-priority *current-process*)))
+				  (if (ldb-test %%scheduler-priority-preemption-field priority)
+				      (promotion-block waiter-queue #-VLM name #+VLM nil
+						       #'lock-lockable-or-timeout
+						       timer self lock-argument)
+				      ;; Change to preemptive priority so that when
+				      ;; unlock-internal wakes us up so we can have the lock,
+				      ;; we will really wake up right away
+				      (with-process-priority
+					  (dpb 1 %%scheduler-priority-preemption-field
+					       priority)
+					(promotion-block waiter-queue #-VLM name #+VLM nil
+						       #'lock-lockable-or-timeout
+						       timer self lock-argument)))))
+			      (lock-lockable self lock-argument)))))
+		    (t (throw 'timeout nil))))))
+      (unless (store-conditional (locf latch) nil process)
+	(lock-latch-wait-internal self))
+      (remove-promotions process lock-argument))))
+
+(compile-flavor-methods xlib::clx-lock)

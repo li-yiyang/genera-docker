@@ -1,0 +1,946 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: NFS; Base: 10; Lowercase: T; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;;; This file implements the protocol version dependent part of the lisp
+;;; machine user end for the Sun Network File System (NFS) Protocol, as
+;;; specified in the sun Network File System Protocol Specification, Revision
+;;; B of 17 February 1986.
+
+(defflavor nfs2-access-path-mixin
+	()
+	()
+  (:required-flavors nfs-access-path-mixin fs:user-file-access-path)
+  :abstract-flavor)
+
+(defmethod (fap-fhandle-times nfs2-access-path-mixin) (fhandle)
+  (declare (values mtime ctime))
+  (fap-ensure-authentication self)
+  (with-nfs2-fattr (fattr)
+    (let ((result
+	    (nfs2proc-getattr fhandle fattr
+			      :transport-agent (fap-transport-agent self))))
+      (unless (numberp result)
+	(values
+	  (nfs2-fattr-mtime-seconds result)
+	  (nfs2-fattr-ctime-seconds result))))))
+
+;;; Mounting stuff
+
+(defmethod (fap-unmount nfs2-access-path-mixin) (pathname)
+  (mnt1proc-umnt (fap-nfs-mount-string-for-host self pathname)
+		 :transport-agent (fap-transport-agent self)))
+
+(defmethod (fap-unmount-all nfs2-access-path-mixin) ()
+  (condition-case ()
+       (mnt1proc-umntall :transport-agent (fap-transport-agent self))
+     (rpc-error)))
+
+(defmethod (fap-try-mount nfs2-access-path-mixin)
+	   (pathname fhandle &optional errorp for-pathname for-operation)
+  (declare (values fhandle))
+  (fap-ensure-authentication self)
+  (let* ((filesystem (fap-nfs-mount-string-for-host self pathname)))
+    (let ((mount-result
+	    (condition-case-if (not errorp)
+			       (error)
+		 (with-nfs2-error-information (for-pathname for-operation)
+		   (mnt1proc-mnt filesystem fhandle
+				 :transport-agent (fap-transport-agent self)))
+	       (fs:file-error error))))
+      (cond ((errorp mount-result)
+	     mount-result)
+	    (t
+	     (unless (eq mount-result fhandle) (copy-nfs-fhandle mount-result fhandle))
+	     (fap-add-mount-entry
+	       self pathname pathname pathname fhandle
+	       (cdr (fap-global-file-properties self fhandle pathname))
+	       nil)
+	     fhandle)))))
+
+(defmethod (fap-nfs-exports nfs2-access-path-mixin) ()
+  (declare (values exports))
+  (loop for entry in
+	    (condition-case ()
+		 (let ((*udp-call-timeout* (* 7 60)))
+		   (mnt1proc-export :transport-agent (fap-transport-agent self)))
+	       (udp-rpc-host-not-responding
+		 (mnt1proc-export :transport-agent (host-tcp-transport-agent fs:host))))
+	collect (mnt1-export-entry-directory entry)))
+
+(defmethod (fap-read-link-with-caching nfs2-access-path-mixin)
+	   (fhandle pathname truename fattr)
+  (read-link-with-caching
+    fhandle pathname truename
+    (nfs2-fattr-mtime-seconds fattr) (nfs2-fattr-ctime-seconds fattr)))
+
+(defmethod (fap-read-link nfs2-access-path-mixin)
+	   (fhandle pathname truename)
+  (declare (values pathname))
+  (fap-ensure-authentication self)
+  (fap-nfs-parse-pathname
+    self 
+    (with-nfs2-error-information (pathname :fap-read-link)
+      (nfs2proc-readlink fhandle :transport-agent (fap-transport-agent self)))
+    (send truename :host)))
+
+(defun-in-flavor (remote-lookup nfs2-access-path-mixin)
+		 (truename dir-fhandle diropres-in directory-p operation
+			   &optional success-codes error-alist)
+  (fap-ensure-authentication self)
+  (let ((reply
+	  (with-nfs2-error-information
+	       ((if directory-p (as-dir truename) truename) operation
+		:success-codes (or success-codes '(0))
+		:error-alist error-alist)
+	    (nfs2proc-lookup dir-fhandle (fap-nfs-filename-string-for-host self truename)
+			     diropres-in :transport-agent (fap-transport-agent self)))))
+    (when (and (not (numberp reply))
+	       (= (nfs2-fattr-type (nfs2-diropres-fattr reply)) *nfs2-ftype-nfdir*))
+      (dir-fhandle-cache-encache
+	(as-file truename)
+	(nfs2-diropres-fhandle reply)
+	(nfs2-fattr-mtime-seconds (nfs2-diropres-fattr reply))
+	(nfs2-fattr-ctime-seconds (nfs2-diropres-fattr reply))))
+    reply))
+
+(defflavor nfs2-enoent-directory () (fs:directory-not-found nfs2-error))
+
+(defmethod (:report-without-pathname nfs2-enoent-directory) (stream)
+  (write-string "Directory not found" stream))
+
+(compile-flavor-methods nfs2-enoent-directory)
+
+(defflavor nfs2-eexist-directory () (fs:directory-already-exists nfs2-error))
+
+(defmethod (:report-without-pathname nfs2-eexist-directory) (stream)
+  (write-string "Directory already exists" stream))
+
+(compile-flavor-methods nfs2-eexist-directory)
+
+(defmethod (fap-lookup-dirpart-in-directory nfs2-access-path-mixin)
+	   (pathname dir-pathname dir-fhandle link-opaque-p links-taken
+		     mount-out-dir-truename mount-in-dir-truename
+		     dir-mtime dir-ctime)
+  (declare (values truename dir-truename dir-fhandle links-taken mtime ctime)
+	   (ignore dir-mtime dir-ctime))
+  (let* ((olddir (send (as-dir dir-pathname) :raw-directory))
+	 (old-depth (if (listp olddir) (length olddir) 0))
+	 (new-dir (subseq (send pathname :raw-directory) 0 (1+ old-depth)))
+	 (new-dir-pathname (send (send pathname :new-raw-directory new-dir)
+				 :directory-pathname-as-file)))
+    (condition-case (err)
+	 (with-nfs2-fattr (fattr)
+	   (with-nfs2-diropres (diropres-in dir-fhandle fattr)
+	     (let ((diropres
+		     (remote-lookup new-dir-pathname dir-fhandle diropres-in t
+				    'fap-lookup-dirpart-in-directory nil
+				    '((2 nfs2-enoent-directory)))))
+	       (cond ((and (= (nfs2-fattr-type (nfs2-diropres-fattr diropres))
+			      *nfs2-ftype-nflnk*)
+			   (null link-opaque-p))
+		      ;; It's a link and we have to chase it.  Make sure were not
+		      ;; in a loop of links.
+		      (check-link-count links-taken new-dir-pathname
+					'fap-lookup-dirpart-in-directory)
+		      ;; Make a new truename and return it, and return nil for
+		      ;; dir-truename and dir-fhandle to indicate a link was
+		      ;; found.  This will force a new lookup with this new
+		      ;; truename.
+		      (multiple-value-bind (link-to merged-link-to)
+			  (fap-read-link-with-caching
+			    self (nfs2-diropres-fhandle diropres)
+			    new-dir-pathname
+			    (true-pathname-like
+			      mount-in-dir-truename
+			      mount-out-dir-truename
+			      new-dir-pathname)
+			    (nfs2-diropres-fattr diropres))
+			(let* ((link (true-pathname-like
+				       new-dir-pathname merged-link-to pathname))
+			       (links-taken
+				 (cons (list pathname link new-dir-pathname link-to)
+				       links-taken)))
+			  (values link
+				  nil
+				  nil
+				  links-taken
+				  (nfs2-fattr-mtime-seconds (nfs2-diropres-fattr diropres))
+				  (nfs2-fattr-ctime-seconds (nfs2-diropres-fattr diropres))))))
+		     (t
+		      ;; It's not a link, so just return everything, since we're
+		      ;; all done
+		      (unless (eq (nfs2-diropres-fhandle diropres) dir-fhandle)
+			(copy-nfs-fhandle (nfs2-diropres-fhandle diropres) dir-fhandle))
+		      (values pathname new-dir-pathname dir-fhandle links-taken
+			      (nfs2-fattr-mtime-seconds (nfs2-diropres-fattr diropres))
+			      (nfs2-fattr-ctime-seconds (nfs2-diropres-fattr diropres))))))))
+       (nfs2-estale
+	 ;; Fhandle was stale, so throw all this away, and force a new lookup
+	 (fap-remove-mount-entry self dir-fhandle)
+	 (values pathname nil nil links-taken nil nil)))))
+
+(defmethod (fap-lookup-nampart-in-directory nfs2-access-path-mixin)
+	   (pathname dir-pathname dir-fhandle link-opaque-p links-taken
+		     mount-out-dir-truename mount-in-dir-truename
+		     dir-mtime dir-ctime)
+  (declare (values truename dir-truename fhandle links-taken mtime ctime))
+  (let ((filename nil))
+    (condition-case (err)
+	 (with-nfs2-fattr (fattr)
+	   (with-nfs2-diropres (diropres-in dir-fhandle fattr)
+	     (multiple-value-setq (filename pathname)
+	       (fap-get-newest-version-if-needed pathname dir-fhandle dir-mtime dir-ctime))
+	     (let ((diropres (remote-lookup pathname dir-fhandle diropres-in nil
+					    'fap-lookup-nampart-in-directory)))
+	       (cond ((and (= (nfs2-fattr-type (nfs2-diropres-fattr diropres))
+			      *nfs2-ftype-nflnk*)
+			   (null link-opaque-p))
+		      ;; It's a link and we have to chase it.  Make sure we're not
+		      ;; in a loop of links.
+		      (check-link-count links-taken pathname
+					'fap-lookup-nampart-in-directory)
+		      ;; Make a new truename with the value of the link, and return
+		      ;; it, and return nil for dir-truename and fhandle to
+		      ;; indicate a link was found This will force a new lookup
+		      ;; with this new truename
+		      (multiple-value-bind (link-to merged-link-to)
+			  (fap-read-link-with-caching
+			    self (nfs2-diropres-fhandle diropres) pathname
+			    (true-pathname-like
+			      mount-in-dir-truename
+			      mount-out-dir-truename
+			      pathname)
+			    (nfs2-diropres-fattr diropres))
+			(let* ((links-taken
+				 (cons (list pathname merged-link-to pathname link-to)
+				       links-taken)))
+			  (values merged-link-to nil nil links-taken
+				  (nfs2-fattr-mtime-seconds (nfs2-diropres-fattr diropres))
+				  (nfs2-fattr-ctime-seconds (nfs2-diropres-fattr diropres))))))
+		     (t
+		      ;; It's not a link, so just return everything, since we're
+		      ;; all done
+		      (unless (eq (nfs2-diropres-fhandle diropres) dir-fhandle)
+			(copy-nfs-fhandle (nfs2-diropres-fhandle diropres) dir-fhandle))
+		      (values pathname dir-pathname (nfs2-diropres-fhandle diropres)
+			      links-taken
+			      (nfs2-fattr-mtime-seconds (nfs2-diropres-fattr diropres))
+			      (nfs2-fattr-ctime-seconds (nfs2-diropres-fattr diropres))))))))
+       (nfs2-estale
+	 ;; Fhandle was stale, so throw all this away, and force a new lookup
+	 (fap-remove-mount-entry self dir-fhandle)
+	 (values pathname nil nil links-taken nil nil)))))
+
+(defmethod (fap-rename-internal nfs2-access-path-mixin)
+	   (old-dir-fhandle old-truename oldname new-dir-fhandle new-truename newname)
+  (fap-ensure-authentication self)
+  ;; First check that something is there.
+  (with-nfs-fhandle (fhandle)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(remote-lookup old-truename old-dir-fhandle diropres-in nil :rename))))
+  ;; Then rename it, not caring if it isn't there anymore.
+  (with-nfs2-error-information
+       (old-truename :rename :success-codes '(0 2) :new-truename new-truename)
+    (nfs2proc-rename old-dir-fhandle oldname new-dir-fhandle newname
+		     :transport-agent (fap-transport-agent self))))
+
+(defmethod (fap-delete-internal nfs2-access-path-mixin)
+	   (dir-fhandle truename filename)
+  (fap-ensure-authentication self)
+  (if (with-nfs-fhandle (fhandle)
+	(with-nfs2-fattr (fattr)
+	  (with-nfs2-diropres (diropres-in fhandle fattr)
+	    (= (nfs2-fattr-type
+		 (nfs2-diropres-fattr
+		   (remote-lookup truename dir-fhandle diropres-in nil :delete)))
+	       *nfs2-ftype-nfdir*))))
+      ;; Then delete it, not caring if it isn't there anymore.
+      ;; Directories are deleted differently than files.
+      (with-nfs2-error-information (truename :delete :success-codes '(0 2))
+	(nfs2proc-rmdir dir-fhandle filename :transport-agent (fap-transport-agent self)))
+    (with-nfs2-error-information (truename :delete :success-codes '(0 2))
+      (nfs2proc-remove dir-fhandle filename :transport-agent (fap-transport-agent self)))))
+       
+(defmethod (fap-expunge-internal nfs2-access-path-mixin)
+	   (dir-fhandle truename filename)
+  (declare (ignore dir-fhandle truename filename)
+	   (values nblocks))
+  0)
+
+(defun-in-flavor (nfs2-sattr-for-creation nfs2-access-path-mixin)
+		 (mode gid &optional (sattr (make-nfs2-sattr)))
+  (declare (values sattr))
+  ;; This could be done better
+  (setf (nfs2-sattr-mode sattr) mode)
+  (setf (nfs2-sattr-uid sattr)
+	(username->uid (fap-unix-name-lookup-access-path self) fs:host-user-id))
+  (setf (nfs2-sattr-gid sattr) gid)
+  (setf (nfs2-sattr-size sattr) -1)
+  (let ((time (time:get-universal-time)))
+    (setf (nfs2-sattr-atime-seconds sattr) (udt-to-unix time))
+    (setf (nfs2-sattr-atime-usecs sattr) 0)
+    (setf (nfs2-sattr-mtime-seconds sattr) (udt-to-unix time))
+    (setf (nfs2-sattr-mtime-usecs sattr) 0))
+  sattr)
+
+(defun-in-flavor (nfs2-gid-for-creation nfs2-access-path-mixin) (dir-fhandle truename)
+  (declare (values gid sgid-p))
+  (with-nfs2-fattr (dir-fattr)
+    ;; Get the attributes of the directory
+    (with-nfs2-error-information
+	 (truename 'gid-for-creation
+		   :success-codes '(0) :error-alist '((2 nfs2-enoent-directory)))
+      (nfs2proc-getattr dir-fhandle dir-fattr :transport-agent (fap-transport-agent self)))
+    ;; If the directory is sgid, use the gid of the directory.
+    (if (logtest #o2000 (nfs2-fattr-mode dir-fattr))
+	(values (nfs2-fattr-gid dir-fattr) t)
+      (values (username->gid (fap-unix-name-lookup-access-path self) fs:host-user-id) nil))))
+
+(defparameter *nfs2-default-mode-for-directories* #o775)
+
+(defmethod (fap-create-directory-internal nfs2-access-path-mixin)
+	   (dir-fhandle truename filename)
+  (fap-ensure-authentication self)
+  ;; First check that nothing is there.
+  (with-nfs-fhandle (fhandle)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(remote-lookup truename dir-fhandle diropres-in t
+		       'lookup-for-create-directory
+		       '(2) '((0 nfs2-eexist-directory))))))
+  ;; Then create the directory, not caring if it already exists.
+  (with-nfs-fhandle (fhandle)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(with-nfs2-sattr (sattr)
+	  (with-nfs2-error-information (truename :create-directory :success-codes '(0 17))
+	    (nfs2proc-mkdir
+	      dir-fhandle filename
+	      (multiple-value-bind (gid sgid-p) (nfs2-gid-for-creation dir-fhandle truename)
+		(nfs2-sattr-for-creation
+		  (if sgid-p
+		      (logior *nfs2-default-mode-for-directories* #o2000)
+		    *nfs2-default-mode-for-directories*)
+		  gid sattr))
+	      diropres-in :transport-agent (fap-transport-agent self))))))))
+
+(defparameter *nfs2-default-mode-for-links* #o775)
+
+(defmethod (fap-create-link-internal nfs2-access-path-mixin)
+	   (dir-fhandle truename filename linkfrom-path linkto-path)
+  (declare (ignore linkfrom-path))
+  (fap-ensure-authentication self)
+  ;; First check that nothing is there.
+  (with-nfs-fhandle (fhandle)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(remote-lookup truename dir-fhandle diropres-in nil 'lookup-for-create-link
+		       '(2) '((0 nfs2-eexist))))))
+  ;; Then create the link, not caring if it already exists.
+  (with-nfs2-sattr (sattr)
+    (with-nfs2-error-information (truename :create-link :success-codes '(0 17))
+      (nfs2proc-symlink
+	dir-fhandle filename
+	(fap-nfs-pathname-string-for-host self linkto-path)
+	(nfs2-sattr-for-creation
+	  *nfs2-default-mode-for-links*
+	  (nfs2-gid-for-creation dir-fhandle truename)
+	  sattr)
+	:transport-agent (fap-transport-agent self)))))
+
+(defmethod (fap-fattr-etc-to-property-list nfs2-access-path-mixin)
+	   (fattr pathname truename fhandle)
+  (declare (values property-list))
+  (assert (not (eql (nfs2-fattr-type fattr) -1)))	;Sanity check
+  (let* ((directory (= (nfs2-fattr-type fattr) *nfs2-ftype-nfdir*))
+	 (link-to (when (= (nfs2-fattr-type fattr) *nfs2-ftype-nflnk*)
+		    (send (fap-read-link-with-caching self fhandle truename truename fattr)
+			  :string-for-host)))
+	 (file (= (nfs2-fattr-type fattr) *nfs2-ftype-nfreg*))
+	 (mode-string (format nil "~O" (logand #o7777 (nfs2-fattr-mode fattr))))
+	 (author-string
+	   (uid->username (fap-unix-name-lookup-access-path self) (nfs2-fattr-uid fattr)))
+	 (group-string
+	   (gid->groupname (fap-unix-name-lookup-access-path self) (nfs2-fattr-gid fattr)))
+	 (characters (file-characters-p truename :probe))
+	 (byte-size (file-byte-size truename characters))
+	 (length-in-bytes (floor (nfs2-fattr-size fattr) (ceiling byte-size 8)))
+	 (block-size (* 8 (nfs2-fattr-blocksize fattr)))
+	 (length-in-blocks (nfs2-fattr-blocks fattr)))
+    (nconc (list pathname)
+	   (when (neq truename pathname) (list :truename truename))
+	   (cond (directory
+		  (list :directory t
+			:block-size block-size
+			:length-in-blocks length-in-blocks))
+		 (link-to
+		  (list :link-to link-to))
+		 (file
+		  (list :byte-size byte-size
+			:length-in-bytes length-in-bytes
+			:block-size block-size
+			:length-in-blocks length-in-blocks)))
+	   (list :author author-string
+		 :creation-date (unix-to-udt (nfs2-fattr-mtime-seconds fattr))
+		 :reference-date (unix-to-udt (nfs2-fattr-atime-seconds fattr))
+		 :protection mode-string
+		 :account group-string))))
+
+(defun-in-flavor (property-list-to-sattr nfs2-access-path-mixin)
+		 (property-list &optional (sattr (make-nfs2-sattr)))
+  (declare (values sattr))
+  (let* ((plist (cdr property-list))
+	 (mode-string (getf plist :protection))
+	 (mode (or (and mode-string (parse-integer mode-string :radix 8 :junk-allowed t))
+		   -1))
+	 (author-string (getf plist :author))
+	 (uid (if author-string
+		  (username->uid (fap-unix-name-lookup-access-path self) author-string)
+		-1))
+	 (group-string (getf plist :account))
+	 (gid (if group-string
+		  (groupname->gid (fap-unix-name-lookup-access-path self) group-string)
+		-1))
+	 (length-in-bytes (getf plist :length-in-bytes))
+	 (byte-size (getf plist :byte-size))
+	 (size (if length-in-bytes
+		   (if byte-size
+		       (* length-in-bytes (ceiling byte-size 8))
+		     length-in-bytes)
+		 -1))
+	 (atime-udt (or (getf plist :reference-date) -1))
+	 (atime-unix (if (= atime-udt -1) -1 (udt-to-unix atime-udt)))
+	 (mtime-udt (max (or (getf plist :creation-date) -1)
+			 (or (getf plist :modification-date) -1)))
+	 (mtime-unix (if (= mtime-udt -1) -1 (udt-to-unix mtime-udt))))
+    (setf (nfs2-sattr-mode sattr) mode)
+    (setf (nfs2-sattr-uid sattr) uid)
+    (setf (nfs2-sattr-gid sattr) gid)
+    (setf (nfs2-sattr-size sattr) size)
+    (setf (nfs2-sattr-atime-seconds sattr) atime-unix)
+    (setf (nfs2-sattr-atime-usecs sattr) (if (= atime-unix -1) -1 0))
+    (setf (nfs2-sattr-mtime-seconds sattr) mtime-unix)
+    (setf (nfs2-sattr-mtime-usecs sattr) (if (= mtime-unix -1) -1 0)))
+  sattr)
+
+(defmethod (fap-change-properties-internal nfs2-access-path-mixin)
+	   (pathname fhandle truename properties)
+  (declare (values property-list)
+	   (ignore pathname))
+  (fap-ensure-authentication self)
+  (with-nfs2-fattr (fattr)
+    (with-nfs2-sattr (sattr)
+      (fap-fattr-etc-to-property-list
+	self
+	(with-nfs2-error-information (truename :change-properties)
+	  (nfs2proc-setattr
+	    fhandle (property-list-to-sattr (cons truename properties) sattr)
+	    fattr :transport-agent (fap-transport-agent self)))
+	truename
+	truename
+	fhandle))))
+
+(defmethod (fap-properties-internal nfs2-access-path-mixin)
+	   (pathname fhandle truename)
+  (declare (values property-list)
+	   (ignore pathname))
+  (fap-ensure-authentication self)
+  (with-nfs2-fattr (fattr)
+    (values (fap-fattr-etc-to-property-list
+	      self
+	      (with-nfs2-error-information (truename :properties)
+		(nfs2proc-getattr fhandle fattr :transport-agent (fap-transport-agent self)))
+	      truename
+	      truename
+	      fhandle)
+	    (copy-list *changeable-properties*))))
+
+(defmethod (fap-trivial-directory-list-internal nfs2-access-path-mixin)
+	   (dir-fhandle truename filename)
+  (declare (values property-lists))
+  (fap-ensure-authentication self)
+  (unless (or (string= filename ".") (string= filename ".."))
+    (with-nfs-fhandle (fhandle)
+      (with-nfs2-fattr (fattr)
+	(with-nfs2-diropres (diropres-in fhandle fattr)
+	  (let ((diropres
+		  (with-nfs2-error-information (truename :directory-list)
+		    (nfs2proc-lookup dir-fhandle filename diropres-in
+				     :transport-agent (fap-transport-agent self)))))
+	    (list (fap-fattr-etc-to-property-list
+		    self
+		    (nfs2-diropres-fattr diropres)
+		    truename
+		    truename
+		    (nfs2-diropres-fhandle diropres)))))))))
+
+(defmethod (fap-uncached-scan-directory nfs2-access-path-mixin)
+	   (pathname truename dir-fhandle mtime ctime function)
+  (declare (sys:downward-funarg function))
+  (fap-ensure-authentication self)
+  (unless (and mtime ctime)
+    (multiple-value-setq (mtime ctime)
+      (fap-fhandle-times self dir-fhandle)))
+  (loop with cookie = 0
+	with contents = nil
+	for readdir-res =
+	    (with-nfs2-error-information (pathname 'fap-uncached-scan-directory)
+	      (nfs2proc-readdir dir-fhandle cookie (transfer-size)
+				:transport-agent (fap-transport-agent self)))
+	do (loop for entry in (nfs2-readdir-res-entries readdir-res)
+		 for name = (nfs2-dir-entry-name entry)
+		 do (setq cookie (nfs2-dir-entry-cookie entry))
+		 when (and (not (string= name "."))
+			   (not (string= name ".."))
+			   (funcall function
+				    (first (push (fap-nfs-parse-filename self name truename)
+						 contents))))
+		   do (return-from fap-uncached-scan-directory nil))
+	until (nfs2-readdir-res-eof readdir-res)
+	finally (dir-contents-cache-encache
+		  (send truename :directory-pathname-as-file)
+		  (nreverse contents) mtime ctime)))
+
+(defmethod (fap-stat nfs2-access-path-mixin)
+	   (pathname truename dir-fhandle fhandle operation)
+  (declare (values plist mtime ctime))
+  (with-nfs2-fattr (fattr)
+    (with-nfs2-diropres (diropres-in fhandle fattr)
+      (let ((result (remote-lookup truename dir-fhandle diropres-in nil operation)))
+	(unless (eq (nfs2-diropres-fhandle result) fhandle)
+	  (copy-nfs-fhandle (nfs2-diropres-fhandle result) fhandle))
+	(let ((fattr (nfs2-diropres-fattr result)))
+	  (values (fap-fattr-etc-to-property-list self fattr pathname truename fhandle)
+		  (nfs2-fattr-mtime-seconds fattr) (nfs2-fattr-ctime-seconds fattr)))))))
+
+(defmethod (fap-directory-list-start-future nfs2-access-path-mixin)
+	   (dir-fhandle truename)
+  (declare (values future))
+  (fap-ensure-authentication self)
+  (start-nfs2proc-lookup-future
+    dir-fhandle (fap-nfs-filename-string-for-host self truename)
+    :transport-agent (fap-transport-agent self)))
+
+(defmethod (fap-directory-list-finish-future nfs2-access-path-mixin)
+	   (dir-fhandle pathname future)
+  (declare (values plist))
+  (fap-ensure-authentication self)
+  (with-nfs-fhandle (fhandle)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(let ((diropres
+		(condition-case ()
+		     (with-nfs2-error-information (pathname 'fap-directory-list-finish-future)
+		       (finish-nfs2proc-lookup-future future diropres-in))
+		   ((fs:file-error rpc-error)
+		    (with-nfs2-error-information (pathname 'fap-directory-list-finish-future)
+		      (nfs2proc-lookup
+			dir-fhandle (fap-nfs-filename-string-for-host self pathname)
+			diropres-in :transport-agent (fap-transport-agent self)))))))
+	  (cdr (fap-fattr-etc-to-property-list
+		 self (nfs2-diropres-fattr diropres) pathname pathname
+		 (nfs2-diropres-fhandle diropres))))))))
+
+(defmethod (fap-directory-list-abort-future nfs2-access-path-mixin)
+	   (future)
+  (abort-nfs2proc-lookup-future future))
+
+(defun-in-flavor (nfs2-fsattr-etc-to-fs-property-list nfs2-access-path-mixin)
+		 (fsattr changeable-properties)
+  (let* ((avail (nfs2-fsattr-bavail fsattr))
+	 (block-size (nfs2-fsattr-bsize fsattr))
+	 (megabytes-avail (round (* avail block-size) 1048576))
+	 (total-avail (+ (- (nfs2-fsattr-blocks fsattr) (nfs2-fsattr-bfree fsattr))
+			 (nfs2-fsattr-bavail fsattr)))
+	 (used (- (nfs2-fsattr-blocks fsattr) (nfs2-fsattr-bfree fsattr)))
+	 (percent-used (round (* used 100) total-avail)))
+    (list nil
+	  :block-size (* 8 block-size)
+	  :disk-space-description
+	  (format nil "~D (~D Megabyte~:P) available, ~D/~D (~D%) (~D byte blocks)"
+		  avail
+		  megabytes-avail
+		  used
+		  total-avail
+		  percent-used
+		  block-size)
+	  :settable-properties changeable-properties)))
+
+(defmethod (fap-global-file-properties nfs2-access-path-mixin) (dir-fhandle truename)
+  (declare (values fs-property-list))
+  (fap-ensure-authentication self)
+  (with-nfs2-fsattr (fsattr)
+    (nfs2-fsattr-etc-to-fs-property-list
+      (with-nfs2-error-information (truename 'fap-global-file-properties)
+	(nfs2proc-statfs dir-fhandle fsattr :transport-agent (fap-transport-agent self)))
+      *changeable-properties*)))
+  
+(defparameter *nfs2-default-mode-for-files* #o664)
+
+(defmethod (fap-create-file nfs2-access-path-mixin)
+	   (dir-fhandle pathname fhandle &optional mode)
+  (declare (values pathname fhandle fattr)
+	   (ignore options))
+  (fap-ensure-authentication self)
+  ;; First check that nothing is there.
+  (with-nfs-fhandle (fhandle)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(remote-lookup pathname dir-fhandle diropres-in nil 'lookup-for-create-file
+		       '(2) '((0 nfs2-eexist))))))
+  ;; Then create the file, not caring if it already exists.
+  (with-nfs2-fattr (fattr)
+    (with-nfs2-diropres (diropres-in fhandle fattr)
+      (let ((result
+	      (with-nfs2-sattr (sattr)
+		(with-nfs2-error-information
+		     (pathname 'fap-create-file :success-codes '(0 17))
+		  (nfs2proc-create
+		    dir-fhandle (fap-nfs-filename-string-for-host self pathname)
+		    (nfs2-sattr-for-creation
+		      (or mode *nfs2-default-mode-for-files*)
+		      (nfs2-gid-for-creation dir-fhandle pathname)
+		      sattr)
+		    diropres-in :transport-agent (fap-transport-agent self))))))
+	(unless (eq (nfs2-diropres-fhandle result) fhandle)
+	  (copy-nfs-fhandle (nfs2-diropres-fhandle result) fhandle))
+	(values pathname fhandle
+		(fap-fattr-etc-to-property-list
+		  self (nfs2-diropres-fattr result) pathname pathname fhandle))))))
+
+(defmethod (fap-check-access-for-output-internal nfs2-access-path-mixin)
+	   (pathname fhandle fattr)
+  "Cause an access check to be made to see whether we can do output to this file."
+  (declare (ignore pathname dir-fhandle fhandle))
+  (let ((uid (username->uid (fap-unix-name-lookup-access-path self) fs:host-user-id))
+	(gid (username->gid (fap-unix-name-lookup-access-path self) fs:host-user-id))
+	(gids (car (username->gids (fap-unix-name-lookup-access-path self) fs:host-user-id))))
+    (cond ((zerop uid))
+	  ((= (nfs2-fattr-uid fattr) uid)
+	   (logtest #o200 (nfs2-fattr-mode fattr)))
+	  ((or (= (nfs2-fattr-gid fattr) gid)
+	       (member (nfs2-fattr-gid fattr) gids))
+	   (logtest #o020 (nfs2-fattr-mode fattr)))
+	  (t (logtest #o002 (nfs2-fattr-mode fattr))))))
+
+(defmethod (fap-create-output-temp nfs2-access-path-mixin)
+	   (pathname dir-fhandle fhandle &optional mode fattr)
+  "Creates a temporary file in the same directory as the given
+   pathname that is suitable for output and later renaming to the pathname
+   when you want to close the stream."
+  (declare (values truename fhandle plist))
+  (loop for counter upfrom 1
+	for possibility = (fap-nfs-temporary-pathname self pathname counter)
+	do (condition-case (err)
+		(return (fap-create-file self dir-fhandle possibility fhandle
+					 (or mode (nfs2-fattr-mode fattr))))
+	      (fs:file-already-exists))))
+
+(defmethod (fap-truncate-file nfs2-access-path-mixin)
+	   (fhandle pathname)
+  (fap-ensure-authentication self)
+  (with-nfs2-fattr (fattr)
+    (with-nfs2-sattr (sattr)
+      (setf (nfs2-sattr-size sattr) 0)
+      (with-nfs2-error-information (pathname 'fap-truncate-file)
+	(nfs2proc-setattr fhandle sattr fattr :transport-agent (fap-transport-agent self)))))
+  nil)
+
+(defflavor wrong-kind-of-file
+	(fhandle fattr mode)
+	(fs:wrong-kind-of-file)
+  (:initable-instance-variables fhandle fattr mode)
+  (:required-init-keywords :fhandle :fattr :mode))
+
+(defmethod (:report-without-pathname wrong-kind-of-file) (stream)
+  (format stream "You can't ~(~A~) ~A in ~(~A~) mode, it's a ~A."
+	  (send self :operation)
+	  (send self :pathname)
+	  mode
+	  (or (nfs2-fattr-ftype-name fattr)
+	      (format nil "file of unknown type (~D)" (nfs2-fattr-type fattr)))))
+
+(compile-flavor-methods wrong-kind-of-file)
+
+(defflavor invalid-operation-for-link
+	()
+	(wrong-kind-of-file fs:invalid-operation-for-link)
+  )
+
+(compile-flavor-methods invalid-operation-for-link)
+
+(defflavor invalid-operation-for-directory
+	()
+	(wrong-kind-of-file fs:invalid-operation-for-directory)
+  )
+
+(compile-flavor-methods invalid-operation-for-directory)
+
+(defmethod (fap-fhandle-etc-for-open nfs2-access-path-mixin)
+	   (dir-fhandle pathname direction byte-size if-exists if-does-not-exist
+			error fhandle links-taken
+			mount-out-dir-truename mount-in-dir-truename
+			dir-mtime dir-ctime)
+  (declare (values fhandle truename length buffer-pointer open-mode
+		   output-temp-pathname plist))
+  (if (eq direction :probe-directory)
+      (values nil (send pathname :directory-pathname-as-file) nil nil nil nil nil)
+    (with-nfs2-fattr (fattr)
+      (with-nfs2-diropres (diropres-in fhandle fattr)
+	(when (and (eq (send pathname :version) :newest)
+		   (eq if-exists :supersede))
+	  (setq if-exists :new-version))
+	(multiple-value-bind (filename truename)
+	    (fap-get-newest-version-if-needed pathname dir-fhandle dir-mtime dir-ctime)
+	  (declare (ignore filename))
+	  (let ((result (remote-lookup truename dir-fhandle diropres-in nil :open '(0 2))))
+	    (cond ((eql result 2)
+		   ;; Nothing there
+		   (handle-does-not-exist-on-open
+		     dir-fhandle pathname truename direction byte-size if-does-not-exist
+		     error fhandle))
+		  ((and (= (nfs2-fattr-type (nfs2-diropres-fattr result))
+			   *nfs2-ftype-nflnk*)
+			(neq direction :probe-link))
+		   ;; A link and we're not probing for a link.
+		   (handle-link-on-open
+		     dir-fhandle pathname truename direction byte-size
+		     if-exists if-does-not-exist 
+		     error (nfs2-diropres-fhandle result) (nfs2-diropres-fattr result)
+		     links-taken mount-out-dir-truename mount-in-dir-truename))
+		  ((or (= (nfs2-fattr-type (nfs2-diropres-fattr result))
+			  *nfs2-ftype-nfreg*)
+		       (and (= (nfs2-fattr-type (nfs2-diropres-fattr result))
+			       *nfs2-ftype-nfdir*)
+			    (or (eq direction :probe)
+				(eq direction :probe-link)))
+		       (and (= (nfs2-fattr-type (nfs2-diropres-fattr result))
+			       *nfs2-ftype-nflnk*)
+			    (eq direction :probe-link)))
+		   ;; A regular file, a directory in probe or probe-link mode,
+		   ;; or a link in probe-link mode.
+		   (handle-exists-on-open
+		     pathname truename direction byte-size if-exists
+		     error (nfs2-diropres-fhandle result) dir-fhandle
+		     (nfs2-diropres-fattr result) dir-mtime dir-ctime))
+		  (t
+		   ;; Anything else that exists but isn't a link or a regular file
+		   (error (select (nfs2-fattr-type (nfs2-diropres-fattr result))
+			    (*nfs2-ftype-nflnk* 'invalid-operation-for-link)
+			    (*nfs2-ftype-nfdir* 'invalid-operation-for-directory)
+			    (otherwise 'wrong-kind-of-file))
+			  :fhandle (copy-nfs-fhandle (nfs2-diropres-fhandle result))
+			  :fattr (copy-nfs2-fattr (nfs2-diropres-fattr result))
+			  :pathname truename
+			  :operation :open
+			  :mode direction)))))))))
+
+(defun-in-flavor (nfs-stream-flavor nfs2-access-path-mixin)
+		 (pathname direction binary-p byte-size direct-p fake-characters)
+  (declare (ignore pathname))
+  (case direction
+    ((:probe :probe-directory :probe-link)
+     'nfs2-probe-stream)
+    (:input
+      (if binary-p
+	  (if (> byte-size 8)
+	      (if direct-p 'nfs2-direct-access-input-wide-binary-stream
+		'nfs2-input-wide-binary-stream)
+	    (if fake-characters
+		(if direct-p 'nfs2-unix-translating-direct-access-input-binary-stream
+		    'nfs2-unix-translating-input-binary-stream)
+	      (if direct-p 'nfs2-direct-access-input-binary-stream
+		'nfs2-input-binary-stream)))
+	(if direct-p 'nfs2-unix-translating-direct-access-input-character-stream
+	    'nfs2-unix-translating-input-character-stream)))
+    (:output
+      (if binary-p
+	  (if (> byte-size 8)
+	      (if direct-p 'nfs2-direct-access-output-wide-binary-stream
+		'nfs2-output-wide-binary-stream)
+	    (if fake-characters
+		(if direct-p 'nfs2-unix-translating-direct-access-output-binary-stream
+		    'nfs2-unix-translating-output-binary-stream)
+	      (if direct-p 'nfs2-direct-access-output-binary-stream
+		'nfs2-output-binary-stream)))
+	(if direct-p 'nfs2-unix-translating-direct-access-output-character-stream
+	    'nfs2-unix-translating-output-character-stream)))
+    (:io
+      (if binary-p
+	  (if (> byte-size 8)
+	      (if direct-p 'nfs2-direct-access-bidirectional-wide-binary-stream
+		'nfs2-bidirectional-wide-binary-stream)
+	    (if fake-characters
+		(if direct-p
+		      'nfs2-unix-translating-direct-access-bidirectional-binary-stream
+		    'nfs2-unix-translating-bidirectional-binary-stream)
+	      (if direct-p 'nfs2-direct-access-bidirectional-binary-stream
+		'nfs2-bidirectional-binary-stream)))
+	(if direct-p 'nfs2-unix-translating-direct-access-bidirectional-character-stream
+	    'nfs2-unix-translating-bidirectional-character-stream)))
+    (otherwise
+      (error "Bad Direction: ~S" direction))))
+
+(defmethod (fap-file-access-path-open-internal nfs2-access-path-mixin)
+	   (fhandle dir-fhandle pathname truename direction characters binary byte-size
+		    preserve-dates raw direct fake-characters
+		    plist buffer-pointer length open-mode output-temp-pathname)
+  (declare (values stream binary-p))
+  (let ((stream-flavor (nfs-stream-flavor truename direction binary byte-size
+					  direct fake-characters)))
+    (values
+      (if (and (neq direction :probe-directory)
+	       (or (null fhandle) (errorp fhandle)))
+	  fhandle
+	(apply #'make-instance
+	       stream-flavor
+	       :pathname pathname
+	       :truename truename
+	       :plist plist
+	       (nconc
+		 (when (member direction '(:input :output :io))
+		   (list :dir-fhandle
+			 (copy-nfs-fhandle dir-fhandle (allocate-resource 'nfs-fhandle))
+			 :fhandle
+			 (copy-nfs-fhandle fhandle (allocate-resource 'nfs-fhandle))
+			 :preserve-dates preserve-dates 
+			 :fake-characters fake-characters
+			 :raw raw
+			 :file-access-path self
+			 :buffer-pointer buffer-pointer
+			 :length length
+			 :open-mode open-mode))
+		 (when (member direction '(:output :io))
+		   (list :output-temp-pathname output-temp-pathname
+			 :output-transfer-size (transfer-size)))
+		 (when (member direction '(:input :io))
+		   (list :input-transfer-size (transfer-size))))))
+      (not characters))))
+
+(compile-flavor-methods nfs2-access-path-mixin)
+
+(defflavor unix-nfs2-access-path
+	()
+	(nfs2-access-path-mixin
+	 nfs-access-path-mixin
+	 unix-nfs-access-path-mixin
+	 fs:font-encapsulating-access-path-mixin
+	 fs:user-file-access-path))
+
+(compile-flavor-methods unix-nfs2-access-path)
+
+(defflavor lispm-nfs2-access-path
+	()
+	(nfs2-access-path-mixin
+	 nfs-access-path-mixin
+	 lispm-nfs-access-path-mixin
+	 fs:font-encapsulating-access-path-mixin
+	 fs:user-file-access-path))
+
+(compile-flavor-methods lispm-nfs2-access-path)
+
+(defflavor vms-nfs2-access-path
+	()
+	(nfs2-access-path-mixin
+	 nfs-access-path-mixin
+	 vms-nfs-access-path-mixin
+	 fs:font-encapsulating-access-path-mixin
+	 fs:user-file-access-path))
+
+(compile-flavor-methods vms-nfs2-access-path)
+
+(defflavor nonunix-nfs2-access-path
+	()
+	(nfs2-access-path-mixin
+	 nfs-access-path-mixin
+	 nonunix-nfs-access-path-mixin
+	 fs:font-encapsulating-access-path-mixin
+	 fs:user-file-access-path))
+
+(compile-flavor-methods nonunix-nfs2-access-path)
+
+(defun nfs2-p (host)
+  (progn (nfs2proc-null :transport-agent (host-udp-transport-agent host))
+	 t))
+
+(setq *nfs-access-path-flavor-alist*
+      (list* '(2 (fs:unix-host nfs2-p unix-nfs2-access-path)
+		 (fs:lispm-host nfs2-p lispm-nfs2-access-path)
+		 (fs:vms-host nfs2-p vms-nfs2-access-path)
+		 (t nfs2-p nonunix-nfs2-access-path))
+	     (remove 2 *nfs-access-path-flavor-alist* :key #'first)))
+
+(cp:define-command  (com-show-nfs-exports
+		      :command-table "NFS"
+		      :name "Show NFS Exports")
+    ((host `((token-or-type nil net:host))))
+   (catch-error
+     (loop with exports =
+	     (condition-case ()
+		  (let ((*udp-call-timeout* (* 7 60)))
+		    (mnt1proc-export :transport-agent (host-udp-transport-agent host)))
+		(udp-rpc-host-not-responding
+		  (mnt1proc-export :transport-agent (host-tcp-transport-agent host))))
+	   with fswidth = (loop for entry in exports
+				maximize (length (mnt1-export-entry-directory entry)))
+	   initially (format t "~&NFS Exports for ~A (a ~A running ~A):~%"
+			     host (send host :machine-type) (send host :system-type))
+	   for entry in exports
+	   for fs = (mnt1-export-entry-directory entry)
+	   for groups = (mnt1-export-entry-groups entry)
+	   do (format t "  ~A~VT~{ ~A~}~%" fs (+ fswidth 3) groups))))
+
+

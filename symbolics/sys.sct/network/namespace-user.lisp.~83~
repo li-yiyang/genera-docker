@@ -1,0 +1,416 @@
+;;; -*- Mode: LISP; Package: NETI; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; This file contains the support for the Lisp Machine Namespace Network Protocol.
+;;; Routines it shares with support for local namespace files are in namespace-parse.
+;;; The protocols here are used by the interface routines in namespace-access-paths.
+
+;;; Errors
+
+(defflavor lispm-namespace-server-error (server error-string) (namespace-server-error)
+  :initable-instance-variables)
+
+(defmethod (:report lispm-namespace-server-error) (stream)
+  (format stream "Error from ~A: ~A" server error-string))
+
+(defflavor lispm-namespace-server-unloaded
+	(host)
+	(namespace-server-namespace-access-error)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (:report lispm-namespace-server-unloaded) (stream)
+  (format stream "Error from ~A: Namespace ~A unloaded." host (send self :namespace)))
+
+(compile-flavor-methods lispm-namespace-server-error lispm-namespace-server-unloaded)
+
+;;;
+
+(defflavor lispm-namespace-access-path
+	((stream)
+	 version
+	 service-access-path)
+	(namespace-access-path)
+  (:initable-instance-variables service-access-path))
+
+(defun-in-flavor (lispm-namespace-get-stream lispm-namespace-access-path) ()
+  (when stream
+    (send self :validate))
+  (unless stream
+    (let ((valid-stream nil))
+      (unwind-protect
+	(progn
+	  (setf stream (net:get-connection-for-service service-access-path))
+	  (setf version *highest-supported-protocol-version*)
+	  (loop while (> version *lowest-supported-protocol-version*)
+		do
+		(format stream "PROTOCOL-VERSION ~D~2%" version)
+		(send stream :force-output)
+		until (let ((recs (loop as rec = (parse-record-as-tokens-with-timeout stream)
+					while rec collect rec)))
+			(not (equal (first (first (first recs))) "ERROR")))
+		do (decf version)
+		finally (setf valid-stream t)))
+	(when (and stream (not valid-stream))
+	  (send stream :close :abort)
+	  (setf stream nil))))))
+
+(defmethod (:init lispm-namespace-access-path :after) (ignore)
+  (lispm-namespace-get-stream))
+
+(defmethod (:validate lispm-namespace-access-path) ()
+  (cond ((null stream)
+	 (lispm-namespace-get-stream)
+	 t)
+	((send stream :listen)
+	 (send self :close :abort)
+	 nil)
+	(t t)))
+
+(defmethod (:close lispm-namespace-access-path) (&optional abortp)
+  (when stream
+    (send stream :close abortp)
+    (setf stream nil)))
+
+(defmethod (:delete-object lispm-namespace-access-path) (namespace object on-behalf-of)
+  (lispm-namespace-get-stream)
+  (searching-one-namespace (namespace)
+    (format stream "UPDATE-BY ~A~%NAMESPACE ~A~%CLASS ~A~%DELETE ~A~2%"
+	    on-behalf-of (send namespace :name) (send object :class)
+	    (send object :primary-name-string namespace)))
+  (send stream :force-output)
+  (let ((record (parse-record-as-tokens stream)))
+    (selector (first (first record)) string-equal
+      ("ERROR"
+       (error 'lispm-namespace-server-error
+	      :server self :error-string (second (first record))))
+      ("TIMESTAMP"))))
+
+(defmethod (:get-brief-incremental-update lispm-namespace-access-path)
+	   (namespace starting-timestamp)
+  (declare (values success timestamp class-alist deleted))
+  (lispm-namespace-get-stream)
+  (format stream "NAMESPACE ~A~%INCREMENTAL BRIEF~%TIMESTAMP ~D~2%"
+	  namespace starting-timestamp)
+  (send stream :force-output)
+  (let ((records (loop as record = (parse-record-as-tokens-with-timeout stream)
+		       while record collect record)))
+    (selector (first (first (first records))) string-equal
+      ("CURRENT" (values t starting-timestamp nil nil))
+      ("TOO-OLD" (values nil (parse-number (second (first (first records))) 0 nil 10. t)
+			 nil nil))
+      ("TIMESTAMP"
+       (let* ((ts (parse-number (second (first (first records))) 0 nil 10. t))
+	      (deleted (loop for (class name) in (rest1 (first records))
+			     when (send namespace :find-object-named
+					(intern-global-name class)
+					(send namespace :intern-name name))
+			       collect it))
+	      (class-alist nil))
+	 (loop for (class-name name) in (second records)
+	       for class = (intern-global-name class-name)
+	       as entry = (or (assq class class-alist)
+			      (let ((new-entry (list class class nil)))
+				(push new-entry class-alist)
+				new-entry))
+	       as interned-name = (parse-and-intern-name class name namespace t)
+	       when interned-name
+	       do (push interned-name (third entry)))
+	 (values t ts class-alist deleted)))
+      ("ERROR"
+       (error 'lispm-namespace-server-error
+	      :server self :error-string (second (first (first records))))))))
+
+(defmethod (:get-full-incremental-update lispm-namespace-access-path)
+	   (namespace starting-timestamp)
+  (declare (values success timestamp))
+  (lispm-namespace-get-stream)
+  (format stream "NAMESPACE ~A~%INCREMENTAL FULL~@[~%TIMESTAMP ~D~]~2%"
+	  (send namespace :name) starting-timestamp)
+  (send stream :force-output)
+  (let ((records (loop as record = (parse-record-as-tokens-with-timeout stream)
+		       while record collect record)))
+    (selector (first (first (first records))) string-equal
+      ("CURRENT"
+       (values t starting-timestamp))
+      ("TOO-OLD"
+       (values nil (parse-number (second (first (first records))) 0 nil 10. t)))
+      ("TIMESTAMP"
+       (read-incremental-update-file-1 namespace records starting-timestamp))
+      ("ERROR"
+       (error 'lispm-namespace-server-error
+	      :server self :error-string (second (first (first records))))))))
+
+(defun-in-flavor (lispm-namespace-names-only-query-response lispm-namespace-access-path)
+	      (namespace class record &aux (valid-p t))
+  (when (and (equal (first (first record)) "ERROR")
+	     (not (null (rest1 (first record)))))
+    (error 'lispm-namespace-server-error :server self :error-string (second (first record))))
+  (when (equal (first record) '("VALID" "NO"))
+    (pop record)
+    (setq valid-p nil))
+  (let ((list (loop for (name) in record
+		    when (condition-case ()
+			     (find-object-named-in-namespace class name namespace)
+			   (net:object-not-found 
+			     (multiple-value-bind (nil object-list)
+				 (send self :query namespace class
+				       :name (parse-and-intern-name class name namespace nil))
+			       (if object-list
+				   (first object-list)
+				   (namespace-warning
+				     "~A ~A was mentioned but then not found." class name)
+				   (setq valid-p nil)
+				   nil))))
+		      collect it)))
+    (values valid-p list)))
+
+(defun-in-flavor (lispm-namespace-query-response lispm-namespace-access-path)
+	      (namespace class records)
+  class
+  (when (string-equal (first (first (first records))) "ERROR")
+    (error 'lispm-namespace-server-error
+			 :server self :error-string (second (first (first records)))))
+  (loop with *collected-objects* = nil
+	with valid-p = t
+	for record in records
+	do (if (equal record '(("VALID" "NO")))
+	       (setq valid-p nil)
+	       (push (record-into-object record namespace) *collected-objects*))
+	finally (return (values valid-p *collected-objects*))))
+
+(defmethod (:query lispm-namespace-access-path) (namespace class &rest property-list)
+  (lispm-namespace-get-stream)
+  (searching-one-namespace (namespace)
+    (let ((names-only nil)
+	  (records))
+      (format stream "NAMESPACE ~A~%CLASS ~A~%" (send namespace :name) class)
+      (loop for (ind val) on property-list by #'cddr
+	    do (selectq ind
+		 (:name
+		  (format stream "NAME ~VQ~%" val #'print-record-string))
+		 (:timestamp
+		  (when val			;For convenience
+		    (format stream "TIMESTAMP ~D~%" val)))
+		 (:names-only
+		  (when (setq names-only val)
+		    (format stream "NAMES-ONLY YES~%")))
+		 (otherwise
+		  (unconvert-tokens ind nil (class-get-template class ind) val stream))))
+      (send stream :tyo #\cr)
+      (send stream :force-output)
+      ;; Must read all the responses first, in case any of the parsing
+      ;; needs to ask about objects.
+      (setf records (if names-only
+			(parse-record-as-tokens-with-timeout stream)
+			(loop as record = (parse-record-as-tokens-with-timeout stream)
+			      while record
+			      collect record)))
+      (if names-only
+	  (lispm-namespace-names-only-query-response namespace class records)
+	  (lispm-namespace-query-response namespace class records)))))
+
+(defmethod (:reload-namespace lispm-namespace-access-path) (namespace &aux timestamp)
+  (lispm-namespace-get-stream)
+  (cond ((>= version 3)
+	 ;; New improved way.
+	 (format stream "NAMESPACE ~A~%INCREMENTAL COMPLETE~2%" namespace)
+	 (send stream :force-output)
+	 (let ((record (parse-record-as-tokens stream)))
+	   (selector (first (first record)) string-equal
+	     ("ERROR"
+	      (error 'lispm-namespace-server-error
+		     :server self :error-string (second (first record))))
+	     ("TIMESTAMP"
+	      (setf timestamp (parse-number (second (first record)) 0 nil 10. t)))))
+	 (let ((objects (reload-namespace-from-stream namespace stream :return-objects t)))
+	   (delete-old-objects-from-namespace namespace objects))
+	 (values t timestamp))
+	;; Must do it the old way.
+	(t (let ((*namespace-record-timeout* (* 60. 60. 10.)))
+	     (setf timestamp (net:invoke-service-on-host
+			       :namespace-timestamp
+			       (service-access-path-host service-access-path)
+			       namespace))
+	     ;; Update global objects by hand.
+	     (send self :query namespace :namespace :name (send namespace :name))
+	     (send self :query namespace :site :local-namespace namespace)
+	     ;; Now do the rest of the objects
+	     (let ((objects)
+		   (classes))
+	       (loop for class in *all-classes*
+		     unless (class-globally-named-p class)
+		     do (multiple-value-bind (valid-p list)
+			    (send self :query namespace class)
+			  (unless valid-p (ferror "Invalid information while reloading."))
+			  (push class classes)
+			  (setf objects (nconc list objects))))
+	       (delete-old-objects-from-namespace namespace objects :classes classes)))
+	   (values t timestamp))))
+
+;;; Network updating
+(defmethod (:update-object lispm-namespace-access-path) (namespace object on-behalf-of)
+  (lispm-namespace-get-stream)
+  ;; bind version so the object printer will know how to filter data as necessary
+  (let ((*namespace-protocol-version* version))
+    (searching-one-namespace (namespace)
+      (format stream "UPDATE-BY ~A~%NAMESPACE ~A~%CLASS ~A~%NAME ~A~%"
+	      on-behalf-of (send namespace :name) (send object :class)
+	      (send object :primary-name-string namespace))
+      (print-object-attributes object stream namespace :suppress-name t)
+      (send stream :force-output)
+      (let ((record (parse-record-as-tokens stream)))
+	(selector (first (first record)) string-equal
+	  ("ERROR"
+	   (error 'lispm-namespace-server-error
+		  :server self :error-string (second (first record))))
+	  ("TIMESTAMP"))))))
+
+(defmethod (:map-over-possible-object-name-completions lispm-namespace-access-path)
+	   (class string namespace function)
+  (lispm-namespace-get-stream)
+  (when (< version 4)
+    (ferror "Completion not supported by server ~A."
+	    (service-access-path-host service-access-path)))
+  (format stream "NAMESPACE ~A~%CLASS ~A~%COMPLETE ~A~%" namespace class string)
+  (send stream :tyo #\cr)
+  (send stream :force-output)
+  (let ((record (parse-record-as-tokens-with-timeout stream)))
+    (when (and (equal (first (first record)) "ERROR")
+	       (not (null (rest1 (first record)))))
+      (error 'lispm-namespace-server-error :server self
+					   :error-string (second (first record))))
+    (loop for (name) in record
+	  do (funcall function name))))
+
+(compile-flavor-methods lispm-namespace-access-path)
+
+;;;
+
+(define-protocol :namespace (:namespace :byte-stream)
+  (:invoke (service-access-path)
+   (make-instance 'lispm-namespace-access-path :service-access-path service-access-path)))
+
+
+
+(define-protocol :namespace-timestamp (:namespace-timestamp :datagram)
+  (:invoke (sap)
+    (destructuring-bind (namespace) (service-access-path-args sap)
+      (with-open-stream
+	(stream (get-connection-for-service sap :rfc-data (send namespace :name)))
+	(multiple-value-bind (datagram start end)
+	    (send stream :read-input-buffer)
+	  (let ((string (make-array end :type 'art-string :displaced-to datagram)))
+	    (or (parse-number string start end 10. t)
+		(cond ((string-equal string ":UNLOADED" start 0 end nil)
+		       (error 'lispm-namespace-server-unloaded
+			      :namespace namespace :host (send stream :foreign-host)))
+		      (t (error 'lispm-namespace-server-error
+				:error-string (substring string start end)))))))))))
+
+
+
+(define-protocol :who-am-i (:who-am-i :datagram)
+  (:invoke-with-stream-and-close (stream)
+    (loop doing
+      (multiple-value-bind (array start end)
+	  (send stream :read-input-buffer)
+	(setf array (ascii-to-string array))
+	(let ((bar-idx (string-search-char #/| array start end)))
+	  (when bar-idx
+	    (return
+	      (values (intern-global-name (substring array start bar-idx))
+		      (if (string-equal array "*UNKNOWN*" (1+ bar-idx) 0 end nil)
+			  :unknown
+			  (substring array (1+ bar-idx) end))
+		      (send stream :foreign-host)))))
+	(send stream :advance-input-buffer)))))
+
+(defun get-who-am-i-from-network ()
+  (declare (values namespace name server))
+  ;; First try hosts we believe to be namespace servers.  Keep down broadcast traffic
+  ;; in the normal case where site hasn't changed.  Even if the host isn't a server there
+  ;; now, their answer is as good as anyone's.
+  (invoke-multiple-services
+    ((loop for (server) in (send *namespace* :server-access-paths)
+	   as path = (unless (eq server *local-host*)
+		       (condition-case ()
+			    (find-path-to-service-on-host :who-am-i server)
+			  (error nil)))
+	   when path collect path)
+     (* 60. 5) "Who am I") (host namespace name server)
+    (error (progn host))			;Prevent compiler warning
+    (:no-error (return-from get-who-am-i-from-network
+		 (values namespace name server))))
+  D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; Since the namespace servers that we know of don't seem to be working, try just a plain
+0  1;; broadcast.
+0  (invoke-multiple-services ((find-paths-to-service-using-broadcast :who-am-i)
+			     (* 60. 10.) "Who am I") (host namespace name server)
+    (sys:network-error
+      host)
+    (:no-error
+      (when namespace
+	(return-from get-who-am-i-from-network
+	  (values namespace name server)))))
+  1;; None of those worked, try any host that supports :who-am-i
+0  (invoke-multiple-services ((searching-one-namespace (*namespace*)
+			       (find-paths-to-service :who-am-i))
+			     (* 60. 10.) "Who am I") (host namespace name server)
+    (sys:network-error
+      host)
+    (:no-error
+      (when namespace
+	(return-from get-who-am-i-from-network
+	  (values namespace name server)))))
+  (values nil :no-response nil))

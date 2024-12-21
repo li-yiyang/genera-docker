@@ -1,0 +1,480 @@
+;; -*- Mode: Lisp; Syntax: Common-Lisp; Package: TCP; Base: 10; Lowercase: Yes -*-
+;; Trivial File Transfer Protocol (RFC 768)
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Constants
+
+(defparameter *tftp-n-retransmissions* 5)
+
+(defconstant tftp-rrq 1)
+(defconstant tftp-wrq 2)
+(defconstant tftp-data 3)
+(defconstant tftp-ack 4)
+(defconstant tftp-error 5)
+(defvar *tftp-timeout* 5 "Basic TFTP timeout interval, seconds")
+(defvar *tftp-pathname-host* "local" "Host against which to parse pathnames")
+
+;;; Meters
+
+(defvar *tftp-retransmissions* 0)
+
+;;; Errors
+
+(defflavor tftp-error () (fs:server-error))
+
+(defflavor tftp-unknown-error () (tftp-error fs:network-lossage))
+(defflavor tftp-file-not-found () (tftp-error fs:file-not-found))
+(defflavor tftp-access-violation () (tftp-error fs:incorrect-access-to-file))
+(defflavor tftp-allocation-exceeded () (tftp-error fs:no-more-room))
+(defflavor tftp-illegal-operation () (tftp-error fs:network-lossage))
+(defflavor tftp-unknown-tid () (tftp-error fs:network-lossage))
+(defflavor tftp-file-exists () (tftp-error fs:file-already-exists))
+(defflavor tftp-no-such-user () (tftp-error fs:network-lossage))
+
+(defun tftp-signal-error (pkt start end)
+  (let ((message (first (tftp-parse-strings pkt (+ start 4) end))))
+    (error (selector (ip-load-16 pkt (+ start 2)) =
+	     (1 'tftp-file-not-found)
+	     (2 'tftp-access-violation)
+	     (3 'tftp-allocation-exceeded)
+	     (4 'tftp-illegal-operation)
+	     (5 'tftp-unknown-tid)
+	     (6 'tftp-file-exists)
+	     (7 'tftp-no-such-user)
+	     (otherwise 'tftp-unknown-error))
+	   :report-string message)))
+
+(defun tftp-store-string (string pkt start)
+  (dotimes (i (string-length string))
+    (setf (aref pkt start) (char-to-ascii (aref string i)))
+    (incf start))
+  (setf (aref pkt start) 0)
+  (incf start)
+  start)
+
+(defun tftp-send-error (conn error)
+  (multiple-value-bind (pkt start ignore)
+      (send conn :get-output-buffer)
+    (ip-store-16 tftp-error pkt start)
+    (incf start 2)
+    (ip-store-16 (or (typecase error
+		       (fs:file-lookup-error 1)
+		       (fs:access-error 2)
+		       (fs:no-more-room 3)
+		       (tftp-illegal-operation 4)
+		       (tftp-unknown-tid 5)
+		       (fs:file-already-exists 6)
+		       (tftp-no-such-user 7))
+		     0) pkt start)
+    (incf start 2)
+    (setf start (tftp-store-string (send error :report-string) pkt start))
+    (send conn :advance-output-buffer start)
+    (send conn :force-output)))
+
+(defun tftp-report-no-response (conn)
+  (error "Host ~A is not responding." (send conn :foreign-host)))
+
+;;; Utilities
+
+(defun tftp-parse-strings (pkt start end)
+  (loop while (< start end)
+	collect (loop with word = (make-array 20 :element-type 'string-char :fill-pointer 0)
+		      for c = (aref pkt start)
+		      do (incf start)
+		      until (zerop c)
+		      do (vector-push-extend (ascii-to-char c) word)
+		      finally (return word))))
+
+(defun tftp-send-ack (conn pkt-no)
+  (multiple-value-bind (pkt start ignore)
+      (send conn :get-output-buffer)
+    (ip-store-16 tftp-ack pkt start)
+    (ip-store-16 pkt-no pkt (+ start 2))
+    (send conn :advance-output-buffer (+ start 4))
+    (send conn :force-output)))
+
+(defun tftp-read-ack (conn pkt-no)
+  (when (process-wait-with-timeout "TFTP Ack" (* *tftp-timeout* 60)
+				   #'(lambda (conn) (send conn :listen))
+				   conn)
+    (multiple-value-bind (ack-pkt ack-start ack-len)
+	(send conn :read-input-buffer)
+      (selector (ip-load-16 ack-pkt ack-start) =
+	(tftp-ack
+	  (let ((ack-no (ip-load-16 ack-pkt (+ ack-start 2))))
+	    (send conn :advance-input-buffer)
+	    (= ack-no pkt-no)))
+	(tftp-error (tftp-signal-error ack-pkt ack-start ack-len))
+	(otherwise (error "Unexpected TFTP packet type ~D received."
+			   (ip-load-16 ack-pkt ack-start))))))) 
+(defparameter *tftp-default-pathname*
+	      (make-pathname :host "LOCAL" :directory :root :name "" :type "")
+  "Pathname with respect to which TFTP file strings are parsed.")
+(defun tftp-server-transfer (udp-conn pkt start end write)
+  (send udp-conn :set-local-port nil)
+  (fs:with-automatic-login-to-sys-host
+    (condition-case (error)
+	 (let* ((trusted-p (ip-host-trusted-p (send udp-conn :network)
+					      (send udp-conn :foreign-address)))
+		(strings (tftp-parse-strings pkt (+ start 2) end))
+		(element-type (selector (second strings) string-equal
+				(("octet" "image") '(unsigned-byte 8))
+				("netascii" 'string-char)
+				(otherwise (error "Invalid TFTP mode ~A." (second strings))))))
+	   (declare (special lmfs:*require-login*))
+	   (send udp-conn :advance-input-buffer)
+	   (when (and (not net:*system-secured*) (not trusted-p))
+	     (error 'tftp-access-violation
+		    :report-string "You cannot TFTP from an untrusted host."))
+	   (when lmfs:*require-login*
+	     (error 'tftp-access-violation
+		    :report-string "You cannot TFTP to this host because you must login."))
+	   (let ((lmfs:*access-permissive* lmfs:*access-permissive*))
+	     (declare (special lmfs:*access-permissive*))
+	     (when (not trusted-p)
+	       D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; Always interpret empty ACLs as "no access" for untrusted hosts.
+0	       (setf lmfs:*access-permissive* nil))
+	     (fs:force-user-to-login)
+	     (let ((pathname (merge-pathnames (fs:parse-pathname (first strings) 
+								 *tftp-pathname-host*)
+					      *tftp-default-pathname*)))
+	       (with-open-file (stream pathname
+				       :direction (if write :output :input)
+				       :element-type element-type
+				       :if-exists :error)
+		 (when write
+		   (tftp-send-ack udp-conn 0))
+		 (with-open-stream (net (make-instance (if write
+							   (if (eq element-type 'string-char)
+							       'tftp-character-input-stream
+							       'tftp-binary-input-stream)
+							   (if (eq element-type 'string-char)
+							       'tftp-character-output-stream
+							       'tftp-binary-output-stream))
+						       :conn udp-conn :byte-size 8
+						       :pathname pathname))
+		   (if write
+		       (stream-copy-until-eof net stream)
+		       (stream-copy-until-eof stream net)))))))
+       (error (tftp-send-error udp-conn error)))))
+
+;;; Network Definitions
+
+(defparameter *accept-tftp-broadcast-requests* nil
+  "Set to T to allow TFTP servers to respond to broadcast requests")
+
+(net:define-server :tftp (:medium :udp :connection udp-conn)
+   ;; only accept requests addressed to us.
+   (when (or *accept-tftp-broadcast-requests*
+	     (compare-internet-address (send udp-conn :local-address)
+				       (ip-interface-local-address
+					 (ip-route-interface (send udp-conn :route)))))
+     (multiple-value-bind (pkt start end)
+	 (send udp-conn :read-input-buffer t t)
+       (when pkt
+	 (let ((op (ip-load-16 pkt start)))
+	   (selector op =
+	     (tftp-rrq (tftp-server-transfer udp-conn pkt start end nil))
+	     (tftp-wrq (tftp-server-transfer udp-conn pkt start end t))
+	     (otherwise (error "Unexpected TFTP packet type ~D." op))))))))
+
+(fs:define-file-protocol :tftp (:udp)
+  (:desirability .1)
+  (:access-path-flavor tftp-file-access-path))
+
+;;;
+
+(defflavor tftp-stream
+	((truename)
+	 (fs:plist)
+	 (si:pathname))
+	(si:file-stream-mixin)
+  :abstract-flavor
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (:length tftp-stream) () nil)
+(defmethod (:qfaslp tftp-stream) () nil)
+
+;;;
+
+(defflavor tftp-probe-stream () (tftp-stream))
+
+(defmethod (:characters tftp-probe-stream) ()
+  (send self :get :characters))
+
+(compile-flavor-methods tftp-probe-stream)
+
+;;; File User
+
+(defflavor tftp-file-access-path
+	()
+	(fs:font-encapsulating-access-path-mixin fs:user-file-access-path)
+  )
+
+(defmethod (:reset tftp-file-access-path) ())
+
+(defmethod (fs:file-access-path-login tftp-file-access-path) (&rest ignore))
+
+(defmethod (fs:file-access-path-open tftp-file-access-path)
+	   (translated pathname
+		       &key
+		       direction
+		       preserve-dates
+		       estimated-length
+		       if-exists
+		       if-does-not-exist
+		       fake-characters
+		       element-type
+		       &allow-other-keys)
+  (when (eq element-type :default)
+    (setq element-type (fs:default-element-type-from-canonical-type
+			 (send pathname :canonical-type))))
+  (fs:check-stream-element-type element-type :protocol "TFTP"
+				:legal-types '(cl:character cl:string-char
+					       (cl:unsigned-byte 8.)))
+  (let* ((characters (cl:subtypep element-type 'cl:character))
+	 (byte-size (and (not characters) (fs:byte-size-from-element-type element-type))))
+    (case direction
+      ((:input :output)
+       (let ((udp-conn (net:get-connection-for-service fs:service-access-path :no-rfc t))
+	     (write (eq direction :output))
+	     (open))
+	 (unwind-protect
+	     (progn
+	       (loop with port = (send udp-conn :foreign-port)
+		     repeat *tftp-n-retransmissions*
+		     doing
+		 (multiple-value-bind (pkt start ignore)
+		     (send udp-conn :new-output-buffer)
+		   (ip-store-16 (if write tftp-wrq tftp-rrq) pkt start)
+		   (incf start 2)
+		   (setf start (tftp-store-string (send translated :string-for-host)
+						  pkt start))
+		   (setf start (tftp-store-string (if (not characters) "octet" "netascii")
+						  pkt start))
+		   (send udp-conn :send-output-buffer pkt start)
+		   (incf *tftp-retransmissions*))
+		 (send udp-conn :set-foreign-port nil)
+		 (if write
+		     (when (tftp-read-ack udp-conn 0) (return))
+		     (when (process-wait-with-timeout "TFTP Open" (* *tftp-timeout* 3 60)
+			     #'(lambda (conn) (send conn :listen))
+			     udp-conn)
+		       (return)))
+		 (send udp-conn :set-foreign-port port)
+		     finally
+		       (decf *tftp-retransmissions*)
+		       (send udp-conn :set-foreign-port port)
+		       (tftp-report-no-response udp-conn))
+	       (setf open (make-instance (if write
+					 (if characters
+					     'tftp-character-output-stream
+					     'tftp-binary-output-stream)
+					 (if characters
+					     'tftp-character-input-stream
+					     'tftp-binary-input-stream))
+				     :file-access-path self
+				     :conn udp-conn :byte-size byte-size
+				     :plist nil :pathname pathname :truename translated))
+	       (when (and fake-characters characters)
+		 (setq open (make-instance 'si:unbuffered-character-to-8bit-stream
+					   :stream open)))
+	       (values open (not characters)))
+	   (unless open (send udp-conn :close)))))
+      (:probe
+	(let ((stream (fs:file-access-path-open
+			self translated pathname :direction :input
+			:element-type element-type
+			:preserve-dates preserve-dates
+			:estimated-length estimated-length
+			:if-exists if-exists :if-does-not-exist if-does-not-exist)))
+	  (send stream :close :abort)
+	  (make-instance 'tftp-probe-stream :pathname pathname :truename translated
+			 :plist '(:characters t))))
+      (otherwise
+	(error "Unsupported :open direction ~S." direction))
+      ))) 
+
+;;;
+
+(defflavor tftp-data-stream
+	((pkt-no 1)
+	 conn)
+	(tftp-stream si:file-data-stream-mixin)
+  :abstract-flavor
+  (:initable-instance-variables conn))
+
+(defmethod (:close tftp-data-stream :after) (&optional abort-p)
+  (when conn
+    (send (prog1 conn (setf conn nil)) :close abort-p)))
+
+;;;
+
+(defflavor tftp-input-stream
+	((eof))
+	(tftp-data-stream)
+  :abstract-flavor)
+
+(defmethod (:next-input-buffer tftp-input-stream) (&optional no-hang-p)
+  (if eof
+      (values nil nil nil t)
+      (loop doing
+	(if no-hang-p
+	    (unless (send conn :listen) (return (values nil nil nil nil)))
+	    (block receive-packet
+	      (dotimes (n *tftp-n-retransmissions*)
+		(when (process-wait-with-timeout
+			    "TFTP In" (* *tftp-timeout* 60)
+			  #'(lambda (uconn) (send uconn :listen))
+			  conn)
+		  (return-from receive-packet))
+		(tftp-send-ack conn (1- pkt-no)))
+	      (tftp-report-no-response conn)))
+
+	(multiple-value-bind (pkt start end)
+	    (send conn :read-input-buffer)
+	  (selector (ip-load-16 pkt start) =
+	    (tftp-data
+	      (let ((this-pkt (ip-load-16 pkt (+ start 2))))
+		(if (= this-pkt pkt-no)
+		    (progn
+		      (tftp-send-ack conn pkt-no)
+		      (incf pkt-no)
+		      (when (< end (+ start 4 512)) (setf eof t))
+		      (return (values pkt (+ start 4) end nil)))
+		    (tftp-send-ack conn (1- pkt-no)))))
+	    (tftp-error (tftp-signal-error pkt start end))
+	    (otherwise (error "Unexpected TFTP packet type ~D received."
+			       (ip-load-16 pkt start)))))
+	(send conn :advance-input-buffer)))) 
+
+(defmethod (:discard-input-buffer tftp-input-stream) (ignore)
+  (send conn :advance-input-buffer))
+
+;;;
+
+(defflavor tftp-output-stream
+	((this-pkt (make-array 512 :element-type '(unsigned-byte 8)))
+	 (this-start 0)
+	 (this-end 512))
+	(tftp-data-stream)
+  :abstract-flavor)
+
+(defun-in-flavor (tftp-flush-buffer tftp-output-stream) ()
+  (loop repeat *tftp-n-retransmissions*
+	doing (multiple-value-bind (pkt start ignore)
+		  (send conn :get-output-buffer)
+		(ip-store-16 tftp-data pkt start)
+		(incf start 2)
+		(ip-store-16 pkt-no pkt start)
+		(incf start 2)
+		(copy-array-portion this-pkt 0 this-start pkt start (+ start this-start))
+		(send conn :advance-output-buffer (+ start this-start))
+		(send conn :force-output)
+		(incf *tftp-retransmissions*))
+	      (when (tftp-read-ack conn pkt-no)
+		(decf *tftp-retransmissions*)
+		(setf this-start 0)
+		(incf pkt-no)
+		(return))
+	finally (tftp-report-no-response conn))
+  nil)
+
+(defmethod (:new-output-buffer tftp-output-stream) ()
+  (values this-pkt this-start this-end))
+
+(defmethod (:send-output-buffer tftp-output-stream) (ignore end &optional ignore)
+  (setf this-start end)
+  (when ( end this-end) (tftp-flush-buffer)))
+
+(defmethod (:discard-output-buffer tftp-output-stream) (ignore))
+
+(defmethod (:close tftp-output-stream) (&optional abortp)
+  (unless abortp
+    (when conn
+      (tftp-flush-buffer))))
+
+;;;
+
+(defflavor tftp-binary-input-stream ()
+	   (ftp-image-input-mixin
+	    tftp-input-stream
+	    si:buffered-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor tftp-binary-output-stream ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-image-output-mixin
+	    tftp-output-stream
+	    si:buffered-output-stream))
+
+(defflavor tftp-character-input-stream ()
+	   (si:unrewindable-buffered-input-stream-mixin
+	    ftp-character-input-mixin
+	    tftp-input-stream
+	    si:buffered-input-stream
+	    si:input-pointer-remembering-mixin
+	    ))
+
+(defflavor tftp-character-output-stream ()
+	   (si:output-pointer-remembering-mixin
+	    ftp-character-output-mixin
+	    tftp-output-stream
+	    si:buffered-output-stream))
+
+(compile-flavor-methods tftp-binary-input-stream tftp-binary-output-stream
+			tftp-character-input-stream tftp-character-output-stream
+			tftp-file-access-path)

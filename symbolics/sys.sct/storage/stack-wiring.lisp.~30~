@@ -1,0 +1,767 @@
+;;; -*- Mode:Lisp; Syntax:Common-Lisp; Package:STORAGE; Lowercase:T; Base:8; -*- 
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Ivory stack-group wiring policies
+
+;;; The stack wiring substrate keeps all stack pages wired during
+;;; execution.  When overflowing pages already wired, the overflow trap handler
+;;; is responsible for calling this substrate.  On underflow, the trap-on-exit
+;;; feature is used.
+
+;;; Because trap-on-exit is used, some conventions must be obeyed by all software.
+;;; These are:
+;;;   1.  Saved Control Registers must be updated either by %P-DPB or in extra
+;;;       stack mode, in order to interlock properly with stack wiring.
+;;;   2.  Anything which changes an FP or sets/resets TRAP-ON-EXIT in a saved control
+;;;       register must go through the interfaces provided in this file.  When
+;;;       changing an FP on another stack which cannot execute, it is sufficient 
+;;;       to unwire that stack first.
+;;;   3.  When reverting from extra-stack mode to emulator mode, the macro
+;;;       SI:REVERT-TO-EMULATOR-MODE must be used.
+;;;   4.  Contrary to the architecture spec, all saved control registers
+;;;       and saved continuation registers must contain cdr-code=3.  It is
+;;;       illegal to have two words on the stack which look like a frame
+;;;       but are not.  (That means don't %BLOCK-COPY out of a control
+;;;       stack.)
+
+;; A stack group which has some wired control-stack pages is called "active".
+;; A doubly linked list of active stack groups is kept to implement an LRU algorithm
+;; for stack unwiring.  The least recently referenced active stack group is at 
+;; *active-stack-groups-tail*.
+
+;; To Do:
+;;   Meter all this.  There is definitely some room for improvement of the policy
+;;   algorithm.  There's also room for improvement in the implementation.  For
+;;   example, we can predict at the time of trap-on-exit from lowest wired frame
+;;   how many frames we're going to return through.  So rather than taking a trap
+;;   every page and resetting up the stack group, we should move down a large number
+;;   of pages.
+
+;; Variable definitions are in STORAGE.
+
+;;; Debuging Aids
+
+(defvar-safeguarded *debug-stack-wiring* nil)
+
+(defmacro stack-wiring-assert (fast-or-slow (format-string &rest format-args) &body assertions)
+  (setq format-string (string-append "Stack Wiring Error: " format-string))
+  (if (eq fast-or-slow :fast)
+      `(compiler:%error-unless (and . ,assertions)
+	 (wired-ferror :proceedable-halt ,format-string . ,format-args))
+      `(compiler:%error-when *debug-stack-wiring*
+	 (unless (and . ,assertions)
+	   (wired-ferror :proceedable-halt ,format-string . ,format-args)))))
+
+(defvar-safeguarded *stack-wiring-trace* (make-array 2000. :area si:safeguarded-objects-area))
+
+(defvar-safeguarded *stack-wiring-trace-pointer* 0)
+
+(defun stack-wiring-trace (event)
+  (declare (safeguarded-function))
+  (let ((pointer *stack-wiring-trace-pointer*))
+    (setf (aref *stack-wiring-trace* pointer) event)
+    (if ( (incf pointer) 2000.)
+	(setq pointer 0))
+    (setq *stack-wiring-trace-pointer* pointer)))
+
+(defmacro when-stack-wiring-trace ((sg) &body body)
+  (declare (ignore sg))	;Used to be able to filter by SG.
+  `(compiler:%error-when *debug-stack-wiring*
+     . ,body))
+
+#+ignore
+(defun verify-sg-counts ()
+  (declare (safeguarded-function))
+  (compiler:%error-when *debug-stack-wiring*
+    (let ((real-count (loop for sg = *active-stack-groups-head* then (sg-thread-next sg)
+			    while sg
+			    sum (%fixnum-floor (%pointer-difference
+						 (sg-wired-control-stack-limit sg)
+						 (sg-wired-control-stack-low sg))
+					       page-size))))
+      (unless (= *wired-control-stack-pages* real-count)
+	(wired-ferror :proceedable-halt "Wired stack page count mismatch")
+	(setq *wired-control-stack-pages* real-count)))))
+
+;; Ensure that exactly the portions of the stack group are wired that are claimed to be.
+(defun verify-stack-wiring (sg)
+  (declare (safeguarded-function))
+  (let ((low (sg-control-stack-low sg))
+	(wired-low (sg-wired-control-stack-low sg))
+	(wired-limit (sg-wired-control-stack-limit sg))
+	(limit (%pointer-plus (sg-control-stack-limit sg)
+			      (+ control-stack-max-frame-size
+				 control-stack-overflow-margin))))
+    (loop for page = low then (%pointer-plus page page-size)
+	  while (%pointer-lessp page limit)
+	  as wired-p = (words-wired-p page page-size)
+	  as should-be-wired-p = (and wired-low
+				      (not (%pointer-lessp page wired-low))
+				      (%pointer-lessp page wired-limit))
+	  always (eq wired-p should-be-wired-p))))
+
+(defun verify-stack-runnable (sg &optional (fp (%pointer (sg-emulator-frame-pointer sg))))
+  (declare (safeguarded-function))
+  (let* ((max-wired-low (logand fp (- page-size)))
+	 (min-wired-limit (logand (%pointer-plus fp (+ control-stack-max-frame-size
+						       control-stack-overflow-margin
+						       page-size -1))
+				  (- page-size))))
+    (and (not (%pointer-lessp max-wired-low (sg-wired-control-stack-low sg)))
+	 (not (%pointer-lessp (sg-wired-control-stack-limit sg) min-wired-limit))
+	 (verify-stack-wiring sg))))
+
+(defun stack-group-actually-active-p (stack-group)
+  (declare (safeguarded-function))
+  (loop for sg = *active-stack-groups-head* then (sg-thread-next sg)
+	while sg
+	thereis (eq stack-group sg)))
+
+(defun verify-wiring-for-stack-group-switch (frame)
+  (let ((current-stack-group %current-stack-group))
+    (when current-stack-group
+      (when (%pointer-lessp frame (sg-wired-control-stack-low current-stack-group))
+	(wired-ferror :proceedable-halt "Returned through trap-on-exit"))
+      (compiler:%error-when *debug-stack-wiring*
+	(let ((wired-low (sg-wired-control-stack-low current-stack-group))
+	      (low (sg-control-stack-low current-stack-group)))
+	  (unless (eq wired-low low)
+	    (let ((frame (%pointer-plus wired-low (sg-wired-frame-offset current-stack-group))))
+	      (unless (dbg:probably-valid-frame-p frame)
+		(wired-ferror :proceedable-halt "Invalid saved wired frame"))
+	      (when (variable-boundp #'dbg:search-for-next-open-frame)
+		(let ((next (dbg:search-for-next-open-frame frame current-stack-group)))
+		  (when (zerop (if next
+				   (%p-ldb-offset %%cr.trap-on-exit-bit next 1)
+				   (ldb %%cr.trap-on-exit-bit
+					(%read-internal-register %register-control-register))))
+		    (wired-ferror :proceedable-halt "Trap-on-exit vanished!")))))))))))
+
+
+;; Stack group thread management.
+
+;; This pushes an active stack group to the head of the replacement LRU.
+(defun push-active-stack-group (sg)
+  (declare (safeguarded-function))
+  (stack-wiring-assert :slow ("Stack group not active before push")
+    (stack-group-actually-active-p sg))
+  (let ((prev (or (sg-thread-prev sg)
+		  (return-from push-active-stack-group nil)))	;Already at head!
+	(next (sg-thread-next sg)))
+    (setf (sg-thread-next prev) next)
+    (if next
+	(setf (sg-thread-prev next) prev)
+	(setf *active-stack-groups-tail* prev))
+    (let ((head *active-stack-groups-head*))
+      (setf (sg-thread-prev sg) nil)
+      (setf (sg-thread-next sg) head)
+      (setf (sg-thread-prev head) sg)		;Can't be NIL if sg is active
+      (setf *active-stack-groups-head* sg)))
+  (stack-wiring-assert :slow ("Stack group not active after push")
+    (stack-group-actually-active-p sg)))
+
+;; This takes an inactive stack and inserts it at the head of the replacement LRU
+(defun push-inactive-stack-group (sg)
+  (declare (safeguarded-function))
+  (stack-wiring-assert :slow ("Stack group is active before push")
+    (not (stack-group-actually-active-p sg)))
+  (incf *count-active-stack-groups*)
+  (let ((head *active-stack-groups-head*))
+    (setf (sg-thread-prev sg) nil)
+    (setf (sg-thread-next sg) head)
+    (if head					;This can be NIL the first time.
+	(setf (sg-thread-prev head) sg)
+	(setf *active-stack-groups-tail* sg))
+    (setf *active-stack-groups-head* sg))
+  (stack-wiring-assert :slow ("Stack group not active after push")
+    (stack-group-actually-active-p sg)))
+
+;; This takes an active stack and deletes it from the replacement LRU
+(defun pop-active-stack-group (sg)
+  (declare (safeguarded-function))
+  (stack-wiring-assert :slow ("Stack group not active before pop")
+    (stack-group-actually-active-p sg))
+  (decf *count-active-stack-groups*)
+  (let ((next (sg-thread-next sg))
+	(prev (sg-thread-prev sg)))
+    (if prev
+	(setf (sg-thread-next prev) next)
+	(setf *active-stack-groups-head* next))
+    (if next
+	(setf (sg-thread-prev next) prev)
+	(setf *active-stack-groups-tail* prev)))
+  (setf (sg-thread-next sg) nil)
+  (setf (sg-thread-prev sg) nil)
+  (stack-wiring-assert :slow ("Stack group is active after pop")
+    (not (stack-group-actually-active-p sg))))
+
+;; Stack Wiring/Unwiring substrate
+
+(defconstant %recompute-wired-low 1)
+(defconstant %recompute-wired-limit 2)
+(defconstant %recompute-all 3)
+
+(defmacro scan-stack ((fp-var cr-loc-var &rest more-vars) stack-group &body body)
+  `(multiple-value-bind (,fp-var ,cr-loc-var)
+       (if (eq %current-stack-group ,stack-group)
+	   (values (%pointer-plus (%stack-frame-pointer)
+		     (- (ldb %%cr.caller-frame-size
+			     (%read-internal-register %register-control-register))))
+		   (locf (%saved-control-register)))
+	   (values (sg-frame-pointer ,stack-group)
+		   (locf (sg-control-register ,stack-group))))
+     (loop named scan-stack
+	   with ,more-vars
+	   do (stack-wiring-assert :fast ("Invalid frame found in scan-stack")
+		(dbg:probably-valid-frame-p ,fp-var))
+	      (progn . ,body)
+	      (psetq ,fp-var (%pointer-plus ,fp-var
+			       (- (%p-ldb %%cr.caller-frame-size ,cr-loc-var)))
+		     ,cr-loc-var (locf (frame-caller-control-register ,fp-var))
+		     . ,(loop for v1 in more-vars
+			      for v2 in `(,fp-var ,cr-loc-var . ,more-vars)
+			      append `(,v1 ,v2))))))
+
+;; The trap-on-exit bit for any active frame must be set in all copies of its control
+;; register.  For normal returns, we only have to set the next open frame, but for
+;; efficiency in throw, we having to set the next active frame as well.  Since intervening
+;; frames can later become active, that means we have to set them, too.
+;; NEXT-ACTIVE-FRAME can only be NIL for other stack groups.
+(defun set-trap-on-exit-internal (frame next-active-frame stack-group value)
+  (declare (safeguarded-function))
+  (multiple-value-bind (control-register-loc search-limit)
+      (if next-active-frame
+	  (values (locf (frame-caller-control-register next-active-frame))
+		  next-active-frame)
+	  (values (locf (sg-control-register stack-group))
+		  (sg-stack-pointer stack-group)))
+    (let ((control-register (%memory-read control-register-loc)))
+      ;; This gratuitously sets the cdr-code when writing into stack groups, but
+      ;; that's harmless.
+      (%memory-write control-register-loc
+	(%set-tag (dpb value %%cr.trap-on-exit-bit control-register)
+		  (dpb 3 %%q-cdr-code-within-tag dtp-fixnum)))
+      (compiler:%error-when (ldb-test %%cr.call-started control-register)
+	;; Search for frames using an finite-state machine for efficiency.
+	;; Can't use %BLOCK-READ out of the stack for early Ivories.
+	;; Could use %BLOCK-READ-TEST, I suppose, but we can only test for CDR-ODD or
+	;; one data type.
+	(prog ((ptr (%pointer-plus frame 2)))
+	   a  (unless (%pointer-lessp ptr search-limit) (go r))
+	      (when ( (%p-ldb (byte 7. 33.)
+			       (prog1 ptr (setq ptr (%pointer-plus ptr 1))))
+		       (ldb (byte 7 1) (dpb 3 %%q-cdr-code-within-tag dtp-even-pc)))
+		(go a))
+	   b  (unless (%pointer-lessp ptr search-limit) (go r))
+	      (let ((cr (%memory-read ptr :cycle-type %memory-scavenge :set-cdr-next nil)))
+		(if (= (%tag cr) (dpb 3 %%q-cdr-code-within-tag dtp-fixnum))
+		    (progn (%memory-write ptr
+			     (%set-tag (dpb value %%cr.trap-on-exit-bit cr)
+				       (dpb 3 %%q-cdr-code-within-tag dtp-fixnum)))
+			   (setq ptr (%pointer-plus ptr 1))
+			   (go a))
+		  (setq ptr (%pointer-plus ptr 1))
+		  (if (= (ldb (byte 7 1) (%tag cr))
+			 (ldb (byte 7 1) (dpb 3 %%q-cdr-code-within-tag dtp-even-pc)))
+		      (go b)
+		      (go a))))
+	   r  (return nil)))
+      nil)))
+
+;; Prepare control-stack pages in SG for execution.
+;; This takes care of wiring, scavenging, and setting SG and trap state.
+;; VMA is a locative.
+(defun prepare-stack-pages (sg vma n-words recompute)
+  (declare (safeguarded-function))
+  (when-stack-wiring-trace (sg)
+    (stack-wiring-trace sg)
+    (stack-wiring-trace 0)			;Prepare
+    (stack-wiring-trace vma)
+    (stack-wiring-trace n-words)
+    (stack-wiring-trace recompute))
+  (stack-wiring-assert :fast ("Unaligned arguments to prepare-stack-pages")
+    (zerop (ldb %%word-within-page n-words))
+    (zerop (ldb %%word-within-page (%pointer vma))))
+  (stack-wiring-assert :fast ("Invalid trap-mode in prepare-stack-pages")
+    (= (%trap-mode) trap-mode-extra-stack))
+  (let* ((vpn (extract-vpn (%pointer vma)))
+	 (n-pages (%fixnum-floor n-words page-size))
+	 (sp (if (eq %current-stack-group sg)
+		 (%stack-frame-pointer)
+		 (sg-stack-pointer sg)))
+	 (words-to-fetch (1+ (%pointer-difference sp vma)))
+	 (pages-to-fetch (if (plusp words-to-fetch)
+			     (min (%fixnum-ceiling words-to-fetch page-size) n-pages)
+			     0))
+	 (pages-to-create (- n-pages pages-to-fetch)))
+    (when (and (eq sp vma)				;Fast check
+	       (eq sp (sg-control-stack-low sp)))	;Real check
+      ;; If SP points to the base of the stack, then the stack is really
+      ;; empty, and we can create all pages.
+      (incf pages-to-create)
+      (decf pages-to-fetch))
+    (%funcall-in-aux-stack #'wire-stack-pages vpn pages-to-fetch pages-to-create)
+    (incf *wired-control-stack-pages* n-pages)
+    ;; Fetched pages need to be scavenged, except on VLM:  it scavenges
+    ;; entire stack on first switch after flip, c.f., note-stack-group-switch
+    #-VLM
+    (when (and (plusp pages-to-fetch)
+	       (not si:%gc-flip-ready))
+      (%block-transport vma words-to-fetch t)))
+  (when (logtest recompute %recompute-wired-low)
+    ;; Case 1:  Wiring pages off the bottom of a stack due to a return.
+    ;; Case 2:  Wiring an unwired stack.
+    (let* ((wired-low (sg-wired-control-stack-low sg))
+	   (desc (sg-wired-frame-descriptor sg))
+	   (low (sg-control-stack-low sg))
+	   (wired-low-fp (and wired-low
+			      (%pointer-plus wired-low
+					     (ldb sg-wired-frame-offset desc)))))
+      ;; Don't have to do any scan if we're initially wiring the stack, and
+      ;; we're wiring it starting at the beginning.
+      (unless (and (null wired-low) (eq low vma))
+	;; Scan down the entire stack looking for the new and old wired frames.
+	;; This shouldn't take long, and the relevant pages should all be resident.
+	(scan-stack (fp cr-loc next-fp next-cr-loc next-next-fp) sg
+	  (cond ((eq fp wired-low-fp)
+		 (if (zerop (ldb sg-trap-on-exit-overload desc))
+		     (set-trap-on-exit-internal fp next-fp sg 0)
+		     (setf (ldb sg-trap-on-exit-overload desc) 0))
+		 (when (eq low vma)
+		   ;; Don't need to continue the scan, since we don't have to set
+		   ;; trap-on-exit from the bottom frame.
+		   (setf (sg-wired-frame-descriptor sg) 0)
+		   (return-from scan-stack nil))
+		 (setq wired-low-fp nil))
+		((%pointer-lessp fp vma)
+		 (stack-wiring-assert :fast ("Failed to find low wired frame")
+		   (null wired-low-fp))
+		 (stack-wiring-assert :fast ("Low wired frame is at top of stack")
+		   (not (null next-fp)))
+		 (if (not (zerop (%p-ldb %%cr.trap-on-exit-bit next-cr-loc)))
+		     (setf (ldb sg-trap-on-exit-overload desc) 1)
+		     (set-trap-on-exit-internal next-fp next-next-fp sg 1))
+		 (setf (sg-wired-frame-descriptor sg)
+		       (dpb (%pointer-difference next-fp vma)
+			    sg-wired-frame-offset desc))
+		 (return-from scan-stack nil)))))
+      (setf (sg-wired-control-stack-low sg) vma)))
+  (when (logtest recompute %recompute-wired-limit)
+    (let ((new-wired-limit (%pointer-plus vma n-words)))
+      (setf (sg-wired-control-stack-limit sg) new-wired-limit)
+      (when (eq %current-stack-group sg)
+	(setf (%read-internal-register %register-control-stack-extra-limit) new-wired-limit)
+	(setf (%read-internal-register %register-control-stack-limit)
+	      (%pointer-plus new-wired-limit (- (+ control-stack-max-frame-size
+						   control-stack-overflow-margin)))))))
+  (when-stack-wiring-trace (sg)
+    (stack-wiring-trace (sg-wired-frame-descriptor sg)))
+  nil)
+
+;; Unwire control-stack pages in SG, and set SG and trap state accordingly.
+;; VMA is a locative
+(defun dispose-stack-pages (sg vma n-words recompute)
+  (declare (safeguarded-function))
+  (when-stack-wiring-trace (sg)
+    (stack-wiring-trace sg)
+    (stack-wiring-trace 1)			;Dispose
+    (stack-wiring-trace vma)
+    (stack-wiring-trace n-words)
+    (stack-wiring-trace recompute))
+  (stack-wiring-assert :fast ("Unaligned arguments to dispose-stack-pages")
+    (zerop (ldb %%word-within-page n-words))
+    (zerop (ldb %%word-within-page (%pointer vma))))
+  (stack-wiring-assert :fast ("Invalid trap-mode in dispose-stack-pages")
+    (= (%trap-mode) trap-mode-extra-stack))
+  (let* ((vpn (extract-vpn (%pointer vma)))
+	 (n-pages (%fixnum-floor n-words page-size))
+	 (sp (if (eq %current-stack-group sg)
+		 (%stack-frame-pointer)
+		 (sg-stack-pointer sg)))
+	 (words-to-unwire (1+ (%pointer-difference sp vma)))
+	 (pages-to-unwire (if (plusp words-to-unwire)
+			      (min (%fixnum-ceiling words-to-unwire page-size) n-pages)
+			      0))
+	 (pages-to-evict (- n-pages pages-to-unwire)))
+    (when (and (eq sp vma)				;Fast check
+	       (eq sp (sg-control-stack-low sp)))	;Real check
+      ;; If SP points to the base of the stack, then the stack is really
+      ;; empty, and we can evict all pages.
+      (incf pages-to-evict)
+      (decf pages-to-unwire))
+    (%funcall-in-aux-stack #'unwire-stack-pages vpn pages-to-unwire pages-to-evict)
+    (decf *wired-control-stack-pages* n-pages))
+  (when (logtest recompute %recompute-wired-low)
+    (let* ((wired-low (sg-wired-control-stack-low sg))
+	   (low (sg-control-stack-low sg))
+	   (desc (sg-wired-frame-descriptor sg))
+	   (new-descriptor 0)
+	   (wired-low-fp (%pointer-plus wired-low (ldb sg-wired-frame-offset desc)))
+	   (new-wired-low (and (not (logtest recompute %recompute-wired-limit))
+			       (%pointer-plus wired-low n-words)))
+	   (scan-for-new new-wired-low))
+      ;; Don't scan the stack when we're unwiring the whole stack and wired-low=low.
+      (unless (and (eq wired-low low)
+		   (logtest recompute %recompute-wired-limit))
+	(scan-stack (fp cr-loc next-fp next-cr-loc next-next-fp) sg
+	  (cond ((and scan-for-new (%pointer-lessp fp new-wired-low))
+		 ;; Set the trap-on-exit in the new wired-low frame.
+		 (stack-wiring-assert :fast ("Low wired frame is at top of stack")
+		   (not (null next-fp)))
+		 (if (not (zerop (%p-ldb %%cr.trap-on-exit-bit next-cr-loc)))
+		     (setf (ldb sg-trap-on-exit-overload new-descriptor) 1)
+		     (set-trap-on-exit-internal next-fp next-next-fp sg 1))
+		 (setf (ldb sg-wired-frame-offset new-descriptor)
+		       (%pointer-difference next-fp new-wired-low))
+		 (setq scan-for-new nil)
+		 (when (eq wired-low low)
+		   (return-from scan-stack nil)))
+		((not (%pointer-lessp wired-low-fp fp))
+		 ;; Clear the trap-on-exit in the old wired-low frame.
+		 (stack-wiring-assert :fast ("SCAN-STACK didn't find the saved FP")
+		   (zerop (%pointer-difference wired-low-fp fp)))
+		 (stack-wiring-assert :fast ("Trap on exit not set where expected")
+		   (not (zerop (%p-ldb %%cr.trap-on-exit-bit cr-loc))))
+		 (when (zerop (ldb sg-trap-on-exit-overload desc))
+		   (set-trap-on-exit-internal fp next-fp sg 0))
+		 (return-from scan-stack nil)))))
+      (setf (sg-wired-control-stack-low sg) new-wired-low
+	    (sg-wired-frame-descriptor sg) new-descriptor)))
+  (when (logtest recompute %recompute-wired-limit)
+    (if (logtest recompute %recompute-wired-low)
+	(setf (sg-wired-control-stack-limit sg) nil)	;Unwiring whole stack
+      (setf (sg-wired-control-stack-limit sg) vma)
+      (when (eq %current-stack-group sg)
+	(setf (%read-internal-register %register-control-stack-extra-limit) vma)
+	(setf (%read-internal-register %register-control-stack-limit)
+	      (%pointer-plus vma (- (+ control-stack-max-frame-size
+				       control-stack-overflow-margin)))))))
+  (when-stack-wiring-trace (sg)
+    (stack-wiring-trace (sg-wired-frame-descriptor sg))))
+
+;; Unwire stack pages from the LRU.  This does not enforce *maximum-wired-pages-per-stack*.
+(defun ensure-stack-pages-available (n-pages)
+  (declare (safeguarded-function))
+  (loop with max = *maximum-wired-control-stack-pages* with words
+	while (> (+ *wired-control-stack-pages* n-pages) max)
+	do
+    (let* ((other-sg *active-stack-groups-tail*)
+	   (other-wired-low (sg-wired-control-stack-low other-sg))
+	   (other-wired-limit (sg-wired-control-stack-limit other-sg))
+	   (other-fp (sg-emulator-frame-pointer other-sg))
+	   (min-limit (%pointer-plus other-fp (+ control-stack-max-frame-size
+						 control-stack-overflow-margin))))
+      (cond ((> (setq words (%pointer-difference other-wired-limit min-limit))
+		(1- page-size))
+	     ;; There are pages to steal off the top of this stack.  Take em.
+	     (let* ((n-pages (min (%fixnum-floor words page-size) n-pages))
+		    (n-words (%fixnum-multiply n-pages page-size))
+		    (new-limit (%pointer-plus other-wired-limit (- n-words))))
+	       (dispose-stack-pages other-sg new-limit n-words %recompute-wired-limit)))
+	    ((> (setq words (%pointer-difference other-fp other-wired-low))
+		(1- page-size))
+	     ;; There are pages to steal off the bottom of this stack.  Take em.
+	     (let* ((n-pages (min (%fixnum-floor words page-size) n-pages))
+		    (n-words (%fixnum-multiply n-pages page-size)))
+	       (dispose-stack-pages other-sg other-wired-low n-words %recompute-wired-low)))
+	    (t ;; We can't keep this stack group active.  Take all its pages.
+	     (pop-active-stack-group other-sg)
+	     (let* ((n-words (%pointer-difference other-wired-limit other-wired-low)))
+	       (dispose-stack-pages other-sg other-wired-low n-words %recompute-all)))))))
+
+;; We must base the calculation of which pages must be wired for a stack to execute
+;; on the first frame down from the top of the stack which is in emulator mode.
+;; (Some of the callers of %STACK-GROUP-SWITCH are in extra stack mode already,
+;; so their FP may be above SG-WIRED-CONTROL-STACK-LIMIT.)
+(defun sg-emulator-frame-pointer (sg)
+  (declare (safeguarded-function))
+  ;; This loop always terminates since the fake bottom frame has trap-mode emulator.
+  (loop with frame = (sg-frame-pointer sg)
+	with cr-loc = (locf (sg-control-register sg))
+	when (= (%p-ldb %%cr.trap-mode cr-loc) trap-mode-emulator)
+	  return frame
+	do (psetq frame (%pointer-plus frame
+			  (- (%p-ldb %%cr.caller-frame-size cr-loc)))
+		  cr-loc (locf (frame-caller-control-register frame)))))
+
+;; External interfaces to stack wiring
+
+;; This is called by %STACK-GROUP-SWITCH before switching from %CURRENT-STACK-GROUP to
+;; the specified stack group.
+(defun note-stack-group-switch (stack-group)
+  ;; This safeguarding is not necessary; it's just for locality with the other functions.
+  (declare (safeguarded-function))
+  (ms-time *ms-time-stack-wiring-manager*
+    (stack-wiring-assert :fast ("Invalid trap-mode in note-stack-group-switch")
+      (= (%trap-mode) trap-mode-extra-stack))
+    (let ((wired-low (sg-wired-control-stack-low stack-group)))
+      ;; The VLM has a huge stack-cache (which will not fault on any
+      ;; oldspace references already in it unless you re-flush it to
+      ;; memory) hence must all get scavenged before we run.  ---+++---
+      ;; Later, we could be more optimal by only transporting the cache,
+      ;; for now, be conservative and transport entire stack (which is
+      ;; likely smaller than the cache anyways!)
+      #+VLM
+      (when (and (not si:%gc-flip-ready)
+		 (neq (sg-wired-stack-gc-generation stack-group)
+		      si:%gc-generation-number))
+	(let* ((base (%pointer (sg-control-stack-low stack-group)))
+	       (pointer (sg-stack-pointer stack-group))
+	       (length (1+ (%pointer-difference pointer base))))
+	  ;; Transport all of stack that is in use
+	  (incf* si:*scav-work-done* length)
+	  (%block-transport base length t)
+	  ;; Now clear enables on unused but created stack (lest we trip
+	  ;; over them growing into those pages later)
+	  (loop for vpn from (1+ (extract-vpn (si:chunk-base-address (%pointer pointer))))
+			below (extract-vpn
+				(si:round-to-chunk
+				  (%pointer (sg-control-stack-limit stack-group))))
+		as pht-index = (pht-lookup vpn)
+		while pht-index do
+	    (vm-write-attribute transport-fault pht-index nil)))
+	(setf (sg-wired-stack-gc-generation stack-group) si:%gc-generation-number))
+      (cond (wired-low
+	     ;; Note this stack-group switch in the active-stack LRU.
+	     (push-active-stack-group stack-group)
+	     ;; If the stack group is active, then it has sufficient pages wired.
+	     ;; However, we may need to scavenge the wired pages.
+	     #-VLM
+	     (when (and (not si:%gc-flip-ready)
+			(neq (sg-wired-stack-gc-generation stack-group)
+			     si:%gc-generation-number))
+	       (%block-transport
+		 wired-low
+		 (1+ (%pointer-difference (sg-stack-pointer stack-group) wired-low))
+		 t)
+	       (setf (sg-wired-stack-gc-generation stack-group) si:%gc-generation-number)))
+	    (t ;; Enter this stack into the LRU.
+	     (push-inactive-stack-group stack-group)
+	     ;; Grab just enough pages to wire the current frame and have enough extra stack.
+	     (let* ((fp (%pointer (sg-emulator-frame-pointer stack-group)))
+		    ;; wired-low is the frame pointer rounded down to the nearest page.
+		    (wired-low (logand fp (- page-size)))
+		    ;; wired-limit is frame-pointer + max-frame-size + overflow-margin
+		    ;; rounded up to the nearest page.
+		    (wired-limit (logand (%pointer-plus fp (+ control-stack-max-frame-size
+							      control-stack-overflow-margin
+							      page-size -1))
+					 (- page-size)))
+		    (n-pages (%fixnum-floor (%pointer-difference wired-limit wired-low)
+					    page-size)))
+	       (ensure-stack-pages-available n-pages)
+	       (prepare-stack-pages stack-group
+				    (%set-tag wired-low dtp-locative)
+				    (%pointer-difference wired-limit wired-low)
+				    %recompute-all))))
+      (stack-wiring-assert :slow ("Stack group not runnable")
+	(verify-stack-runnable stack-group)))))
+
+(defun sg-return-from-low-wired-frame (sg wired-low)
+  (declare (safeguarded-function))
+  (ms-time *ms-time-stack-wiring-manager*
+    (stack-wiring-assert :fast ("Invalid trap-mode in sg-return-from-low-wired-frame")
+      (= (%trap-mode) trap-mode-extra-stack))
+    (let ((wired-limit (sg-wired-control-stack-limit sg)))
+      ;; Ensure there's a page to wire according to our policy.
+      (cond (( (%fixnum-floor (%pointer-difference wired-limit wired-low) page-size)
+		*maximum-wired-pages-per-stack*)
+	     ;; We already have the maximum number of pages we're allowed.  Steal a wired page
+	     ;; from the top of our own stack.
+	     (dispose-stack-pages sg (%pointer-plus wired-limit (- page-size)) page-size
+				  %recompute-wired-limit))
+	    (t (ensure-stack-pages-available 1)))
+      (prepare-stack-pages sg (%pointer-plus wired-low (- page-size)) page-size
+			   %recompute-wired-low)
+      (stack-wiring-assert :slow ("Stack words not wired in low-frame return")
+	(words-wired-p (sg-wired-control-stack-low sg)
+		       (%pointer-difference (sg-wired-control-stack-limit sg)
+					    (sg-wired-control-stack-low sg)))))))
+
+(defun sg-wired-overflow (sg wired-limit)
+  ;; Safeguarded to avoid transport traps, etc.  We're called in extra-stack mode.
+  (declare (safeguarded-function))
+  (ms-time *ms-time-stack-wiring-manager*
+    (stack-wiring-assert :fast ("Invalid trap-mode in sg-wired-overflow")
+      (= (%trap-mode) trap-mode-extra-stack))
+    (let ((wired-low (sg-wired-control-stack-low sg)))
+      ;; Ensure there's a page to wire according to our policy.
+      (cond (( (%fixnum-floor (%pointer-difference wired-limit wired-low) page-size)
+		*maximum-wired-pages-per-stack*)
+	     ;; We already have the maximum number of pages we're allowed.  Steal a wired page
+	     ;; from the bottom of our own stack.
+	     (dispose-stack-pages sg wired-low page-size %recompute-wired-low))
+	    (t (ensure-stack-pages-available 1)))
+      (prepare-stack-pages sg wired-limit page-size %recompute-wired-limit)
+      (stack-wiring-assert :slow ("Stack words not wired in wired overflow")
+	(words-wired-p (sg-wired-control-stack-low sg)
+		       (%pointer-difference (sg-wired-control-stack-limit sg)
+					    (sg-wired-control-stack-low sg)))))))
+
+;; This is a hook for programs (such as the scheduler or stack-group resources) to
+;; explicitly unwire all control-stack pages associated with a stack.
+(defun unwire-control-stack-pages (sg &optional warm-boot-p)
+  (declare (safeguarded-function))
+  (%set-min-trap-mode trap-mode-extra-stack)
+  (ms-time *ms-time-stack-wiring-manager*
+    (let ((wired-low (sg-wired-control-stack-low sg)))
+      (when wired-low
+	(let ((n-words (%pointer-difference (sg-wired-control-stack-limit sg) wired-low)))
+	  (pop-active-stack-group sg)
+	  (if (not warm-boot-p)
+	      (dispose-stack-pages sg wired-low n-words %recompute-all)
+	    ;; Forcibly unwire a stack which we warm-booted out of.
+	    (unwire-stack-pages (extract-vpn (%pointer wired-low))
+				(%fixnum-floor n-words page-size) 0)
+	    (decf *wired-control-stack-pages* (%fixnum-floor n-words page-size))
+	    (setf (sg-wired-control-stack-low sg) nil
+		  (sg-wired-control-stack-limit sg) nil
+		  (sg-wired-frame-descriptor sg) 0)))))))
+
+;; Called by disk-save
+;; This doesn't unwire our own pages, which are handled specially.
+(defun unwire-all-stack-pages ()
+  (%set-min-trap-mode trap-mode-extra-stack)
+  (loop with csg = %current-stack-group	;Must equal *active-stack-groups-head*
+	as sg = *active-stack-groups-tail*
+	until (eq sg csg)
+	do (unwire-control-stack-pages sg)))
+
+;; Must be called on the aux stack.
+;; Value is either 0 (off) or 1 (on).
+(defun set-trap-on-exit-flag (frame next-active-frame stack-group value)
+  (declare (safeguarded-function))
+  (ms-time *ms-time-stack-wiring-manager*
+    (when-stack-wiring-trace (stack-group)
+      (stack-wiring-trace stack-group)
+      (stack-wiring-trace (if (zerop value) 3 2))	;Clear/Set trap-on-exit flag
+      (stack-wiring-trace frame)
+      (stack-wiring-trace next-active-frame))
+    (stack-wiring-assert :fast ("Invalid trap-mode in set-trap-on-exit-flag")
+      (= (%trap-mode) trap-mode-extra-stack))
+    (let* ((wired-low (sg-wired-control-stack-low stack-group))
+	   (desc (sg-wired-frame-descriptor stack-group)))
+      (if (and wired-low
+	       (eq (%pointer-plus wired-low (ldb sg-wired-frame-offset desc))
+		   frame)
+	       (neq (sg-control-stack-low stack-group)
+		    frame))
+	  ;; Trap-on-exit bit already set for stack-wiring.  Just overload it.
+	  (setf (sg-wired-frame-descriptor stack-group)
+		(dpb value sg-trap-on-exit-overload desc))
+	  ;; Just use trap-on-exit bit.
+	  (set-trap-on-exit-internal frame next-active-frame stack-group value)))
+    (when-stack-wiring-trace (stack-group)
+      (stack-wiring-trace (sg-wired-frame-descriptor stack-group)))))
+
+;; Should be called on the aux stack to avoid races.  Value is T or NIL.
+;; NEXT-ACTIVE-FRAME can be NIL if FRAME is the top active frame.
+(defun trap-on-exit-flag (frame next-active-frame stack-group)
+  (declare (safeguarded-function))
+  (and (not (zerop (ldb %%cr.trap-on-exit-bit
+			(cond (next-active-frame
+			       (frame-caller-control-register next-active-frame))
+			      ((eq %current-stack-group stack-group)
+			       (%saved-control-register))
+			      (t (sg-control-register stack-group))))))
+       (let ((wired-low (sg-wired-control-stack-low stack-group)))
+	 (or (null wired-low)
+	     (neq (%pointer-plus wired-low (sg-wired-frame-offset stack-group)) frame)
+	     (not (zerop (sg-trap-on-exit-overload stack-group)))))))
+
+;; Must be called on the aux stack.
+;; Call this before changing the frame pointer.  See POP-GREAT-GRANDFATHERS-STACK.
+(defun note-frame-pointer-change (sg from to)
+  (declare (safeguarded-function))
+  (ms-time *ms-time-stack-wiring-manager*
+    (stack-wiring-assert :fast ("Invalid trap-mode in note-frame-pointer-change")
+      (= (%trap-mode) trap-mode-extra-stack))
+    (when-stack-wiring-trace (sg)
+      (stack-wiring-trace sg)
+      (stack-wiring-trace 4)			;FP change
+      (stack-wiring-trace from)
+      (stack-wiring-trace to))
+    (let* ((wired-low (sg-wired-control-stack-low sg))
+	   (desc (sg-wired-frame-descriptor sg))
+	   (offset (ldb sg-wired-frame-offset desc)))
+      (when (and wired-low
+		 (eq (%pointer-plus wired-low offset) from))
+	(let ((new-offset (%pointer-difference to wired-low)))
+	  (if (not (minusp new-offset))
+	      (setf (sg-wired-frame-descriptor sg)
+		    (dpb new-offset sg-wired-frame-offset desc))
+	      (si:saving-registers-for-trap-for-effect
+		(sg-return-from-low-wired-frame sg wired-low))))))
+    (when-stack-wiring-trace (sg)
+      (stack-wiring-trace (sg-wired-frame-descriptor sg)))))
+
+;; Metering functions.
+
+(defun show-wired-stacks ()
+  (without-interrupts	;So the LRU has a chance of remaining consistent.
+    (format t "~%~D page~:P out of ~D maximum wired page~:P"
+	    *wired-control-stack-pages*
+	    *maximum-wired-control-stack-pages*)
+    (loop for sg = *active-stack-groups-head* then (sg-thread-next sg)
+	  while sg
+	  as low = (sg-wired-control-stack-low sg)
+	  as fp = (sg-emulator-frame-pointer sg)
+	  as limit = (sg-wired-control-stack-limit sg)
+	  as pages = (%fixnum-floor (%pointer-difference limit low) page-size)
+	  do (format t "~%~32A Low=~\\SI:ADDRESS\\, FP=~\\SI:ADDRESS\\, Limit=~\\SI:ADDRESS\\ ~
+			(~D page~:P)"
+		     (sg-name sg) (%pointer low) (%pointer fp) (%pointer limit) pages)
+	  sum pages into total-pages
+	  finally (unless (= *wired-control-stack-pages* total-pages)
+		    (format t "~%(Actual count of wired pages is ~D.)" total-pages)))))

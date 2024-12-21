@@ -1,0 +1,2409 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: FED; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; A note on coordinate systems:
+;;; Raster planes implement their own internal coordinate indexing, we mostly only deal
+;;; with their external coordinate systems.  However, these still have several
+;;; interpretations.  black-plane and gray-plane and the registers are indexed by editing
+;;; coordinates.  0,0 is the upper-left of the editing box (keep in mind that negative
+;;; indices are allowed).  displayed-plane is indexed by scaled down window coordinates,
+;;; which have 0,0 at the upper-left of the possibly scrolled window (whole plane, not
+;;; just the viewport).
+
+;;; Strategy for proper interaction between fast redisplay and the dw history:
+;;; Copy images are drawn and remembered in the history.  Redisplay updates the
+;;; remembered image and the display separately with recording disabled.  It is necessary
+;;; that the image in the history be correct, since otherwise getting the correct bits
+;;; back when the typeout window goes down would be an awful mess, typical of static
+;;; windows.
+
+(defconstant redisplay-degree-none 0)
+(defconstant redisplay-degree-all 1)
+(defconstant redisplay-degree-complete 2)
+
+(dw:define-program-framework bitmap-editor
+  :inherit-from (undo-program:undo-program)
+  :command-definer t
+  :command-table (:inherit-from nil)
+  :selectable nil
+  :state-variables ((black-plane (make-image-raster-plane))
+		    (gray-plane (make-image-raster-plane))
+		    (displayed-black nil) (displayed-gray nil) (displayed-sample nil)
+		    (black-presentation nil) (gray-presentation nil) (sample-presentation nil)
+		    (grid-redisplay-degree redisplay-degree-none)
+		    (sample-redisplay-degree redisplay-degree-none)
+		    ;; Used to offset coordinates in displayed-black to black-plane.
+		    (displayed-x-offset 10) (displayed-y-offset 10)
+		    (scale 10)
+		    (registers (make-array 0)) (register-width nil) (register-height nil)
+		    (bounding-box (make-instance 'bounding-box-outline
+						 :components '(:left :top :right :bottom)))
+		    (drawing-mode :draw)
+		    (foreground-alu (color:sc-fill-alu -1 -1))
+		    (background-alu (color:sc-fill-alu 0 -1))
+		    (image-edited-p nil)
+		    ))
+
+(defun fix-raster-displayed-presentation-extent (presentation left top right bottom scale)
+  (dw::extend-presentation-displayed-box presentation
+					 (* left scale) (* top scale)
+					 (* right scale) (* bottom scale))
+  (let ((scaled-image (first (dw:presentation-inferiors presentation))))
+    (when (typep scaled-image 'dw::simply-scaled-image-graphics-displayed-presentation)
+      (let ((args (nthcdr 9 (dw::graphics-displayed-presentation-arguments scaled-image))))
+	(minf (first args) left)
+	(minf (second args) top)
+	(maxf (third args) right)
+	(maxf (fourth args) bottom)))))
+
+(defun-in-flavor (draw-one-point bitmap-editor) (displayed-raster displayed-presentation
+						 window x y value
+						 scale window-x-offset window-y-offset
+						 array-x-offset array-y-offset
+						 special-function)
+  (declare (values displayed-raster displayed-presentation))
+  (when (null displayed-presentation)
+    (return-from draw-one-point
+      (draw-one-plane black-plane displayed-raster displayed-presentation nil
+		      window scale window-x-offset window-y-offset
+		      array-x-offset array-y-offset special-function)))
+  (let ((window-x (+ x window-x-offset))
+	(window-y (+ y window-y-offset))
+	(array-x (+ x array-x-offset))
+	(array-y (+ y array-y-offset)))
+    (unless (or (minusp array-x) (minusp array-y))
+      (setq displayed-raster (assure-raster-large-enough displayed-raster
+							 (1+ array-x) (1+ array-y)))
+      (unless (= value (raster-aref displayed-raster array-x array-y))
+	(flet ((draw (stream x y)
+		 (declare (sys:downward-function))
+		 (if (neq (raster-plane-element-type black-plane) 'bit)
+		     (draw-image-raster-cell black-plane stream
+					     (- x array-x-offset) (- y array-y-offset)
+					     (* x scale) (* y scale) scale nil)
+		     (send stream :draw-rectangle scale scale (* x scale) (* y scale) :flip))))
+	  (dw:with-output-recording-disabled (window)
+	    (if special-function
+		(funcall special-function window window-x window-y nil #'draw)
+		(draw window window-x window-y))))
+	(fix-raster-displayed-presentation-extent displayed-presentation
+						  window-x window-y
+						  (1+ window-x) (1+ window-y)
+						  scale)
+	(setf (raster-aref displayed-raster array-x array-y) value))))
+  (values displayed-raster displayed-presentation))
+
+(defmethod (draw-single-point bitmap-editor) (grid sample points-modified x y alu)
+  (let* ((old (raster-plane-aref black-plane x y))
+	 (new (load-byte			;Trim -1 for comparison below.
+		(if (integerp alu) (boole alu -1 old) (send alu :fill-data))
+		0
+		(array-element-byte-size
+		  (or (raster-plane-raster black-plane)
+		      (make-array 0
+				  :element-type (raster-plane-element-type black-plane)))))))
+    (unless (= old new)
+      (vector-push-extend x points-modified)
+      (vector-push-extend y points-modified)
+      (vector-push-extend old points-modified)
+      (setf (raster-plane-aref black-plane x y) new)
+      (multiple-value-setq (displayed-black black-presentation)
+	(draw-one-point displayed-black black-presentation
+			grid x y new
+			scale displayed-x-offset displayed-y-offset
+			displayed-x-offset displayed-y-offset nil))
+      (multiple-value-setq (displayed-sample sample-presentation)
+	(multiple-value-bind (function allowed-left-kern allowed-top-kern)
+	    (sample-redisplay-parameters self)
+	  (draw-one-point displayed-sample sample-presentation
+			  sample x y new 1 0 0
+			  allowed-left-kern allowed-top-kern function))))))
+
+(defmethod (redisplay-grid bitmap-editor) (pane)
+  (when (> grid-redisplay-degree redisplay-degree-none)
+    (when ( grid-redisplay-degree redisplay-degree-complete)
+      ;; Clear the whole contents and redraw non-incremental parts.
+      (send pane :clear-history)
+      (when displayed-black
+	(si:fill-array displayed-black nil 0))
+      (setq black-presentation nil)
+      (when displayed-gray
+	(si:fill-array displayed-gray nil 0))
+      (setq gray-presentation nil)
+      (when ( scale 4)
+	(graphic-input:draw-grid pane scale))
+      (bounding-box-outline-draw bounding-box pane))
+    (tv:prepare-sheet (pane)
+      (multiple-value-setq (displayed-black black-presentation)
+	(draw-one-plane black-plane displayed-black black-presentation nil
+			pane scale displayed-x-offset displayed-y-offset
+			displayed-x-offset displayed-y-offset nil))
+      (multiple-value-setq (displayed-gray gray-presentation)
+	(draw-one-plane gray-plane displayed-gray gray-presentation tv:25%-gray
+			pane scale displayed-x-offset displayed-y-offset
+			displayed-x-offset displayed-y-offset nil))))
+  (setq grid-redisplay-degree redisplay-degree-none))
+
+(defmethod (sample-redisplay-parameters bitmap-editor) () (values nil 0 0))
+
+(defmethod (redisplay-sample bitmap-editor) (pane)
+  (when (> sample-redisplay-degree redisplay-degree-none)
+    (when ( sample-redisplay-degree redisplay-degree-complete)
+      (send pane :clear-history)
+      (when displayed-sample
+	(si:fill-array displayed-sample nil 0))
+      (setq sample-presentation nil))
+    (multiple-value-setq (displayed-sample sample-presentation)
+      (multiple-value-bind (function allowed-left-kern allowed-top-kern)
+	  (sample-redisplay-parameters self)
+	(draw-one-plane black-plane displayed-sample sample-presentation nil pane 1 0 0
+			allowed-left-kern allowed-top-kern function)))
+    (setq sample-redisplay-degree redisplay-degree-none)))
+
+;;; window-x,y-offset is the position of 0,0 of raster-plane in window (initially where
+;;;  the bounding box is positioned in the middle).
+;;; array-x,y-offset is the offset of 0,0 of the raster-plane into displayed-raster.
+;;; For the grid pane, these are the same (minimum displayable point is minimum editable);
+;;; for the the sample pane, window position is 0,0 and array offset is enough to allow for
+;;;  some moderate left kern.
+(defun draw-one-plane (raster-plane displayed-raster displayed-presentation pattern
+		       window scale window-x-offset window-y-offset
+		       array-x-offset array-y-offset special-function)
+  (declare (values displayed-raster displayed-presentation)
+	   (sys:downward-funarg special-function))
+  (multiple-value-bind (raster origin-x origin-y width height)
+      (decode-raster-plane raster-plane)
+    (cond ((zerop width)
+	   ;; Nothing to draw
+	   (when displayed-presentation
+	     (dw:erase-displayed-presentation displayed-presentation window)
+	     (setq displayed-presentation nil))
+	   (when displayed-raster
+	     (si:fill-array displayed-raster nil 0))
+	   (when special-function
+	     ;; Draw the non-editing part of the sample.
+	     (funcall special-function window 0 0 t #'ignore)))
+	  (t
+	   ;; raster-x,y is the point in the recording raster to which the start of the
+	   ;;  plane's raster goes.
+	   ;; raster-width,height is the minimum size of the recording raster.
+	   ;; source-x,y is the point in the plane's raster (not the raster plane) that goes
+	   ;;  at the beginning of the recording raster.
+	   ;; window-x,y is the point in the window to which the start of the recording
+	   ;;  raster goes (after scaling).
+	   (let* ((raster-x (+ origin-x array-x-offset))
+		  (raster-y (+ origin-y array-y-offset))
+		  (raster-width (+ raster-x width))
+		  (raster-height (+ raster-y height))
+		  (source-x 0)
+		  (source-y 0)
+		  (window-x (* (- window-x-offset array-x-offset) scale))
+		  (window-y (* (- window-y-offset array-y-offset) scale)))
+	     ;; If we are trying to access the part of the array past where recording goes,
+	     ;; trim it down.  This normally only happens in the sample pane when there's a
+	     ;; lot of left kern.
+	     (when (minusp raster-x)
+	       (decf source-x raster-x)
+	       (incf width raster-x)
+	       (setq raster-x 0))
+	     (when (minusp raster-y)
+	       (decf source-y raster-y)
+	       (incf height raster-y)
+	       (setq raster-y 0))
+	     (labels ((draw (stream x y raster)
+			(declare (sys:downward-function))
+			(if (neq (raster-plane-element-type raster-plane) 'bit)
+			    (draw-image-raster-plane raster-plane stream x y
+						     (unless (eq raster displayed-raster)
+						       raster)
+						     array-x-offset array-y-offset
+						     0 0 raster-width raster-height
+						     scale pattern)
+			    (if (> scale 1)
+				(graphics::draw-simply-scaled-image stream raster
+								    x y scale scale pattern
+								    :flip color:alu-noop nil
+								    0 0
+								    raster-width raster-height)
+				(send stream :draw-1-bit-raster raster-width raster-height
+				      raster 0 0 x y :flip color:alu-noop))))
+		      (do-draw (stream raster first-p)
+			(if special-function
+			    (funcall special-function stream window-x window-y first-p
+				     #'draw raster)
+			    (draw stream window-x window-y raster))))
+	       (if displayed-raster
+		   (multiple-value-setq (displayed-raster raster-width raster-height)
+		     (assure-raster-large-enough displayed-raster raster-width raster-height))
+		   (let ((element-type (raster-plane-element-type raster-plane)))
+		     (setq raster-width (max 128 (graphics::raster-array-correct-width
+						   raster-width element-type))
+			   raster-height (max 128 raster-height)
+			   displayed-raster (make-raster-array raster-width raster-height
+							       :element-type element-type))))
+	       (if displayed-presentation
+		   (with-copy-array (copy (raster-width raster-height)
+					  :element-type (raster-plane-element-type
+							  raster-plane))
+		     ;; Copy becomes an image of the changed bits, which can then be updated
+		     ;; onto both the screen and the record.
+		     (bitblt tv:alu-xor raster-width raster-height
+			     displayed-raster 0 0 copy 0 0)
+		     (bitblt tv:alu-xor width height
+			     raster source-x source-y
+			     copy raster-x raster-y)
+		     (bitblt tv:alu-xor raster-width raster-height
+			     copy 0 0 displayed-raster 0 0)
+		     (dw:with-output-recording-disabled (window)
+		       (do-draw window copy nil))
+		     (fix-raster-displayed-presentation-extent displayed-presentation
+							       0 0
+							       raster-width raster-height
+							       scale))
+		 (si:fill-array displayed-raster nil 0)
+		 (bitblt tv:alu-seta width height
+			 raster source-x source-y
+			 displayed-raster raster-x raster-y)
+		 (setq displayed-presentation (dw:with-output-as-presentation (:stream window)
+						(do-draw window displayed-raster t)))
+		 (send window :new-scroll-position)
+		 ;; Make sure any real presentations are seen by the mouse first.
+		 (setf (dw::graphics-displayed-presentation-priority displayed-presentation)
+		       -1)))))))
+  (values displayed-raster displayed-presentation))
+
+(defmacro highlighting-other-point ((stream highlight-other-point type) &body body)
+  `(highlighting-other-point-internal (dw:named-continuation highlighting-other-point (,stream)
+					. ,body)
+				      ,stream ,highlight-other-point ,type))
+
+(defun highlighting-other-point-internal (continuation stream highlight-other-point
+					  &optional (type :point))
+  (let (frame)
+    (if (and highlight-other-point
+	     (setq frame (find-bitmap-editor-frame-from-stream stream)))
+	(unwind-protect
+	    (progn
+	      (highlight-other-point frame highlight-other-point type)
+	      (funcall continuation stream))
+	  (highlight-other-point frame highlight-other-point type))
+	(funcall continuation stream))))
+
+(defstruct (point :list)
+  column
+  row)
+
+(define-presentation-type point-column (() &key highlight-other-point)
+   :expander 'integer
+   :parser ((stream &key default)
+	    (highlighting-other-point (stream highlight-other-point :column)
+	      (accept 'integer :stream stream :default default :prompt nil))))
+
+(define-presentation-type point-row (() &key highlight-other-point)
+   :expander 'integer
+   :parser ((stream &key default)
+	    (highlighting-other-point (stream highlight-other-point :row)
+	      (accept 'integer :stream stream :default default :prompt nil))))
+
+(define-presentation-type point (() &key highlight-other-point)
+   :expander '((sequence-enumerated point-column point-row))
+   :printer ((point stream)
+	     (destructuring-bind (x y) point
+	       ;; Rather than sequence, which has stupid "and" and spaces.
+	       (format stream "~S,~S" x y)))
+   :parser ((stream &key default original-type)
+	    ;; So that we don't get an inner translator to just one coordinate.
+	    (dw:with-presentation-input-context (original-type :allow-inheritance nil) (blip)
+		 (highlighting-other-point (stream highlight-other-point :point)
+		   (accept '((sequence-enumerated point-column point-row)
+			     :echo-space nil)
+			   :stream stream :default default :prompt nil))
+	       (otherwise (dw:presentation-blip-object blip))))
+   )
+
+(define-presentation-translator point-column (point point-column) (point)
+  (point-column point))
+(define-presentation-translator point-row (point point-row) (point)
+  (point-row point))
+
+(define-presentation-type point-sequence ()
+   :expander '((sequence point))
+   :parser ((stream)
+	    (values
+	      (let ((frame (find-bitmap-editor-frame-from-stream stream)))
+		(sys:with-stack-array (points 10 :fill-pointer 0)
+		  (unwind-protect
+		      (loop named outer do
+			(let ((point (accept 'point :stream stream :prompt nil
+					     :additional-blip-chars '(#\,))))
+			  (vector-push-extend point points)
+			  (when frame
+			    (highlight-other-point frame point))
+			  (loop do
+			    (multiple-value-bind (more-to-come point)
+				(dw::sequence-check-end stream 'point nil)
+			      (ecase more-to-come
+				((nil)
+				 (return-from outer (coerce points 'list)))
+				((t)
+				 (return))
+				((:accepted)
+				 (vector-push-extend point points)
+				 (when frame
+				   (highlight-other-point frame point))))))))
+		    (when frame
+		      (map () #'(lambda (point)
+				  (highlight-other-point frame point))
+			   points)))))
+	      )))
+
+(defun find-bitmap-editor-frame-from-stream (stream)
+  (let ((frame (send-if-handles stream :superior)))
+    (when (typep frame 'dw:program-frame)
+      (let ((program (send frame :program)))
+	(when (typep program 'bitmap-editor)
+	  frame)))))
+
+(defun highlight-other-point (frame point &optional (type :point))
+  (bitmap-editor-highlight-other-point (send frame :program)
+				       (send frame :get-pane 'grid)
+				       point type))
+
+(defmethod (bitmap-editor-highlight-other-point bitmap-editor) (pane point type)
+  (let ((width 1)
+	(height 1)
+	x y)
+    (ecase type
+      (:point
+	(setq x (point-column point)
+	      y (point-row point)))
+      (:column
+	(setq x point
+	      y (- (bounding-box-outline-top bounding-box) displayed-y-offset)
+	      height (bounding-box-outline-height bounding-box)))
+      (:row
+	(setq x (- (bounding-box-outline-left bounding-box) displayed-x-offset)
+	      y point
+	      width (bounding-box-outline-width bounding-box))))
+    (dw:with-output-recording-disabled (pane)
+      (send pane :draw-1-bit-raster (* width scale) (* height scale) tv:50%-gray 0 0
+	    (* (+ x displayed-x-offset) scale)
+	    (* (+ y displayed-y-offset) scale)
+	    :flip color:alu-noop))))
+
+(defmacro define-two-point-command ((name &rest command-options
+					  &key gesture
+					  &allow-other-keys)
+				    ((var-1 (ignore type-1)
+					    &rest args-1
+					    &key ((:prompt prompt-1))
+					    &allow-other-keys)
+				     (var-2 (ignore type-2)
+					    &rest args-2
+					    &key ((:prompt prompt-2))
+					    &allow-other-keys)
+				     &rest other-args)
+				    &body body)
+  `(progn
+     (define-bitmap-editor-command (,name . ,(si:rem-keywords command-options '(:gesture)))
+				   ((,var-1 '((token-or-type (("prompt-for-point" . nil))
+							   ,type-1))
+				     :default nil :provide-default t
+				     . ,args-1)
+				    (,var-2 `((token-or-type (("prompt-for-point" . nil))
+							   ((,',type-2)
+							    :highlight-other-point ,,var-1)))
+				     :default nil :provide-default t
+				     . ,args-2)
+				    . ,other-args)
+	(multiple-value-setq (,var-1 ,var-2)
+	  (get-two-points ,var-1 ',type-1 ,prompt-1 ,var-2 ',type-2 ,prompt-2))
+	. ,body)
+     (define-presentation-to-command-translator ,name
+						(point :gesture ,gesture)
+						(point)
+       (list ',name
+	     ,(ecase type-1
+		(point 'point)
+		((point-row point-column) `(,type-1 point)))))))
+
+(defun get-two-points (point-1 type-1 prompt-1 point-2 type-2 prompt-2)
+  (when (null point-1)
+    (setq point-1 (with-stack-list (prompt "Click on ~?" prompt-1)
+		    (accept type-1 :prompt prompt))))
+  (when (null point-2)
+    (setq point-2 (with-stack-list (prompt "Click on ~?" prompt-2)
+		    (accept `((,type-2) :highlight-other-point ,point-1) :prompt prompt))))
+  (values point-1 point-2))
+
+(defflavor point-displayed-presentation
+	((dw::type 'point)
+	 (dw::displayed-box (dw::make-box 0 0 0 0))
+	 (moving-point (list 0 0)))
+	(dw::displayed-presentation)
+  (:readable-instance-variables moving-point))
+
+(defmethod (dw::presentation-mouse-sensitive-boxes point-displayed-presentation)
+	   (window &optional (ignore t))
+  (dw::displayed-box-mouse-sensitive-boxes dw::displayed-box window))
+
+(compile-flavor-methods point-displayed-presentation)
+
+(defun-in-flavor (image-changed bitmap-editor) (&key (redisplay-degree redisplay-degree-all)
+						     (complete-redisplay nil)
+						     (set-modified t))
+  (when complete-redisplay
+    (maxf redisplay-degree redisplay-degree-complete))
+  (maxf grid-redisplay-degree redisplay-degree)
+  (maxf sample-redisplay-degree redisplay-degree)
+  (when set-modified
+    (setq image-edited-p t)))
+
+(defmethod (bitmap-editor-top-level bitmap-editor) ()
+  (let ((grid (dw:get-program-pane 'grid))
+	(sample (dw:get-program-pane 'sample)))
+    (send grid :set-scroll-position-function
+	  #'(lambda (window &rest args)
+	      (apply #'graphic-input:grid-scroll-position-function window scale args)))
+    (send grid :set-sub-presentation-presentation-function
+      (let ((presentation (make-instance 'point-displayed-presentation))
+	    (other-presentation (make-instance 'point-displayed-presentation)))
+	#'(lambda (window x y force-p)
+	    (block legit
+	      (let ((otherwise
+		      (letf (((symbol-value-in-instance
+				window 'dw::sub-presentation-presentation-function)
+			      nil))
+			(send window :displayed-presentation-at-position x y))))
+		(when (multiple-value-bind (left top right bottom)
+			  (send window :visible-cursorpos-limits)
+			(or (< x left) ( x right)
+			    (< y top) ( y bottom)))
+		  (return-from legit otherwise))
+		(when (loop for presentation = otherwise
+					     then (dw::presentation-superior presentation)
+			    while presentation
+			    thereis (not (member (dw:presentation-type presentation)
+						 ;; Quite some variety in the junk category.
+						 '(t nil dw::no-type dw::graphics
+						   graphic-input:grid-output))))
+		  (return-from legit otherwise)))
+	      ;; For defeating EQness check.
+	      (when (eq presentation (send window :last-highlighted-presentation))
+		(rotatef presentation other-presentation))
+	      (setq x (floor x scale) 
+		    y (floor y scale))
+	      (let ((point (if (not force-p)
+			       (point-displayed-presentation-moving-point presentation)
+			       ;; If going to be returned in click, must be freshly consed.
+			       (list 0 0))))
+		(setf (point-column point) (- x displayed-x-offset))
+		(setf (point-row point) (- y displayed-y-offset))
+		(setf (dw:presentation-object presentation) point))
+	      (dw::set-box-edges (dw::presentation-displayed-box presentation)
+				 (1- (* x scale)) (1- (* y scale))
+				 (+ (* (1+ x) scale) 2) (+ (* (1+ y) scale) 2))
+	      presentation))))
+    (flet ((handle-wakeup (blip)
+	     (declare (sys:downward-function))
+	     (when (dw:presentation-blip-typep blip 'dw::window-wakeup-refresh)
+	       (select (dw:presentation-blip-object blip)
+		 (grid (maxf grid-redisplay-degree redisplay-degree-complete))
+		 (sample (maxf sample-redisplay-degree redisplay-degree-complete))))
+	     (dw::default-window-wakeup-handler blip)))
+      (dw:default-command-top-level self :window-wakeup #'handle-wakeup))))
+
+(defun-in-flavor (cleanup-points-modified bitmap-editor) (points-modified)
+  (loop for index downfrom (- (fill-pointer points-modified) 3) to 0 by 3 do
+    (setf (raster-plane-aref black-plane
+			     (aref points-modified index) (aref points-modified (1+ index)))
+	  (aref points-modified (+ index 2))))
+  (image-changed))
+
+(defundo draw-point (program x y value saved-value))
+
+(defmethod (undo-element-redo draw-point) ()
+  (setq saved-value (draw-point-for-undo program x y value)))
+
+(defmethod (undo-element-undo draw-point) ()
+  (draw-point-for-undo program x y saved-value))
+
+(defmethod (draw-point-for-undo bitmap-editor) (x y value)
+  (prog1 (raster-plane-aref black-plane x y)
+	 (setf (raster-plane-aref black-plane x y) value)
+	 (image-changed)))
+
+(defundo draw-subplane (program subplane saved-subplane))
+
+(defmethod (undo-element-redo draw-subplane) ()
+  (setq saved-subplane (draw-subplane-for-undo program subplane saved-subplane)))
+
+(defmethod (undo-element-undo draw-subplane) ()
+  (draw-subplane-for-undo program saved-subplane nil))
+
+(defmethod (draw-subplane-for-undo bitmap-editor) (subplane saved-subplane)
+  (unless saved-subplane
+    (setq saved-subplane (raster-plane-empty-copy black-plane)))
+  (multiple-value-bind (subplane-raster subplane-x subplane-y subplane-width subplane-height)
+      (decode-raster-plane subplane)
+    (multiple-value-bind (raster origin-x origin-y)
+	(decode-raster-plane black-plane)
+      (when raster
+	(copy-raster-to-raster-plane raster saved-subplane
+				     :from-x (- subplane-x origin-x)
+				     :from-y (- subplane-y origin-y)
+				     :to-x subplane-x :to-y subplane-y
+				     :width subplane-width
+				     :height subplane-height)))
+    (copy-raster-to-raster-plane subplane-raster black-plane
+				 :clear-first nil :to-x subplane-x :to-y subplane-y
+				 :width subplane-width :height subplane-height))
+  (image-changed)
+  saved-subplane)
+
+(defun-in-flavor (undo-save-points-modified bitmap-editor) (points-modified)
+  (multiple-value-bind (min-x min-y max-x max-y)
+      (loop for index below (fill-pointer points-modified) by 3
+	    minimize (aref points-modified index) into min-x
+	    maximize (aref points-modified index) into max-x
+	    minimize (aref points-modified (1+ index)) into min-y
+	    maximize (aref points-modified (1+ index)) into max-y
+	    finally (return (values min-x min-y max-x max-y)))
+    (if (and (= min-x max-x) (= min-y max-y))
+	(undo-save 'draw-point
+		   (format () "Draw point ~D,~D" min-x min-y)
+		   min-x min-y
+		   (raster-plane-aref black-plane min-x min-y) (aref points-modified 2))
+	(let ((subplane (raster-plane-empty-copy black-plane))
+	      (saved-subplane (raster-plane-empty-copy black-plane)))
+	  (multiple-value-bind (raster origin-x origin-y)
+	      (decode-raster-plane black-plane)
+	    (copy-raster-to-raster-plane raster subplane
+					 :from-x (- min-x origin-x) :from-y (- min-y origin-y)
+					 :to-x min-x :to-y min-y
+					 :width (1+ (- max-x min-x))
+					 :height (1+ (- max-y min-y))))
+	  (copy-raster-planes subplane saved-subplane)
+	  (loop for index downfrom (- (fill-pointer points-modified) 3) to 0 by 3 do
+	    (setf (raster-plane-aref saved-subplane
+				     (aref points-modified index)
+				     (aref points-modified (1+ index)))
+		  (aref points-modified (+ index 2))))
+	  (undo-save 'draw-subplane "Draw points" subplane saved-subplane))))
+  (setq image-edited-p t))
+
+(defvar *non-alu-drawing-modes* '(:foreground :background))
+
+(defun-in-flavor (highlight-current-drawing-mode bitmap-editor)
+		 (&optional pane (mode drawing-mode))
+  (unless pane
+    (setq pane (dw:get-program-pane 'drawing-mode-menu)))
+  (let ((presentations (send pane :displayed-presentations)))
+    (when (plusp (length presentations))
+      (dolist (pres (dw:presentation-inferiors (elt presentations 0)))
+	(if (eql (dw:presentation-object pres) mode)
+	    (dw:displayed-presentation-set-highlighting pres pane :inverse-video)
+	    (dw:displayed-presentation-clear-highlighting pres pane :inverse-video))))))
+
+(defun-in-flavor (get-drawing-alu bitmap-editor) (drawing-mode)
+  (ecase drawing-mode
+    (:draw boole-ior)
+    (:erase boole-andc1)
+    (:flip boole-xor)
+    (:noop boole-2)
+    (:foreground foreground-alu)
+    (:background background-alu)))
+
+(define-bitmap-editor-command (com-draw-point ) ((point 'point)
+						 &key
+						 (initial-drawing-mode 'drawing-mode
+								       :default drawing-mode))
+   (let* ((grid (dw:get-program-pane 'grid))
+	  (sample (dw:get-program-pane 'sample))
+	  (drawing-mode-menu (dw:get-program-pane 'drawing-mode-menu))
+	  (console (tv:sheet-console grid))
+	  (fore-back-p (member drawing-mode *non-alu-drawing-modes*))
+	  (last-drawing-mode drawing-mode)
+	  (last-alu (get-drawing-alu drawing-mode)))
+     (redisplay-grid self grid)			;Get rid of pending redisplay
+     (stack-let ((points-modified (make-array 75 :fill-pointer 0)))
+       (unwind-protect-case ()
+	   (flet ((draw-point (x y alu)
+		    (draw-single-point self grid sample points-modified x y alu))
+		  (current-alu ()
+		    (let ((current-drawing-mode
+			    (let ((control-p (sys:console-key-state console :control))
+				  (meta-p (sys:console-key-state console :meta)))
+			      (cond ((and control-p meta-p) :noop)
+				    (control-p (if fore-back-p :background :erase))
+				    (meta-p (if fore-back-p :foreground :draw))
+				    (t drawing-mode)))))
+		      (unless (eq current-drawing-mode last-drawing-mode)
+			(setq last-drawing-mode current-drawing-mode
+			      last-alu (get-drawing-alu last-drawing-mode))
+			(highlight-current-drawing-mode drawing-mode-menu last-drawing-mode)))
+		    last-alu))
+	     (destructuring-bind (x y) point
+	       (draw-point x y (get-drawing-alu initial-drawing-mode))
+	       (dw:tracking-mouse (grid :whostate "Drawing")
+		 (:release-mouse () (return nil))
+		 (:mouse-motion-hold (nx ny &aux alu)
+		  (setq nx (- (floor nx scale) displayed-x-offset)
+			ny (- (floor ny scale) displayed-y-offset)
+			;; Do this here to always update highlighting even if don't redraw.
+			;; Should we redo the current point if shift changes, but position does
+			;; not?
+			alu (current-alu))
+		  (unless (and (= nx x) (= ny y))
+		    (draw-point nx ny alu)
+		    (setq x nx y ny))))))
+	 (:normal (undo-save-points-modified points-modified))
+	 (:abort (cleanup-points-modified points-modified))
+	 (:always
+	   (unless (eq last-drawing-mode drawing-mode)
+	     (highlight-current-drawing-mode drawing-mode-menu)))))))
+
+(defvar *draw-point-echo* nil 
+  "Whether drawing points by clicking with the mouse echos the command")
+
+;;; These are all :menu nil to reduce clutter there.
+(define-presentation-to-command-translator click-on-point
+					   (point :menu nil)
+					   (point)
+  (values `(com-draw-point ,point) 'cp:command
+	  :echo *draw-point-echo*))
+
+(defun bitmap-editor-drawing-mode-fore-back-p (window)
+  (let ((bitmap-editor (dw:current-program :window window :type 'bitmap-editor :error-p nil)))
+    (when bitmap-editor
+      (member (bitmap-editor-drawing-mode bitmap-editor) *non-alu-drawing-modes*))))
+
+(define-presentation-to-command-translator control-click-on-point
+					   (point :gesture :control-left :menu nil)
+					   (point &key window)
+  (values `(com-draw-point ,point
+			   :initial-drawing-mode ,(if (bitmap-editor-drawing-mode-fore-back-p
+							window)
+						      :background :erase))
+	  'cp:command
+	  :echo *draw-point-echo*))
+
+(define-presentation-to-command-translator meta-click-on-point
+					   (point :gesture :meta-left :menu nil)
+					   (point &key window)
+  (values `(com-draw-point ,point
+			   :initial-drawing-mode ,(if (bitmap-editor-drawing-mode-fore-back-p
+							window)
+						      :foreground :draw))
+	  'cp:command
+	  :echo *draw-point-echo*))
+
+(define-presentation-to-command-translator control-meta-click-on-point
+					   (point :gesture :control-meta-left :menu nil)
+					   (point)
+  (values `(com-draw-point ,point :initial-drawing-mode :noop) 'cp:command
+	  :echo *draw-point-echo*))
+
+(defmacro inverting-undoably (arglist name &body body)
+  `(flet ((do-it ,arglist . ,body))
+     (do-undoably 'function-undo-element ,name
+		  (list . ,arglist) #'do-it #'do-it)))
+
+(define-bitmap-editor-command (com-swap-gray :menu-accelerator t :menu-level :gray) ()
+   (inverting-undoably () "Swap gray"
+     (swap-raster-planes black-plane gray-plane)
+     (image-changed)))
+
+(defundo clear-gray (program saved-gray))
+
+(defmethod (undo-element-redo clear-gray) ()
+  (setq saved-gray (clear-gray program saved-gray)))
+
+(defmethod (undo-element-undo clear-gray) ()
+  (restore-saved-planes program nil saved-gray :alu boole-ior))
+
+(defmethod (clear-gray bitmap-editor) (saved-gray)
+  (unless saved-gray
+    (setq saved-gray (raster-plane-empty-copy gray-plane)))
+  (copy-raster-planes gray-plane saved-gray)
+  (clear-raster-plane gray-plane)
+  (image-changed :set-modified nil)
+  saved-gray)
+
+(define-bitmap-editor-command (com-clear-gray :menu-accelerator t :menu-level :gray) ()
+   (do-undoably 'clear-gray "Clear gray"))
+
+(defundo merge-gray (program alu clear-afterwards
+			     saved-black saved-gray))
+
+(defmethod (undo-element-redo merge-gray) ()
+  (multiple-value-setq (saved-black saved-gray)
+    (merge-gray program alu clear-afterwards
+			saved-black saved-gray)))
+
+(defmethod (undo-element-undo merge-gray) ()
+  (restore-saved-planes program saved-black saved-gray))
+
+(defmethod (merge-gray bitmap-editor) (alu clear-afterwards saved-black saved-gray)
+  (unless saved-black
+    (setq saved-black (raster-plane-empty-copy black-plane)))
+  (copy-raster-planes black-plane saved-black)
+  (copy-raster-planes gray-plane black-plane :alu (get-drawing-alu alu))
+  (when clear-afterwards
+    (unless saved-gray
+      (setq saved-gray (raster-plane-empty-copy gray-plane)))
+    (copy-raster-planes gray-plane saved-gray)
+    (clear-raster-plane gray-plane))
+  (image-changed)
+  (values saved-black saved-gray))
+
+(define-bitmap-editor-command (com-merge-gray )
+			      (&key (alu 'drawing-mode :default :draw)
+				    (clear-afterwards 'boolean :default nil
+						      :documentation "clear gray when done"))
+   (do-undoably 'merge-gray "Merge gray" alu clear-afterwards))
+
+(dw:define-command-menu-handler ("Merge Gray" bitmap-editor :gray
+				 :gesture (:left :shift-left :right))
+				(&rest args &key (gesture :left) &allow-other-keys)
+  (if (eq gesture :shift-left)
+      `(com-merge-gray :clear-afterwards t)
+      (apply #'dw:standard-command-menu-handler 'com-merge-gray args)))
+
+(define-two-point-command (com-move-gray :menu-accelerator t :menu-level :gray)
+    ((point 'point :prompt "point to move")
+     (new-point 'point :prompt "point to move this point to"))
+   (let ((dx (- (point-column new-point) (point-column point)))
+	 (dy (- (point-row new-point) (point-row point))))
+     (undoably (dx dy) "Move gray"
+       (progn
+	 (shift-raster-plane gray-plane dx dy)
+	 (image-changed :set-modified nil))
+       (progn
+	 (shift-raster-plane gray-plane (- dx) (- dy))
+	 (image-changed :set-modified nil)))))
+
+(defun-in-flavor (mouse-input-grid-rectangle bitmap-editor) (&rest args)
+  (multiple-value-bind (left top right bottom)
+      (apply #'graphic-input:mouse-input-rectangle :stream (dw:get-program-pane 'grid) args)
+    (values (- (floor left scale) displayed-x-offset)
+	    (- (floor top scale) displayed-y-offset)
+	    (- (floor right scale) displayed-x-offset)
+	    (- (floor bottom scale) displayed-y-offset))))
+
+(define-bitmap-editor-command (com-swap-gray-region :menu-accelerator "Swap Rgn" ;Yuck!
+						    :menu-level :gray)
+    (&key (start-x 'number)
+	  (start-y 'number))
+   (multiple-value-bind (left top right bottom)
+       (mouse-input-grid-rectangle :start-x start-x :start-y start-y)
+     (inverting-undoably () "Swap gray region"
+       (swap-raster-subplanes black-plane gray-plane left top right bottom)
+       (image-changed))))
+
+(define-presentation-to-command-translator swap-region-starting-here
+   (point :gesture nil
+	  :documentation "Swap gray region starting here")
+   (ignore &key x y)
+  `(com-swap-gray-region :start-x ,x :start-y ,y))
+
+(define-bitmap-editor-command (com-refresh)
+    ()
+   (image-changed :complete-redisplay t :set-modified nil))
+
+(defundo clear-all (program saved-black saved-gray))
+
+(defmethod (undo-element-redo clear-all) ()
+  (multiple-value-setq (saved-black saved-gray)
+    (clear-all program saved-black saved-gray)))
+
+(defmethod (undo-element-undo clear-all) ()
+  (restore-saved-planes program saved-black saved-gray :alu boole-ior))
+
+(defmethod (clear-all bitmap-editor) (saved-black saved-gray)
+  (unless saved-black
+    (setq saved-black (raster-plane-empty-copy black-plane)))
+  (unless saved-gray
+    (setq saved-gray (raster-plane-empty-copy gray-plane)))
+  (copy-raster-planes black-plane saved-black)
+  (copy-raster-planes gray-plane saved-gray)
+  (clear-raster-plane black-plane)
+  (clear-raster-plane gray-plane)
+  (image-changed)
+  (values saved-black saved-gray))
+
+(defmethod (restore-saved-planes bitmap-editor) (saved-black saved-gray &key (alu boole-1))
+  (when saved-black
+    (copy-raster-planes saved-black black-plane :alu alu))
+  (when saved-gray
+    (copy-raster-planes saved-gray gray-plane :alu alu))
+  (image-changed :set-modified (not (null saved-black))))
+
+(define-bitmap-editor-command (com-clear-all :menu-accelerator t :menu-level :draw) ()
+   (do-undoably 'clear-all "Clear all"))
+
+(define-two-point-command (com-move-black :menu-accelerator t :menu-level :draw)
+    ((point 'point :prompt "point to move")
+     (new-point 'point :prompt "point to move this point to"))
+   (let ((dx (- (point-column new-point) (point-column point)))
+	 (dy (- (point-row new-point) (point-row point))))
+     (undoably (dx dy) "Move black"
+       (progn
+	 (shift-raster-plane black-plane dx dy)
+	 (image-changed))
+       (progn
+	 (shift-raster-plane black-plane (- dx) (- dy))
+	 (image-changed)))))
+
+(define-two-point-command (com-stretch-column )
+    ((column 'point-column :prompt "column to move")
+     (to-column 'point-column :prompt "column to move this column to"))
+  (undoably (column to-column) "Stretch column"
+    (progn
+      (stretch-raster-plane-column black-plane column (- to-column column))
+      (image-changed))
+    (progn
+      (stretch-raster-plane-column black-plane to-column (- column to-column))
+      (image-changed))))
+
+(define-two-point-command (com-stretch-row )
+    ((row 'point-row :prompt "row to move")
+     (to-row 'point-row :prompt "row to move this row to"))
+  (undoably (row to-row) "Stretch row"
+    (progn
+      (stretch-raster-plane-row black-plane row (- to-row row))
+      (image-changed))
+    (progn
+      (stretch-raster-plane-row black-plane to-row (- row to-row))
+      (image-changed))))
+
+(dw:define-command-menu-handler ("Stretch" bitmap-editor :draw
+				 :gesture (:left :shift-left :right))
+				(&key (gesture :left))
+  (case gesture
+    (:left `(com-stretch-column ))
+    (:shift-left `(com-stretch-row ))
+    (:right
+      (case dw:*command-menu-test-phase*
+	((t)
+	 (throw 'dw:command-menu-test-phase `(com-stretch-column)))
+	((:documentation)
+	 (throw 'dw:command-menu-test-phase "Choose arguments for Stretch"))
+	(otherwise
+	  (let ((command (dw:menu-choose-from-set '(com-stretch-column com-stretch-row)
+						  'cp:command-name)))
+	    (when command
+	      (list command))))))))
+
+(define-bitmap-editor-command (com-rotate :menu-accelerator t :menu-level :draw)
+    ((center 'point
+	     :prompt "about point"
+	     :default (center-point self)
+	     :documentation "point about which to do the rotation")
+     (angle '((member 90 -90 180))
+	    :prompt "angle"
+	    :default 90
+	    :documentation "counterclockwise rotation angle in degrees"))
+   (undoably (center angle) "Rotate"
+     (progn
+       (rotate-raster-plane black-plane (point-column center) (point-row center) angle)
+       (image-changed))
+     (progn
+       (rotate-raster-plane black-plane (point-column center) (point-row center)
+			    (if (eql angle 180) angle (- angle)))
+       (image-changed))))
+
+(define-presentation-to-command-translator rotate-around-here
+					   (point :gesture ()
+						  :documentation "Rotate around this point")
+					   (point &key mouse-char)
+  (let ((angle (case mouse-char
+		 (#\Mouse-R (if (or dw:*inside-handler-test-phase*
+				    dw:*inside-handler-documentation-phase*)
+				90
+				(dw:menu-choose '(90 -90 180)
+						:prompt "Angle to rotate (counterclockwise)")))
+		 (otherwise 90))))
+    (when angle
+      `(com-rotate ,point ,angle))))
+
+(define-bitmap-editor-command (com-reflect-vertically )
+    ((column 'point-column :default (point-column (center-point self))))
+   (inverting-undoably (column) "Reflect vertically"
+     (reflect-raster-plane-vertically black-plane column)
+     (image-changed)))
+
+(define-bitmap-editor-command (com-reflect-horizontally )
+    ((row 'point-row :default (point-row (center-point self))))
+   (inverting-undoably (row) "Reflect horizontally"
+     (reflect-raster-plane-horizontally black-plane row)
+     (image-changed)))
+
+(define-bitmap-editor-command (com-reflect-diagonally )
+    ((negate-p 'boolean)
+     (center 'point :default (center-point self)))
+   (inverting-undoably (center negate-p) "Reflect diagonally"
+     (reflect-raster-plane-diagonally black-plane
+				      (point-column center) (point-row center) negate-p)
+     (image-changed)))
+
+(dw:define-command-menu-handler ("Reflect" bitmap-editor :draw
+				 :gesture (:left :shift-left :meta-left :meta-middle
+					   :right))
+				(&key (gesture :left))
+  (case gesture
+    (:left '(com-reflect-horizontally))
+    (:shift-left '(com-reflect-vertically))
+    (:meta-left '(com-reflect-diagonally))
+    (:meta-middle '(com-reflect-diagonally t))
+    (:right
+      (case dw:*command-menu-test-phase*
+	((t)
+	 (throw 'dw:command-menu-test-phase `(com-reflect-horizontally)))
+	((:documentation)
+	 (throw 'dw:command-menu-test-phase "Reflect about some axis"))
+	(otherwise
+	  (let ((default (center-point dw:*program*))
+		(axis :horizontal))
+	    (dw:with-typeout-window-for-accept-values
+	      (let ((rubout-handler nil)
+		    (dw::*accept-active* nil)
+		    (dw:*presentation-input-context* nil))
+		(dw:accepting-values ()
+		  (setq axis (accept '((alist-member :alist
+						     (("Horizonal (-)" . :horizontal)
+						      ("Vertical (|)" . :vertical)
+						      ("Diagonal (/)" . :diagonal)
+						      ("Diagonal (\\)" . :reverse-diagonal))))
+				     :prompt "Axis" :default axis))
+		  (case axis
+		    (:horizontal
+		      (setf (point-row default)
+			    (accept 'point-row :default (first default)
+				    :prompt "Row about which to reflect")))
+		    (:vertical
+		      (setf (point-column default)
+			    (accept 'point-column :default (second default)
+				    :prompt "Column about which to reflect")))
+		    (otherwise
+		      (setq default (accept 'point :default default
+					    :prompt "Point about which to reflect")))))))
+	    (case axis
+	      (:horizontal
+		`(com-reflect-horizontally ,(point-row default)))
+	      (:vertical
+		`(com-reflect-vertically ,(point-column default)))
+	      (:diagonal
+		`(com-reflect-diagonally nil ,default))
+	      (:reverse-diagonal
+		`(com-reflect-diagonally t ,default)))))))))
+
+(define-presentation-to-command-translator reflect-around-point
+    (point :gesture ()
+	   :documentation ((point &key mouse-char for-menu-p)
+			   (cond (for-menu-p
+				  "Reflect about this point")
+				 ((eql mouse-char #\mouse-r)
+				  "Menu of axes")
+				 (t
+				  (present-to-string 
+				    (reflect-around-point-internal point mouse-char)
+				    'cp:command)))))
+    (point &key mouse-char)
+  (reflect-around-point-internal point mouse-char))
+
+(defun reflect-around-point-internal (point mouse-char)
+  (let ((axis (case mouse-char
+		(#\Mouse-L :horizontal)
+		(#\Mouse-M :vertical)
+		(#\C-Mouse-L :diagonal)
+		(#\C-Mouse-M :reverse-diagonal)
+		(#\Mouse-R (if (or dw:*inside-handler-test-phase*
+				   dw:*inside-handler-documentation-phase*)
+			       :horizontal
+			       (dw:menu-choose '(("Horizonal (-)" . :horizontal)
+						 ("Vertical (|)" . :vertical)
+						 ("Diagonal (/)" . :diagonal)
+						 ("Diagonal (\\)" . :reverse-diagonal))
+					       :prompt "Axis about which to rotate")))
+		(otherwise :horizontal))))
+    (case axis
+      (:horizontal
+	`(com-reflect-horizontally ,(point-row point)))
+      (:vertical
+	`(com-reflect-vertically ,(point-column point)))
+      (:diagonal
+	`(com-reflect-diagonally nil ,point))
+      (:reverse-diagonal
+	`(com-reflect-diagonally t ,point)))))
+
+(defvar *alu-drawing-modes* '(:draw :erase :flip))
+(defvar *drawing-modes* (append *alu-drawing-modes* *non-alu-drawing-modes*))
+
+(define-presentation-type drawing-mode (nil &key (for-program-menu nil))
+   :expander `((dw:member-sequence ,*drawing-modes*))
+   :printer ((mode stream)
+	     (if for-program-menu
+		 (if (not (and (member mode *non-alu-drawing-modes*)
+			       (graphics:graphics-stream-p stream)))
+		     (format stream "~@(~A~) points" mode)
+		   (write-string (case mode
+				   (:foreground "Fore: ")
+				   (:background "Back: "))
+				 stream)
+		   (multiple-value-bind (left top)
+		       (send stream :read-cursorpos)
+		     (let ((right (+ left (floor (send stream :inside-size) 4)))
+			   (bottom (+ top (- (send stream :line-height)
+					     (send stream :vsp)))))
+		       (multiple-value-bind (size color-map value)
+			   (drawing-mode-color-parameters for-program-menu mode)
+			 (draw-image-color-rectangle (load-byte value 0 size) color-map size
+						     left top right bottom
+						     :stream stream))
+		       (graphics:draw-rectangle left top right bottom
+						:filled nil :stream stream)
+		       (send stream :set-cursorpos right top))))
+		 (princ (string-downcase mode) stream)))
+   :choose-displayer ((stream object query-identifier)
+		      (dw:accept-values-choose-from-sequence
+			stream *drawing-modes*
+			object query-identifier
+			:type 'drawing-mode))
+   )
+
+(defmethod (display-drawing-modes bitmap-editor) (stream)
+  (destructuring-bind (&key remaining-width remaining-height &allow-other-keys)
+     dw:*pane-sizing-options*
+    (format-item-list (if (and (member drawing-mode *non-alu-drawing-modes*)
+			       (null dw:*pane-sizing-options*))	;Sizing always the three.
+			  *non-alu-drawing-modes* *alu-drawing-modes*)
+		      :stream stream
+		      :presentation-type `((drawing-mode) :for-program-menu ,self)
+		      :fresh-line nil :optimal-number-of-rows 1 :additional-indentation 0
+		      :max-width remaining-width :max-height remaining-height))
+  (highlight-current-drawing-mode stream))
+
+(defun-in-flavor (set-drawing-mode bitmap-editor) (mode)
+  (unless (eq mode drawing-mode)
+    (rotatef drawing-mode mode)
+    (if (neq (member mode *non-alu-drawing-modes*)
+	     (member drawing-mode *non-alu-drawing-modes*))
+	(send dw:*program-frame* :redisplay-pane 'drawing-mode-menu t)
+	(highlight-current-drawing-mode))))
+
+(define-bitmap-editor-command (com-set-drawing-mode )
+    ((mode 'drawing-mode :default :draw :prompt "mode"))
+   (set-drawing-mode mode))
+
+(define-presentation-to-command-translator set-drawing-mode (drawing-mode) (mode)
+  `(com-set-drawing-mode ,mode))
+
+(define-presentation-to-command-translator toggle-drawing-mode
+					   (point :gesture :middle :menu nil)
+					   (ignore &key window)
+  (let ((bitmap-editor (dw:current-program :window window :type 'bitmap-editor :error-p nil)))
+    (when bitmap-editor
+      (let ((new-mode (case (bitmap-editor-drawing-mode bitmap-editor)
+			(:draw :erase)
+			(:erase :flip)
+			(:foreground :background)
+			(:background :foreground)
+			(otherwise :draw))))
+	`(com-set-drawing-mode ,new-mode)))))
+
+(define-presentation-type fore-back-drawing-mode ()
+   :abbreviation-for `(and drawing-mode (member . ,*non-alu-drawing-modes*))
+   :description "foreground or background")
+
+(define-bitmap-editor-command (com-set-pixel )
+    ((mode 'fore-back-drawing-mode
+	   :prompt "for mode"
+	   :default :foreground)
+     (value (raster-plane-element-type black-plane)
+	    :prompt "value"
+	    :default (if (eq mode :foreground) -1 0)))
+   (send (ecase mode
+	   (:foreground foreground-alu)
+	   (:background background-alu))
+	 :set-fill-data value)
+   (when (member drawing-mode *non-alu-drawing-modes*)
+     (send dw:*program-frame* :redisplay-pane 'drawing-mode-menu t)))
+
+(defun set-pixel-point-tester (ignore &key window &allow-other-keys)
+  (let ((program (dw:current-program :window window :type 'bitmap-editor :error-p nil)))
+    (and program
+	 (member (bitmap-editor-drawing-mode program) *non-alu-drawing-modes*))))
+
+(defun set-pixel-command (mode point &key window &allow-other-keys)
+  `(com-set-pixel ,mode
+		  ,(let ((program (dw:current-program :window window :type 'bitmap-editor)))
+		     (raster-plane-aref (bitmap-editor-black-plane program)
+					(point-column point) (point-row point)))))
+
+(define-presentation-to-command-translator set-foreground-pixel-point
+					   (point :gesture nil
+						  :documentation "Set foreground to this pixel"
+						  :tester set-pixel-point-tester)
+					   (&rest args)
+  (apply #'set-pixel-command :foreground args))
+
+(define-presentation-to-command-translator set-background-pixel-point
+					   (point :gesture nil
+						  :documentation "Set background to this pixel"
+						  :tester set-pixel-point-tester)
+					   (&rest args)
+  (apply #'set-pixel-command :background args))
+
+(defun drawing-mode-color-parameters (program mode)
+  (declare (values size color-map value))
+  (let ((black-plane (bitmap-editor-black-plane program)))
+    (values (array-element-byte-size
+	      (or (raster-plane-raster black-plane)
+		  (make-array 0 :element-type (raster-plane-element-type black-plane))))
+	    (raster-plane-color-map black-plane)
+	    (send (ecase mode
+		    (:foreground (bitmap-editor-foreground-alu program))
+		    (:background (bitmap-editor-background-alu program)))
+		  :fill-data))))
+
+(define-presentation-to-command-translator choose-new-pixel
+					   (fore-back-drawing-mode
+					     :gesture :menu
+					     :documentation "Choose pixel value")
+					   (mode &key window)
+  (if dw:*inside-handler-test-phase*
+      `(com-set-pixel ,mode)
+      (let ((value (multiple-value-bind (size color-map value)
+		       (drawing-mode-color-parameters
+			 (dw:current-program :window window :type 'bitmap-editor)
+			 mode)
+		     (choose-image-color size color-map :default value))))
+	(when value
+	  `(com-set-pixel ,mode ,value)))))
+
+(defundo draw-shape (program drawing-function points saved-subplane))
+
+(defmethod (undo-element-redo draw-shape) ()
+  (setq saved-subplane (draw-shape-for-undo program drawing-function points saved-subplane)))
+
+(defmethod (undo-element-undo draw-shape) ()
+  (draw-subplane-for-undo program saved-subplane nil))
+
+(defmethod (draw-shape-for-undo bitmap-editor) (drawing-function points saved-subplane)
+  (unless saved-subplane
+    (setq saved-subplane (raster-plane-empty-copy black-plane)))
+  (multiple-value-bind (min-x min-y max-x max-y)
+      (loop for index below (length points) by 2
+	    minimize (elt points index) into min-x
+	    maximize (elt points index) into max-x
+	    minimize (elt points (1+ index)) into min-y
+	    maximize (elt points (1+ index)) into max-y
+	    finally (return (values min-x min-y max-x max-y)))
+    (multiple-value-bind (raster origin-x origin-y)
+	(decode-raster-plane black-plane)
+      (when raster
+	(copy-raster-to-raster-plane raster saved-subplane
+				     :from-x (- min-x origin-x) :from-y (- min-y origin-y)
+				     :to-x min-x :to-y min-y
+				     :width (1+ (- max-x min-x))
+				     :height (1+ (- max-y min-y))))))
+  (let ((alu (get-drawing-alu drawing-mode)))
+    (case drawing-function
+      (graphics:draw-rectangle
+	(raster-plane-draw-rectangle black-plane (elt points 0) (elt points 1)
+						 (elt points 2) (elt points 3)
+						 alu))
+      (graphics:draw-line	;Special case
+	(raster-plane-draw-line black-plane (elt points 0) (elt points 1)
+					    (elt points 2) (elt points 3)
+					    alu))
+      (otherwise
+	(with-output-to-raster-plane (stream black-plane :alu alu)
+	  (funcall drawing-function points :stream stream)))))
+  (image-changed)
+  saved-subplane)
+
+;;; These next two are pretty worthless since the resolution isn't great enough to get
+;;; anything decent without hand pixel hacking.  But they were in the old fed.
+(define-two-point-command (com-draw-line :menu-accelerator t :menu-level :draw)
+			  ((point 'point :prompt "first point")
+			   (new-point 'point :prompt "draw line from here to"))
+  (do-undoably 'draw-shape "Draw line"
+	       'graphics:draw-line (list (point-column point) (point-row point)
+					 (point-column new-point) (point-row new-point))))
+
+;;; This could be on the :draw-line gesture, but that conflicts with the FED bucky drawing
+;;; modes.  Perhaps some rethinking is in order?
+(define-presentation-to-command-translator draw-line-from-point
+					   (point :gesture ()
+						  :documentation "Draw line starting here")
+					   (point)
+  `(com-draw-line ,point))
+
+(define-bitmap-editor-command (com-draw-spline :menu-accelerator t :menu-level :draw)
+			      ((points 'point-sequence :prompt "points"
+						       :provide-default nil))
+   (unless (> (length points) 2)
+     (dw:command-error "You must give at least three points for a spline."))
+   (do-undoably 'draw-shape "Draw spline"
+		'graphics:draw-cubic-spline (loop for point in points
+						  collect (point-column point)
+						  collect (point-row point))))
+
+(define-two-point-command (com-draw-rectangle :menu-accelerator "Draw Rect" :menu-level :draw)
+			  ((point 'point :prompt "first point")
+			   (new-point 'point :prompt "draw rectangle from here to"))
+  (do-undoably 'draw-shape "Draw rectangle"
+	       'graphics:draw-rectangle (list (point-column point) (point-row point)
+					      (point-column new-point) (point-row new-point))))
+
+(define-presentation-to-command-translator draw-rectangle-from-point
+   (point :gesture ()
+	  :documentation "Draw rectangle starting here")
+   (point)
+  `(com-draw-rectangle ,point))
+
+(define-bitmap-editor-command (com-draw-polygon :menu-accelerator nil :menu-level :draw)
+			      ((points 'point-sequence :prompt "points"
+						       :provide-default nil))
+   (unless (> (length points) 2)
+     (dw:command-error "You must give at least three points for a polygon."))
+   (do-undoably 'draw-shape "Draw polygon"
+		'graphics:draw-polygon (loop for point in points
+					     collect (point-column point)
+					     collect (point-row point))))
+
+(define-bitmap-editor-command (com-flood-region :menu-accelerator "Flood" :menu-level :draw)
+    ((seed-point 'point :prompt "seed point"))
+   (let ((flood (flood-raster-plane black-plane
+				    (point-column seed-point) (point-row seed-point)
+				    (if (member drawing-mode *alu-drawing-modes*)
+					boole-xor (get-drawing-alu drawing-mode)))))
+     (unless flood
+       (dw:command-error "Region is not closed"))
+     (do-undoably 'draw-subplane "Flood region" (make-flood-subplane black-plane flood) nil)))
+
+(define-presentation-to-command-translator flood-from-point
+   (point :gesture () :documentation "Flood region containing this point")
+   (point)
+  `(com-flood-region ,point))
+
+;;;; Registers
+
+(defflavor register-plane
+	((unique-id 1)
+	 (empty-p t)
+	 left top right bottom
+	 )
+	(image-raster-plane)
+  :initable-instance-variables
+  :readable-instance-variables
+  (:writable-instance-variables empty-p)
+  (:constructor make-register-plane (unique-id &optional (element-type 'bit))))
+
+(defmethod (register-plane-edges register-plane) ()
+  (values left top right bottom))
+
+(defmethod (register-plane-set-edges register-plane) (new-left new-top new-right new-bottom)
+  (setq left new-left
+	top new-top
+	right new-right
+	bottom new-bottom))
+
+(defmethod (clear-register-plane register-plane) ()
+  (clear-raster-plane self)
+  (setq empty-p t))
+
+(defmethod (draw-register-plane register-plane) (stream)
+  (send stream :clear-region left top right bottom)
+  (dw:with-output-as-presentation (:object self :type 'register-plane
+				   :stream stream
+				   :displayed-box (dw:make-box left top right bottom)
+				   :highlighting-boxes `(:boxes ((,left ,top ,right ,bottom)))
+				   :single-box t)
+    (unless empty-p
+      (raster-plane-draw-filled-area self left top right bottom :stream stream))))
+
+(define-presentation-type register-plane ()
+   :no-deftype t
+   :parser ((stream) (loop doing (dw:read-char-for-accept stream)))
+   :printer ((register stream)
+	     (princ (register-plane-unique-id register) stream)))
+
+(compile-flavor-methods register-plane)
+
+(defmethod (draw-registers bitmap-editor) (pane)
+  (when (and register-width register-height)
+    (multiple-value-bind (nil nil width height)
+	(send pane :visible-cursorpos-limits)
+      (let* ((ncols (floor (1- width) (+ register-width 2)))
+	     (nrows (floor (1- height) (+ register-height 2)))
+	     (left (floor (- width (1+ (* ncols (+ register-width 2)))) 2))
+	     (top (floor (- height (1+ (* nrows (+ register-height 2)))) 2)))
+	(let ((olength (length registers))
+	      (nlength (* nrows ncols)))
+	  (when (> nlength olength)
+	    (adjust-array registers nlength)
+	    (let ((type (raster-plane-element-type black-plane)))
+	      (loop for i from olength below nlength do
+		(setf (aref registers i) (make-register-plane i type))))))
+	(let ((right (+ left (* ncols (+ register-width 2)))))
+	  (loop repeat (1+ nrows) for y from top by (+ register-height 2) do
+	    (graphics:draw-line left y right y :stream pane)))
+	(let ((bottom (+ top (* nrows (+ register-height 2)))))
+	  (loop repeat (1+ ncols) for x from left by (+ register-width 2) do
+	    (graphics:draw-line x top x bottom :stream pane)))
+	(loop for y from top by (+ register-height 2)
+	      for j below nrows do
+	      (loop for x from left by (+ register-width 2)
+		    for i below ncols do
+		(let ((register (aref registers (+ i (* j ncols)))))
+		  (register-plane-set-edges register (+ x 2) (+ y 2)
+					     (+ x register-width 1) (+ y register-height 1))
+		  (draw-register-plane register pane))))))))
+
+(defundo change-register (program register source destination
+				  saved-register saved-destination))
+
+(defmethod (undo-element-redo change-register) ()
+  (multiple-value-setq (saved-register saved-destination)
+    (change-register program register source destination saved-register saved-destination)))
+
+(defmethod (undo-element-undo change-register) ()
+  (unchange-register program register source destination
+		     saved-register saved-destination))
+
+(defmethod (change-register bitmap-editor) (register source destination
+						     saved-register saved-destination)
+  (when destination
+    (unless saved-destination
+      (setq saved-destination (raster-plane-empty-copy black-plane)))
+    (ecase destination
+      ((:black)
+       (copy-raster-planes black-plane saved-destination)
+       (copy-raster-planes register black-plane :alu boole-ior)
+       (image-changed))
+      ((:gray)
+       (copy-raster-planes gray-plane saved-destination)
+       (copy-raster-planes register gray-plane :alu boole-ior)
+       (image-changed :set-modified nil))))
+  (when source
+    (if (register-plane-empty-p register)
+	(setq saved-register :clear)
+      (unless saved-register
+	(setq saved-register (raster-plane-empty-copy register)))
+      (copy-raster-planes register saved-register))
+    (unless (equal (raster-plane-element-type register)
+		   (raster-plane-element-type black-plane))
+      (let ((new-register (make-register-plane (register-plane-unique-id register)
+					       (raster-plane-element-type black-plane))))
+	(multiple-value-bind (left top right bottom)
+	    (register-plane-edges register)
+	  (register-plane-set-edges new-register left top right bottom))
+	(nsubstitute new-register register registers)
+	(structure-forward register new-register)	;For undo history
+	(setq register new-register)))
+    (setf (register-plane-empty-p register) nil)
+    (setf (raster-plane-color-map register) (raster-plane-color-map black-plane))
+    (ecase source
+      ((:clear) (clear-register-plane register))
+      ((:black) (copy-raster-planes black-plane register))
+      ((:gray) (copy-raster-planes gray-plane register)))
+    (draw-register-plane register (dw:get-program-pane 'registers)))
+  (values saved-register saved-destination))
+
+(defmethod (unchange-register bitmap-editor) (register source destination
+						       saved-register saved-destination)
+  (when destination
+    (ecase destination
+      ((:black)
+       (copy-raster-planes saved-destination black-plane)
+       (image-changed))
+      ((:gray)
+       (copy-raster-planes saved-destination gray-plane)
+       (image-changed :set-modified nil))))
+  (when source
+    (if (eq saved-register :clear)
+	(clear-register-plane register)
+      (copy-raster-planes saved-register register)
+      (setf (register-plane-empty-p register) nil))
+    (draw-register-plane register (dw:get-program-pane 'registers))))
+
+(define-bitmap-editor-command (com-retrieve-register-into-black )
+			      ((register 'register-plane))
+   (do-undoably 'change-register "Retrieve register" register nil :black))
+
+(define-bitmap-editor-command (com-retrieve-register-into-gray ) ((register 'register-plane))
+   (do-undoably 'change-register "Retrieve register" register nil :gray))
+
+(define-bitmap-editor-command (com-store-black-into-register ) ((register 'register-plane))
+   (do-undoably 'change-register "Store register" register :black nil))
+
+(define-bitmap-editor-command (com-store-gray-into-register ) ((register 'register-plane))
+   (do-undoably 'change-register "Store register" register :gray nil))
+
+(define-bitmap-editor-command (com-clear-register ) ((register 'register-plane))
+   (do-undoably 'change-register "Clear register" register :clear nil))
+
+(define-presentation-to-command-translator register-retrieve-black
+					   (register-plane
+					     :gesture ()
+					     :tester ((register)
+						      (not
+							(register-plane-empty-p register))))
+					   (register)
+  `(com-retrieve-register-into-black ,register))
+
+(define-presentation-to-command-translator register-retrieve-gray
+					   (register-plane
+					     :gesture ()
+					     :tester ((register)
+						      (not
+							(register-plane-empty-p register))))
+					   (register)
+  `(com-retrieve-register-into-gray ,register))
+
+(define-presentation-to-command-translator register-store-black
+					   (register-plane :gesture ())
+					   (register)
+  `(com-store-black-into-register ,register))
+
+(define-presentation-to-command-translator register-store-gray
+					   (register-plane :gesture ())
+					   (register)
+  `(com-store-gray-into-register ,register))
+
+(define-presentation-to-command-translator register-retrieve-or-store
+					   (register-plane :gesture :select :menu ())
+					   (register)
+  (if (register-plane-empty-p register)
+      `(com-store-black-into-register ,register)
+      `(com-retrieve-register-into-black ,register)))
+
+(define-presentation-to-command-translator register-clear
+					   (register-plane :gesture ())
+					   (register)
+  `(com-clear-register ,register))
+
+;;;; Visible bounding box stuff
+
+(defflavor bounding-box-outline
+	(left top
+	 width height
+	 (baseline-height nil)
+	 (thickness 4) (scale 1)
+	 (components '(:left :top :right :bottom))
+	 (movable-components '(:left :top :right :bottom))
+	 (presentation nil))
+	()
+  :initable-instance-variables
+  :writable-instance-variables)
+
+(defmethod (bounding-box-outline-edges bounding-box-outline) ()
+  (values left top (+ left width) (+ top height)))
+
+(defmethod (bounding-box-outline-set-edges bounding-box-outline) (new-left new-top
+								  right bottom)
+  (setq left new-left top new-top
+	width (- right left) height (- bottom top)))
+
+(defmethod (bounding-box-outline-position bounding-box-outline) ()
+  (values left top))
+
+(defmethod (bounding-box-outline-set-position bounding-box-outline) (new-left new-top)
+  (setq left new-left top new-top))
+
+(defmethod (bounding-box-outline-size bounding-box-outline) ()
+  (values width height))
+
+(define-presentation-type bounding-box-edge ()
+   )
+
+(defmethod (bounding-box-outline-draw-edge bounding-box-outline) (edge stream)
+  (dw:with-output-as-presentation (:object edge :type 'bounding-box-edge :stream stream)
+    (ecase edge
+      (:left
+	(send stream :draw-rectangle thickness (* (or baseline-height height) scale)
+	      (- (* left scale) thickness) (* top scale)
+	      :flip))
+      (:top
+	(send stream :draw-rectangle (+ (* width scale) (* thickness 2)) thickness
+	      (- (* left scale) thickness) (- (* top scale) thickness)
+	      :flip))
+      (:right
+	(send stream :draw-rectangle thickness (* (or baseline-height height) scale)
+	      (* (+ left width) scale) (* top scale)
+	      :flip))
+      (:bottom
+	(send stream :draw-rectangle (+ (* width scale) (* thickness 2)) thickness
+	      (- (* left scale) thickness) (* (+ top height) scale)
+	      :flip))
+      (:baseline
+	(unless (= height baseline-height)	;Don't overwrite.
+	  (send stream :draw-rectangle (+ (* width scale) (* thickness 2)) thickness
+		(- (* left scale) thickness) (* (+ top baseline-height) scale)
+		:flip)))
+      (:middle 
+	(send stream :draw-rectangle thickness (* (or baseline-height height) scale)
+	      (* (+ left (floor width 2)) scale) (* top scale)
+	      :flip)))))
+
+(defsubst-in-flavor (bounding-box-draw-internal bounding-box-outline) (stream)
+  (dolist (edge components)
+    (bounding-box-outline-draw-edge self edge stream)))
+
+(defmethod (bounding-box-outline-draw bounding-box-outline) (stream)
+  (setq presentation (dw:with-output-as-presentation (:object self :type (type-of self)
+						      :stream stream)
+		       (bounding-box-draw-internal stream))))
+
+(defmethod (bounding-box-outline-erase bounding-box-outline) (stream)
+  (when presentation
+    (dw:erase-displayed-presentation presentation stream)
+    (setq presentation nil)))
+
+(defundo set-scale (program scale center-x center-y old-scale old-center-x old-center-y))
+
+(defmethod (undo-element-redo set-scale) ()
+  (multiple-value-setq (old-scale old-center-x old-center-y)
+    (set-scale-internal program scale center-x center-y)))
+
+(defmethod (undo-element-undo set-scale) ()
+  (set-scale-internal program old-scale old-center-x old-center-y))
+
+(defmethod (set-scale-internal bitmap-editor) (new-scale new-center-x new-center-y)
+  (let ((old-scale scale))
+    (multiple-value-bind (old-center-x old-center-y)
+	(multiple-value-bind (left top right bottom)
+	    (graphic-input:grid-redisplay-limits (dw:get-program-pane 'grid) old-scale)
+	  (values (- (floor (+ left right) 2) displayed-x-offset)
+		  (- (floor (+ top bottom) 2) displayed-y-offset)))
+      (unless new-center-x
+	(setq new-center-x old-center-x))
+      (unless new-center-y
+	(setq new-center-y old-center-y))
+      (unless (and (= scale new-scale)
+		   (= new-center-x old-center-x)
+		   (= new-center-y old-center-y))
+	(setq scale new-scale)
+	(setf (bounding-box-outline-scale bounding-box) scale)
+	(multiple-value-bind (new-displayed-x-offset new-displayed-y-offset)
+	    (multiple-value-bind (left top right bottom)
+		(graphic-input:grid-redisplay-limits (dw:get-program-pane 'grid) new-scale)
+	      (values (- (floor (- right left) 2) new-center-x)
+		      (- (floor (- bottom top) 2) new-center-y)))
+	  (multiple-value-bind (x y)
+	      (bounding-box-outline-position bounding-box)
+	    (incf x (- new-displayed-x-offset displayed-x-offset))
+	    (incf y (- new-displayed-y-offset displayed-y-offset))
+	    (bounding-box-outline-set-position bounding-box x y))
+	  (setq displayed-x-offset new-displayed-x-offset
+		displayed-y-offset new-displayed-y-offset))
+	(maxf grid-redisplay-degree redisplay-degree-complete))
+      (values old-scale old-center-x old-center-y))))
+
+(define-bitmap-editor-command (com-set-scale :menu-accelerator t :menu-level :draw)
+			      ((new-scale '((integer (0)))
+					  :prompt "new scale factor"
+					  :default 10 :confirm t))
+   (do-undoably 'set-scale "Set scale" new-scale))
+
+(define-bitmap-editor-command (com-zoom-by-factor )
+			      ((factor 'number
+				       :prompt "factor"
+				       :documentation "factor by which to alter scale"
+				       :default 2 :confirm t))
+   (do-undoably 'set-scale "Zoom by factor" (round (* scale factor))))
+
+(define-bitmap-editor-command (com-zoom/expand
+				:menu-accelerator "Zoom/Expand"
+				:menu-level :draw
+				:menu-documentation "Make region occupy whole window")
+    (&key (start-x 'number)
+	  (start-y 'number))
+   (multiple-value-bind (left top right bottom)
+       (mouse-input-grid-rectangle :start-x start-x :start-y start-y)
+     (do-undoably 'set-scale "Zoom/Expand"
+		  (multiple-value-bind (gleft gtop gright gbottom)
+		      (graphic-input:grid-redisplay-limits (dw:get-program-pane 'grid) 1)
+		    (max 1 (min (floor (- gright gleft) (- right left))
+				(floor (- gbottom gtop) (- bottom top)))))
+		  (floor (+ left right) 2) (floor (+ top bottom) 2))))
+
+(defvar-resettable *bounding-box-open* nil)
+
+(defmacro with-bounding-box-open (&body body)
+  `(let ((grid (dw:get-program-pane 'grid))
+	 (me-p (null *bounding-box-open*))
+	 (*bounding-box-open* t))
+     (when me-p
+       (dw:remove-window-typeout-window grid :prompt-p nil)
+       (bounding-box-outline-erase bounding-box grid))
+     (multiple-value-prog1
+       (progn . ,body)
+       (when me-p
+	 (bounding-box-outline-draw bounding-box grid)))))
+
+(defun-in-flavor (move-view-internal bitmap-editor) (dx dy)
+  (incf displayed-x-offset dx)
+  (incf displayed-y-offset dy)
+  (with-bounding-box-open
+    (multiple-value-bind (x y)
+	(bounding-box-outline-position bounding-box)
+      (incf x dx)
+      (incf y dy)
+      (bounding-box-outline-set-position bounding-box x y)))
+  (maxf grid-redisplay-degree redisplay-degree-all))
+
+(defun-in-flavor (move-view-undoably bitmap-editor) (dx dy)
+  (undoably (dx dy) "Move view"
+    (move-view-internal dx dy)
+    (move-view-internal (- dx) (- dy))))
+
+(define-two-point-command (com-move-view :menu-accelerator t :menu-level :draw)
+			  ((point 'point :prompt "point to move")
+			   (new-point 'point :prompt "move this point to"))
+   (move-view-undoably (- (point-column new-point) (point-column point))
+		       (- (point-row new-point) (point-row point))))
+
+(defun-in-flavor (center-view bitmap-editor) (&key undoably)
+  (multiple-value-bind (bb-left bb-top bb-right bb-bottom)
+      (bounding-box-outline-edges bounding-box)
+    (multiple-value-bind (grid-left grid-top grid-right grid-bottom)
+	(graphic-input:grid-redisplay-limits (dw:get-program-pane 'grid) scale)
+      (funcall (if undoably #'move-view-undoably #'move-view-internal)
+	       (- (floor (+ grid-left grid-right) 2)
+		  (floor (+ bb-left bb-right) 2))
+	       (- (floor (+ grid-top grid-bottom) 2)
+		  (floor (+ bb-top bb-bottom) 2))))))
+
+(define-bitmap-editor-command (com-center-view :menu-accelerator t :menu-level :draw)
+			      ()
+   (center-view :undoably t))
+
+(defmethod (bounding-box-outline-drag-box bounding-box-outline)
+	   (stream &key start-x start-y original-x original-y)
+  ;; original-x/y is the point we are moving; start-x/y is the mouse position
+  (multiple-value-bind (x y)
+      (send stream :mouse-position)
+    (when (null start-x)
+      (setq start-x x))
+    (when (null start-y)
+      (setq start-y y)))
+  (when (null original-x)
+    (setq original-x start-x))
+  (when (null original-y)
+    (setq original-y start-y))
+  (let ((dx (round (- start-x original-x) scale))
+	(dy (round (- start-y original-y) scale))
+	(draw-dx 0)
+	(draw-dy 0))
+    (flet ((draw (stream)
+	     (letf ((left (+ left draw-dx))
+		    (top (+ top draw-dy)))
+	       (bounding-box-draw-internal stream))))
+      (dw:with-output-recording-disabled (stream)
+	(unwind-protect
+	    (dw:tracking-mouse (stream :whostate "Moving bounding box")
+	      (:mouse-motion-hold (x y)
+	       (let ((ndx (round (- x original-x) scale))
+		     (ndy (round (- y original-y) scale)))
+		 (unless (and (= ndx draw-dx) (= ndy draw-dy))
+		   (draw stream)
+		   (setq dx ndx dy ndy)
+		   (setq draw-dx dx draw-dy dy)
+		   (draw stream))))
+	      (:release-mouse () (return)))
+	  (unless (and (zerop draw-dx) (zerop draw-dy))
+	    (draw stream)
+	    (setq draw-dx 0 draw-dy 0)
+	    (draw stream)))))
+    (incf left dx)
+    (incf top dy))
+  (dw:erase-displayed-presentation presentation stream)
+  (send stream :output-for-re-presentation presentation #'bounding-box-draw-internal stream))
+
+(defmethod (bounding-box-outline-drag-edge bounding-box-outline)
+	   (edge stream &key start-x start-y original-x original-y)
+  (multiple-value-bind (x y)
+      (send stream :mouse-position)
+    (when (null start-x)
+      (setq start-x x))
+    (when (null start-y)
+      (setq start-y y)))
+  (when (null original-x)
+    (setq original-x start-x))
+  (when (null original-y)
+    (setq original-y start-y))
+  (let* ((delta (round (ecase edge
+			 ((:left :right) (- start-x original-x))
+			 ((:top :bottom :baseline) (- start-y original-y)))
+		       scale))
+	 (draw-delta 0)
+	 (horizontal-p (ecase edge
+			 ((:left :right) t)
+			 ((:top :bottom :baseline) nil)))
+	 (drawing-edge (case edge
+			 (:bottom
+			   (if baseline-height :below-baseline :bottom))
+			 (:baseline
+			   :bottom)
+			 (otherwise
+			   edge)))
+	 ;; Draw the perpendicular edges, with additional clipping, and the edge in question.
+	 (perpendicular (intersection components
+				      (if horizontal-p '(:top :bottom :baseline)
+					  '(:left :right)))))
+    (flet ((draw (stream &optional (delta draw-delta))
+	     (if (zerop delta)
+		 (with-stack-list (just-this edge)
+		   (letf ((components just-this))
+		     (bounding-box-draw-internal stream)))
+		 (let ((draw-left left) (draw-top top)
+		       (draw-right (+ left width)) (draw-bottom (+ top height))
+		       (parallel edge))
+		   (ecase drawing-edge
+		     (:left
+		       (if (minusp delta)
+			   (psetq draw-left (+ draw-left delta)
+				  draw-right draw-left)
+			   (setq draw-right (+ draw-left delta)
+				 parallel :right)))
+		     (:top
+		       (if (minusp delta)
+			   (psetq draw-top (+ draw-top delta)
+				  draw-bottom draw-top)
+			   (setq draw-bottom (+ draw-top delta)
+				 parallel :bottom)))
+		     (:right
+		       (if (plusp delta)
+			   (psetq draw-right (+ draw-right delta)
+				  draw-left draw-right)
+			   (setq draw-left (+ draw-right delta)
+				 parallel :left)))
+		     (:bottom
+		       (if (plusp delta)
+			   (psetq draw-bottom (+ draw-bottom delta)
+				  draw-top draw-bottom)
+			   (setq draw-top (+ draw-bottom delta)
+				 parallel :top)))
+		     (:below-baseline
+		       (setq perpendicular nil
+			     parallel :bottom)))
+		   (with-stack-list* (edges-to-draw parallel perpendicular)
+		     (letf ((left draw-left)
+			    (top draw-top)
+			    (width (- draw-right draw-left))
+			    (height (- draw-bottom draw-top))
+			    (components edges-to-draw))
+		       (bounding-box-draw-internal stream)))))))
+      (dw:with-output-recording-disabled (stream)
+	(unwind-protect
+	    (dw:tracking-mouse (stream :whostate "Moving bounding box")
+	      (:mouse-motion-hold (x y)
+	        (let ((ndelta (if horizontal-p
+				  (round (- x original-x) scale)
+				  (round (- y original-y) scale))))
+		  (unless (= ndelta draw-delta)
+		    (draw stream)
+		    (setq delta ndelta)
+		    (setq draw-delta delta)
+		    (draw stream))))
+	      (:release-mouse () (return)))
+	    (unless (zerop draw-delta)
+	      (draw stream)
+	      (draw stream 0)))))
+    (ecase edge
+      (:left
+	(incf left delta)
+	(decf width delta))
+      (:top
+	(incf top delta)
+	(decf height delta))
+      (:right
+	(incf width delta))
+      (:bottom
+	(incf height delta))
+      (:baseline
+	(incf baseline-height delta))))
+  ;; XOR while moving the edge isn't perfect, so always redraw the whole thing when done
+  ;; to make sure there aren't any turds.
+  (dw:erase-displayed-presentation presentation stream)
+  (send stream :output-for-re-presentation presentation #'bounding-box-draw-internal stream))
+
+(defmethod (note-bounding-box-move bitmap-editor) ()
+  (multiple-value-bind (new-x-offset new-y-offset)
+      (bounding-box-outline-position bounding-box)
+    (let ((dx (- displayed-x-offset new-x-offset))
+	  (dy (- displayed-y-offset new-y-offset)))
+      (unless (and (zerop dx) (zerop dy))
+	;; The net effect of this is no change in the grid display, since 0,0 is moved by
+	;; the same amount as its displayed position in the window.  But the sample shifts.
+	(setq displayed-x-offset new-x-offset
+	      displayed-y-offset new-y-offset)
+	(flet ((move-one-plane (plane)
+		 (raster-plane-increment-origin plane dx dy)))
+	  (move-one-plane black-plane)
+	  (move-one-plane gray-plane)
+	  (map () #'move-one-plane registers))
+	(maxf sample-redisplay-degree redisplay-degree-complete)))))
+
+(defun-in-flavor (drag-bounding-box-command bitmap-editor) (part &rest position-args)
+  (multiple-value-bind (old-left old-top old-right old-bottom)
+      (bounding-box-outline-edges bounding-box)
+    (let ((old-baseline (bounding-box-outline-baseline-height bounding-box)))
+      (let ((grid (dw:get-program-pane 'grid)))
+	(if (eq part :box)
+	    (apply #'bounding-box-outline-drag-box bounding-box grid position-args)
+	    (apply #'bounding-box-outline-drag-edge bounding-box part grid position-args)))
+      (multiple-value-call #'undo-save 'set-bounding-box-edges "Move bounding box"
+			   (bounding-box-outline-edges bounding-box)
+			   (bounding-box-outline-baseline-height bounding-box)
+			   old-left old-top old-right old-bottom old-baseline)))
+  (note-bounding-box-move self))
+
+(define-bitmap-editor-command (com-move-bounding-box )
+			      ((part '((member :box :left :top :right :bottom :baseline)))
+			       &key
+			       (start-x 'number) (start-y 'number))
+   (drag-bounding-box-command part :start-x start-x :start-y start-y))
+
+;;; Click left moves whole or piece, depending on whether subpiece is sensitive.
+(define-presentation-to-command-translator move-box
+    (bounding-box-outline
+      :documentation "Move bounding box while mouse is held down.")
+    (ignore &key x y)
+  `(com-move-bounding-box :box :start-x ,x :start-y ,y))
+
+;;; Click shift-left unconditionally moves the whole
+(define-presentation-to-command-translator move-box-shift
+    (bounding-box-outline
+      :gesture :shift-left
+      :documentation "Move bounding box while mouse is held down.")
+    (ignore &key x y)
+   `(com-move-bounding-box :box :start-x ,x :start-y ,y))
+
+;;; This sometimes shadows one of the above by applying to deeper presentation
+(define-presentation-to-command-translator move-box-edge
+    (bounding-box-edge
+      :tester ((edge &key presentation)
+	       (and presentation
+		    (let ((superior (dw:presentation-superior presentation)))
+		      (and superior
+			   (let ((bounding-box (dw:presentation-object superior)))
+			     (and (typep bounding-box 'bounding-box-outline)
+				  (member edge (bounding-box-outline-movable-components
+						 bounding-box))))))))
+      :documentation "Move this edge while mouse is held down.")
+    (edge &key x y)
+   `(com-move-bounding-box ,edge :start-x ,x :start-y ,y))
+
+(define-bitmap-editor-command (com-snap-bounding-box )
+			      ((part '((member :box :left :top :right :bottom :baseline)))
+			       &key
+			       (original-x 'number) (original-y 'number)
+			       (start-x 'number) (start-y 'number))
+   (drag-bounding-box-command part :original-x original-x :original-y original-y
+				   :start-x start-x :start-y start-y))
+
+(defvar *bounding-box-snap-distance* 4)
+
+(defmethod (find-closest-bounding-box-edge bitmap-editor) (point)
+  (multiple-value-bind (left top right bottom)
+      (bounding-box-outline-edges bounding-box)
+    (let* ((px (+ (point-column point) displayed-x-offset))
+	   (py (+ (point-row point) displayed-y-offset))
+	   (x-to-move (cond (( (- left *bounding-box-snap-distance*) px left) :left)
+			    (( right px (+ right *bounding-box-snap-distance*)) :right)))
+	   (y-to-move (cond (( (- top *bounding-box-snap-distance*) py top) :top)
+			    (( bottom py (+ bottom *bounding-box-snap-distance*)) :bottom))))
+      (unless (or x-to-move y-to-move)
+	(setq x-to-move (cond (( (abs (- px right)) *bounding-box-snap-distance*) :right)
+			      (( (abs (- px left)) *bounding-box-snap-distance*) :left))
+	      y-to-move (cond (( (abs (- py bottom)) *bounding-box-snap-distance*) :bottom)
+			      (( (abs (- py top)) *bounding-box-snap-distance*) :top))))
+      (when (or x-to-move y-to-move)
+	(let ((movable (bounding-box-outline-movable-components bounding-box)))
+	  (let ((bb-x (ecase x-to-move
+			((nil) px)
+			(:left left)
+			(:right right)))
+		(bb-y (ecase y-to-move
+			((nil) py)
+			(:top top)
+			(:bottom bottom))))
+	    (let ((edge (if (and x-to-move y-to-move) :box (or x-to-move y-to-move))))
+	      (unless (member edge movable)
+		(setq edge :box))
+	      (values edge (* bb-x scale) (* bb-y scale)))))))))
+
+(define-presentation-to-command-translator snap-box-here
+   (point
+     :gesture :shift-middle
+     :documentation ((point &key window)
+		     (let* ((program (dw:current-program :window window :type 'bitmap-editor))
+			    (edge (find-closest-bounding-box-edge program point)))
+		       (format nil "Move the bounding box~@[ ~(~A~)~] here and drag while held"
+			       (and (neq edge :box) edge)))))
+   (point &key window x y)
+  (let ((program (dw:current-program :window window :type 'bitmap-editor :error-p nil)))
+    (when program
+      (multiple-value-bind (edge ex ey)
+	  (find-closest-bounding-box-edge program point)
+	(when edge
+	  `(com-snap-bounding-box ,edge :original-x ,ex :original-y ,ey
+					:start-x ,x :start-y ,y))))))
+
+(defun-in-flavor (reset-bounding-box-size-and-scale bitmap-editor)
+		 (width height &optional (baseline nil) (scale-factor 1))
+  (clear-raster-plane black-plane)
+  (image-changed :complete-redisplay t)
+  (let ((grid (dw:get-program-pane 'grid)))
+    (dw:remove-window-typeout-window grid :prompt-p nil)
+    (multiple-value-bind (inside-left inside-top inside-right inside-bottom)
+	(send grid :visible-cursorpos-limits)
+      (setq scale (max 4 (min 16
+			      (floor (- inside-right inside-left 10)
+				     (* width scale-factor))
+			      (floor (- inside-bottom inside-top 10)
+				     (* height scale-factor))))
+	    displayed-x-offset (max 0
+				    (- (floor (- inside-right inside-left) (* scale 2))
+				       (floor width 2)))
+	    displayed-y-offset (max 0
+				    (- (floor (- inside-bottom inside-top) (* scale 2))
+				       (floor height 2)))))
+    (setf (bounding-box-outline-scale bounding-box) scale)
+    (setf (bounding-box-outline-left bounding-box) displayed-x-offset)
+    (setf (bounding-box-outline-top bounding-box) displayed-y-offset)
+    (setf (bounding-box-outline-width bounding-box) width)
+    (setf (bounding-box-outline-height bounding-box) height)
+    (setf (bounding-box-outline-baseline-height bounding-box) baseline)
+    ;; Recompute constraints.
+    (send dw:*program-frame* :set-configuration (send dw:*program-frame* :configuration))
+    (redisplay-grid self grid))
+  (let ((registers (dw:get-program-pane 'registers :if-does-not-exist nil)))
+    (when registers
+      (multiple-value-bind (inside-left inside-top inside-right inside-bottom)
+	  (send registers :visible-cursorpos-limits)
+	(setq register-width (floor (- inside-right inside-left 10)
+				    (min 10
+					 (max 4 (floor (- inside-right inside-left) width))))
+	      register-height (floor (- inside-bottom inside-top 10)
+				     (min 2 (max 1 (floor (- inside-bottom inside-top)
+							  height))))))
+      (send dw:*program-frame* :redisplay-pane registers t))))
+
+(compile-flavor-methods bounding-box-outline)
+
+(dw:define-program-framework standalone-bitmap-editor
+  :inherit-from (bitmap-editor dw:help-program)
+  :pretty-name "Bitmap editor"
+  :select-key #\}
+  :command-definer t
+  :top-level (standalone-bitmap-editor-top-level)
+  :help standalone-bitmap-editor-help
+  :command-table (:inherit-from '("bitmap-editor" "help-program" "undo-program"))
+  :panes
+  ((title :title :height-in-lines 1
+	  :redisplay-function 'dw:help-program-draw-title :redisplay-after-commands nil)
+   (sample :display :redisplay-after-commands t :incremental-redisplay :own-redisplayer
+		    :redisplay-function 'redisplay-sample
+		    :cursor-viewport-even-number-of-lines nil
+		    :margin-components `dw:((margin-ragged-borders )
+					    (margin-scroll-bar :history-noun "bitmap"
+							       :visibility :if-needed)
+					    (margin-scroll-bar :margin :bottom
+							       :history-noun "bitmap"
+							       :visibility :if-needed)
+					    (margin-white-borders :thickness 2)))
+   (registers :display :incremental-redisplay nil :redisplay-after-commands nil
+	      :redisplay-function 'draw-registers)
+   (grid :display :typeout-window t
+	 :redisplay-after-commands t :incremental-redisplay :own-redisplayer
+	 :redisplay-function 'redisplay-grid
+	 :cursor-viewport-even-number-of-lines nil
+	 :margin-components `dw:((margin-ragged-borders )
+				 (margin-scroll-bar :history-noun "bitmap")
+				 (margin-scroll-bar :margin :bottom :history-noun "bitmap")
+				 (margin-white-borders :thickness 2)))
+   (command :interactor :end-of-page-mode :scroll)
+   (help-menu :command-menu :menu-level :help :columns '(("Help")) :center-p t)
+   (undo-menu :command-menu :menu-level :undo :rows '(("Undo" "Redo" "Skip")))
+   (drawing-mode-menu :display :redisplay-function 'display-drawing-modes
+		      :redisplay-after-commands nil
+		      :margin-components `dw:((margin-borders )
+					      (margin-white-borders :thickness 4)
+					      (margin-whitespace :margin :left :thickness 10))
+		      :default-character-style '(:jess :roman :normal))
+   (draw-menu :command-menu :menu-level :draw)
+   (gray-menu :command-menu :menu-level :gray))
+  :configurations '((main (:layout (main :column title samples grid menus command)
+				   (samples :row sample registers)
+				   (menus :row menus1 draw-menu menus2)
+				   (menus1 :column help-menu undo-menu)
+				   (menus2 :column drawing-mode-menu gray-menu))
+			  (:sizes (main (samples :ask-window self
+						 :call-program sample-pane-size sample)
+				        (title 1 :lines) (command 4 :lines)
+					(menus 4 :lines draw-menu)
+				      :then (grid :even))
+				  (samples (sample :ask-window self
+						   :call-program sample-pane-size sample)
+					 :then (registers :even))
+				  (menus (menus1 :ask-window self
+						 :size-for-pane undo-menu)
+					 (menus2 :ask-window self
+						 :size-for-pane drawing-mode-menu)
+				       :then (draw-menu :even))
+				  (menus1 (undo-menu 1 :lines)
+					:then (help-menu :even))
+				  (menus2 (drawing-mode-menu 1 :lines)
+					:then (gray-menu :even))
+				  )))
+  :state-variables ((editing-mode :writable)
+		    (image-being-edited nil)
+		    (image-to-be-edited nil)
+		    ))
+
+(defmethod (set-image-being-edited standalone-bitmap-editor) (image)
+  (multiple-value-bind (width height)
+      (images::image-size image)
+    (reset-bounding-box-size-and-scale width height))
+  (let ((raster (images::image-raster image)))
+    (let ((type (array-element-type raster)))
+      (when (equal-typep type 'bit)
+	(setq type 'bit))
+      (unless (equal type (raster-plane-element-type black-plane))
+	(setq black-plane (make-image-raster-plane :element-type type)
+	      gray-plane (make-image-raster-plane :element-type type)
+	      displayed-black nil displayed-gray nil))
+      (unless (eq (eql type 'bit)
+		  (not (null (member drawing-mode *alu-drawing-modes*))))
+	;; Switch between 1 bit and deep menus.
+	(set-drawing-mode (case drawing-mode
+			    (:foreground :draw)
+			    (:background :erase)
+			    (:draw :foreground)
+			    (:erase :background)
+			    (:flip :foreground)
+			    (otherwise drawing-mode)))))
+    (copy-raster-to-raster-plane raster black-plane))
+  (setf (raster-plane-color-map gray-plane) 
+	(setf (raster-plane-color-map black-plane) (images::image-color-map image)))
+  (setq image-being-edited image)
+  (setq grid-redisplay-degree redisplay-degree-all)
+  (setq image-edited-p nil))
+
+(defmethod (standalone-bitmap-editor-top-level standalone-bitmap-editor) ()
+  (if image-to-be-edited
+      (set-image-being-edited self (prog1 image-to-be-edited (setq image-to-be-edited nil)))
+      (when (null image-being-edited)
+	(reset-bounding-box-size-and-scale 64 64)))
+  (bitmap-editor-top-level self))
+
+(defmethod (sample-pane-size standalone-bitmap-editor)
+	   (stacking pane remaining-width remaining-height total-width total-height)
+  (ignore pane total-width total-height)
+  (multiple-value-bind (image-width image-height)
+      (if image-being-edited
+	  (values (images::image-width image-being-edited)
+		  (images::image-height image-being-edited))
+	  (values 0 0))
+    (ecase stacking
+      (:horizontal
+	(max (floor remaining-width 4) (min (floor (* remaining-width 3) 4) image-width)))
+      (:vertical
+	(max (floor remaining-height 8) (min (floor remaining-height 3) image-height))))))
+
+(defmethod (standalone-bitmap-editor-help standalone-bitmap-editor) (stream string-so-far)
+  (dw:help-program-help self stream string-so-far "
+Click on a command from the menus at the right,
+or click on the grid to draw."))
+
+(defmethod (dw::map-command-name-to-help-topic standalone-bitmap-editor) (symbol)
+  (multiple-value-bind (found name)
+      (cp:command-in-command-table-p symbol (dw:program-command-table self))
+    (when found
+      `(,name ,(dw:program-pretty-name self) "command"))))
+
+(defundo set-bounding-box-edges (program left top right bottom baseline
+				 old-left old-top old-right old-bottom old-baseline))
+
+(defmethod (undo-element-redo set-bounding-box-edges) ()
+  (let ((bounding-box (bitmap-editor-bounding-box program)))
+    (multiple-value-setq (old-left old-top old-right old-bottom)
+      (bounding-box-outline-edges bounding-box))
+    (setq old-baseline (bounding-box-outline-baseline-height bounding-box)))
+  (set-bounding-box-edges-internal program left top right bottom baseline))
+
+(defmethod (undo-element-undo set-bounding-box-edges) ()
+  (set-bounding-box-edges-internal program old-left old-top old-right old-bottom
+				   old-baseline))
+
+(defmethod (set-bounding-box-edges-internal bitmap-editor) (left top right bottom baseline)
+  (with-bounding-box-open
+    (bounding-box-outline-set-edges bounding-box left top right bottom)
+    (setf (bounding-box-outline-baseline-height bounding-box) baseline))
+  (note-bounding-box-move self))
+
+(define-standalone-bitmap-editor-command (com-refit-bounding-box :menu-accelerator "Refit box"
+								 :menu-level :draw)
+					 ()
+   (multiple-value-bind (left top right bottom)
+       (raster-plane-filled-area black-plane)
+     (incf left displayed-x-offset)
+     (incf top displayed-y-offset)
+     (incf right displayed-x-offset)
+     (incf bottom displayed-y-offset)
+     (maxf right (1+ left))
+     (maxf bottom (1+ top))
+     (when (eq editing-mode :fixed-size)
+       (multiple-value-bind (width height)
+	   (bounding-box-outline-size bounding-box)
+	 (setq left (- (floor (+ left right) 2) (ceiling width 2))
+	       top (- (floor (+ top bottom) 2) (ceiling height 2))
+	       right (+ left width)
+	       bottom (+ top height))))
+     (do-undoably 'set-bounding-box-edges "Fit bounding box"
+		  left top right bottom)))
+
+(defun-in-flavor (bounding-box-editing-edges bitmap-editor) ()
+  (multiple-value-bind (left top right bottom)
+      (bounding-box-outline-edges bounding-box)
+    (values (- left displayed-x-offset)
+	    (- top displayed-y-offset)
+	    (- right displayed-x-offset)
+	    (- bottom displayed-y-offset))))
+
+(defmethod (center-point bitmap-editor) ()
+  (multiple-value-bind (left top right bottom)
+      (bounding-box-editing-edges)
+    (list (floor (+ left right) 2) (floor (+ top bottom) 2))))
+
+(defun-in-flavor (save-image-being-edited standalone-bitmap-editor) (&optional name)
+  (when name
+    (let ((other-image (images:find-image-named name :if-does-not-exist nil)))
+      (if other-image
+	  (unless (eq image-being-edited other-image)
+	    (dw:command-error "There is already another image named ~A." name))
+	  (setq image-being-edited nil))))
+  (multiple-value-bind (left top right bottom)
+      (bounding-box-editing-edges)
+    (let ((image-width (- right left))
+	  (image-height (- bottom top))
+	  raster)
+      (if image-being-edited
+	  (si:fill-array (setq raster (images::image-raster image-being-edited)) nil 0)
+	  (setq raster (graphics::make-raster-array-with-correct-width
+			 image-width image-height
+			 :element-type (raster-plane-element-type black-plane))
+		image-being-edited (images:make-image-from-raster raster
+								  :width image-width
+								  :height image-height
+								  :name name)))
+      (cond ((eq editing-mode :writable)
+	     (adjust-array raster (list image-height
+					(graphics::raster-array-correct-width
+					  image-width (array-element-type raster)))
+			   ;; This will force the element type smaller until the editor
+			   ;; supports deep rasters.
+			   :element-type (raster-plane-element-type black-plane))
+	     (setf (images::image-width image-being-edited) image-width
+		   (images::image-height image-being-edited) image-height))
+	    (t
+	     (minf right (+ left (images::image-width image-being-edited)))
+	     (minf bottom (+ top (images::image-height image-being-edited)))))
+      (copy-raster-plane-to-raster black-plane raster
+				   :image-left left :image-top top
+				   :image-right right :image-bottom bottom)))
+  (setq image-edited-p nil))
+
+(defun-in-flavor (offer-save-if-image-modified standalone-bitmap-editor) ()
+  (when (and image-being-edited image-edited-p (neq editing-mode :read-only))
+    (when (yes-or-no-p "The image ~A has been modified, save it back first? "
+		       (images:image-name image-being-edited))
+      (save-image-being-edited))))
+
+(define-standalone-bitmap-editor-command (com-edit-image :menu-accelerator "Edit"
+							 :menu-level :draw)
+    ((image 'images::named-image :confirm t))
+   (offer-save-if-image-modified)
+   (set-image-being-edited self image))
+
+(define-standalone-bitmap-editor-command (com-create-image )
+    (&key
+     (name 'string :prompt "name" :default "Unnamed")
+     (width '(integer 1) :prompt "width" :default 64)
+     (height '(integer 1) :prompt "height" :default 64)
+     (depth '(member 1 2 4 8 24) :prompt "bits per pixel" :default 1)
+     (color 'boolean :documentation "include a default color map"
+	    :default (member depth '(4 8))))
+   (offer-save-if-image-modified)
+   (set-image-being-edited self (images:make-image-from-raster
+				  (graphics::make-raster-array-with-correct-width
+				    width height :element-type `(unsigned-byte ,depth))
+				  :width width :height height
+				  :color-map (and color
+						  (case depth
+						    (4 color:*standard-4b-color-map*)
+						    (8 color:*standard-false-color-map*)))
+				  :name name :invisible-to-database t)))	;For now.
+
+(define-standalone-bitmap-editor-command (com-save-image :menu-accelerator "Save"
+							 :menu-level :draw)
+    ((name 'string
+	   :prompt "under name"
+	   :default (and image-being-edited (images:image-name image-being-edited))
+	   :confirm (null image-being-edited)))
+   (when (equal name "")			;Only happens when no name image.
+     (setq name nil))
+   (ecase editing-mode
+     (:read-only
+       (dw:command-error "The bitmap cannot be saved back into this image"))
+     ((:writable :fixed-size)
+      (save-image-being-edited name))))
+
+(define-standalone-bitmap-editor-command (com-hardcopy-bitmap :menu-accelerator "Hardcopy"
+							      :menu-level :draw)
+    (&key
+      (printer 'sys:printer
+	       :prompt "on" :default hardcopy:*default-bitmap-printer*)
+      (orientation '((member :landscape :portrait :best-fit)) :default :best-fit)
+      (scale '((token-or-type (("Best fit")) ((number (0))))) :prompt "factor"
+	     :default nil :provide-default t)
+      )
+   (multiple-value-bind (raster nil nil width height)
+       (decode-raster-plane black-plane)
+     (hci::hardcopy-image raster printer
+			  :width width :height height :zoom scale
+			  :title (if image-being-edited
+				     (images:image-name image-being-edited)
+				     "Bitmap editor")
+			  :orientation orientation)))
+
+(define-standalone-bitmap-editor-command (com-exit-standalone-bitmap-editor
+					   :name "Done"
+					   :menu-accelerator "Done"
+					   :menu-level :draw)
+					 ()
+   (offer-save-if-image-modified)
+   (setq image-being-edited nil)
+   (send dw:*program-frame* :bury))
+
+(compile-flavor-methods standalone-bitmap-editor)
+
+(cp:install-commands 'standalone-bitmap-editor '(images:com-read-image-file
+						 images:com-write-image-file))
+
+(defun edit-image (image &key (writable-p t) (size-adjustable-p t) (wait nil))
+  (let* ((frame (dw::find-and-select-program-window 'standalone-bitmap-editor
+		  :reuse-test #'(lambda (ignore program)
+				  (and (null (standalone-bitmap-editor-image-being-edited
+					       program))
+				       (null (standalone-bitmap-editor-image-to-be-edited
+					       program))))
+		  :program-state-variables `((image-to-be-edited ,image)
+					     (editing-mode ,(cond ((not writable-p)
+								   :read-only)
+								  ((not size-adjustable-p)
+								   :fixed-size)
+								  (t
+								   :writable))))))
+	 (program (send frame :program)))
+    (when wait
+      (catch-error-restart (abort "Skip waiting")
+	(process-wait "Bitmap editor started"
+	  #'(lambda (program)
+	      (not (null (standalone-bitmap-editor-image-being-edited program))))
+	  program)
+	(process-wait "Bitmap Editor Done"
+	  #'(lambda (program)
+	      (null (standalone-bitmap-editor-image-being-edited program)))
+	  program)))
+    image))
+
+;;; Alternative interface
+(defun edit-bitmap (raster &key width height name
+				(writable-p t) (size-adjustable-p t) (wait nil))
+  (multiple-value-bind (rwidth rheight)
+      (decode-raster-array raster)
+    (unless width
+      (setq width rwidth))
+    (unless height
+      (setq height rheight)))
+  (edit-image (images:make-image-from-raster raster :width width :height height :name name)
+	      :writable-p writable-p :size-adjustable-p size-adjustable-p
+	      :wait wait)
+  raster)
+
+#||	;Include these forms if you require strict compatibility.
+(defun kbd-edit-bitmap (&optional arg)
+  (hci::hardcopy-screen-1 (case arg
+			    (2 '(:whole-screen))
+			    (3 '(:selected-window))
+			    (4 '(:mouse-window))
+			    (5 '(:who-line))
+			    (otherwise '(:rectangle)))
+			  '(:bitmap-editor)))
+
+(tv:add-function-key #\super-Q 'kbd-edit-bitmap
+		     "Edit a screen image using bitmap editor.
+  1 or no arg allows specification of a rectangle.
+  2 takes the whole screen.
+  3 takes just the selected window.
+  4 takes the window under the mouse.
+  5 takes just the mouse documentation line.")
+||#

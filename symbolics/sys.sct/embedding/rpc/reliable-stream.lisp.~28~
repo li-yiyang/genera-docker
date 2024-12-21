@@ -1,0 +1,455 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: COMMON-LISP-INTERNALS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Reliable streams.  Somewhat reminiscent of dialnet, but without the dependencies.
+;;; Output is sent in packets consisting of one byte of opcode, one byte of data length,
+;;; and two bytes of checksum of the actual data.
+
+;;; Fields in the opcode.
+
+;;; The sender of this expects the odd packet next.
+(defconstant %%reliable-op-even-ack (byte 1 0))
+
+;;; The sender is (re)transmitting the even packet.
+(defconstant %%reliable-op-even-data (byte 1 1))
+
+;;; The sender has enclosed some data.
+(defconstant %%reliable-op-data (byte 1 2))
+
+;;; Try to prevent lossage in ack sequencing.
+(defconstant %%reliable-op-bit-count (byte 5 3))
+
+(defstruct (reliable-stream-packet :array
+				   (:size-macro reliable-stream-packet-header-length)
+				   (:constructor nil))
+  opcode	;Which packet expected next, which this is, parity, etc.
+  length	;Length including header (up to 255).
+  checksum-msb	;16-bit ones complement sign of data bytes.
+  checksum-lsb
+  )
+
+(defstruct (reliable-stream-packet-header :named-array-leader
+					  (:conc-name reliable-stream-packet-)
+					  (:constructor make-reliable-stream-packet ())
+					  (:constructor-make-array-keywords
+					    (length 256)
+					    (type 'sys:art-8b)))
+  (fill-pointer 0)
+  (state :empty)
+  (last-transmit-time 0))
+
+(defflavor reliable-encapsulating-stream
+	(raw-stream
+	 process 
+
+	 input-packet-1
+	 input-packet-2
+	 user-input-packet
+	 system-input-packet
+	 last-input-process
+
+	 output-packet-1
+	 output-packet-2
+	 user-output-packet
+	 system-output-packet
+	 last-output-process
+
+	 (last-ack-time 0)
+	 (retransmit-interval 20)
+	 (ack-interval 3600)
+	 )
+	(si:buffered-binary-stream)
+  (:initable-instance-variables raw-stream)
+  (:constructor make-reliable-encapsulating-stream (raw-stream)))
+
+(defmethod (make-instance reliable-encapsulating-stream) (&rest ignore)
+  (setq input-packet-1 (make-reliable-stream-packet)
+	input-packet-2 (make-reliable-stream-packet)
+	user-input-packet input-packet-1
+	system-input-packet input-packet-1
+	last-input-process nil)
+
+  (setq output-packet-1 (make-reliable-stream-packet)
+	output-packet-2 (make-reliable-stream-packet)
+	user-output-packet output-packet-1
+	system-output-packet output-packet-1
+	last-output-process nil)
+
+  ;; I'd like this to be a simple process, if I could arrange for the raw-stream to
+  ;; wake it up on input.
+  (setq process (process:make-process "Reliable stream server"
+				      :top-level-whostate "Reliable I/O"))
+  (process:process-preset process #'reliable-encapsulating-stream-process self)
+  (process:process-enable process))
+
+(defmethod (:close reliable-encapsulating-stream) (&optional abort-p)
+  (when raw-stream
+   (send raw-stream :close abort-p)
+   (setq raw-stream nil))
+  (when process
+    (process:process-kill process)
+    (setq process nil)))
+
+(defmethod (:next-input-buffer reliable-encapsulating-stream) (&optional no-hang-p)
+  (loop
+    (when (%store-conditional (locf (reliable-stream-packet-state user-input-packet))
+			      :full :user)
+      (return
+	(values user-input-packet
+		(reliable-stream-packet-header-length)
+		(reliable-stream-packet-length user-input-packet))))
+    (when no-hang-p
+      (return nil))
+    (setq last-input-process *current-process*)
+    (process:process-block "Reliable input"
+			   #'(lambda (place)
+			       (eq (reliable-stream-packet-state (location-contents place))
+				   :full))
+			   (locf user-input-packet))))
+
+(defmethod (:discard-input-buffer reliable-encapsulating-stream) (packet)
+  (assert (and (eq packet user-input-packet)
+	       (eq (reliable-stream-packet-state packet) :user)))
+  (setf (reliable-stream-packet-state packet) :empty)
+  (process:process-wakeup process)
+  (setq user-input-packet (if (eq packet input-packet-1) input-packet-2 input-packet-1)))
+
+(defmethod (:new-output-buffer reliable-encapsulating-stream) ()
+  (loop
+    (when (%store-conditional (locf (reliable-stream-packet-state user-output-packet))
+			      :empty :user)
+      (return (values user-output-packet (reliable-stream-packet-header-length) 255)))
+    (setq last-output-process *current-process*)
+    (process:process-block "Reliable output"
+			   #'(lambda (place)
+			       (eq (reliable-stream-packet-state (location-contents place))
+				   :empty))
+			   (locf user-output-packet))))
+
+(defmethod (:send-output-buffer reliable-encapsulating-stream) (packet end &optional ignore)
+  (assert (and (eq packet user-output-packet)
+	       (eq (reliable-stream-packet-state packet) :user)))
+  (setf (fill-pointer packet) end
+	(reliable-stream-packet-length packet) end)
+  (multiple-value-bind (msb lsb)
+      (reliable-stream-checksum-packet packet)
+    (setf (reliable-stream-packet-checksum-msb packet) msb
+	  (reliable-stream-packet-checksum-lsb packet) lsb))
+  (setf (reliable-stream-packet-state packet) :full)
+  (process:process-wakeup process)
+  (setq user-output-packet (if (eq packet output-packet-1) output-packet-2 output-packet-1)))
+
+(defmethod (:discard-output-buffer reliable-encapsulating-stream) (packet)
+  (assert (and (eq packet user-output-packet)
+	       (eq (reliable-stream-packet-state packet) :user)))
+  (setf (reliable-stream-packet-state packet) :empty)
+  (process:process-wakeup process))
+
+(defmethod (:finish reliable-encapsulating-stream) ()
+  (unless (eq (reliable-stream-packet-state system-output-packet) :empty)
+    (setq last-output-process *current-process*)
+    (process:process-block "Reliable finish"
+			   #'(lambda (place)
+			       (eq (reliable-stream-packet-state (location-contents place))
+				   :empty))
+			   (locf system-output-packet))))
+
+;;; Unfortunately, we cannot actually use process wakeup structure because we won't
+;;; be informed when input becomes available on the stream.
+(defmethod (reliable-encapsulating-stream-process reliable-encapsulating-stream) ()
+  (loop
+    (reliable-encapsulating-stream-process-wakeup self)
+    (send raw-stream :input-wait "Reliable server"
+	  #'reliable-encapsulating-stream-process-predicate self)))
+
+;;; Do this when something happens
+(defmethod (reliable-encapsulating-stream-process-wakeup reliable-encapsulating-stream) ()
+  (let* ((packet system-input-packet)
+	 (state (reliable-stream-packet-state packet)))
+    (unless (member state '(:full :user))
+      (multiple-value-bind (buffer start end)
+	  (send raw-stream :read-input-buffer nil t)
+	(when buffer
+	  (loop
+	    (when ( start end)
+	      (send raw-stream :advance-input-buffer end)
+	      (multiple-value-setq (buffer start end)
+		(send raw-stream :read-input-buffer nil t))
+	      (when (null buffer)
+		(return)))
+	    (ecase state
+	      (:empty
+	       (let ((opcode (aref buffer start)))
+		 (incf start)
+		 (unless (= (ldb %%reliable-op-bit-count opcode)
+			    (logcount (logand opcode #o7)))
+		   ;; Garbage
+		   (send raw-stream :advance-input-buffer end)
+		   (send raw-stream :clear-input)
+		   (return))
+		 (if (eq (ldb-test %%reliable-op-even-ack opcode)
+			 (eq system-output-packet output-packet-1))
+		     (setf (reliable-stream-packet-last-transmit-time system-output-packet)
+			   0)
+		   (setf (reliable-stream-packet-state system-output-packet) :empty)
+		   (setq system-output-packet (if (eq system-output-packet output-packet-1)
+						  output-packet-2 output-packet-1))
+		   (when last-output-process
+		     (process:process-wakeup last-output-process)))
+		 (when (ldb-test %%reliable-op-data opcode)
+		   (setf (reliable-stream-packet-opcode packet) opcode)
+		   (setf (fill-pointer packet) 1)
+		   (setq state :filling))))
+	      (:filling
+		(let* ((old (fill-pointer packet))
+		       (count (min (- end start)
+				   (- (if ( old (reliable-stream-packet-header-length))
+					  (reliable-stream-packet-length packet)
+					  (reliable-stream-packet-header-length))
+				      old)))
+		       (new (+ old count)))
+		  (when (minusp count)		;Length byte corrupted
+		    (send raw-stream :advance-input-buffer end)
+		    (send raw-stream :clear-input)
+		    (setq state :empty)
+		    (return))
+		  (copy-array-portion buffer start (incf start count)
+				      packet old new)
+		  (setf (fill-pointer packet) new)
+		  (when (and ( new (reliable-stream-packet-header-length))
+			     (= new (reliable-stream-packet-length packet)))
+		    (setq last-ack-time 0)	;Force (n)ack sooner
+		    (cond ((neq (ldb-test %%reliable-op-even-data
+					  (reliable-stream-packet-opcode packet))
+				(eq packet input-packet-1))
+			   ;; Out of sequence
+			   (setq state :empty))
+			  ((not (multiple-value-bind (msb lsb)
+				    (reliable-stream-checksum-packet packet)
+				  (and (= msb (reliable-stream-packet-checksum-msb packet))
+				       (= lsb (reliable-stream-packet-checksum-lsb packet)))))
+			   ;; Bad checksum
+			   (setq state :empty))
+			  (t
+			   ;; Good data
+			   (send raw-stream :advance-input-buffer start)
+			   (setq state :full)
+			   (return))))))))
+	  (setf (reliable-stream-packet-state packet) state)
+	  (when (eq state :full)
+	    (setq system-input-packet (if (eq packet input-packet-1)
+					  input-packet-2 input-packet-1))
+	    (when last-input-process
+	      (process:process-wakeup last-input-process)))))))
+  (cond ((let ((state (reliable-stream-packet-state system-output-packet)))
+	   (or (eq state :full)
+	       (and (eq state :retransmit)
+		    (time-elapsed-p retransmit-interval
+				    (reliable-stream-packet-last-transmit-time
+				      system-output-packet)))))
+	 (setf (reliable-stream-packet-opcode system-output-packet)
+	       (let ((basic (dpbs (if (eq system-input-packet input-packet-1) 1 0)
+				  %%reliable-op-even-ack
+				  (if (eq system-output-packet output-packet-1) 1 0)
+				  %%reliable-op-even-data
+				  1 %%reliable-op-data 0)))
+		 (dpb (logcount basic) %%reliable-op-bit-count basic)))
+	 (send raw-stream :string-out system-output-packet)
+	 (send raw-stream :force-output)
+	 (setf (reliable-stream-packet-state system-output-packet) :retransmit)
+	 (setf (reliable-stream-packet-last-transmit-time system-output-packet)
+	       (setq last-ack-time (sys:time))))
+	((time-elapsed-p ack-interval last-ack-time)
+	 (send raw-stream :tyo
+	       (let ((basic (dpb (if (eq system-input-packet input-packet-1) 1 0)
+				 %%reliable-op-even-ack 0)))
+		 (dpb (logcount basic) %%reliable-op-bit-count basic)))
+	 (send raw-stream :force-output)
+	 (setq last-ack-time (sys:time)))))
+
+(defmethod (reliable-encapsulating-stream-process-predicate reliable-encapsulating-stream) ()
+  (or (let ((state (reliable-stream-packet-state system-output-packet)))
+	(or (eq state :full)
+	    (and (eq state :retransmit)
+		 (time-elapsed-p retransmit-interval
+				 (reliable-stream-packet-last-transmit-time
+				   system-output-packet)))))
+      (time-elapsed-p ack-interval last-ack-time)))
+
+(defun reliable-stream-checksum-packet (packet)
+  (let ((checksum 0))
+    (loop for byte being the array-elements of packet
+	      from (reliable-stream-packet-header-length)
+		   below (reliable-stream-packet-length packet)
+	  do (incf checksum byte)
+	     (setq checksum (+ (ldb (byte 16 16) checksum) (ldb (byte 16 0) checksum))))
+    (values (ldb (byte 8 8) checksum) (ldb (byte 8 0) checksum))))
+
+(compile-flavor-methods reliable-encapsulating-stream)
+
+#||
+;;;; Testing 
+
+(defflavor slightly-unreliable-encapsulating-stream
+	(raw-stream
+	 (output-buffer (make-array 256 :element-type '(unsigned-byte 8))))
+	(si:buffered-binary-stream)
+  (:initable-instance-variables raw-stream)
+  (:constructor make-slightly-unreliable-encapsulating-stream (raw-stream)))
+
+(defmethod (:close slightly-unreliable-encapsulating-stream) (&optional abort-p)
+  (when raw-stream
+   (send raw-stream :close abort-p)
+   (setq raw-stream nil)))
+
+;;; The system random puts you in the cold load stream because of some process lock
+(defun less-random-random (limit)
+  (logand (sys:%microsecond-clock) (1- (ash 1 (1- (integer-length limit))))))
+
+(defmethod (:next-input-buffer slightly-unreliable-encapsulating-stream) (&optional no-hang-p)
+  (multiple-value-bind (buffer start end)
+      (send raw-stream :read-input-buffer nil no-hang-p)
+    (when (and buffer (> end start))
+      (case (less-random-random 16)
+	(1 (let ((index (+ start (less-random-random (- end start)))))
+	     (setf (aref buffer index) (logxor (aref buffer index) (less-random-random 256)))))
+	(2 (let ((index (+ start (less-random-random (- end start)))))
+	     (unless (= index (1- end))
+	       (copy-array-portion buffer (1+ index) end buffer index (1- end)))
+	     (decf end)))
+	))
+    (values buffer start end)))
+
+(defmethod (:discard-input-buffer slightly-unreliable-encapsulating-stream) (buffer)
+  (ignore buffer)
+  (send raw-stream :advance-input-buffer))
+
+(defmethod (:new-output-buffer slightly-unreliable-encapsulating-stream) ()
+  (values output-buffer 0 (length output-buffer)))
+
+(defmethod (:send-output-buffer slightly-unreliable-encapsulating-stream)
+	   (buffer end &optional ignore &aux (start 0))
+  (when (> end start)
+    (case (less-random-random 16)
+      (1 (let ((index (+ start (less-random-random (- end start)))))
+	   (setf (aref buffer index) (logxor (aref buffer index) (less-random-random 256)))))
+      (2 (let ((index (+ start (less-random-random (- end start)))))
+	   (unless (= index (1- end))
+	     (copy-array-portion buffer (1+ index) end buffer index (1- end)))
+	   (decf end)))
+      ))
+  (send raw-stream :string-out buffer start end))
+
+(defmethod (:discard-output-buffer slightly-unreliable-encapsulating-stream) (buffer)
+  (ignore buffer))
+
+(defmethod (:force-output slightly-unreliable-encapsulating-stream :after) ()
+  (send raw-stream :force-output))
+
+(defmethod (:clear-input slightly-unreliable-encapsulating-stream :after) ()
+  (send raw-stream :clear-input))
+
+(compile-flavor-methods slightly-unreliable-encapsulating-stream)
+
+(defun reliable-echo-test-server (stream)
+  (loop
+    (multiple-value-bind (buffer start end)
+	(send stream :read-input-buffer "Unexpected EOF")
+      (format t "~D" (- end start))
+      (send stream :string-out buffer start end)
+      (send stream :advance-input-buffer end)
+      (send stream :force-output)
+      (format t " "))))
+
+(defun reliable-echo-test-user (stream &optional (size 512))
+  (stack-let ((output-buffer (make-array size :element-type '(unsigned-byte 8)))
+	      (input-buffer (make-array size :element-type '(unsigned-byte 8))))
+    (loop
+      (let ((nchars (less-random-random size)))
+	(dotimes (i nchars)
+	  (setf (aref output-buffer i) (less-random-random 256)))
+	(send stream :string-out output-buffer 0 nchars)
+	(send stream :force-output)
+	(format t "~D" nchars)
+	(send stream :string-in "Unexpected EOF" input-buffer 0 nchars)
+	(dotimes (i nchars)
+	  (unless (= (aref output-buffer i) (aref input-buffer i))
+	    (format t "~&** ~D ~O ~O~%" i (aref output-buffer i) (aref input-buffer i))))
+	(format t " ")))))
+
+;;; Note that server refers to whether it echos or not.  The connection logic is backward.
+;;; This is because the host runs the echo server after connecting to the guest server.
+(defun reliable-echo-test (&key server fake-serial reliable unreliable (size 512))
+  (let ((stream (cond ((not fake-serial)
+		       (si:make-serial-stream :unit 0 :baud 9600 :parity nil
+					      :generate-xon-xoff nil :xon-xoff-protocol nil
+					      :number-of-data-bits 8 :number-of-stop-bits 1))
+		      (server
+		       (chaos:open-stream net:*local-host* "FAKE-RPC" :characters nil))
+		      (t
+		       (let ((cx (chaos:listen "FAKE-RPC")))
+			 (chaos:accept cx)
+			 (chaos:make-stream cx :characters nil))))))
+    (when (and (not server) (not fake-serial))
+      (send stream :clear-input))
+    (when unreliable
+      (setq stream (make-slightly-unreliable-encapsulating-stream stream)))
+    (when reliable
+      (setq stream (make-reliable-encapsulating-stream stream)))
+    (with-open-stream (stream stream)
+      (if server
+	  (reliable-echo-test-server stream)
+	  (reliable-echo-test-user stream size)))))
+
+||#

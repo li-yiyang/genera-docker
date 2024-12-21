@@ -1,0 +1,915 @@
+;;; -*- Mode: LISP; Package: Debugger; Base: 8.; Lowercase: T -*- 
+
+;;; Debugger breakpoints and single-stepper
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;--- To do:
+;; *Single-step should be able to take a numeric argument (save count in a
+;;   special variable, one entry per process)
+;;  "Single-step should be more careful than just using the resume key." --Moon
+;;  Single-stepping at a funcall steps over the called function.  I prefer
+;;   this behavior, but others might not like it.  Perhaps a breakpoint should
+;;   be set in the called function (under a separate command)?
+
+;;--- Recursively entered breakpoints get completely confused
+;;--- Setting a breakpoint at the entry pseudo-instruction can crash the machine
+;;--- Stepping through a catch-close loses
+
+(defvar *all-breakpoints* nil
+  "List of names of all functions which contain breakpoints")
+
+;; Here are the debugger commands
+(cp:define-command (com-set-breakpoint :command-table "Breakpoint"
+				       :provide-output-destination-keyword nil)
+    ((function 'compiled-function-spec)
+     (pc '((cl:integer) :base 8)
+	 :default (default-initial-pc function)
+	 :prompt "PC"
+	 :when (typep (si:valid-function-definition function)
+		      :compiled-function))
+     &key
+     (conditional 'break-condition
+		  :default #'true
+		  :mentioned-default 'always
+		  :documentation "When to break")
+     (action 'break-action
+	     :default nil
+	     :documentation "What to do at a breakpoint"))
+  (cond ((si:valid-function-definition function))
+	(t
+	 (setq pc (second function)
+	       function (first function))))
+  (com-set-breakpoint-internal function pc conditional action))
+
+(defun com-set-breakpoint-internal (function pc &optional (conditional #'true) (action nil))
+  (multiple-value-bind (function pc error)
+      (validate-function-and-pc function pc)
+    (if error
+	(princ error)
+      (clear-breakpoint function pc)
+      (set-breakpoint function pc :breakpoint conditional action *inside-display-debugger*)
+      (format t "~&Breakpoint set in ~S at PC ~O" (function-name function) pc))))
+
+;;--- This knows to much about the internals of the presentation
+(defun maybe-represent-instruction (presentation window set)
+  (when #---ignore t #+++ignore		;always do this, since the callers are actions
+	(or (null *inside-display-debugger*)
+	    (neq window (send dw::*program-frame* :get-pane 'source-code)))
+    ;; Only do this if we are not in the Display Debugger, or the
+    ;; place we clicked is not in the source-code pane
+    (cl:setf (cl:getf (cdr (dw::presentation-type presentation)) :bpt) set)
+    (incf dw::*presentation-input-context-tick*)
+    (send window :represent-presentation presentation)))
+
+(define-presentation-action set-breakpoint-from-disassembly
+   (compiler:compiled-function-and-pc dw:top-level-command-context
+    :documentation "Set breakpoint here"
+    :gesture :set-breakpoint)
+   (object &key presentation window)
+  (destructuring-bind (function pc) object
+    (multiple-value-bind (function pc error)
+	(validate-function-and-pc function pc)
+      (unless error
+	(clear-breakpoint function pc)
+	(set-breakpoint function pc :breakpoint nil nil *inside-display-debugger*)
+	(maybe-represent-instruction presentation window t)))))
+
+(define-presentation-action proceed-to-here
+   (sys:code-fragment t
+    :documentation "Proceed to here"
+    :gesture :modify
+    :context-independent t
+    :tester ((&rest ignore)
+	     (and (variable-boundp *error*)
+		  (variable-boundp *current-frame*))))
+   (code-fragment &key presentation)
+  code-fragment
+  (multiple-value-bind (function pc)
+      (function-and-pc-from-presentation-node
+	(if (typep presentation 'zwei:basic-presentation-node)
+	    presentation (dw::presentation-form presentation)))
+    (when (and function pc)
+      (proceed-to-here-internal function pc))))
+
+(define-presentation-action proceed-to-pc
+   (compiler:compiled-function-and-pc t
+    :documentation "Proceed to here"
+    :gesture :modify
+    :context-independent t
+    :tester ((&rest ignore)
+	     (and (variable-boundp *error*)
+		  (variable-boundp *current-frame*))))
+   (object)
+  (destructuring-bind (function pc) object
+    (proceed-to-here-internal function pc)))
+
+(defun proceed-to-here-internal (function-spec pc)
+  (let* ((function (si:valid-function-definition function-spec))
+	 ;;--- This can't always get the right frame, but we can try
+	 (our-frame (loop for frame = *current-frame*
+				    then (frame-previous-frame frame)
+			  until (null frame)
+			  when (eq function (frame-function frame))
+			    do (return frame))))
+    (clear-breakpoint function pc)
+    (set-breakpoint function pc :breakpoint
+		    (let ((gone-off nil))
+		      (lambda () (prog1 (not gone-off) (setq gone-off t))))
+		    (lambda () (when our-frame
+				 ;;--- Need to clear this if bpt is never hit
+				 (setf (debugger-trace-flag our-frame) nil)
+				 (clear-breakpoint function pc))))
+    (when our-frame
+      (setf (debugger-trace-flag our-frame) t))
+    (com-proceed)))
+
+(define-presentation-action complex-breakpoint-from-disassembly
+   (compiler:compiled-function-and-pc dw:top-level-command-context
+    :documentation "Set a complex breakpoint here"
+    :gesture :set-complex-breakpoint)
+   (object &key presentation window)
+  (destructuring-bind (function pc) object
+    (multiple-value-bind (function pc error)
+	(validate-function-and-pc function pc)
+      (unless error
+	(multiple-value-bind (conditional action)
+	    (accept-complex-breakpoint function pc)
+	  (clear-breakpoint function pc)
+	  (set-breakpoint function pc :breakpoint conditional action *inside-display-debugger*)
+	  (maybe-represent-instruction presentation window t))))))
+
+(defun accept-complex-breakpoint (function pc)
+  (declare (values conditional action))
+  (ignore function pc)
+  (dw:accepting-values (query-io
+			:label "Enter a complex breakpoint"
+			:own-window t)
+    (let* ((conditional (accept 'break-condition
+				:stream query-io))
+	   (action (accept '((scl:token-or-type (:select) break-action))
+			   :stream query-io))
+	   (special-action (when (eq action :select)
+			     ;;--- This should accept a subset of all the locals
+			     nil)))
+      (values conditional (or special-action action)))))
+
+(cp:define-command (com-clear-breakpoint :command-table "Breakpoint"
+					 :provide-output-destination-keyword nil)
+    ((function 'compiled-function-spec)
+     (pc '((cl:integer) :base 8)
+	 :default (default-initial-pc function)
+	 :prompt "PC"
+	 :when (typep (si:valid-function-definition function)
+		      :compiled-function)))
+  (cond ((si:valid-function-definition function))
+	(t
+	 (setq pc (second function)
+	       function (first function))))
+  (com-clear-breakpoint-internal function pc))
+
+(defun com-clear-breakpoint-internal (function pc)
+  (multiple-value-bind (function pc error)
+      (validate-function-and-pc function pc)
+    (if error
+	(princ error)
+	(if (not (any-breakpoint-in-function function pc))
+	    (format t "~&There is no breakpoint in ~S at ~O"
+		    (function-name function) pc)
+	  (clear-breakpoint function pc *inside-display-debugger*)
+	  (format t "~&Breakpoint cleared from ~S at PC ~O" (function-name function) pc)))))
+
+(define-presentation-action clear-breakpoint-from-disassembly
+   (compiler:compiled-function-and-pc dw:top-level-command-context
+    :documentation "Clear breakpoint from here"
+    :gesture :clear-breakpoint)
+   (object &key presentation window)
+  (destructuring-bind (function pc) object
+    (multiple-value-bind (function pc error)
+	(validate-function-and-pc function pc)
+      (unless error
+	(clear-breakpoint function pc *inside-display-debugger*)
+	(maybe-represent-instruction presentation window nil)))))
+
+(define-presentation-to-command-translator clear-breakpoint-from-source
+   (sys:code-fragment
+    :documentation "Clear breakpoint from here"
+    :gesture :clear-breakpoint)
+   (code-fragment &key presentation)
+  code-fragment
+  (multiple-value-bind (function pc)
+      (function-and-pc-from-presentation-node
+	(if (typep presentation 'zwei:basic-presentation-node)
+	    presentation (dw::presentation-form presentation)))
+    (when (and function pc)
+      `(com-clear-breakpoint ,function ,pc))))
+
+(cp:define-command (com-clear-all-breakpoints :command-table "Breakpoint"
+					      :provide-output-destination-keyword nil)
+    ((function '((or null compiled-function-spec))
+	       :prompt "a compiled function spec"
+	       :default nil))
+  (loop with cleared-one = nil
+	for fname in (if function (ncons function) *all-breakpoints*)
+	as function = (fdefinition fname)
+	as breaks = (breakpoints-in-function function)
+	do (clear-breakpoint function nil *inside-display-debugger*)
+	   (setq cleared-one t)
+	   (format t "~&Breakpoint~P cleared from ~S at PC~@['s~] "
+	     (length breaks) fname ( 1 (length breaks)))
+	   (format-textual-list breaks
+				#'(lambda (bpt ignore) (format t "~O" (bpt-pc bpt)))
+				:conjunction "and")
+	finally (unless cleared-one
+		  (format t "~&There are no breakpoints to clear"))))
+
+;; This function kludgily updates *all-breakpoints* if it finds that there
+;; are no breakpoints in a function.
+(cp:define-command (com-show-breakpoints :command-table "Breakpoint"
+					 :provide-output-destination-keyword nil)
+    ()
+  (loop with showed-one = nil
+	for fname in *all-breakpoints*
+	as function = (fdefinition fname)
+	as breaks = (breakpoints-in-function function)
+	if (null breaks)			;if there are no breakpoints here,
+	  do (setq *all-breakpoints*		; clean up the master list
+		   (delete fname *all-breakpoints*))
+	do (setq showed-one t)
+	   (format t "~&Breakpoint~P in ~S at PC~@['s~] "
+	     (length breaks) fname ( 1 (length breaks)))
+	   (format-textual-list breaks
+				#'(lambda (bpt ignore) (format t "~O" (bpt-pc bpt)))
+				:conjunction "and")
+	finally (unless showed-one
+		  (format t "~&There are currently no breakpoints set"))))
+
+
+;; True if frame is not an interpreted function or part of the interpreter
+(defun function-steppable-p (function)
+  (and (zerop (logand %arg-desc-interpreted (args-info function)))
+       (not (cl:gethash function *uninteresting-functions*))))
+
+(cp:define-command (com-single-step :command-table "Debugger"
+				    :provide-output-destination-keyword nil)
+    (#+++ignore (nframes 'cl:integer
+			 :default 1))
+  (if (function-steppable-p (frame-function *innermost-interesting-frame*))
+      (loop repeat #+++ignore nframes #---ignore 1
+	    do (single-step))
+    (format t "~&You cannot single-step in this frame")))
+
+(cp:define-command-accelerator single-step "Debugger" (#\c-sh-S) () (arg-p arg)
+  #---ignore (ignore arg-p arg)
+  `(com-single-step #+++ignore ,(if arg-p arg 1)))
+
+
+
+;; For each type of breakpoint, there is a different callout function.
+;; This alist maps breakpoint types to callout opcodes.
+(defvar *breakpoint-opcode-alist* ())
+
+;; Support for compiled function stepper
+(defun breakpoint-list-in-function (function)
+  (cdr (si:debugging-info-user-entry function :breakpoints)))
+
+;; Return a list of breakpoints in function.  If pc is a number, return only
+;; the breakpoint at that pc
+(defun breakpoints-in-function (function &optional (pc nil))
+  (if (null pc)
+      (breakpoint-list-in-function function)
+    (loop for bpt in (breakpoint-list-in-function function)
+	  if (= pc (bpt-pc bpt))
+	    return (ncons bpt))))
+
+;; if there is a breakpoint at the given pc, return it
+(defun any-breakpoint-in-function (function &optional (pc nil))
+  (car (breakpoints-in-function function pc)))
+
+;;--- Don't even look at this crap
+(defmacro munging-breakpoints ((function pc) &body body)
+  `(let* ((extra (si:cca-extra-info-for-debugging (compiled-function-cca ,function)))
+	  (break-entry (assq :breakpoints (cdr extra)))
+	  (breaks (cdr break-entry))
+	  (cca (assq :function-cca (cdr extra))))
+     ;; First remove the :BREAKPOINTS association from the debug-info
+     (when break-entry
+       (setq extra (delete break-entry extra)))
+     ;; If first breakpoint create cca field
+     (when (not cca)
+       (setf cca (compiled-function-cca function))
+       (setq extra (append extra `((:function-cca ,@cca)))))
+     ;; Keep only the breakpoints that we are not dealing with
+     (setq breaks
+	   (loop for bpt in breaks
+		 when ( ,pc (bpt-pc bpt))
+		   collect bpt))
+     ;; Run the body, then put the :BREAKPOINTS association back
+     ,@body
+     (setf (cca-extra-info (compiled-function-cca ,function)) extra)))
+
+#+3600
+;; Stash the breakpoint in function at pc, and record that fact
+(defun set-breakpoint (function pc type &optional conditional action tick)
+  (flet ((add-breakpoint-to-cca (function pc inst conditional action)
+	   (munging-breakpoints (function pc)
+	     (push (make-bpt pc pc
+			     instruction inst
+			     conditional conditional
+			     action action) breaks)
+	     (setq extra (append extra `((:breakpoints ,@breaks)))))))
+    (let ((lim-pc (1- (llc:disassemble-lim-pc function))))
+      (when ( 0 pc lim-pc)
+	(when (not (any-breakpoint-in-function function pc))
+	  (without-interrupts
+	    (let ((inst (compiled-function-instruction function pc)))
+	      (si:compiled-function-set-instruction
+		function pc (symeval (cadr (assq type *breakpoint-opcode-alist*))))
+	      (si:push* (function-name function) *all-breakpoints*)
+	      (%clear-instruction-cache)
+	      (add-breakpoint-to-cca function pc inst conditional action))))))
+    (when (and tick
+	       *inside-display-debugger*
+	       (eq function (frame-function *current-frame*)))
+      (redisplay-tick *source-code-pane-tick*))))
+
+#+imach
+(defun set-breakpoint (function pc type &optional conditional action tick)
+  (ignore type)
+  (flet ((add-breakpoint-to-cca (function pc inst data-type conditional action)
+	   (munging-breakpoints (function pc)
+	     (push (make-bpt pc pc
+			     instruction inst
+			     data-type data-type
+			     conditional conditional
+			     action action) breaks)
+	     (setq extra (append extra `((:breakpoints ,@breaks)))))))
+    (let ((lim-pc (1- (ilc:disassemble-lim-pc function)))
+	  (breakpoint-instruction 0))
+      (when ( 0 pc lim-pc)
+	(when (not (ilc:any-breakpoint-in-function function pc))
+	  (without-interrupts
+	      (multiple-value-bind (inst-type current-instruction even-bound)
+		  (si:parsed-function-instruction function pc)
+		(ignore even-bound)
+		(setf (ldb %%packed-instruction-opcode breakpoint-instruction)
+		      (ilc:opcode-for-instruction '%proc-breakpoint))
+		(if ( inst-type dtp-packed-instruction-60)
+		    (si:compiled-function-set-instruction function pc breakpoint-instruction)
+		    (si:compiled-function-set-to-packed-instruction
+		      function pc breakpoint-instruction))
+		(si:push* (function-name function) *all-breakpoints*)
+		(%clear-instruction-cache)
+		(add-breakpoint-to-cca function pc current-instruction inst-type
+				       conditional action))))))
+    (when (and tick
+	       *inside-display-debugger*
+	       (eq function (frame-function *current-frame*)))
+      (redisplay-tick *source-code-pane-tick*))))
+
+;; Clear the breakpoint in function at pc
+(defun clear-breakpoint (function pc &optional (tick t))
+  (flet ((remove-breakpoint-from-cca (function pc)
+	   (munging-breakpoints (function pc)
+	     (when breaks
+	       (setq extra (append extra `((:breakpoints ,@breaks))))))))
+    (let ((breaks (breakpoints-in-function function pc)))
+      (when breaks
+	(without-interrupts
+	  (loop for bpt in breaks
+		as fpc = (bpt-pc bpt)
+		as instruction = (bpt-instruction bpt)
+		if (or (null pc)
+		       (= pc fpc))
+		  do
+		    #+3600
+		    (si:compiled-function-set-instruction function fpc instruction)
+		    #+imach
+		    (if ( (bpt-data-type bpt) dtp-packed-instruction-60)
+			(let ((inst-bits
+				(if (evenp fpc)
+				    (ldb %%q-even-instruction (%pointer instruction))
+				    (dpb
+				      (ldb %%q-odd-instruction-within-tag (bpt-data-type bpt))
+				      %%odd-instruction-tag-component
+				      (ldb %%q-odd-instruction-within-pointer
+					   (%pointer instruction))))))
+			  (si:compiled-function-set-instruction function fpc inst-bits))
+			(let ((inst-bits (%set-tag instruction (bpt-data-type bpt))))
+			  (si:compiled-function-set-instruction function fpc inst-bits 't)))
+		    (%clear-instruction-cache)
+		    (remove-breakpoint-from-cca function fpc)
+		finally
+		  (when (not (any-breakpoint-in-function function))
+		    (setq *all-breakpoints*
+			  (delete (function-name function) *all-breakpoints*)))))
+	(when (and tick
+		   *inside-display-debugger*
+		   (eq function (frame-function *current-frame*)))
+	  (redisplay-tick *source-code-pane-tick*))))))
+
+#+imach
+(defun default-initial-pc (function)
+  (setq function (si:valid-function-definition function t))
+  (when function
+    0))
+
+;; Guess at a good start pc for a function (try to skip arg-taking)
+;;--- This needs work (n>4 optional arguments will lose)
+#+3600
+(defun default-initial-pc (function)
+  (setq function (si:valid-function-definition function t))
+  (when function
+    (multiple-value-bind (nil n-optional)
+	(llc:decode-entry-information
+	  (compiled-function-instruction function 0))
+      (if n-optional (1+ n-optional) 1))))
+
+(defunp validate-function-and-pc (function pc)
+  (declare (values function pc error))
+  ;; Make sure we have an actual compiled function
+  (let ((real-function (si:valid-function-definition function)))
+    (unless real-function
+      (return (values nil nil
+		      (format nil "~S is not a defined function" function))))
+    (unless (and (zerop (logand %arg-desc-interpreted (args-info function)))
+		 (typep real-function :compiled-function))
+      (return (values nil nil
+		      (format nil "~S is not a compiled function" function))))
+    (let* ((smallest-pc (default-initial-pc real-function))
+	   #+imach(cca (compiled-function-cca real-function))
+	   #+imach(lim-pc (cca-n-instructions cca))
+	   #+3600 (lim-pc (llc:disassemble-lim-pc real-function))
+	   )
+      (if (null pc)
+	  (setq pc smallest-pc))
+      ;; Make sure the pc is legal
+      (unless ( smallest-pc pc lim-pc)
+	(return (values nil nil
+			(format nil "The PC, ~O, must be larger than 0 and smaller than ~O"
+				pc lim-pc)))))
+    (return (values real-function pc nil))))
+
+
+
+#||
+(defun show-callout-functions ()
+  (loop with m-e-c = (assoc 'sys:microcode-escape-constants si:*magic-locations*)
+	with first = (second m-e-c)
+	with last  = (third m-e-c)
+	for ptr = first then (%pointer-plus ptr 1)
+	as off = (%pointer-difference ptr first)
+	until (eq ptr last)
+	do (condition-case ()
+	       (format t "~&~O~8T~S" off (cdr ptr))
+	     (sys:undefined-function
+	       (format t "~&~O~8T<Undefined function>" off))
+	     (dbg:bad-data-type-in-memory-trap
+	       (format t "~&~O~8T<Bad data>" off)))))
+||#
+
+;; Define an opcode for a type of callout through A memory.
+#+3600
+(defmacro define-ddt-callout (opcode-slot function-name type)
+  `(progn 'compile
+     (defvar ,opcode-slot)
+     (define-ddt-callout-1 ',opcode-slot ',function-name ',type)))
+
+#+3600
+(defun define-ddt-callout-1 (opcode-slot function-name type)
+  (set opcode-slot (loop for index from 0
+			 for (mtype mname) in (cdddr (assq 'sys:microcode-escape-constants
+							   si:*magic-locations*))
+			 when (and (eq mtype :function)
+				   (eq mname function-name))
+			   return
+			     #+3600
+			     (llc:unsigned-immediate-operand
+			       llc:*funcall-microcode-escape-constant-opcode* index)
+			     #+imach
+			     (ilc:unsigned-immediate-operand
+			       ilc:*funcall-microcode-escape-constant-opcode* index)
+			 finally (ferror "~S is not a defined callout function"
+					 function-name)))
+  (cl:pushnew `(,type ,opcode-slot) *breakpoint-opcode-alist* :test #'equal))
+
+
+;; These two lists are alists indexed by stack group (i.e., one entry per process).
+;; The elements in one entry consist of a breakpoint to set followed by a list of
+;; temporary breakpoints to clear
+#+3600
+(defvar-safeguarded *breakpoint-kludgery* ())
+#+3600
+(defvar-safeguarded *single-step-kludgery* ())
+
+;; Set real breakpoint and clear temporary ones
+#+3600
+(defmacro set-and-clear-breakpoints (all-kludges)
+  ;; Find the kludges for this stack group
+  `(let ((kludges (assq current-process ,all-kludges)))
+     (if (null kludges)
+	 (fsignal "Internal stepper error - can't find breakpoint kludges for this process")
+       ;; First set the real breakpoint
+       (let ((set (second kludges)))
+	 (when set
+	   (set-breakpoint (first set) (bpt-pc (second set)) :breakpoint
+			   (bpt-conditional (second set)) (bpt-action (second set)))))
+       ;; Now remove the temporary breakpoints
+       (loop for (func pc) in (cddr kludges)
+	     do (clear-breakpoint func pc)
+	     finally (setq ,all-kludges (delete kludges ,all-kludges))))))
+
+;; Like above, but for all stack groups
+#+3600
+(defmacro set-and-clear-all-breakpoints (all-kludges)
+  `(loop for kludges in ,all-kludges
+	   do (let ((set (second kludges)))
+		(when set
+		  (set-breakpoint (first set) (bpt-pc (second set)) :breakpoint
+				  (bpt-conditional (second set)) (bpt-action (second set)))))
+	      (loop for (func pc) in (cddr kludges)
+		    do (clear-breakpoint func pc))
+	 finally (setq ,all-kludges nil)))
+
+;; Warm booting should clear all temporary breakpoints
+#+3600
+(add-initialization
+  "Reset all temporary breakpoints"
+  '(reset-all-kludge-breakpoints)
+  '(:warm))
+
+#+3600
+(defun reset-all-kludge-breakpoints ()
+  (set-and-clear-all-breakpoints *breakpoint-kludgery*)
+  (set-and-clear-all-breakpoints *single-step-kludgery*))
+
+;; This is the basic stepper breakpoint flavor
+(defflavor stepper-break (frame) (break)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defmethod (:report stepper-break) (stream)
+  (let ((fr (frame-previous-frame frame)))
+    (with-language-for-frame (fr language)
+      (lframe-describe-instruction language fr stream))))
+
+(defmethod (current-and-innermost-frames-for-debugger stepper-break) (ignore)
+  (let ((fr (frame-previous-frame frame)))
+    (values fr fr)))
+
+;; Breakpoint condition
+(defflavor breakpoint () (stepper-break))
+
+(defmethod (condition-type breakpoint) () "Breakpoint")
+
+#+3600
+(defun enter-debugger-via-breakpoint ()
+  (declare (dbg:error-reporter))
+  (declare (safeguarded-function disable-reference-validation))
+  (condition-bind ((breakpoint 'generic-breakpoint-handler))
+    (signal 'breakpoint :frame (%stack-frame-pointer))))
+
+#+3600
+(define-ddt-callout *breakpoint-opcode* enter-debugger-via-breakpoint :breakpoint)
+
+;; Back up the pc by 1 in the current frame.  This is how we start up a frame
+;; after it has hit a breakpoint
+#+3600
+(defun back-up-return-pc (frame)
+  (setf (frame-return-pc frame)
+	(let ((pc (frame-return-pc frame)))
+	  (select (%data-type pc)
+	    (dtp-even-pc (sys:%make-pointer-offset dtp-odd-pc pc -1))
+	    (dtp-odd-pc (sys:%make-pointer dtp-even-pc pc))
+	    (otherwise (error "Not a PC?"))))))
+
+;; The sole purpose of this function is to back up the pc which we will
+;; need to execute again.  You might think that this is where we should
+;; check for conditional breakpoints, but you would be wrong, since the
+;; conditional gets run in the lexical and dynamic environment of the
+;; frame in which the breakpoint is set.
+#+3600
+(defun generic-breakpoint-handler (object)
+  (back-up-return-pc (send object :frame))
+  ;; Return NIL to force debugger entry
+  nil)
+
+;; Breakpoint cleanup condition
+(defflavor breakpoint-cleanup () (stepper-break))
+
+(defmethod (condition-type breakpoint-cleanup) () "Breakpoint cleanup")
+
+#+3600
+(defun enter-debugger-via-breakpoint-cleanup ()
+  (declare (dbg:error-reporter))
+  (declare (safeguarded-function disable-reference-validation))
+  (condition-bind ((breakpoint-cleanup 'breakpoint-cleanup-handler))
+    (set-and-clear-breakpoints *breakpoint-kludgery*)
+    (signal 'breakpoint-cleanup :frame (%stack-frame-pointer))))
+
+#+3600
+(define-ddt-callout *breakpoint-cleanup-opcode* enter-debugger-via-breakpoint-cleanup
+		    :breakpoint-cleanup)
+
+;; The sole purpose of this function is to back up the pc which we will
+;; need to execute again
+#+3600
+(defun breakpoint-cleanup-handler (object)
+  (back-up-return-pc (send object :frame))
+  ;; Return T to inhibit debugger entry
+  t)
+
+;; Single-step condition
+(defflavor single-step () (stepper-break))
+
+(defmethod (condition-type single-step) () "Single step")
+
+#+3600
+(defun enter-debugger-via-single-step ()
+  (declare (dbg:error-reporter))
+  (declare (safeguarded-function disable-reference-validation))
+  (condition-bind ((single-step 'generic-breakpoint-handler))
+    (set-and-clear-breakpoints *single-step-kludgery*)
+    (signal 'single-step :frame (%stack-frame-pointer))))
+
+#+3600
+(define-ddt-callout *single-step-opcode* enter-debugger-via-single-step :single-step)
+
+(compile-flavor-methods breakpoint breakpoint-cleanup single-step)
+
+
+#+3600
+(defmacro instruction-class (class &body opcodes)
+  `(defconst ,(intern class)
+	     ',(mapcar #'(lambda (op)
+			   (symeval (intern (string-append "*" op "-OPCODE*")
+					    llc:*llc-package*)))
+		       opcodes)))
+
+#+3600
+(instruction-class *unconditional-branches*
+  branch long-branch long-branch-immed)
+
+#+3600
+(instruction-class *conditional-branches*
+  branch-true branch-false
+  branch-true-else-pop branch-false-else-pop
+  branch-true-and-pop branch-false-and-pop
+  branch-eq branch-not-eq
+  branch-atom branch-not-atom
+  branch-endp branch-not-endp)
+
+#+3600
+(instruction-class *return-family*
+  call-0-return call-1-return call-2-return call-3-return call-4-return
+  funcall-0-return funcall-1-return funcall-2-return funcall-3-return funcall-4-return
+  call-n-return funcall-n-return funcall-ni-return
+  lexpr-funcall-return lexpr-funcall-n-return
+  return-n return-stack return-multiple
+  popj popj-n popj-multiple)
+
+;; Compute the next pc to be executed.  There are 4 cases:
+;;  1. Conditional branch  pc+1 and branch destination
+;;  2. Unconditional branch  branch destination
+;;  3. Popj  Return address of current frame (more or less)
+;;  4. Straight line  pc+1
+#+3600
+(defun compute-next-pc (frame function pc)
+  (declare (values (next-func-1 next-pc-1 next-func-2 next-pc-2)))
+  (flet ((compute-real-pc (pc offset)
+	   ;; Given a pc in a function and an offset, compute the new real pc
+	   (let ((word-offset (ash offset -1))
+		 (halfword-offset (logxor (logand 1 offset) (if (minusp offset) 1 0))))
+	     (+ (* (+ (// pc 2) word-offset) 2)
+		(logxor (logand pc 1) halfword-offset)))))
+    (let* ((inst (compiled-function-instruction function pc))
+	   (uop (llc:get-universal-opcode inst)))
+      (cond
+	((memq uop *conditional-branches*)
+	 ;; Return branch destination and next pc
+	 (values function
+		 (compute-real-pc pc (llc:get-signed-operand inst))
+		 function (1+ pc)))
+	((memq uop *unconditional-branches*)
+	 ;; Return branch destination
+	 (cond ((eq uop llc:*long-branch-immed-opcode*)
+		(let ((prev-inst (compiled-function-instruction function (1- pc))))
+		  (if (= (llc:get-universal-opcode prev-inst)
+			 llc:*push-immed-opcode*)
+		      (let ((high-byte (llc:get-signed-operand prev-inst))
+			    (low-byte (llc:get-operand inst)))
+			(values function
+				(compute-real-pc pc (+ low-byte (ash high-byte 8)))))
+		    (ferror "Internal stepper error - can't compute next PC"))))
+	       ((eq uop llc:*long-branch-opcode*)
+		(let* ((index (llc:get-operand inst))
+		       (offset (cca-object (compiled-function-cca function) index))
+		       (type (typep offset)))
+		  (if (eq type :fixnum)
+		      (values function (compute-real-pc pc inst))
+		    (ferror "Internal stepper error - can't compute next PC"))))
+	       (t (values function
+			  (compute-real-pc pc (llc:get-signed-operand inst))))))
+	((memq uop *return-family*)
+	 ;; Steppable return pc from this frame
+	 (loop for previous-prev-frame first frame then prev-frame
+	       for prev-frame first (frame-previous-frame frame)
+			      then (frame-previous-frame prev-frame)
+	       if (null prev-frame)
+		 do (ferror "Internal stepper error - there is no previous frame")
+	       as function = (frame-function prev-frame)
+	       if (function-steppable-p (frame-function prev-frame))
+		 do (return (values function
+				    (function-relative-pc
+				      (frame-return-pc previous-prev-frame) function)))))
+	(t
+	 ;; Return next pc in this frame
+	 (values function (1+ pc)))))))
+
+
+;; This disgusting crock keeps us from munging breakpoints when we are
+;; in the middle of single-stepping
+(defvar *within-single-step* nil)
+
+#+imach
+(defun maybe-hack-breakpoints () )
+
+;; Proceeding is a gross kludge in the breakpoint case.  What we do is this:
+;;  1. Replace the breakpoint with the original instruction
+;;  2. Insert a cleanup breakpoint at the "next" pc
+;;  3. Effect a <resume>
+;;  4. Break immediately for cleanup
+#+3600
+(defun maybe-hack-breakpoints ()
+  (when (not *within-single-step*)
+    (let* ((frame *innermost-interesting-frame*)
+	   (function (frame-function frame))
+	   (pc (frame-relative-exit-pc frame))
+	   (kludges ()))
+      (when (fixp pc)				;bomb if this is nil
+	(when (typep *error* 'breakpoint)
+	  ;; Remove original breakpoint and set phony breakpoints which
+	  ;; we will use so we can insert the real one again.  Then we
+	  ;; back up the pc so that <resume> works.  If the user has
+	  ;; manually cleared this breakpoint, we needn't do this.
+	  (let ((bpt (any-breakpoint-in-function function pc)))
+	    (when bpt
+	      (clear-breakpoint function pc)
+	      ;; Breakpoints to clear
+	      (multiple-value-bind (f1 n1 f2 n2)
+		  (compute-next-pc frame function pc)
+		(set-breakpoint f1 n1 :breakpoint-cleanup)
+		(push `(,f1 ,n1) kludges)
+		(when f2
+		  (set-breakpoint f2 n2 :breakpoint-cleanup)
+		  (push `(,f2 ,n2) kludges)))
+	      ;; Breakpoint to set
+	      (push `(,function ,bpt) kludges)
+	      (push current-process kludges)
+	      (push kludges *breakpoint-kludgery*))))))))
+
+#+imach
+(defun finish-call-p (stack-frame-pointer)
+  (let* ((pc (frame-return-pc (frame-next-open-frame stack-frame-pointer))))
+    (multiple-value-bind (function relative-pc)
+	(si:decode-pc pc)
+      (multiple-value-bind (inst-type instruction evenpc)
+	  (si:parsed-function-instruction function relative-pc)
+	(when ( inst-type dtp-packed-instruction-60)
+	  (let* ((instruction-bits
+		   (if evenpc
+		       (ldb %%q-even-instruction (%pointer instruction))
+		       (dpb
+			 (ldb %%q-odd-instruction-within-tag inst-type)
+			 %%odd-instruction-tag-component
+			 (ldb %%q-odd-instruction-within-pointer
+			      (%pointer instruction)))))
+		 (opcode (ldb %%packed-instruction-opcode instruction-bits)))
+	    (if (and ( opcode (ilc:opcode-for-instruction 'finish-call-n))
+		     ( opcode (ilc:opcode-for-instruction 'finish-call-tos-apply)))
+		't
+		nil)))))))
+
+#+imach
+(defun set-step-instruction (frame)
+  (map-over-frames-in-stack %current-stack-group
+    #'(lambda (fp cr-loc ignore)
+	(when (eq fp frame)
+	  (si:%p-dpb 1 %%cr.instruction-trace cr-loc)
+	  (when (finish-call-p frame)
+	    (si:%p-dpb 0 %%cr.instruction-trace cr-loc)
+	    (loop initially
+		    (setf stack-ptr cr-loc)
+		  as stack-ptr = (%pointer-plus stack-ptr -1)
+		  as prev-stack-ptr = (%pointer-plus stack-ptr -1)
+		  until (and (eql (%p-ldb %%q-cdr-code stack-ptr) 3)
+			     (eql (%p-ldb %%q-cdr-code prev-stack-ptr) 3))
+		  finally
+		    (si:%p-dpb 1 sys:%%cr.instruction-trace stack-ptr)
+		    (si:%p-dpb 1 sys:%%cr.trace-pending stack-ptr)))))))
+
+#+imach
+(defun single-step-proceed (proceed)
+  ;; stepping from a breakpoint is a special case 
+  ;; stepping instruction in breakpoint information
+  (if (not *current-breakpoint-info*)
+    (set-step-instruction *current-frame*)
+    (setq *step-from-breakpoint* t))
+  (execute-proceed-command proceed))
+
+#+3600
+(defun single-step-proceed (proceed)
+  (let* ((*within-single-step* t)
+	 (frame *innermost-interesting-frame*)
+	 (function (frame-function frame))
+	 (pc (frame-relative-exit-pc frame))
+	 (kludges ()))
+    ;; Back up the pc iff we stopped for breakpoint or single-step
+    (when (fixp pc)
+      ;; If there is a breakpoint here, remove it
+      (let ((bpt (any-breakpoint-in-function function pc)))
+	(when bpt
+	  (clear-breakpoint function pc))
+	;; Set the breakpoints so we can step
+	(multiple-value-bind (f1 n1 f2 n2)
+	    (compute-next-pc frame function pc)
+	  (set-breakpoint f1 n1 :single-step)
+	  (push `(,f1 ,n1) kludges)
+	  (when f2
+	    (set-breakpoint f2 n2 :single-step)
+	    (push `(,f2 ,n2) kludges)))
+	;; Remember if we removed any breakpoint
+	(if bpt
+	    (push `(,function ,bpt) kludges)
+	    (push nil kludges))
+	(push current-process kludges)
+	(push kludges *single-step-kludgery*))
+      ;; Now proceed
+      (execute-proceed-command proceed))))
+
+;; The way single stepping works is as follows:
+;;  1. Get the instruction at the current pc - it has not been executed yet
+;;  2. Insert a breakpoint at the "next" pc
+;;  3. Effect a <resume>
+;; Notice that if we stepped to a breakpoint, we have to insert the real
+;; instruction - executing a breakpoint is just stupid
+(defun single-step ()
+  (let ((proceed (loop for entry in *proceed-dispatch-table*
+		       do (when (mem #'char-equal #\Resume (car entry))
+			    (return (cdr entry))))))
+    (if proceed
+	(single-step-proceed proceed)) ;; will not return
+    (beep)
+    (format t "~&There is no way to proceed from this error")
+    nil))
+

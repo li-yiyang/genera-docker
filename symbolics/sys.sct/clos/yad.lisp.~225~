@@ -1,0 +1,3091 @@
+;;; -*- Mode: LISP; Syntax: ANSI-Common-Lisp; Base: 10; Package: CLOS-INTERNALS -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Things to do in this file:
+;;;
+;;; Right now, a "Dispatch" includes the type of dispatch and the thing being
+;;; dispatched to.  For example, a type of "Class on position 0" and a particular
+;;; class.  These should be split, and passed around separately.  The information
+;;; in "Class on position 0" can easily fit in a fixnum, and then we won't cons
+;;; nearly as much.
+;;;
+;;; Decide whether or not working out what the dispatch is going to be should be
+;;; sorting the applicable methods at the same time or not, and then make everything
+;;; either pass around a list of methods, or a list of lists of methods consistently.
+;;;
+;;; I think things would be cleaner if all the escape handlers were assembled, rather
+;;; than playing around with PCs pointing somewhere other than the first instruction
+;;; of a function.  However, it would be good to make the macro-assembler be able to
+;;; understand the same structures that are defined in storage before doing this.
+
+;;; Description of Ivory Dispatching:
+;;;
+;;; Ivory dispatching is accomplished through a series of dispatch steps.
+;;; In each dispatch step, FP|2 is called the selector before the dispatch
+;;; step and the extra argument after the dispatch step, and FP|3 is called
+;;; the dispatch argument.  Each dispatch step ends by transferring control
+;;; with some variety of a jump: %JUMP, %MESSAGE-DISPATCH, or
+;;; %GENERIC-DISPATCH.  The extra argument of each dispatch step except the
+;;; last is the selector for the next dispatch step.  The extra argument of
+;;; the last dispatch step is described below.
+;;; 
+;;; The %MESSAGE-DISPATCH and %GENERIC-DISPATCH instructions ensure that at
+;;; least FP|2 and FP|3 are available, pulling them from the apply argument,
+;;; if necessary.  When additional arguments will be dispatched on, an
+;;; ENSURE operation must be done before accessing this argument.  An ensure
+;;; operation ensures that there are at least a certain number of arguments,
+;;; pulling them out of the apply argument if necessary.
+;;; 
+;;; An ENSURE operation checks the control reigster to see if there are
+;;; already enough spread arguments.  If there are not, then an entry
+;;; instruction with the appropriate number of required arguments, and a
+;;; rest argument if there are any optional arguments or a rest argument, is
+;;; executed to accomplish a PULL-APPLY-ARGS.  By only executing the entry
+;;; instruction if there are not enough arguments, we ensure that a
+;;; PUSH-APPLY-ARGS will not occur (that would break the entry instruction
+;;; of the ultimate handler).
+;;; 
+;;; Since each %GENERIC-DISPATCH requires the argument being dispatched on
+;;; to be in FP|3, the original value in FP|3 must be saved if an argument
+;;; other than the first will be used for dispatching.  The
+;;; SAVE-DISPATCH-ARGUMENT operation is used to save the current value of
+;;; the dispatch argument.  All it does is push FP|3 onto the stack.  The
+;;; inverse operation, RESTORE-DISPATCH-ARGUMENT, sets FP|3 to be whatever
+;;; is on the top of the stack.  The SET-DISPATCH-ARGUMENT operation is used
+;;; to set the dispatch argument (i.e. FP|3) to the value of some other
+;;; argument.
+;;; 
+;;; When a dispatch occurs on an argument which shares a data type (other
+;;; than DTP-INSTANCE) such as DTP-LEXICAL-CLOSURE, the data type's handler
+;;; table contains only a default handler.  This handler pushes FP|3 onto
+;;; the stack and then sets FP|3 to a "fake instance", which is an object
+;;; with data type DTP-INSTANCE that has a handler table appropriate for the
+;;; class of the dispatch argument.  The next dispatch step must begin by
+;;; restoring the dispatch argument to its proper value by popping the stack
+;;; into FP|3.
+;;; 
+;;; When dispatching finishes, the arguments must be restored.  An ensure
+;;; operation doesn't need to be undone, but if the first argument was saved
+;;; in a dispatch step, then it must be restored.  The actual PC to branch
+;;; to is passed in the extra argument, and the real extra argument (what
+;;; the combined method wants) is either in the extra argument (a cons of
+;;; the PC and the real extra argument) or a constant in the final dispatch
+;;; code.  After the first argument has been restored and FP|2 set to the
+;;; real extra argument, the actual PC is %JUMPed to.
+;;; 
+;;; When a %GENERIC-DISPATCH misses, i.e. doesn't find anything in the
+;;; handler table, the miss handler will first try rehashing the table, and
+;;; then it will restore the arguments to their original values.  It is
+;;; important that there is enough information around for this to be done
+;;; since these original values are used to compute an appropriate handler
+;;; and extra argument for the generic function with arguments.  The
+;;; dispatch steps needed to reach the handler and extra argument will be
+;;; inserted into the handler tables.  For this function invocation,
+;;; dispatching is considered complete.  A function call to the handler
+;;; (which is a PC.  A kludge is used to get the function call to happen)
+;;; with the arguments will be done from the miss handler.
+;;; 
+;;; The first dispatch step always uses the funcallable instance extra
+;;; argument as the selector.  This has data type DTP-GENERIC-FUNCTION and
+;;; has the GENERIC-FUNCTION-CLOS bit set.  The generic function can be
+;;; determined from the DTP-GENERIC-FUNCTION object.  If the first argument
+;;; is to be dispatched on, the first dispatch step will consist only of a
+;;; %GENERIC-DISPATCH.  Otherwise, the first dispatch step will consist of
+;;; an ENSURE operation, a SAVE-DISPATCH-ARGUMENT operation, a
+;;; SET-DISPATCH-ARGUMENT operation, and the dispatch.  If the :SELECTOR
+;;; option was used in the generic function, then the dispatch on the first
+;;; argument will be entered twice in the handler tables, once with the
+;;; DTP-GENERIC-FUNCTION as the selector, and again using the specified
+;;; selector as the selector.
+;;; 
+;;; If there are additional dispatches, the selector will be a two element
+;;; dotted list.  The first element will be the generic function.  The
+;;; second element will be a class whose handler table has an entry for this
+;;; position of the dispatch.  The tail will be a list of other classes
+;;; whose handler tables have entries for the generic function at this
+;;; dispatch position.  (These selectors are three words long for the
+;;; benefit of reorder memory, even though it doesn't yet do anything with
+;;; them.  The three word part is in a static area and are managed like a
+;;; resource.  The tails are in the default cons area and the tail position
+;;; is set to NIL when one of these selectors are returned to the list of
+;;; available selectors.  When I have time to figure out how to do it, they
+;;; should be able to stay put in the handler tables, so that the work of
+;;; reorder memory wouldn't be wasted.).  If the ENSURE and
+;;; SAVE-DISPATCH-ARGUMENT operations have not already been done, they are
+;;; done at this time.  The dispatch argument is set to the next argument to
+;;; dispatch on, and then a %GENERIC-DISPATCH is performed.
+;;; 
+;;; EQL dispatches always follow a CLASS dispatch.  The dispatch argument is
+;;; an EQL-DISPATCH-INSTANCE and the selector is the real dispatch argument.
+;;; The dispatch is done using %MESSAGE-DISPATCH, so the dispatch argument
+;;; is in FP|2 and the selector is in FP|3, conveniently.  The handler
+;;; tables of EQL-DISPATCH-INSTANCEs are filled in completely for the
+;;; EQL-specialized objects of the class.  If the dispatch finds an EQL
+;;; specializer in the table, FP|3 will end up with the EQL-DISPATCH
+;;; instance in it, and FP|2 will have the next extra argument, i.e. the
+;;; dispatch argument gets trashed.  Thus, if the original FP|3 has not yet
+;;; been saved, an EQL dispatch must save it.  If FP|3 does not match an
+;;; entry in the table, then the extra argument comes from the
+;;; EQL-DISPATCH-INSTANCE and a PC from the EQL-DISPATCH-INSTANCE is jumped
+;;; to.
+;;; 
+;;; When a dispatch table lookup fails to find a handler, the arguments must
+;;; be restored by figuring out what is on the stack.  The dispatch
+;;; conventions ensure that this can always be done.  If FP|3 contains a
+;;; fake instance, then TOS needs to be popped into FP|3.  If the selector
+;;; is a cons whose first element is a generic function, then this is not
+;;; the first dispatch; the original FP|3 will be found on the top of the
+;;; stack and must be popped into FP|3.  If, instead, the selector has data
+;;; type DTP-GENERIC-FUNCTION and is not a CLOS generic function selector,
+;;; then there is nothing to be restored (because the selector is a Flavors
+;;; generic function and they dispatch only on the first argument).
+;;; Otherwise, the generic function associated with the selector must be
+;;; found and its funcallable instance function examined.  If this function
+;;; consists of just a %GENERIC-DISPATCH, then we know that FP|3 still has
+;;; its original value.  Otherwise, we must pop the stack into FP|3 to
+;;; restore the original value.
+
+(IN-PACKAGE :CLOS-INTERNALS)
+
+#-Genera
+(DEFSUBST GENERIC-FUNCTION-CLOS (SELECTOR)
+  (DECLARE (IGNORE SELECTOR))
+  T)
+
+#+Genera
+(EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+(SCL:DEFPROP DISPATCH T SI:DEBUG-INFO))
+
+#+IMACH
+(DEFUN DISPATCH-HANDLER-SPEC (HANDLER)
+  (ETYPECASE HANDLER
+    (SYS:COMPILED-FUNCTION-PC (SETF HANDLER (SYS:%FIND-STRUCTURE-HEADER HANDLER)))
+    (SYS:COMPILED-FUNCTION))
+  (CDR (SI:DEBUGGING-INFO-USER-ENTRY HANDLER 'DISPATCH)))
+
+#+Minima
+(DEFUN DISPATCH-HANDLER-SPEC (HANDLER)
+  (WHEN (TYPEP HANDLER 'IVORY::PC)
+    (SETF HANDLER (MINIMA-INTERNALS::FIND-CONTAINING-OBJECT HANDLER)))
+  (GETF (CDR (IVORY::COMPILED-FUNCTION-EXTRA-INFO HANDLER)) 'DISPATCH))
+
+#+|3600|
+(DEFUN DISPATCH-HANDLER-SPEC (HANDLER)
+  (IF (TYPEP HANDLER 'SYS:GENERIC-FUNCTION)
+      '(0)
+      (CDR (SI:DEBUGGING-INFO-USER-ENTRY HANDLER 'DISPATCH))))
+
+#-(OR Genera Minima) (PROGN
+
+(DEFVAR *DISPATCH-HANDLER-SPECS* (CLOS-MAKE-HASH-TABLE :TEST #'EQ))
+
+(DEFUN DISPATCH-HANDLER-SPEC (HANDLER)
+  (CLOS-GETHASH HANDLER *DISPATCH-HANDLER-SPECS*))
+
+(DEFUN (SETF DISPATCH-HANDLER-SPEC) (SPEC HANDLER)
+  (SETF (CLOS-GETHASH HANDLER *DISPATCH-HANDLER-SPECS*) SPEC))
+
+)
+
+(DEFPARAMETER *DISPATCH-HANDLERS* NIL)
+
+#+(OR IMACH Minima)
+(DEFUN FIND-DISPATCH-HANDLER (SPEC)
+  (WITH-CLOS-LOCK
+    (OR (CDR (ASSOC SPEC *DISPATCH-HANDLERS* :TEST #'EQUAL))
+	(LET ((CODE (ASSEMBLE `((DISPATCH-HANDLER ,@SPEC)))))
+	  (PUSH (CONS SPEC CODE) *DISPATCH-HANDLERS*)
+	  CODE))))
+
+;;; On 3600s (for now) and in CLOE, dispatch tables contain functions to be called
+;;; and integers which tell what kind of dispatch to do.
+(EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+(DEFCONSTANT %%DISPATCH-POSITION (BYTE 8. 0.))
+
+(DEFCONSTANT %%DISPATCH-TYPE (BYTE 4. 8.))
+(DEFCONSTANT %DISPATCH-TYPE-CLASS 0)
+(DEFCONSTANT %DISPATCH-TYPE-EQ 1)
+(DEFCONSTANT %DISPATCH-TYPE-EQL 2)
+(DEFCONSTANT %DISPATCH-TYPE-UPDATE 3)
+)
+(DEFSTRUCT (DISPATCH (:TYPE LIST))
+  TYPE)
+
+(DEFSTRUCT (CLASS-DISPATCH (:TYPE LIST)
+			   (:INCLUDE DISPATCH (TYPE 'CLASS-DISPATCH)))
+  POSITION
+  CLASS)
+
+(DEFSTRUCT (EQL-DISPATCH (:TYPE LIST)
+			 (:INCLUDE DISPATCH (TYPE 'EQL-DISPATCH)))
+  POSITION
+  KEY-OR-NIL
+  ALL-KEYS)
+
+(DEFSTRUCT (FINISH-DISPATCH (:TYPE LIST)
+			    (:INCLUDE DISPATCH (TYPE 'FINISH-DISPATCH)))
+  HANDLER
+  EXTRA-ARGUMENT)
+
+;;; COMPUTE-HANDLER-AND-EXTRA-ARGUMENT state dispatch extra-argument
+;;;
+;;;   Called when a new handler is needed.
+;;;
+;;; COMPUTE-DISPATCH state handler extra-argument
+;;;
+;;;   Called to interpret an existing dispatch.
+;;;
+;;; UPDATE-DISPATCH-STATE state dispatch
+;;;
+;;;   Called to determine changes to the state after a dispatch.
+
+(EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+(DEFCONSTANT %%DISPATCH-STATE-ENSURED-P (BYTE 1. 0.))
+(DEFCONSTANT %%DISPATCH-STATE-RESTORE-P (BYTE 1. 1.))
+(DEFCONSTANT %%DISPATCH-STATE-REST-P (BYTE 1. 2.))
+(DEFCONSTANT %%DISPATCH-STATE-DISPATCHED-P (BYTE 1. 3.))
+(DEFCONSTANT %%DISPATCH-STATE-DISPATCH-ARGUMENT (BYTE 8. 8.))
+(DEFCONSTANT %%DISPATCH-STATE-N-REQUIRED (BYTE 8. 16.))
+)
+
+(DEFMACRO CLOS-LDB-TEST (BYTE WORD)
+  `(LDB-TEST ,BYTE ,WORD))
+
+(DEFINE-SETF-EXPANDER CLOS-LDB-TEST (BYTE WORD &ENVIRONMENT ENV)
+  (MULTIPLE-VALUE-BIND (WORD-TEMPS WORD-VALS WORD-STORES WORD-STORE-FORM WORD-ACCESS-FORM)
+      (GET-SETF-EXPANSION WORD ENV)
+    (LET ((BTEMP (GENSYM))
+	  (STORE (GENSYM)))
+	(VALUES (LIST* BTEMP WORD-TEMPS)
+		(LIST* BYTE WORD-VALS)
+		(LIST STORE)
+		`(MULTIPLE-VALUE-BIND ,WORD-STORES
+		     (DPB (IF ,STORE -1 0) ,BTEMP ,WORD-ACCESS-FORM)
+		   ,WORD-STORE-FORM)
+		`(LDB-TEST ,BTEMP ,WORD-ACCESS-FORM)))))
+
+(DEFMACRO DISPATCH-STATE-ENSURED-P (DISPATCH-STATE)
+  `(CLOS-LDB-TEST %%DISPATCH-STATE-ENSURED-P ,DISPATCH-STATE))
+
+(DEFMACRO DISPATCH-STATE-RESTORE-P (DISPATCH-STATE)
+  `(CLOS-LDB-TEST %%DISPATCH-STATE-RESTORE-P ,DISPATCH-STATE))
+
+(DEFMACRO DISPATCH-STATE-REST-P (DISPATCH-STATE)
+  `(CLOS-LDB-TEST %%DISPATCH-STATE-REST-P ,DISPATCH-STATE))
+
+(DEFMACRO DISPATCH-STATE-DISPATCHED-P (DISPATCH-STATE)
+  `(CLOS-LDB-TEST %%DISPATCH-STATE-DISPATCHED-P ,DISPATCH-STATE))
+
+(DEFMACRO DISPATCH-STATE-DISPATCH-ARGUMENT (DISPATCH-STATE)
+  `(LDB %%DISPATCH-STATE-DISPATCH-ARGUMENT ,DISPATCH-STATE))
+
+(DEFMACRO DISPATCH-STATE-N-REQUIRED (DISPATCH-STATE)
+  `(LDB %%DISPATCH-STATE-N-REQUIRED ,DISPATCH-STATE))
+
+(DEFUN DESCRIBE-DISPATCH-STATE (STATE)
+  (FORMAT T "~&Dispatch arg: ~s, N-required: ~s~:[~; Ensured~]~:[~; Restore~]~:[~; Rest~] ~
+             ~:[~;Dispatched~]"
+	  (DISPATCH-STATE-DISPATCH-ARGUMENT STATE)
+	  (DISPATCH-STATE-N-REQUIRED STATE)
+	  (DISPATCH-STATE-ENSURED-P STATE)
+	  (DISPATCH-STATE-RESTORE-P STATE)
+	  (DISPATCH-STATE-REST-P STATE)
+	  (DISPATCH-STATE-DISPATCHED-P STATE)))
+
+(EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+(DEFUN MAKE-INITIAL-DISPATCH-STATE (N-REQUIRED REST-P)
+  (DPB N-REQUIRED %%DISPATCH-STATE-N-REQUIRED
+       (DPB (IF REST-P 1 0) %%DISPATCH-STATE-REST-P 0)))
+)
+
+
+
+
+#+CLOE-Runtime
+(in-package 'compiler)
+
+#+CLOE-Runtime
+(EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+
+(defun codegen-numargscheck (form mode whichjump)
+  (unless (typep (second form) 'fixnum) (error "Constant argument expected: ~S." form))
+  (ensure-edi-valid)				;Might as well, it's invariably useful.
+  (let ((join (reflabel)))
+    (gencode CMP EDI CIMMED (ash (second form) 2))
+    (gencode JGE join)
+    (cmprttrap TRAP-WNUMARGS)
+    (setlabel join))
+  (compile-single-value EDX mode)		;In case some joker uses this for value.
+  )
+
+(define-code-template system::%minargscheck (form mode)
+  (codegen-numargscheck form mode JGE))
+
+(define-code-template system::%numargscheck (form mode)
+  (codegen-numargscheck form mode JE))
+
+(define-code-template clos-internals::%gfcf-selector (form mode)
+  (vcompile (second form) CMP-LOAD)
+  (gencode MOV EBX INDEX EAX CADDR32 0)
+  (if (eq mode CMP-PUSH)
+      (gencode PUSH INDEX EAX EBX CADDR32 0)
+      (let ((r (if (eq mode CMP-LOADI) ESI EAX)))
+	(gencode MOV r INDEX EAX EBX CADDR32 0)
+	(compile-single-value r mode))))
+
+
+(define-code-template clos-internals::%set-gfcf-selector (form mode)
+  (vcompile (second form) CMP-PUSH)
+  (vcompile (third form) CMP-LOAD)
+  (gencode POP ESI)
+  (gencode MOV EBX INDEX ESI CADDR32 0)
+  (gencode MOV TO EAX INDEX ESI EBX CADDR32 0)
+  (compile-single-value EAX mode))
+
+
+(define-code-template clos-internals::%gfcf-arg (form mode)
+  (vcompile (second form) CMP-PUSH)
+  (vcompile (third form) CMP-LOADI)
+  (gencode POP EAX)
+  (gencode MOV EBX INDEX EAX CADDR32 0)
+  (gencode SUB EBX ESI)
+  (if (eq mode CMP-PUSH)
+      (gencode PUSH INDEX EAX EBX CADDR32 -4)
+      (let ((r (if (eq mode CMP-LOADI) ESI EAX)))
+	(gencode MOV r INDEX EAX EBX CADDR32 -4)
+	(compile-single-value r mode))))
+      
+
+(define-code-template clos-internals::%dispatch-internal-tail-recursively (form mode)
+  (declare (ignore mode))
+  (vcompile (second form) CMP-LOAD)
+  (gencode CALL NEAR INDEX EDX CADDR32 sys::sq$l-%setup-generic-function-call)
+  ;;No, it never returns.
+  )
+
+
+(define-code-template clos-internals::%tail-call-new-handler (form mode)
+  (declare (ignore mode))
+  (vcompile (second form) CMP-PUSH)		;New handler function
+  (vcompile (third form) CMP-LOAD)		;new extra argument
+  (ensure-edi-valid)
+  (gencode MOV TO EAX INDEX EBP EDI CADDR32 8)
+  (gencode POP EAX)
+  (gencode LEAVE)
+  (gencode JMP NEAR INDEX EAX CADDR32 CODE-POS))
+
+);End EVAL-WHEN
+
+#+CLOE-Runtime
+(in-package 'clos-internals)
+
+
+#+IMACH
+(DEFUN FINISH-HANDLER-AND-EXTRA-ARGUMENT (HANDLER EXTRA-ARGUMENT)
+  (DECLARE (VALUES HANDLER EXTRA-ARGUMENT))
+  (TYPECASE HANDLER
+    (SYS:COMPILED-FUNCTION
+      (VALUES (HANDLER-PC HANDLER) EXTRA-ARGUMENT))
+    (SYS:COMPILED-FUNCTION-PC
+      (VALUES HANDLER EXTRA-ARGUMENT))
+    (OTHERWISE
+      (VALUES (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER)
+	      (MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))))
+
+#+Minima
+(DEFUN FINISH-HANDLER-AND-EXTRA-ARGUMENT (HANDLER EXTRA-ARGUMENT)
+  (TYPECASE HANDLER
+    (IVORY::COMPILED-CODE
+      (VALUES (HANDLER-PC HANDLER) EXTRA-ARGUMENT))
+    (IVORY::PC
+      (VALUES HANDLER EXTRA-ARGUMENT))
+    (OTHERWISE
+      (VALUES (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER)
+	      (MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))))
+
+#+(OR |3600| CLOE-Runtime)
+(DEFSUBST FINISH-HANDLER-AND-EXTRA-ARGUMENT (HANDLER EXTRA-ARGUMENT)
+  (VALUES HANDLER EXTRA-ARGUMENT))
+
+(DEFUN COMPUTE-FINISH-DISPATCH (HANDLER EXTRA-ARGUMENT)
+  (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+      (FINISH-HANDLER-AND-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)
+    (MAKE-FINISH-DISPATCH :HANDLER HANDLER :EXTRA-ARGUMENT EXTRA-ARGUMENT)))
+
+#+|3600|
+(DEFUN START-POSITION-0-CLASS-DISPATCH (SELECTOR &REST ARGUMENTS)
+  (DECLARE (DYNAMIC-EXTENT ARGUMENTS))
+  (DECLARE (DISPATCH 0))
+  (APPLY SELECTOR ARGUMENTS))
+
+#+|3600|
+(DEFUN MAKE-DISPATCH-STARTER (HANDLER STATE)
+  (LET ((N-REQUIRED (DISPATCH-STATE-N-REQUIRED STATE))
+	(RESTP (DISPATCH-STATE-REST-P STATE)))
+    (WITH-CLOS-LOCK
+      (SYS:WITH-STACK-LIST (KEY STATE HANDLER)
+	(LET ((STARTER (CDR (ASSOC KEY *DISPATCH-HANDLERS* :TEST #'EQUAL))))
+	  (WHEN STARTER (RETURN-FROM MAKE-DISPATCH-STARTER STARTER)))
+	(LET* ((REQUIRED-PARAMETERS NIL))
+	  (LOOP REPEAT (1- N-REQUIRED) DOING
+	    (PUSH (GENSYM) REQUIRED-PARAMETERS))
+	  (LET ((CODE
+		  (COMPILE
+		    NIL
+		    `(LAMBDA (,@(IF (DISPATCH-STATE-DISPATCHED-P STATE)
+				    `(ARG0 EXTRA-ARGUMENT IGNORE)
+				    `(EXTRA-ARGUMENT ARG0))
+			      ,@REQUIRED-PARAMETERS
+			      ,@(WHEN RESTP '(&REST REST)))
+		       (DECLARE (DISPATCH ENSURE ,HANDLER)
+				,@(WHEN RESTP `((DYNAMIC-EXTENT REST))))
+		       ;; Don't get "Bound but never used" warnings on these
+		       ;; variables.
+		       ,@REQUIRED-PARAMETERS
+		       ,@(WHEN RESTP '(REST))
+		       ,(WHEN REQUIRED-PARAMETERS
+			  `(SETF (SYS:%P-CDR-CODE (LOCF ,@(LAST REQUIRED-PARAMETERS)))
+				 ,(IF RESTP SYS:CDR-NORMAL SYS:CDR-NIL)))
+		       (DISPATCH-INTERNAL
+			 ',HANDLER
+			 ARG0
+			 EXTRA-ARGUMENT
+			 ,(IF REQUIRED-PARAMETERS
+			      `(SYS:%MAKE-POINTER
+				 SYS:DTP-LIST
+				 (LOCF ,(FIRST REQUIRED-PARAMETERS)))
+			      (IF RESTP
+				  'REST
+				  NIL)))))))
+	    (PUSH (CONS (COPY-LIST KEY) CODE) *DISPATCH-HANDLERS*)
+	    CODE))))))
+
+#+CLOE-Runtime
+(DEFUN MAKE-DISPATCH-STARTER (HANDLER STATE)
+  (LET ((N-REQUIRED (DISPATCH-STATE-N-REQUIRED STATE))
+	(RESTP (DISPATCH-STATE-REST-P STATE)))
+    (WITH-CLOS-LOCK
+      (SYS::WITH-STACK-LIST (KEY STATE HANDLER)
+	(LET ((STARTER (CDR (ASSOC KEY *DISPATCH-HANDLERS* :TEST #'EQUAL))))
+	  (WHEN STARTER (RETURN-FROM MAKE-DISPATCH-STARTER STARTER)))
+	(LET ((CODE (COMPILE NIL `(LAMBDA ()
+				    (DECLARE (SYSTEM::INHIBIT-FUNCTION-ENTRY-CODE))
+				    (SYSTEM::%MINARGSCHECK ,(1+ N-REQUIRED))
+				    (%DISPATCH-INTERNAL-TAIL-RECURSIVELY ',HANDLER)))))
+	  (SETF (DISPATCH-HANDLER-SPEC CODE) `(ENSURE ,HANDLER))
+	  (PUSH (CONS (COPY-LIST KEY) CODE) *DISPATCH-HANDLERS*)
+	  CODE)))))
+
+#+CLOE-Runtime
+(DEFUN START-POSITION-0-CLASS-DISPATCH ()
+  (DECLARE (SYSTEM::INHIBIT-FUNCTION-ENTRY-CODE))
+  (SYSTEM::%MINARGSCHECK 2)
+  (%DISPATCH-INTERNAL-TAIL-RECURSIVELY 
+    #.(DPB %DISPATCH-TYPE-CLASS %%DISPATCH-TYPE (DPB 0 %%DISPATCH-POSITION 0))	;Sigh (the "#.")
+    ))
+
+#+CLOE-Runtime
+(SETF (DISPATCH-HANDLER-SPEC #'START-POSITION-0-CLASS-DISPATCH) '(0))
+
+#+(OR |3600| CLOE-Runtime)
+;;; This is a separate function in Genera to avoid making the dispatch
+;;; functions large enough that they would require long-branches.
+;;; It's separate in non-Genera because it is used in a generic function
+;;; call frame when there is a missed dispatch.
+(DEFUN HANDLE-MISSED-DISPATCH-1 (SELECTOR &REST ARGUMENTS)
+  (DECLARE (DYNAMIC-EXTENT ARGUMENTS))
+  (DECLARE (DBG:ERROR-REPORTER))
+  #+Genera
+  (IF (TYPEP SELECTOR 'CONS)
+      (HANDLE-MISSED-DISPATCH (FIRST SELECTOR) ARGUMENTS)
+      (LET ((FUNCALLABLE-INSTANCE (DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR)))
+	(IF (GENERIC-FUNCTION-P FUNCALLABLE-INSTANCE)
+	    (HANDLE-MISSED-DISPATCH FUNCALLABLE-INSTANCE ARGUMENTS)
+	    ;; Signal the Flavors error
+	    (SCL:SIGNAL-PROCEED-CASE ((VALUE) 'DBG:UNCLAIMED-MESSAGE
+				      :OBJECT (FIRST ARGUMENTS)
+				      :MESSAGE SELECTOR
+				      :ARGUMENTS (COPY-LIST (REST ARGUMENTS)))
+	      (:NEW-FUNCTION
+		(APPLY VALUE ARGUMENTS))
+	      (:ARGUMENT-VALUE
+		(APPLY SELECTOR VALUE (REST ARGUMENTS)))))))
+  #-Genera
+  (HANDLE-MISSED-DISPATCH
+    (IF (TYPEP SELECTOR 'CONS)
+	(FIRST SELECTOR)
+	(DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR))
+    ARGUMENTS))
+
+#+|3600|
+;;; This is a separate function to avoid making the dispatch functions large
+;;; enough that they would require long-branches.
+(DEFUN HANDLE-APPARENTLY-MISSED-DISPATCH (INSTANCE INFORMATION SELECTOR)
+  (DECLARE (VALUES EXTRA-ARGUMENT HANDLER))
+  (LET ((DISPATCH-TABLE (%INSTANCE-INFORMATION-DISPATCH-TABLE INFORMATION)))
+    ;; Lookup failed, make sure the dispatch table is properly hashed
+    (COMPILER:%ERROR-WHEN (DISPATCH-TABLE-NEEDS-REHASHING DISPATCH-TABLE)
+      (MULTIPLE-VALUE-BIND (FOUNDP CELL NEW-DISPATCH-TABLE)
+	  (DISPATCH-TABLE-SEARCH DISPATCH-TABLE SELECTOR)
+	(UNLESS (EQ DISPATCH-TABLE NEW-DISPATCH-TABLE)
+	  (SETF (%INSTANCE-INFORMATION-DISPATCH-TABLE INFORMATION) NEW-DISPATCH-TABLE))
+	(WHEN FOUNDP
+	  (RETURN-FROM HANDLE-APPARENTLY-MISSED-DISPATCH
+	    (VALUES (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) (DISPATCH-ENTRY-HANDLER CELL))))))
+    ;; The selector is definitely not in the dispatch-table
+    (WHEN (EQ (%INSTANCE-INFORMATION-CLASS INFORMATION) T)	;SYS:EQL-DISPATCH-INSTANCE-P
+      ;; These never really miss.  The default is in the EQL-DISPATCH-INSTANCE.
+      (RETURN-FROM HANDLE-APPARENTLY-MISSED-DISPATCH
+	(VALUES (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT INSTANCE)
+		(EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER INSTANCE))))
+    ;; Truly missed dispatch
+    NIL))
+
+#+CLOE-Runtime
+;;;This is the same as the above except we can't agree to have the same arguments
+;;; for the macros that they use (which were macroized for modularity and code
+;;; sharing reasons).
+(DEFUN HANDLE-APPARENTLY-MISSED-DISPATCH (INSTANCE INFORMATION SELECTOR)
+  (DECLARE (VALUES EXTRA-ARGUMENT HANDLER))
+  (LET ((DISPATCH-TABLE (%INSTANCE-INFORMATION-DISPATCH-TABLE INFORMATION)))
+    ;; Lookup failed, make sure the dispatch table is properly hashed
+    (WHEN (DISPATCH-TABLE-NEEDS-REHASHING DISPATCH-TABLE)
+      (MULTIPLE-VALUE-BIND (FOUNDP CELL NEW-DISPATCH-TABLE)
+	  (DISPATCH-TABLE-SEARCH DISPATCH-TABLE SELECTOR)
+	(UNLESS (EQ DISPATCH-TABLE NEW-DISPATCH-TABLE)
+	  (SETF (%INSTANCE-INFORMATION-DISPATCH-TABLE INFORMATION) NEW-DISPATCH-TABLE))
+	(WHEN FOUNDP
+	  (RETURN-FROM HANDLE-APPARENTLY-MISSED-DISPATCH
+	    (VALUES (DISPATCH-ENTRY-EXTRA-ARGUMENT NEW-DISPATCH-TABLE CELL)
+		    (DISPATCH-ENTRY-HANDLER NEW-DISPATCH-TABLE CELL))))))
+    ;; The selector is definitely not in the dispatch-table
+    (WHEN (EQ (%INSTANCE-INFORMATION-CLASS INFORMATION) T)	;SYS:EQL-DISPATCH-INSTANCE-P
+      ;; These never really miss.  The default is in the EQL-DISPATCH-INSTANCE.
+      (RETURN-FROM HANDLE-APPARENTLY-MISSED-DISPATCH
+	(VALUES (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT INSTANCE)
+		(EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER INSTANCE))))
+    ;; Truly missed dispatch
+    (VALUES NIL NIL)))
+
+
+#+|3600|
+(DEFMACRO DEFINE-DISPATCH-INTERNAL (NAME ARGUMENTS DISPATCH-TYPE DISPATCH-ARGUMENT
+					 APPLY DISPATCHED-P DIRECT-P)
+  (MACROLET ((NTH-ARGUMENT (POSITION)
+	       `(COND ((AND DISPATCHED-P (CDR ARGUMENTS) (NOT (EQ (SECOND ARGUMENTS) '&REST)))
+		       `(IF (> ,',POSITION 0)
+			    (LOCATION-CONTENTS (SYS:%POINTER-PLUS
+						 (LOCF ,(SECOND ARGUMENTS))
+						 (1- ,',POSITION)))
+			    ARG0))
+		      ((AND DISPATCH-TYPE (NOT DIRECT-P))
+		       `(LOCATION-CONTENTS (SYS:%POINTER-PLUS
+					     (LOCF ,(FIRST ARGUMENTS))
+					     ,',POSITION)))
+		      (T
+			`(IF (> ,',POSITION 0)
+			     (LOCATION-CONTENTS (SYS:%POINTER-PLUS
+						  OTHER-ARGUMENTS
+						  (1- ,',POSITION)))
+			     ARG0)))))
+    (LET* ((PARAMETERS (REMOVE '&REST ARGUMENTS))
+	   (LAMBDA-LIST `(,@(COND (DIRECT-P `(ARG0 IGNORE EXTRA-ARGUMENT))
+				  (DISPATCHED-P `(ARG0 EXTRA-ARGUMENT IGNORE))
+				  (DISPATCH-TYPE `(EXTRA-ARGUMENT))
+				  (T `(HANDLER ARG0 EXTRA-ARGUMENT)))
+			  ,@(IF DISPATCHED-P (CDR ARGUMENTS) ARGUMENTS)))
+	   (NEXT-DISPATCH
+	     (MULTIPLE-VALUE-BIND (FIRST-ARG REMAINING-ARGS)
+		 (IF (AND DISPATCH-TYPE (NOT DIRECT-P))
+		     (VALUES (FIRST PARAMETERS) (REST PARAMETERS))
+		     (VALUES 'ARG0 PARAMETERS))
+	       `((UNLESS (INTEGERP HANDLER)	;faster than FIXNUMP
+		   (RETURN-FROM ,NAME
+		     (,APPLY HANDLER ,FIRST-ARG EXTRA-ARGUMENT NIL ,@REMAINING-ARGS)))
+		 (LET ((POSITION (LDB %%DISPATCH-POSITION HANDLER)))
+		   (SETQ SELECTOR EXTRA-ARGUMENT
+			 INSTANCE ,(NTH-ARGUMENT POSITION))
+		   (UNLESS (= (LDB %%DISPATCH-TYPE HANDLER) %DISPATCH-TYPE-CLASS)
+		     (ROTATEF SELECTOR INSTANCE)))))))
+      `(DEFUN ,NAME (,@LAMBDA-LIST &AUX ,@(ECASE DISPATCH-TYPE
+					    ((NIL) `(SELECTOR INSTANCE))
+					    ((CLASS) `((SELECTOR EXTRA-ARGUMENT)
+						       (INSTANCE ,DISPATCH-ARGUMENT)
+						       HANDLER))
+					    ((EQL EQ) `((SELECTOR ,DISPATCH-ARGUMENT)
+							(INSTANCE EXTRA-ARGUMENT)
+							HANDLER))))
+	 (DECLARE (DBG:ERROR-REPORTER)
+		  ,@(WHEN (OR DIRECT-P DISPATCHED-P)
+		      `((IGNORE IGNORE))))
+	 ,@(WHEN DISPATCH-TYPE
+	     `((DECLARE (DISPATCH ENSURE ,(DPB (ECASE DISPATCH-TYPE
+						 (CLASS %DISPATCH-TYPE-CLASS)
+						 (EQL %DISPATCH-TYPE-EQL))
+					       %%DISPATCH-TYPE
+					       (DPB (IF (EQ DISPATCH-ARGUMENT 'ARG0) 0
+							(POSITION DISPATCH-ARGUMENT ARGUMENTS))
+						    %%DISPATCH-POSITION 0))))))
+	 (LOOP					;Repeat for each dispatch
+           ,@(UNLESS DISPATCH-TYPE
+	       NEXT-DISPATCH)
+	   ;; Start with a simple table lookup
+	   (TAGBODY
+	     TRY-AGAIN
+		(LET ((INFORMATION (%INSTANCE-INFORMATION-INLINE INSTANCE)))
+		  (BLOCK DO-LOOKUP
+		    ;; WITHOUT-INTERRUPTS takes 9 microseconds
+		    ;; WITH-NO-OTHER-PROCESSES takes 25 microseconds best case
+		    (SYS:WITHOUT-INTERRUPTS
+		      (LET ((ADDRESS (DISPATCH-TABLE-INITIAL-PROBE-ADDRESS
+				       (%INSTANCE-INFORMATION-DISPATCH-ADDRESS INFORMATION)
+				       (%INSTANCE-INFORMATION-DISPATCH-MASK INFORMATION)
+				       SELECTOR)))
+			(LOOP
+			  (LET ((PROBE (LOCATION-CONTENTS ADDRESS)))
+			    (WHEN (EQL PROBE SELECTOR)
+			      (SETQ EXTRA-ARGUMENT (SYS:%P-CONTENTS-INCREMENT-POINTER ADDRESS))
+			      (SETQ HANDLER (SYS:%P-CONTENTS-INCREMENT-POINTER ADDRESS))
+			      (RETURN-FROM DO-LOOKUP))
+			    (IF (NOT (NULL PROBE))
+				(SETQ ADDRESS (DISPATCH-TABLE-NEXT-ADDRESS ADDRESS))
+				;; Lookup failed, make sure the dispatch table is
+				;; properly hashed 
+				(MULTIPLE-VALUE-BIND (NEW-EXTRA-ARGUMENT NEW-HANDLER)
+				    (HANDLE-APPARENTLY-MISSED-DISPATCH INSTANCE INFORMATION
+								       SELECTOR)
+				  (UNLESS NEW-HANDLER
+				    ;; Lookup failed, leave the WITHOUT-INTERRUPTS
+				    (RETURN))
+				  ;; Lookup succeeded after rehashing
+				  (SETQ HANDLER NEW-HANDLER
+					EXTRA-ARGUMENT NEW-EXTRA-ARGUMENT)
+				  (RETURN-FROM DO-LOOKUP)))))))
+		    ;; The selector is definitely not in the dispatch-table and
+		    ;; (SYS:EQL-DISPATCH-INSTANCE-P INSTANCE) is definitely false
+		    (COMPILER:%ERROR-WHEN (INSTANCE-INFORMATION-OBSOLETE-P INFORMATION)
+					  (UPDATE-INSTANCE-USING-CLASS (CLASS-OF INSTANCE) INSTANCE)
+					  ;; Try same dispatch again, INSTANCE and EXTRA-ARGUMENT are unchanged
+					  (GO TRY-AGAIN))
+		    ;; Really did miss
+		    (RETURN-FROM ,NAME
+		      (,APPLY #'HANDLE-MISSED-DISPATCH-1 SELECTOR
+		       ,@(UNLESS (AND DISPATCH-TYPE
+				      (NOT DIRECT-P))
+			   `(ARG0))
+		       ,@PARAMETERS)))
+		  ;; After exit from DO-LOOKUP, go around the loop and do another dispatch
+		  ;; Logically this should be outside the binding of INFORMATION, but we get
+		  ;; slightly better code by leaving it inside, at the cost of increasing the
+		  ;; stack depth by 1 while executing the method.
+		  ,@(WHEN DISPATCH-TYPE
+		      NEXT-DISPATCH)
+		  )))))))
+
+#+|3600|
+(ZWEI:DEFPROP DEFINE-DISPATCH-INTERNAL DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+#+|3600|
+;;; The default dispatch function, which is called from a helper function created
+;;; by MAKE-DISPATCH-STARTER, when there isn't a more specific dispatch function
+(DEFINE-DISPATCH-INTERNAL DISPATCH-INTERNAL (OTHER-ARGUMENTS) NIL NIL APPLY NIL NIL)
+
+#+|3600|
+;;; Called from the dispatch-table of a shared data type
+(DEFINE-DISPATCH-INTERNAL DISPATCH-INTERNAL-1 (&REST OTHER-ARGUMENTS) CLASS ARG0 APPLY NIL T)
+
+#+|3600|
+;;; The maximum number of required parameters for optimized dispatch
+(EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+(DEFPARAMETER *MAXIMUM-FAST-DISPATCH-ARGUMENTS* 5))	;Generates 110 different functions
+
+#+|3600|
+(DEFMACRO GENERATE-DISPATCH-INTERNAL-FUNCTIONS ()
+  `(PROGN
+     ,@(LOOP FOR N-ARGS FROM 1 TO *MAXIMUM-FAST-DISPATCH-ARGUMENTS*
+	     AS ARGUMENTS = (SUBSEQ '(ARG0 ARG1 ARG2 ARG3 ARG4 ARG5 ARG6) 0 N-ARGS) NCONC
+	 (LOOP FOR DISPATCH-ARG FROM 0 BELOW N-ARGS NCONC
+	   (LOOP FOR DISPATCHED IN '(NIL T) NCONC
+	     (LOOP FOR REST IN '(NIL T) NCONC
+	       (LOOP FOR DISPATCH-TYPE IN '(CLASS EQL)
+		     AS NAME = (INTERN (FORMAT NIL "DISPATCH-INTERNAL-~A-~D-OF-~D~
+						    ~:[~;-REST~]~:[~;-DISPATCHED~]"
+					       DISPATCH-TYPE (1+ DISPATCH-ARG) N-ARGS
+					       REST DISPATCHED))
+		     AS STATE = (DPB (IF DISPATCHED 1 0)
+				     %%DISPATCH-STATE-DISPATCHED-P
+				     (MAKE-INITIAL-DISPATCH-STATE N-ARGS REST))
+		     AS HANDLER = (DPB (ECASE DISPATCH-TYPE
+					 (CLASS %DISPATCH-TYPE-CLASS)
+					 (EQL %DISPATCH-TYPE-EQL))
+				       %%DISPATCH-TYPE
+				       (DPB DISPATCH-ARG %%DISPATCH-POSITION 0))
+		     NCONC
+		       (UNLESS (AND (ZEROP DISPATCH-ARG)  ;START-POSITION-0-CLASS-DISPATCH
+				    (EQ DISPATCH-TYPE 'CLASS)
+				    (NOT DISPATCHED))
+			 `((DEFINE-DISPATCH-INTERNAL ,NAME (,@ARGUMENTS
+							    ,@(WHEN REST
+								`(&REST OTHER-ARGUMENTS)))
+						     ,DISPATCH-TYPE
+						     ,(NTH DISPATCH-ARG ARGUMENTS)
+						     ,(IF REST 'APPLY 'FUNCALL)
+						     ,DISPATCHED
+						     NIL)
+			   ,(LET ((KEY (GENSYM))
+				  (VALUE (GENSYM))
+				  (PAIR (GENSYM)))
+			      `(LET* ((,KEY '(,STATE ,HANDLER))
+				      (,VALUE #',NAME)
+				      (,PAIR (ASSOC ,KEY *DISPATCH-HANDLERS*
+						    :TEST #'EQUAL)))
+				 (IF ,PAIR
+				     (SETF (CDR ,PAIR) ,VALUE)
+				     (PUSH (CONS ,KEY ,VALUE) *DISPATCH-HANDLERS*))))
+			   ,@(WHEN (EQ DISPATCH-TYPE 'EQL)
+			       ;; Works for both EQ and EQL
+			       (LET ((KEY (GENSYM))
+				     (VALUE (GENSYM))
+				     (PAIR (GENSYM)))
+				 `((LET* ((,KEY '(,STATE ,(DPB %DISPATCH-TYPE-EQ
+							       %%DISPATCH-TYPE
+							       HANDLER)))
+					  (,VALUE #',NAME)
+					  (,PAIR (ASSOC ,KEY *DISPATCH-HANDLERS*
+							:TEST #'EQUAL)))
+				     (IF ,PAIR
+					 (SETF (CDR ,PAIR) ,VALUE)
+					 (PUSH (CONS ,KEY ,VALUE) *DISPATCH-HANDLERS*)))))))))))))))
+
+#+|3600|
+(GENERATE-DISPATCH-INTERNAL-FUNCTIONS)
+
+
+#+CLOE-Runtime
+(DEFUN %SETUP-GENERIC-FUNCTION-CALL (HANDLER ARGBLOCK)
+  (DECLARE (OPTIMIZE (SPEED 3) (SAFETY 0) (SPACE 0)))
+  (TAGBODY
+    TRY-AGAIN
+       (UNLESS (TYPEP HANDLER 'FIXNUM)
+	 (RETURN-FROM %SETUP-GENERIC-FUNCTION-CALL HANDLER))
+       (LET ((POSITION (THE FIXNUM (LDB %%DISPATCH-POSITION (THE FIXNUM HANDLER)))) SELECTOR INSTANCE (DISPTYPE 0))
+	 (DECLARE (FIXNUM POSITION HANDLER DISPTYPE))
+	 (COND ((= (SETQ DISPTYPE (LDB %%DISPATCH-TYPE HANDLER)) %DISPATCH-TYPE-CLASS)
+		(SETQ SELECTOR (%GFCF-SELECTOR ARGBLOCK) INSTANCE (%GFCF-ARG ARGBLOCK POSITION)))
+	       ((OR (= DISPTYPE %DISPATCH-TYPE-EQL) (= DISPTYPE %DISPATCH-TYPE-EQ))
+		(SETQ SELECTOR (%GFCF-ARG ARGBLOCK POSITION) INSTANCE (%GFCF-SELECTOR ARGBLOCK)))
+	       (T (ERROR "Dispatch table incorrect")))
+	 ;; Start with a simple table lookup
+	 (LET ((INFORMATION (%INSTANCE-INFORMATION-INLINE INSTANCE)))
+	   (BLOCK DO-LOOKUP
+	     (WITH-NO-OTHER-PROCESSES
+	       (LET ((ADDRESS
+		       (DISPATCH-TABLE-INITIAL-PROBE-ADDRESS
+			 (%INSTANCE-INFORMATION-DISPATCH-ADDRESS INFORMATION)
+			 (%INSTANCE-INFORMATION-DISPATCH-MASK INFORMATION)
+			 SELECTOR))
+		     (DISPATCH-TABLE (%INSTANCE-INFORMATION-DISPTAB INFORMATION)))
+		 (DECLARE (TYPE DISPATCH-TABLE-ADDRESS ADDRESS))
+		 (LOOP
+		   (LET ((PROBE (DISPATCH-ENTRY-SELECTOR DISPATCH-TABLE ADDRESS)))
+		     (WHEN (EQ PROBE SELECTOR)
+		       (%SET-GFCF-SELECTOR ARGBLOCK (DISPATCH-ENTRY-EXTRA-ARGUMENT DISPATCH-TABLE ADDRESS))
+		       (SETQ HANDLER (DISPATCH-ENTRY-HANDLER DISPATCH-TABLE ADDRESS))
+		       (RETURN-FROM DO-LOOKUP))
+		     (IF (NOT (NULL PROBE))
+			 (SETQ ADDRESS (DISPATCH-TABLE-NEXT-ADDRESS ADDRESS))
+			 (MULTIPLE-VALUE-BIND (NEW-EXTRA-ARGUMENT NEW-HANDLER)
+			     (HANDLE-APPARENTLY-MISSED-DISPATCH INSTANCE INFORMATION SELECTOR)
+			   (UNLESS NEW-HANDLER (RETURN))
+			   (SETQ HANDLER NEW-HANDLER)
+			   (%SET-GFCF-SELECTOR ARGBLOCK NEW-EXTRA-ARGUMENT)
+			   (RETURN-FROM DO-LOOKUP)))))))
+	     (WHEN (INSTANCE-INFORMATION-OBSOLETE-P INFORMATION)
+	       (UPDATE-INSTANCE-USING-CLASS (CLASS-OF INSTANCE) INSTANCE)
+	       (GO TRY-AGAIN))
+	     ;; Really did miss
+	     (RETURN-FROM %SETUP-GENERIC-FUNCTION-CALL #'HANDLE-MISSED-DISPATCH-1))
+	   (GO TRY-AGAIN)))))
+
+
+;;;This is called by the cloe kernel because it can't do EQL lookups.
+#+CLOE-Runtime
+(DEFUN SETUP-GENERIC-FUNCTION-CALL-EQL-DISPATCH-LOOKUP (SELECTOR INSTANCE INFORMATION)
+  (UNLESS (SYSTEM::XNUMP SELECTOR) (ERROR "Why am I being called?"))
+  (LET ((ADDRESS
+	  (DISPATCH-TABLE-INITIAL-PROBE-ADDRESS
+	    (%INSTANCE-INFORMATION-DISPATCH-ADDRESS INFORMATION)
+	    (%INSTANCE-INFORMATION-DISPATCH-MASK INFORMATION)
+	    SELECTOR))
+	(DISPATCH-TABLE (%INSTANCE-INFORMATION-DISPTAB INFORMATION))
+	(XNUM-TYPE (SYS::%XNUM-TYPE SELECTOR)))
+    (DECLARE (TYPE DISPATCH-TABLE-ADDRESS ADDRESS) (FIXNUM XNUM-TYPE))
+    (LOOP
+      (LET ((PROBE (DISPATCH-ENTRY-SELECTOR DISPATCH-TABLE ADDRESS)))
+	(COND ((NULL PROBE) (RETURN NIL))
+	      ((AND (SYS::XNUMP PROBE) (= (SYS::%XNUM-TYPE PROBE) XNUM-TYPE) (= PROBE SELECTOR))
+	       (RETURN (VALUES (DISPATCH-ENTRY-HANDLER DISPATCH-TABLE ADDRESS)
+			       (DISPATCH-ENTRY-EXTRA-ARGUMENT DISPATCH-TABLE ADDRESS))))
+	      (T (SETQ ADDRESS (DISPATCH-TABLE-NEXT-ADDRESS ADDRESS))))))))
+
+
+#+(OR |3600| CLOE-Runtime)
+(DEFUN COMPUTE-HANDLER-AND-EXTRA-ARGUMENT (STATE DISPATCH EXTRA-ARGUMENT)
+  (DECLARE (VALUES HANDLER EXTRA-ARGUMENT NEXT-STATE))
+  (LET ((NEW-STATE STATE))
+    (ECASE (DISPATCH-TYPE DISPATCH)
+      (CLASS-DISPATCH
+	(LET ((DISPATCH-POSITION (CLASS-DISPATCH-POSITION DISPATCH)))
+	  (VALUES
+	    (COND ((DISPATCH-STATE-ENSURED-P STATE)
+		   ;; Once ensured, then we are running the dispatch interpreter,
+		   ;; which expects fixnums
+		   (DPB %DISPATCH-TYPE-CLASS %%DISPATCH-TYPE
+			(DPB DISPATCH-POSITION %%DISPATCH-POSITION 0)))
+		  ((OR (DISPATCH-STATE-DISPATCHED-P STATE)
+		       (NOT (= DISPATCH-POSITION 0)))
+		   ;; Have to ensure on this dispatch
+		   (SETF (DISPATCH-STATE-ENSURED-P NEW-STATE) T)
+		   (MAKE-DISPATCH-STARTER
+		     (DPB %DISPATCH-TYPE-CLASS %%DISPATCH-TYPE
+			  (DPB DISPATCH-POSITION %%DISPATCH-POSITION 0))
+		     STATE))
+		  (T #+CLOE-Runtime (SETF (DISPATCH-STATE-ENSURED-P NEW-STATE) T)
+		     #'START-POSITION-0-CLASS-DISPATCH))
+	    EXTRA-ARGUMENT
+	    (DPB DISPATCH-POSITION %%DISPATCH-STATE-DISPATCH-ARGUMENT
+		 (DPB 1 %%DISPATCH-STATE-DISPATCHED-P NEW-STATE)))))
+      (EQL-DISPATCH
+	(LET ((DISPATCH-POSITION (EQL-DISPATCH-POSITION DISPATCH)))
+	  (VALUES
+	    (COND ((DISPATCH-STATE-ENSURED-P STATE)
+		   ;; Once ensured, then we are running the dispatch interpreter,
+		   ;; which expects fixnums
+		   (DPB (IF (SOME #'EQL-NOT-EQ-P (EQL-DISPATCH-ALL-KEYS DISPATCH))
+			    %DISPATCH-TYPE-EQL
+			    %DISPATCH-TYPE-EQ)
+			%%DISPATCH-TYPE
+			(DPB DISPATCH-POSITION %%DISPATCH-POSITION 0)))
+		  (T
+		   ;; Have to ensure on this dispatch
+		   (SETF (DISPATCH-STATE-ENSURED-P NEW-STATE) T)
+		   (MAKE-DISPATCH-STARTER
+		     (DPB (IF (SOME #'EQL-NOT-EQ-P (EQL-DISPATCH-ALL-KEYS DISPATCH))
+			      %DISPATCH-TYPE-EQL
+			      %DISPATCH-TYPE-EQ)
+			  %%DISPATCH-TYPE
+			  (DPB DISPATCH-POSITION %%DISPATCH-POSITION 0))
+		     STATE)))
+	    EXTRA-ARGUMENT
+	    (DPB -1 %%DISPATCH-STATE-DISPATCH-ARGUMENT
+		 (DPB 1 %%DISPATCH-STATE-DISPATCHED-P NEW-STATE)))))
+      (FINISH-DISPATCH
+	(LET ((HANDLER (FINISH-DISPATCH-HANDLER DISPATCH))
+	      (EXTRA-ARGUMENT (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH)))
+	  (COND ((NULL (DISPATCH-STATE-DISPATCHED-P STATE))
+		 (VALUES
+		   #+|3600| (COMPILE NIL
+				   (IF (OR (DISPATCH-STATE-REST-P STATE)
+					   (> (DISPATCH-STATE-N-REQUIRED STATE) 8))
+				       (IF (= (DISPATCH-STATE-N-REQUIRED STATE) 0)
+					   `(LAMBDA (SELECTOR &REST REST)
+					      (DECLARE (DYNAMIC-EXTENT REST))
+					      (DECLARE (NOTINLINE APPLY))
+					      SELECTOR
+					      (APPLY ',HANDLER ',EXTRA-ARGUMENT REST))
+					   `(LAMBDA (SELECTOR ARG0 &REST REST)
+					      (DECLARE (DYNAMIC-EXTENT REST))
+					      (DECLARE (NOTINLINE APPLY))
+					      SELECTOR
+					      (APPLY ',HANDLER ARG0 ',EXTRA-ARGUMENT NIL
+						     REST)))
+				       (IF (= (DISPATCH-STATE-N-REQUIRED STATE) 0)
+					   `(LAMBDA (SELECTOR)
+					      (DECLARE (NOTINLINE FUNCALL))
+					      SELECTOR
+					      (FUNCALL ',HANDLER ',EXTRA-ARGUMENT))
+					   (LET ((REST (SUBSEQ '(ARG1 ARG2 ARG3 ARG4
+								 ARG5 ARG6 ARG7)
+							       0 (1- (DISPATCH-STATE-N-REQUIRED
+								       STATE)))))
+					     `(LAMBDA (SELECTOR ARG0 ,@REST)
+						(DECLARE (NOTINLINE FUNCALL))
+						SELECTOR
+						(FUNCALL ',HANDLER ARG0 ',EXTRA-ARGUMENT
+							 NIL ,@REST))))))
+		   #+CLOE-Runtime (COMPILE NIL
+				   `(LAMBDA ()
+				      (declare (SYSTEM::INHIBIT-FUNCTION-ENTRY-CODE)
+					       (optimize (speed 3) (safety 0)))
+				      (%tail-call-new-handler ',handler ',extra-argument)))
+		   NIL
+		   NIL))
+		(T
+		 (VALUES
+		   HANDLER
+		   EXTRA-ARGUMENT
+		   NIL))))))))
+
+#+IMACH
+(DEFUN COMPUTE-HANDLER-AND-EXTRA-ARGUMENT (STATE DISPATCH EXTRA-ARGUMENT)
+  (DECLARE (VALUES HANDLER EXTRA-ARGUMENT NEXT-STATE))
+  (LET* ((NEW-STATE STATE)
+	 (ENSUREDP (DISPATCH-STATE-ENSURED-P STATE))
+	 (RESTORE (WHEN (DISPATCH-STATE-RESTORE-P STATE) '((RESTORE-DISPATCH-ARGUMENT T)))))
+    (MACROLET ((ENSURE ()
+		       ``(,@(UNLESS ENSUREDP
+			      (SETF (DISPATCH-STATE-ENSURED-P NEW-STATE) T)
+			      `((ENSURE ,(DISPATCH-STATE-N-REQUIRED STATE)
+					,(DISPATCH-STATE-REST-P STATE))
+				(SAVE-DISPATCH-ARGUMENT))))))
+      (ECASE (DISPATCH-TYPE DISPATCH)
+	(CLASS-DISPATCH
+	  (LET ((DISPATCH-POSITION (CLASS-DISPATCH-POSITION DISPATCH)))
+	    (VALUES
+	      (FIND-DISPATCH-HANDLER
+		`(,@RESTORE
+		  ,@(UNLESS (EQL (DISPATCH-STATE-DISPATCH-ARGUMENT STATE) DISPATCH-POSITION)
+		      `(,@(ENSURE)
+			(SET-DISPATCH-ARGUMENT ,DISPATCH-POSITION)))
+		  (CLASS)))
+	      EXTRA-ARGUMENT
+	      (SYS:DPBS DISPATCH-POSITION %%DISPATCH-STATE-DISPATCH-ARGUMENT
+			(IF (CLASS-SHARES-DATA-TYPE-P (CLASS-DISPATCH-CLASS DISPATCH))
+			    1
+			    0)
+			%%DISPATCH-STATE-RESTORE-P
+			1 %%DISPATCH-STATE-DISPATCHED-P
+			NEW-STATE))))
+	(EQL-DISPATCH
+	  (LET ((DISPATCH-POSITION (EQL-DISPATCH-POSITION DISPATCH)))
+	    (VALUES
+	      (FIND-DISPATCH-HANDLER
+		`(,@RESTORE
+		  ,@(ENSURE)
+		  ,@(UNLESS (EQL (DISPATCH-STATE-DISPATCH-ARGUMENT STATE) DISPATCH-POSITION)
+		      `((SET-DISPATCH-ARGUMENT ,DISPATCH-POSITION)))
+		  ,(IF (SOME #'EQL-NOT-EQ-P (EQL-DISPATCH-ALL-KEYS DISPATCH))
+		       (LET ((TYPE (ETYPECASE (FIRST (EQL-DISPATCH-ALL-KEYS DISPATCH))
+				     (DOUBLE-FLOAT 'SYS:DTP-DOUBLE-FLOAT)
+				     (COMPLEX 'SYS:DTP-COMPLEX)
+				     (SYS:BIG-RATIO 'SYS:DTP-BIG-RATIO)
+				     (BIGNUM 'SYS:DTP-BIGNUM))))
+			 `(EQL ,TYPE))
+		       '(EQ))))
+	      EXTRA-ARGUMENT
+	      (SYS:DPBS -1 %%DISPATCH-STATE-DISPATCH-ARGUMENT
+			1 %%DISPATCH-STATE-DISPATCHED-P
+			0 %%DISPATCH-STATE-RESTORE-P
+			NEW-STATE))))
+	(FINISH-DISPATCH
+	  (COND ((NULL (DISPATCH-STATE-DISPATCHED-P STATE))
+		 (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+		     (FINISH-HANDLER-AND-EXTRA-ARGUMENT
+		       (FINISH-DISPATCH-HANDLER DISPATCH)
+		       (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH))
+		   (VALUES
+		     (ASSEMBLE
+		       `((PACKED BRANCH (BRANCH-OFFSET AFTER-ENTRY))
+			 AFTER-ENTRY
+			 (IMMEDIATE ,EXTRA-ARGUMENT)
+			 (PACKED POP (FP 2))
+			 (IMMEDIATE ,(SYS:%MAKE-POINTER SYS:DTP-EVEN-PC HANDLER))
+			 (PACKED %JUMP (SP POP))
+			 (SUFFIX NIL)))
+		     NIL)))
+		((OR RESTORE (DISPATCH-STATE-ENSURED-P STATE))
+		 (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+		     (FINISH-HANDLER-AND-EXTRA-ARGUMENT
+		       (FINISH-DISPATCH-HANDLER DISPATCH)
+		       (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH))
+		   (IF (SIMPLE-CONSTANT-P EXTRA-ARGUMENT)
+		       (VALUES
+			 (FIND-DISPATCH-HANDLER
+			   `(,@RESTORE
+			     ,@(WHEN (DISPATCH-STATE-ENSURED-P STATE)
+				 `((RESTORE-DISPATCH-ARGUMENT
+				     ,@(UNLESS RESTORE
+					 `(T)))))
+			     (JUMP-CONSTANT-EXTRA-ARGUMENT ,EXTRA-ARGUMENT)))
+			 HANDLER)
+		       (VALUES
+			 (FIND-DISPATCH-HANDLER `(,@RESTORE
+						  ,@(WHEN (DISPATCH-STATE-ENSURED-P STATE)
+						      `((RESTORE-DISPATCH-ARGUMENT
+							  ,@(UNLESS RESTORE
+							      `(T)))))
+						  (UNWRAP-EXTRA-ARGUMENT)))
+			 (CONS HANDLER EXTRA-ARGUMENT)
+			 NIL))))
+		(T
+		 (VALUES
+		   (FINISH-DISPATCH-HANDLER DISPATCH)
+		   (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH)
+		   NIL))))))))
+
+#+Minima
+(DEFUN COMPUTE-HANDLER-AND-EXTRA-ARGUMENT (STATE DISPATCH EXTRA-ARGUMENT)
+  (LET* ((NEW-STATE STATE)
+	 (ENSUREDP (DISPATCH-STATE-ENSURED-P STATE))
+	 (RESTORE (WHEN (DISPATCH-STATE-RESTORE-P STATE) '((RESTORE-DISPATCH-ARGUMENT T)))))
+    (MACROLET ((ENSURE ()
+		 ``(,@(UNLESS ENSUREDP
+			(SETF (DISPATCH-STATE-ENSURED-P NEW-STATE) T)
+			`((ENSURE ,(DISPATCH-STATE-N-REQUIRED STATE)
+				  ,(DISPATCH-STATE-REST-P STATE))
+			  (SAVE-DISPATCH-ARGUMENT))))))
+      (ECASE (DISPATCH-TYPE DISPATCH)
+	(CLASS-DISPATCH
+	  (LET ((DISPATCH-POSITION (CLASS-DISPATCH-POSITION DISPATCH)))
+	    (VALUES
+	      (FIND-DISPATCH-HANDLER
+		`(,@RESTORE
+		  ,@(UNLESS (EQL (DISPATCH-STATE-DISPATCH-ARGUMENT STATE) DISPATCH-POSITION)
+		      `(,@(ENSURE)
+			(SET-DISPATCH-ARGUMENT ,DISPATCH-POSITION)))
+		  (CLASS)))
+	      EXTRA-ARGUMENT
+	      (IVORY::%LOGDPBS
+		DISPATCH-POSITION %%DISPATCH-STATE-DISPATCH-ARGUMENT
+		(IF (CLASS-SHARES-DATA-TYPE-P (CLASS-DISPATCH-CLASS DISPATCH))
+		    1
+		    0)
+		%%DISPATCH-STATE-RESTORE-P
+		1 %%DISPATCH-STATE-DISPATCHED-P
+		NEW-STATE))))
+	(EQL-DISPATCH
+	  (LET ((DISPATCH-POSITION (EQL-DISPATCH-POSITION DISPATCH)))
+	    (VALUES
+	      (FIND-DISPATCH-HANDLER
+		`(,@RESTORE
+		  ,@(ENSURE)
+		  ,@(UNLESS (EQL (DISPATCH-STATE-DISPATCH-ARGUMENT STATE) DISPATCH-POSITION)
+		      `((SET-DISPATCH-ARGUMENT ,DISPATCH-POSITION)))
+		  ,(IF (SOME #'EQL-NOT-EQ-P (EQL-DISPATCH-ALL-KEYS DISPATCH))
+		       (LET ((TYPE (ETYPECASE (FIRST (EQL-DISPATCH-ALL-KEYS DISPATCH))
+				     (DOUBLE-FLOAT 'IVORY::DOUBLE-FLOAT)
+				     (COMPLEX 'IVORY::COMPLEX)
+				     (RATIO 'IVORY::BIG-RATIO)
+				     (INTEGER 'IVORY::BIGNUM))))
+			 `(EQL ,TYPE))
+		       '(EQ))))
+	      EXTRA-ARGUMENT
+	      (IVORY::%LOGDPBS -1 %%DISPATCH-STATE-DISPATCH-ARGUMENT
+			       1 %%DISPATCH-STATE-DISPATCHED-P
+			       0 %%DISPATCH-STATE-RESTORE-P
+			       NEW-STATE))))
+	(FINISH-DISPATCH
+	  (COND ((NULL (DISPATCH-STATE-DISPATCHED-P STATE))
+		 (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+		     (FINISH-HANDLER-AND-EXTRA-ARGUMENT
+		       (FINISH-DISPATCH-HANDLER DISPATCH)
+		       (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH))
+		   (VALUES
+		     (ASSEMBLE
+		       `((PACKED BRANCH (BRANCH-OFFSET AFTER-ENTRY))
+			 AFTER-ENTRY
+			 (IMMEDIATE ,EXTRA-ARGUMENT)
+			 (PACKED POP (FP 2))
+			 (IMMEDIATE ,(HANDLER-PC HANDLER))
+			 (PACKED %JUMP (SP POP))
+			 (SUFFIX NIL)))
+		     NIL)))
+		((OR RESTORE (DISPATCH-STATE-ENSURED-P STATE))
+		 (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+		     (FINISH-HANDLER-AND-EXTRA-ARGUMENT
+		       (FINISH-DISPATCH-HANDLER DISPATCH)
+		       (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH))
+		   (IF (SIMPLE-CONSTANT-P EXTRA-ARGUMENT)
+		       (VALUES
+			 (FIND-DISPATCH-HANDLER
+			   `(,@RESTORE
+			     ,@(WHEN (DISPATCH-STATE-ENSURED-P STATE)
+				 `((RESTORE-DISPATCH-ARGUMENT
+				     ,@(UNLESS RESTORE
+					 `(T)))))
+			     (JUMP-CONSTANT-EXTRA-ARGUMENT ,EXTRA-ARGUMENT)))
+			 HANDLER)
+		       (VALUES
+			 (FIND-DISPATCH-HANDLER `(,@RESTORE
+						  ,@(WHEN (DISPATCH-STATE-ENSURED-P STATE)
+						      `((RESTORE-DISPATCH-ARGUMENT
+							  ,@(UNLESS RESTORE
+							      `(T)))))
+						  (UNWRAP-EXTRA-ARGUMENT)))
+			 (CONS HANDLER EXTRA-ARGUMENT)
+			 NIL))))
+		(T
+		 (VALUES
+		   (FINISH-DISPATCH-HANDLER DISPATCH)
+		   (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH)
+		   NIL))))))))
+
+#+(OR |3600| CLOE-Runtime)
+(DEFUN COMPUTE-DISPATCH (STATE HANDLER EXTRA-ARGUMENT)
+  (DECLARE (VALUES DISPATCH EXTRA-ARGUMENT STATE))
+  (LET ((NEW-STATE STATE))
+    (UNLESS (TYPEP HANDLER 'FIXNUM)
+      (LET ((DISPATCH-INFO (DISPATCH-HANDLER-SPEC HANDLER)))
+	(WHEN (NULL DISPATCH-INFO)
+	  (RETURN-FROM COMPUTE-DISPATCH
+	    (VALUES
+	      (MAKE-FINISH-DISPATCH
+		:HANDLER HANDLER
+		:EXTRA-ARGUMENT EXTRA-ARGUMENT)
+	      EXTRA-ARGUMENT
+	      NEW-STATE)))
+	(LOOP FOR ELT IN DISPATCH-INFO DOING
+	  (WHEN (TYPEP ELT 'FIXNUM)
+	    (SETQ HANDLER ELT)
+	    (RETURN))
+	  (ECASE ELT
+	    (ENSURE
+	      (SETF (DISPATCH-STATE-ENSURED-P NEW-STATE) T))))))
+    (LET ((POSITION (LDB %%DISPATCH-POSITION HANDLER))
+	  (DISPTYPE (LDB %%DISPATCH-TYPE HANDLER)))
+      (DECLARE (FIXNUM POSITION DISPTYPE))
+      (COND ((= DISPTYPE %DISPATCH-TYPE-CLASS)
+	     (VALUES
+	       (MAKE-CLASS-DISPATCH :POSITION POSITION)
+	       EXTRA-ARGUMENT
+	       (DPB POSITION %%DISPATCH-STATE-DISPATCH-ARGUMENT NEW-STATE)))
+	    ((OR (= DISPTYPE %DISPATCH-TYPE-EQL) (= DISPTYPE %DISPATCH-TYPE-EQ))
+	     (VALUES
+	       (MAKE-EQL-DISPATCH :POSITION POSITION)
+	       EXTRA-ARGUMENT
+	       (DPB POSITION %%DISPATCH-STATE-DISPATCH-ARGUMENT NEW-STATE)))))))
+
+#+(OR IMACH Minima)
+(DEFUN COMPUTE-DISPATCH (STATE HANDLER EXTRA-ARGUMENT)
+  #+Genera (DECLARE (VALUES DISPATCH EXTRA-ARGUMENT STATE))
+  (LET ((NEW-STATE STATE)
+	(DISPATCH-HANDLER-SPEC (DISPATCH-HANDLER-SPEC HANDLER)))
+    (WHEN (NULL DISPATCH-HANDLER-SPEC)
+      (RETURN-FROM COMPUTE-DISPATCH
+	(VALUES
+	  (MAKE-FINISH-DISPATCH
+	    :HANDLER HANDLER
+	    :EXTRA-ARGUMENT EXTRA-ARGUMENT)
+	  EXTRA-ARGUMENT
+	  NEW-STATE)))
+    (LOOP WHILE DISPATCH-HANDLER-SPEC DOING
+      (LET ((COMPONENT (POP DISPATCH-HANDLER-SPEC)))
+	(ECASE (FIRST COMPONENT)
+	  ((SAVE-DISPATCH-ARGUMENT))
+	  ((RESTORE-DISPATCH-ARGUMENT)
+	   (SETF (DISPATCH-STATE-RESTORE-P NEW-STATE) NIL))
+	  ((UNWRAP-EXTRA-ARGUMENT)
+	    (RETURN-FROM COMPUTE-DISPATCH
+	      (VALUES
+		(MAKE-FINISH-DISPATCH
+		  :HANDLER (POP EXTRA-ARGUMENT)
+		  :EXTRA-ARGUMENT EXTRA-ARGUMENT)
+		EXTRA-ARGUMENT
+		NEW-STATE)))
+	  ((JUMP-CONSTANT-EXTRA-ARGUMENT)
+	   (RETURN-FROM COMPUTE-DISPATCH
+	     (VALUES
+	       (MAKE-FINISH-DISPATCH
+		 :HANDLER EXTRA-ARGUMENT
+		 :EXTRA-ARGUMENT (CAR DISPATCH-HANDLER-SPEC))
+	       EXTRA-ARGUMENT
+	       NEW-STATE)))
+	  ((ENSURE)
+	    (SETF (DISPATCH-STATE-N-REQUIRED NEW-STATE) (SECOND COMPONENT)
+		  (DISPATCH-STATE-REST-P NEW-STATE) (THIRD COMPONENT)
+		  (DISPATCH-STATE-ENSURED-P NEW-STATE) T))
+	  ((SET-DISPATCH-ARGUMENT)
+	    (SETF (DISPATCH-STATE-DISPATCH-ARGUMENT NEW-STATE)
+		  (SECOND COMPONENT)))
+	  ((CLASS)
+	    (RETURN-FROM COMPUTE-DISPATCH
+	      (VALUES
+		(MAKE-CLASS-DISPATCH
+		  :POSITION (DISPATCH-STATE-DISPATCH-ARGUMENT NEW-STATE))
+		EXTRA-ARGUMENT
+		NEW-STATE)))
+	  ((EQ EQL)
+	    (RETURN-FROM COMPUTE-DISPATCH
+	      (LET ((POSITION (DISPATCH-STATE-DISPATCH-ARGUMENT NEW-STATE)))
+		(SETF (DISPATCH-STATE-DISPATCH-ARGUMENT NEW-STATE) -1)
+		(VALUES
+		  (MAKE-EQL-DISPATCH :POSITION POSITION)
+		  EXTRA-ARGUMENT
+		  NEW-STATE)))))))))
+
+#+(OR |3600| CLOE-Runtime)
+(DEFUN UPDATE-DISPATCH-STATE (STATE DISPATCH)
+  (ECASE (DISPATCH-TYPE DISPATCH)
+    (CLASS-DISPATCH
+      (SETF (DISPATCH-STATE-DISPATCHED-P STATE) T))
+    (EQL-DISPATCH
+      (SETF (DISPATCH-STATE-DISPATCHED-P STATE) T))
+    (FINISH-DISPATCH))
+  STATE)
+
+#+(OR IMACH Minima)
+(DEFUN UPDATE-DISPATCH-STATE (STATE DISPATCH)
+  (ECASE (DISPATCH-TYPE DISPATCH)
+    (CLASS-DISPATCH
+      (SETF (DISPATCH-STATE-RESTORE-P STATE)
+	    (CLASS-SHARES-DATA-TYPE-P (CLASS-DISPATCH-CLASS DISPATCH)))
+      (SETF (DISPATCH-STATE-DISPATCHED-P STATE) T))
+    (EQL-DISPATCH
+      (SETF (DISPATCH-STATE-DISPATCHED-P STATE) T))
+    (FINISH-DISPATCH))
+  STATE)
+			     
+
+;;; Dispatch keys are either the extra arguments of the funallable instance, or
+;;; lists.  If a list, the first element is the generic function, and the remaining
+;;; elements are the classes which the generic function dispatches on.
+;;;
+;;; The lists are created in a static area, to reduce handler table rehashing.  They
+;;; are all of the same length (for reordering purposes), but the last element is
+;;; dotted so that additional elements may be stuck on the end.  The lists are
+;;; recycled.  When in the free list, the car of the list is the next list.
+
+(DEFPARAMETER *DISPATCH-KEY-FREE-LIST* NIL)
+
+(DEFUN ALLOCATE-DISPATCH-KEY (GENERIC-FUNCTION)
+  (LET ((KEY (WITH-CLOS-LOCK
+	       (LET ((FREE-LIST *DISPATCH-KEY-FREE-LIST*))
+		 (WHEN FREE-LIST
+		   (SETQ *DISPATCH-KEY-FREE-LIST* (CAR FREE-LIST)))
+		 FREE-LIST))))
+    (COND (KEY
+	   (SETF (FIRST KEY) GENERIC-FUNCTION)
+	   KEY)
+	  (T
+	   ;; Want the length to be odd (for better hashing), so make
+	   ;; the first "cons" three elements long.
+	   #+Genera
+	   (LET ((LIST (SCL:MAKE-LIST 3 :AREA *CLOS-STATIC-AREA*)))
+	     (SYS:%CHANGE-LIST-TO-CONS (CDR LIST))
+	     (SETF (CAR LIST) GENERIC-FUNCTION)
+	     LIST)
+	   #+CLOE-Runtime
+	   ;; ADDRESS-OF of a CONS falls alternately on odd and even addreses, so
+	   ;; this should provide reasonable hashing.
+	   (SYSTEM::CONS-IN-AREA GENERIC-FUNCTION NIL SYS::AKIND$K-STATIC)
+	   #-(OR Genera CLOE-Runtime)
+	   (CONS GENERIC-FUNCTION NIL)))))
+
+(DEFUN DEALLOCATE-DISPATCH-KEY (KEY)
+  (WHEN (TYPEP KEY 'CONS)
+    #+Genera
+    ;; The first "cons" is three elements long.  Keep it that way.
+    (PROGN 
+      (SETF (SECOND KEY) NIL)
+      (SETF (CDDR KEY) NIL))
+    #-Genera
+    (SETF (CDR KEY) NIL)
+    (WITH-CLOS-LOCK
+      (SETF (FIRST KEY) *DISPATCH-KEY-FREE-LIST*)
+      (SETQ *DISPATCH-KEY-FREE-LIST* KEY))))
+
+;;; Adds a dispatch on class with selectors, and updates the appropriate tables.
+(DEFUN INSERT-IN-CLASS-DISPATCH-TABLE
+       (HANDLER EXTRA-ARGUMENT CLASS SELECTOR)
+  (LET ((INFORMATION (CLASS-INSTANCE-INFORMATION CLASS)))
+    (INSERT-IN-INFORMATION-DISPATCH-TABLE INFORMATION SELECTOR HANDLER EXTRA-ARGUMENT)
+    ;; In the case of the first dispatch in a Genera system, there may be more than
+    ;; one selector.  This is how message passing is supported.
+    #+Genera
+    (WHEN (TYPEP SELECTOR 'SYS:GENERIC-FUNCTION)
+      ;; Support your local message
+      (LET ((OTHER-SELECTOR (SYS:GENERIC-FUNCTION-SELECTOR SELECTOR)))
+	(WHEN (AND OTHER-SELECTOR
+		   (NOT (TYPEP OTHER-SELECTOR 'SYS:GENERIC-FUNCTION))
+		   (NOT (AND (EQ (AREF INFORMATION 0) 'SYS:FLAVOR)
+			     (GET OTHER-SELECTOR 'FLAVOR:GENERIC))))
+	  (INSERT-IN-INFORMATION-DISPATCH-TABLE
+	    INFORMATION OTHER-SELECTOR HANDLER EXTRA-ARGUMENT))))
+    (ETYPECASE SELECTOR
+      (CONS
+	(IF HANDLER
+	    (UNLESS (MEMBER CLASS (CDR SELECTOR))
+	      #+Genera
+	      ;; In Genera, the first "cons" is three words long, to
+	      ;; improve hashing.  Be careful to keep it that way.
+	      (IF (SECOND SELECTOR)
+		  (PUSH CLASS (CDDR SELECTOR))
+		  (SETF (SECOND SELECTOR) CLASS))
+	      #-Genera
+	      (PUSH CLASS (CDR SELECTOR))
+	      )
+	    (PROGN
+	      #+Genera
+	      ;; In Genera, the first "cons" is three words long, to
+	      ;; improve hashing.  Be careful to keep it that way.
+	      (IF (EQ (SECOND SELECTOR) CLASS)
+		  (SETF (SECOND SELECTOR) NIL)
+		  (SETF (CDDR SELECTOR) (DELETE CLASS (CDDR SELECTOR))))
+	      #-Genera
+	      (SETF (CDR SELECTOR) (DELETE CLASS (CDR SELECTOR)))
+	      )))
+      (#+Genera SYS:GENERIC-FUNCTION
+       #+Minima GENERIC-FUNCTION-SELECTOR
+       #-(OR Genera Minima) FUNCALLABLE-INSTANCE
+       ;; At this point the first dispatch has been set, so there is a
+       ;; good chance we will be able to handle these generic function
+       (LET ((GENERIC-FUNCTION (FUNCALLABLE-INSTANCE-FROM-GENERIC-SELECTOR SELECTOR)))
+	 (IF HANDLER
+	     (PUSHNEW CLASS (DISPATCHING-FUNCALLABLE-INSTANCE-TABLE GENERIC-FUNCTION))
+	     (SETF (DISPATCHING-FUNCALLABLE-INSTANCE-TABLE GENERIC-FUNCTION)
+		   (DELETE CLASS
+			   (DISPATCHING-FUNCALLABLE-INSTANCE-TABLE GENERIC-FUNCTION)))))))))
+
+(DEFUN CLASS-DISPATCH-TABLE-SEARCH (CLASS SELECTOR)
+  #+Genera (DECLARE (VALUES FOUNDP HANDLER EXTRA-ARGUMENT))
+  (MULTIPLE-VALUE-BIND (FOUNDP CELL DISPATCH-TABLE)
+      (INFORMATION-DISPATCH-TABLE-SEARCH (CLASS-INSTANCE-INFORMATION CLASS) SELECTOR)
+    DISPATCH-TABLE
+    (IF CELL
+	(VALUES FOUNDP
+		(PROGN
+		  #+(OR IMACH Minima) (DISPATCH-ENTRY-HANDLER-PC CELL)
+		  #+|3600| (DISPATCH-ENTRY-HANDLER CELL)
+		  #-(OR IMACH |3600| Minima) (DISPATCH-ENTRY-HANDLER DISPATCH-TABLE CELL)
+		  )
+		(PROGN
+		  #+(OR IMACH Minima) (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)
+		  #+|3600| (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)
+		  #-(OR IMACH |3600| Minima)
+		  (DISPATCH-ENTRY-EXTRA-ARGUMENT DISPATCH-TABLE CELL)
+		  ))
+	(VALUES FOUNDP NIL NIL))))
+
+(DEFUN GENERIC-DISPATCH-KEY-ELEMENTS (SELECTOR)
+  (ETYPECASE SELECTOR
+    (CONS (CDR SELECTOR))
+    (#+Genera SYS:GENERIC-FUNCTION
+     #+Minima GENERIC-FUNCTION-SELECTOR
+     #-(OR Genera Minima) FUNCALLABLE-INSTANCE
+     (DISPATCHING-FUNCALLABLE-INSTANCE-TABLE
+       (FUNCALLABLE-INSTANCE-FROM-GENERIC-SELECTOR SELECTOR)))))
+
+(DEFUN GENERIC-DISPATCH-KEY-EMPTY-P (SELECTOR)
+  (EVERY #'NULL (GENERIC-DISPATCH-KEY-ELEMENTS SELECTOR)))
+
+(DEFUN EQL-DISPATCH-INSTANCE-DISPATCH-TABLE-SEARCH (EQL-DISPATCH-INSTANCE KEY-OR-NIL)
+  #+Genera (DECLARE (VALUES HANDLER EXTRA-ARGUMENT FOUNDP))
+  (MULTIPLE-VALUE-BIND (FOUNDP CELL DISPATCH-TABLE)
+      (WHEN KEY-OR-NIL
+	(INFORMATION-DISPATCH-TABLE-SEARCH
+	  (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE)
+	  KEY-OR-NIL))
+    DISPATCH-TABLE
+    (IF FOUNDP
+	(VALUES
+	  (PROGN
+	    #+(OR IMACH Minima) (DISPATCH-ENTRY-HANDLER-PC CELL)
+	    #+|3600| (DISPATCH-ENTRY-HANDLER CELL)
+	    #-(OR IMACH |3600| Minima) (DISPATCH-ENTRY-HANDLER DISPATCH-TABLE CELL)
+	    )
+	  (PROGN
+	    #+(OR IMACH Minima) (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)
+	    #+|3600| (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)
+	    #-(OR IMACH |3600| Minima)
+	    (DISPATCH-ENTRY-EXTRA-ARGUMENT DISPATCH-TABLE CELL)
+	    )
+	  T)
+	(VALUES
+	  (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE)
+	  (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE)
+	  NIL)))) 
+
+#+(OR |3600| CLOE-Runtime)
+(DEFUN FIND-EQL-DISPATCH-MISS-HANDLER (KEYS)
+  KEYS
+  #'(LAMBDA (&REST IGNORE)
+      (DECLARE (IGNORE IGNORE))
+      (ERROR "EQL Dispatch miss handler executed.")))
+
+;;; Start out with no GC dependence, and let table insertion update the miss handlers.
+#+IMACH
+(DEFUN FIND-EQL-DISPATCH-MISS-HANDLER (KEYS)
+  (DECLARE (IGNORE KEYS))
+  (AREF *EQL-DISPATCH-MISS-HANDLERS* %GC-DEPENDENCE-NONE))
+
+#+IMACH
+(DEFINE-EQL-DISPATCH-MISS-HANDLER HANDLE-STATIC-GCABLE-SELECTORS-EQL-DISPATCH-DEFAULT
+				  %GC-DEPENDENCE-STATIC
+				  (DISPATCH-ARGUMENT EQL-DISPATCH-INSTANCE #|&REST ARGUMENTS|#)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  ;; Remind the compiler that there's junk on the stack.
+  (COMPILER:%NOTE-UNKNOWN-GROUP)
+  (COMPILER:%ERROR-WHEN		;DISPATCH-TABLE-NEEDS-REHASHING
+      (LET ((GENERATION (DISPATCH-TABLE-GC-GENERATION
+			  (%INSTANCE-INFORMATION-DISPTAB
+			    (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE)))))
+	(/= (IF (NOT (EQ GENERATION :DEFAULT))
+		GENERATION
+		*LAST-REHASH-GC-STATIC-GENERATION-NUMBER*)
+	    %GC-STATIC-GENERATION-NUMBER))
+    (WHEN (INSTANCE-DISPATCH-TABLE-SEARCH EQL-DISPATCH-INSTANCE DISPATCH-ARGUMENT)
+      ;; Try again
+      (SYS:%GENERIC-DISPATCH)))
+  ;; This is a real miss, so call the default handler
+  (SETQ DISPATCH-ARGUMENT (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE))
+  (SYS:%JUMP (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE)))
+
+#+IMACH
+(DEFINE-EQL-DISPATCH-MISS-HANDLER HANDLE-DYNAMIC-GCABLE-SELECTORS-EQL-DISPATCH-DEFAULT
+				  %GC-DEPENDENCE-DYNAMIC
+				  (DISPATCH-ARGUMENT EQL-DISPATCH-INSTANCE #|&REST ARGUMENTS|#)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  ;; Remind the compiler that there's junk on the stack.
+  (COMPILER:%NOTE-UNKNOWN-GROUP)
+  (COMPILER:%ERROR-WHEN		;DISPATCH-TABLE-NEEDS-REHASHING
+       (/= %GC-DYNAMIC-GENERATION-NUMBER
+	   (DISPATCH-TABLE-GC-GENERATION
+	     (%INSTANCE-INFORMATION-DISPTAB
+	       (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE))))
+    (WHEN (INSTANCE-DISPATCH-TABLE-SEARCH EQL-DISPATCH-INSTANCE DISPATCH-ARGUMENT)
+      ;; Try again
+      (SYS:%GENERIC-DISPATCH)))
+  ;; This is a real miss, so call the default handler
+  (SETQ DISPATCH-ARGUMENT (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE))
+  (SYS:%JUMP (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE)))
+
+#+IMACH
+(DEFINE-EQL-DISPATCH-MISS-HANDLER HANDLE-EPHEMERAL-GCABLE-SELECTORS-EQL-DISPATCH-DEFAULT
+				  %GC-DEPENDENCE-EPHEMERAL
+				  (DISPATCH-ARGUMENT EQL-DISPATCH-INSTANCE #|&REST ARGUMENTS|#)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  ;; Remind the compiler that there's junk on the stack.
+  (COMPILER:%NOTE-UNKNOWN-GROUP)
+  (COMPILER:%ERROR-WHEN		;DISPATCH-TABLE-NEEDS-REHASHING
+	(/= %GC-GENERATION-NUMBER
+	    (DISPATCH-TABLE-GC-GENERATION
+	      (%INSTANCE-INFORMATION-DISPTAB
+		(%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE))))
+    (WHEN (INSTANCE-DISPATCH-TABLE-SEARCH EQL-DISPATCH-INSTANCE DISPATCH-ARGUMENT)
+      ;; Try again
+      (SYS:%GENERIC-DISPATCH)))
+  ;; This is a real miss, so call the default handler
+  (SETQ DISPATCH-ARGUMENT (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE))
+  (SYS:%JUMP (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE)))
+
+#+IMACH
+(DEFINE-EQL-DISPATCH-MISS-HANDLER HANDLE-IMMEDIATE-SELECTORS-EQL-DISPATCH-DEFAULT
+				  %GC-DEPENDENCE-NONE
+				  (DISPATCH-ARGUMENT EQL-DISPATCH-INSTANCE #|&REST ARGUMENTS|#)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  DISPATCH-ARGUMENT
+  ;; Remind the compiler that there's junk on the stack.
+  (COMPILER:%NOTE-UNKNOWN-GROUP)
+  ;; This is a real miss, so call the default handler
+  (SETQ DISPATCH-ARGUMENT (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE))
+  (SYS:%JUMP (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE)))
+
+#+Minima
+(DEFUN FIND-EQL-DISPATCH-MISS-HANDLER (KEYS)
+  (DECLARE (IGNORE KEYS))
+  (HANDLER-PC-NO-ENTRY #'HANDLE-IMMEDIATE-SELECTORS-EQL-DISPATCH-DEFAULT))
+
+#+Minima
+(DEFUN HANDLE-IMMEDIATE-SELECTORS-EQL-DISPATCH-DEFAULT
+       (DISPATCH-ARGUMENT EQL-DISPATCH-INSTANCE #|&REST ARGUMENTS|#)
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  DISPATCH-ARGUMENT
+  ;; Remind the compiler that there's junk on the stack.
+  (ZL:::COMPILER:%NOTE-UNKNOWN-GROUP)
+  ;; Inline call to DISPATCH-TABLE-NEEDS-REHASHING.
+  (WHEN (NOT (EQ MINIMA-INTERNALS::*CURRENT-GC-GENERATION*
+		 (DISPATCH-TABLE-GC-GENERATION
+		   (%INSTANCE-INFORMATION-DISPTAB
+		     (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE)))))
+    (WHEN (INSTANCE-DISPATCH-TABLE-SEARCH EQL-DISPATCH-INSTANCE DISPATCH-ARGUMENT)
+      ;; Try again
+      (IVORY:%GENERIC-DISPATCH)))
+  ;; This is a real miss, so call the default handler
+  (SETQ DISPATCH-ARGUMENT
+	(EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE))
+  (ZL:::COMPILER:%JUMP (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE)))
+
+#+(OR IMACH Minima)
+(DEFUN FIND-EQL-DISPATCH-MISS-HANDLER-AND-EXTRA-ARGUMENT (GENERIC-FUNCTION)
+  #+Genera (DECLARE (VALUES HANDLER EXTRA-ARGUMENT))
+  (VALUES (HANDLER-PC-NO-ENTRY #'HANDLE-EQL-DISPATCH-MISS)
+	  GENERIC-FUNCTION))
+
+#+(OR |3600| CLOE-Runtime)
+(DEFUN FIND-EQL-DISPATCH-MISS-HANDLER-AND-EXTRA-ARGUMENT (GENERIC-FUNCTION)
+  (DECLARE (VALUES HANDLER EXTRA-ARGUMENT))
+  (VALUES #'HANDLE-EQL-DISPATCH-MISS
+	  GENERIC-FUNCTION))
+
+#+IMACH
+(DEFUN HANDLE-EQL-DISPATCH-MISS (GENERIC-FUNCTION DISPATCH-ARGUMENT #|&REST ARGUMENTS|#)
+  (DECLARE (DBG:ERROR-REPORTER))
+  DISPATCH-ARGUMENT
+  (SETQ DISPATCH-ARGUMENT (SYS:%POP))
+  (UNLESS (LDB-TEST SYS:%%CR.APPLY
+		    (SYS:%READ-INTERNAL-REGISTER SYS:%REGISTER-CONTROL-REGISTER))
+    (SYS:%PUSH NIL))
+  (COMPILER:%INSTRUCTION SYS:%SET-CDR-CODE-2 (SYS:SP -1))
+  (HANDLE-MISSED-DISPATCH
+    GENERIC-FUNCTION
+    (SYS:%SET-TAG (LOCF DISPATCH-ARGUMENT) SYS:DTP-LIST)))
+
+#+Minima
+(DEFUN HANDLE-EQL-DISPATCH-MISS (GENERIC-FUNCTION DISPATCH-ARGUMENT #|&REST ARGUMENTS|#)
+  DISPATCH-ARGUMENT
+  (SETQ DISPATCH-ARGUMENT (ZL:::COMPILER:%POP))
+  (UNLESS (MINIMA-DEFINITIONS:FIXNUM-FIELD-VALUE
+	    (IVORY:REGISTER IVORY:CONTROL-REGISTER) IVORY:CONTROL-REGISTER IVORY::APPLY)
+    (ZL:::COMPILER:%PUSH NIL))
+  (ZL:::COMPILER:%INSTRUCTION ZL:::SYS:%SET-CDR-CODE-2 (ZL:::SYS:SP -1))
+  (HANDLE-MISSED-DISPATCH
+    GENERIC-FUNCTION
+    (IVORY:%SET-TAG (LOCF DISPATCH-ARGUMENT) (IVORY:DATA-TYPE 'IVORY::CONS))))
+
+#+|3600|
+(DEFUN HANDLE-EQL-DISPATCH-MISS (ARG0 GENERIC-FUNCTION IGNORE &REST ARGUMENTS)
+  (DECLARE (DBG:ERROR-REPORTER)
+	   (IGNORE IGNORE))
+  (DECLARE (DYNAMIC-EXTENT ARGUMENTS))
+  (SYS:WITH-STACK-LIST* (ARGUMENTS ARG0 ARGUMENTS)
+    (HANDLE-MISSED-DISPATCH
+      GENERIC-FUNCTION
+      ARGUMENTS)))
+
+#+CLOE-Runtime
+(DEFUN HANDLE-EQL-DISPATCH-MISS (GENERIC-FUNCTION &REST ARGUMENTS)
+  (DECLARE (SYS:DOWNWARD-REST-ARGUMENT))
+  (DECLARE (DYNAMIC-EXTENT ARGUMENTS))
+  (HANDLE-MISSED-DISPATCH
+    GENERIC-FUNCTION
+    ARGUMENTS))
+
+(DEFUN SET-EQL-DISPATCH-INSTANCE-DISPATCH
+       (GENERIC-FUNCTION EQL-DISPATCH-INSTANCE DISPATCH HANDLER EXTRA-ARGUMENT &OPTIONAL (UPDATE T))
+  (INSERT-IN-EQL-DISPATCH-INSTANCE-DISPATCH-TABLE
+    EQL-DISPATCH-INSTANCE
+    (EQL-DISPATCH-KEY-OR-NIL DISPATCH)
+    GENERIC-FUNCTION
+    HANDLER EXTRA-ARGUMENT
+    (AND UPDATE (EQL-DISPATCH-ALL-KEYS DISPATCH))))
+
+(DEFUN INSERT-IN-EQL-DISPATCH-INSTANCE-DISPATCH-TABLE
+       (EQL-DISPATCH-INSTANCE KEY-OR-NIL GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT &OPTIONAL ALL-KEYS)
+  (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+      (IF HANDLER
+	  (VALUES HANDLER EXTRA-ARGUMENT)
+	  (FIND-EQL-DISPATCH-MISS-HANDLER-AND-EXTRA-ARGUMENT GENERIC-FUNCTION))
+    (IF KEY-OR-NIL
+	(INSERT-IN-INFORMATION-DISPATCH-TABLE
+	  (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE)
+	  KEY-OR-NIL HANDLER EXTRA-ARGUMENT)
+	(MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+	    (FINISH-HANDLER-AND-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)
+	  (WITH-NO-OTHER-PROCESSES
+	    (UNLESS (EQ (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE) HANDLER)
+	      (SETF (EQL-DISPATCH-INSTANCE-DEFAULT-HANDLER EQL-DISPATCH-INSTANCE) HANDLER))
+	    (UNLESS (EQ (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE) EXTRA-ARGUMENT)
+	      (SETF (EQL-DISPATCH-INSTANCE-DEFAULT-EXTRA-ARGUMENT EQL-DISPATCH-INSTANCE) EXTRA-ARGUMENT))))))
+  (WHEN ALL-KEYS (UPDATE-EQL-DISPATCH-INSTANCE GENERIC-FUNCTION EQL-DISPATCH-INSTANCE ALL-KEYS)))
+
+(DEFUN EQL-DISPATCH-INSTANCE-EMPTY-P (EQL-DISPATCH-INSTANCE)
+  (ZEROP (DISPATCH-TABLE-NUMBER-OF-ENTRIES
+	   (%INSTANCE-INFORMATION-DISPATCH-TABLE
+	     (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE)))))
+
+(DEFUN EQL-DISPATCH-INSTANCE-ALL-KEYS (EQL-DISPATCH-INSTANCE)
+  (LET ((ALL-KEYS NIL))
+    (WITH-NO-OTHER-PROCESSES
+      (MAP-OVER-DISPATCH-TABLE
+	#'(LAMBDA (SELECTOR HANDLER EXTRA-AGRUMENT)
+	    (WHEN SELECTOR (PUSH SELECTOR ALL-KEYS))
+	    (VALUES SELECTOR HANDLER EXTRA-AGRUMENT))
+	(%INSTANCE-INFORMATION-DISPATCH-TABLE
+	  (%INSTANCE-INSTANCE-INFORMATION EQL-DISPATCH-INSTANCE))))
+    ALL-KEYS))
+
+;;; Jumped to when a class discrimination misses
+;;;
+;;; See comment about Ivory dispatching at the front of the file.
+#+IMACH
+(DEFUN HANDLE-CLASS-DISPATCH-MISS (SELECTOR DISPATCH-ARGUMENT #|&REST ARGS|#)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  ;; It could be that the table just needs rehashing
+  (WHEN (INSTANCE-DISPATCH-TABLE-SEARCH DISPATCH-ARGUMENT SELECTOR)
+    ;; Try again
+    (SYS:%GENERIC-DISPATCH))
+  ;; This is a real miss.  Do any argument restorations, etc. and then go to
+  ;; handle-missed-dispatch.
+  (WHEN (FAKE-INSTANCE-P DISPATCH-ARGUMENT)
+    (SETQ DISPATCH-ARGUMENT (SYS:%POP)))
+  (COND ((AND (CONSP SELECTOR)
+	      (SYS:FUNCALLABLE-INSTANCE-P (FIRST SELECTOR)))
+	 (SETQ DISPATCH-ARGUMENT (SYS:%POP))
+	 (SETQ SELECTOR (FIRST SELECTOR)))
+	((AND (TYPEP SELECTOR 'SYS:GENERIC-FUNCTION)
+	      (NOT (GENERIC-FUNCTION-CLOS SELECTOR)))
+	 ;; If dealing with a Flavors generic function, the only way to get here is
+	 ;; through a built-in class, so we want to call
+	 ;; FLAVOR::GENERIC-APPLIED-TO-NON-INSTANCE (after fixing up the stack).
+	 )
+	(T
+	 ;; Too bad the stack is so messed up that we can't get away with a local
+	 ;; variable.
+	 (SETQ SELECTOR
+	       (OR (DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR)
+		   SELECTOR))
+	 (UNLESS
+	   (OR (NOT (GENERIC-FUNCTION-P SELECTOR))
+	       (= (SYS:%P-LDB SYS:%%PACKED-INSTRUCTION-OPCODE
+			      (%FUNCALLABLE-INSTANCE-FUNCTION SELECTOR))
+		  I-LISP-COMPILER:*%GENERIC-DISPATCH-OPCODE*)
+	       (NULL (DISPATCH-HANDLER-SPEC (%FUNCALLABLE-INSTANCE-FUNCTION SELECTOR))))
+	   (SETQ DISPATCH-ARGUMENT (SYS:%POP)))))
+  (UNLESS (LDB-TEST SYS:%%CR.APPLY
+		    (SYS:%READ-INTERNAL-REGISTER SYS:%REGISTER-CONTROL-REGISTER))
+    (SYS:%PUSH NIL))
+  (COMPILER:%INSTRUCTION SYS:%SET-CDR-CODE-2 (SYS:SP -1))
+  (IF (GENERIC-FUNCTION-P SELECTOR)
+      (HANDLE-MISSED-DISPATCH
+	SELECTOR
+	(SYS:%SET-TAG (LOCF DISPATCH-ARGUMENT) SYS:DTP-LIST))
+      (APPLY #'FLAVOR::GENERIC-APPLIED-TO-NON-INSTANCE
+	     SELECTOR
+	     (SYS:%SET-TAG (LOCF DISPATCH-ARGUMENT) SYS:DTP-LIST))))
+
+#+Minima
+(DEFUN HANDLE-CLASS-DISPATCH-MISS (SELECTOR DISPATCH-ARGUMENT #|&REST ARGS|#)
+  (DECLARE (NOTINLINE INSTANCE-DISPATCH-TABLE-SEARCH))
+  ;; It could be that the table just needs rehashing
+  (WHEN (INSTANCE-DISPATCH-TABLE-SEARCH DISPATCH-ARGUMENT SELECTOR)
+    ;; Try again
+    (IVORY:%GENERIC-DISPATCH))
+  ;; This is a real miss.  Do any argument restorations, etc. and then go to
+  ;; handle-missed-dispatch.
+  (WHEN (FAKE-INSTANCE-P DISPATCH-ARGUMENT)
+    (SETQ DISPATCH-ARGUMENT (ZL:::COMPILER:%POP)))
+  (COND ((AND (CONSP SELECTOR)
+	      (FUNCALLABLE-INSTANCE-P (FIRST SELECTOR)))
+	 (SETQ DISPATCH-ARGUMENT (ZL:::COMPILER::%POP))
+	 (SETQ SELECTOR (FIRST SELECTOR)))
+	(T
+	 ;; Too bad the stack is so messed up that we can't get away with a local
+	 ;; variable.
+	 (SETQ SELECTOR (DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR))
+	 (UNLESS
+	   (OR (= (ZL:::SYS:%P-LDB ZL:::SYS:%%PACKED-INSTRUCTION-OPCODE
+				   (%FUNCALLABLE-INSTANCE-FUNCTION SELECTOR))
+		  ZL:::I-LISP-COMPILER:*%GENERIC-DISPATCH-OPCODE*)
+	       (NULL (DISPATCH-HANDLER-SPEC (%FUNCALLABLE-INSTANCE-FUNCTION SELECTOR))))
+	   (SETQ DISPATCH-ARGUMENT (ZL:::COMPILER:%POP)))))
+  (UNLESS (MINIMA-DEFINITIONS:FIXNUM-FIELD-VALUE
+	    (IVORY:REGISTER IVORY:CONTROL-REGISTER) IVORY:CONTROL-REGISTER IVORY::APPLY)
+    (ZL:::COMPILER:%PUSH NIL))
+  (ZL:::COMPILER:%INSTRUCTION ZL:::SYS:%SET-CDR-CODE-2 (ZL:::SYS:SP -1))
+  (HANDLE-MISSED-DISPATCH
+    SELECTOR
+    (IVORY:%SET-TAG (LOCF DISPATCH-ARGUMENT) (IVORY:DATA-TYPE 'IVORY::CONS))))
+
+#+|3600|
+(DEFUN HANDLE-CLASS-DISPATCH-MISS (ARG0 SELECTOR SECOND-SELECTOR &REST MORE-ARGUMENTS)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (DECLARE (DYNAMIC-EXTENT MORE-ARGUMENTS))
+  (SETQ SELECTOR (OR SELECTOR SECOND-SELECTOR))
+  (LET ((REHASHED (INSTANCE-DISPATCH-TABLE-SEARCH ARG0 SELECTOR)))
+    (IF (AND (CONSP SELECTOR)
+	     (SYS:FUNCALLABLE-INSTANCE-P (FIRST SELECTOR)))
+	(SETQ SELECTOR (FIRST SELECTOR))
+	(LET ((FUNCALLABLE-INSTANCE (DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR)))
+	  (IF (GENERIC-FUNCTION-P FUNCALLABLE-INSTANCE)
+	      (SETQ SELECTOR FUNCALLABLE-INSTANCE)
+	      (APPLY #'FLAVOR::GENERIC-APPLIED-TO-NON-INSTANCE SELECTOR ARG0 MORE-ARGUMENTS))))
+    (IF REHASHED
+	(APPLY SELECTOR ARG0 MORE-ARGUMENTS)
+	(SYS:WITH-STACK-LIST* (ARGUMENTS ARG0 MORE-ARGUMENTS)
+	  (HANDLE-MISSED-DISPATCH
+	    SELECTOR
+	    ARGUMENTS)))))
+
+#+CLOE-Runtime
+(DEFUN HANDLE-CLASS-DISPATCH-MISS (SELECTOR ARG0 &REST MORE-ARGUMENTS)
+  (DECLARE (SYS:DOWNWARD-REST-ARGUMENT))
+  (LET ((REHASHED (INSTANCE-DISPATCH-TABLE-SEARCH ARG0 SELECTOR)))
+    (COND ((AND (CONSP SELECTOR)
+		(TYPEP (FIRST SELECTOR) 'FUNCALLABLE-INSTANCE))
+	   (SETQ SELECTOR (FIRST SELECTOR)))
+	  (T (SETQ SELECTOR (DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR))))
+    (IF REHASHED
+	(APPLY SELECTOR ARG0 MORE-ARGUMENTS)
+	(SYS::WITH-STACK-LIST* (ARGUMENTS ARG0 MORE-ARGUMENTS)
+	  (HANDLE-MISSED-DISPATCH
+	    SELECTOR
+	    ARGUMENTS)))))
+
+
+(DEFUN HANDLE-START-DISPATCH-MISS (SELECTOR &REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  #+(or Genera CLOE-Runtime) (DECLARE (DBG:ERROR-REPORTER))
+  (HANDLE-MISSED-DISPATCH
+    (DISPATCHING-FUNCALLABLE-INSTANCE-FROM-SELECTOR SELECTOR)
+    ARGS))
+
+
+(DEFUN FIX-CLASS-DISPATCH-TABLE-MISS-HANDLERS ()
+  (LET* ((CLASSES NIL)
+	 (DEFAULT-HANDLER #'HANDLE-CLASS-DISPATCH-MISS)
+	 (MISS-HANDLER
+	   (PROGN
+	     #+(OR IMACH Minima) (HANDLER-PC-NO-ENTRY DEFAULT-HANDLER)
+	     #-(OR IMACH Minima) DEFAULT-HANDLER)))
+    (LABELS ((FIX-CLASS (CLASS)
+	       (WHEN (MEMBER CLASS CLASSES)
+		 (RETURN-FROM FIX-CLASS NIL))
+	       (PUSH CLASS CLASSES)
+	       (WHEN (CLASS-FINALIZED-P CLASS)
+		 (WITH-NO-OTHER-PROCESSES
+		   (LET ((DISPATCH-TABLE
+			   (%INSTANCE-INFORMATION-DISPATCH-TABLE
+			     (CLASS-INSTANCE-INFORMATION CLASS))))
+		     (SETF (DISPATCH-TABLE-DEFAULT-HANDLER DISPATCH-TABLE) DEFAULT-HANDLER)
+		     (SETF (DISPATCH-TABLE-MISS-HANDLER DISPATCH-TABLE) MISS-HANDLER)
+		     (MAP-OVER-DISPATCH-TABLE
+		       #'(LAMBDA (SELECTOR HANDLER EXTRA-ARGUMENT)
+			   (VALUES SELECTOR
+				   (IF (NULL SELECTOR)
+				       MISS-HANDLER
+				       HANDLER)
+				   EXTRA-ARGUMENT))
+		       DISPATCH-TABLE))))
+	       (MAPC #'FIX-CLASS (CLASS-DIRECT-SUBCLASSES CLASS))))
+      (FIX-CLASS (FIND-CLASS T)))))
+
+(DEFUN MODIFY-DISPATCHES (GENERIC-FUNCTION DISPATCH-FUNCTION)
+  (WITH-CLOS-LOCK
+    (LET ((HANDLER (%FUNCALLABLE-INSTANCE-FUNCTION GENERIC-FUNCTION)))
+      (MULTIPLE-VALUE-BIND (N-REQUIRED N-OPTIONAL RESTP KEYWORDSP ALLOW-OTHER-KEYS-P)
+	  (LAMBDA-LIST-COMPONENTS (GENERIC-FUNCTION-LAMBDA-LIST GENERIC-FUNCTION))
+	(MULTIPLE-VALUE-BIND (NEW-HANDLER NEW-EXTRA-ARGUMENT INSERTP)
+	    (MODIFY-DISPATCH-STEP
+	      GENERIC-FUNCTION
+	      DISPATCH-FUNCTION
+	      HANDLER
+	      (%FUNCALLABLE-INSTANCE-EXTRA-ARGUMENT GENERIC-FUNCTION)
+	      (MAKE-INITIAL-DISPATCH-STATE
+		N-REQUIRED
+		(OR (> N-OPTIONAL 0) RESTP KEYWORDSP ALLOW-OTHER-KEYS-P)))
+	  (DECLARE (IGNORE NEW-EXTRA-ARGUMENT))
+	  #+IMACH
+	  (WHEN (SYS:TYPE-MEMBER NEW-HANDLER SYS:DTP-EVEN-PC SYS:DTP-ODD-PC)
+	    (SETQ NEW-HANDLER (HANDLER-PC-FUNCTION NEW-HANDLER)))
+	  #+Minima
+	  (WHEN (TYPEP NEW-HANDLER 'IVORY::PC)
+	    (SETF NEW-HANDLER (HANDLER-PC-FUNCTION NEW-HANDLER)))
+	  #+|3600|
+	  (WHEN (EQ NEW-HANDLER #'START-POSITION-0-CLASS-DISPATCH)
+	    ;; Let the microcode do it
+	    (SETQ NEW-HANDLER (%FUNCALLABLE-INSTANCE-EXTRA-ARGUMENT GENERIC-FUNCTION)))
+	  (UNLESS (EQ HANDLER NEW-HANDLER)
+	    (SETF (%FUNCALLABLE-INSTANCE-FUNCTION GENERIC-FUNCTION)
+		  (IF INSERTP
+		      NEW-HANDLER
+		      #'HANDLE-START-DISPATCH-MISS))))))))
+
+(DEFUN MODIFY-DISPATCH-STEP
+       (GENERIC-FUNCTION DISPATCH-FUNCTION HANDLER EXTRA-ARGUMENT STATE)
+  (WHEN (NULL HANDLER)
+    ;; Nothing already exists, so just add the new dispatches
+    (RETURN-FROM MODIFY-DISPATCH-STEP
+      (MODIFY-MISS-DISPATCH
+	GENERIC-FUNCTION (FUNCALL DISPATCH-FUNCTION NIL) DISPATCH-FUNCTION STATE)))
+  ;; A dispatch may already exist.  Have to replace it with something
+  (MULTIPLE-VALUE-BIND (OLD-DISPATCH EXTRA-ARGUMENT OLD-STATE)
+      (COMPUTE-DISPATCH STATE HANDLER EXTRA-ARGUMENT)
+    (DECLARE (IGNORE OLD-STATE))
+    (LET ((NEW-DISPATCH (FUNCALL DISPATCH-FUNCTION OLD-DISPATCH)))
+      (ECASE (DISPATCH-TYPE OLD-DISPATCH)
+	(CLASS-DISPATCH
+	  (COND ((AND (EQ (DISPATCH-TYPE NEW-DISPATCH) 'CLASS-DISPATCH)
+		      (EQL (CLASS-DISPATCH-POSITION OLD-DISPATCH)
+			   (CLASS-DISPATCH-POSITION NEW-DISPATCH)))
+		 (MODIFY-CLASS-DISPATCH
+		   GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION EXTRA-ARGUMENT STATE))
+		(T
+		 (DELETE-CLASS-DISPATCH GENERIC-FUNCTION EXTRA-ARGUMENT OLD-DISPATCH STATE)
+		 (MODIFY-MISS-DISPATCH
+		   GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION STATE EXTRA-ARGUMENT))))
+	(EQL-DISPATCH
+	  (COND ((AND (EQ (DISPATCH-TYPE NEW-DISPATCH) 'EQL-DISPATCH)
+		      (EQL (EQL-DISPATCH-POSITION OLD-DISPATCH)
+			   (EQL-DISPATCH-POSITION NEW-DISPATCH)))
+		 (MODIFY-EQL-DISPATCH
+		   GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION EXTRA-ARGUMENT STATE))
+		(T
+		 (DELETE-EQL-DISPATCH GENERIC-FUNCTION EXTRA-ARGUMENT OLD-DISPATCH STATE)
+		 (MODIFY-MISS-DISPATCH
+		   GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION STATE))))
+	(FINISH-DISPATCH
+	  (MODIFY-MISS-DISPATCH GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION STATE
+				EXTRA-ARGUMENT))))))
+
+(DEFUN MODIFY-MISS-DISPATCH
+       (GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION STATE &OPTIONAL SELECTOR)
+  (ECASE (DISPATCH-TYPE NEW-DISPATCH)
+    (DELETE
+      ;; There's already nothing here, so just return.
+      (VALUES NIL NIL NIL))
+    (FINISH-DISPATCH
+      ;; All done.  Let the state function do what it wants to the
+      ;; handler and the extra argument to put them in the form that
+      ;; works.
+      (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+	  (COMPUTE-HANDLER-AND-EXTRA-ARGUMENT STATE NEW-DISPATCH NIL)
+	(VALUES HANDLER EXTRA-ARGUMENT T)))
+    (CLASS-DISPATCH
+      ;; There's a class dispatch to be done, so we're
+      ;; going to replace this handler and extra argument
+      ;; with ones that accomplish the dispatch.
+      (MODIFY-CLASS-DISPATCH
+	GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION
+	(IF (DISPATCH-STATE-DISPATCHED-P STATE)
+	    (ALLOCATE-DISPATCH-KEY GENERIC-FUNCTION)
+	    SELECTOR)
+	STATE))
+    (EQL-DISPATCH
+      ;; There's an EQL dispatch to be done.  Pretend it's already been
+      ;; done and continue
+      (MODIFY-EQL-DISPATCH
+	GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION
+	(ALLOCATE-EQL-DISPATCH-INSTANCE
+	  GENERIC-FUNCTION
+	  (EQL-DISPATCH-ALL-KEYS NEW-DISPATCH))
+	STATE))))
+	
+(DEFUN MODIFY-CLASS-DISPATCH
+       (GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION EXTRA-ARGUMENT STATE)
+  (LET ((CLASS (CLASS-DISPATCH-CLASS NEW-DISPATCH)))
+    (MULTIPLE-VALUE-BIND (NEW-HANLDER NEW-EXTRA-ARGUMENT NEW-STATE)
+	(COMPUTE-HANDLER-AND-EXTRA-ARGUMENT STATE NEW-DISPATCH EXTRA-ARGUMENT)
+      (MULTIPLE-VALUE-BIND (FOUNDP OLD-NEXT-HANDLER OLD-NEXT-EXTRA-ARGUMENT)
+	  (CLASS-DISPATCH-TABLE-SEARCH CLASS NEW-EXTRA-ARGUMENT)
+	(LET ((NEXT-STATE (UPDATE-DISPATCH-STATE NEW-STATE NEW-DISPATCH)))
+	  (MULTIPLE-VALUE-BIND (NEW-NEXT-HANDLER NEW-NEXT-EXTRA-ARGUMENT INSERTP)
+	      (IF FOUNDP
+		  (MODIFY-DISPATCH-STEP
+		    GENERIC-FUNCTION
+		    DISPATCH-FUNCTION OLD-NEXT-HANDLER OLD-NEXT-EXTRA-ARGUMENT NEXT-STATE)
+		  (MODIFY-DISPATCH-STEP GENERIC-FUNCTION DISPATCH-FUNCTION NIL NIL NEXT-STATE))
+	    (COND (INSERTP
+		   (INSERT-IN-CLASS-DISPATCH-TABLE
+		     NEW-NEXT-HANDLER NEW-NEXT-EXTRA-ARGUMENT CLASS NEW-EXTRA-ARGUMENT)
+		   (VALUES NEW-HANLDER NEW-EXTRA-ARGUMENT T))
+		  (T
+		   (INSERT-IN-CLASS-DISPATCH-TABLE NIL NIL CLASS NEW-EXTRA-ARGUMENT)
+		   (COND ((GENERIC-DISPATCH-KEY-EMPTY-P NEW-EXTRA-ARGUMENT)
+			  (DEALLOCATE-DISPATCH-KEY NEW-EXTRA-ARGUMENT)
+			  (VALUES NIL NIL NIL))
+			 (T (VALUES NEW-HANLDER NEW-EXTRA-ARGUMENT T)))))))))))
+
+(DEFUN DISPATCH-STEP-DELETER (IGNORE)
+  (DECLARE (IGNORE IGNORE))
+  '(DELETE))
+
+(DEFUN DELETE-CLASS-DISPATCH (GENERIC-FUNCTION EXTRA-ARGUMENT OLD-DISPATCH STATE)
+  ;; Delete ourselves and all our descendents
+  (LET ((DISPATCH (MAKE-CLASS-DISPATCH :POSITION (CLASS-DISPATCH-POSITION OLD-DISPATCH))))
+    (DOLIST (CLASS (GENERIC-DISPATCH-KEY-ELEMENTS EXTRA-ARGUMENT))
+      (WHEN CLASS
+	(MULTIPLE-VALUE-BIND (FOUNDP NEXT-HANDLER NEXT-EXTRA-ARGUMENT)
+	    (CLASS-DISPATCH-TABLE-SEARCH CLASS EXTRA-ARGUMENT)
+	  (WHEN FOUNDP
+	    (SETF (CLASS-DISPATCH-CLASS DISPATCH) CLASS)
+	    (MODIFY-DISPATCH-STEP
+	      GENERIC-FUNCTION
+	      #'DISPATCH-STEP-DELETER
+	      NEXT-HANDLER NEXT-EXTRA-ARGUMENT
+	      (UPDATE-DISPATCH-STATE STATE DISPATCH))
+	    (INSERT-IN-CLASS-DISPATCH-TABLE NIL NIL CLASS EXTRA-ARGUMENT)))))
+    (DEALLOCATE-DISPATCH-KEY EXTRA-ARGUMENT)
+    (VALUES NIL NIL NIL)))
+
+(DEFUN DELETE-DISPATCHES (DISPATCH-TABLE)
+  (WITH-NO-OTHER-PROCESSES
+    (LET ((MISS-HANDLER (DISPATCH-TABLE-MISS-HANDLER DISPATCH-TABLE)))
+      (MAP-OVER-DISPATCH-TABLE
+	#'(LAMBDA (SELECTOR HANDLER EXTRA-ARGUMENT)
+	    HANDLER
+	    (WHEN SELECTOR
+	      ;; Have to figure out what kind of dispatch this is
+	      (MODIFY-DISPATCH-STEP NIL #'DISPATCH-STEP-DELETER HANDLER EXTRA-ARGUMENT 0))
+	    (VALUES NIL MISS-HANDLER NIL))
+	DISPATCH-TABLE))))
+
+(DEFUN CHANGE-EQL-DISPATCHES (OBJECT)
+  (DOLIST (GENERIC-FUNCTION (SPECIALIZER-DIRECT-GENERIC-FUNCTIONS `(EQL ,OBJECT)))
+    (UPDATE-DISPATCHES GENERIC-FUNCTION #'STANDARD-METHOD-COMBINER T)))
+
+(DEFUN MODIFY-EQL-DISPATCH (GENERIC-FUNCTION NEW-DISPATCH DISPATCH-FUNCTION EQL-DISPATCH-INSTANCE STATE)
+  (MULTIPLE-VALUE-BIND (NEW-HANLDER NEW-EQL-DISPATCH-INSTANCE NEW-STATE)
+      (COMPUTE-HANDLER-AND-EXTRA-ARGUMENT STATE NEW-DISPATCH EQL-DISPATCH-INSTANCE)
+    (MULTIPLE-VALUE-BIND (OLD-NEXT-HANDLER OLD-NEXT-EXTRA-ARGUMENT)
+	(EQL-DISPATCH-INSTANCE-DISPATCH-TABLE-SEARCH
+	  EQL-DISPATCH-INSTANCE (EQL-DISPATCH-KEY-OR-NIL NEW-DISPATCH))
+      (LET ((NEXT-STATE (UPDATE-DISPATCH-STATE NEW-STATE NEW-DISPATCH)))
+	(MULTIPLE-VALUE-BIND (NEW-NEXT-HANDLER NEW-NEXT-EXTRA-ARGUMENT INSERTP)
+	    (MODIFY-DISPATCH-STEP
+	      GENERIC-FUNCTION
+	      DISPATCH-FUNCTION
+	      OLD-NEXT-HANDLER
+	      OLD-NEXT-EXTRA-ARGUMENT
+	      NEXT-STATE)
+	  (COND (INSERTP
+		 (SET-EQL-DISPATCH-INSTANCE-DISPATCH
+		   GENERIC-FUNCTION EQL-DISPATCH-INSTANCE NEW-DISPATCH
+		   NEW-NEXT-HANDLER NEW-NEXT-EXTRA-ARGUMENT)
+		 (VALUES NEW-HANLDER NEW-EQL-DISPATCH-INSTANCE T))
+		(T
+		 (SET-EQL-DISPATCH-INSTANCE-DISPATCH
+		   GENERIC-FUNCTION EQL-DISPATCH-INSTANCE NEW-DISPATCH NIL NIL)
+		 (IF (EQL-DISPATCH-INSTANCE-EMPTY-P NEW-EQL-DISPATCH-INSTANCE)
+		     (VALUES NIL NIL NIL)
+		     (VALUES NEW-HANLDER NEW-EQL-DISPATCH-INSTANCE T)))))))))
+
+(DEFUN DELETE-EQL-DISPATCH (GENERIC-FUNCTION EQL-DISPATCH-INSTANCE OLD-DISPATCH STATE)
+  ;; Delete ourselves and our descendents
+  (LET* ((ALL-KEYS (EQL-DISPATCH-INSTANCE-ALL-KEYS EQL-DISPATCH-INSTANCE))
+	 (DISPATCH (MAKE-EQL-DISPATCH
+		     :POSITION (EQL-DISPATCH-POSITION OLD-DISPATCH)
+		     :KEY-OR-NIL NIL
+		     :ALL-KEYS ALL-KEYS)))
+    (DOLIST (KEY (CONS NIL ALL-KEYS))
+      (SETF (EQL-DISPATCH-KEY-OR-NIL DISPATCH) KEY)
+      (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+	  (EQL-DISPATCH-INSTANCE-DISPATCH-TABLE-SEARCH EQL-DISPATCH-INSTANCE KEY)
+	(MODIFY-DISPATCH-STEP
+	  GENERIC-FUNCTION
+	  #'DISPATCH-STEP-DELETER
+	  HANDLER EXTRA-ARGUMENT (UPDATE-DISPATCH-STATE STATE DISPATCH))
+	(SET-EQL-DISPATCH-INSTANCE-DISPATCH GENERIC-FUNCTION EQL-DISPATCH-INSTANCE DISPATCH NIL NIL NIL)))
+    (VALUES NIL NIL NIL)))
+
+(DEFUN HANDLE-MISSED-DISPATCH (GENERIC-FUNCTION ARGUMENTS)
+  #+(or Genera CLOE-Runtime) (DECLARE (DBG:ERROR-REPORTER))
+  (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+      (LET (#+Genera (SYS:DEFAULT-CONS-AREA SYS:BACKGROUND-CONS-AREA))
+	;; Reorder memory binds SYS:DEFAULT-CONS-AREA to a temporary area.  One place we
+	;; can get called is during OPTIMIZE-COMPILED-FUNCTIONS, when processing function
+	;; names which are implemented as instances.
+	(GENERIC-FUNCTION-ENSURE-ARGUMENTS-MAPPED GENERIC-FUNCTION ARGUMENTS
+						  #'STANDARD-METHOD-COMBINER))
+    ;; Ensure that the arguments aren't from an older generation than the extra
+    ;; argument.
+    (DOLIST (ARGUMENT ARGUMENTS)
+      (WHEN (PROGN #+Genera (OR (SYS:INSTANCEP ARGUMENT)
+				(SYS:FUNCALLABLE-INSTANCE-P ARGUMENT))
+		   #-Genera T)
+	(WHEN (INSTANCE-INFORMATION-OBSOLETE-P (%INSTANCE-INFORMATION-INLINE ARGUMENT))
+	  (UPDATE-INSTANCE-USING-CLASS (CLASS-OF ARGUMENT) ARGUMENT))))
+    ;; When redefining certain metaclasses, we end up using instances which have not
+    ;; yet been updated, so the assumption that every instance we ever see has the
+    ;; latest instance information is not valid.  We could reorganize dispatching to
+    ;; update the instance's informataion dispatch table instead of the class', but
+    ;; it is easier to just updtae the class' version of the information and directly
+    ;; call the combined method here.
+    #+IMACH
+    (APPLY #'HANDLE-MISSED-DISPATCH
+	   (PROGN
+	     (SETF (SYS:%READ-INTERNAL-REGISTER SYS:%REGISTER-CONTINUATION)
+		   HANDLER)
+	     (COMPILER:NO-OP)
+	     (COMPILER:NO-OP)
+	     EXTRA-ARGUMENT)
+	   ARGUMENTS)
+    #+Minima
+    (APPLY #'HANDLE-MISSED-DISPATCH
+	   (PROGN
+	     (SETF (IVORY:REGISTER IVORY::CONTINUATION) HANDLER)
+	     (ZL:::COMPILER:NO-OP)
+	     (ZL:::COMPILER:NO-OP)
+	     EXTRA-ARGUMENT)
+	   ARGUMENTS)
+    #+|3600|
+    (IF (DISPATCHING-FUNCALLABLE-INSTANCE-PRECEDENCE-ORDER GENERIC-FUNCTION)
+	(APPLY HANDLER
+	       (FIRST ARGUMENTS)
+	       EXTRA-ARGUMENT
+	       NIL
+	       (REST ARGUMENTS))
+	(APPLY HANDLER EXTRA-ARGUMENT ARGUMENTS))
+    #+CLOE-Runtime
+    ;; Note:  CLOE needs something like the above for metaclass redefinition to work.
+    (APPLY HANDLER EXTRA-ARGUMENT ARGUMENTS)))
+
+(DEFUN GENERIC-DISPATCH-ENSURE-MAPPING (GENERIC-FUNCTION ARGUMENT-FUNCTION METHOD-COMBINER)
+  (DECLARE (DYNAMIC-EXTENT ARGUMENT-FUNCTION))
+  (LET* ((METHODS (LIST (GENERIC-FUNCTION-METHODS GENERIC-FUNCTION)))
+	 (ORDER (DISPATCHING-FUNCALLABLE-INSTANCE-PRECEDENCE-ORDER GENERIC-FUNCTION))
+	 (DISPATCHES (MAKE-LIST (LENGTH ORDER) :INITIAL-ELEMENT (FIND-CLASS T)))
+	 (PENDING-DISPATCH NIL)
+	 (FINAL-DISPATCH NIL))
+    ;; For now, just go in argument precedence order
+    (LABELS ((COMBINER-ARGUMENT-FUNCTION (TYPE POSITION)
+	       (LET ((DISPATCH (NTH POSITION DISPATCHES)))
+		 (ECASE TYPE
+		   (CLASS
+		     (IF (CONSP DISPATCH)
+			 (CLASS-OF (SECOND DISPATCH))
+			 DISPATCH))
+		   (EQL
+		     (IF (CONSP DISPATCH)
+			 (VALUES T (SECOND DISPATCH))
+			 (VALUES NIL NIL))))))
+	     (GET-DISPATCH (OLD-DISPATCH)
+	       (WHEN (AND OLD-DISPATCH
+			  (NOT (EQ (DISPATCH-TYPE OLD-DISPATCH) 'FINISH-DISPATCH)))
+		 ;; Try to get synchronized to the old dispatch.  We assume that
+		 ;; everyone is following the (unnecessary) convention of dispatching in
+		 ;; argument precedence order.  This is a reasonable assumption when you
+		 ;; consider that everything goes through this function.  The convention
+		 ;; isn't reasonable -- we should almost always start at physical
+		 ;; position 0.  The actual dispatch order can vary depending on the
+		 ;; previous dispatch steps.
+		 (ECASE (DISPATCH-TYPE OLD-DISPATCH)
+		   (CLASS-DISPATCH
+		     ;; Matching a class dispatch.  If there is a pending dispatch, it
+		     ;; means an EQL dispatch is supposed to have occurred, i.e.
+		     ;; something has gone wrong.
+		     (WHEN PENDING-DISPATCH
+		       (ERROR "CLASS dispatch step matched a pending EQL dispatch"))
+		     ;; Find the position in the order that corresponds
+		     ;; with that dispatch.  If there is no such position,
+		     ;; then something is wrong.
+		     (LOOP DOING
+		       (WHEN (EQL (CLASS-DISPATCH-POSITION OLD-DISPATCH)
+				  (FIRST ORDER))
+			 (RETURN))
+		       (WHEN (OR (NULL ORDER)
+				 (POSITION-SPECIALIZED-P
+				   GENERIC-FUNCTION METHODS (FIRST ORDER)))
+			 (ERROR "Internal CLOS bug -- Positions don't match"))
+		       (POP ORDER)))
+		   (EQL-DISPATCH
+		     ;; EQL dispatch steps are supposed to follow class dispatch steps.
+		     ;; PENDING-DISPATCH should have been left with the EQL dispatch
+		     ;; that we should be doing.
+		     (UNLESS (AND PENDING-DISPATCH
+				  (EQL (EQL-DISPATCH-POSITION OLD-DISPATCH)
+				       (EQL-DISPATCH-POSITION PENDING-DISPATCH)))
+		       (ERROR "EQL not pending")))))
+	       ;; Use the pending (EQL) dispatch.
+	       (WHEN PENDING-DISPATCH
+		 ;; Make a note of the dispatch we just did
+		 (WHEN (EQL-DISPATCH-KEY-OR-NIL PENDING-DISPATCH)
+		   (SETF (NTH (EQL-DISPATCH-POSITION PENDING-DISPATCH) DISPATCHES)
+			 `(EQL ,(EQL-DISPATCH-KEY-OR-NIL PENDING-DISPATCH))))
+		 (RETURN-FROM GET-DISPATCH
+		   (PROG1 PENDING-DISPATCH
+			  (SETQ PENDING-DISPATCH NIL))))
+	       (WHEN (NULL METHODS)
+		 ;; No applicable method.
+		 (RETURN-FROM GET-DISPATCH
+		   (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+		       (FUNCALL METHOD-COMBINER GENERIC-FUNCTION NIL
+				#'COMBINER-ARGUMENT-FUNCTION)
+		     (SETQ FINAL-DISPATCH (COMPUTE-FINISH-DISPATCH HANDLER EXTRA-ARGUMENT)))))
+	       (LET ((POSITION
+		       ;; Find the next place in the precedence order which is
+		       ;; specialized.  If there isn't any, then we're done with this
+		       ;; dispatch.
+		       (LOOP DOING
+			 (WHEN (NULL ORDER)
+			   ;; Nothing more to dispatch on, so compute the combined
+			   ;; method and return.
+			   (MULTIPLE-VALUE-BIND (HANDLER EXTRA-ARGUMENT)
+			       (FUNCALL METHOD-COMBINER
+					GENERIC-FUNCTION
+					(APPLY #'NCONC METHODS)
+					#'COMBINER-ARGUMENT-FUNCTION)
+			     (RETURN-FROM GET-DISPATCH
+			       (SETQ FINAL-DISPATCH
+				     (COMPUTE-FINISH-DISPATCH HANDLER EXTRA-ARGUMENT)))))
+			 (LET ((POSITION (POP ORDER)))
+			   (WHEN (POSITION-SPECIALIZED-P GENERIC-FUNCTION METHODS POSITION)
+			     (RETURN POSITION))))))
+		 ;; Decide what dispatch-step(s) to do for this position.
+		 (MULTIPLE-VALUE-BIND (NEW-METHODS CLASS EQLS EQL)
+		     (CHOOSE-APPLICABLE-METHODS METHODS ARGUMENT-FUNCTION POSITION)
+		   (WHEN (AND EQLS
+			      ;; There's only one element in the NULL class, so don't
+			      ;; need to dispatch on it.  Also, things really get
+			      ;; screwed up if you put a NIL in the dispatch tables.
+			      (NOT (EQ CLASS (FIND-CLASS 'NULL))))
+		     ;; EQL dispatches need to be done.  Do them after the class
+		     ;; dispatch (think about when the the class dispatch can be
+		     ;; skipped).
+		     (SETQ PENDING-DISPATCH
+			   (MAKE-EQL-DISPATCH :POSITION POSITION
+					      :KEY-OR-NIL EQL
+					      :ALL-KEYS EQLS)))
+		   (SETQ METHODS NEW-METHODS)
+		   (SETF (NTH POSITION DISPATCHES)
+			 ;; If the class is NULL, then we know that the argument is
+			 ;; EQL to NIL
+			 (IF (EQ CLASS (FIND-CLASS 'NULL))
+			     `(EQL NIL)
+			     CLASS))
+		   (MAKE-CLASS-DISPATCH :POSITION POSITION
+					:CLASS CLASS)))))
+      (MODIFY-DISPATCHES GENERIC-FUNCTION #'GET-DISPATCH)
+      (VALUES
+	(FINISH-DISPATCH-HANDLER FINAL-DISPATCH)
+	(FINISH-DISPATCH-EXTRA-ARGUMENT FINAL-DISPATCH)))))
+
+(DEFUN TOO-FEW-ARGUMENTS-ERROR (GENERIC-FUNCTION ARGUMENTS)
+  #+Genera (ERROR 'SYS:TOO-FEW-ARGUMENTS :FUNCTION GENERIC-FUNCTION
+		  :NARGS (LENGTH ARGUMENTS) :ARGUMENT-LIST ARGUMENTS)
+  #-Genera (ERROR "Too few arguments to function ~A." GENERIC-FUNCTION))
+
+(DEFUN GENERIC-FUNCTION-ENSURE-ARGUMENTS-MAPPED (GENERIC-FUNCTION ARGUMENTS METHOD-COMBINER)
+  (WHEN (< (LENGTH ARGUMENTS)
+	   (LENGTH (DISPATCHING-FUNCALLABLE-INSTANCE-PRECEDENCE-ORDER GENERIC-FUNCTION)))
+    (TOO-FEW-ARGUMENTS-ERROR GENERIC-FUNCTION ARGUMENTS))
+  (GENERIC-DISPATCH-ENSURE-MAPPING
+    GENERIC-FUNCTION
+    #'(LAMBDA (TYPE POSITION)
+	(LET ((ARG (NTH POSITION ARGUMENTS)))
+	  (ECASE TYPE
+	    (CLASS (CLASS-OF ARG))
+	    (EQL (VALUES T ARG)))))
+    METHOD-COMBINER))
+
+(DEFUN GENERIC-FUNCTION-ENSURE-SPECIALIZERS-MAPPED
+       (GENERIC-FUNCTION SPECIALIZERS METHOD-COMBINER)
+  (GENERIC-DISPATCH-ENSURE-MAPPING
+    GENERIC-FUNCTION
+    #'(LAMBDA (TYPE POSITION)
+	(LET ((SPECIALIZER (NTH POSITION SPECIALIZERS)))
+	  (ECASE TYPE
+	    (CLASS
+	      (IF (TYPEP SPECIALIZER 'CONS)
+		  (CLASS-OF (SECOND SPECIALIZER))
+		  SPECIALIZER))
+	    (EQL
+	      (IF (TYPEP SPECIALIZER 'CONS)
+		  (VALUES T (SECOND SPECIALIZER))
+		  (VALUES NIL NIL))))))
+    METHOD-COMBINER))
+
+(DEFUN MAP-OVER-GENERIC-FUNCTION-COMPUTED-DISPATCHES
+       (GENERIC-FUNCTION MAPPING-FUNCTION &REST OTHER-ARGUMENTS)
+  (DECLARE (DYNAMIC-EXTENT OTHER-ARGUMENTS))
+  (WITH-CLOS-LOCK
+    (MULTIPLE-VALUE-BIND (N-REQUIRED N-OPTIONAL RESTP KEYWORDSP ALLOW-OTHER-KEYS-P)
+	(LAMBDA-LIST-COMPONENTS (GENERIC-FUNCTION-LAMBDA-LIST GENERIC-FUNCTION))
+      (LET* ((OLD-HANDLER (%FUNCALLABLE-INSTANCE-FUNCTION GENERIC-FUNCTION))
+	     (NEW-HANDLER
+	       (APPLY
+		 #'GENERIC-FUNCTION-MAP-OVER-DISPATCH
+		 GENERIC-FUNCTION
+		 OLD-HANDLER
+		 (%FUNCALLABLE-INSTANCE-EXTRA-ARGUMENT GENERIC-FUNCTION)
+		 (MAKE-INITIAL-DISPATCH-STATE
+		   N-REQUIRED
+		   (OR (> N-OPTIONAL 0) RESTP KEYWORDSP ALLOW-OTHER-KEYS-P))
+		 MAPPING-FUNCTION
+		 OTHER-ARGUMENTS)))
+	#+IMACH
+	(WHEN (SYS:TYPE-MEMBER NEW-HANDLER SYS:DTP-EVEN-PC SYS:DTP-ODD-PC)
+	  (SETQ NEW-HANDLER (HANDLER-PC-FUNCTION NEW-HANDLER)))
+	#+Minima
+	(WHEN (TYPEP NEW-HANDLER 'IVORY::PC)
+	  (SETF NEW-HANDLER (HANDLER-PC-FUNCTION NEW-HANDLER)))
+	#+|3600|
+	(WHEN (EQ NEW-HANDLER #'START-POSITION-0-CLASS-DISPATCH)
+	  ;; Let the microcode do it
+	  (SETQ NEW-HANDLER (%FUNCALLABLE-INSTANCE-EXTRA-ARGUMENT GENERIC-FUNCTION)))
+	(UNLESS (EQ OLD-HANDLER NEW-HANDLER)
+	  (SETF (%FUNCALLABLE-INSTANCE-FUNCTION GENERIC-FUNCTION)
+		(OR NEW-HANDLER #'HANDLE-START-DISPATCH-MISS)))))))
+
+(DEFUN GENERIC-FUNCTION-MAP-OVER-DISPATCH
+       (GENERIC-FUNCTION ORIGINAL-HANDLER ORIGINAL-EXTRA-ARGUMENT ORIGINAL-STATE
+	MAPPING-FUNCTION &REST OTHER-ARGUMENTS)
+  (DECLARE (DYNAMIC-EXTENT OTHER-ARGUMENTS))
+  (MULTIPLE-VALUE-BIND (DISPATCH EXTRA-ARGUMENT STATE)
+      (COMPUTE-DISPATCH ORIGINAL-STATE ORIGINAL-HANDLER ORIGINAL-EXTRA-ARGUMENT)
+    (ECASE (DISPATCH-TYPE DISPATCH)
+      (CLASS-DISPATCH
+	(DOLIST (CLASS (GENERIC-DISPATCH-KEY-ELEMENTS EXTRA-ARGUMENT))
+	  (WHEN CLASS
+	    (SETF (CLASS-DISPATCH-CLASS DISPATCH) CLASS)
+	    (MULTIPLE-VALUE-BIND (FOUNDP NEXT-HANDLER NEXT-EXTRA-ARGUMENT)
+		(CLASS-DISPATCH-TABLE-SEARCH CLASS EXTRA-ARGUMENT)
+	      (WHEN FOUNDP
+		(MULTIPLE-VALUE-BIND (NEW-NEXT-HANDLER NEW-NEXT-ARGUMENT)
+		    (APPLY MAPPING-FUNCTION
+			   DISPATCH
+			   NEXT-HANDLER
+			   NEXT-EXTRA-ARGUMENT
+			   (UPDATE-DISPATCH-STATE STATE DISPATCH)
+			   OTHER-ARGUMENTS)
+		  (UNLESS (AND (EQ NEW-NEXT-HANDLER NEXT-HANDLER)
+			       (EQ NEW-NEXT-ARGUMENT NEXT-EXTRA-ARGUMENT))
+		    (INSERT-IN-CLASS-DISPATCH-TABLE
+		      NEW-NEXT-HANDLER NEW-NEXT-ARGUMENT CLASS EXTRA-ARGUMENT)))))))
+	(COND ((GENERIC-DISPATCH-KEY-EMPTY-P EXTRA-ARGUMENT)
+	       (DEALLOCATE-DISPATCH-KEY EXTRA-ARGUMENT)
+	       (VALUES NIL NIL))
+	      (T (VALUES ORIGINAL-HANDLER ORIGINAL-EXTRA-ARGUMENT))))
+      (EQL-DISPATCH
+	(SETF (EQL-DISPATCH-KEY-OR-NIL DISPATCH) NIL)
+	(LET* ((ALL-KEYS-TO-FOLLOW NIL)
+	       (REMOVE-EQL-DISPATCH NIL)
+	       (REMOVED-KEYS NIL))
+	  (MULTIPLE-VALUE-BIND (NEXT-HANDLER NEXT-EXTRA-ARGUMENT)
+	      (EQL-DISPATCH-INSTANCE-DISPATCH-TABLE-SEARCH EXTRA-ARGUMENT NIL)
+	    (LOOP DOING
+	      (MULTIPLE-VALUE-BIND (NEW-NEXT-HANDLER NEW-NEXT-ARGUMENT KEY-OR-NIL OPERATION)
+		  (APPLY MAPPING-FUNCTION
+			 DISPATCH
+			 NEXT-HANDLER
+			 NEXT-EXTRA-ARGUMENT
+			 (UPDATE-DISPATCH-STATE STATE DISPATCH)
+			 OTHER-ARGUMENTS)
+		(COND (KEY-OR-NIL
+		       (ECASE OPERATION
+			 (:REMOVE-KEYS
+			   (SETQ REMOVED-KEYS KEY-OR-NIL))
+			 (:TRAVERSE
+			   ;; Follow only these keys
+			   (SETQ ALL-KEYS-TO-FOLLOW (REST KEY-OR-NIL))
+			   (UNLESS (FIRST KEY-OR-NIL)
+			     (RETURN)))))
+		      (T
+		       (ECASE OPERATION
+			 ((NIL)
+			   (UNLESS (AND (EQ NEW-NEXT-HANDLER NEXT-HANDLER)
+					(EQ NEW-NEXT-ARGUMENT NEXT-EXTRA-ARGUMENT))
+			     (INSERT-IN-EQL-DISPATCH-INSTANCE-DISPATCH-TABLE
+			       EXTRA-ARGUMENT KEY-OR-NIL GENERIC-FUNCTION NEW-NEXT-HANDLER
+			       NEW-NEXT-ARGUMENT))
+			   (RETURN))
+			 ((:REMOVE-EQL-DISPATCH)
+			   (SETQ ORIGINAL-HANDLER NIL)
+			   (SETQ ORIGINAL-EXTRA-ARGUMENT NIL)
+			   (SETQ REMOVE-EQL-DISPATCH T)
+			   (RETURN)))))))
+	    (FLET ((DO-KEY (KEY REMOVE)
+		     (SETF (EQL-DISPATCH-KEY-OR-NIL DISPATCH) KEY)
+		     (MULTIPLE-VALUE-BIND (NEXT-HANDLER NEXT-EXTRA-ARGUMENT FOUNDP)
+			 (EQL-DISPATCH-INSTANCE-DISPATCH-TABLE-SEARCH EXTRA-ARGUMENT KEY)
+		       (IF REMOVE
+			   (WHEN FOUNDP
+			     (MODIFY-DISPATCH-STEP
+			       GENERIC-FUNCTION
+			       #'DISPATCH-STEP-DELETER
+			       NEXT-HANDLER
+			       NEXT-EXTRA-ARGUMENT
+			       (UPDATE-DISPATCH-STATE STATE DISPATCH)))
+			   (MULTIPLE-VALUE-BIND (NEW-NEXT-HANDLER NEW-NEXT-ARGUMENT)
+			       (MULTIPLE-VALUE-BIND (NEXT-HANDLER NEXT-EXTRA-ARGUMENT)
+				   (IF FOUNDP
+				       (VALUES NEXT-HANDLER NEXT-EXTRA-ARGUMENT)
+				       (FIND-EQL-DISPATCH-MISS-HANDLER NIL))
+				 (APPLY MAPPING-FUNCTION
+					DISPATCH
+					NEXT-HANDLER
+					NEXT-EXTRA-ARGUMENT
+					(UPDATE-DISPATCH-STATE STATE DISPATCH)
+					OTHER-ARGUMENTS))
+			     (UNLESS (AND (EQ NEW-NEXT-HANDLER NEXT-HANDLER)
+					  (EQ NEW-NEXT-ARGUMENT NEXT-EXTRA-ARGUMENT))
+			       (INSERT-IN-EQL-DISPATCH-INSTANCE-DISPATCH-TABLE
+				 EXTRA-ARGUMENT KEY GENERIC-FUNCTION NEW-NEXT-HANDLER
+				 NEW-NEXT-ARGUMENT)))))))
+	      (SETQ ALL-KEYS-TO-FOLLOW (OR ALL-KEYS-TO-FOLLOW
+					   (EQL-DISPATCH-INSTANCE-ALL-KEYS EXTRA-ARGUMENT)))
+	      (DOLIST (KEY REMOVED-KEYS)
+		(DO-KEY KEY T))
+	      (DOLIST (KEY ALL-KEYS-TO-FOLLOW)
+		(DO-KEY KEY REMOVE-EQL-DISPATCH))
+	      (WHEN REMOVED-KEYS
+		(REMOVE-EQL-DISPATCH-INSTANCE-KEYS EXTRA-ARGUMENT REMOVED-KEYS))
+	      (VALUES ORIGINAL-HANDLER ORIGINAL-EXTRA-ARGUMENT)))))
+      (FINISH-DISPATCH
+	(LET ((OLD-HANDLER (FINISH-DISPATCH-HANDLER DISPATCH))
+	      (OLD-EXTRA-ARGUMENT (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH)))
+	  (MULTIPLE-VALUE-BIND (NEW-HANDLER NEW-EXTRA-ARGUMENT)
+	      (APPLY MAPPING-FUNCTION DISPATCH OLD-HANDLER OLD-EXTRA-ARGUMENT
+		     STATE OTHER-ARGUMENTS)
+	    (COND ((NULL NEW-HANDLER)
+		   (VALUES NIL NIL))
+		  ((AND (EQ OLD-HANDLER NEW-HANDLER)
+			(EQ OLD-EXTRA-ARGUMENT NEW-EXTRA-ARGUMENT))
+		   (VALUES ORIGINAL-HANDLER ORIGINAL-EXTRA-ARGUMENT))
+		  (T
+		   (COMPUTE-HANDLER-AND-EXTRA-ARGUMENT
+		     ORIGINAL-STATE
+		     (COMPUTE-FINISH-DISPATCH NEW-HANDLER NEW-EXTRA-ARGUMENT)
+		     NIL))))))))) 
+
+;;; Remove methods that are eliminated by this dispatch.
+(DEFUN FILTER-METHODS (METHODS DISPATCH)
+  (LET ((NEW-METHODS NIL))
+    (ECASE (DISPATCH-TYPE DISPATCH)
+      (CLASS-DISPATCH
+	(LET ((CLASS-PRECEDENCE-LIST (CLASS-PRECEDENCE-LIST (CLASS-DISPATCH-CLASS DISPATCH)))
+	      (POSITION (CLASS-DISPATCH-POSITION DISPATCH)))
+	  (DOLIST (METHOD METHODS)
+	    (LET ((SPECIALIZER (NTH POSITION (METHOD-SPECIALIZERS METHOD))))
+	      (WHEN (MEMBER
+		      (IF (TYPEP SPECIALIZER 'CONS)
+			  ;; Remember that a method with this specializer is still in
+			  ;; the set of applicable methods.
+			  (CLASS-OF (SECOND SPECIALIZER))
+			  SPECIALIZER)
+		      CLASS-PRECEDENCE-LIST)
+		(PUSH METHOD NEW-METHODS))))))
+      (EQL-DISPATCH
+	(LET ((KEY-OR-NIL (EQL-DISPATCH-KEY-OR-NIL DISPATCH))
+	      (POSITION (EQL-DISPATCH-POSITION DISPATCH)))
+	  (DOLIST (METHOD METHODS)
+	    (LET ((SPECIALIZER (NTH POSITION (METHOD-SPECIALIZERS METHOD))))
+	      (WHEN (IF KEY-OR-NIL
+			;; Remember that the non-EQL specialized methods are still
+			;; applicable methods.
+			(OR (NOT (TYPEP SPECIALIZER 'CONS))
+			    (EQL (SECOND SPECIALIZER) KEY-OR-NIL))
+			(NOT (TYPEP SPECIALIZER 'CONS)))
+		(PUSH METHOD NEW-METHODS)))))))
+    NEW-METHODS))
+
+;;; Remove specializers that are eliminated by this dispatch.
+(DEFUN FILTER-SPECIALIZERS (SPECIALIZERS-LIST DISPATCH)
+  (LET ((NEW-SPECIALIZERS-LIST NIL))
+    (ECASE (DISPATCH-TYPE DISPATCH)
+      (CLASS-DISPATCH
+	(LET ((CLASS-PRECEDENCE-LIST (CLASS-PRECEDENCE-LIST (CLASS-DISPATCH-CLASS DISPATCH)))
+	      (POSITION (CLASS-DISPATCH-POSITION DISPATCH)))
+	  (DOLIST (SPECIALIZERS SPECIALIZERS-LIST)
+	    (LET ((SPECIALIZER (NTH POSITION SPECIALIZERS)))
+	      (WHEN (MEMBER
+		      (IF (TYPEP SPECIALIZER 'CONS)
+			  ;; Remember that a method with this specializer is still in
+			  ;; the set of applicable methods.
+			  (CLASS-OF (SECOND SPECIALIZER))
+			  SPECIALIZER)
+		      CLASS-PRECEDENCE-LIST)
+		(PUSH SPECIALIZERS NEW-SPECIALIZERS-LIST))))))
+      (EQL-DISPATCH
+	(LET ((KEY-OR-NIL (EQL-DISPATCH-KEY-OR-NIL DISPATCH))
+	      (POSITION (EQL-DISPATCH-POSITION DISPATCH)))
+	  (DOLIST (SPECIALIZERS SPECIALIZERS-LIST)
+	    (LET ((SPECIALIZER (NTH POSITION SPECIALIZERS)))
+	      (WHEN (IF KEY-OR-NIL
+			;; Remember that the non-EQL specialized methods are still
+			;; applicable methods.
+			(OR (NOT (TYPEP SPECIALIZER 'CONS))
+			    (EQL (SECOND SPECIALIZER) KEY-OR-NIL))
+			(NOT (TYPEP SPECIALIZER 'CONS)))
+		(PUSH SPECIALIZERS NEW-SPECIALIZERS-LIST)))))))
+    NEW-SPECIALIZERS-LIST))
+
+(DEFUN UPDATE-DISPATCHES (GENERIC-FUNCTION METHOD-COMBINER &OPTIONAL FORCE)
+  (WITH-CLOS-LOCK
+    (LET ((ADDED-SPECIALIZERS-LIST NIL)
+	  (REMOVED-SPECIALIZERS-LIST NIL))
+      (MULTIPLE-VALUE-BIND (ADDED-METHODS REMOVED-METHODS)
+	  (GET-GENERIC-FUNCTION-METHOD-CHANGES GENERIC-FUNCTION)
+	;; For now, all we care about are changes to the specializers, so collapse the
+	;; list of method additions and deletions to lists of specializer additions and
+	;; deletions.
+	(DOLIST (METHOD ADDED-METHODS)
+	  (PUSHNEW (METHOD-SPECIALIZERS METHOD) ADDED-SPECIALIZERS-LIST
+		   :TEST #'EQUIVALENT-SPECIALIZER-LISTS-P))
+	(DOLIST (METHOD REMOVED-METHODS)
+	  (PUSHNEW (METHOD-SPECIALIZERS METHOD) REMOVED-SPECIALIZERS-LIST
+		   :TEST #'EQUIVALENT-SPECIALIZER-LISTS-P)))
+      (SETQ REMOVED-SPECIALIZERS-LIST
+	    (SET-DIFFERENCE REMOVED-SPECIALIZERS-LIST ADDED-SPECIALIZERS-LIST
+			    :TEST #'EQUIVALENT-SPECIALIZER-LISTS-P))
+      (LABELS ((MAPPER (DISPATCH HANDLER EXTRA-ARGUMENT STATE
+				 METHODS
+				 ADDED-SPECIALIZERS-LIST REMOVED-SPECIALIZERS-LIST
+				 PENDING-EQL-P ADDED-EQLS REMOVED-EQLS
+				 &REST DISPATCHES)
+		 (DECLARE (DYNAMIC-EXTENT DISPATCHES))
+		 (ECASE (DISPATCH-TYPE DISPATCH)
+		   (CLASS-DISPATCH
+		     (WHEN PENDING-EQL-P
+		       (RETURN-FROM MAPPER
+			 ;; There needs to be an EQL dispatch here, so kill off the
+			 ;; rest.
+			 (MODIFY-DISPATCH-STEP
+			   GENERIC-FUNCTION
+			   #'DISPATCH-STEP-DELETER
+			   HANDLER
+			   EXTRA-ARGUMENT
+			   STATE)))
+		     (LET ((DISPATCH-POSITION (CLASS-DISPATCH-POSITION DISPATCH))
+			   (POSITION-PLACE
+			     ;; List of dispatch positions following the previous
+			     ;; dispatch.
+			     (LET ((ORDER (DISPATCHING-FUNCALLABLE-INSTANCE-PRECEDENCE-ORDER
+					    GENERIC-FUNCTION)))
+			       (IF (NULL DISPATCHES)
+				   ORDER
+				   (DOLIST (DISPATCH DISPATCHES)
+				     (WHEN (EQ (DISPATCH-TYPE DISPATCH) 'CLASS-DISPATCH)
+				       (RETURN
+					 (CDR (MEMBER (CLASS-DISPATCH-POSITION DISPATCH)
+						      ORDER)))))))))
+		       (UNLESS (EQL DISPATCH-POSITION (FIRST POSITION-PLACE))
+			 ;; Some dispatch positions have been skipped since the last
+			 ;; dispatch.  Make sure that none of them have become
+			 ;; specialized.
+			 (DOLIST (POSITION POSITION-PLACE)
+			   (WHEN (EQL POSITION DISPATCH-POSITION)
+			     (RETURN NIL))
+			   ;; POSITION-SPECIALIZED-P wants a list of lists of methods
+			   (LET ((METHOD-LIST (LIST METHODS)))
+			     (DECLARE (DYNAMIC-EXTENT METHOD-LIST))
+			     (WHEN (POSITION-SPECIALIZED-P GENERIC-FUNCTION METHOD-LIST POSITION)
+			       ;; Delete the remaining dispatches.
+			       (RETURN-FROM MAPPER
+				 (MODIFY-DISPATCH-STEP
+				   GENERIC-FUNCTION
+				   #'DISPATCH-STEP-DELETER
+				   HANDLER
+				   EXTRA-ARGUMENT
+				   STATE))))))
+		       (LET ((ADDED-SPECIALIZERS-LIST
+			       (FILTER-SPECIALIZERS ADDED-SPECIALIZERS-LIST DISPATCH))
+			     (REMOVED-SPECIALIZERS-LIST
+			       (FILTER-SPECIALIZERS REMOVED-SPECIALIZERS-LIST DISPATCH)))
+			 (WHEN (OR FORCE ADDED-SPECIALIZERS-LIST REMOVED-SPECIALIZERS-LIST)
+			   (LET ((FILTERED-METHODS (LIST (FILTER-METHODS METHODS DISPATCH))))
+			     (DECLARE (DYNAMIC-EXTENT FILTERED-METHODS))
+			     (MULTIPLE-VALUE-BIND (SPECIALIZED-P EQL-P)
+				 (POSITION-SPECIALIZED-P
+				   GENERIC-FUNCTION
+				   FILTERED-METHODS
+				   DISPATCH-POSITION)
+			       (WHEN (NULL SPECIALIZED-P)
+				 ;; No need to keep this one
+				 (MODIFY-DISPATCH-STEP
+				   GENERIC-FUNCTION
+				   #'DISPATCH-STEP-DELETER
+				   HANDLER
+				   EXTRA-ARGUMENT
+				   STATE)
+				 (RETURN-FROM MAPPER NIL))
+			       (LET ((ADDED-EQLS (CONS NIL NIL))
+				     (REMOVED-EQLS (CONS NIL NIL)))
+				 (DOLIST (SPECIALIZERS ADDED-SPECIALIZERS-LIST)
+				   (LET ((SPECIALIZER (NTH DISPATCH-POSITION SPECIALIZERS)))
+				     (IF (CONSP SPECIALIZER)
+					 (PUSHNEW (SECOND SPECIALIZER) (CDR ADDED-EQLS))
+					 (SETF (FIRST ADDED-EQLS) T))))
+				 (DOLIST (SPECIALIZERS REMOVED-SPECIALIZERS-LIST)
+				   (LET ((SPECIALIZER (NTH DISPATCH-POSITION SPECIALIZERS)))
+				     (WHEN (CONSP SPECIALIZER)
+				       (PUSHNEW (SECOND SPECIALIZER) (CDR REMOVED-EQLS)))))
+				 ;; Some of the "REMOVED-EQLS" aren't going to be
+				 ;; removed.  We have to look at the methods to tell
+				 ;; for sure.
+				 (DOLIST (METHOD (CAR FILTERED-METHODS))
+				   (LET ((SPECIALIZER
+					   (NTH DISPATCH-POSITION
+						(METHOD-SPECIALIZERS METHOD))))
+				     (WHEN (CONSP SPECIALIZER)
+				       (SETF (CDR REMOVED-EQLS)
+					     (DELETE (SECOND SPECIALIZER)
+						     (CDR REMOVED-EQLS))))))
+				 (RETURN-FROM MAPPER
+				   (APPLY
+				     #'GENERIC-FUNCTION-MAP-OVER-DISPATCH
+				     GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE
+				     #'MAPPER
+				     (FIRST FILTERED-METHODS)
+				     ADDED-SPECIALIZERS-LIST
+				     REMOVED-SPECIALIZERS-LIST
+				     EQL-P
+				     ADDED-EQLS
+				     REMOVED-EQLS
+				     DISPATCH
+				     DISPATCHES)))))))
+		       (VALUES HANDLER EXTRA-ARGUMENT)))
+		   (EQL-DISPATCH
+		     (LET ((KEY-OR-NIL (EQL-DISPATCH-KEY-OR-NIL DISPATCH)))
+		       (WHEN (NULL KEY-OR-NIL)
+			 ;; Null KEY-OR-NIL means we get to set up what we map over.
+			 (WHEN (NULL PENDING-EQL-P)
+			   ;; Splice it out
+			   (RETURN-FROM MAPPER
+			     (VALUES HANDLER EXTRA-ARGUMENT NIL :REMOVE-EQL-DISPATCH)))
+			 (WHEN (CDR REMOVED-EQLS)
+			   (RETURN-FROM MAPPER
+			     (VALUES HANDLER EXTRA-ARGUMENT
+				     (PROG1 (CDR REMOVED-EQLS)
+					    (SETF (CDR REMOVED-EQLS) NIL))
+				     :REMOVE-KEYS)))
+			 (WHEN (AND (CDR ADDED-EQLS) (NOT FORCE))
+			   ;; Just do these
+			   (RETURN-FROM MAPPER
+			     (VALUES NIL NIL (PROG1 (CONS (FIRST ADDED-EQLS)
+							  (REST ADDED-EQLS))
+						    (SETF (REST ADDED-EQLS) NIL))
+				     :TRAVERSE))))
+		       (LET ((ADDED-SPECIALIZERS-LIST
+			       (FILTER-SPECIALIZERS ADDED-SPECIALIZERS-LIST DISPATCH))
+			     (REMOVED-SPECIALIZERS-LIST
+			       (FILTER-SPECIALIZERS REMOVED-SPECIALIZERS-LIST DISPATCH)))
+			 (MULTIPLE-VALUE-BIND (NEW-HANDLER NEW-EXTRA-ARG)
+			     (IF (OR FORCE ADDED-SPECIALIZERS-LIST REMOVED-SPECIALIZERS-LIST)
+				 (APPLY
+				   #'GENERIC-FUNCTION-MAP-OVER-DISPATCH
+				   GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE
+				   #'MAPPER
+				   (FILTER-METHODS METHODS DISPATCH)
+				   ADDED-SPECIALIZERS-LIST
+				   REMOVED-SPECIALIZERS-LIST
+				   NIL		;No pending EQL dispatch now
+				   NIL
+				   NIL
+				   DISPATCH
+				   DISPATCHES)
+				 (VALUES HANDLER EXTRA-ARGUMENT NIL))
+			   (VALUES NEW-HANDLER NEW-EXTRA-ARG NIL NIL)))))
+		   (FINISH-DISPATCH
+		     (IF (AND (NULL ADDED-SPECIALIZERS-LIST)
+			      (NULL METHODS))
+			 (VALUES NIL NIL NIL)
+			 (FINISH-RECOMBINER
+			   GENERIC-FUNCTION METHOD-COMBINER DISPATCHES METHODS))))))
+	(MAP-OVER-GENERIC-FUNCTION-COMPUTED-DISPATCHES
+	  GENERIC-FUNCTION #'MAPPER
+	  (GENERIC-FUNCTION-METHODS GENERIC-FUNCTION)
+	  ADDED-SPECIALIZERS-LIST
+	  REMOVED-SPECIALIZERS-LIST
+	  NIL NIL NIL)))
+    (DOLIST (FAMILY (FUNCTION-MAPPING-TABLE-FAMILIES GENERIC-FUNCTION))
+      (UPDATE-MAPPING-TABLE-FAMILY-FOR-GENERIC-FUNCTION FAMILY GENERIC-FUNCTION))))
+
+(DEFUN RECOMPUTE-DISPATCHES (GENERIC-FUNCTION FILTER-FUNCTION FINISH-FUNCTION)
+  (LABELS ((MAPPER (DISPATCH HANDLER EXTRA-ARGUMENT STATE METHODS PENDING-EQL-P
+			     &REST DISPATCHES)
+	     (DECLARE (DYNAMIC-EXTENT DISPATCHES))
+	     (ECASE (DISPATCH-TYPE DISPATCH)
+	       (CLASS-DISPATCH
+		 (WHEN PENDING-EQL-P
+		   (RETURN-FROM MAPPER
+		     ;; There needs to be an EQL dispatch here, so kill off the
+		     ;; rest.
+		     (MODIFY-DISPATCH-STEP
+		       GENERIC-FUNCTION
+		       #'DISPATCH-STEP-DELETER
+		       HANDLER
+		       EXTRA-ARGUMENT
+		       STATE)))
+		 (LET ((DISPATCH-POSITION (CLASS-DISPATCH-POSITION DISPATCH))
+		       (POSITION-PLACE
+			 ;; List of dispatch positions following the previous
+			 ;; dispatch.
+			 (LET ((ORDER (DISPATCHING-FUNCALLABLE-INSTANCE-PRECEDENCE-ORDER
+					GENERIC-FUNCTION)))
+			   (IF (NULL DISPATCHES)
+			       ORDER
+			       (DOLIST (DISPATCH DISPATCHES)
+				 (WHEN (EQ (DISPATCH-TYPE DISPATCH) 'CLASS-DISPATCH)
+				   (RETURN
+				     (CDR (MEMBER (CLASS-DISPATCH-POSITION DISPATCH)
+						  ORDER)))))))))
+		   (UNLESS (EQL DISPATCH-POSITION (FIRST POSITION-PLACE))
+		     ;; Some dispatch positions have been skipped since the last
+		     ;; dispatch.  Make sure that none of them have become
+		     ;; specialized.
+		     (DOLIST (POSITION POSITION-PLACE)
+		       (WHEN (EQL POSITION DISPATCH-POSITION)
+			 (RETURN NIL))
+		       ;; POSITION-SPECIALIZED-P wants a list of lists of methods
+		       (LET ((METHOD-LIST (LIST METHODS)))
+			 (DECLARE (DYNAMIC-EXTENT METHOD-LIST))
+			 (WHEN (POSITION-SPECIALIZED-P GENERIC-FUNCTION METHOD-LIST POSITION)
+			   ;; Delete the remaining dispatches.
+			   (RETURN-FROM MAPPER
+			     (MODIFY-DISPATCH-STEP
+			       GENERIC-FUNCTION
+			       #'DISPATCH-STEP-DELETER
+			       HANDLER
+			       EXTRA-ARGUMENT
+			       STATE))))))
+		   (WHEN (FUNCALL FILTER-FUNCTION DISPATCH)
+		     (LET ((FILTERED-METHODS (LIST (FILTER-METHODS METHODS DISPATCH))))
+		       (DECLARE (DYNAMIC-EXTENT FILTERED-METHODS))
+		       (MULTIPLE-VALUE-BIND (SPECIALIZED-P EQL-P)
+			   (POSITION-SPECIALIZED-P
+			     GENERIC-FUNCTION
+			     FILTERED-METHODS
+			     DISPATCH-POSITION)
+			 (WHEN (NULL SPECIALIZED-P)
+			   ;; No need to keep this one
+			   (MODIFY-DISPATCH-STEP
+			     GENERIC-FUNCTION
+			     #'DISPATCH-STEP-DELETER
+			     HANDLER
+			     EXTRA-ARGUMENT
+			     STATE)
+			   (RETURN-FROM MAPPER NIL))
+			 (RETURN-FROM MAPPER
+			   (APPLY
+			     #'GENERIC-FUNCTION-MAP-OVER-DISPATCH
+			     GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE
+			     #'MAPPER
+			     (FIRST FILTERED-METHODS)
+			     EQL-P
+			     DISPATCH
+			     DISPATCHES)))))
+		   (VALUES HANDLER EXTRA-ARGUMENT)))
+	       (EQL-DISPATCH
+		 (COND ((NULL PENDING-EQL-P)
+			;; Don't need this one anymore
+			(MODIFY-DISPATCH-STEP
+				GENERIC-FUNCTION
+				#'DISPATCH-STEP-DELETER
+				HANDLER
+				EXTRA-ARGUMENT
+				STATE))
+		       ((LET ((POSITION (EQL-DISPATCH-POSITION DISPATCH))
+			      (EQLS (EQL-DISPATCH-ALL-KEYS DISPATCH))
+			      (MISSINGP NIL)
+			      (METHOD-EQLS NIL))
+			  (DOLIST (METHOD METHODS)
+			    (LET ((SPECIALIZER (NTH POSITION (METHOD-SPECIALIZERS METHOD))))
+			      (WHEN (CONSP SPECIALIZER)
+				(LET ((EQL-OBJECT (SECOND SPECIALIZER)))
+				  (UNLESS (MEMBER EQL-OBJECT EQLS)
+				    (SETQ MISSINGP T))
+				  (PUSHNEW EQL-OBJECT METHOD-EQLS)))))
+			  (OR MISSINGP
+			      (DOLIST (EQL-OBJECT EQLS)
+				(UNLESS (MEMBER EQL-OBJECT METHOD-EQLS)
+				  (RETURN T)))))
+			;; Set of EQL things changed.  For now, flush the whole
+			;; thing.  Later be clever.
+			(MODIFY-DISPATCH-STEP
+				GENERIC-FUNCTION
+				#'DISPATCH-STEP-DELETER
+				HANDLER
+				EXTRA-ARGUMENT
+				STATE))
+		       ((FUNCALL FILTER-FUNCTION DISPATCH)
+			(APPLY
+			  #'GENERIC-FUNCTION-MAP-OVER-DISPATCH
+			  GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE
+			  #'MAPPER
+			  (FILTER-METHODS METHODS DISPATCH)
+			  NIL			;No pending EQL dispatch now
+			  DISPATCH
+			  DISPATCHES))
+		       (T (VALUES HANDLER EXTRA-ARGUMENT))))
+	       (FINISH-DISPATCH
+		 ;; Anything pending will be taken care of by the finish function
+		 (FUNCALL FINISH-FUNCTION
+			  DISPATCHES
+			  METHODS
+			  HANDLER
+			  EXTRA-ARGUMENT)))))
+    (MAP-OVER-GENERIC-FUNCTION-COMPUTED-DISPATCHES
+      GENERIC-FUNCTION #'MAPPER
+      (GENERIC-FUNCTION-METHODS GENERIC-FUNCTION) NIL)))
+
+(DEFUN FINISH-RECOMBINER (GENERIC-FUNCTION METHOD-COMBINER DISPATCHES METHODS)
+  (LET* ((N-SPECIALIZERS
+	   (LENGTH (DISPATCHING-FUNCALLABLE-INSTANCE-PRECEDENCE-ORDER
+		     GENERIC-FUNCTION)))
+	 (CLASS-SPECIALIZERS (MAKE-LIST N-SPECIALIZERS))
+	 (EQL-SPECIALIZERS (MAKE-LIST N-SPECIALIZERS))
+	 (T-CLASS (FIND-CLASS T)))
+    (FILL CLASS-SPECIALIZERS T-CLASS)
+    (FILL EQL-SPECIALIZERS NIL)
+    (DOLIST (DISPATCH DISPATCHES)
+      (ECASE (DISPATCH-TYPE DISPATCH)
+	(CLASS-DISPATCH
+	  (SETF (NTH (CLASS-DISPATCH-POSITION DISPATCH) CLASS-SPECIALIZERS)
+		(CLASS-DISPATCH-CLASS DISPATCH)))
+	(EQL-DISPATCH
+	  (SETF (NTH (EQL-DISPATCH-POSITION DISPATCH) EQL-SPECIALIZERS)
+		(EQL-DISPATCH-KEY-OR-NIL DISPATCH)))))
+    ;; Now make sure that there are no additional dispatches to be done,
+    ;; because if there are we don't want to compute new dispatches here.
+    (LOOP WITH METHODS = (LIST METHODS)
+	  FOR POSITION FROM 0
+	  FOR CLASS-SPECIALIZER IN CLASS-SPECIALIZERS
+	  FOR EQL-SPECIALIZER IN EQL-SPECIALIZERS
+	  DOING
+      (MULTIPLE-VALUE-BIND (SPECIALIZED-P EQL-P)
+	  (POSITION-SPECIALIZED-P GENERIC-FUNCTION METHODS POSITION)
+	(WHEN (OR (AND (NULL EQL-SPECIALIZER) EQL-P)
+		  (AND (EQ CLASS-SPECIALIZER T-CLASS) SPECIALIZED-P))
+	  ;; Too bad
+	  (RETURN-FROM FINISH-RECOMBINER (VALUES NIL NIL)))))
+    (FUNCALL METHOD-COMBINER
+	     GENERIC-FUNCTION
+	     METHODS
+	     #'(LAMBDA (TYPE POSITION)
+		 (ECASE TYPE
+		   (CLASS (NTH POSITION CLASS-SPECIALIZERS))
+		   (EQL
+		     (LET ((SPEC (NTH POSITION EQL-SPECIALIZERS)))
+		       (IF SPEC
+			   (VALUES T SPEC)
+			   ;; If the class is NULL, the argument is EQL to NIL.
+			   (IF (EQ (NTH POSITION CLASS-SPECIALIZERS) (FIND-CLASS 'NULL))
+			       (VALUES T NIL)
+			       (VALUES NIL NIL)))))))
+	     T)))
+
+(DEFUN RECOMBINE-METHODS-SPECIALIZED-ON-CLASS (CLASS METHOD-COMBINER)
+  (LET ((GENERIC-FUNCTIONS))
+    (MAP-OVER-DISPATCH-TABLE
+      #'(LAMBDA (SELECTOR HANDLER EXTRA-ARGUMENT)
+	  (TYPECASE SELECTOR
+	    (CONS
+	      (PUSHNEW (FIRST SELECTOR) GENERIC-FUNCTIONS))
+	    (GENERIC-FUNCTION-SELECTOR
+	      (WHEN (GENERIC-FUNCTION-CLOS SELECTOR)
+		(PUSHNEW (FUNCALLABLE-INSTANCE-FROM-GENERIC-SELECTOR SELECTOR)
+			 GENERIC-FUNCTIONS)))
+	    (OTHERWISE))
+	  (VALUES SELECTOR HANDLER EXTRA-ARGUMENT))
+      (%INSTANCE-INFORMATION-DISPATCH-TABLE
+	(CLASS-INSTANCE-INFORMATION CLASS)))
+    (DOLIST (GENERIC-FUNCTION GENERIC-FUNCTIONS)
+      (LABELS ((MAPPER (DISPATCH HANDLER EXTRA-ARGUMENT STATE METHODS MATCHP &REST DISPATCHES)
+		 (DECLARE (DYNAMIC-EXTENT DISPATCHES))
+		 (ECASE (DISPATCH-TYPE DISPATCH)
+		   ((CLASS-DISPATCH EQL-DISPATCH)
+		    (APPLY
+		      #'GENERIC-FUNCTION-MAP-OVER-DISPATCH
+		      GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE #'MAPPER
+		      (FILTER-METHODS METHODS DISPATCH)
+		      (OR MATCHP
+			  (AND (EQ (DISPATCH-TYPE DISPATCH) 'CLASS-DISPATCH)
+			       (EQ (CLASS-DISPATCH-CLASS DISPATCH) CLASS)))
+		      DISPATCH DISPATCHES))
+		   (FINISH-DISPATCH
+		     (IF MATCHP
+			 (FINISH-RECOMBINER
+			   GENERIC-FUNCTION METHOD-COMBINER DISPATCHES METHODS)
+			 (VALUES HANDLER EXTRA-ARGUMENT))))))
+	(MAP-OVER-GENERIC-FUNCTION-COMPUTED-DISPATCHES
+	  GENERIC-FUNCTION #'MAPPER
+	  (GENERIC-FUNCTION-METHODS GENERIC-FUNCTION)
+	  NIL)))))
+
+(DEFUN PRINT-DISPATCHES (GENERIC-FUNCTION)
+  (LET (#-Genera (*INDENT* 0))
+    #-Genera (DECLARE (SPECIAL *INDENT*))
+    (MACROLET ((NEWLINE () #+Genera '(FORMAT T "~&") #-Genera '(FORMAT T "~&~vT" *INDENT*)))
+      (LABELS ((MAPPER (DISPATCH HANDLER EXTRA-ARGUMENT STATE)
+		 (ECASE (DISPATCH-TYPE DISPATCH)
+		   (CLASS-DISPATCH
+		     (NEWLINE)
+		     (FORMAT T "Class dispatch at position ~s on class ~s"
+			     (CLASS-DISPATCH-POSITION DISPATCH)
+			     (CLASS-NAME (CLASS-DISPATCH-CLASS DISPATCH))))
+		   (EQL-DISPATCH
+		     (LET ((KEY-OR-NIL (EQL-DISPATCH-KEY-OR-NIL DISPATCH)))
+		       (NEWLINE)
+		       (IF KEY-OR-NIL
+			   (FORMAT T "EQL dispatch at position ~s on key ~s"
+				   (EQL-DISPATCH-POSITION DISPATCH) KEY-OR-NIL)
+			   (FORMAT T "Default EQL dispatch at position ~s"
+				   (EQL-DISPATCH-POSITION DISPATCH)))))
+		   (FINISH-DISPATCH
+		     (NEWLINE)
+		     (FORMAT T "Finish at handler ~s, extra argument ~s"
+			     (FINISH-DISPATCH-HANDLER DISPATCH)
+			     (FINISH-DISPATCH-EXTRA-ARGUMENT DISPATCH))))
+		 (UNLESS (EQ (DISPATCH-TYPE DISPATCH) 'FINISH-DISPATCH)
+		   #+Genera (SCL:INDENTING-OUTPUT (*STANDARD-OUTPUT* 3)
+			      (GENERIC-FUNCTION-MAP-OVER-DISPATCH
+				GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE #'MAPPER))
+		   #-Genera (LET ((*INDENT* (+ *INDENT* 3)))
+			      (DECLARE (SPECIAL *INDENT*))
+			      (GENERIC-FUNCTION-MAP-OVER-DISPATCH
+				GENERIC-FUNCTION HANDLER EXTRA-ARGUMENT STATE #'MAPPER)))
+		 (VALUES HANDLER EXTRA-ARGUMENT)))
+	(MAP-OVER-GENERIC-FUNCTION-COMPUTED-DISPATCHES GENERIC-FUNCTION #'MAPPER)))))
+
+
+(DEFUN POSITION-SPECIALIZED-P (GENERIC-FUNCTION METHODS POSITION)
+  #+Genera (DECLARE (VALUES SPECIALIZED-P EQL-SPECIALIZED-P))
+  GENERIC-FUNCTION
+  (LET ((T-CLASS (FIND-CLASS T))
+	(SPECIALIZED-P
+	  #+Genera
+	  ;; Messages always start on the first argument
+	  (AND (= POSITION 0)
+	       (GENERIC-FUNCTION-SELECTOR GENERIC-FUNCTION))
+	  #-Genera
+	  NIL)
+	(EQL-P NIL))
+    (DOLIST (GROUP METHODS)
+      (DOLIST (METHOD GROUP)
+	(LET ((SPECIALIZER (NTH POSITION (METHOD-SPECIALIZERS METHOD))))
+	  (UNLESS (EQ SPECIALIZER T-CLASS)
+	    (SETQ SPECIALIZED-P T)
+	    (WHEN (CONSP SPECIALIZER)
+	      (SETQ EQL-P T))))
+	(WHEN (AND (NOT SPECIALIZED-P)
+		   (LOGTEST (ASH 1 POSITION) (METHOD-MAPPED-ARGUMENTS-BITMAP METHOD)))
+	  (SETF SPECIALIZED-P T))))
+    (VALUES SPECIALIZED-P EQL-P)))
+
+(DEFUN CHOOSE-APPLICABLE-METHODS (METHODS ARGUMENT-FUNCTION I)
+  (DECLARE (DYNAMIC-EXTENT ARGUMENT-FUNCTION))
+  #+Genera (DECLARE (VALUES METHODS CLASS EQLS EQL))
+  ;; Methods is a list of lists.  Each sublist contains methods whose positions are
+  ;; equal at this stage of the sort/filter operation.  We will return a list of
+  ;; lists with the same ordering constraints and additional filtering.
+  (LET ((CLASS (FUNCALL ARGUMENT-FUNCTION 'CLASS I))
+	(CLASS-EQLS NIL)
+	(EQL-OR-NIL NIL)
+	(RESULT NIL))
+    (MULTIPLE-VALUE-BIND (EQLP VALUE)
+	(FUNCALL ARGUMENT-FUNCTION 'EQL I)
+      (DOLIST (GROUP METHODS)
+	;; Pick up all the EQL specializers for this class, and, if any apply,
+	;; get those methods
+	(LET ((EQLS NIL))
+	  (DOLIST (METHOD GROUP)
+	    (LET ((SPECIALIZER (NTH I (METHOD-SPECIALIZERS METHOD))))
+	      (WHEN (AND (LISTP SPECIALIZER)
+			 (EQ (CAR SPECIALIZER) 'EQL))
+		(LET ((METHOD-EQL (SECOND SPECIALIZER)))
+		  (WHEN (EQ (CLASS-OF METHOD-EQL) CLASS)
+		    (PUSHNEW METHOD-EQL CLASS-EQLS))
+		  (WHEN (AND EQLP (EQL METHOD-EQL VALUE))
+		    (SETQ EQL-OR-NIL VALUE)
+		    (PUSH METHOD EQLS))))))
+	  (WHEN EQLS (PUSH EQLS RESULT)))
+	;; Now for each class in the class precedence list of CLASS, get the
+	;; methods that are applicable
+	(DOLIST (CLASS (CLASS-PRECEDENCE-LIST CLASS))
+	  (LET ((CLASS-METHODS NIL))
+	    (DOLIST (METHOD GROUP)
+	      (LET ((SPECIALIZER (NTH I (METHOD-SPECIALIZERS METHOD))))
+		(WHEN (EQ SPECIALIZER CLASS)
+		  (PUSH METHOD CLASS-METHODS))))
+	    (WHEN CLASS-METHODS (PUSH CLASS-METHODS RESULT)))))
+      (VALUES (NREVERSE RESULT)
+	      CLASS
+	      CLASS-EQLS
+	      EQL-OR-NIL))))
+    
+
+#+IMACH (PROGN
+
+(DEFUN HANDLE-DTP-ARRAY-DISPATCH (EXTRA-ARGUMENT OBJECT)
+  (DECLARE (DBG:ERROR-REPORTER))
+  EXTRA-ARGUMENT
+  (SYS:%PUSH OBJECT)				;Trick compiler into using SP
+						;addressing, and also leave a copy of
+						;the real object on top of the stack.
+  (LET ((HEADER (SYS:%SET-TAG (SYS:%MEMORY-READ
+				OBJECT :CYCLE-TYPE SYS:%MEMORY-HEADER) SYS:DTP-FIXNUM)))
+    (SETQ OBJECT
+	  (IF (OR (NOT (LDB-TEST SYS:ARRAY-LONG-PREFIX-BIT HEADER))
+		  (= (LDB SYS:ARRAY-LONG-DIMENSIONS-FIELD HEADER) 1))
+	      (IF (= (LDB SYS:ARRAY-TYPE-FIELD HEADER) SYS:ART-1B)
+		  *BIT-VECTOR-INSTANCE*
+		  (IF (LDB-TEST SYS:ARRAY-NAMED-STRUCTURE-BIT HEADER)
+		      (CASE (SYS:NAMED-STRUCTURE-SYMBOL OBJECT)
+			(SYS:PACKAGE *PACKAGE-INSTANCE*)
+			(OTHERWISE *VECTOR-INSTANCE*))
+		      *VECTOR-INSTANCE*))
+	      (IF (LDB-TEST SYS:ARRAY-NAMED-STRUCTURE-BIT HEADER)
+		  (CASE (SYS:NAMED-STRUCTURE-SYMBOL OBJECT)
+		    (SYS:READTABLE *READTABLE-INSTANCE*)
+		    (OTHERWISE *ARRAY-INSTANCE*))
+		  *ARRAY-INSTANCE*))))
+  (SYS:%GENERIC-DISPATCH))
+
+;;; For DTP-LEXICAL-CLOSURE, the subclasses are funcallable instances and T.  If the
+;;; first "environment" is a DTP-GENERIC-FUNCTION, assume we are dealing with a
+;;; funcallable instance, and pass the dispatch on to it.  Otherwise, pass it on to
+;;; T.
+(DEFUN HANDLE-DTP-LEXICAL-CLOSURE-DISPATCH (EXTRA-ARGUMENT OBJECT)
+  (DECLARE (DBG:ERROR-REPORTER))
+  EXTRA-ARGUMENT
+  (SYS:%PUSH OBJECT)				;Trick the compiler into using SP
+						;addressing, and also leave a copy of
+						;the real object on top of the stack.
+  (LET ((EXTRA-ARGUMENT (SYS:%MEMORY-READ OBJECT :SET-CDR-NEXT NIL)))
+    (IF (= (LDB SYS:%%Q-CDR-CODE-WITHIN-TAG (SYS:%TAG EXTRA-ARGUMENT))
+	   SYS:LEXICAL-CLOSURE-SUBTYPE-FUNCALLABLE-INSTANCE)
+	(SETQ OBJECT (%DISPATCH-INSTANCE-FROM-EXTRA-ARGUMENT EXTRA-ARGUMENT))
+	(SETQ OBJECT *LEXICAL-CLOSURE-INSTANCE*)))
+  (SYS:%GENERIC-DISPATCH))
+
+(DEFUN FAKE-INSTANCE-P (INSTANCE)
+  (OR (EQ *VECTOR-INSTANCE* INSTANCE)
+      (EQ *BIT-VECTOR-INSTANCE* INSTANCE)
+      (EQ *ARRAY-INSTANCE* INSTANCE)
+      (EQ *LEXICAL-CLOSURE-INSTANCE* INSTANCE)
+      (EQ *PACKAGE-INSTANCE* INSTANCE)
+      (EQ *READTABLE-INSTANCE* INSTANCE)
+      (AND (= (SYS:%DATA-TYPE INSTANCE) SYS:DTP-INSTANCE)
+	   (MEMBER (FIND-CLASS 'FUNCALLABLE-INSTANCE)
+		   (%CLASS-INSTANCE-INFORMATION-PRECEDENCE-LIST
+		     (%INSTANCE-INSTANCE-INFORMATION INSTANCE))))))
+
+;;; Maybe this should be a generic function
+(DEFUN CLASS-SHARES-DATA-TYPE-P (CLASS)
+  (OR (EQ CLASS (FIND-CLASS 'ARRAY))
+      (EQ CLASS (FIND-CLASS 'VECTOR))
+      (EQ CLASS (FIND-CLASS 'BIT-VECTOR))
+      (EQ CLASS (FIND-CLASS 'PACKAGE))
+      (EQ CLASS (FIND-CLASS 'READTABLE))
+      (EQ CLASS (FIND-CLASS 'SYS:LEXICAL-CLOSURE))
+      (EQ CLASS (FIND-CLASS 'STANDARD-GENERIC-FUNCTION))
+      (AND *CLOS-INITIALIZED-P*
+	   (MEMBER (FIND-CLASS 'FUNCALLABLE-INSTANCE) (CLASS-PRECEDENCE-LIST CLASS)))))
+
+)
+
+#+Minima (PROGN
+
+(DEFUN HANDLE-DTP-ARRAY-DISPATCH (EXTRA-ARGUMENT OBJECT)
+  EXTRA-ARGUMENT
+  (ZL:::COMPILER:%PUSH OBJECT)			;Trick compiler into using SP
+						;addressing, and also leave a copy of
+						;the real object on top of the stack.
+  (LET ((HEADER (IVORY:%SET-TAG (IVORY:%MEMORY-READ OBJECT :CYCLE-TYPE 'IVORY:HEADER)
+				(IVORY:DATA-TYPE 'FIXNUM))))
+    (SETQ OBJECT
+	  (IF (OR (NOT (MINIMA-DEFINITIONS:FIXNUM-FIELD-VALUE HEADER IVORY:ARRAY-HEADER IVORY:LONG-PREFIX))
+		  (= 1 (MINIMA-DEFINITIONS:FIXNUM-FIELD-VALUE HEADER IVORY:LONG-ARRAY-HEADER IVORY:RANK)))
+	      (IF (= (MINIMA-DEFINITIONS:FIXNUM-FIELD-VALUE HEADER IVORY:ARRAY-HEADER IVORY::TYPE-FIELD)
+		     #O05)
+		  *BIT-VECTOR-INSTANCE*
+		  *VECTOR-INSTANCE*)
+	      *ARRAY-INSTANCE*)))
+  (IVORY:%GENERIC-DISPATCH))
+
+;;; For DTP-LEXICAL-CLOSURE, the subclasses are funcallable instances and T.  If the
+;;; first "environment" is a DTP-GENERIC-FUNCTION, assume we are dealing with a
+;;; funcallable instance, and pass the dispatch on to it.  Otherwise, pass it on to
+;;; T.
+(DEFUN HANDLE-DTP-LEXICAL-CLOSURE-DISPATCH (EXTRA-ARGUMENT OBJECT)
+  (DECLARE (IGNORE EXTRA-ARGUMENT))
+  (ZL:::COMPILER:%PUSH OBJECT)			;Trick the compiler into using SP
+						;addressing, and also leave a copy of
+						;the real object on top of the stack.
+  (LET ((EXTRA-ARGUMENT (IVORY:%MEMORY-READ OBJECT :SET-CDR-NEXT NIL)))
+    (IF (EQ (MINIMA-DEFINITIONS:FIXNUM-FIELD-VALUE (IVORY:%TAG EXTRA-ARGUMENT) IVORY::TAG IVORY::LEXICAL-CLOSURE-SUBTYPE)
+	    'IVORY::FUNCALLABLE-INSTANCE)
+	(SETQ OBJECT (%DISPATCH-INSTANCE-FROM-EXTRA-ARGUMENT EXTRA-ARGUMENT))
+	(SETQ OBJECT *LEXICAL-CLOSURE-INSTANCE*)))
+  (IVORY:%GENERIC-DISPATCH))
+
+(DEFUN FAKE-INSTANCE-P (INSTANCE)
+  (OR (EQ *VECTOR-INSTANCE* INSTANCE)
+      (EQ *BIT-VECTOR-INSTANCE* INSTANCE)
+      (EQ *ARRAY-INSTANCE* INSTANCE)
+      (EQ *LEXICAL-CLOSURE-INSTANCE* INSTANCE)
+      (AND (INSTANCEP INSTANCE)
+	   (MEMBER (FIND-CLASS 'FUNCALLABLE-INSTANCE)
+		   (%CLASS-INSTANCE-INFORMATION-PRECEDENCE-LIST
+		     (%INSTANCE-INSTANCE-INFORMATION INSTANCE))))))
+
+;;; Maybe this should be a generic function
+(DEFUN CLASS-SHARES-DATA-TYPE-P (CLASS)
+  (OR (EQ CLASS (FIND-CLASS 'ARRAY))
+      (EQ CLASS (FIND-CLASS 'VECTOR))
+      (EQ CLASS (FIND-CLASS 'BIT-VECTOR))
+      (EQ CLASS (FIND-CLASS 'IVORY::LEXICAL-CLOSURE))
+      (EQ CLASS (FIND-CLASS 'STANDARD-GENERIC-FUNCTION))
+      (AND *CLOS-INITIALIZED-P*
+	   (MEMBER (FIND-CLASS 'FUNCALLABLE-INSTANCE) (CLASS-PRECEDENCE-LIST CLASS)))))
+
+)
+
+(DEFUN STANDARD-METHOD-COMBINER
+       (GENERIC-FUNCTION METHODS ARGUMENT-FUNCTION &OPTIONAL IGNORE-ERRORS)
+  (WITHOUT-METHOD-COMBINATION-ERRORS-IF
+    IGNORE-ERRORS
+    ((LET ((METHODS (SORT-APPLICABLE-METHODS GENERIC-FUNCTION METHODS ARGUMENT-FUNCTION)))
+       (MULTIPLE-VALUE-BIND (CHECK-KEYWORDS-P KEYWORDS)
+	   (KEYWORD-INFORMATION GENERIC-FUNCTION METHODS)
+	 (MULTIPLE-VALUE-BIND (FUNCTION-NAME EXTRA-ARGUMENT)
+	     (IF METHODS
+		 (GENERATE-COMBINED-METHOD
+		   GENERIC-FUNCTION
+		   ARGUMENT-FUNCTION
+		   (COMPUTE-EFFECTIVE-METHOD-1 GENERIC-FUNCTION METHODS ARGUMENT-FUNCTION)
+		   CHECK-KEYWORDS-P
+		   KEYWORDS
+		   :USE-EXTRA-ARGUMENT T)
+		 (GENERIC-FUNCTION-NO-APPLICABLE-METHOD-FUNCTION-NAME-AND-EXTRA-ARGUMENT
+		   GENERIC-FUNCTION))
+       (VALUES (FDEFINITION FUNCTION-NAME)
+	       EXTRA-ARGUMENT)))))
+    (()
+     (VALUES NIL NIL))))

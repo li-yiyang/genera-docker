@@ -1,0 +1,2503 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Package: DYNAMIC-WINDOWS; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;; Notes:
+
+;;; Should there really be an automatic cache as a tree for a completion
+;;; set, or is the table manipulation you have to do (handling inserts
+;;; and deletes inside your application) going to make that not worth
+;;; it?
+
+;;; Should we have to store all the values as well as strings in the
+;;; leaf nodes, or can there be a separate parser for things like
+;;; symbols where that's easy?
+
+;;; There needs to be a way to select from the completions or their
+;;; associated values before they are merged in.
+
+;;; Things that have a static set of possibilities could convert chunk
+;;; keys to indices in the sorted set of chunks and then use < and =
+;;; instead of string< and string=.
+
+;;; Could reduce storage comsumption by making the btree one big array
+;;; and node pointers just indices.
+
+;;;; Completion proper.
+
+(defparameter *standard-completion-delimiters* "- ")
+
+;;; Comparison all done with string=, upcasing happens as part of chunk splitting.
+(defsubst string=-start (string substring)
+  (%string= string 0 substring 0 (vector-length substring)))
+
+(defsubst string-exact-compare-start (string substring)
+  (%string-exact-compare string 0 substring 0 (vector-length substring)))
+
+(defmacro with-string-broken-into-completion-chunks
+	  ((chunks-var nchunks-var chunk-delimiters-var
+	    string delimiters
+	    &optional match-nchunks match-chunks match-delimiters)
+	   &body body)
+  `(with-data-stack
+     (etypecase ,delimiters
+       (vector )
+       (list
+	 (setf ,delimiters (make-stack-array (length ,delimiters)
+					     :initial-contents ,delimiters))))
+     (multiple-value-bind (,nchunks-var ,chunks-var ,chunk-delimiters-var)
+	 (break-into-completion-chunks ,string ,delimiters
+				       ',(not (member chunk-delimiters-var '(ignore nil)))
+				       ,match-nchunks ,match-chunks ,match-delimiters)
+       (when ,nchunks-var
+	 . ,body))))
+
+;;; Yes, this really does seem to make a difference.
+(defun string-search-set-fast (set string start end)
+  (let ((string string)
+	(set set)
+	(set-length (vector-length set)))
+    (declare (array-register set string))
+    (loop for i from start below end do
+      (let ((char (aref string i)))
+	(when (loop for j from 0 below set-length thereis (char-equal (aref set j) char))
+	  (return i))))))
+
+;;; Returns arrays on the data stack.
+;;; MATCH-xxx arguments are used to incremental comparison against the desired completion.
+;;; We terminate and stop breaking as soon as a mismatch is hit.
+(defun break-into-completion-chunks (string delimiters
+				     &optional (need-chunk-delimiters t)
+					       match-nchunks match-chunks match-delimiters)
+  (declare (values nchunks chunks chunk-delimiters))
+  (let* ((string (string string))
+	 (string-length (vector-length string))
+	 (chunks (make-stack-array 10 :fill-pointer 0))
+	 (chunk-delimiters (and need-chunk-delimiters (make-stack-array 10
+									:fill-pointer 0)))
+	 (start-string-index 0)
+	 (chunk-index 0))
+    (loop do
+      (let* ((next-string-index (string-search-set-fast delimiters string
+							start-string-index string-length))
+	     (chunk-end (or next-string-index string-length))
+	     (chunk-length (- chunk-end start-string-index)))
+	(when need-chunk-delimiters
+	  (let ((delimiter (and next-string-index
+				(make-char (aref string next-string-index)))))
+	    (when (and match-nchunks
+		       (< chunk-index match-nchunks)
+		       (let ((match-delimiter (aref match-delimiters chunk-index)))
+			 (not (or (null match-delimiter)
+				  (and delimiter (char-equal delimiter match-delimiter))))))
+	      (return-from break-into-completion-chunks nil))
+	    (vector-push-extend delimiter chunk-delimiters)))
+	(when (and match-nchunks
+		   (< chunk-index match-nchunks)
+		   (not (let* ((match-chunk (aref match-chunks chunk-index))
+			       (match-chunk-length (vector-length match-chunk)))
+			  (and ( chunk-length match-chunk-length)
+			       (%string-equal string start-string-index
+					      match-chunk 0
+					      match-chunk-length)))))
+	  (return-from break-into-completion-chunks nil))
+	(let ((array (make-stack-array chunk-length :type (array-type string))))
+	  (si:copy-string-portion string start-string-index chunk-end
+				  array 0 chunk-length :make-thin t)
+	  (vector-push-extend array chunks))
+	(incf chunk-index)
+	(when (null next-string-index)
+	  (return))
+	(setq start-string-index (1+ next-string-index))))
+    (when (and match-nchunks (< chunk-index match-nchunks))
+      (return-from break-into-completion-chunks nil))
+    (loop for i below chunk-index
+	  do (nstring-upcase (aref chunks i)))
+    (values chunk-index chunks chunk-delimiters)))
+
+(defmacro do-possible-completions ((string-chunks-var string-nchunks-var completion-var
+				    object-var presentation-type-var
+				    completion-chunks-var completion-nchunks-var
+				    completion-delimiters-var
+				    string delimiters generator)
+				   other-tests
+				   begin-suggesting-form
+				   &body body)
+  `(with-string-broken-into-completion-chunks (,string-chunks-var ,string-nchunks-var
+					       string-delimiters ,string ,delimiters)
+     (let* ((.first-chunk. (aref ,string-chunks-var 0))
+	    (.first-chunk-length. (vector-length .first-chunk.)))
+       (funcall ,generator ,string
+	 (lambda (,completion-var &optional (,object-var ,completion-var)
+		  ,presentation-type-var)
+	   (declare (downward-function))
+	   (if (eq ,completion-var '.begin-suggesting.)
+	       ,begin-suggesting-form
+	       (when (and ( (vector-length ,completion-var) .first-chunk-length.)
+			  (%string-equal .first-chunk. 0 ,completion-var 0
+					 .first-chunk-length.)
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")	   0			  . ,other-tests)
+		 (setq ,completion-var (string ,completion-var))
+		 (with-string-broken-into-completion-chunks (,completion-chunks-var
+							     ,completion-nchunks-var
+							     ,completion-delimiters-var
+							     ,completion-var ,delimiters
+							     ,string-nchunks-var
+							     ,string-chunks-var
+							     string-delimiters)
+		   . ,body))))))))
+
+(defun complete-string-internal (string delimiters possibility-generator action)
+  (declare (values string success object first-interesting-index nmatches)
+	   (downward-funarg possibility-generator))
+  (with-stack-array (result 100 :type 'art-fat-string :fill-pointer 0)
+    (let ((nmatches 0)
+	  (best-object nil)
+	  (best-object-string nil)
+	  (first-interesting-index nil))
+      (do-possible-completions (string-chunks string-nchunks completion object ignore
+				completion-chunks completion-nchunks completion-delimiters
+				string delimiters possibility-generator)
+			       ((not (when (and (plusp nmatches)
+						(let ((maximum-length (fill-pointer result)))
+						  (or (= maximum-length .first-chunk-length.)
+						      (%string-equal
+							result .first-chunk-length.
+							completion .first-chunk-length.
+							(- maximum-length
+							   .first-chunk-length.)))))
+				       ;; This isn't going to contribute anything.
+				       ;; No need to break it apart.
+				       (incf nmatches)
+				       (when (or (null best-object-string)
+						 (< (vector-length completion)
+						    (vector-length best-object-string)))
+					 (setq best-object-string completion
+					       best-object object))
+				       t)))
+			       (progn
+				 (setf (fill-pointer result) 0)
+				 (setq nmatches 0)
+				 (setq best-object nil)
+				 (setq best-object-string nil)
+				 (setq first-interesting-index nil))
+	;; Really a possibility
+	(cond ((zerop nmatches)
+	       (zl:array-push-portion-extend result completion)
+	       (when (eq action :complete-limited)
+		 (setf (fill-pointer result)
+		       (loop for i below string-nchunks
+			     sum (string-length (aref completion-chunks i))
+			     count (aref completion-delimiters i))))
+	       (setq first-interesting-index (fill-pointer result)))
+	      (t
+	       (let ((result-index 0)
+		     (result-length (fill-pointer result)))
+		 (dotimes (i (if (eq action :complete-limited)
+				 string-nchunks
+				 completion-nchunks))
+		   (let* ((next-result-index (string-search-set-fast delimiters result
+								     result-index
+								     result-length))
+			  (result-chunk-end (or next-result-index result-length))
+			  (result-chunk-length (- result-chunk-end result-index)))
+		     (let* ((completion-chunk (aref completion-chunks i))
+			    (diff (%string-compare result result-index
+						   completion-chunk 0
+						   result-chunk-length)))
+		       (unless (zerop diff)
+			 ;; If there is a mismatch, cut off the offending characters.
+			 (let* ((new-result-chunk-length (1- (abs diff)))
+				(amount-to-trim (- result-chunk-length
+						   new-result-chunk-length))
+				(new-result-chunk-end (- result-chunk-end
+							 amount-to-trim)))
+			   (copy-array-portion result result-chunk-end result-length
+					       result new-result-chunk-end
+					       (- result-length amount-to-trim))
+			   (setq result-chunk-end new-result-chunk-end)))
+		       (when (and (or (not (zerop diff))
+				      ;; No mismatch, but more to come in this completion.
+				      ( (vector-length completion-chunk)
+					 result-chunk-length)))
+			 (if (and (eq action :complete)
+				  ( i (1- string-nchunks)))
+			     ;; No more stuff from user, stop at ambiguity.
+			     (setq next-result-index nil)
+			     ;; Otherwise, note interesting event here.
+			     (setq first-interesting-index (min first-interesting-index
+								result-chunk-end)))))
+		     (setq result-index result-chunk-end)
+		     (when (or (null next-result-index)
+			       (let ((completion-delimiter (aref completion-delimiters i)))
+				 (not (and completion-delimiter
+					   (char-equal completion-delimiter
+						       (aref result result-index))))))
+		       ;; Something interesting happened here.
+		       (setq first-interesting-index (min first-interesting-index
+							  result-index))
+		       (return))
+		     (incf result-index)))
+		 (setf (fill-pointer result) result-index))))
+	(incf nmatches)
+	(when (or (null best-object-string)
+		  (< (vector-length completion) (vector-length best-object-string)))
+	  (setq best-object-string completion
+		best-object object)))
+      (case nmatches
+	(0 (values string nil nil nil 0))
+	;; even if there is only one match, we may not have completed all the
+	;; chunks, so don't indicate success unless we have completed the whole thing
+	(1 (values (heapify-string result)
+		   (string-equal best-object-string result)
+		   best-object
+		   nil
+		   1))
+	(otherwise
+	  (values (heapify-string result)
+		  (string-equal best-object-string result)
+		  best-object
+		  first-interesting-index
+		  nmatches))))))
+
+(defun complete-string-possible-completions (string delimiters possibility-generator)
+  ;; Returns a list of (string object presentation-type)
+  (declare (values possibilities))
+  (let ((possibilities nil))
+    (if (zerop (vector-length string))
+	(funcall possibility-generator string
+		 #'(lambda (completion &optional (object completion) type)
+		     (declare (downward-function))
+		     (if (eq completion '.begin-suggesting.)
+			 (setq possibilities nil)
+			 (pushnew (list completion object type) possibilities
+				  :test #'string-equal :key #'car))))
+	(do-possible-completions (string-chunks string-nchunks completion object type
+				  completion-chunks completion-nchunks completion-delimiters
+				  string delimiters possibility-generator)
+				 ()
+				 (setq possibilities nil)
+	  (ignore completion-chunks completion-nchunks completion-delimiters)
+	  (pushnew (list completion object type) possibilities
+		   :test #'string-equal :key #'car)))
+    (sort possibilities #'string-lessp :key #'car)))
+
+(defun complete-string-n-possible-completions (string delimiters possibility-generator)
+  (let ((count 0))
+    (if (zerop (vector-length string))
+	(funcall possibility-generator string
+		 #'(lambda (completion &rest ignore)
+		     (declare (downward-function))
+		     (if (eq completion '.begin-suggesting.)
+			 (setq count 0)
+			 (incf count))))
+	(do-possible-completions (string-chunks string-nchunks completion object type
+				  completion-chunks completion-nchunks completion-delimiters
+				  string delimiters possibility-generator)
+				 ()
+				 (setq count 0)
+	  (ignore completion-chunks completion-nchunks completion-delimiters
+		  completion object type)
+	  (incf count)))
+    count))
+
+(defun complete-string-apropos-completions (string delimiters possibility-generator initial-p)
+  (declare (values possibilities string-chunks))
+  (let ((checker (if initial-p
+		     #'string=-start
+		     #'(lambda (string substring)
+			 (string-search substring string))))
+	(possibilities nil))
+    (with-string-broken-into-completion-chunks (string-chunks string-nchunks nil
+						string delimiters)
+      (funcall possibility-generator ""		;Disgorge all
+	(lambda (completion &optional (object completion) type)
+	  (declare (downward-function))
+	  (if (eq completion '.begin-suggesting.)
+	      (setq possibilities nil)
+	      (with-string-broken-into-completion-chunks
+		(completion-chunks completion-nchunks nil
+				   completion delimiters)
+		(when (loop for index below string-nchunks
+			    always (let ((string-chunk (aref string-chunks index)))
+				     (dotimes (jndex completion-nchunks)
+				       (when (funcall checker
+						      (aref completion-chunks jndex)
+						      string-chunk)
+					 (return t)))))
+		  (pushnew (list completion object type) possibilities
+			   :test #'string-equal :key #'car))))))
+      (values (sort possibilities #'string-lessp :key #'car)
+	      (map 'vector #'string-downcase string-chunks)))))
+
+;;;1 0The second argument to the generator function is a function to be
+;;;1 0called on a string (and object and presentation type) to suggest
+;;;1 0that string, or on the special symbol dw::.begin-suggesting. to
+;;;1 0reset all suggestions.
+(defmacro suggestion-completer ((string &rest options) &body body)
+  (declare (arglist (string &key delimiters action) &body body))
+  `(suggestion-completer-internal ,string
+			(lambda (,string .function.)
+			  (ignore ,string)
+			  (flet ((suggest (&rest args)
+				   (apply .function. args))
+				 (begin-suggesting ()
+				   (funcall .function. '.begin-suggesting.)))
+			    #'begin-suggesting ;OK if not used
+			    . ,body))
+			. ,options))
+
+(defmacro suggest (name &rest objects)
+  (ignore name objects)
+  (error "You cannot use ~S outside of ~S" 'suggest 'completing-from-suggestions))
+
+(defmacro begin-suggesting ()
+  (error "You cannot use ~S outside of ~S" 'begin-suggesting 'completing-from-suggestions))
+
+(defun suggestion-completer-internal (string generator
+				      &key (delimiters *standard-completion-delimiters*)
+					   (action :complete))
+  (declare (downward-funarg generator))
+  (ecase action
+    ((:complete-limited :complete :complete-maximal)
+     (complete-string-internal string delimiters generator action))
+    (:possibilities
+     (complete-string-possible-completions string delimiters generator))
+    (:possibilities-quick-length
+     (complete-string-n-possible-completions string delimiters generator))
+    (:apropos-possibilities
+     (complete-string-apropos-completions string delimiters generator nil))
+    (:apropos-initial-possibilities
+     (complete-string-apropos-completions string delimiters generator t))
+    ((:apropos-possibilities-quick-length :apropos-initial-possibilities-quick-length) nil)))
+
+
+(defmacro completing-from-suggestions ((stream &rest options) &body body)
+  (declare (arglist (stream &key
+			    (allow-any-input nil)
+			    (delimiters *standard-completion-delimiters*)
+			    (enable-forced-return nil)
+			    (force-complete nil)
+			    (partial-completers nil)
+			    (type nil)
+			    (parser nil)
+			    (complete-activates nil)
+			    (compress-choices 20)
+			    (compression-delimiter nil)
+			    (initially-display-possibilities nil))
+		    &body body)
+	   (values object success string))
+  `(complete-input
+     ,stream
+     (lambda (.string. &optional (.action. :complete))
+       (suggestion-completer (.string. :action .action.
+			     ;; Only pass in if given explicitly, so that
+			     ;; it defaults.
+			     . ,(zwei:some-plist options '(:delimiters)))
+	 . ,body))
+     . ,(si:rem-keywords options '(:delimiters))))
+
+(defflavor input-completer-no-match
+	(describer)
+	(input-not-of-required-type)
+  :initable-instance-variables)
+
+(defmethod (:report input-completer-no-match) (stream)
+  (princ "Please enter " stream)
+  (if (variable-boundp describer)
+      (funcall describer stream)
+      (describe-presentation-type type stream))
+  (write-char #\. stream))
+
+(compile-flavor-methods input-completer-no-match)
+
+(zl:defvar-resettable *complete-input-right-trims-characters* '(#\Return))
+
+(defvar *default-display-possibilities-query-cutoff-length* 20)
+
+(defun display-possibilities (token possibilities-generator type stream parser
+			      &rest options
+			      &key how
+			      &allow-other-keys)
+  (flet ((do-it (stream)
+	   (declare (sys:downward-function))
+	   (apply #'display-possibilities-internal token possibilities-generator
+						   type stream parser options)))
+    (if (eq how :menu)
+	(do-it stream)				;Help-displayer gets into the act later.
+	(funcall *help-displayer* #'do-it stream))))
+
+;;; Put body of display-possibilities in a separate function so it
+;;; doesn't get overindented.  Also defaulting of :query-cutoff-length must be done
+;;; after going through *help-displayer*.
+(defun display-possibilities-internal (token possibilities-generator type stream parser
+				       &key
+				       (how :possibilities)
+				       (separate-typeout t)
+				       compress-choices
+				       compression-options
+				       compression-delimiter
+				       (query-cutoff-length
+					 *default-display-possibilities-query-cutoff-length*)
+				       documenter
+				       (document (not (null documenter)))
+				       possibility-printer
+				       (show-possibilities-for-uninteresting-types t))
+ (block display-possibilities
+  ;; should we do this before or after quote trimming?
+  (setq token
+	(string-right-trim *complete-input-right-trims-characters* token))
+  (let ((asked-p nil)
+	(abbrev-word nil)
+	(abbrev-n nil)
+	(abbrev-presentation nil)
+	(abbrev-presentation-type nil)
+	(if-compressed (getf compression-options :if-compressed)))
+    (flet ((ask-if-too-long (length)
+	     (or asked-p
+		 (null query-cutoff-length)
+		 (< length query-cutoff-length)
+		 (fquery `(:stream ,stream)
+			 "There are ~D ~:[possibilities~;possible ~A~].  ~
+Do you want to see them all? "
+			 length 
+			 type
+			 (with-output-to-string (s)
+			   (describe-presentation-type type s t :possibilities))))))
+      ;; remove quotes when trying to show possibilities
+      (unless (string-equal token "")
+	(setq token (string-trim '(#\") token)))
+      (when (and (not compress-choices)
+		 (member how '(:apropos :apropos-initial
+			       :possibilities :initial-possibilities)))
+	(let ((length (funcall possibilities-generator token
+			       (ecase how
+				 (:apropos :apropos-possibilities-quick-length)
+				 (:apropos-initial
+				   :apropos-initial-possibilities-quick-length)
+				 ((:possibilities :initial-possibilities)
+				  :possibilities-quick-length)))))
+	  (when length
+	    (if (ask-if-too-long length)
+		(setq asked-p t)
+		(return-from display-possibilities nil)))))
+      ;; Work around compiler bug
+      ;(multiple-value-bind (possibilities token-chunks)
+      (let (possibilities token-chunks)
+	(multiple-value-setq (possibilities token-chunks)
+	  (funcall possibilities-generator
+		   token (ecase how
+			   (:apropos :apropos-possibilities)
+			   (:apropos-initial :apropos-initial-possibilities)
+			   ((:possibilities :initial-possibilities) :possibilities)
+			   (:menu :possibilities))))
+	;; At this point, a possibility looks like
+	;; (STRING OBJECT PRESENTATION-TYPE)
+	(if (eq how :menu)
+	    ;;Really we should just be able to put up the presentations like
+	    ;; it does below.
+	    (let ((item-list (loop for poss in possibilities
+				   collect `(,(first poss) :value ,poss))))
+	      (if item-list
+		  (menu-choose item-list :prompt "Select completion")
+		  (si:with-ie-typeout (stream si:*typeout-default*)
+		    (funcall *help-displayer*
+			     (lambda (stream)
+			       (format stream "~&There are no possible completions of \"~A\"."
+				       token))
+			     stream))
+		  nil))
+	    (let ((presentation-type-description
+		    (let ((string 
+			    (if (null type)
+				(if (or (zerop (length possibilities))
+					(> (length possibilities) 1))
+				    "completions"
+				    "completion")
+				(with-output-to-string (s)
+				  (describe-presentation-type
+				    type s
+				    ( (length possibilities) 1)
+				    :possibilities)))))
+		      (cond ((string-equal string "a " :end1 2)
+			     (substring string 2))
+			    ((string-equal string "an " :end1 3)
+			     (substring string 3))
+			    (t string)))))
+	      (flet ((interesting-type-p (type)
+		       (let ((type-symbol (presentation-type-name type)))
+			 (not (member type-symbol '(boolean menu-choose member)))))
+		     (left-substring-completion ()
+		       ;; for now, just trim off the trailing space if it's present
+		       ;; --- really should only trim off things that are partial completers.
+		       (let ((search-string (if (not (zerop (string-length token)))
+						(string-trim " " token)
+						token)))
+			 (let ((left-substring-possibilities 
+				 (if (string-equal search-string token) possibilities
+				     (funcall possibilities-generator
+					      search-string :possibilities))))
+			   (let ((valid-completion
+				   (find search-string
+					 left-substring-possibilities
+					 :test #'string-equal :key #'car)))
+			     (when (and valid-completion
+					(neq (first possibilities) valid-completion))
+			       valid-completion)))))
+		     (present-possibility (possibility &optional (stream *standard-output*))
+		       (declare (downward-function))
+		       (destructuring-bind (string object &optional presentation-type)
+			   possibility
+			 (if possibility-printer
+			     (funcall possibility-printer
+				      string object stream presentation-type)
+			   (with-output-as-presentation (:stream stream
+							 :object (funcall parser object string)
+							 :type (or presentation-type type
+								   (type-of object)))
+			     (write-string string stream)))))
+		     (document-possibility (possibility &optional (stream *standard-output*))
+		       (destructuring-bind (string object &optional (presentation-type type))
+			   possibility
+			 (funcall (or documenter
+				      (lambda (thing stream)
+					(write-string (documentation thing presentation-type)
+						      stream)))
+				  (funcall parser object string)
+				  stream)))
+		     (possibility-preamble (phrase-1 stream phrase-2)
+		       (format stream "~&~A " phrase-1)
+		       (cond ((string-equal token "")
+			      (if (null type)
+				  (format stream "possible ~A" presentation-type-description)
+				(format stream "possible ")
+				(format stream "~A" presentation-type-description)))
+			     ((member how '(:apropos :apropos-initial))
+			      (format stream "~A containing "
+				      presentation-type-description)
+			      (format-textual-list token-chunks
+						   #'(lambda (string stream)
+						       (format stream "\"~A\"" string))
+						   :stream stream
+						   :conjunction "and"))
+			     (t
+			      (format stream "possible ~A starting with \"~A\""
+				      presentation-type-description
+				      token)))
+		       (format stream "~A~%" phrase-2))
+		     (possibility-postamble (stream)
+		       (when abbrev-word
+1			 0(display-possibilities-help
+			   abbrev-presentation abbrev-presentation-type
+			   abbrev-word abbrev-n compression-delimiter stream)
+			 (when if-compressed
+			   ;; !!! Note: In System 427.23, FORMAT loses the presentation
+			   ;;           info if this is a presentation-recording-string,
+			   ;;           but PRINC does not, so don't collapse this into
+			   ;;           a call to FORMAT until that is fixed!
+			   ;;           See CP::SHOW-COMMAND-NAME-HELP for an example of
+			   ;;           something that cares.
+			   ;;           -kmp 26-Apr-90
+			   (terpri stream)
+			   (princ if-compressed stream)))))
+		(when separate-typeout
+		  (send stream :start-typeout si:*typeout-default*))
+		(let ((left-substring-completion (left-substring-completion)))
+		  ;; New hackery
+		  (when (or (eq compress-choices :always)
+			    (and (numberp compress-choices)
+				 (> (length possibilities) compress-choices)))
+		    (multiple-value-setq (possibilities
+					   abbrev-presentation
+					   abbrev-presentation-type
+					   abbrev-word
+					   abbrev-n)
+			  (compress-possibilities possibilities
+						  :type type
+						  :compress-choices compress-choices
+						  :delimiter compression-delimiter)))
+		  (cond ((null possibilities)
+			 (when (or show-possibilities-for-uninteresting-types
+				   (interesting-type-p type))
+			   (possibility-preamble "There are no" stream ".")
+			   (terpri stream)
+			   (possibility-postamble stream)))
+			((null (rest possibilities))
+			 (possibility-preamble "The only" stream " is:")
+			 (if document
+			     (let ((possibility (first possibilities)))
+			       (format stream "  ~~Q~~
+					        ~%    ~~Q~~%"
+				       #'(lambda () (present-possibility possibility))
+				       #'(lambda () (document-possibility possibility))))
+			     (format-item-list possibilities
+					       :printer #'present-possibility
+					       :stream stream))
+			 (possibility-postamble stream))
+			((ask-if-too-long (length possibilities))
+			 (possibility-preamble "These are the" stream ":")
+			 (if (eq document 't)
+			     (format-sequence-as-table-rows possibilities
+			       #'(lambda (possibility stream)
+				   (format-cell possibility
+						#'(lambda (poss stream)
+						    (present-possibility poss stream)
+						    (write-string "  " stream))
+						:stream stream)
+				   (format-cell possibility #'document-possibility
+						    :stream stream))
+			       :stream stream)
+			     (format-item-list possibilities
+					       :printer #'present-possibility
+					       :stream stream))
+			 (possibility-postamble stream)))
+		  (when left-substring-completion
+		    (format stream "~3&Press ~ for \"" #\Tab)
+		    (present-possibility left-substring-completion stream)
+		    (write-char #\" stream)))
+		(when separate-typeout
+		  (send stream :finish-typeout :blank-line))
+		nil))))))))
+
+(defvar *display-ellipsis-help* t)
+
+(sys:defvar-standard *completion-help-chars* '(#\Help))
+
+(defun mouse-sensitive-stream-p (stream)
+  ;; This is so that you can ask a stream whether output to it will really
+  ;; become mouse-sensitive.
+  (if (operation-handled-p stream :mouse-sensitive-stream-p)
+      (send stream :mouse-sensitive-stream-p)
+      ;; Heuristic. If the stream doesn't know, assume it is mouse-sensitive if
+      ;; it handles :mouse-click.
+      (operation-handled-p stream :mouse-click)))
+
+(defun display-possibilities-help (abbrev-presentation abbrev-presentation-type
+				   abbrev-word abbrev-n abbrev-delimiter stream)
+  (let* ((n (count abbrev-delimiter abbrev-word)))
+    (when *display-ellipsis-help*
+      (format stream "A notation such as \"~@\\presentation\\\" means that ~
+                      there ~\\is-are\\ ~:*~D possibilit~@:P~
+		    ~%beginning with \"~A\"."
+	      abbrev-presentation abbrev-presentation-type abbrev-n
+	      abbrev-word)
+      (cond ((mouse-sensitive-stream-p stream)
+	     (format stream "  Click mouse-Left on such an item to see it expanded."))
+	    (t
+	     (if (char-equal abbrev-delimiter #\Space)
+		 (format stream "  Type the first~:[~*~; ~R~] word~:P" (> n 1) n)
+		 (format stream "  Type the initial portion"))
+	     (format stream " of such an item (e.g., \"~A\") ~
+			   ~%and then press ~{~@:C~^ or ~} to see it expanded."
+		     abbrev-word *completion-help-chars*))))))
+
+;;; This function defines the "user interface" to completion, i.e. what
+;;; happens when you hit <Complete> or <End>, how partial (chunk-at-a-time)
+;;; completion works, etc.
+
+;;; --- unresolved issues
+;;; Should :TYPE be a required argument?  It's hard to do possibilities display
+;;; without it, especially choice compression.
+;;; Who signals errors?  Maybe if :TYPE is NIL we should return the invalid completion
+;;; instead of signalling the error here.  Do any of the parsers really want to do
+;;; their own error-handling?  Should they just use CONDITION-CASE?
+
+;;; :apropos for anywhere-in-string, :apropos-initial for beginning-of-token
+(defvar *what-control-/-does* :apropos)
+
+;;; T if Space (etc.) does partial completing within quotes.
+(defvar *partial-complete-inside-quotes* nil)
+
+;;; A special null string, recognized by the 1or0 presentation type.
+;;; This allows (accept '(null-or-type string) :default "foo") to work
+;;; properly when the user types the literal string "".
+(defvar *complete-input-magic-null-string* "")
+
+;;; Gird your grid for a big one.
+(compiler-let ((compiler:*enable-frame-splitting* t))
+(defun complete-input (stream function
+		       &key
+		       (allow-any-input		; NIL means that the typed input must be a
+			 nil			; member of the completion set.  It also forces
+			 allow-any-input-provided)	; completion on #\Return
+		       (force-complete		; ---compatibility only, reverse sense of ALLOW-ANY-INPUT
+			 t
+			 force-complete-provided)
+		       enable-forced-return	; Make #\c-Return return the input even if ALLOW-ANY-INPUT is NIL
+						; and the input doesn't match a completion
+		       partial-completers	; chunk-completion trigger chars
+		       (type nil)		; presentation type being completed
+						; (for possibilities display and errors)
+		       parser			; for post-processing of completions
+		       (compress-choices 20)
+		       (compression-delimiter #\Space)
+		       (help-offers-possibilities t)
+		       (initially-display-possibilities nil)
+		       possibility-printer
+		       (complete-activates nil)
+		       (documenter nil)		;For help displays
+		       (document (not (null documenter))))	;T, NIL, or :IF-UNIQUE.
+  (declare (values object success string)
+	   (downward-funarg function))
+  
+  ;; --- compatibility code
+  (when force-complete-provided
+    (when allow-any-input-provided
+      (error ":FORCE-COMPLETE is an obsolete synonym for :ALLOW-ANY-INPUT.  You can't specify both."))
+    (if (eq force-complete :unless-control-return)
+	(setq allow-any-input nil enable-forced-return t)
+	(setq allow-any-input (not force-complete))))
+  
+  (labels ((maybe-parse (object token)
+	     (declare (downward-function))
+	     (if (null parser) object (funcall parser token)))
+	   (maybe-trim (stuff)
+	     (let ((chars *complete-input-right-trims-characters*))
+	       (loop
+		 (let ((len (fill-pointer stuff)))
+		   (unless (and (plusp len)
+				(member (aref stuff (1- len)) chars :test #'char-equal))
+		     (return stuff))
+		   (setf (fill-pointer stuff) (1- len))))))
+	   (ends-in-char-p (string char)
+	     (let ((sl (string-length string)))
+	       (and (plusp sl)
+		    (char-equal (aref string (1- sl)) char)))))
+    ;; Note well that this string has to be copied out of the stack before it
+    ;; is returned.  HEAPIFY-STRING will do this optimally
+    (with-stack-array (stuff-so-far 100. :element-type 'character :fill-pointer 0)
+      (let ((noninteractive (not (send stream :interactive)))
+	    (overloaded-partial-completers (remove-if-not #'accept-blip-p
+							  partial-completers))
+	    (old-activation-test (si:input-editor-option :activation))
+	    (old-command-test (si:input-editor-option :command))
+; see comment on complete-input-blip-p flet below
+;	    (old-blip-test (si:input-editor-option :blip-character))
+	    (old-rescan-test (si:input-editor-option :rescan))
+	    (old-dynamic-blip-handler (si:input-editor-option :dynamic-blip-handler))
+	    (success-type nil)
+	    )
+	;; We have to call the existing activation tester to get the current dynamic
+	;; state.  Perhaps the input editor should support adding new activation
+	;; testers, rather than simply :OVERRIDE.
+	(flet ((complete-input-activation-p (char)
+		 (declare (downward-function))
+		 (or (and (characterp char)
+			  (or (member char '(#\Complete #\Super-Complete #\Tab)
+				      :test #'char-equal)
+			      (and enable-forced-return
+				   (char-equal char #\Control-Return))))
+		     (and old-activation-test
+			  (apply (first old-activation-test)
+				 char
+				 (rest old-activation-test)))))
+	       ;; Commands are like activators, except that the cursor
+	       ;; doesn't move and you never leave the input editor
+	       ;; because of them.  (At least I think that's right.)
+	       (complete-input-command-p (char)
+		 (declare (downward-function))
+		 (or (and (characterp char)
+			  ;; Do not put #\Help in this list, because that will
+			  ;; prevent the input-editor from causing complicated
+			  ;; p-t's (like OR) from displaying all the right stuff.
+			  ;;--- Does this mean that #\Control-? and #\Control-/
+			  ;;--- should get similar treatment by the IE?
+			  (member char '(#\Control-? #\Control-/) :test #'char-equal))
+		     (and old-command-test
+			  (apply (first old-command-test)
+				 char
+				 (rest old-command-test)))))
+; Damn!  UNTYIing blip characters doesn't work in the input editor,
+; so use the ACCEPT blip char mechanism which works better.
+;	       (complete-input-blip-p (char)
+;	         (declare (downward-function))
+;	         (or (member char partial-completers :test #'char-equal)
+;		     (and old-blip-test
+;			  (apply (first old-blip-test)
+;			         char
+;			         (rest old-blip-test)))))
+	       (complete-input-rescan-p (char)
+		 (declare (downward-function))
+		 (or (and (characterp char)
+			  (member char '(#\Control-? #\Control-/ #\Help) :test #'char-equal))
+		     (and old-rescan-test
+			  (apply (first old-rescan-test)
+				 char
+				 (rest old-rescan-test)))))
+	       (complete-input-blip-handler (blip stream)
+		 (if (not (eql (second blip) #\Mouse-Right))
+		     (if old-dynamic-blip-handler
+			 (funcall (first old-dynamic-blip-handler) blip stream)
+			 ;return the blip if no old handler.  This will then cause
+			 ;the :PREEMPTABLE option to kick in
+			 blip)
+		   ;; Argh!  We need this so that a Mouse-Right click will force
+		   ;; a rescan after editing commands like m-Rubout.
+		   (send stream :set-activator (presentation-input-blip-handler blip stream))
+		   (throw 'si:input-editor-rescan nil))))
+	  (si:with-input-editing-options
+	      (((:command :override) #'complete-input-command-p)
+	       ((:activation :override) #'complete-input-activation-p)
+; see comment on FLET above
+;	       ((:blip-character :override) #'complete-input-blip-p)
+	       ((:rescan :override) #'complete-input-rescan-p)
+	       ((:dynamic-blip-handler :override) #'complete-input-blip-handler))
+	    (with-accept-blip-chars (partial-completers)
+	      ;; Right now, only OR uses this mechanism.
+	      (when (or (member initially-display-possibilities
+				'(:then-return :then-return-no-compress-choices))
+			(and (not (atom initially-display-possibilities))
+			     (eq (car initially-display-possibilities) :then-return)))
+		(let ((stuff-so-far (send stream :stuff-so-far))
+		      (compression-options '()))
+		  (unless (atom initially-display-possibilities)
+		    (psetq initially-display-possibilities
+			   (car initially-display-possibilities)
+			   compression-options
+			   (cdr initially-display-possibilities)))
+		  (cond ((and help-offers-possibilities
+			      (or (neq help-offers-possibilities ':within-token)
+				  (string-search-not-char #\sp stuff-so-far)))
+			 (when (eq initially-display-possibilities
+				   :then-return-no-compress-choices)
+			   (setq compress-choices nil))
+			 (display-possibilities stuff-so-far function type
+						stream #'maybe-parse
+						:how :initial-possibilities
+						:separate-typeout nil
+						:possibility-printer possibility-printer
+						;; If :initially-display-possibilities
+						;; you get all the choices, pending
+						;; rethinking of this entire scheme
+						:query-cutoff-length nil
+						:compression-options compression-options
+						:compress-choices compress-choices
+						:compression-delimiter compression-delimiter
+						:show-possibilities-for-uninteresting-types nil
+						:document document :documenter documenter))
+			(t
+			 ;; don't do anything now, pending future thought
+			 nil)))
+		(throw 'done-displaying-possibilities nil))
+	      
+	      (when initially-display-possibilities
+		(display-possibilities stuff-so-far function type stream #'maybe-parse
+				       :how :initial-possibilities
+				       :separate-typeout t
+				       :possibility-printer possibility-printer
+				       :query-cutoff-length nil	;You asked for it.
+				       :compress-choices (unless
+							   (eq initially-display-possibilities
+							       :without-compression)
+							   compress-choices)
+				       :compression-delimiter compression-delimiter
+				       :document document :documenter documenter))
+	     (let ((*completion-help-chars*
+		     (if help-offers-possibilities
+			 '(#\Help #\c-? #\c-/)
+			 '(#\c-? #\c-/))))
+	      (with-accept-help ((:subhelp
+				   (lambda (stream string-so-far)
+				     (cond ((and help-offers-possibilities
+						 (or (neq help-offers-possibilities
+							  ':within-token)
+						     (string-search-not-char #\sp
+									     string-so-far)))
+					    (format stream "~%")
+					    (display-possibilities
+					      string-so-far function type stream
+					      #'maybe-parse
+					      :how :possibilities
+					      :separate-typeout nil
+					      :possibility-printer possibility-printer
+					      :compress-choices compress-choices
+					      :compression-delimiter compression-delimiter
+					      :document document
+					      :documenter documenter))
+					   ((eq help-offers-possibilities ':within-token)
+					    (format stream "~&~
+Use c-? or c-/ for a list of all possibilities.
+Use ~C after typing something for a list of possible completions of what you typed."
+						    #\help))
+					   (t (format
+						stream
+						"~&~
+Use c-? or c-/ for a list of possibilities."))))))
+		
+		(with-in-band-menu (:name "Menu of completions")
+		  (let ((loc (send stream :read-location)))
+		    (loop with rch 
+			  with quote-status	;NIL, :INSIDE, :BOTH
+			  for (token how-quoted) = (multiple-value-list
+						     (read-standard-token
+						       stream
+						       :quote-p (eq quote-status ':inside)))
+			  for ch = (read-char-for-accept stream)
+			  for class = nil
+			  for completion-mode = nil
+			  for unread = nil
+			  for return = nil
+			  for completion-type = nil
+			  with answer-object = nil
+			  do (zl:array-push-portion-extend stuff-so-far token)
+			  do
+		      (case how-quoted
+			(:FIRST (case quote-status
+				  (:INSIDE (setq quote-status :BOTH))
+				  (:BOTH (setq quote-status :BOTH))
+				  (otherwise (setq quote-status :INSIDE))
+				  ))
+			(:BOTH (setq quote-status :BOTH)))
+		      ;; decode the delimiter into actions to be performed
+		      (cond ((characterp ch)
+			     (setq rch ch))
+			    ((null ch)
+			     (setq completion-mode (if allow-any-input nil :complete)
+				   class :activation
+				   return t))	;like random ch
+			    ((and (presentation-blip-p ch)	;Ignore wakeups.
+				  (neq (car ch) 'in-band-menu)))
+			    (t (setq class (car ch))
+			       (when (eq class 'in-band-menu)
+				 (setq class :activation))
+			       (setq rch (second ch))
+			       (ecase class
+				 ((:accept :blip-character)
+				  (if (and quote-status
+					   (not *partial-complete-inside-quotes*)
+					   (or (member ch (union partial-completers
+								 overloaded-partial-completers)
+						       :test #'compare-char-for-accept)))
+				      (if (eq quote-status ':inside)
+					  (vector-push-extend rch stuff-so-far)
+					  ;; in the case where quote-status is
+					  ;; :BOTH and partial completing is not
+					  ;; allowed, then if this character
+					  ;; is an overloaded-partial-completer AND
+					  ;; allow-any-input is nil
+					  ;; then we MUST ensure that later on
+					  ;; this input is validated somehow.
+					  (if (and (not allow-any-input)
+						   (member ch overloaded-partial-completers
+							   :test #'compare-char-for-accept))
+					      (setq completion-mode :complete
+						    unread t
+						    return 'if-validated)))
+				      
+				      (if (member ch partial-completers
+						  :test #'compare-char-for-accept)
+					  (if (member ch overloaded-partial-completers
+						      :test #'compare-char-for-accept)
+					      (setq completion-mode :complete-limited
+						    return 'if-completed unread t)
+					      (if (and (not noninteractive)
+						       (send stream :rescanning-p))
+						  ;; No need to complete on partial completers
+						  ;; when rescanning.
+						  (vector-push-extend rch stuff-so-far)
+						  (setq completion-mode :complete-limited)))
+					  (setq completion-mode (if allow-any-input nil :complete)
+						return t unread t))))
+				 ((:activation :command)
+				  (case rch
+				    (#\End
+				     ;(maybe-trim stuff-so-far)	;I don't think that's right.
+				     (setq completion-mode :complete
+					   return 'if-completed
+					   unread t))
+				    (#\Tab
+				     (with-stack-list*
+				       (*complete-input-right-trims-characters*
+					 #\space *complete-input-right-trims-characters*)
+				       (maybe-trim stuff-so-far))
+				     (setq completion-mode :complete
+					   return 'if-validated
+					   unread 't))
+				    
+				    (#\Complete
+				     (setq completion-mode :complete
+					   return (and complete-activates 'if-completed)
+					   unread complete-activates))
+				    (#\Super-Complete
+				     (setq completion-mode :complete-maximal return nil unread nil))
+				    ((#\Mouse-R)
+				     (let ((poss (display-possibilities
+						   stuff-so-far function type stream
+						   #'maybe-parse
+						   :how :menu
+						   :separate-typeout nil
+						   :possibility-printer possibility-printer
+						   :compress-choices compress-choices
+						   :compression-delimiter compression-delimiter
+						   :document document :documenter documenter))
+					   ;; Forget the quotes around command names
+					   (dont-quote (command-name-input-context-p type)))
+				       (when poss
+					 ;; Only get here if clicked on a menu item, return it.
+					 (presentation-replace-input stream loc (first poss)
+								     :dont-quote dont-quote)
+					 ;;--- It would sure be nice to put some sort
+					 ;;--- of activation delimiter here, but how do
+					 ;;--- you figure out what to insert?  It could
+					 ;;--- be #\space, #\, or #\return, etc.
+					 #+ignore (send stream :replace-input 0 " ")
+					 ;; Don't have to worry about unreading a delimiter as
+					 ;; this was triggered by an activation
+					 (return (values (maybe-parse (second poss)
+								      (first poss))
+							 t (first poss))))))
+				    ((#\Control-? #\Control-/)
+				     (si:with-ie-typeout-if-appropriate (stream)
+				       (display-possibilities
+					 stuff-so-far function type stream #'maybe-parse
+					 :how (case rch
+						((#\Control-? #\Help) :possibilities)
+						(#\Control-/ *what-control-/-does*))
+					 :separate-typeout nil
+					 :possibility-printer possibility-printer
+					 :compress-choices compress-choices
+					 :compression-delimiter compression-delimiter
+					 :document document :documenter documenter)))
+				    (#\Control-Return
+				     (setq completion-mode nil
+					   return t unread t))
+				    (otherwise
+				      (maybe-trim stuff-so-far)
+				      (cond ((eq quote-status ':both)
+					     (setq completion-mode (if allow-any-input
+								       nil
+								       :complete-for-validation)
+						   return 'if-validated
+						   unread t))
+					    (t (setq completion-mode (if allow-any-input
+									 nil
+									 :complete)
+						     return t
+						     unread t)))))))))
+		      
+		      ;; Ok, this is a SPECIAL case.  We check to see if the null
+		      ;; string was read, and if so, we signal parse-error ('cause ACCEPT
+		      ;; handles this specially) so that the default value will be filled
+		      ;; in by ACCEPT.  This should be fixed to return the null string
+		      ;; and let the parser signal parse-error.  (COMPLETING-FROM-SUGGESTIONS should
+		      ;; take care of this for most parsers.)  Perhaps, :ALLOW-ANY-INPUT NIL
+		      ;; should imply that COMPLETE-INPUT should signal.
+		      ;;
+		      ;; There is a tension here between wanting to fill in the default and
+		      ;; use the maximal left substring when the user types #\End or a field
+		      ;; terminator that also does completion.  Putting this check before the
+		      ;; completion code means that the default always wins.
+		      (when (and return (string-equal stuff-so-far ""))
+			(unread-char-for-accept ch stream)
+			(signal 'input-not-of-required-type
+				:string *complete-input-magic-null-string*
+				:type type))
+		      
+		      (when completion-mode
+			(multiple-value-bind (string success object good-point-position nmatches)
+			    (funcall function stuff-so-far
+				     (if (eq completion-mode ':complete-for-validation)
+					 :complete completion-mode))
+			  ;;--- we have to get all the completers into the new protocol
+			  ;;--- until then, simulate it
+			  (when (null nmatches)
+			    (if success
+				(setq nmatches 1)
+				(if (string-equal string stuff-so-far)
+				    ;; nothing happened, assume invalid completion
+				    (setq nmatches 0)
+				    ;; if something happened but the completion was not
+				    ;; unique, we know it was ambiguous
+				    (setq nmatches 2))))
+			  (setq answer-object object)
+			  (cond ((= nmatches 0)
+				 ;; no valid completion, so no replace input
+				 (setq completion-type 'invalid)
+				 (unless (eq class :activation)
+				   (vector-push-extend rch stuff-so-far)))
+				(( nmatches 1)
+				 (let* ((contents-same (string-equal stuff-so-far string))
+					(need-to-add-delimiter
+					  ;;--- is this special-case of activation chars correct?
+					  ;;--- what about Return?  what about leaving the
+					  ;;--- delimiter?
+					  (unless (eq class :activation)
+					    ;; no change this time through the loop, add the
+					    ;; delimiter for future chunk successes
+					    ;;--- this code needs knowledge that the
+					    ;;--- blip-character that was read is one of the
+					    ;;--- delimiters for a chunk.
+					    (or contents-same
+						;; otherwise, check the last character
+						(not (ends-in-char-p string rch))))))
+				   (when (and success rch	;rch could be nil if
+						;this is non-interactive
+					      (> nmatches 1)
+					      (member rch partial-completers
+						      :test #'char-equal))
+				     ;; try to make nmatches = 1 by
+				     ;; eliminating completions that don't include
+				     ;; this delimiter.  Gag.
+						;(dbg:whistle)
+				     (multiple-value-bind (nil nil nil nil n)
+					 (funcall function
+						  (string-append stuff-so-far rch)
+						  completion-mode)
+				       (when (zerop n) (setq nmatches 1))))
+				   (cond ((eq return 'if-validated)
+					  (if (and success contents-same)
+					      (setq return t)
+					      (setq completion-type 'invalid))
+					  (setq string stuff-so-far))	;!!
+					 (t
+					   (setq success-type success)
+					   (cond (success
+						  (cond ((= nmatches 1)
+							 (setq completion-type 'unique))
+							(t
+							 (setq completion-type
+							       'left-substring))))
+						 (t (setq completion-type 'ambiguous)))
+					   ;; replace contents of stuff-so-far with completion
+					   (setf (fill-pointer stuff-so-far) 0)
+					   (zl:array-push-portion-extend stuff-so-far string)
+					   (unless (= nmatches 1)
+					     ;; we are going around the loop again, add the
+					     ;; delimiter to the end if it isn't already there
+					     ;; as the result of completion
+					     (when need-to-add-delimiter
+					       (vector-push-extend rch stuff-so-far)))))
+				   ;; quotify if necessary
+				   (let ((len (string-length string)))
+				     (with-stack-array (new-string (+ len 3)
+								   :type 'art-fat-string
+								   :fill-pointer 0)
+				       (if (or (compare-char-for-accept ch #\Tab)
+					       (and return
+						    ;; if completion is left substring
+						    ;; we may have to quote so rescanning
+						    ;; won't screw us by doing unwanted
+						    ;; completion.
+						    (eq completion-type 'left-substring)
+
+						    ;; we only have to do this if the delimiter
+						    ;; is a partial completer.
+						    ;; If the delimiter isn't a partial completer
+						    ;; then there isn't any ambiguity
+						    ;; (we think)
+						    (member rch partial-completers)
+
+						    ;; if-completed means only exit if
+						    ;; completed to a valid completion.
+						    ;; At this point, since the "successful"
+						    ;; completion is a left substring and
+						    ;; we prefer long completions now,
+						    ;; don't exit
+						    (neq return 'if-completed)
+						    ))
+					   (add-quotes-appropriately string new-string :both)
+					   (add-quotes-appropriately string new-string quote-status))
+				       ;; delimiter goes outside the quotes
+				       (when need-to-add-delimiter
+					 (vector-push rch new-string))
+				       (presentation-replace-input
+					 stream
+					 loc
+					 new-string
+					 :dont-quote t)))
+				   ;; Position the cursor to the failure point if super-complete
+				   ;; or no other action taken on complete or failure.
+				   (when (and good-point-position
+					      (neq completion-mode ':complete-for-validation)
+					      (or (eql rch #\Super-Complete)
+						  (and (or (not success) (eql rch #\Complete))
+						       (neq class :accept)
+						       (not (eql rch #\Tab))
+						       contents-same))
+					      (operation-handled-p stream :set-typein-location))
+				     (send stream :set-typein-location
+					   loc good-point-position)))))
+			  ))
+		      
+		      (when (compare-char-for-accept ch #\Tab)
+			(presentation-replace-input stream (send stream :read-location)
+						    " " :dont-quote t)
+			(setq ch (cond ((listp ch) (subst #\Space #\Tab ch))
+				       (t #\Space))))
+		      
+		      ;; check for errors unconditionally, remembering that we may not have
+		      ;; called the completer at all (completion-type = NIL)
+		      (if noninteractive
+			  (flet ((noninterr ()
+				   (declare (dbg:error-reporter))
+				   (if type
+				       (error 'input-not-of-required-type
+					      :string token :type type)
+				       (zl:parse-ferror "Not a valid input: ~A" token))))
+			    (ecase completion-type
+			      ((nil unique left-substring))
+			      ((invalid) (unless allow-any-input (noninterr)))
+			      ((ambiguous) (when (eq completion-mode :complete) (noninterr)))))
+			  ;; interactive completion, report errors and ambiguities
+			  ;; If allow-any-input is NIL, we have to signal errors for invalid
+			  ;; completions.
+			  (ecase completion-type
+			    ((nil unique left-substring))	; no possible errors to report
+			    (invalid
+			      (cond ((not allow-any-input)
+				     ;; --- should erroring  be conditionalized on the RETURN flag
+				     ;; --- so that #\Complete doesn't signal parse errors?
+				     ;; --- that's in conflict with complete across OR types
+				     ;; unconditionally unread the delimiter so that OR can catch
+				     ;; the error and call the next parser
+				     (unread-char-for-accept ch stream)
+				     ;; Never return from COMPLETE-INPUT with junk if :ALLOW-ANY-INPUT NIL
+				     (if type
+					 (error
+					   (if enable-forced-return
+					       'input-not-of-required-type-unless-control-return
+					       'input-not-of-required-type)
+					   :string (heapify-string stuff-so-far)
+					   :type type)
+					 (zl:parse-ferror "Invalid completion: ~A"
+							  (heapify-string stuff-so-far))))
+				    ((eq completion-mode :complete)
+				     ;; don't beep on a partial-completer failure if :FORCE-COMPLETE NIL
+				     (beep stream))))
+			    (ambiguous
+			      ;; only beep on ambiguous full completions, in either ALLOW-ANY-INPUT mode
+			      (when (eq completion-mode :complete)
+				(beep stream)))))
+		      
+		      ;; hack conditional return
+		      (when (eq return 'if-completed)
+			(cond ((and (eq completion-type 'left-substring)
+				    (eql rch #\End))
+			       ;; Do nothing in this case.
+			       ;; #\End is an acceptable way to get a short completion.
+			       ;; It is ok to hard-wire in #\End here, because #\End
+			       ;; is hardwired in in other places in this function.
+			       ;; (Two wrongs make a right.)
+			       )
+			      ((neq completion-type 'unique)
+			       (setq return nil))))
+		      
+		      ;; Decide whether or not to return, remembering that
+		      ;; we might have called the completer.
+		      (when return
+			(when (or allow-any-input
+				  (member completion-type '(nil unique left-substring)))
+			  ;; leave the last delimiter for our caller
+			  (when unread
+			    (unread-char-for-accept ch stream))
+			  (let ((stuff-so-far (heapify-string stuff-so-far)))
+			    (return (values (maybe-parse answer-object stuff-so-far)
+					    ;; SUCCESS-TYPE will be T or :ANY here
+					    (if (member completion-type
+							'(unique left-substring))
+						success-type
+					      nil)
+					    stuff-so-far)))))))))))))))))
+)
+
+(defun complete-from-sequence (sequence stream &rest options
+					       &key (name-key #'string) 
+						    (value-key #'identity)
+						    (predicate #'true)
+						    (delimiters
+						      *standard-completion-delimiters*)
+					       &allow-other-keys)
+  (declare (arglist sequence stream
+		    &key type (name-key #'string) (value-key #'identity) (predicate #'true)
+			 (delimiters *standard-completion-delimiters*)
+			 (allow-any-input nil) (enable-forced-return nil)
+			 (initially-display-possibilities nil)
+			 (partial-completers nil) (complete-activates nil)
+			 (compress-choices 20) (compression-delimiter #\Space)
+			 documenter document)
+	   (values object success string))
+  (si:with-rem-keywords (completion-keywords options '(:name-key :value-key :predicate
+						       :delimiters))
+    (apply #'complete-input stream
+	   (lambda (string &optional (action :complete))
+	     (suggestion-completer (string :action action :delimiters delimiters)
+	       (map () (lambda (element)
+			 (when (funcall predicate element)
+			   (suggest (funcall name-key element) (funcall value-key element))))
+		    sequence)))
+	   completion-keywords)))
+
+;;; Output is the element itself.  Should only be used by COMPLETE-INPUT-FROM-AARRAY.
+;;; Doesn't use COMPLETING-FROM-SUGGESTIONS so that it can intersperse binary subsetting.
+(defparameter *completion-needs-full-set* '(:apropos-possibilities
+					    :apropos-initial-possibilities))
+
+(defun complete-from-aarray (aarray string action &optional whole-cdr)
+  (declare (values new-string success object new-character-pos nmatches))
+  (suggestion-completer (string :action action :delimiters zwei:*completing-delims*)
+    (let ((subset (if (or (member action *completion-needs-full-set*)
+			  (equal string ""))
+		      aarray			;Need to look at everything
+		      (multiple-value-bind (nil completions)
+			  (zwei:complete-string string aarray zwei:*completing-delims*)
+			completions))))
+      (map 'nil					;No DO-SEQUENCE or LOOP patch
+	   #'(lambda (element)
+	       (suggest (first element)
+			(if whole-cdr
+			    (cdr element)
+			  ;; If this should not be treated as a whole-cdr aarray,
+			  ;; then always suggest just a single thing.  This means
+			  ;; if you expect ("item" . (first-part second-part)) to
+			  ;; to work when you don't use 1:whole-cdr t0, too bad.
+			  (if (listp (cdr element)) (second element) (cdr element)))))
+	   subset))))
+
+;; STRING is either the string typed by the user (after having been chunkwise
+;; completed) or NIL if either SUCCESS is NIL or the user clicked on something.
+;; SUCCESS could be NIL, T, or :ANY if we consed up a fake answer.
+;; OBJECT is the CDR of the aarray entry, or the clicked-upon object itself
+;; (in which case SUCCESS will be T and STRING will be NIL).
+;; If WHOLE-CDR is T, this means to return the entire cdr of the aarray element
+;; rather than just a single item from the cdr.
+(defun complete-input-from-aarray (aarray stream &rest options
+				   &key type allow-any-expression-input
+					whole-cdr possibility-printer
+				   &allow-other-keys)
+  (declare (values string success object))
+  (zl:check-arg type (and type (presentation-type-p type)) "a presentation-type")
+  #+ignore (si:sort-aarray aarray)
+  (when whole-cdr (setq type `(sequence ,type)))
+  (si:with-rem-keywords (options options '(:type :allow-any-expression-input
+					   :whole-cdr :possibility-printer))
+    (flet ((complete-from-aarray-internal (string action)
+	     (declare (sys:downward-function))
+	     (let ((complete-values (multiple-value-list
+				      (complete-from-aarray aarray string action
+							    whole-cdr))))
+	       (if (null allow-any-expression-input)
+		   (values-list complete-values)
+		 (case action
+		   ((:complete :complete-limited :complete-maximal)
+		    (destructuring-bind (new-string success . ignore) complete-values
+		      (if success
+			  (values-list complete-values)
+			(let ((object (condition-case ()
+					   (read-from-string new-string)
+					 (error (return-from complete-from-aarray-internal
+						  (values-list complete-values))))))
+			  (when whole-cdr (setq object (list object)))
+			  ;; Cons up a fake entry, but flag it
+			  (values (copy-seq new-string) :any object nil 1)))))
+		   (otherwise (values-list complete-values))))))
+	   (present-aarray-possibility (string object stream &optional presentation-type)
+	     (declare (sys:downward-function))
+	     ;; A p-type supplied explicitly overrides the possibility-printer
+	     ;;--- Is that right?  It seems reasonable and breaks nothing...
+	     (if presentation-type		;used by ellipsis stuff
+		 (present object presentation-type :stream stream)
+	       (if possibility-printer
+		   (funcall possibility-printer string object stream presentation-type)
+		 (present object type :stream stream)))))
+      (multiple-value-bind (object success string)
+	  (with-presentation-input-editor-context (stream type)
+						  (blip start-loc)
+	       (condition-case (error)
+		    (apply #'complete-input stream
+			   #'complete-from-aarray-internal
+			   :type type
+			   :possibility-printer #'present-aarray-possibility
+			   options)
+		  (input-not-of-required-type
+		    (error 'input-not-of-required-type
+			   :type type :string (send error :string))))
+	     (t (echo-presentation-blip stream blip start-loc)
+		(values (presentation-blip-object blip) t nil)))
+	(when (null success)			;Maybe typed Return instead of End
+	  (let ((new-object (if (arrayp aarray)
+				(si:aarray-lookup string aarray)
+			      (assoc string aarray :test #'string-equal))))
+	    (if whole-cdr
+		(cdr new-object)
+	      (if (listp (cdr new-object)) (second new-object) (cdr new-object)))
+	    (setq success (not (null object)))))
+	;; STRING will be NIL when we completed via a blip
+	(values string success object)))))
+
+(defun (complete-input-from-aarray compiler:style-checker) (form)
+  (destructuring-bind (function aarray stream
+		       &rest options &key (type nil type-supplied) &allow-other-keys)
+      form
+    (ignore aarray stream options type)
+    (unless type-supplied
+      (warn "You must supply ~S to ~S" :type function))))
+
+#||
+(defun test-aarray-completion ()
+  (loop for type in `(sct:system package sys:function-spec)
+	doing
+    (print (accept type))
+    (print (accept `(sequence ,type)))
+    (print (accept `(token-or-type (:all) ,type)))
+    (print (accept `(token-or-type (:all) (sequence ,type))))))
+||#
+
+;;; set can be an aarray, an alist, or just a list of symbols.
+(defun complete-input-from-symbol-set (stream set type initially-display-possibilities
+				       &optional function)
+  (multiple-value-bind (value nil string)
+      (complete-input stream
+		      (or function
+			  #'(lambda (string &optional (action :complete))
+			      (complete-from-symbol-set set string action #'true)))
+		      :type type
+		      ;; Having #\- in this list is more of an annoyance than an aid.
+		      ;; The only reason for space is to keep the CP overloading from beeping
+		      ;; when you enter a SETF kind of spec.
+		      :partial-completers '(#\Space)
+		      :initially-display-possibilities initially-display-possibilities
+		      :help-offers-possibilities ':within-token
+		      :compress-choices nil)	;otherwise Help is unbearably slow
+    (let ((possible nil))
+      (if (arrayp set)				;An aarray
+	  (let ((entry (si:aarray-lookup string set)))
+	    (when entry
+	      (if (atom entry)
+		  (setq possible (list entry))
+		  (setq string (car entry)
+			possible (cdr entry)))))
+	  (dolist (entry set)
+	    (if (atom entry)
+		(when (string-equal string entry)
+		  (pushnew entry possible))
+		(when (string-equal string (car entry))
+		  (setq possible (union (cdr entry) possible))))))
+      (when (or (null possible)			;Did something funny with packages,
+		(null (cdr possible))		;or item is unique,
+		(eq value (intern-soft string)))	;or accessible.
+	(return-from complete-input-from-symbol-set value))
+      ;; Unfortunately, you have to rubout back to the beginning of the entry before you
+      ;; can use this mouse-sensitive list.  That's probably still better than having it
+      ;; get erased when you start editing.
+      (si:with-ie-typeout-if-appropriate (stream)
+	(format stream "These are the ")
+	(describe-presentation-type type stream t)
+	(format stream " matching ~A:~%" string)
+	(format-item-list possible :stream stream :presentation-type type))
+      (parse-error "~A is ambiguous.  You must type a package prefix." string))))
+
+(defun complete-from-symbol-set (set string action predicate)
+  (declare (values new-string success object new-character-pos nmatches))
+  (let ((package *package*)
+	(package-index nil)
+	(name string))
+    (let ((index (string-search-char #\: string)))
+      (when index
+	(setq package (find-package (substring string 0 index))
+	      package-index (1+ (string-search-char #\: string :from-end t))
+	      name (substring string package-index))))
+    (suggestion-completer (string :action action :delimiters zwei:*completing-delims*)
+      (let ((subset (if (or (member action *completion-needs-full-set*)
+			    (equal name ""))
+			set			;Need to look at everything
+			(multiple-value-bind (nil completions)
+			    (zwei:complete-string name set zwei:*completing-delims*)
+			  completions))))
+	(if package-index
+	    (when package			;Garbage package => no completions.
+	      (stack-let ((temp-string (make-array 25 :fill-pointer 0
+						      :element-type 'character)))
+		(if (member action '(:apropos-possibilities
+				     :apropos-initial-possibilities))
+		    (map 'nil
+			 (lambda (element)
+			   (let ((symbols (if (consp element) (cdr element) element)))
+			     (flet ((maybe-suggest (symbol)
+				      (let ((symbol-package (and (symbolp symbol)
+								 (symbol-package symbol))))
+					(when (and symbol-package
+						   (eq symbol-package package)
+						   (if (eq action :apropos-possibilities)
+						       (string-search name
+								      (symbol-name symbol))
+						     (string=-start name
+								    (symbol-name symbol)))
+						   (funcall predicate symbol))
+					  (suggest (string-append
+						     (si:pkg-prefix-name package) ":" symbol)
+						   element)))))
+			       (if (consp symbols)
+				   (dolist (symbol symbols)
+				     (maybe-suggest symbol))
+				 (maybe-suggest symbols)))))
+			 subset)
+		  (vector-push-portion-extend temp-string string 0 package-index)
+		  (nstring-upcase temp-string)
+		  (map 'nil
+		       (lambda (element)
+			 (let* ((name (if (consp element) (car element) (symbol-name element)))
+				(accessible (intern-soft name package)))
+			   (when (and accessible
+				      (if (consp element)
+					  (member accessible (cdr element))
+					(eq accessible element))
+				      (funcall predicate accessible))
+			     (setf (fill-pointer temp-string) package-index)
+			     (vector-push-portion-extend temp-string name)
+			     ;; Copying necessary because string might get squirreled away.
+			     (suggest (copy-seq temp-string) accessible))))
+		       subset))))
+	  (map 'nil
+	       (lambda (element)
+		 (let ((name (if (consp element) (car element) (symbol-name element))))
+		   (cond ((atom element)
+			  (when (funcall predicate element)
+			    (suggest name element)))
+			 ((null (cddr element))
+			  ;; Only one, offer it.
+			  (when (funcall predicate (cadr element))
+			    (suggest name (cadr element))))
+			 (t
+			  (let ((preferred (intern-soft name package)))
+			    (if (and (member preferred (cdr element))
+				     (funcall predicate preferred))
+				;; More than one and one would be what read gave: just it.
+				(suggest name preferred)
+			      ;; Multiple possibilities, suggest all that predicate accepts
+			      (dolist (symbol (cdr element))
+				(when (funcall predicate symbol)
+				  (suggest name symbol)))))))))
+	       subset))))))
+
+
+;;; Ellipses.  These are used when display-possibilities abbreviates
+;;; its display by using "Show ..." in place of "Show File" "Show Foo" "Show Etc"
+;;; The option COMPRESS-CHOICES controls abbreviation.
+;;; If :ALWAYS, always compress to ellipses; if :NEVER, never compress;
+;;; if a number, compress when the TOTAL number of possibilities exceeds
+;;; this threshold.  
+(define-presentation-type ellipsis ((&key object-type)
+				    &key expansions
+				    (compress-choices 20)
+				    (compression-delimiter #\Space))
+   :expander t
+   ;; No parser.  We never allow someone to do (accept 'ellipsis) 
+   :printer ((ellipsis stream)
+	     (cl:write-string ellipsis stream)))
+
+(defun expand-ellipsis (ellipsis &key presentation window)
+  (ignore ellipsis)
+  (let ((p-t (presentation-type presentation))
+	(string (presentation-object presentation)))
+    (with-presentation-type-arguments (ellipsis p-t)
+      p-t
+      (si:with-ie-typeout-if-appropriate (window)
+	;;; This action (on click-left) is only valid when we're accept'ing the original
+	;;; type remembered by this ellipsis.  It causes an additional display of
+	;;; the expansion of the ellipsis to be presented as more "help" info.
+	(unless (eq *display-ellipsis-help* :always)
+	  ;; If he's running this code, he's clearly figured out the notation,
+	  ;; so suppress the `helpful' little message.
+	  (setq *display-ellipsis-help* nil))
+	(format window "Possible completions of \"~A\""
+	  (substring string 0 (string-search "..." string)))
+	(when (or (eq compress-choices :always)
+		  (and (numberp compress-choices)
+		       (> (length expansions) compress-choices)))
+	  (setq expansions
+		(compress-possibilities expansions
+					:type object-type
+					:compress-choices compress-choices
+					:delimiter compression-delimiter)))
+	(format-item-list expansions
+			  :printer (lambda (possibility stream)
+				     (destructuring-bind (string object &optional type)
+					 possibility
+				       (with-output-as-presentation
+					   (:stream stream
+					    :object object
+					    :type (or type object-type))
+					 (write-string string stream))))
+			  :stream window)))))
+
+;;; This action (on click-left) is only valid when we're accept'ing the original
+;;; type remembered by this ellipsis.  It causes an additional display of
+;;; the expansion of the ellipsis to be presented as more "help" info.
+(define-presentation-action expand-ellipsis
+   (ellipsis t
+    :tester ellipsis-applies-p
+    :documentation "Expand ellipsis")
+   (ellipsis &key presentation window)
+  (expand-ellipsis ellipsis :presentation presentation :window window))
+
+;;; Turns an ellipsis into an object of the type that was originally "compressed"
+;;; by selection from a menu (a la Mouse-R).  The tester ensures that this
+;;; translator is only active in the appropriate input context (i.e. accepting the
+;;; type originally compressed).
+(define-presentation-translator ellipsis-menu
+   (ellipsis t
+    :tester ellipsis-applies-p
+    :documentation "Menu of expansions"
+    :gesture :menu
+    :do-not-compose t
+    :context-independent nil)
+   (ignore &key presentation)
+  (let ((p-t (presentation-type presentation))
+	(string (presentation-object presentation))
+	(menu-object-type nil))
+    (with-presentation-type-arguments (ellipsis p-t)
+      (setq menu-object-type object-type)
+      (let ((expansion
+	      (dw:menu-choose
+		expansions
+		:prompt (format nil "Completions of \"~A\""
+			  (substring string 0
+				     (string-search "..." string))))))
+	(when expansion
+	  (values expansion menu-object-type))))))
+
+;;; Ellipsis is only valid when accepting the original type, although that may be hidden
+;;; inside a token-or-type of a sequence of the thing in question.
+(defun ellipsis-applies-p (ignore &key presentation input-context &allow-other-keys)
+  (when (not (null input-context))
+    (with-presentation-type-arguments (ellipsis (presentation-type presentation))
+      (let ((current-type
+	      (presentation-input-context-presentation-type
+		input-context)))
+	(or (presentation-subtypep object-type current-type)
+	    (block yes
+	      (map-over-type-hierarchy current-type nil t
+		#'(lambda (supertype ignore ignore)
+		    (when (eq (presentation-type-name supertype) 'sequence)
+		      (with-presentation-type-arguments (sequence supertype)
+			(when (eql element-type '*)
+			  ;; Just anything lispish, I guess.
+			  (setq element-type 'sys:expression))
+			(when (presentation-subtypep object-type element-type)
+			  (return-from yes t))))))))))))
+
+;;; Takes a set of possibilities (STRING OBJECT &OPTIONAL TYPE) and "compresses" them
+;;; into a new set of possibilities where each set of possibilities that share a
+;;; left word is replaced by a possibility of type ELLIPSIS.  E.g., "Show File" and "Show Foo"
+;;; of type COMMAND are compressed into a "Show ..." of type ELLIPSIS.  The ellipsis remembers
+;;; the original type so that it can be expanded later.
+(defun compress-possibilities (possibilities &key type compress-choices (delimiter #\space)
+			       &aux abbrev-presentation abbrev-presentation-type
+			            abbrev-word abbrev-n)
+  (macrolet ((1+or-nil (arg)			;increments if arg is fixnum, returns nil 
+	       `(when ,arg (1+ ,arg))))		;when nil, blows out on any other.
+    (loop with first-name = (caar possibilities)
+	  for search-start first 0 then space
+	  as space = (and search-start
+			  (1+or-nil (string-search-char
+				      delimiter first-name :start search-start)))
+	  while (and search-start
+		     (cdr possibilities)
+		     (if space
+			 (string-search first-name (caar (last possibilities))
+					:start1 0 :end1 space
+					:start2 0 :end2 space)
+			 (string-equal first-name (caar (last possibilities)))))
+	  finally
+	    (return
+	     (values
+	      (loop for remaining on possibilities
+		    as item = (car remaining)
+		    as (name obj item-type) = item
+		    as (next-name . nil) = (cadr remaining)
+		    collect
+		      (let ((initial-string-length
+			      (1+or-nil
+				(string-search-char delimiter name :start search-start))))
+			(if (and initial-string-length
+				 next-name
+				 (string-search name next-name
+						:start1 0 :end1 initial-string-length
+						:start2 0 :end2 initial-string-length))
+			    (let ((things
+				    (loop for rest-list on remaining
+					  as (next-name object nil) = (car rest-list)
+					  while (string-search
+						  name next-name
+						  :start1 0 :end1 initial-string-length
+						  :start2 0 :end2 initial-string-length)
+					  collecting `(,next-name ,object) into things
+					  do (setq remaining rest-list)
+					  finally (return (values things)))))
+			      (let ((new-string
+				      (string-append (substring name 0 initial-string-length)
+						     "..."
+						     (format nil " (~D)" (length things))))
+				    (type-to-use (or type item-type (type-of obj))))
+				(heap-copy-presentation-type-if-necessary type-to-use)
+				(let ((presentation-type
+					`((ellipsis :object-type ,type-to-use)
+					  :compress-choices ,compress-choices
+					  :compression-delimiter ,delimiter
+					  :expansions ,things)))
+				  (unless abbrev-word
+				    (setq abbrev-word (substring name 0 initial-string-length)
+					  abbrev-n (length things)
+					  abbrev-presentation new-string
+					  abbrev-presentation-type presentation-type))
+				  (list new-string
+					new-string
+					presentation-type))))
+			  item)))
+	      abbrev-presentation abbrev-presentation-type abbrev-word abbrev-n)))))
+
+
+(defmacro with-command-token-completion-caches ((string-cache completion-bounds-table)
+						&body body)
+  `(sys:with-data-stack
+     (let ((,string-cache (sys:make-stack-array 100 :element-type 'character :fill-pointer 0))
+	   (,completion-bounds-table (sys:make-stack-array 30 :fill-pointer 0)))
+       . ,body)))
+
+(defmacro command-token-suggestion-completer ((string-cache completion-bounds-table
+							    delimiters string action)
+					      &body body)
+  `(progn
+     (let ((cache-string-length (fill-pointer ,string-cache)))
+       (when (or (zerop cache-string-length)
+		 (not (sys:%string= string 0 ,string-cache 0 cache-string-length)))
+	 (setf (fill-pointer ,completion-bounds-table) 0)))
+     (setf (fill-pointer ,string-cache) 0)
+     (string-nconc ,string-cache string)
+     (dw:suggestion-completer (,string :action ,action :delimiters ,delimiters)
+       (macrolet
+	 ((suggest-element (element)
+	    `(destructuring-bind (string . values) ,element
+	       (dw:suggest string values)))
+	  (make-suggestions (aarray)
+	    (once-only (aarray)
+	      `(if (member ,',action '(:complete-limited :complete :complete-maximal))
+		   (let (table-index lower-bound upper-bound)
+		     (loop for index below (fill-pointer ,',completion-bounds-table) by 3
+			   when (eq (aref ,',completion-bounds-table index) ,aarray)
+			     return (setq table-index index
+					  lower-bound (aref ,',completion-bounds-table
+							    (1+ index))
+					  upper-bound (aref ,',completion-bounds-table
+							    (+ index 2)))
+			   finally
+			     (setq table-index (fill-pointer ,',completion-bounds-table))
+			     (vector-push-extend ,aarray ,',completion-bounds-table)
+			     (vector-push-extend (setq lower-bound 0)
+						 ,',completion-bounds-table)
+			     (vector-push-extend (setq upper-bound (fill-pointer ,aarray))
+						 ,',completion-bounds-table))
+		     (unless (= lower-bound upper-bound)
+		       (multiple-value-setq (lower-bound upper-bound)
+			 (command-aarray-bounds ,',string ,aarray lower-bound upper-bound)))
+		     (setf (aref ,',completion-bounds-table (1+ table-index)) lower-bound)
+		     (setf (aref ,',completion-bounds-table (+ table-index 2)) upper-bound)
+		     (loop for index from lower-bound below upper-bound do
+		       (suggest-element (aref ,aarray index))))
+		   (let ((subset (if (or (member ,',action *completion-needs-full-set*)
+					 (equal ,',string ""))
+				     ,aarray
+				     (multiple-value-bind (nil completions)
+					 (zwei:complete-string ,',string ,aarray
+							       ,',delimiters)
+				       completions))))
+		     (map 'nil (lambda (element) (suggest-element element)) subset))))))
+	 . ,body))))
+
+;;; This is a copy of zwei:complete-string-bounds.
+(defun command-aarray-bounds (string aarray lower-bound upper-bound)
+  (si:sort-aarray aarray)
+  (let ((lo lower-bound)
+	(hi lower-bound)
+	(hihi upper-bound))
+    (let ((hilo hihi))
+      (loop
+	;; Yes, truncate.  The bounds do go either side of one another sometimes.
+	(let ((index (truncate (- hilo lo) 2)))
+	  (when (zerop index)
+	    (return))
+	  (incf index lo)
+	  (let ((compare (command-completion-compare string (first (aref aarray index)))))
+	    (cond ((eq compare :less)
+		   (setq lo index)
+		   (setq hi index))
+		  (t
+		   (setq hilo index)
+		   (if (eq compare :greater)
+		       (setq hihi index)
+		       (setq hi index))))))))
+    (loop
+      (let ((index (truncate (- hihi hi) 2)))
+	(when (zerop index)
+	  (return))
+	(incf index hi)
+	(let ((compare (command-completion-compare string (first (aref aarray index)))))
+	  (if (eq compare :greater)
+	      (setq hihi index)
+	      (setq hi index)))))
+    (values lo (1+ hi))))
+
+;;; Possible values are NIL (indeterminate), :GREATER, or :LESS.
+(defun command-completion-compare (test completion)
+  (let ((test-index 0)
+	(test-length (string-length test))
+	(completion-index 0)
+	(completion-length (string-length completion)))
+    (loop
+      (when (or ( test-index test-length)
+		( completion-index completion-length))
+	(return nil))
+      (let ((next-test-index (sys:%string-search-char #\space test test-index test-length))
+	    (next-completion-index (sys:%string-search-char #\space
+							    completion completion-index
+							    completion-length)))
+	(let ((test-chunk-length (- (or next-test-index test-length) test-index))
+	      (completion-chunk-length (- (or next-completion-index completion-length)
+					  completion-index)))
+	  (let ((test (sys:%string-compare completion completion-index test test-index
+					   (min test-chunk-length completion-chunk-length))))
+	    (cond ((minusp test)
+		   (return :less))
+		  ((plusp test)
+		   (return :greater))
+		  (( test-chunk-length completion-chunk-length)
+		   ;; When get to first substring, that's all we can say.
+		   (return nil)))))
+	(when (or (null next-test-index)
+		  (null next-completion-index))
+	  (return nil))
+	(setq test-index (1+ next-test-index)
+	      completion-index (1+ next-completion-index))))))
+
+#||	;Maybe in some future release
+
+(defparameter *btree-branching-factor* 8)
+
+(defstruct (btree-node-contents
+	     (:type :grouped-array)
+	     (:size-macro btree-node-modulus)
+	     (:conc-name btree-node-)
+	     (:copier nil))
+  key
+  value)
+
+(defprop btree-node btree-named-structure-invoke named-structure-invoke)
+(defstruct (btree-node :named-array-leader :conc-name
+		       (:make-array (:length (* *btree-branching-factor*
+						(btree-node-modulus)))))
+  (fill-pointer 0)
+  (leaf-p t))
+
+(defmacro do-btree-elements ((index key value node &key from-end) &body body)
+  (let ((inside `(let ((,key (btree-node-key ,index ,node))
+		       (,value (btree-node-value ,index ,node)))
+		   . ,body)))
+    (if (not from-end)
+      `(loop for ,index below (fill-pointer ,node) by (btree-node-modulus)
+	     do ,inside)
+      `(loop for ,index downfrom (- (fill-pointer ,node) (btree-node-modulus))
+	     to 0 by (btree-node-modulus)
+	     do ,inside))))
+
+(defselect btree-named-structure-invoke
+  (:print-self (btree-node stream ignore ignore)
+    (printing-random-object (btree-node stream :typep)))
+  (:describe (btree-node)
+    (describe-defstruct btree-node)
+    (when (plusp (fill-pointer btree-node))
+      (format t "Contents:~%")
+      (formatting-table ()
+	(do-btree-elements (index key value btree-node)
+	  (formatting-row ()
+	    (formatting-cell (t :align :right) (prin1 index))
+	    (formatting-cell () (write-string key))
+	    (formatting-cell () (prin1 value))))))))
+
+;;; Not inherited
+(defprop completion-btree-node btree-named-structure-invoke named-structure-invoke)
+(defstruct (completion-btree-node :named-array-leader :conc-name
+				  (:include btree-node)
+				  ;; Not inherited
+				  (:make-array (:length (* *btree-branching-factor*
+							   (btree-node-modulus)))))
+  (chunk-depth 0))
+
+(defprop completion-btree btree-named-structure-invoke named-structure-invoke)
+(defstruct (completion-btree :named-array-leader :conc-name
+			     (:include completion-btree-node)
+			     ;; Not inherited
+			     (:make-array (:length (* *btree-branching-factor*
+						      (btree-node-modulus))))
+			     (:constructor make-completion-btree-internal))
+  delimiters
+  (chunk-hash-table nil))
+
+(defun make-completion-btree (&key (delimiters *standard-completion-delimiters*)
+				   (intern-chunks t))
+  (make-completion-btree-internal :delimiters delimiters
+				  :chunk-hash-table (and intern-chunks
+							 (make-hash-table :test 'string=))))
+
+;;; This is allowed to return lots of stuff that isn't even close
+;;; because it happened to be in a node that was close but didn't exact
+;;; match in non-terminal chunks.
+;;; Alternatively, you could force string= entries (rather than string) for each
+;;; chunk level.  That'd make the tree a whole lot bigger of course.
+
+(defun map-over-completion-btree-possible-completions (string delimiters top-node function)
+  (declare (downward-funarg function))
+  (with-string-broken-into-completion-chunks (chunks min-depth nil string delimiters)
+    (labels ((map-for-depth (node depth)
+	       (let ((chunk-key (if (< depth min-depth) (aref chunks depth) "")))
+		 (if (btree-node-leaf-p node)
+		     ;; Insist on at least as many delims in the results
+		     (when ( (1+ depth) min-depth)
+		       (do-btree-elements (index key value node)
+			 (when (string=-start key chunk-key)
+			   (funcall function value))))
+		     (do-btree-elements (index key new-node node :from-end t)
+		       (let ((compare (string-exact-compare-start key chunk-key)))
+			 (unless (plusp compare)
+			   (let ((new-depth (completion-btree-node-chunk-depth new-node)))
+			     (map-for-depth new-node new-depth)
+			     (unless (zerop compare)
+			       (return nil))))))))))
+      (map-for-depth top-node 0))))
+
+(defmacro make-key-permanent (key permanent-key tree)
+  `(progn
+     (when (null ,permanent-key)
+       (setq ,permanent-key (make-key-permanent-internal ,key ,tree)))
+     ,permanent-key))
+
+(defun make-key-permanent-internal (key tree)
+  (let ((hash-table (completion-btree-chunk-hash-table tree)))
+    (if (null hash-table)
+	(copy-seq key)
+	(multiple-value-bind (value success)
+	    (gethash key hash-table)
+	  (if success value
+	      (setq key (copy-seq key))
+	      (setf (gethash key hash-table) key)
+	      key)))))
+
+(defun completion-btree-insert (string tree &key (if-exists :supersede))
+  (with-string-broken-into-completion-chunks (chunks nchunks nil string
+					      (completion-btree-delimiters tree))
+    (when (plusp nchunks)
+      (let ((node tree)
+	    (depth 0))
+	(loop do
+	  (let* ((chunk-key (aref chunks depth))
+		 (next-depth (1+ depth))
+		 (last-chunk-p (= next-depth nchunks)))
+	    (multiple-value-bind (last-this-depth first-next-depth permanent-key)
+		(find-completion-btree-node-for-insert node chunk-key nil tree
+						       depth last-chunk-p)
+	      (if last-chunk-p
+		  (return (insert-into-btree-node last-this-depth chunk-key
+						  permanent-key tree
+						  string if-exists))
+		  (if (null first-next-depth)
+		      (setq node (split-completion-btree-node
+				   last-this-depth
+				   :new-depth (make-key-permanent chunk-key permanent-key
+								  tree)))
+		      (setq node first-next-depth))))
+	    (setq depth next-depth)))))))
+
+;;; This finds the place to insert based only on this chunk level
+;;; Note that to get around the left substring problem, we have to sometimes take the
+;;; second match instead of the first.
+(defun find-completion-btree-node-for-insert (top-node chunk-key
+					      permanent-chunk-key tree
+					      depth primus-inter-pares)
+  (declare (values last-this-depth first-next-depth permanent-chunk-key))
+  (let ((node top-node))
+    (loop do
+      (when (btree-node-leaf-p node)
+	(return (values node nil permanent-chunk-key)))
+      (let* ((new-node (block this-node
+			 (do-btree-elements (index key value node :from-end t)
+			   (when (string key chunk-key)
+			     (when (and primus-inter-pares
+					(plusp index)
+					(string= key
+						 (btree-node-key
+						   (- index (btree-node-modulus))
+						   node)))
+			       (return-from this-node (btree-node-value
+							(- index (btree-node-modulus))
+							node)))
+			     (return-from this-node value)))
+			 (unless primus-inter-pares
+			   (setf (btree-node-key 0 node)
+				 (make-key-permanent chunk-key permanent-chunk-key tree)))
+			 (btree-node-value 0 node))))
+	(unless (= (completion-btree-node-chunk-depth new-node) depth)
+	  ;; Need the next chunk to be able to search any more.
+	  (return (values node new-node permanent-chunk-key)))
+	(setq node new-node)))))
+
+(defun insert-into-btree-node (node chunk-key permanent-chunk-key tree value leaf-p)
+  (when (and leaf-p (not (btree-node-leaf-p node)))
+    ;; Not a leaf, this node only has inferiors of greater depth, it needs a new one
+    ;;  of the same depth.
+    (let ((new-node (make-completion-btree-node
+		      :chunk-depth (completion-btree-node-chunk-depth node))))
+      (make-key-permanent chunk-key permanent-chunk-key tree)
+      (insert-into-btree-node node chunk-key permanent-chunk-key tree new-node nil)
+      (setq node new-node)))
+  (when ( (floor (fill-pointer node) (btree-node-modulus)) *btree-branching-factor*)
+    (make-key-permanent chunk-key permanent-chunk-key tree)
+    (setq node (split-completion-btree-node node :overflow permanent-chunk-key)))
+  (block done
+    (do-btree-elements (index key ignore node)
+      (block next
+	(when (and leaf-p (string= key chunk-key))
+	  (let ((stored-value (btree-node-value index node)))
+	    (when (string-equal value stored-value)
+	      (ecase leaf-p
+		((:supersede) )
+		((:error) (zl:fsignal "The value ~S was already in the table as ~S."
+				      value stored-value)))
+	      (setf (btree-node-value index node) value)
+	      (return-from done))
+	    (unless (string-lessp value stored-value)
+	      (return-from next))))
+	(when (string key chunk-key)
+	  (make-key-permanent chunk-key permanent-chunk-key tree)
+	  (insert-into-btree-node-at-index node index permanent-chunk-key value)
+	  (when (zerop index)
+	    (setf (btree-node-key 0 node) permanent-chunk-key))
+	  (return-from done))))
+    (insert-into-btree-node-at-index node (fill-pointer node)
+				     (make-key-permanent chunk-key permanent-chunk-key tree)
+				     value))
+  nil)
+
+(defun insert-into-btree-node-at-index (node index key value)
+  (loop for wp downfrom (fill-pointer node) by (btree-node-modulus) above index
+	as rp = (- wp (btree-node-modulus))
+	do (setf (btree-node-key wp node) (btree-node-key rp node))
+	   (setf (btree-node-value wp node) (btree-node-value rp node)))
+  (setf (btree-node-key index node) key)
+  (setf (btree-node-value index node) value)
+  (incf (fill-pointer node) (btree-node-modulus)))
+
+;;; :overflow -- normal b tree thing, split in half.
+;;; :new-depth -- this leaf node needs a new inferior of a greater depth.
+;;;   we in fact need to make up to three inferiors, for the two halves of the
+;;;   old stuff and the new empty one in the middle.
+;;; chunk-key must be permanent, which doesn't hurt, since even if we
+;;; don't use it someone will in the new node we make.
+(defun split-completion-btree-node (node why chunk-key)
+  (let ((node-depth (completion-btree-node-chunk-depth node))
+	(node-leaf-p (btree-node-leaf-p node))
+	(node-fill-pointer (fill-pointer node)))
+    (ecase why
+      (:overflow
+	(let* ((into-1 (floor node-fill-pointer 2))
+	       (into-2 (- node-fill-pointer into-1))
+	       (node-1 (make-completion-btree-node :fill-pointer into-1
+						   :chunk-depth node-depth
+						   :leaf-p node-leaf-p))
+	       (node-2 (make-completion-btree-node :fill-pointer into-2
+						   :chunk-depth node-depth
+						   :leaf-p node-leaf-p)))
+	  (copy-array-portion node 0 into-1 node-1 0 into-1)
+	  (copy-array-portion node into-1 node-fill-pointer node-2 0 into-2)
+	  (setf (btree-node-value 0 node) node-1)
+	  (setf (btree-node-value (btree-node-modulus) node) node-2)
+	  (setf (btree-node-leaf-p node) nil)
+	  (setf (fill-pointer node) (* (btree-node-modulus) 2))
+	  (let ((key-1 (btree-node-key 0 node)))
+	    (when (string> key-1 chunk-key)
+	      (setf (btree-node-key 0 node) chunk-key)))
+	  (let ((key-2 (btree-node-key 0 node-2)))
+	    (setf (btree-node-key (btree-node-modulus) node) key-2)
+	    (if (string key-2 chunk-key) node-2 node-1))))
+      
+      (:new-depth
+	(assert node-leaf-p)
+	(let* ((index (block index
+			(do-btree-elements (index key ignore node :from-end t)
+			  (when (string key chunk-key)
+			    (return-from index (+ index (btree-node-modulus)))))
+			0))
+	       (into-2 (- node-fill-pointer index))
+	       (node-1 nil)
+	       (new-node (make-completion-btree-node :fill-pointer 0
+						     :chunk-depth (1+ node-depth)
+						     :leaf-p t))
+	       (node-2 nil))
+	  (when (plusp index)
+	    (setq node-1 (make-completion-btree-node :fill-pointer index
+						     :chunk-depth node-depth
+						     :leaf-p node-leaf-p))
+	    (copy-array-portion node 0 index node-1 0 index))
+	  (when (plusp into-2)
+	    (setq node-2 (make-completion-btree-node :fill-pointer into-2
+						     :chunk-depth node-depth
+						     :leaf-p node-leaf-p))
+	    (copy-array-portion node index node-fill-pointer node-2 0 into-2))
+	  (let ((index 0))
+	    (when node-1
+	      (setf (btree-node-key index node) (btree-node-key 0 node-1))
+	      (setf (btree-node-value index node) node-1)
+	      (incf index 2))
+	    (setf (btree-node-key index node) chunk-key)
+	    (setf (btree-node-value index node) new-node)
+	    (incf index 2)
+	    (when node-2
+	      (setf (btree-node-key index node) (btree-node-key 0 node-2))
+	      (setf (btree-node-value index node) node-2)
+	      (incf index 2))
+	    (setf (btree-node-leaf-p node) nil)
+	    (setf (fill-pointer node) index)
+	    new-node))))))
+
+;;; Parser interface
+(defun completion-btree-complete-input (stream tree &rest options)
+  (apply #'complete-input stream
+	 (lambda (string action)
+	   (completion-btree-complete string tree action))
+	 options))
+
+(defun completion-btree-complete (string tree &optional (action :complete))
+  (let ((delimiters (completion-btree-delimiters tree)))
+    (suggestion-completer-internal string
+			 (lambda (string function)
+			   (map-over-completion-btree-possible-completions string delimiters
+									   tree function))
+			 :delimiters delimiters
+			 :action action)))
+
+||#
+
+;;;; Tests
+#||
+(defun test-breaking (string &optional (delimiters *standard-completion-delimiters*))
+  (with-string-broken-into-completion-chunks (chunks nchunks chunk-delimiters
+						     string delimiters)
+    (dotimes (i nchunks)
+      (format t "~&~D: ~S ~S~%" i (aref chunks i) (aref chunk-delimiters i)))))
+
+(test-breaking "foo-bar")
+(test-breaking "foo-bar-")
+
+(defun verify-completion-btree (tree)
+  (declare (compiler:inhibit-style-warnings t))	;I know about the BREAK's in here.
+  (let ((delimiters (completion-btree-delimiters tree)))
+    (labels ((verify-internal (node previous-keys)
+	       (let ((leaf-p (btree-node-leaf-p node))
+		     (depth (completion-btree-node-chunk-depth node)))
+		 (let ((previous-key (when (and previous-keys
+						(= depth (first previous-keys)))
+				       (second previous-keys))))
+		   (do-btree-elements (index key value node)
+		     (cond ((zerop index)
+			    (unless (or (null previous-key)
+					(string= key previous-key))
+			      (break "~&First key in ~S|~D, for ~S was ~S, superior ~S.~%"
+				     node index value key previous-key)))
+			   #||
+			   ((string= key previous-key)
+			    (let ((previous-node (btree-node-value (- index
+								      (btree-node-modulus))
+								   node)))
+			      (unless (and (not leaf-p)
+					   (= (completion-btree-node-chunk-depth value)
+					      (1+ depth)))
+				(break "~&Equal key in ~S|~D, for ~S was ~S, previous ~S."
+				       node index value key previous-node))))
+			   ||#
+			   ((string< key previous-key)
+			    (break "~&Key ~S less than previous in ~S|~D, for ~S was ~S."
+				   key node index value previous-key)))
+		     (unless (eq leaf-p (stringp value))
+		       (break "~&Value in ~S|~D was ~S, but this is~:[ not~] a leaf node."
+			      node index value leaf-p))
+		     (if leaf-p
+			 (with-string-broken-into-completion-chunks (chunks nchunks nil
+									    value delimiters)
+			   (unless (string= (aref chunks (1- nchunks)) key)
+			     (break "~&Key for ~S in ~S|~D, ~S, doesn't match chunk ~S."
+				     value node index (aref chunks (1- nchunks)) key))
+			   (loop for (depth key) on previous-keys by 'cddr
+				 do (unless (string key (aref chunks depth))
+				      (break "~&Chunk ~S for ~S in ~S|~D doesn't match ~S."
+					     (aref chunks depth) value node index key))))
+			 (with-stack-list* (keys depth key previous-keys)
+			   (verify-internal value keys)))
+		     (setq previous-key key))))))
+      (verify-internal tree nil))))
+
+;;; Look, but don't search.
+(defun find-string-in-btree (string tree)
+  (labels ((find-internal (node)
+	     (let ((leaf-p (btree-node-leaf-p node)))
+	       (do-btree-elements (index ignore value node)
+		 (if leaf-p
+		     (when (string-equal value string)
+		       (return-from find-string-in-btree node))
+		     (find-internal value))))))
+    (find-internal tree)))
+
+(defun show-btree-all-contents (tree)
+  (labels ((show-internal (node depth)
+	     (let ((leaf-p (btree-node-leaf-p node)))
+	       (do-btree-elements (index key value node)
+		 (format t "~&~v@T~A ~S." depth key value)
+		 (unless leaf-p
+		   (show-internal value (1+ depth)))))))
+    (show-internal tree 0)))
+
+(defun watch-for-disappearing-string (string strings tree)
+  (unless (member string strings :test #'string-equal)
+    (error "String wasn't in the list."))
+  (let ((inserted-p nil)
+	(last-known-whereabouts nil))
+    (dolist (name strings)
+      (when (string-equal name string)
+	(setq inserted-p t))
+      (completion-btree-insert name tree)
+      (when inserted-p
+	(let ((now (find-string-in-btree string tree)))
+	  (unless now
+	    (break "Disappeared; last known whereabouts: ~S." last-known-whereabouts))
+	  (setq last-known-whereabouts now))))))
+
+(defun test-insertions (keys &optional (delimiters *standard-completion-delimiters*)
+				       (check-each-time nil))
+  (let ((tree (make-completion-btree :delimiters delimiters)))
+    (flet ((check (up-to)
+	     (verify-completion-btree tree)
+	     (loop for list first keys then (cdr list) until (eq list up-to)
+		   as key = (first list) do
+	       (unless (find-string-in-btree key tree)
+		 (break "The string ~S didn't make it into the tree." key)))
+	     (loop for list first keys then (cdr list) until (eq list up-to)
+		   as key = (first list) do
+	       (unless (string= (completion-btree-complete (string-upcase key) tree) key)
+		 (break "The key ~S didn't complete correctly." key)))))
+      (loop for (key . up-to) on keys do
+	(completion-btree-insert key tree)
+	(when check-each-time
+	  (check up-to)))
+      (check nil))
+    tree))
+
+(test-insertions '("aaa" "bbb" "ccc") "-")
+(test-insertions '("aaa" "aaa") "-")
+(test-insertions '("foo-bar" "foo-bar") "-")
+(test-insertions '("foo-bar" "bar") "-")
+(test-insertions '("foo-bar" "foo") "-")
+(test-insertions '("foo-bar" "foo" "foo-bar") "-")
+(test-insertions '("foo" "foo-bar" "foo") "-")
+(test-insertions '("foo-bar" "-") "-")
+(test-insertions '("foo-bar" "foo-bar1" "foo-bar2") "-")
+(test-insertions '("foo-bar" "foo-bar1" "foo-bar2" "foo-bar") "-")
+(test-insertions '("foo-bar" "fox-bar" "xxx-bar" "yyy-bar" "bar" "qqq-www" "fot-bar") "-")
+
+(defun completion-btree-lookup (string tree)
+  (let ((result nil))
+    (map-over-completion-btree-possible-completions string
+						    (completion-btree-delimiters tree)
+						    tree
+						    (lambda (value) (push value result)))
+    result))
+
+(defun test-lookups (keys delimiters tests)
+  (fresh-line)
+  (let ((tree (test-insertions keys delimiters)))
+    (let ((results (loop for test in tests
+			 collect (completion-btree-lookup test tree))))
+      (formatting-table ()
+	(loop for test in tests
+	      for result in results
+	      do
+	  (formatting-row ()
+	    (formatting-cell () (write-string test))
+	    (formatting-cell () (format-textual-list result #'write-string))))))
+    tree))
+
+(test-lookups '("aaa" "bbb" "zzz") "" '("a" "c" "z" ""))
+(test-lookups '("aaa" "aba" "bbb" "zzz") "" '("a" "ab"))
+(test-lookups '("aaa-bbb" "ccc-ddd" "www-uuu") "-" '("a" "a-" "-" "w"))
+(test-lookups '("foo" "foo-bar") "-" '("f" "f-"))
+(test-lookups '("foo-bar" "bar") "-" '("f" "f-"))
+(test-lookups '("foo" "foo-bar" "foo-bar") "-" '("f" "f-"))
+
+(defun make-test-completer (keys mode delimiters)
+  (ecase mode
+    (:raw
+      (lambda (string action)
+	(suggestion-completer (string :delimiters delimiters :action action)
+	  (dolist (key keys)
+	    (suggest key)))))
+    (:btree
+      (let ((btree (test-insertions keys delimiters)))
+	(lambda (string action)
+	  (completion-btree-complete string btree action))))
+    (:zwei
+      (let ((alist (loop for key in keys
+			 collect (list key key))))
+	(lambda (string ignore)
+	  (zwei:complete-string string alist (coerce delimiters 'list)))))))
+
+(defun test-completer (keys tests &optional (mode :raw) (delimiters "- "))
+  (format t "~&~A: " mode)
+  (format-textual-list keys #'write-string)
+  (terpri)
+  (let ((completer (make-test-completer keys mode delimiters)))
+    (formatting-table ()
+      (formatting-column-headings ()
+	(with-underlining ()
+	  (with-character-face (:italic)
+	    (formatting-cell () "Input")
+	    (formatting-cell () "Limited")
+	    (formatting-cell () "Full")
+	    (formatting-cell () "Maximal")
+	    )))
+      ;(flet ((write-string-in-quotes (string) (format t "\"~A\"" string)))
+      (macrolet ((write-string-in-quotes (string) `(format t "\"~A\"" ,string)))
+	(dolist (test tests)
+	  (formatting-row ()
+	    (formatting-cell ()
+	      (write-string-in-quotes test))
+	    (dolist (action '(:complete-limited :complete :complete-maximal))
+	      (formatting-cell ()
+		(write-string-in-quotes (funcall completer test action))))))))))
+
+(test-completer '("foo-bar" "fortz" "barfo" "www-uuu") '("f" "b" "f-" "-"))
+
+(defvar *standard-screw-keys* '(("aa-bb-cc" "aa-cc-bb" "xx-yy-zz")
+				("aa-bb-cc" "aa-dd-cc" "xx-yy-zz")
+				("aa-bb-cc" "aaa-bb-cc" "xx-yy-zz")
+				("aa-bb-cc" "aa.bb-cc" "xx-yy-zz")))
+(defvar *standard-screw-inputs* '("" "a" "a-" "a." "a--" "x"))
+(defvar *standard-screw-delimiters* "-. ")
+
+(defun show-standard-screws ()
+  (dolist (keys *standard-screw-keys*)
+    (dolist (mode '(:raw :zwei))
+      (test-completer keys *standard-screw-inputs* mode *standard-screw-delimiters*))))
+
+(defun test-standard-screws ()
+  (dolist (keys *standard-screw-keys*)
+    (let ((raw-completer (make-test-completer keys :raw *standard-screw-delimiters*))
+	  (zwei-completer (make-test-completer keys :zwei *standard-screw-delimiters*)))
+      (dolist (input *standard-screw-inputs*)
+	(let ((raw-result (funcall raw-completer input :complete))
+	      (zwei-result (funcall zwei-completer input :complete)))
+	  (unless (string-equal raw-result zwei-result)
+	    (format t "~&For input ~S with set ~S.  RAW: ~S.  ZWEI: ~S.~%"
+		    input keys raw-result zwei-result)))))))
+
+(defun test-completion-input (keys)
+  (accept `(member . ,keys)))
+
+(dolist (keys '(("aa-bb-cc" "aa-cc-bb" "xx-yy-zz")
+		("aa-bb-cc" "aa-dd-cc" "xx-yy-zz")))
+  (test-completion-input keys))
+
+(defun test-pkg-insertions (pkg)
+  (let ((tree (make-completion-btree)))
+    (do-symbols (sym pkg)
+      (completion-btree-insert (symbol-name sym) tree))
+    (verify-completion-btree tree)
+    tree))
+
+(setq tr (test-pkg-insertions "DW"))
+;;; .016(.057 disk) sec first time, .0016 second time
+(time (intern "BRAND-NEW-SYMBOL-001" "DW") t)
+;;; .025(.052 disk) sec first time, .011 second time
+(time (completion-btree-insert "BRAND-NEW-SYMBOL-001" tr) t)
+;;; .088 secs
+(time (completion-btree-complete "d-p-t" tr) t)
+
+(define-presentation-type completion-btree (() &key tree)
+   :parser ((stream)
+	    (completion-btree-complete-input stream tree
+					     :space-complete t :force-complete t
+					     :error-type 'completion-btree)))
+
+(defun test-aarray-insertions (aarray)
+  (let ((tree (make-completion-btree)))
+    (loop for (key) being the array-elements of aarray do
+      (completion-btree-insert key tree))
+    (verify-completion-btree tree)
+    tree))
+
+(setq tr (test-aarray-insertions sage:*sage-completion-aarray*))
+
+;;; .688419(.110)
+(time (zwei:complete-string "t l m" sage:*sage-completion-aarray* zwei:*completing-delims*)
+      t)
+;;; .140
+(time (zwei:complete-string "the lisp machine" sage:*sage-completion-aarray*
+			    zwei:*completing-delims*)
+      t)
+;;; .64029(.005)
+(time (completion-btree-complete "t l m" tr) t)
+;;; .147
+(time (completion-btree-complete "the lisp machine" tr) t)
+
+;;; .557571 first time, .003312 when already in.
+(time (let ((zwei:*zmacs-completion-aarray* sage:*sage-completion-aarray*))
+	(zwei:section-completion 'foo "A Brand New Topic"))
+      t)
+;;; .110531 first time, .013174 when already in.
+(time (completion-btree-insert "A Brand New Topic" tr) t)
+
+||#

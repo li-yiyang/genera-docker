@@ -1,0 +1,1873 @@
+;;; -*- Mode: Lisp; Syntax: Common-Lisp; Package: TCP; Base: 10; Lowercase: Yes -*-
+;; Transmission Control Protocol -- control proper
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+#|
+
+Cast of characters, in order of appearance:
+
+External interactions:
+    Interaction with IP (:receive-ip-packet)
+    Interaction with network system (:enable, :reset, :packet-buffer-panic, define-server)
+Simple things:
+    Segment management
+    TCB management
+    Segment/TCB management (free-all-xxx-segs)
+Output:
+    Cause a segment to be transmitted
+    send various types of segments for a TCB
+    User level state change functions
+    User level output
+Input:
+    User level input
+    input processing utilities
+    server starter
+    GDF input (procedural) state machine
+Background:
+    Retransmitter
+    Top level
+
+|#
+
+;; The protocol
+
+(defmethod (:receive-ip-packet tcp-protocol) (seg total-length source destination)
+  (neti:with-network-packet (seg)
+    (let ((start (lsh (seg-data-offset seg) 2)))	;in bytes
+      (alter-tcp-segment-leader seg
+				:source-address source
+				:destination-address destination
+				:start start :length (+ (- total-length start)
+							(seg-syn seg) (seg-fin seg)))
+      (when *record-tcp-debugging-info* (record-tcp-segment-header seg :in))
+      (cond ((not *tcp-enable*) (ip-return-packet seg))
+	    ((or (< start 20.) (> start total-length))
+	     (incf *segs-in-bad-data-offset*)
+	     (ip-return-packet seg))
+	    ((ip-check-checksum seg 0 16 total-length source destination
+				protocol-number total-length)
+	     (incf *segs-in-bad-checksum*)	;the global total
+	     (incf checksum-errors)		;the instance variable
+	     (ip-return-packet seg))
+	    (T
+	     (alter-tcp-segment-leader seg
+				       :link T
+				       :bound total-length
+				       :time-transmitted 0
+				       :times-transmitted 0
+				       :allocated T
+				       :output-state NIL)
+	     (incf *segs-given-out*)
+	     (incf *segs-in*)
+	     (if (> start 20.) (incf *segs-in-with-options*))
+	     (send self :receive-tcp-segment seg))))))
+(defmethod (:enable tcp-protocol) ()
+  (without-interrupts				;just to make sure
+    (setq *tcp-protocol* self)
+    (setq *last-tcp-retransmit-time* (zl:time))
+    (setq *last-tcp-idle-probe-time* (zl:time))
+    (setq *tcp-enable* t)
+    (process:enable-run-reason *tcp-background*)
+    (process:wakeup *tcp-background*)
+    (reset-tcp-background-timer 0)))
+(defmethod (:disable tcp-protocol) ()
+  (without-interrupts
+    (setq *tcp-enable* nil)
+    (process:disable-run-reason *tcp-background*)))
+(defmethod (:reset tcp-protocol) ()
+  (process:with-no-other-processes
+    (send self :disable)
+    (dolist (tcb *tcb-list*)
+      (let ((stream (tcb-user-stream tcb)))
+	(when stream
+	  (setf (tcb-state tcb) :closing)
+	  (send stream :close :abort)))
+      (reset-tcb tcb :resetting-tcp))
+    (setq *tcb-list* nil)
+    (map-tcp-segments #'(lambda (seg)
+			  (when (seg-allocated seg)
+			    (incf *segs-given-back*)
+			    (setf (seg-allocated seg) nil)))))
+  (process:reset *tcp-background*))
+
+(defmethod (:packet-buffer-panic tcp-protocol) ()
+  (process:with-no-other-processes
+    (dolist (tcb *tcb-list*)
+      (free-all-received-segs tcb))))
+
+
+  ;;
+;;;;;;  TCP packet allocation and freeing
+  ;;
+
+(defun get-tcp-segment (tcb &optional no-wait-p)
+  (multiple-value-bind (seg bound)
+      (ip-get-packet (and tcb (tcb-route tcb)) no-wait-p
+		     'sys:art-8b 0
+		     tcp-segment-leader-size 'tcp-segment-header)
+    (when seg
+      (neti:with-network-packet (seg)
+	(si:fill-array seg 20 0)		;clear out header
+	(without-interrupts
+	  (incf *segs-given-out*)
+	  (alter-tcp-segment-header seg :data-offset 5.)
+	  (alter-tcp-segment-leader seg
+				    :link T
+				    :start 20.
+				    :length 0
+				    :bound bound
+				    :time-transmitted 0
+				    :times-transmitted 0
+				    :allocated (or tcb t))
+	  (setf (seg-sequence seg) (or (and tcb (tcb-next-send-seq tcb))
+				       0))))
+      seg)))
+
+(defun return-tcp-segment (seg)
+  (without-interrupts
+    (when (seg-allocated seg)			;Don't free it if it has already
+						;been freed (e.g., by (neti:reset) 
+      (setf (seg-allocated seg) nil)
+      (setf (seg-output-state seg) nil)
+      (incf *segs-given-back*)
+      (ip-return-packet seg))))
+
+(defun tcp-segment-string (seg)
+  (let ((string (neti:get-sub-packet seg 'sys:art-string (seg-start seg))))
+    (setf (fill-pointer string) (seg-length-data-only seg))
+    string))
+
+(defun map-tcp-segments (function &rest other-function-args)
+  (declare (sys:downward-funarg function))
+  (neti:map-sub-packets
+    #'(lambda (sub-packet named-structure-symbol function other-function-args)
+	(ignore named-structure-symbol)
+	(when (typep sub-packet 'tcp-segment-header)
+	  (apply function sub-packet other-function-args)))
+    function
+    other-function-args))
+
+
+(defun make-tcb (network protocol route host address port local-address local-port
+		 &aux tcb)
+  D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; network is the IP-protocol instance
+0  (process:with-no-other-processes
+    (cond ((setq tcb (pop *free-tcb-list*))
+	   (copy-array-contents *prototype-tcb* tcb))
+	  (T (setq tcb (make-tcb-internal))
+	     (incf *tcbs-made*)))
+    (unless route (setq route (send network :route-to-address address)))
+    (let ((tcb tcb))
+      (declare (sys:array-register tcb))
+      (when (null local-port)
+	(setq local-port
+	      (loop do (incf *last-gensym-port-number*)
+		    as number = *last-gensym-port-number*
+		    do (cond ((loop for existing-tcb in *tcb-list*
+				    thereis (= number (tcb-local-port existing-tcb))))
+			     ((and ( 1_10. number) (< number 1_16.))
+			      (return number))
+			     (T (setq *last-gensym-port-number* 1_10.))))))
+      ;; C.f, RFC879:  this is the best we can assume given no other
+      ;; information
+      (let* ((max-seg-size (compute-max-seg-size route))
+	     (mss (min (- *ip-default-max-packet-size* 40)
+		       ;; but don't exceed out own max!
+		       max-seg-size)))
+	(alter-tcb tcb
+		   :protocol protocol
+		   :network network
+		   :route route
+		   :foreign-host host
+		   :foreign-address address
+		   :foreign-port port	       
+		   :local-address local-address
+		   :local-port local-port
+		   :local-window-size (or *default-window-size*
+					  (* *max-segs-outstanding* max-seg-size))
+		   :max-seg-size mss
+		   :time-last-received (zl:time)
+		   :current-retransmission-delay *tcp-retransmit-interval*
+		   :congestion-window mss
+		   :slow-start-threshold nil
+		   :retransmissions 0
+		   ))
+      (push tcb *tcb-list* :area neti:network-cons-area)
+      (incf *tcbs-released*)))
+    (process:wakeup *tcp-background*)
+  tcb)
+
+(defun remove-tcb (tcb)
+  (process:with-no-other-processes
+    (setf (tcb-state tcb) :closed)
+    (setf (tcb-substate tcb) :inactive)
+    (setf (tcb-user-stream tcb) nil)
+    (free-all-read-segs tcb)
+    (free-all-received-segs tcb)
+    (free-all-send-segs tcb)
+    (setf (tcb-reading-process tcb) nil)
+    (setf (tcb-writing-process tcb) nil)
+    (setq *tcb-list* (delete tcb *tcb-list*))
+    (unless (member tcb *free-tcb-list*)
+      (zl:push-in-area tcb *free-tcb-list* neti:network-cons-area))
+    (incf *tcbs-returned*)
+    nil))
+
+(defun tcb-travel-through-states (tcb whostate timeout &rest states
+				  &aux (start-time (zl:time)))
+  (or whostate (setq whostate "TCP Net Wait"))
+  (loop named top
+	for state in states
+	do (loop until (neq (tcb-state tcb) state)
+		 do (when timeout
+		      (when ( (time-difference (zl:time) start-time) timeout)
+			(return-from top nil)))
+		 do (process-wait whostate
+			#'(lambda (tcb state start-time timeout)
+			    (or (neq (tcb-state tcb) state)
+				(and timeout
+				     ( (time-difference (zl:time) start-time) timeout))))
+			tcb state start-time timeout))
+	finally (return t)))
+(defun tcb-wakeup-reader (tcb)
+  (let ((reader (tcb-reading-process tcb)))
+    (when reader
+      (process:wakeup reader))))
+(defun tcb-wakeup-writer (tcb)
+  (let ((writer (tcb-writing-process tcb)))
+    (when writer
+      (process:wakeup writer))))
+
+  ;;
+;;;;;;  Simple tcb/segment interactions.
+  ;;
+
+;;; Free a list of segments linked through seg-link.  This function should
+;;; be called with interrupts off, since an abort would cause a failure to
+;;; free all the segmentss.  Before interrupts are turned back on, all
+;;; previous pointers to the segments should have been nullified.  This
+;;; routine is used mainly by the three funcitons that follow it.
+
+(defun free-segment-list (seg-list)
+  (loop as seg = seg-list then next
+	while seg
+	as next = (seg-link seg)
+	do (return-tcp-segment seg)))
+
+(defun free-all-read-segs (tcb)
+  (without-interrupts
+    (free-segment-list (prog1 (tcb-read-segs tcb)
+			      (alter-tcb tcb
+					 :read-segs nil
+					 :read-segs-last nil
+					 :read-segs-length 0)))))
+
+(defun free-all-received-segs (tcb)
+  (without-interrupts
+    (free-segment-list (prog1 (tcb-received-segs tcb)
+			      (setf (tcb-received-segs tcb) nil)))))
+
+(defun free-all-send-segs (tcb)
+  (without-interrupts
+    (free-segment-list (prog1 (tcb-send-segs tcb)
+			      (alter-tcb tcb
+					 :send-segs nil
+					 :send-segs-last nil
+					 :send-segs-length 0)))))
+
+  ;;
+;;;;;;  Output.
+  ;;
+
+(defmethod (:transmit-tcp-segment tcp-protocol) (seg total-length route)
+  (neti:with-network-packet (seg)
+    (unless (neti:packet-being-transmitted seg)
+      (setf (seg-data-offset seg) (lsh (seg-start seg) -2))
+      (let* ((source (seg-source-address seg))
+	     (destination (seg-destination-address seg))
+	     (free-flag (eq (seg-link seg) t)))
+	(when *record-tcp-debugging-info*
+	  (record-tcp-segment-header seg :out))
+	(ip-set-checksum seg 0 (get-structure-offset-inline tcp-segment-header checksum-high)
+			 total-length
+			 source destination
+			 tcp-protocol-number
+			 total-length)
+	(when (zerop (seg-times-transmitted seg))
+	  (setf (seg-time-transmitted seg) (zl:time)))
+	(incf (seg-times-transmitted seg))
+	(incf *segs-transmitted*)
+	(when free-flag
+	  (setf (seg-allocated seg) nil)
+	  (incf *segs-given-back*))
+	(cond (*tcp-enable* (send self :transmit-ip-packet
+				  seg total-length
+				  route source destination
+				  free-flag))
+	      (free-flag (return-tcp-segment seg)))))))
+
+(defun transmit-seg-for-tcb (tcb seg &aux total-length)
+  ;; use with-preemption-disabled
+    (let ((tcb tcb)
+	  (seg seg))
+      (declare (sys:array-register tcb seg))
+      (process:with-no-other-processes				;no funny business
+    
+	(setq total-length
+	      (+ (seg-start seg) (- (seg-length seg) (seg-syn seg) (seg-fin seg))))
+    
+	;; fill in the ports
+	(setf (seg-source-address      seg) (tcb-local-address   tcb))
+	(setf (seg-source-port	   seg) (tcb-local-port	     tcb))
+	(setf (seg-destination-address seg) (tcb-foreign-address tcb))
+	(setf (seg-destination-port	   seg) (tcb-foreign-port    tcb))
+    
+	;; set the ack bit if it is valid
+	(let ((received (tcb-seq-num-received tcb)))
+	  (when received			;maybe not established yet
+	    (setf (seg-acknowledge seg) received)
+	    (setf (seg-window seg)
+		  (max 0 (seq-num-difference (tcb-seq-num-limit tcb) received)))
+	    (setf (seg-ack seg) 1)
+	    (setf (tcb-seq-num-acked tcb) received)
+	    (when (let ((seg-seq (seg-sequence seg))
+			(advert (tcb-send-seq-advert tcb))
+			(seg-length (seg-length seg)))
+		    ;; segment is expected to be acceptable if
+		    ;; (a) some part of it is in the window, or
+		    ;; (b) the segment has no data and is at the top of the window
+		    ;; This is needed because zero window probes are
+		    ;; completely ignored, and we piggy-back the ack here
+		    ;; instead of immediately ACKing out of bounds segments.
+		    (or (null advert)
+			(seq-num-compare seg-seq < advert)
+			(and (zerop seg-length)
+			     (seq-num-compare seg-seq = advert))))
+	      (setf (tcb-needs-acking tcb) nil))))
+    
+	;; set the urgent pointer, if it is set 
+	;; (try to save some hairy arithmetic while testing)
+	(let (urgent seq diff)
+	  (when (and (setq urgent (tcb-send-urgent-pointer tcb))
+		     (seq-num- urgent (setq seq (seg-sequence seg)))
+		     (< (setq diff (seq-num-difference urgent seq)) 1_16.))
+	    (setf (seg-urgent seg) diff)
+	    (setf (seg-urg seg) 1)))
+    
+	;; finally send it on its way
+	(send (tcb-protocol tcb) :transmit-tcp-segment seg total-length (tcb-route tcb)))))
+
+(defun retransmit-seg-for-tcb (tcb seg)
+  (incf *segs-retransmitted*)
+  (incf (tcb-retransmissions tcb))
+  (transmit-seg-for-tcb tcb seg))
+
+
+
+(defun send-data-seg-for-tcb (tcb seg &optional push-p urgent-p &aux mark)
+  (let ((tcb tcb)
+	(seg seg))
+      (declare (sys:array-register tcb seg))
+      (process:with-no-other-processes		;no funny business
+    
+	;; update snd.nxt and snd.wnd
+	(let* ((snd.nxt (seq-num-sum (seg-sequence seg) (seg-length seg)))
+	       (snd.wnd (seq-num-difference (tcb-send-seq-limit tcb) snd.nxt)))
+	  (setf (tcb-next-send-seq tcb) snd.nxt)
+	  (setf (tcb-send-window tcb) snd.wnd))
+    
+	;; if user is requesting urgent, set the slot in the TCB.  Will get
+	;; put on output segments during transmit 
+	(when urgent-p
+	  (setf (tcb-send-urgent-pointer tcb)
+		(seq-num-difference (tcb-next-send-seq tcb) 1)))
+    
+	(cond ((zerop (seg-length seg))
+	       ;; No point in sending a zero-length segment.
+	       (return-tcp-segment seg))
+	  
+	      (t	
+	       ;; if user is requesting push, set it in this segment
+	       (when push-p
+		 (setf (seg-psh seg) 1))
+	   
+	       ;; add the segment to the output queue
+	       (case (seg-output-state seg)
+		 ((nil :user-only)
+		  (setf (seg-output-state seg) :tcb-only)
+		  (setf (seg-link seg) nil)	;is on a transmit list (the end)
+		  (cond ((tcb-send-segs tcb)
+			 (setf (seg-link (tcb-send-segs-last tcb)) seg))
+			(T (setf (tcb-send-segs tcb) seg)
+			   ;; chain was empty, need to reinit some slots
+			   (let ((now (zl:time)))
+			     (setf (tcb-time-last-received tcb) now)
+			     (setf (tcb-last-retransmit-time tcb) now))
+			   (setq mark t)
+			   ))
+		  (setf (tcb-send-segs-last tcb) seg)
+		  (incf (tcb-send-segs-length tcb)))
+		 (:tcb-and-user			;user added data
+		   ;;don't requeue, but do change its state
+		   (setf (seg-output-state seg) :tcb-only
+			 (seg-times-transmitted seg) 0))
+		 (otherwise (tcp-implementation-error t
+						      "Attempt to send data segment ~S, which has a bad output state"
+						      seg)))
+	   
+	       ;; send it through the TCB
+						;in case user added data
+						;while still on a transmit list.
+	       (if (neti:packet-being-transmitted seg)
+		   ;; if there's still room, then we'll just not send it, because we'll probably
+		   ;; get another chance.
+		   ;; but, if there isn't room, loop *now* so we don't have to wait retransmit
+		   ;; interval before it ever gets sent.
+		   #+3600
+		   (when ( (+ (seg-start seg) (seg-length seg))
+			    (min (seg-bound seg) (+ (seg-start seg) (tcb-max-seg-size tcb))))
+		     (loop while (neti:packet-being-transmitted seg))
+		     (transmit-seg-for-tcb tcb seg))
+		   #+IMach 
+		   ;; it's not the microcode we're waiting for, but another lisp
+		   ;; process, which will never run since we're inside of a
+		   ;; without-preemption.  Just accept defeat and return.
+		   nil
+		   (transmit-seg-for-tcb tcb seg))
+	       ;; update retransmit time, if this is new on the list
+	       (when mark
+		 (mark-tcb-for-later-retransmission tcb))
+	       
+	       )))))
+
+
+
+
+(defun send-syn-for-tcb (tcb seg new-state &optional new-substate)
+  (let ((seg seg)
+	(tcb tcb))
+    (declare (sys:array-register seg tcb))
+    (multiple-value-bind (iss)
+	(initialize-tcb-send-side tcb)
+      (setf (seg-sequence seg) iss)
+      (setf (seg-flags seg) seg-flag-syn-bit)
+      (setf (seg-length seg) 1)
+    
+      ;;kludge
+      (setf (seg-start seg) (+ 20. 4))
+      ;; per RFC879, we send our capability (even though the tcb may
+      ;; have a different, default, value for now)
+      (loop with max-seg-size = (compute-max-seg-size (tcb-route tcb))
+	    for byte in `(2 4 ,(ldb (byte 8 8) max-seg-size) ,(ldb (byte 8 0) max-seg-size))
+	    for idx upfrom 20.
+	    do (setf (aref seg idx) byte))
+    
+      (without-interrupts
+	(setf (tcb-state tcb) new-state)
+	(when new-substate (setf (tcb-substate tcb) new-substate))
+	(send-data-seg-for-tcb tcb seg)))))
+
+(defun compute-max-seg-size (route)
+  (multiple-value-bind (pkt len)
+      (ip-get-packet route t)
+    (if pkt
+	(progn (ip-return-packet pkt)
+	       (- len 40))
+	;; C.f, RFC879 for the logic behind 40
+	(- *ip-default-max-packet-size*  40))))
+
+;; this could use some cleaning up.
+(defun send-fin-for-tcb (tcb seg &aux (state (tcb-state tcb)))
+  (if (member state '(:syn-received :established :close-wait))
+      (progn (without-interrupts
+	       (setf (tcb-state tcb)
+		     (cadr (assoc (tcb-state tcb) '((:syn-received :fin-wait-1)
+						   (:established  :fin-wait-1)
+						   (:close-wait   :last-ack))))))
+	     (setf (seg-flags seg) seg-flag-fin-bit)
+	     (setf (seg-length seg) 1)
+	     (send-data-seg-for-tcb tcb seg))
+    (return-tcp-segment seg)))
+
+(defun send-ack-for-tcb (tcb seg reason)
+  (let ((tcb tcb))
+    (declare (sys:array-register tcb))
+    (when *record-tcp-debugging-info*
+      (let* ((recent-tcp-send-ack-reasons *recent-tcp-send-ack-reasons* )
+	     (pos (array-leader recent-tcp-send-ack-reasons 1))
+	     (len (fill-pointer recent-tcp-send-ack-reasons)))
+	(declare (sys:array-register recent-tcp-send-ack-reasons))
+	(setf (aref recent-tcp-send-ack-reasons pos) reason)
+	(setf (array-leader recent-tcp-send-ack-reasons 1) (rem (1+ pos) len))))
+    (when seg
+      (neti:with-network-packet (seg)
+	(cond ((tcb-next-send-seq tcb)
+	       (setf (seg-sequence seg) (if (minusp (tcb-send-window tcb))
+					    (tcb-send-seq-advert tcb)
+					    (tcb-next-send-seq tcb)))
+	       (setf (seg-flags seg) 0)
+	       (setf (seg-length seg) 0)
+	       (setf (seg-link seg) t)		;declare not on transmit list
+	       (transmit-seg-for-tcb tcb seg))
+	      (t (return-tcp-segment seg)))))))
+
+(defun send-rst-for-tcb (tcb seg)
+  (when seg
+    (neti:with-network-packet (seg)
+      (let ((tcb tcb))
+	(declare (sys:array-register tcb))
+	(setf (seg-sequence seg) (if (tcb-next-send-seq tcb)
+				     (if (minusp (tcb-send-window tcb))
+					 (tcb-send-seq-advert tcb)
+					 (tcb-next-send-seq tcb))
+				     0))
+	(setf (seg-flags seg) seg-flag-rst-bit)
+	(setf (seg-length seg) 0)
+	(setf (seg-link seg) t)			;declare not on transmit list
+	(transmit-seg-for-tcb tcb seg)))))
+;;; this is a misnomer.  The best we can do is know that all our data
+;;; reached the other side.  For TCP, that is good enough.
+(defun tcp-finished-p (tcb)
+  (or (null tcb)
+      (seq-num-compare (tcb-next-send-seq tcb) = (tcb-send-seq-acked tcb))
+      (not (member (tcb-state tcb) '(:established :close-wait)))))
+
+(defun push-tcb (tcb)
+  (without-interrupts				;going to frob end of list
+    (let ((seg (tcb-send-segs-last tcb)))
+      (when seg
+	(setf (seg-psh seg) 1)
+	(retransmit-seg-for-tcb tcb seg)))))
+
+
+
+(defun check-connection-state (tcb &aux (state (tcb-state tcb))
+			       (substate (tcb-substate tcb)))
+  (case state
+    ((:established :syn-received :close-wait))	;valid states
+    ((:syn-sent :listen)
+     (reset-tcb tcb :no-response)
+     (error 'tcp-host-not-responding-during-connection :connection tcb))
+    (:closed
+     (case substate
+       (:reset (error 'tcp-connection-refused :connection tcb))
+       (:destination-unreachable
+	(error 'tcp-destination-unreachable-during-connection :connection tcb))
+       (otherwise (error 'bad-tcp-state-in-connect :connection tcb :state state))))
+    (otherwise
+     (reset-tcb tcb :bad-state)
+     (error 'bad-tcp-state-in-connect :connection tcb :state state))))
+
+(defun open-tcb (active-p host port local-port &key
+		 (wait-for-syn t) (timeout *tcp-connect-timeout*) my-address foreign-address)
+  1;; my-address and foreign-address are used by :start-open-auxiliary-stream since it
+0  1;; already has a stream open to the host and we want to make sure we use the same addresses.
+0  1;; Think about the cases where either the local host or the foreign host has more than one
+0  1;; address.
+0  (loop until *tcp-enable*
+	do (process-wait "Await TCP enabled"
+	       #'(lambda () *tcp-enable*)))
+  (when host (setq host (net:parse-host host)))
+  (check-type port (or null (integer 0 1_16.))
+	     "a TCP port number or NIL")
+  (check-type local-port (or null (integer 0 1_16.))
+	     "a TCP port number or NIL")
+  (when (and active-p (or (null host) (null port)))
+    (error "When actively opening a TCP connection ~
+	     both the foreign host and port must be specified."))
+  (let (address network route local-address protocol tcb)
+    (unwind-protect
+      (progn (cond (host
+		    ;; NB: the 'network' we want is the ip-protocol
+		    ;; network, not, e.g., the ARPANET network.
+		    ;; Therefore, for now, we get the tcp-protocol from
+		    ;; the ARPANET network, and get the ip-protocol
+		    ;; network from it!
+		    (setq network (ip-network-for-host host))
+		    (setq protocol (send network :tcp-protocol))
+		    (setq network (send protocol :network))
+		    (multiple-value-setq (route local-address address)
+		      (send network :route-to-host host))
+		    (if (and foreign-address (sys:fixnump foreign-address))
+			(setq address foreign-address))
+		    (if (and my-address (sys:fixnump my-address))
+			(setq local-address my-address)))
+		   (T
+		    (setq protocol *tcp-protocol*)
+		    (setq network (send protocol :network))))
+	     (setq tcb (make-tcb network protocol route host address port
+				 local-address local-port)
+		   local-port (tcb-local-port tcb))	;may be assigned now	     
+	     (cond (active-p
+		    (send-syn-for-tcb tcb (get-tcp-segment tcb) :syn-sent :active))
+		   (T (setf (tcb-substate tcb) :passive)
+		      (setf (tcb-state tcb) :listen)))
+	     (when wait-for-syn
+	       (complete-open-tcb tcb timeout))
+	     (prog1 tcb (setq tcb nil)))
+      (when tcb (abort-tcb tcb)))))
+
+(defun complete-open-tcb (tcb timeout)
+  ;; Wait until the connection is fully established.
+  (tcb-travel-through-states
+    tcb
+    (string-append "TCP Connect " (or (and tcb (neti:host-short-name (tcb-foreign-host tcb)))
+				      ""))
+    timeout
+    :listen :syn-sent :syn-received)
+  (check-connection-state tcb))
+
+(defparameter *tcp-close-timeout*  (* 60. 5.)	;5 seconds
+  "The time in 60ths of a second to wait for a TCP connection to close.
+Wait forever if this is set to NIL.")
+
+(defun close-tcb (tcb &optional abort-p)
+  (process:with-no-other-processes
+    (when (or (tcb-read-segs tcb)
+              (tcb-received-segs tcb))
+      ;; the theory here is that if the LispM is closing a connection, it
+      ;; is really finished with it.  There shouldn't be any input
+      ;; packets, and if there are, they will never be read.  Therefore,
+      ;; it isn't really a syncronous close.
+;     (setq abort-p t)                          ;If abort is set, we send a reset
+                                                ;in abort-tcb below -- Kalman
+      (free-all-read-segs tcb)
+      (free-all-received-segs tcb))
+    (if abort-p
+        (abort-tcb tcb)
+	(let ((completed-normally nil))
+	  (unwind-protect
+	      (case (tcb-state tcb)
+		((:listen :syn-sent)
+		 (setq completed-normally t)
+		 (remove-tcb tcb))
+		((:syn-received :established :close-wait)
+		 (setf (tcb-substate tcb) :closing)
+		 (send-fin-for-tcb tcb (get-tcp-segment tcb))
+		 ;; the lispm hangs forever here if there is no timeout  12/5/95 -- JCMa.
+		 #|(tcb-travel-through-states tcb "TCP Closing" nil
+                                        :syn-received :established :close-wait :last-ack
+                                        :fin-wait-1 :fin-wait-2 :closing)|#
+		 (tcb-travel-through-states tcb "TCP Closing" *tcp-close-timeout*
+					    :syn-received :established :close-wait :last-ack
+					    :fin-wait-1 :fin-wait-2 :closing)
+		 (unless (member (tcp::tcb-state tcb) '(:time-wait :closed))
+		   #+ignore
+		   (tv:notify nil "Old state was ~s" (tcp::tcb-state tcb))
+		   (setf (tcp::tcb-state tcb) :closed))
+		 (setq completed-normally t)
+		 (when (eq (tcb-state tcb) :closed)
+		   (remove-tcb tcb)
+		   ;; otherwise it is in :time-wait and will be removed by the background
+		   ))
+		((:fin-wait-1 :fin-wait-2) (setq completed-normally t))
+		(:closed
+		  (setq completed-normally t)
+		  (unless (eq (tcb-substate tcb) :inactive)
+		    (remove-tcb tcb)))
+		(otherwise (bad-tcp-connection-state tcb "close a connection")))
+	    (tcb-wakeup-reader tcb)
+	    (tcb-wakeup-writer tcb)
+	    (unless completed-normally
+	      (abort-tcb tcb)))))))
+
+(defun abort-tcb (tcb)
+  (process:with-no-other-processes
+    (free-all-send-segs tcb)
+    (free-all-read-segs tcb)
+    (free-all-received-segs tcb)
+    (let ((completed-normally nil))
+      (unwind-protect
+	(case (tcb-state tcb)
+	  ((:listen :syn-sent)
+	   (setq completed-normally t)
+	   (remove-tcb tcb))
+	  ((:syn-received :established :fin-wait-1 :fin-wait-2 :close-wait)
+	   (setf (tcb-state tcb) :closed)
+	   (setf (tcb-substate tcb) :aborted)
+	   (send-rst-for-tcb tcb (get-tcp-segment tcb))
+	   (setq completed-normally t)
+	   (remove-tcb tcb))
+	  ((:closing :last-ack :time-wait)
+	   (setq completed-normally t)
+	   (remove-tcb tcb)))
+	(tcb-wakeup-reader tcb)
+	(tcb-wakeup-writer tcb)
+	(unless completed-normally
+	  (incf *abnormal-tcb-aborts*)		;this shouldn't happen
+	  (remove-tcb tcb))))))
+
+
+  ;;
+;;;;;;  User level output
+  ;;
+
+(defun tcp-output-allowed-p (tcb)
+  (or (null tcb)
+      1;; Allow output if at least one seg can be sent, or (for the case
+0      1;; where the advertised window is less than a full segment) at
+0      1;; least 1/2 window can be sent.
+(2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")      0(let ((one (tcb-max-seg-size tcb))
+	    (advert (seq-num-difference (tcb-send-seq-advert tcb) (tcb-send-seq-acked tcb)))
+	    (send-window (tcb-send-window tcb)))
+	(or
+	  (and (plusp send-window)		;Still room in the window
+	       ( send-window
+		  (min one (si:%fixnum-floor advert 2))))
+	  (and *tcp-zero-window-probe-timeout*
+	       (zerop send-window)		;Allow just one more segment to be sent
+	       (< send-window (tcb-max-seg-size tcb))
+	       (time-elapsed-p *tcp-zero-window-probe-timeout*
+			       (tcb-last-retransmit-time tcb)))))
+      (not (member (tcb-state tcb) '(:established :close-wait)))
+      ))
+
+(defun get-output-segment (tcb)
+  (declare (values seg start limit))
+  (let ((seg nil) start limit)
+    ;; If we get this far, we are now allowed to send something.
+    (unless *tcp-segment-combination-disabled*
+      (without-interrupts			;maybe get old output segment
+	(setq seg (tcb-send-segs-last tcb))
+	(when seg
+	  (setq start (+ (seg-start seg) (seg-length seg)))
+	  (setq limit (min (seg-bound seg) (+ (seg-start seg) (tcb-max-seg-size tcb))))
+	  (cond ((or (= start limit)		;can't use it -- already full
+		     ;; Don't use the transmitting packet on IMach
+		     ;; (where it will be a long time before it goes out
+		     ;; again, c.f., send-data-seg-for-tcb)
+		     #+IMach
+		     (neti:packet-being-transmitted seg)		     
+		     ) (setq seg nil))
+		((eq (seg-output-state seg) :tcb-only)	;this better be so!
+		 (setf (seg-output-state seg) :tcb-and-user))
+		(T (tcp-implementation-error t
+		     "Segment ~S was found at the end of ~S's transmit list, ~@
+		    but does not have an output state of :TCB-ONLY" seg tcb))))))
+    (when (not seg)
+      (setq seg (get-tcp-segment tcb))
+      (setq start (seg-start seg))
+      (setq limit (seg-bound seg))
+      (setf (seg-output-state seg) :user-only))
+    (values seg start (min limit
+			   (+ start (let ((send-window (tcb-send-window tcb))
+					  (max-seg-size (tcb-max-seg-size tcb)))
+				      ;; If the window is zero and we
+				      ;; got here, that means the zero
+				      ;; window timeout has expired.
+				      ;; Return a whole (large) buffer.
+				      ;; Otherwise, limit it to the send
+				      ;; window.
+				      (if (not (plusp send-window))
+					  max-seg-size
+					  (min send-window max-seg-size))))))))
+
+(defun accept-tcb (tcb)
+  (case (tcb-state tcb)
+    (:listen
+     (setf (tcb-route tcb)
+	   (send (tcb-network tcb)
+		 :route-to-address (tcb-foreign-address tcb)))
+     (send-syn-for-tcb tcb (get-tcp-segment tcb) :syn-received :passive)
+     (tcb-travel-through-states tcb "TCP Accept" nil :syn-received))
+    (otherwise (bad-tcp-connection-state tcb "accept a connection"))))
+
+(defun reject-tcb (tcb)
+  (case (tcb-state tcb)
+    (:listen
+     (setf (tcb-state tcb) :closed)
+     (send-rst-for-tcb tcb (get-tcp-segment tcb))
+     (remove-tcb tcb))
+    (:closed
+     (remove-tcb tcb))					;already gone
+    (otherwise
+     (unwind-protect
+	 (bad-tcp-connection-state tcb "reject a connection")
+       (abort-tcb tcb)))))
+
+;;; The only thing stopping us from sending the segment is the TCB being
+;;; closed.  We don't block for output room here; that was done when the
+;;; segment was requested.
+(defun send-data-segment (tcb seg &optional push-p urgent-p)
+  (unwind-protect
+    (if (not (member (tcb-state tcb) '(:established :close-wait)))
+	(bad-tcp-connection-state tcb "send a segment to")
+      (send-data-seg-for-tcb tcb (prog1 seg (setq seg nil)) push-p urgent-p))
+    (when seg (return-tcp-segment seg))))
+
+
+  ;;
+;;;;;;  User level input
+  ;;
+
+(defun tcp-data-available (tcb)
+  (or (null tcb)
+      (not (null (tcb-read-segs tcb)))
+      (not (member (tcb-state tcb) '(:established :fin-wait-1 :fin-wait-2)))))
+
+(defun tcb-advance-advertised-window (tcb rcv.red rcv.wnd)
+  (setf (tcb-seq-num-limit tcb) (seq-num-sum rcv.red rcv.wnd))
+  (setf (tcb-advance-window-threshold tcb)
+	(seq-num-sum rcv.red (lsh (+ rcv.wnd rcv.wnd rcv.wnd) -3)))	;3/8ths
+  nil)
+
+(defun get-next-read-segment (tcb &aux seg)
+  (declare (values seg start end))
+  ;; try to get a segment
+  (process:with-no-other-processes
+    (setq seg (tcb-read-segs tcb))
+    (when seg
+      (setf (tcb-read-segs tcb) (seg-link seg))
+      (decf (tcb-read-segs-length tcb))
+      (when (null (tcb-read-segs tcb))
+	(setf (tcb-read-segs-last tcb) nil))))
+  1;; Process critical stuff done, allow scheduling and do the rest of our processing
+0  (when seg
+    (let* ((seg.seq (seg-sequence seg))
+	   (rcv.red (tcb-seq-num-read tcb))
+	   (offset (seq-num-difference rcv.red seg.seq)))
+      (setq rcv.red (seq-num-sum seg.seq (seg-length seg)))
+      (setf (tcb-seq-num-read tcb) rcv.red)
+      ;; maybe open window a bit
+      (when (and2 0(seq-num- rcv.red (tcb-advance-window-threshold tcb))
+		 1;; Don't open the window if we are closing since that can invoke an RST.
+0		 (not (member (tcb-state tcb)
+			      '(:closing :time-wait :close-wait :last-ack :closed))))
+	(tcb-advance-advertised-window tcb rcv.red (tcb-local-window-size tcb))
+	(send-ack-for-tcb tcb (get-tcp-segment tcb t) :window-advancing))
+      ;; maybe turn off urgent
+      (when (and (tcb-read-urgent-pointer tcb)
+		 (seq-num-> rcv.red (tcb-read-urgent-pointer tcb)))
+	(setf (tcb-read-urgent-pointer tcb) nil))
+      ;; be paranoid -- don't trust streams to do the right thing
+      ;; with zero length segments.  (Yes, I got screwed.)
+      (let ((start (+ (seg-start seg) offset))
+	    (limit (seg-bound seg)))
+	(values seg start limit)))))
+
+
+
+(defun find-tcb-for-seg (seg)
+  (neti:with-network-packet (seg)
+    (let* ((source-address (seg-source-address seg))
+	   (source-port (seg-source-port seg))
+	   (dest-address (seg-destination-address seg))
+	   (dest-port   (seg-destination-port seg)))
+      (loop for tcb in *tcb-list*
+	    when (and (or (null (tcb-foreign-port tcb))
+			  (= source-port (tcb-foreign-port tcb)))
+		      (= dest-port (tcb-local-port tcb))
+		      (or (null (tcb-foreign-address tcb))
+			  (compare-internet-address source-address
+						    (tcb-foreign-address tcb)))
+		      (compare-internet-address dest-address (tcb-local-address tcb)))
+	      do
+		(when (null (tcb-foreign-port tcb))
+		  (setf (tcb-foreign-port tcb) source-port))
+		(when (null (tcb-foreign-address tcb))
+		  (setf (tcb-foreign-address tcb) source-address))
+		(return tcb)))))
+
+
+  ;;
+;;;;;;  Actually receive a segment.
+  ;;
+(defun tcb-process-ack (tcb seg.ack seg.wnd)
+  (declare (values snd.una))
+  (let ((tcb tcb)
+	(now (zl:time))
+	(acked 0))
+    (declare (sys:array-register tcb))
+    ;; things we already know:
+    ;;   Called from ethernet receiver (:receive-tcp-segment or syn-meets-tcb)
+    ;;     Therefore, we are without interrupts.
+    ;;   (seq-num-compare seg.ack  snd.nxt) is true
+    (loop for seg first (tcb-send-segs tcb) then next-seg
+	  while seg
+	  for length = (seg-length seg)
+	  while (seq-num-compare (seq-num-sum (seg-sequence seg) length)  seg.ack)
+	  as next-seg = (seg-link seg)
+	  ;; unlink it
+	  do (setf (tcb-send-segs tcb) next-seg)
+	     (when (null next-seg)
+	       (setf (tcb-send-segs-last tcb) nil))
+	     (decf (tcb-send-segs-length tcb))
+	     ;; note how long it took for last (most recently
+	     ;; transmitted/acked, we hope) segment
+	  as transmitted = (seg-time-transmitted seg)
+	  ;; we don't do the calculation if any seg in this ack was
+	  ;; retransmitted, as that will skew the calculation enormously
+	  as retransmitted = (or retransmitted (> (seg-times-transmitted seg) 1))
+	  sum length into total-bytes
+	  finally
+	    (when (and (or (not retransmitted)
+			   ;; but we do do the calculation if we have
+			   ;; no estimate yet at all
+			   (null (tcb-average*8-round-trip-time tcb)))
+		       transmitted
+		       *adaptive-tcp-retransmission-enabled*)
+	      (let ((measured (time-difference now transmitted)))
+		;; weed out ridiculous RTT's (e.g., from a retransmitted
+		;; segment that wasn't dropped, just slow)
+		(when (plusp measured)
+		  ;; Update the average and deviation RTT, use it to
+		  ;; compute the RTO.  The average and deviation are
+		  ;; stored as scaled integers.  Here we calculate:
+		  ;;   average = average + error/8,
+		  ;;   deviation = deviation + (|error| - deviation)/4, and
+		  ;;   rto = average + 2*deviation
+		  ;; per VanJacobsen's recommendations.
+		  (let* ((average*8 (or (tcb-average*8-round-trip-time tcb)
+					(sys:%fixnum-multiply
+					  (tcb-current-retransmission-delay tcb)
+					  8)))
+			 (error (- measured (sys:%fixnum-floor average*8 8)))
+			 (abs-error (if (plusp error) error (- error)))
+			 (deviation*4 (or (tcb-deviation*4-round-trip-time tcb)
+					  (sys:%fixnum-multiply abs-error 4)))
+			 (new-rto))
+		    (setq average*8 (+ average*8 error)
+			  deviation*4 (+ deviation*4
+					 (- abs-error
+					    (sys:%fixnum-floor deviation*4 4)))
+			  new-rto (sys:%fixnum-floor
+				    (+ (sys:%fixnum-floor average*8 4)
+				       deviation*4)
+				    2))
+		    (setf (tcb-average*8-round-trip-time tcb) average*8
+			  (tcb-deviation*4-round-trip-time tcb) deviation*4
+			  (tcb-current-retransmission-delay tcb) new-rto)
+		    ))))
+	    (setq acked total-bytes)
+	    ;; free it
+	  do (case (seg-output-state seg)
+	       (:tcb-only (return-tcp-segment seg))
+	       (:tcb-and-user (setf (seg-output-state seg) :user-only
+				    ;; be consistent
+				    (seg-times-transmitted seg) 0))
+	       (otherwise (tcp-implementation-error
+			    t
+			    "Segment ~S is on an output list, but its status doesn't claim so."
+			    seg))))
+    ;; if the first segment to send is *already* old, then we want retransmission to start
+    ;; immediately
+    (let ((seg (tcb-send-segs tcb)))
+      (when seg
+	(when (and (seg-time-transmitted seg)
+		   (or (time-lessp (tcb-next-retransmit-time tcb) now)	;already old
+		       ;; We have been probing and the window has opened
+		       (and (< (tcb-send-window tcb) 0)
+			    (plusp seg.wnd))))
+	  (setf (tcb-retransmit-immediately tcb) t)
+	  ;; Retransmit NOW!
+	  (retransmit-for-tcb tcb))))
+    (let ((wakeup-writer nil)
+	  (snd.nxt (tcb-next-send-seq tcb))
+	  (snd.una (tcb-send-seq-acked tcb)))
+      (let ((wnd.lim (seq-num-sum seg.ack seg.wnd))
+	    (snd.lim (tcb-send-seq-advert tcb)))
+	(when (seq-num-< snd.lim wnd.lim)
+	  (setq snd.lim wnd.lim)
+	  (setf (tcb-send-seq-advert tcb) snd.lim))
+	(let ((useful (seq-num-difference snd.lim snd.nxt))
+	      (advert (seq-num-difference snd.lim seg.ack)))
+	  (cond (*tcp-congestion-avoidance-enabled*
+		 (let* ((congestion (tcb-congestion-window tcb))
+			(slow (tcb-slow-start-threshold tcb))
+			(one (tcb-max-seg-size tcb)))
+		   (when (and (eq (tcb-state tcb) :established)
+			      (< congestion advert))
+		     ;; Update the congestion-window
+		     (setf (tcb-congestion-window tcb)
+			   (setq congestion
+				 (cond
+				   ;; JRD bandwidth-predicted congestion
+				   ;; --- no agreement on how to do that yet
+				   
+				   ;; slow-start
+				   ((or (null slow) ( congestion slow)) 
+				    ;; Increment by what you sent (in
+				    ;; case you are sending small
+				    ;; packets)
+				    (+ congestion (min acked one)))
+				   ;; congestion mode probe
+				   (t
+				     (+ congestion (floor one (/ congestion one))))))))
+		   ;; cwind is an increment on what's been acked, not
+		   ;; what's been sent, but don't create a negative
+		   ;; window
+		   (let* ((current (seq-num-difference snd.nxt seg.ack))
+			  (limit (seq-num-sum SEG.ACK (min advert
+							   (max congestion current))))
+			  (window (seq-num-difference limit snd.nxt)))
+		     (setf (tcb-send-seq-limit tcb) limit
+			   (tcb-send-window tcb) window
+			   ;; silly window ?
+			   wakeup-writer t))))
+		(t (setf (tcb-send-seq-limit tcb) snd.lim)
+		   (setf (tcb-send-window tcb) useful)
+		   ;; old, compatible, silly window
+		   (setf wakeup-writer t)))))
+      (cond ((seq-num-> seg.ack snd.una)
+	     ;; more data has been acked
+	     (setf (tcb-send-seq-acked tcb) seg.ack)
+	     (setf (tcb-time-last-received tcb) now)
+	     (when (seq-num-compare seg.ack = snd.nxt)
+	       (setf wakeup-writer t)))
+	    ((seq-num-compare seg.ack = snd.una = (tcb-send-seq-limit tcb))
+	     ;; confirmation has been received that the zero window still exists.
+	     (setf (tcb-time-last-received tcb) now)))
+      (when (and wakeup-writer (tcp-output-allowed-p tcb))
+	(tcb-wakeup-writer tcb))
+      seg.ack)))
+
+(defun initialize-tcb-send-side (tcb)
+  (declare (values iss))
+  (let* ((iss (seq-num-normalize (time:microsecond-time)))
+	 (snd.nxt (seq-num-sum iss 1))
+	 (tcb tcb))
+    (declare (sys:array-register tcb))
+    (free-all-send-segs tcb)			;just to be sure
+2    0(alter-tcb tcb
+	       :initial-send-seq iss
+	       :send-seq-acked iss
+	       :next-send-seq snd.nxt
+	       :send-seq-limit snd.nxt
+	       :send-seq-advert snd.nxt
+	       :send-window 0
+	       :last-retransmit-time (zl:time)
+	       :send-urgent-pointer nil
+	       :slow-start-threshold nil)
+2    0iss))
+
+(defun initialize-tcb-receive-side (tcb irs)
+  (declare (values rcv.nxt rcv.lim))
+  (let* ((rcv.nxt (seq-num-sum irs 1))
+	 (rcv.lim (seq-num-sum rcv.nxt (tcb-local-window-size tcb))))
+    (free-all-read-segs tcb)			;just to be sure
+    (free-all-received-segs tcb)		;ditto
+    (alter-tcb tcb
+	       :initial-receive-seq irs
+	       :seq-num-read rcv.nxt
+	       :seq-num-received rcv.nxt
+	       :seq-num-acked irs
+	       :seq-num-limit rcv.lim
+	       :advance-window-threshold rcv.nxt	;send ack on first byte read
+	       )
+    (values rcv.nxt rcv.lim)))
+
+(defun remove-syn-from-segment (seg seg.seq seg.len seg.urg)
+  (declare (values syn seg.seq seg.len seg.urg))
+  (neti:with-network-packet (seg)
+    (seq-num-incf seg.seq)
+    (decf seg.len)
+    (setf (seg-syn seg) 0)
+    (setf (seg-sequence seg) seg.seq)
+    (setf (seg-length seg) seg.len)
+    (values nil seg.seq seg.len (and seg.urg (seq-num-difference seg.urg 1)))))
+
+(defun tcb-set-slow-start-mode (tcb)
+  (setf (tcb-slow-start-threshold tcb)
+	;; old way was: half of what's out there, not half of what we
+	;; were planning to put out there, but that's too conservative.
+	;; It makes a single packet drop look like you lost all your
+	;; bandwidth
+	(max (floor (tcb-congestion-window tcb) 2)
+	     (tcb-max-seg-size tcb))
+	(tcb-congestion-window tcb) (tcb-max-seg-size tcb)))
+(defun tcb-next-retransmit-time (tcb)
+  (let* ((seg (tcb-send-segs tcb))
+	 (times))
+    (when seg
+      (if (not (plusp (setq times (seg-times-transmitted seg))))
+	  ;; We have a new seg on the transmit list so just use the current time since it has
+	  ;; yet to be transmitted
+	  (tcb-current-retransmission-delay tcb)
+	  ;; Compute a new retransmit time.
+	  (let* ((then (tcb-last-retransmit-time tcb))
+		 (time (seg-time-transmitted seg))
+		 (earliest-retransmit-time (time-increment then *min-retransmission-time*))
+		 (latest-retransmit-time (time-increment then *max-retransmission-time*))
+		 (indicated-retransmit-time
+		   (let ((delay (lsh (max (tcb-current-retransmission-delay tcb) 1)
+				     (1- times))))
+		     ;; if lsh overflows, use latest time
+		     (if (plusp delay)
+			 (time-increment time delay)
+			 latest-retransmit-time))))
+	    (if (time-lessp latest-retransmit-time indicated-retransmit-time)
+		latest-retransmit-time
+		(if (not (time-lessp earliest-retransmit-time indicated-retransmit-time))
+		    earliest-retransmit-time
+		    indicated-retransmit-time)))))))
+
+1;;; Retransmit segs in an orderly manner...
+0(defun retransmit-for-tcb (tcb &aux (time (zl:time)))
+  (declare (values something-was-retransmitted))
+  (cond ((time-elapsed-p *tcp-response-timeout* (tcb-time-last-received tcb) time)
+	 (reset-tcb tcb :timeout)
+	 nil)
+	(t (process:with-no-other-processes
+	     (let ((seg (tcb-send-segs tcb))
+		   (something-retransmitted nil)
+		   (retransmit-time (tcb-next-retransmit-time tcb)))
+1	       ;; retransmit delay is increased proportional to the number of times the
+	       ;; seg has been transmitted.  This creates an exponential backoff when we
+	       ;; use this time for future calculations.
+0	       (when (and seg
+			  (or (tcb-retransmit-immediately tcb)
+			      (and retransmit-time
+				   (not (time-lessp time retransmit-time))))
+			  (not (neti:packet-being-transmitted seg)))
+1		 ;; adjust slow-start-threshold and congestion-window on
+		 ;; first retransmit
+0		 (when (and2 0*tcp-congestion-avoidance-enabled*
+			    (eq (tcb-state tcb) :established)
+1			    ;; not if you are re-re-transmitting
+0			    (= 1 (seg-times-transmitted seg))
+			    )
+		   (tcb-set-slow-start-mode tcb))
+		 1;; Time to retransmit
+0		 (setf (tcb-retransmit-immediately tcb) nil)
+		 (retransmit-seg-for-tcb tcb seg)
+		 (setq something-retransmitted t)
+		 (setf (tcb-last-retransmit-time tcb) time))
+	       (mark-tcb-for-later-retransmission tcb)
+	       something-retransmitted)))))
+
+(defun mark-tcb-for-later-retransmission (tcb)
+  (let ((next-retrans (tcb-next-retransmit-time tcb)))
+    (when2 0(and next-retrans
+	       (or (null *tcp-next-retransmission-time*)
+		   (time-lessp next-retrans *tcp-next-retransmission-time*)))
+      (setf *tcp-next-retransmission-time* next-retrans)
+      (set-tcp-background-timer next-retrans))))
+
+(defun maybe-combine-segs (last-seg seg)
+  (neti:with-network-packet (last-seg)
+    (neti:with-network-packet (seg)
+      (let* ((diff (+ (seg-start last-seg)
+		      (seq-num-difference (seg-sequence seg) (seg-sequence last-seg))))
+	     (lim (+ diff (- (seg-bound seg) (seg-start seg)))))
+	(when (and ( diff (seg-bound last-seg))
+		   ( lim (array-dimension last-seg 0)))
+	  (let ((nb (- lim (seg-bound last-seg))))
+	    (when (plusp nb)
+	      (copy-array-portion seg (- (seg-bound seg) nb) (seg-bound seg)
+				  last-seg (seg-bound last-seg) lim)
+	      (incf (seg-length last-seg) nb)
+	      (setf (seg-bound last-seg) lim)
+	      (return-tcp-segment seg))
+	    t))))))
+;;; Known to be without-interrupts (in scheduler, actually)
+(defun add-seg-to-end-of-input-queue (tcb seg seg.lim fin)
+  (declare (values rcv.nxt))
+  (unless (member (tcb-state tcb) '(:established :fin-wait-1 :fin-wait-2))
+    (return-tcp-segment seg)
+    (return-from add-seg-to-end-of-input-queue
+      ;; Not in a data-recieving state since a FIN has already come in.
+      ;; Ignore the segment text.  Regardless, return the next expected
+      ;; sequence number.
+      (tcb-seq-num-received tcb)))
+  (let ((last-seg (tcb-read-segs-last tcb)))
+    (cond ((= (seg-start seg) (seg-bound seg))
+	   ;; don't bother queuing it -- even if it is a FIN, the user
+	   ;; doesn't need to see it.
+	   (return-tcp-segment seg))
+	  ((null last-seg)
+	   ;; queue is empty, put it on.
+	   (setf (seg-link seg) nil)
+	   (setf (tcb-read-segs tcb) seg)
+	   (setf (tcb-read-segs-last tcb) seg)
+	   (incf (tcb-read-segs-length tcb))
+	   (tcb-wakeup-reader tcb))
+	  ((and (not fin) (maybe-combine-segs last-seg seg)))
+	  (t
+	   ;; add to the end of the queue
+	   (setf (seg-link seg) nil)
+	   (setf (seg-link (tcb-read-segs-last tcb)) seg)
+	   (setf (tcb-read-segs-last tcb) seg)
+	   (incf (tcb-read-segs-length tcb)))))
+  (when fin
+    (case (tcb-state tcb)
+      (:established (setf (tcb-state tcb) :close-wait))
+      (:fin-wait-1  (setf (tcb-state tcb) :closing))
+      (:fin-wait-2  (setf (tcb-state tcb) :time-wait)
+       ;; there is a possible window here.  Suppose the user is stopped
+       ;; long enough for the background to remove (and reuse) the TCB?
+       ;; It's pretty unlikely.
+       (setf (tcb-2MSL-timer tcb) (zl:time)))
+      (otherwise (tcp-implementation-error nil
+		   "TCB ~S in bad state while receiving a FIN." tcb)
+		 (reset-tcb tcb :implementation-error)))
+    (tcb-wakeup-reader tcb)
+    (free-all-received-segs tcb)
+    ;; acking will be done by the *some-tcb-needs-acking* checker
+    )
+  (setf (tcb-seq-num-received tcb) seg.lim)
+  (unless *some-tcb-needs-acking*
+    (setq *some-tcb-needs-acking* (zl:time)))
+  (reset-tcp-background-timer 2)
+  1;; Efficeincy hack:  Since it can be awhile before the background can get around to ACKing
+  ;; some of the packets we have received, we will keep a counter in tcb-needs-acking.  If the
+  ;; counter hits 3, we have received 3 segs without sending an ACK, we send one out right
+  ;; away.  That keeps data streaming a bit better and avoids lossage when dealing with hosts
+  ;; that have a small number of buffers and can only send out a few packets at a time, even
+  ;; though we have the window space for them to send more.  This is only done on hosts who's
+  ;; send-window is smaller than our receive window.
+0  (when (< (tcb-send-window tcb) (tcb-local-window-size tcb))
+    (let ((ack-state (tcb-needs-acking tcb)))
+      (cond ((null ack-state)
+	     (setf (tcb-needs-acking tcb) 1))	1;First packet since last ACK
+0	    ((and (numberp ack-state) (< ack-state 3))
+	     (incf (tcb-needs-acking tcb)))	1;Increment previous count
+0	    (t					1;Need to ACK
+0	     (send-ack-for-tcb tcb (get-tcp-segment tcb t) :immediate-ack)))))
+  (values seg.lim))
+(defun add-seg-to-input-queue (tcb seg seg.seq seg.lim seg.urg fin)
+  (macrolet ((setup-seg-ack ()
+	       `(progn
+		  (setf (tcb-needs-acking tcb) t)
+		  (unless *some-tcb-needs-acking*
+		    (setq *some-tcb-needs-acking* (zl:time)))
+		  (reset-tcp-background-timer 2.))))
+    (let ((tcb tcb))				; might as well do this too,
+      (declare (sys:array-register tcb))	; as long as we're doing with-network-packets..
+      (neti:with-network-packet (seg)
+	(let ((rcv.nxt (tcb-seq-num-received tcb))	;might as well cache these, 
+	      (rcv.lim (tcb-seq-num-limit tcb)))	;they are only arefs
+	  (cond ((seq-num-compare seg.seq = seg.lim)
+		 1;;no data (don't send an ACK)
+0		 (return-tcp-segment seg))
+		((seq-num-compare seg.lim  rcv.nxt)
+		 1;;already have the data
+0		 (setup-seg-ack)
+		 (send-ack-for-tcb tcb seg :already-have-data))
+		((seq-num-compare seg.seq  rcv.nxt)
+		 ;; new segment
+		 ;; maybe delete some segments which it spans
+		 (loop as last = (tcb-read-segs-last tcb)
+		       while (and last
+				  (seq-num- seg.seq (seg-sequence last)))
+		       do (loop for prev = nil then this
+				for this first (tcb-read-segs tcb) then (seg-link this)
+				do (when (null this)
+				     (tcp-implementation-error
+				       nil
+				       "The last segment, ~S, on the in-order chain of ~S ~
+				  was not found by chaining through from the front."
+				       last tcb))
+				   (when (eq last this)
+				     (cond (prev (setf (seg-link prev) nil))
+					   (T    (setf (tcb-read-segs tcb) nil)))
+				     (setf (tcb-read-segs-last tcb) prev)
+				     (decf (tcb-read-segs-length tcb))
+				     (return-tcp-segment this)
+				     (return))))
+		 ;; add it to the end of the input queue
+		 (multiple-value-setq (rcv.nxt)
+		   (add-seg-to-end-of-input-queue tcb seg seg.lim fin))
+		 ;; try to pull off received segs
+		 (loop for r-seg = (tcb-received-segs tcb) then next
+		       while r-seg
+		       as next = (seg-link r-seg)
+		       do (setq seg.seq (seg-sequence r-seg)
+				seg.lim (seq-num-sum seg.seq (seg-length r-seg)))
+		       do (neti:with-network-packet (r-seg)
+			    (cond ((seq-num-compare seg.lim  rcv.nxt)
+				   (setf (tcb-received-segs tcb) next)
+				   (return-tcp-segment r-seg))
+				  ((seq-num-compare seg.seq  rcv.nxt)
+				   (setf (tcb-received-segs tcb) next)
+				   (multiple-value-setq (rcv.nxt)
+				     (add-seg-to-end-of-input-queue
+				       tcb r-seg seg.lim (not (zerop (seg-fin r-seg))))))
+				  (T ;; still out of order
+				   (return))))))
+		((seq-num-compare seg.lim  rcv.lim)
+		 ;; add to receive-segs -- try to compact overlaps
+		 (prog ((prev nil)
+			(this (tcb-received-segs tcb))
+			this.seq this.lim)
+		    end-test
+		       (when (null this)
+			 (cond ((null prev)
+				(setf (seg-link seg) nil)
+				(setf (tcb-received-segs tcb) seg))
+			       ((and (not fin) (maybe-combine-segs prev seg)))
+			       (t
+				(setf (seg-link seg) nil)
+				(setf (seg-link prev) seg)))
+			 (return))
+		       (setq this.seq (seg-sequence this)
+			     this.lim (seq-num-sum this.seq (seg-length this)))
+		       (when (seq-num-compare seg.seq < this.seq)
+			 (go splice-it-in-before-this))
+		       (when (seq-num-compare seg.seq = this.seq)
+			 (if (seq-num-compare seg.lim > this.lim)
+			     (go splice-it-in-before-this)	;which will remove the overlap too
+			     (return-tcp-segment seg)
+			     (return)))
+		       (when (seq-num-compare seg.lim  this.lim)
+			 ;; new segment is a subset of existing segment
+			 (return-tcp-segment seg)
+			 (return))		 
+		    repeat
+		       (setq prev this
+			     this (seg-link this))
+		       (go end-test)
+		    splice-it-in-before-this
+		       (cond ((null prev)
+			      (setf (seg-link seg) this)
+			      (setf (tcb-received-segs tcb) seg))
+			     ((and (not fin) (maybe-combine-segs prev seg))
+			      (setf seg prev))
+			     (t
+			      (setf (seg-link seg)  (seg-link prev))
+			      (setf (seg-link prev) seg)))
+		       ;; try and remove any overlap
+		       (loop while (seq-num-compare seg.lim  this.lim)
+			     do (setq this (prog1 (seg-link this)
+						  (return-tcp-segment this)))
+				(setf (seg-link seg) this)
+			     while this
+			     do (setq this.lim (seq-num-sum (seg-sequence this) (seg-length this))))
+		       (return))
+		 (setup-seg-ack)
+		 (tcb-wakeup-reader tcb))
+		(T (setup-seg-ack)
+		   (return-tcp-segment seg))))
+	(when (and seg.urg
+		   (or (null (tcb-read-urgent-pointer tcb))
+		       (seq-num-compare seg.urg  (tcb-read-urgent-pointer tcb))))
+	  (setf (tcb-read-urgent-pointer tcb) seg.urg))))))
+(defun reset-tcb (tcb reason)
+  (without-interrupts
+    (setf (tcb-state tcb) :closed)
+    (setf (tcb-substate tcb) reason)
+    (free-all-send-segs tcb)
+    (free-all-read-segs tcb)
+    (free-all-received-segs tcb))
+  (tcb-wakeup-reader tcb)
+  (tcb-wakeup-writer tcb))
+
+(defun reset-incoming-segment (protocol seg)		;need a better name
+  (neti:with-network-packet (seg)
+    (if (not (zerop (seg-rst seg)))		;not allowed to reset a reset
+	(return-tcp-segment seg)
+	(cond ((not (zerop (seg-ack seg)))	;ack bit on
+	       (setf (seg-sequence seg) (seg-acknowledge seg))
+	       (setf (seg-flags seg) seg-flag-rst-bit))
+	      (T				;ack bit off
+	       (setf (seg-acknowledge seg) (seq-num-sum (seg-sequence seg) (seg-length seg)))
+	       (setf (seg-sequence seg) 0)
+	       (setf (seg-flags seg) (logior seg-flag-rst-bit seg-flag-ack-bit))))
+	;; turn segment around
+	(rotatef (seg-source-address seg) (seg-destination-address seg))
+	(alter-tcp-segment-leader seg
+				  :start 20.
+				  :length 0)
+	(rotatef (seg-source-port-high seg) (seg-destination-port-high seg))
+	(rotatef (seg-source-port-low  seg) (seg-destination-port-low  seg))
+	(setf (seg-window seg) 0)
+	(setf (seg-urgent seg) 0)
+	(send protocol :transmit-tcp-segment seg (seg-start seg) nil))))	 
+
+(defun receive-syn-segment (tcp-protocol seg &aux server)
+  "Caller not allowed to use SEG after calling this"
+  (setq server (tcp-port-protocol-name (seg-destination-port seg)))
+  (setq server (and server (neti:find-server-named server)))
+  (cond ((or (null server)
+	     (null (neti:service-enabled-p (neti:server-protocol-name server))))
+	 (reset-incoming-segment tcp-protocol seg))
+	(t
+	 (let ((tcb (make-tcb (send tcp-protocol :network) tcp-protocol nil
+			      nil (seg-source-address seg) (seg-source-port seg)
+			      (seg-destination-address seg) (seg-destination-port seg))))
+	   (setf (tcb-state tcb) :listen)
+	   (setf (tcb-substate tcb) :dont-auto-syn)
+	   (syn-meets-tcb tcb seg)
+	   ;; this may still reject, but that's life.
+	   (neti:invoke-server server :tcp
+			       (send (send tcp-protocol :network) :network)
+			       (tcb-foreign-address tcb)
+			       tcb)))))
+
+
+(defun process-syn-options (tcb seg)
+  (neti:with-network-packet (seg)
+    (prog ((limit (seg-start seg)) (idx 20.) bytes-remaining option)
+       next-option
+	  (setq bytes-remaining (- limit idx))
+	  (unless (plusp bytes-remaining) (go exit))
+	  (setq option (aref seg idx))
+	  (selector option =
+	    (0 (go exit))
+	    (1 (incf idx))
+	    (2 (unless (and ( bytes-remaining 4)
+			    (= (aref seg (1+ idx)) 4))
+		 (go error))
+	       ;; C.f., RFC879:  when we get a reply, we know we can use
+	       ;; the min of theirs and ours (rather than the default)
+	       (let ((mss (min (ip-load-16 seg (+ idx 2))
+			       (compute-max-seg-size (tcb-route tcb)))))
+		 (setf (tcb-congestion-window tcb) mss)
+		 (setf (tcb-max-seg-size tcb) mss)
+		 ;; --- perhaps reverse-compute the route-max and store
+		 ;; it back into the route for future use?
+		 )
+	       (incf idx 4))
+	    (otherwise (go error)))
+	  (go next-option)
+       error
+	  (incf *syns-with-bad-options*)
+       exit
+	  )))
+
+(defun syn-meets-tcb (tcb seg &optional (queue-seg-for-input t))
+  (without-interrupts
+    (let* ((seg.seq (seg-sequence seg))
+	   (seg.len (seg-length seg))
+	   (seg.lim (seq-num-sum seg.seq seg.len))
+	   (seg.urg (and (not (zerop (seg-urg seg)))
+			 (seq-num-sum seg.seq (seg-urgent seg)))))
+      (initialize-tcb-receive-side tcb (seg-sequence seg))
+      (multiple-value-setq (nil seg.seq seg.len seg.urg)
+	(remove-syn-from-segment seg seg.seq seg.len seg.urg))
+      (alter-tcb tcb
+		 :foreign-address (seg-source-address seg)
+		 :foreign-port (seg-source-port seg)
+		 :local-address (seg-destination-address seg)
+		 )
+      (process-syn-options tcb seg)
+      (case (tcb-state tcb)
+	(:syn-sent
+	 (let ((seg.ack (and (not (zerop (seg-ack seg)))
+			     (seg-acknowledge seg))))
+	   (when seg.ack (tcb-process-ack tcb seg.ack (seg-window seg))))
+	 (cond ((seq-num-> (tcb-send-seq-acked tcb) (tcb-initial-send-seq tcb))
+		(setf (tcb-state tcb) :established)
+		(unless (retransmit-for-tcb tcb)
+		  (send-ack-for-tcb tcb (get-tcp-segment tcb t) :syn-meets-listen)))
+	       (T (setf (tcb-state tcb) :syn-received)
+		  (send-ack-for-tcb tcb (get-tcp-segment tcb t) :syn-meets-listen))))
+	;;(:listen (setf (tcb-state tcb) :syn-received))
+	)
+      (when queue-seg-for-input
+	(add-seg-to-input-queue tcb seg
+				seg.seq seg.lim
+				seg.urg (not (zerop (seg-fin seg))))))))
+
+(defmethod (:receive-tcp-segment tcp-protocol) (seg)
+  (neti:with-network-packet (seg)
+    (process:with-no-other-processes
+      ;; most common case is :established state.  Cache everything it needs
+      (let* ((tcb (find-tcb-for-seg seg))
+	     (state (and tcb (tcb-state tcb)))
+	     (rcv.nxt (and tcb (tcb-seq-num-received tcb)))
+	     (rcv.lim (and tcb (tcb-seq-num-limit tcb)))
+	     (snd.una (and tcb (tcb-send-seq-acked tcb)))
+	     (snd.nxt (and tcb (tcb-next-send-seq tcb)))
+	     (flags (seg-flags seg))
+	     (seg.seq (seg-sequence seg))
+	     (seg.len (seg-length seg))
+	     (seg.lim (seq-num-sum seg.seq seg.len))
+	     (seg.ack (and (ldb-test seg-flag-ack-field flags) (seg-acknowledge seg)))
+	     (seg.urg (and (ldb-test seg-flag-urg-field flags)
+			   (seq-num-sum seg.seq (seg-urgent seg))))
+	     (rst (ldb-test seg-flag-rst-field flags))
+	     (syn (ldb-test seg-flag-syn-field flags))
+	     (fin (ldb-test seg-flag-fin-field flags)))
+
+	(prog segment-arrives ()
+	      (case state
+		(:established (go established))
+		((nil :closed) (go closed))
+		(:listen (go listen))
+		(:syn-sent (go syn-sent))
+		(otherwise (go established)))
+	   closed
+	      (cond (rst (return-tcp-segment seg))
+		    (syn (receive-syn-segment self seg))
+		    (T (reset-incoming-segment self seg)))
+	      (return-from segment-arrives)
+	   listen
+	      ;; first check for an RST
+	      (when rst
+		(return-tcp-segment seg)
+		(return-from segment-arrives))
+	      ;; second check for an ACK
+	      (when seg.ack
+		(reset-incoming-segment self seg)
+		(return-from segment-arrives))
+	      ;; third check for a SYN
+	      (when syn
+		;; Someday check security and precedence
+		(if (eq (tcb-substate tcb) :dont-auto-syn)
+		    (return-tcp-segment seg)	;Listen has not yet accepted or rejected
+		    (syn-meets-tcb tcb seg nil)	;Full listen specified, match things up
+		    ;; use the incoming seg for sending out SYN.  If there was
+		    ;; other control or text, wait for it to be retransmitted.
+		    (send-syn-for-tcb tcb seg :syn-received))
+		(return-from segment-arrives))
+	      ;; fourth other control or text
+	      (return-tcp-segment seg)
+	      (return-from segment-arrives)
+	   syn-sent
+	      ;; first check the ACK bit
+	      (when seg.ack
+		(unless (seq-num-compare (tcb-initial-send-seq tcb) < seg.ack  snd.nxt)
+		  (if rst
+		      (return-tcp-segment seg)
+		      (reset-incoming-segment self seg))
+		  (return-from segment-arrives)))
+	      ;; second check the RST bit
+	      (when rst
+		(if seg.ack
+		    (reset-tcb tcb :reset))
+		(return-tcp-segment seg)
+		(return-from segment-arrives))
+	      ;; third check the security and precedence
+	      ;; fourth check the SYN bit	  
+	      (when syn
+		(syn-meets-tcb tcb seg)
+		(return-from segment-arrives))
+	      ;; fifth, neither SYN nor RST, drop and return
+	      (return-tcp-segment seg)
+	      (return-from segment-arrives)
+	   established
+	   several-others
+	      ;; reject unacceptable segments
+	      (unless (if (zerop seg.len)
+			  (if (= rcv.nxt rcv.lim)
+			      (seq-num-compare rcv.nxt = seg.seq)
+			      (seq-num-compare rcv.nxt  seg.seq < rcv.lim))
+			  (if (= rcv.nxt rcv.lim)
+			      nil
+			      (or (seq-num-compare rcv.nxt  seg.seq < rcv.lim)
+				  (seq-num-compare rcv.nxt < seg.lim  rcv.lim))))
+		;; not acceptable
+		(if rst
+		    (return-tcp-segment seg)
+		    (setf (tcb-needs-acking tcb) t)
+		    (unless *some-tcb-needs-acking*
+		      (setq *some-tcb-needs-acking* (zl:time)))
+		    (reset-tcp-background-timer 2.)
+		    (return-tcp-segment seg))
+		(return-from segment-arrives))
+	      ;; second check the RST bit
+	      (when rst
+		(return-tcp-segment seg)
+		(case state
+		  (:syn-received
+		    ;; the spec says to handle :active and :passive
+		    ;; differently We do, but not the way it suggests.  The
+		    ;; thing doing the listen can figure out what to do if it
+		    ;; was passive.  If it was active, then closing down the
+		    ;; connection is the right thing.
+		    (reset-tcb tcb
+			       (case (tcb-substate tcb)
+				 ((:passive :closing) :reset)
+				 (:active  :refused)
+				 (otherwise (tcp-implementation-error t
+								      "Unknown substate ~S for TCB in :syn-received state."
+								      (tcb-substate tcb))))))
+		  ((:established :fin-wait-1 :fin-wait-2 :close-wait)
+		   (reset-tcb tcb :reset))
+		  ((:closing :last-ack :time-wait)
+		   (remove-tcb tcb))
+		  (otherwise (tcp-implementation-error t
+						       "TCP state machine fell through.  Unknown state ~S with RST bit."
+						       state)))
+		(return-from segment-arrives))
+	      ;; third check security and precedence
+	      ;; fourth, check the SYN bit
+	      (when syn
+		(when (seq-num-compare seg.seq  (tcb-initial-receive-seq tcb))
+		  (reset-incoming-segment self seg)
+		  (reset-tcb tcb :syn-out-of-window)
+		  (return-from segment-arrives))
+		;; pretend it wasn't there and continue
+		(multiple-value-setq (syn seg.seq seg.len seg.urg)
+		  (remove-syn-from-segment seg seg.seq seg.len seg.urg)))
+	      ;; fifth check the ACK field (big clause)
+	      (when (null seg.ack)
+		(return-tcp-segment seg)
+		(return-from segment-arrives))
+	      ;; ACK bit is on
+	      (when (eq state :syn-received)
+		(cond ((seq-num-compare snd.una  seg.ack  snd.nxt)
+		       (setq state :established)
+		       (setf (tcb-state tcb) state)
+		   ;;; continue processing via fall through
+		       )
+		      (T (reset-incoming-segment self seg)
+			 (return-from segment-arrives))))
+	      (cond ((or (eq state :established)	;common case
+			 (member state '(:fin-wait-1 :fin-wait-2 :close-wait :closing)))
+		     ;; deal with ack information now
+		     (cond ((seq-num-compare snd.una  seg.ack  snd.nxt)
+			    ;; maybe new ack and/or window information
+			    (multiple-value-setq (snd.una)
+			      (tcb-process-ack tcb seg.ack (seg-window seg))))
+			   ((seq-num-compare seg.ack < snd.una)
+			    ;; duplicate ack.  Don't bother checking for larger window here.
+			    )
+			   (T #| (seq-num-compare seg.ack > snd.nxt) |#
+			      (setf (tcb-needs-acking tcb) t)
+			      (unless *some-tcb-needs-acking*
+				(setq *some-tcb-needs-acking* (zl:time)))
+			      (reset-tcp-background-timer 2.)
+			      (return-tcp-segment seg)
+			      (return-from segment-arrives)))
+		     ;; additional things to do if in various states
+		     (when (and (eq state :fin-wait-1)
+				(seq-num-compare snd.una = snd.nxt))	;FIN acknowledged
+		       (setq state :fin-wait-2)
+		       (setf (tcb-state tcb) state))
+		     #+ignore ( (when (and (eq state :fin-wait-2)
+					   (null (tcb-send-segs tcb)))
+				  ;; The user will notice this state and
+				  ;; acknowledge his own close.  There is
+				  ;; nothing to do here.
+				  ))
+		     (when (eq state :closing)
+		       (when (= snd.una snd.nxt)	;FIN acknowledged
+			 (setq state :time-wait)
+			 (setf (tcb-state tcb) state)
+			 (setf (tcb-2MSL-timer tcb) (zl:time)))
+		       (return-tcp-segment seg)
+		       (return-from segment-arrives)))
+		    ;; other states
+		    ((eq state :last-ack)
+		     ;; maybe process new acks
+		     (when (seq-num-compare snd.una < seg.ack  snd.nxt)
+		       (multiple-value-setq (snd.una)
+			 (tcb-process-ack tcb seg.ack 0)))
+		     (when (= snd.una snd.nxt)	;FIN acknowledged
+		       (remove-tcb tcb))
+		     (return-tcp-segment seg)
+		     (return-from segment-arrives))
+		    ((eq state :time-wait)
+		     (send-ack-for-tcb tcb seg :ack-while-in-time-wait)
+		     (setf (tcb-2MSL-timer tcb) (zl:time))
+		     (return-from segment-arrives)))
+	      ;; sixth check the URG bit,
+	      ;; seventh process segment text, and
+	      ;; eigth check the FIN bit
+	  
+	      ;; These are all handled by the input queuer because of
+	      ;; the need to compact packets, put them on the input
+	      ;; queue in order, and keep out-of-order packets for
+	      ;; later processing.  However, if the LispM is trying to close
+	      ;; the connection, it will not be able to handle any incoming
+	      ;; data.  In this case, the substate is :closing and the only
+	      ;; 'data' allowed is a FIN.
+	      (if (and (eq (tcb-substate tcb) :closing)
+		       (cond (fin ( seg.len 1))
+			     (T   ( seg.len 0))))
+		  (progn (reset-tcb tcb :data-while-closing)
+			 (reset-incoming-segment self seg))
+		  (add-seg-to-input-queue tcb seg seg.seq seg.lim seg.urg fin))
+	      (return-from segment-arrives)))))
+  nil)
+
+1;;; This tells IP to try other addresses of the host if possible
+0(defmethod (:report-failing-route tcp-protocol) (route foreign-address)
+  (send network :report-failing-route route foreign-address))
+
+
+(defmethod (:note-destination-unreachable tcp-protocol) (seg ignore source destination ignore)
+  (neti:with-network-packet (seg)
+    (alter-tcp-segment-leader seg :source-address destination :destination-address source)
+    (rotatef (seg-source-port seg) (seg-destination-port seg))
+    (let ((tcb (find-tcb-for-seg seg)))
+      (when tcb
+	(reset-tcb tcb :destination-unreachable)))))
+(defmethod (:note-source-quench tcp-protocol) (ignore ignore source destination)
+  (when *tcp-congestion-avoidance-enabled*
+    (process:with-no-other-processes
+      (loop for tcb in *tcb-list*
+	    1;;Use EQL to avoid nil address problems
+0	    when (and (eql source (tcb-local-address tcb))	
+		      (eql destination (tcb-foreign-address tcb)))
+	      do
+		(let ((tcb tcb))
+		  (declare (sys:array-register tcb))
+		  (when (eq (tcb-state tcb) :established)
+		    (tcb-set-slow-start-mode tcb))))))) 
+
+  ;;
+;;;;;;  The background process
+  ;;
+
+(defun tcp-background-predicate ()
+  (and *tcb-list*
+       *tcp-enable*
+       ;;(or *tcp-next-retransmission-time* *some-tcb-needs-acking*)
+       (process:timer-expired-p *tcp-background-timer*)))
+(defun tcp-background ()
+  (process:clear-timer *tcp-background-timer*)
+  (let* ((time (zl:time))
+	 (time-to-retransmit (and *tcp-next-retransmission-time*
+				  (time-lessp *tcp-next-retransmission-time* time)))
+	 (time-to-ack (and *some-tcb-needs-acking*
+			   (time-elapsed-p 1. *some-tcb-needs-acking* time)))	;1250 msecs
+	 (time-to-idle-probe (and *last-tcp-idle-probe-time*
+				  (time-elapsed-p *tcp-idle-probe-interval*
+						  *last-tcp-idle-probe-time* time))))
+    ;; update timer variables
+    (when time-to-retransmit
+      (setq *last-tcp-retransmit-time* time)
+      (setf *tcp-next-retransmission-time* nil))
+    (if time-to-idle-probe (setq *last-tcp-idle-probe-time* time))
+    ;; retransmit for connections that need it
+    ;; close down connections whose timers have expired
+    (process:with-no-other-processes
+      (dolist (tcb *tcb-list*)
+	(let ((tcb tcb))
+	  (declare (sys:array-register tcb))
+	  1;; Handle any ACKs that need to be done from background
+0	  (when (or (tcb-needs-acking tcb)
+		    (and time-to-ack
+			 (tcb-seq-num-received tcb)
+			 (seq-num-> (tcb-seq-num-received tcb) (tcb-seq-num-acked tcb))))
+	    (send-ack-for-tcb
+	      tcb (get-tcp-segment tcb t)
+	      (if (tcb-needs-acking tcb) :background-need :background-time))
+	    (setf (tcb-needs-acking tcb) nil))
+	  1;; Retransmit, if necessary
+0	  (when (and time-to-retransmit
+		     (tcb-send-segs tcb)
+		     (member (tcb-state tcb) '(:established :close-wait :closing
+							    :fin-wait-1 :last-ack
+							    :syn-sent :syn-received)))
+	    (retransmit-for-tcb tcb))
+	  1;; Open up any windows with a quick outgoing zero-window-probe (20 seconds)
+0	  (when (and (< (tcb-send-window tcb) (tcb-max-seg-size tcb))
+		     (time-elapsed-p *tcp-zero-window-probe-timeout*
+				     (tcb-last-retransmit-time tcb)))
+	    (tcb-wakeup-writer tcb))
+	  1;; Trigger resets on receiving conns that we haven't received anything from in 2
+	  ;; minutes.
+0	  (when (and time-to-idle-probe
+		     (null (tcb-send-segs tcb))	;not needed if trying to retransmit
+		     (time-elapsed-p *tcp-idle-probe-interval*
+				     (tcb-time-last-received tcb) time)
+		     (member (tcb-state tcb) '(:established :close-wait :fin-wait-2)))
+	    ;; Very important note:  This does NOT, and is not intended to,
+	    ;; ensure the other side of the connection is alive.  We are
+	    ;; not asking for any positive confirmation that this ack was
+	    ;; received.  What this IS for is to generate a RESET from the
+	    ;; foreign host if the connection is known to be dead.  This
+	    ;; issue was discussed on the TCP-IP@SRI-NIC mailing list from
+	    ;; 22 Nov 83 and lasting for a few days.
+	    ;; This mechanism is also used for the "zero window probe".
+	    (send-ack-for-tcb tcb (get-tcp-segment tcb t) :idle-probe))
+	  1;; Close any connections that have been in :time-wait for 2 x the Max Seg Lifetime
+	  ;; (2 minutes).
+0	  (when (and (eq (tcb-state tcb) :time-wait)
+		     (time-elapsed-p (* 60. 60. 2) (tcb-2MSL-timer tcb) time))
+	    (remove-tcb tcb))))
+      ;; initialize variables that get set when processing received packets
+      (when time-to-ack
+	(setq *some-tcb-needs-acking* nil))
+      (when *tcp-next-retransmission-time*
+	(set-tcp-background-timer *tcp-next-retransmission-time*))
+      (reset-tcp-background-timer (min *tcp-zero-window-probe-timeout* (* 60. 60.)))
+      (setq *tcp-background-bedtime* time))))
+(defun reset-tcp-background-timer (delta-time)
+  (process:with-no-other-processes
+    (let ((delta-time-in-microseconds (* delta-time 16666.)))
+      (when
+	(or (not (process:timer-pending-p *tcp-background-timer*))
+	    (zerop delta-time)			1;Just do it if 0
+0	    (multiple-value-bind (timer-expiration-low timer-expiration-high)
+		(process:timer-expiration-time *tcp-background-timer*)
+	      (multiple-value-bind (time-now-low time-now-high)
+		  (time:full-microsecond-time)
+		(multiple-value-bind (time-then-low time-then-high)
+		    (if (zl:fixnump delta-time-in-microseconds)
+			(if (minusp delta-time-in-microseconds)
+			    (multiple-value-bind (low borrow)
+				(si:%sub-bignum-step
+				  time-now-low (abs delta-time-in-microseconds) 0)
+			      (values low (- time-now-high borrow)))
+			    (multiple-value-bind (low carry)
+				(si:%add-bignum-step
+				  time-now-low delta-time-in-microseconds 0)
+			      (values low (+ carry time-now-high))))
+			(multiple-value-bind (low carry)
+			    (si:%add-bignum-step
+			      time-now-low
+			      (si:bignum-ref delta-time-in-microseconds 0) 0)
+			  (values low (+ carry
+					 (si:bignum-ref delta-time-in-microseconds 1)
+					 time-now-high))))
+		  (or (< time-then-high timer-expiration-high)
+		      (and (= time-then-high timer-expiration-high)
+			   (if (< time-then-low 0)
+			       (if (< timer-expiration-low 0)
+				   (< time-then-low timer-expiration-low)
+				   nil)
+			       (if (< timer-expiration-low 0)
+				   t
+				   (< time-then-low timer-expiration-low)))))))))
+	(process:reset-timer-relative-timer-units
+	  *tcp-background-timer* delta-time-in-microseconds)))))
+(defun set-tcp-background-timer (time)
+  (let* ((time-now (zl:time))
+	 (difference (time-difference time time-now)))
+    (reset-tcp-background-timer (if (time-lessp time time-now) 0 (max 0 difference)))))

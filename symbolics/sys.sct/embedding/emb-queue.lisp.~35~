@@ -1,0 +1,168 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Base: 10; Package: COMMON-LISP-INTERNALS; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Code to manipulate queues and signals.
+;;;
+;;; A queue is represented by a dtp-physical-address pointing at the structure
+;;; in the embedding communication area.
+
+;;; Compute the address of a given word of data in the queue.
+(defmacro emb-queue-location (queue index)
+  `(%pointer-plus ,queue (+ ,index (defstorage-size emb-queue))))
+
+;;; Read in the slots of an emb-queue structure quickly.
+(defmacro with-embedded-queue-slots ((queue &rest names) &body body)
+  (let ((offset (loop while (member (car names) '(nil ignore)) count t do (pop names))))
+    `(multiple-value-bind ,names
+	 (progn
+	   (setf (%block-register 1) ,(if (= offset 0) queue `(%pointer-plus ,queue ,offset)))
+	   (values ,@(loop repeat (length names) collect `(%block-read 1))))
+       ,@body)))
+
+(defwiredfun emb-queue-space (queue)
+  (with-embedded-queue-slots (queue ignore queue-size put-index take-index)
+    (let ((space (- take-index put-index 1)))
+      (if ( space 0) space (+ space queue-size)))))
+
+(defwiredfun emb-queue-filled (queue)
+  (with-embedded-queue-slots (queue ignore queue-size put-index take-index)
+    (let ((filled (- put-index take-index)))
+      (if ( filled 0) filled (+ filled queue-size)))))
+
+(defwiredfun emb-queue-empty-p (queue)
+  (with-embedded-queue-slots (queue ignore ignore put-index take-index)
+    (= put-index take-index)))
+
+(defwiredfun emb-queue-full-p (queue)
+  (with-embedded-queue-slots (queue ignore queue-size put-index take-index)
+    (= (1- (if ( take-index 0) take-index queue-size)) put-index)))
+
+;;; Put one element into the queue.  Interlocking must be supplied by the caller.
+(defwiredfun wired-emb-queue-put (queue element)
+  (with-embedded-queue-slots (queue element-size queue-size queue-put queue-take)
+    (select element-size
+      (4 (%memory-write (emb-queue-location queue queue-put) element))
+      (1 (let ((address (emb-queue-location queue (%fixnum-floor queue-put 4))))
+	   (%memory-write address
+	     (let ((word (%memory-read address)))
+	       (select (%fixnum-mod queue-put 4)
+		 (0 (%logdpb element (byte 8 0) word))
+		 (1 (%logdpb element (byte 8 8) word))
+		 (2 (%logdpb element (byte 8 16) word))
+		 (otherwise (%logdpb element (byte 8 24) word)))))))
+      (2 (let ((address (emb-queue-location queue (%fixnum-floor queue-put 2))))
+	   (%memory-write address
+	     (let ((word (%memory-read address)))
+	       (select (%fixnum-mod queue-put 2)
+		 (0 (%logdpb element (byte 16 0) word))
+		 (otherwise (%logdpb element (byte 16 16) word))))))))
+    (let ((new-put (let ((put (1+ queue-put))) (if (< put queue-size) put 0))))
+      ;; Busy wait if the queue is now full, before updating put index
+      (loop while (= queue-take new-put) do (setq queue-take (emb-queue-take-index queue)))
+      (setf (emb-queue-put-index queue) new-put)
+      ;; Signal the receiver if the queue was empty beforehand
+      (when (= (emb-queue-take-index queue) queue-put)
+	(send-emb-signal (emb-queue-signal queue))))))
+
+;;; Take one element from the queue.  Interlocking must be supplied by the caller.
+(defwiredfun wired-emb-queue-take (queue)
+  (with-embedded-queue-slots (queue element-size queue-size queue-put queue-take)
+    (when ( queue-put queue-take)
+      (prog1
+	(select element-size
+	  (4 (%memory-read (emb-queue-location queue queue-take)))
+	  (1 (let ((word
+		     (%memory-read (emb-queue-location queue (%fixnum-floor queue-take 4)))))
+	       (select (%fixnum-mod queue-take 4)
+		 (0 (ldb (byte 8 0) word))
+		 (1 (ldb (byte 8 8) word))
+		 (2 (ldb (byte 8 16) word))
+		 (otherwise (ldb (byte 8 24) word)))))
+	  (2 (let ((word
+		     (%memory-read (emb-queue-location queue (%fixnum-floor queue-take 2)))))
+	       (select (%fixnum-mod queue-take 2)
+		 (0 (ldb (byte 16 0) word))
+		 (otherwise (ldb (byte 16 16) word))))))
+	(setf (emb-queue-take-index queue)
+	      (let ((take (1+ queue-take))) (if (< take queue-size) take 0)))))))
+
+;;; For compatibility.  The wired versions used to be limited, now they're the same.
+(deff emb-queue-put #'wired-emb-queue-put)
+(deff emb-queue-take #'wired-emb-queue-take)
+
+;;; This would take &key arguments if they worked in wired functions
+(defwiredfun construct-emb-queue (queue-size &optional (element-size 4) (signal -1))
+  (let* ((total-words (+ (defstorage-size emb-queue)
+			 (%fixnum-ceiling (* queue-size element-size) 4)))
+	 (q-handle (wired-allocate-emb-buffer total-words))
+	 (q (emb-buf-pma q-handle)))
+    (setf (emb-queue-element-size q) element-size)
+    (setf (emb-queue-queue-size q) queue-size)
+    (setf (emb-queue-signal q) signal)
+    (setf (emb-queue-take-index q) 0)
+    (setf (emb-queue-put-index q) 0)
+    q))
+
+(defun describe-emb-queue (q &optional (stream *standard-output*))
+  (assert (pma-inside-comm-area q))
+  (zl:format stream "~&Queue ~S" q)
+  (zl:format stream "~&  element-size  ~D" (emb-queue-element-size q))
+  (zl:format stream "~&  queue-size    ~D" (emb-queue-queue-size q))
+  (zl:format stream "~&  put-index     ~D" (emb-queue-put-index q))
+  (zl:format stream "~&  take-index    ~D" (emb-queue-take-index q))
+  (zl:format stream "~&  signal number ~D" (emb-queue-signal q))
+  (let ((n (emb-queue-filled q)))
+    (if (zerop n)
+	(zl:format stream "~& is empty")
+	(zl:format stream "~& contains ~D elements" n))))

@@ -1,0 +1,2616 @@
+;;; -*- Mode: LISP; Package: NETI; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; The network and local file support which used to be here has been moved to
+;;; namespace-user, namespace-server, namespace-parse, namespace-access-paths, namespace-defs,
+;;; and namespace-local.
+
+;;; Definitions
+
+;;; This is the part of the database shared by all namespaces, i.e. those
+;;; indexed by global names.
+(defvar *shared-class-table* "the part of the namespace database shared by all namespaces")
+
+(defvar *namespace-boot-count* 0 "incremented each boot")
+
+;;; Where all the objects reside
+(defvar *namespace-object-area* (make-area :name '*namespace-object-area* :gc :static
+					   :region-size #o200000))
+
+;; This is an alist of class names and lists of properties of that class for which no
+;; warning should be given if conflicting values come from different namespaces.
+(defconst *object-properties-of-little-importance*
+	  '((:host :machine-type)))
+
+;;; Structures
+
+(defstruct (boot-timestamp :list (:make-list (:area *namespace-object-area*)) :conc-name)
+  (boot-count -1)
+  (timestamp -1)
+  (last-validation-time 0)
+  )
+
+(defstruct (validation-timestamp :list (:make-list (:area *namespace-object-area*))
+				 :conc-name)
+  namespace
+  (timestamp (make-boot-timestamp))
+  primary-name					;Primary name in this namespace
+  property-list					;Properties for this namespace
+  )
+
+(defstruct (property-list-cache-entry :list (:make-list (:area *namespace-object-area*))
+				      :conc-name)
+  (timestamp (make-boot-timestamp))
+  (objects nil)
+  )
+
+(defstruct (changed-objects-entry :list (:make-list (:area *namespace-object-area*))
+				  (:conc-name changed-objects-))
+  timestamp
+  deleted					;Alist of (class-name . name-objects)
+  changed					;List of objects
+  )
+
+(defstruct (class-entry :list (:make-list (:area *namespace-object-area*)) :conc-name)
+  class
+  (name-table (cl:make-hash-table :test #'eq :locking :without-interrupts))
+  (object-table (cl:make-hash-table :test #'eq :locking :without-interrupts
+				    :number-of-values 0))
+  )
+
+;;; Entries in CLASS-ENTRY-NAME-TABLE. TIMESTAMP is used to know that no object with
+;;; this name exists without querying a server.
+(defstruct (name-entry :list (:make-list (:area *namespace-object-area*)) :conc-name)
+  name
+  (timestamp (make-boot-timestamp))
+  object
+  )
+
+;;; Macros
+
+(defmacro with-namespace-locked ((namespace) &body body)
+  `(let ((*inhibit-validity-checking* t))
+     (process:with-lock ((namespace-local-lock ,namespace))
+       ,@body)))
+
+;;; Utilities
+
+(defun copy-boot-timestamp (from-ts to-ts)
+  (setf (boot-timestamp-boot-count to-ts)
+	(boot-timestamp-boot-count from-ts))
+  (setf (boot-timestamp-timestamp to-ts)
+	(boot-timestamp-timestamp from-ts))
+  (setf (boot-timestamp-last-validation-time to-ts)
+	(boot-timestamp-last-validation-time from-ts)))
+
+(defun set-boot-timestamp-timestamp (boot-timestamp timestamp)
+  (setf (boot-timestamp-boot-count boot-timestamp) *namespace-boot-count*)
+  (setf (boot-timestamp-timestamp boot-timestamp) timestamp)
+  (setf (boot-timestamp-last-validation-time boot-timestamp) (time)))
+
+(defun reset-boot-timestamp (boot-timestamp)
+  (setf (boot-timestamp-boot-count boot-timestamp) -1)
+  (setf (boot-timestamp-timestamp boot-timestamp) -1)
+  (setf (boot-timestamp-last-validation-time boot-timestamp) (time)))
+
+(defun unblockable-process-p ()
+  (or inhibit-scheduling-flag
+      (send current-process :simple-p)))
+
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");;; Bound to T when booting a standalone site to avoid distressing notifications
+0(defvar *inhibit-namespace-notifications*(2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB") 0nil)
+
+(defun namespace-warning (ctl-string &rest format-args)
+  (unless *inhibit-namespace-notifications*
+    (if (not (variable-boundp #'tv:notify))
+	(lexpr-funcall #'format cold-load-stream ctl-string format-args)
+	(tv:notify nil (with-output-to-string (stream)
+			 (lexpr-funcall #'format stream ctl-string format-args)
+			 (namespace-user-print-server-host stream))))))
+
+(defun global-object-namespace (object)
+  (class-namespace-for-object-update (send object :class)
+				     (send object :name)
+				     (send object :property-list)))
+
+;;; Flavors for objects
+
+;;; This is the base flavor of all objects in the network naming database.
+(defflavor object
+	(class
+	 (names nil)
+	 (validation-timestamps nil))
+	(property-list-mixin)
+  (:settable-instance-variables names)		;for uninterned objects
+  (:initable-instance-variables class)
+  (:gettable-instance-variables class)
+  (:method-combination :change-of-attributes (:progn :most-specific-last)
+		       :copy-object (:progn :most-specific-last))
+  (:default-init-plist :area *namespace-object-area*))
+
+(defun-in-flavor (object-get-validation-timestamp object) (namespace &optional create-p)
+  (let ((vts (ns-assq namespace validation-timestamps)))
+    (when (and (null vts) create-p)
+      (setf vts (make-validation-timestamp namespace namespace))
+      (push vts validation-timestamps)
+      (send namespace :new-object class self))
+    vts))
+
+(defmethod (:unclaimed-message object) (message &rest args)
+  (if (class-get-template class message)
+      (send self ':get message)
+      (signal-proceed-case ((new-message) 'unclaimed-message
+			    ':object self
+			    ':message message
+			    ':arguments (copylist args))
+	(:new-message (lexpr-funcall self new-message args)))))
+
+(defmethod (:user-get object) (attribute-name)
+  (send self :check-validity)
+  (let ((elem (assq attribute-name (send self :user-property))))
+    (and elem (second elem))))
+
+(defmethod (:set-object-valid object) (namespace &key timestamp unless-older-than-timestamp)
+  (unless timestamp
+    (setf timestamp (send namespace :validation-timestamp)))
+  (let ((vts (object-get-validation-timestamp namespace)))
+    (when (and vts
+	       (or (null unless-older-than-timestamp)
+		   ( (boot-timestamp-timestamp (validation-timestamp-timestamp vts))
+		      unless-older-than-timestamp)))
+      (set-boot-timestamp-timestamp (validation-timestamp-timestamp vts) timestamp)
+      (loop for name in (send self :names-in-namespace namespace)
+	    for name-entry = (or (send namespace :get-name-entry class name nil)
+				 (ferror "Object's names not linked."))
+	    do (set-boot-timestamp-timestamp (name-entry-timestamp name-entry) timestamp)))))
+
+(defmethod (:set-valid-for-namespace object) (namespace primary-name property-list
+							&aux changed-p)
+  (declare (values changed-p))
+  (let ((validation-timestamp (object-get-validation-timestamp namespace t)))
+    (when (neq primary-name (validation-timestamp-primary-name validation-timestamp))
+      (setf changed-p t)
+      (setf (validation-timestamp-primary-name validation-timestamp) primary-name))
+    (unless (loop with old-pl = (validation-timestamp-property-list validation-timestamp)
+		  for (indicator nil) on (class-all-templates class) by #'cddr
+		  always (cl:equal (get (locf old-pl) indicator)
+				   (get (locf property-list) indicator)))
+      (setq changed-p t)
+      (setf (validation-timestamp-property-list validation-timestamp)
+	    (copytree property-list *namespace-object-area*))))
+  ;;Return,
+  changed-p)
+
+(defmethod (:set-other-namespaces object) (other-ns-name-list)
+  ;;Make other validation timestamps as needed.
+  (loop with changed-p
+	for name in other-ns-name-list
+	for namespace = (send name :namespace)
+	do (unless (send namespace :loaded)
+	     (let ((vts (object-get-validation-timestamp namespace nil)))
+	       (when (null vts)
+		 (when (send self :set-valid-for-namespace namespace name nil)
+		   (setf changed-p t)))))
+	finally (return changed-p)))
+
+(defmethod (:names-in-namespace object) (namespace)
+  (si:eliminate-duplicates
+    (let ((vts (object-get-validation-timestamp namespace)))
+      (list* (validation-timestamp-primary-name vts)
+	     (loop for indicator in (class-get-template class :other-naming-properties)
+		   nconc (copylist (get (locf (validation-timestamp-property-list vts))
+					indicator)))))))
+
+(defmethod (:change-of-attributes object :progn) () )
+
+(defwhopper (:change-of-attributes object) ()
+  ;;Regenerate the names.
+  (let ((old-names names)
+	(new-names (si:eliminate-duplicates
+		     (loop for (namespace) in validation-timestamps
+			   nconc (send self :names-in-namespace namespace))))
+	(names-changed nil))
+    ;;Delete its old names.
+    (loop for name in old-names
+	  unless (or (memq name new-names) (stringp name))
+	    do (setf names-changed t)
+	       (send (name-namespace name) :remove-object self class name))
+    ;;Link up all the new names
+    (loop for name in new-names
+	  unless (memq name old-names)
+	    do (setf names-changed t)
+	       (send (name-namespace name) :add-object self class name))
+    ;;Make name list
+    (when names-changed
+      (setf names (copylist new-names *namespace-object-area*))))
+  ;;Check for uninterned (or recently deleted) object
+  (if (null validation-timestamps)
+      ;; Uninterned object
+      (continue-whopper)
+      ;;Regenerate the property list, retaining any random properties.
+      (let ((new-plist
+	      (if (and (null (rest1 validation-timestamps))
+		       (not (ns-eq self *now-fixing-up*))
+		       (not (ns-assq self *unknown-object-fixups*)))
+		  ;;Simple case -- only one namespace
+		  (validation-timestamp-property-list (first validation-timestamps))
+		  ;;Hard case -- multiple namespaces or fixups involved
+		  (copylist (merge-object-property-lists self class validation-timestamps)
+			    *namespace-object-area*))))
+	(loop for (ind val) on (send self :property-list) by 'cddr
+	      unless (class-get-template class ind)
+		do (setf (cl::getf new-plist ind) val)
+		   #+ignore #+ignore
+		   (push val new-plist)
+		   (push ind new-plist))
+	(send self :set-property-list new-plist))	
+      ;;Recompute the property list cache.
+      (loop for (namespace) in validation-timestamps
+	    do (recompute-property-lists-for-object self namespace))
+      ;;Make sure that the flavor is the same.
+      (let ((flavor (namespace-flavor-for-class class flavor:property-list)))
+	(if (eq (%instance-flavor self) (flavor:find-flavor flavor))
+	    (continue-whopper)
+	  (change-instance-flavor self flavor)
+	  ;; Since we just changed our flavor, we shouldn't continue the
+	  ;; whopper, as this would result in running the methods for the old
+	  ;; flavor, not the new flavor.  The best thing to do is to send
+	  ;; ourself a :CHANGE-OF-ATTRIBUTES to re-run this method from the
+	  ;; start.  We assume that we won't get here again since the flavor
+	  ;; is now correct.
+	  (send self :change-of-attributes)))))
+
+(defun list-contains-fixup-p (list)
+  (typecase list
+    (:list (loop for elem in list
+		 thereis (list-contains-fixup-p elem)))
+    (object-fixup t)
+    (otherwise nil)))
+
+(defun merge-object-property-lists (object class validation-timestamps)
+  (loop for (indicator (nil nil template)) on (class-all-templates class) by #'cddr
+	for new-property
+	= (if (eq (first template) :element)
+	      (loop with new-value
+		    for vts in validation-timestamps
+		    do (loop for val in (get (locf (validation-timestamp-property-list vts))
+					     indicator)
+			     unless (or (member val new-value)
+					(list-contains-fixup-p val))
+			     do (push val new-value))
+		    finally (return (copylist (nreverse new-value) *namespace-object-area*)))
+	      (loop with all-vals
+		    for vts in validation-timestamps
+		    for val = (get (locf (validation-timestamp-property-list vts))
+				   indicator)
+		    when (and val
+			      (not (member val all-vals))
+			      (not (list-contains-fixup-p val)))
+		    do (push val all-vals)
+		    finally
+		    (when (and (rest1 all-vals)
+			       (not (memq indicator (cdr (assq class *object-properties-of-little-importance*)))))
+		      (namespace-warning "Incompatible values ~A for ~A property of ~S.  ~
+The first will be used."
+					 all-vals indicator object))
+		    (return (first all-vals))))
+	when new-property
+	collect indicator and collect new-property))
+
+(defmethod (:copy-object object) (new-object)
+  (loop for vts in (reverse validation-timestamps)
+	do (send new-object :set-valid-for-namespace
+		 (validation-timestamp-namespace vts)
+		 (validation-timestamp-primary-name vts)
+		 (validation-timestamp-property-list vts))))
+
+(defmethod (:check-validity object) (&optional relative-to-namespace force-p)
+  (declare (values was-valid-p valid-p))
+  ;;Check global objects in their proper namespace.
+  (when (class-globally-named-p class)
+    (setf relative-to-namespace
+	  (validation-timestamp-namespace (first validation-timestamps))))
+  (block check-validity
+    ;;If no namespace specified, try them all.
+    (when (null relative-to-namespace)
+      (loop with all-were-valid = t
+	    with all-are-valid = t
+	    for vts in validation-timestamps
+	    as namespace = (validation-timestamp-namespace vts)
+	    do (multiple-value-bind (was-valid valid)
+		   (send self :check-validity namespace force-p)
+		 (setf all-were-valid (and all-were-valid was-valid))
+		 (setf all-are-valid (and all-are-valid valid)))
+	    finally (return-from check-validity (values all-were-valid all-are-valid))))
+    ;;Can we do anything at all?
+    (when (or *inhibit-validity-checking*	;Not turned on or cannot go blocked to check
+	      (unblockable-process-p))
+      (return-from check-validity (values t nil)))
+    ;;Locate appropriate validation timestamp
+    (let ((validation-timestamp (object-get-validation-timestamp relative-to-namespace)))
+      (let ((boot-timestamp (validation-timestamp-timestamp validation-timestamp)))
+	(when (and validation-timestamp
+		   (not force-p)
+		   ;;Have we validated this already in this bootload?
+		   (or (and *validate-once-per-boot*
+			    (= (boot-timestamp-boot-count boot-timestamp)
+			       *namespace-boot-count*)
+			    (not (send relative-to-namespace :local-server-p)))
+		       ;; Or is the object protected?
+		       (= (boot-timestamp-timestamp boot-timestamp) -2)))
+	  (return-from check-validity (values t t))))
+      ;;Ask the namespace if it has changed at all.
+      (multiple-value-bind (ns-was-valid ns-valid)
+	  (send relative-to-namespace :get-latest-timestamp force-p)
+	;;If it did, make sure we weren't deleted.
+	(unless ns-was-valid
+	  (setf validation-timestamp (object-get-validation-timestamp relative-to-namespace)))
+	;;If we're not here, we're done.
+	(unless validation-timestamp
+	  (return-from check-validity (values ns-was-valid ns-valid)))
+	;;If we're a server, then we're done.
+	(when (send relative-to-namespace :loaded)
+	  (return-from check-validity (values ns-was-valid ns-valid)))
+	;;We need these too
+	(let* ((boot-timestamp (validation-timestamp-timestamp validation-timestamp))
+	       (old-timestamp (boot-timestamp-timestamp boot-timestamp)))
+	  ;;If the object is up-to-date, then we're done.
+	  (when (and (not force-p)
+		     ( old-timestamp (send relative-to-namespace :validation-timestamp)))
+	    (return-from check-validity (values ns-was-valid ns-valid)))
+	  ;;If we checked recently, then we're done.
+	  (when (and (not force-p)
+		     (plusp old-timestamp)
+		     (= (boot-timestamp-boot-count boot-timestamp) *namespace-boot-count*)
+		     (not (time-elapsed-p
+			    *validation-retry-minimum-wait*
+			    (boot-timestamp-last-validation-time boot-timestamp))))
+	    (return-from check-validity (values ns-was-valid ns-valid)))
+	  ;;We actually have to ask a server.
+	  (when (or force-p (not (plusp old-timestamp)))
+	    (setf old-timestamp nil))
+	  (multiple-value-bind (success objects)
+	      (query-namespace-server
+		class relative-to-namespace
+		:name (validation-timestamp-primary-name validation-timestamp)
+		:timestamp old-timestamp)
+	    (cond ((not success)
+		   ;; Unable to check validity.
+		   (return-from check-validity (values ns-was-valid nil)))
+		  ((and (null old-timestamp)
+			(not (ns-memq self objects)))
+		   (namespace-warning 
+		     "Namespace server was unable to find ~A ~A in namespace ~A.~@
+		          It will be removed from the namespace."
+		     class (send self :primary-name-string relative-to-namespace)
+		     relative-to-namespace)
+		   (delete-object-from-namespace self relative-to-namespace t)
+		   (return-from check-validity (values nil t)))
+		  (t
+		   ;; We were either mentioned, or we haven't changed since OLD-TIMESTAMP.
+		   ;; In either case, we are valid now.
+		   (send self :set-object-valid relative-to-namespace)
+		   (return-from check-validity (values nil t)))
+		  )))))))
+
+(defmethod (:get object :before) (&rest ignore)
+  (unless *inhibit-validity-checking*
+	(send self ':check-validity)))
+
+;;;
+
+(defmethod (:print-self object) (stream ignore slashify-p)
+  (let ((*inhibit-validity-checking* t))	;Inconvenient if happens here.
+    (if slashify-p
+	(si:printing-random-object (self stream :typep)
+	  (format stream "~A ~A" class self))
+      (princ (condition-case ()
+		 (send self :primary-name-string)
+	       (namespace-object-deleted "<Deleted>"))
+	     stream))))
+
+(defmethod (:primary-name-in-namespace object) (namespace)
+  (let ((vts (object-get-validation-timestamp namespace)))
+    (when vts
+      (validation-timestamp-primary-name vts))))
+
+;;; This is the internal message to use
+(defmethod (:primary-name object) (&optional namespace)
+  (cond ((null names)
+	 (error 'namespace-object-deleted :class class))
+	((null validation-timestamps) (first names))
+	(namespace
+	 (or (send self :primary-name-in-namespace namespace)
+	     (send self :primary-name)))
+	(t (loop for namespace in *namespace-search-list*
+		 thereis (send self :primary-name-in-namespace namespace)
+		 finally (return (validation-timestamp-primary-name
+				   (first (last validation-timestamps))))))))
+
+(defmethod (:primary-name-string object) (&optional namespace)
+  (let ((name (send self ':primary-name namespace)))
+    (if (typep name 'name)
+	(send name ':possibly-qualified-string class)
+	(string name))))
+
+;;; STRING of an object is its name.
+(defmethod (:string-for-printing object) ()
+  (send self ':primary-name-string))
+
+;;; This is the external message.  For compatibility, things like hosts redefine it
+;;; to return a string.
+(defmethod (:name object) ()
+  (send self :primary-name))
+
+(defmethod (:name-p object) (test)
+  (memq test names))
+
+(defmethod (:uninterned-p object) ()
+  (null validation-timestamps))
+
+(defmethod (:property-list-compare object) (property-list)
+  (find-object-from-property-list-compare self class property-list))
+
+(defmethod (:namespaces object) ()
+  (loop for vts in validation-timestamps
+	collect (validation-timestamp-namespace vts)))
+
+(defmethod (:namespace-view-internal object) (namespace)
+  (declare (values primary-name property-list))
+  (let ((vts (if (class-globally-named-p class)
+		 (first validation-timestamps)
+		 (object-get-validation-timestamp namespace))))
+    (when vts
+      (values (validation-timestamp-primary-name vts)
+	      (validation-timestamp-property-list vts)))))
+
+(defmethod (:namespace-view object) (namespace)
+  (declare (values primary-name property-list))
+  (multiple-value-bind (name plist)
+      (send self :namespace-view-internal namespace)
+    (values name (copytree plist))))
+
+(defmethod (:delete-from-namespace object) (namespace)
+  (setf validation-timestamps (delq (object-get-validation-timestamp namespace)
+				    validation-timestamps))
+  (send self :change-of-attributes))
+
+(compile-flavor-methods object)
+
+;;; These are objects for which there is a specific flavor,
+;;; they don't need to print the same word twice.
+(defflavor own-flavor-object ()
+  (object)
+  :abstract-flavor)
+
+(defmethod (:print-self own-flavor-object) (stream ignore slashify-p)
+  (let ((*inhibit-validity-checking* t))	;Inconvenient if happens here.
+    (if slashify-p
+	(si:printing-random-object (self stream :typep)
+	  (princ self stream))
+      (princ (if names
+		 (send self ':primary-name-string)
+		 "<Deleted>")
+	     stream))))
+
+(defflavor name
+	(namespace
+	 string
+	 (domain-p nil)
+	 qualified-string)
+	()
+  (:gettable-instance-variables namespace string)
+  (:initable-instance-variables namespace string))
+
+(defmethod (:qualified-string name) (&optional prefer-domain-name)
+  (if (and (variable-boundp qualified-string)
+	   (eq (not prefer-domain-name) (not domain-p)))
+      qualified-string
+      (setq domain-p prefer-domain-name)
+      (setq qualified-string
+	    (let ((default-cons-area *namespace-object-area*))
+	      (let ((domain-name
+		      (and prefer-domain-name
+			   (send namespace :internet-domain-name))))
+		(if domain-name
+		    (string-append string #/. domain-name)
+		    (string-append (send namespace :name) #/| string)))))))
+
+(defmethod (:possibly-qualified-string name) (&optional for-class)
+  (send self (if (or (null for-class)
+		     (send self ':shadowed-p for-class))
+		 ':qualified-string ':string)))
+
+(defmethod (:shadowed-p name) (for-class &optional (*inhibit-validity-checking* t))
+  (unless (ns-eq namespace *domain-namespace*)	; never default to "DOMAIN|..."
+    (loop for other-namespace in *namespace-search-list*
+	  ;; Come to namespace, not shadowed
+	  when (ns-eq other-namespace namespace) return nil
+						   ;; Come to an object in a namespace earlier in list, shadowed
+	  when (send other-namespace :find-object-named
+		     for-class (send other-namespace ':intern-name string nil))
+	    return t
+	      ;; Never found namespace, as if shadowed.
+	  finally (return t))))
+
+(defmethod (:string-for-printing name) ()
+  (send self ':qualified-string))
+
+(defmethod (:print-self name) (stream ignore slashify-p)
+  (if slashify-p
+      (si:printing-random-object (self stream :typep)
+	(princ self stream))
+    (princ (send self :string-for-printing) stream)))
+
+(compile-flavor-methods name)
+
+(defun name-namespace (name)
+  (typecase name
+    (:symbol *namespace*)
+    (name (send name :namespace))
+    (otherwise (ferror "Bad name type."))))
+
+
+1;;; We need a special flavor of lock that will signal a condition when the lock cannot be
+;;; obtained.
+0(defflavor 2local-namespace-lock 0() (process::simple-recursive-normal-lock)
+  (:init-keywords :flavor))
+
+(defflavor 2namespace-unlockable 0(namespace) (dbg:condition)
+  (:readable-instance-variables)
+  (:initable-instance-variables))
+
+(defmethod 2(dbg:report namespace-unlockable)0 (stream)
+  (format stream "The namespace ~A cannot be locked from this process at this time."))
+
+1;; This will signal a condition
+0(defwhopper 2(process::lock-internal local-namespace-lock)0 (lock-argument)
+  1;; Lock-argument is the namespace
+0  (when (and (unblockable-process-p) (null (process:lock-lockable-p self)))
+    1;; If we can't get the lock and we are "unblockable", then signal the condition.  Only
+    ;; those conditinon-casing for it will catch it.
+0    (signal 'namespace-unlockable :namespace lock-argument))
+  (continue-whopper lock-argument))
+
+(define-namespace-class-object-flavor :namespace namespace)
+
+;;; Local cache of some namespace
+(defflavor namespace
+	((update-lock (process:make-lock "Namespace Update Lock" :recursive t
+					 :area neti:*namespace-object-area*))
+	 (local-lock (process:make-lock "Namespace Lock" :recursive t
+					:area neti:*namespace-object-area*
+					:flavor 'local-namespace-lock))
+	 ;; Association list of class name and list of name entries
+	 (class-table *shared-class-table*)
+	 ;; Table of interned names, string is key, NAME object is value.
+	 (name-table (cl:make-hash-table :test #'string-equal :locking :without-interrupts))
+	 ;; Monotonically increasing number.  This is the latest for a
+	 ;; modification to this namespace.  It is compared against timestamps
+	 ;; in objects for validity.
+	 validation-timestamp			;initialized by :INIT method
+	 ;; T if the whole namespace is loaded
+	 (loaded nil)
+	 ;; :PRIMARY, :SECONDARY, or NIL depending on what kind of server we are.
+	 (local-server-type nil)
+	 ;; Usable access paths to this namespace.
+	 (server-access-paths nil)
+	 ;; For locally resident namespaces, association list of files
+	 ;; that make up this namespace.
+	 (file-information nil)
+	 ;; Hash table of pattern match queries.
+	 ;; Key is (class . property-list); value is (boot-timestamp object-list).
+	 (object-property-list-cache
+	   (cl:make-hash-table :test #'equal :locking :without-interrupts))
+	 ;; List of changes made to the database at each timestamp.
+	 (changed-objects-alist (list-in-area *namespace-object-area* nil nil))
+	 (recompute-server-access-paths nil)
+	 )
+	(own-flavor-object)
+  (:default-init-plist :class :namespace)
+  (:gettable-instance-variables loaded object-property-list-cache)
+  (:settable-instance-variables file-information server-access-paths)
+  (:readable-instance-variables local-lock update-lock))
+
+(defmethod (:server-access-paths namespace :before) ()
+  (when recompute-server-access-paths
+    (send self :compute-local-server-type)))
+
+(defmethod (invalidate-namespace-server-access-paths namespace) ()
+  (setq recompute-server-access-paths t))
+
+(defmethod (:init namespace) (ignore)
+  (setf validation-timestamp (make-boot-timestamp)))
+
+(defmethod (:change-of-attributes namespace) ()
+  (when (ns-eq self (symeval-globally '*namespace*))
+    (setq-globally *namespace-search-list* (send self ':search-rules)))
+  (setq recompute-server-access-paths t))
+
+(defmethod (:set-loaded namespace) ()
+  (setf loaded t))
+
+(defmethod (:set-unloaded namespace) (reason &rest args)
+  (when loaded
+    (namespace-warning "Namespace ~A has become unloaded:~&~A"
+		       self (format nil reason args))
+    (setf loaded nil)))
+
+(defmethod (:local-server-p namespace) ()
+  (when recompute-server-access-paths
+    (send self :compute-local-server-type))
+  local-server-type)
+
+(defmethod (:compute-local-server-type namespace) ()
+  (setf file-information nil)			;decache any old information
+  (let ((*inhibit-validity-checking* t))
+    (multiple-value (local-server-type server-access-paths)
+      (let* ((primaries (send self :get :primary-name-server))
+	     (secondaries (send self :get :secondary-name-server))
+	     (default-secondaries (and (or primaries secondaries)
+				       ;; The following clause can't possibly work.
+				       #||
+				       (or (eq self *namespace*)
+					   ;; support for banana republic namespaces
+					   ;; rules are this: if you have an extra
+					   ;; namespace at your site, either all or none
+					   ;; of the default secondaries have to know
+					   ;; about it. This is only here for SCRC
+					   ;; purposes, we don't support
+					   ;; more than one namespace in a site in
+					   ;; the field.
+					   (multiple-value-bind (success any)
+					       (query-namespace-server
+						 :namespace *namespace*
+						 :name (send self :name))
+					     (and success any)))
+				       ||#
+				       (searching-one-site ()
+					 (find-objects-from-property-list
+					   :host 
+					   :default-secondary-name-server "YES")))))
+	(cond ((ns-memq *local-host* primaries)
+	       (values :primary (compute-server-access-paths (list *local-host*))))
+	      ((or *local-host-is-default-secondary-namespace-server*
+		   (ns-memq *local-host* secondaries)
+		   (ns-memq *local-host* default-secondaries))
+	       (values :secondary (compute-server-access-paths primaries)))
+	      (t
+	       (send self :set-unloaded "No longer server for this namespace.")
+	       (let ((hosts default-secondaries))
+		 (loop for host in secondaries do
+		   (when (and (send host :site)
+			      (ns-eq (send (send host :site) :local-namespace) *namespace*))
+		     (setq hosts (cons host (ns-delq host hosts)))))
+		 (loop for host in primaries do
+		   (when (and (send host :site)
+			      (ns-eq (send (send host :site) :local-namespace) *namespace*))
+		     (setq hosts (cons host (ns-delq host hosts)))))
+		 (values nil (compute-server-access-paths
+			       (or hosts (append primaries secondaries))))))))))
+  (setq recompute-server-access-paths nil))
+
+(defun compute-server-access-paths (hosts)
+  (sort (copylist (loop for host in hosts
+			for nap = (condition-case ()
+				      (net:find-path-to-service-on-host
+					:namespace host)
+				    (host-does-not-support-service nil))
+			for ntap = (condition-case ()
+				       (net:find-path-to-service-on-host
+					 :namespace-timestamp host)
+				     (host-does-not-support-service nil))
+			when nap
+			  collect (list host nap ntap)))
+	#'(lambda (x1 x2)
+	    (service-access-path-desirability-greaterp
+	      (second x1) (second x2)))))
+
+(defmethod (:primary-server-access-paths namespace) ()
+  (when recompute-server-access-paths
+    (send self :compute-local-server-type))
+  (if (null local-server-type)
+      (compute-server-access-paths (send self :primary-name-server))
+      server-access-paths))
+
+(defmethod (:get-latest-timestamp namespace) (&optional (force-p t))
+  (declare (values was-valid-p valid-p))
+  (block get-latest-timestamp
+    (when (or *inhibit-validity-checking*
+	      (unblockable-process-p)
+	      (not *namespaces-initialized*))
+      (return-from get-latest-timestamp (values t nil)))
+    (process:with-lock (update-lock)
+      (when recompute-server-access-paths
+	(send self :compute-local-server-type))
+      (when (and (not force-p)
+		 (= (boot-timestamp-boot-count validation-timestamp) *namespace-boot-count*)
+		 (or (and *validate-once-per-boot*
+			  (not local-server-type))
+		     (not (time-elapsed-p
+			    *check-namespace-validity-time*
+			    (boot-timestamp-last-validation-time validation-timestamp)))))
+	(return-from get-latest-timestamp (values t t)))
+      (let ((current-timestamp (boot-timestamp-timestamp validation-timestamp)))
+	(unless (plusp current-timestamp) (setf current-timestamp nil))
+	(let ((success
+		(if local-server-type
+		    (get-full-incremental-update-from-network
+		      self current-timestamp)
+		    (get-incremental-update-from-network
+		      self current-timestamp))))
+	  (return-from get-latest-timestamp
+	    (values (eql current-timestamp
+			 (boot-timestamp-timestamp validation-timestamp))
+		    success)))))
+    (return-from get-latest-timestamp (values t nil))))
+
+(defmethod (:validation-timestamp namespace) ()
+  (boot-timestamp-timestamp validation-timestamp))
+
+;;; Set the timestamp for data in the namespace only.
+;;; In the case of a TOO-OLD reply to an incremental update, it is important not to
+;;; affect the namespace as an object, since it may be changed itself.
+(defmethod (:set-latest-validation-timestamp namespace) (new-timestamp)
+  (check-arg-type new-timestamp :fix)
+  (set-boot-timestamp-timestamp validation-timestamp new-timestamp))
+
+;;;
+
+(defmethod (:changed-objects-alist namespace) ()
+  ;; If we are a secondary name server, get an update if necessary.
+  (send self :get-latest-timestamp nil)
+  ;; Now return the list.
+  (values-list changed-objects-alist))
+
+(defmethod (:set-changed-objects-alist namespace) (new-alist)
+  (setf (first changed-objects-alist) new-alist))
+
+;;; This keeps the size of the changes down by eliminating earlier versions of changes
+;;; to the same object.
+(defun-in-flavor (prune-objects-from-alist namespace) (objects)
+  (loop for entry in (first changed-objects-alist)
+	do (setf (changed-objects-changed entry)
+		 (del-if #'(lambda (changed-object)
+			     (ns-memq changed-object objects))
+			 (changed-objects-changed entry)))
+	   (setf (changed-objects-deleted entry)
+		 (del-if #'(lambda (deleted-name)
+			     (loop with (dclass name) = deleted-name
+				   for object in objects
+				   thereis (and (eq (send object ':class) dclass)
+						(send object ':name-p name))))
+			 (changed-objects-deleted entry)))))
+
+(defun-in-flavor (alist-entry-from-timestamp namespace) (timestamp)
+  (let ((entry (assoc timestamp (first changed-objects-alist))))
+    (unless entry
+      (setf (first changed-objects-alist)
+	    (nconc (first changed-objects-alist)
+		   (ncons (setf entry (make-changed-objects-entry timestamp timestamp))))))
+    entry))
+
+(defmethod (:add-entry-for-changed-objects namespace) (timestamp objects)
+  (prune-objects-from-alist objects)
+  (let ((entry (alist-entry-from-timestamp timestamp)))
+    (setf (changed-objects-changed entry) objects)))
+
+(defmethod (:add-entry-for-deleted-objects namespace) (timestamp objects)
+  (prune-objects-from-alist objects)
+  (let ((entry (alist-entry-from-timestamp timestamp)))
+    (setf (changed-objects-deleted entry)
+	  (mapcar #'(lambda (object)
+		      (list (send object ':class)
+			    (send object ':primary-name self)))
+		  objects))))
+
+(defmethod (:changes-since-timestamp namespace) (timestamp)
+  (declare (values change-entries result-valid-p))
+  (let ((namespace-entry (send self ':changed-objects-alist)))
+    (cond ((null namespace-entry)
+	   (values nil nil))
+	  ((= timestamp (boot-timestamp-timestamp validation-timestamp))
+	   (values nil t))
+	  (t (let ((timestamp-entry (assoc timestamp namespace-entry)))
+	       (when timestamp-entry
+		 (values (memq timestamp-entry namespace-entry) t)))))))
+
+;;;
+
+(defmethod (:add-incremental-update namespace) (up-to-timestamp class-alist deleted-objects)
+  ;; Everything that was previously valid and isn't mentioned, is still valid.
+  (let ((present-timestamp (boot-timestamp-timestamp validation-timestamp)))
+    (loop for class-entry in class-table
+	  as class-name = (class-entry-class class-entry)
+	  as (nil nil changed-names) = (assq class-name class-alist)
+	  as global-p = (class-globally-named-p class-name)
+	  do
+      (maphash #'(lambda (object ignore)
+		   (unless (or (loop for oname in (send object :names-in-namespace self)
+				     thereis (memq oname changed-names))
+			       (and global-p
+				    (not (ns-eq (global-object-namespace object) self))))
+		     (send object :set-object-valid self
+			   :timestamp up-to-timestamp
+			   :unless-older-than-timestamp present-timestamp)))
+	       (class-entry-object-table class-entry))
+	  unless global-p
+	    do (loop for name-entry being the hash-elements of
+			 (class-entry-name-table class-entry)
+				    with-key name
+		     unless (or (name-entry-object name-entry)
+				(memq name changed-names)
+				(let ((ts (boot-timestamp-timestamp
+					    (name-entry-timestamp name-entry))))
+				  (or (null ts)
+				      (< ts present-timestamp))))
+		       do (set-boot-timestamp-timestamp (name-entry-timestamp name-entry)
+							up-to-timestamp)))
+    ;; If no objects changed in a particular class, then all property list results encached
+    ;; are valid, modulo deleted objects.
+    (loop for cache-entry being the hash-elements of object-property-list-cache with-key key
+	  when (and (let ((elem (loop with entry-class = (first key)
+				      for elem in class-alist
+				      when (eq (second elem) entry-class)
+					return elem)))
+		      (or (null elem)
+			  (null (third elem))))
+		    (let ((ts (boot-timestamp-timestamp
+				(property-list-cache-entry-timestamp cache-entry))))
+		      (and ts ( ts present-timestamp))))
+	    do (setf (property-list-cache-entry-objects cache-entry)
+		     (del-if #'(lambda (y) (ns-memq y deleted-objects))
+			     (property-list-cache-entry-objects cache-entry)))
+	       (set-boot-timestamp-timestamp
+		 (property-list-cache-entry-timestamp cache-entry)
+		 up-to-timestamp)))
+  ;; We are now up-to-date.
+  (send self :set-latest-validation-timestamp up-to-timestamp))
+
+(defmethod (:new-object namespace) (class-name object)
+  (let ((class-entry (send self :get-class-entry class-name)))
+    (setf (gethash (follow-structure-forwarding object) (class-entry-object-table class-entry))
+	  t)))
+
+;;; This method is only concerned with the namespace plist cache.
+;;; The object's own :delete-from-namespace method removes it from
+;;; the namespace's table of objects.  Confusing, but that's the breaks.
+;;; Never call this.
+(defmethod (:delete-object namespace) (object)
+  "Internal protocol. Use DELETE-OBJECT or DELETE-OBJECT-FROM-NAMESPACE"
+  (let* ((class-name (send object :class))
+	 (class-entry (assq class-name class-table)))
+    (loop for cache-entry being the hash-elements of object-property-list-cache with-key key
+	  when (eq (first key) class-name)
+	    do (setf (property-list-cache-entry-objects cache-entry)
+		     (ns-delq object (property-list-cache-entry-objects cache-entry))))
+    (remhash (follow-structure-forwarding object) (class-entry-object-table class-entry))))
+
+(defmethod (:note-structure-forwarding namespace) (class-name from to)
+  (let* ((class-entry (assq class-name class-table))
+	 (object-table (class-entry-object-table class-entry)))
+    (remhash from object-table)
+    (setf (gethash (follow-structure-forwarding to) object-table) t)))
+
+(defmethod (:add-object namespace) (object object-class name)
+  (let ((name-entry (send self ':get-name-entry object-class name t)))
+    (setf (name-entry-object name-entry) object))
+  object)
+
+(defmethod (:remove-object namespace) (object object-class name)
+  (let ((name-entry (send self ':get-name-entry object-class name nil)))
+    (when name-entry
+      (unless (ns-eq (name-entry-object name-entry) object)
+	(ferror "Object//name mismatch"))
+      (setf (name-entry-object name-entry) nil))))
+
+(defmethod (:find-object-named namespace) (in-class name)
+  (name-entry-object (send self ':get-name-entry in-class name nil)))
+
+(defmethod (:get-class-entry namespace) (class-name)
+  (let ((class-entry (assq class-name class-table)))
+    (when (null class-entry)
+      (when (null (class-all-templates class-name))
+	(ferror "Invalid class ~A." class-name))
+      (setq class-entry (make-class-entry class class-name))
+      (push-in-area class-entry class-table *namespace-object-area*))
+    class-entry))
+
+(defmethod (:get-name-entry namespace) (in-class name create-p)
+  (condition-case ()
+       (with-namespace-locked (self)
+	 (let ((class-entry (send self :get-class-entry in-class)))
+	   (if create-p
+	       (scl:modify-hash (class-entry-name-table class-entry) name
+				#'(lambda (name name-entry key-exists-p)
+				    (if key-exists-p
+					name-entry
+					(make-name-entry name name))))
+	       (gethash name (class-entry-name-table class-entry)))))
+     (namespace-unlockable nil)))
+
+(defmethod (:objects-of-class namespace) (in-class)
+  (let ((class-entry (assq in-class class-table)))
+    (when class-entry
+      (cli::maptable (class-entry-object-table class-entry) #'(lambda (object ignore) object)
+		     'list))))
+
+(defmethod (:map-over-objects-of-class namespace) (in-class function &rest args)
+  (declare (sys:downward-funarg function))
+  (let ((class-entry (assq in-class class-table)))
+    (when class-entry
+      (without-interrupts
+	(maphash #'(lambda (object ignore)
+		     (cl:apply function object args))
+		 (class-entry-object-table class-entry))))))
+
+(defmethod (:get-object-property-list-entry namespace) (in-class for-property-list create-p)
+  (declare (values property-list-entry created-p))
+  (condition-case ()
+       (with-namespace-locked (self)
+	 (with-stack-list* (key in-class for-property-list)
+	   (or (gethash key object-property-list-cache)
+	       (and create-p
+		    (let ((new-elem (make-property-list-cache-entry)))
+		      (setf (gethash (copytree key *namespace-object-area*)
+				     object-property-list-cache)
+			    new-elem)
+		      (values new-elem t))))))
+     (namespace-unlockable (values nil nil))))
+
+;;; This is called by hosts to encache their reverse address mapping, which is assumed
+;;; to be unique.
+(defmethod (:make-object-property-list-entry-valid namespace)
+	   (in-class for-property-list objects)
+  (multiple-value-bind (elem new-p)
+      (send self ':get-object-property-list-entry in-class for-property-list t)
+    (when (cond ((or new-p (null (property-list-cache-entry-objects elem)))
+		 ;; If this is a new entry or previously didn't know a host at this address,
+		 ;; remember objects.
+		 (setf (property-list-cache-entry-objects elem)
+		       (copylist objects *namespace-object-area*))
+		 t)
+		;; If this is the same old entry, can mark it as valid now.
+		((equal (property-list-cache-entry-objects elem) objects)))
+      (set-boot-timestamp-timestamp (property-list-cache-entry-timestamp elem)
+				    (send self ':validation-timestamp)))))
+
+(defmethod (:intern-name namespace) (name &optional (need-to-upcase t))
+  (multiple-value-bind (val found-p)
+      (gethash name name-table)
+    (if found-p val
+	(setq name (if need-to-upcase
+		       (let ((default-cons-area *namespace-object-area*))
+			 (string-upcase name 0 nil t))
+		       (substring name 0 nil *namespace-object-area*)))
+	(let ((new (make-instance 'name :string name :namespace self
+				  :area *namespace-object-area*)))
+	  (setf (gethash name name-table) new)
+	  new))))
+
+(defmethod (:intern-name-soft namespace) (name)
+  (gethash name name-table))
+
+(defmethod (:before-full-gc namespace) ()
+  (send self :set-unloaded "Full GC")
+  (clrhash name-table)
+  (setf file-information nil)
+  (setf (first changed-objects-alist) nil)
+  (loop for sublis on class-table
+	until (eq sublis *shared-class-table*)
+	do (clrhash (class-entry-name-table (car sublis)))
+	   (clrhash (class-entry-object-table (car sublis)))))
+
+(defmethod (:re-intern-object namespace) (class-name object)
+  (send self :new-object class-name object)
+  (loop with global-p = (class-globally-named-p class-name)
+	for name in (send object :names-in-namespace self)
+	unless global-p
+	  do (setf (gethash (send name :string) name-table) name)
+	do (send self :add-object object class-name name)))
+
+(compile-flavor-methods namespace)
+
+;;; Interning of names
+(defun parse-name (namestring global-p &optional namespace (soft nil))
+  (declare (values interned-name special-namespace))
+  (check-arg-type namestring :string)
+  ;;--- This is not strictly necessary since we maintain the names in an
+  ;;--- equal hash table
+  (when (string-fat-p namestring)
+    (let* ((length (string-length namestring))
+	   (new (make-array length :type 'art-string)))
+      (si:copy-string-portion namestring 0 length new 0 length :make-thin t)
+      (setq namestring new)))
+  (unless namespace
+    (setq namespace *namespace*))
+  (if global-p
+      (values (intern-global-name namestring) nil)
+    (let ((bar-idx (string-search-char #/| namestring))
+	  (intern (if soft ':intern-name-soft ':intern-name)))
+      (if bar-idx
+	  (let ((special-namespace (find-namespace-named (substring namestring 0 bar-idx)
+							 namespace)))
+	    (values (send special-namespace intern (substring namestring (1+ bar-idx)))
+		    special-namespace))
+	(values (send namespace intern namestring) nil)))))
+
+(defun intern-global-name (namestring)
+  (check-arg-type namestring :string)
+  (when (string-fat-p namestring)
+    (let* ((length (string-length namestring))
+	   (new (make-array length :type 'art-string)))
+      (si:copy-string-portion namestring 0 length new 0 length :make-thin t)
+      (setq namestring new)))
+  (multiple-value-bind (symbol interned)
+      (intern-soft namestring si:pkg-keyword-package)
+    (if interned
+	symbol
+	(intern (string-upcase namestring) si:pkg-keyword-package))))
+
+(defun parse-and-intern-name (class name namespace soft)
+  (declare (values interned-name namespace qualified-p))
+  (if (class-globally-named-p class)
+      (values (if (keywordp name)
+		  name
+		  (intern-global-name name))
+	      namespace nil)
+    (if (typep name 'name)
+	(values name (send name :namespace) t)
+      (multiple-value-bind (interned-name special-namespace)
+	  (parse-name name nil namespace soft)
+	(values interned-name (or special-namespace namespace) special-namespace)))))
+
+(defun find-namespace-named (namespace-name &optional (in-namespace *namespace*))
+  (setf namespace-name (parse-and-intern-name :namespace namespace-name in-namespace nil))
+  (condition-case (error)
+      (find-object-named-in-namespace :namespace namespace-name in-namespace)
+    (object-not-found-in-namespace
+      (error 'namespace-not-found :name namespace-name
+	     :valid-p (send error :valid-p)
+	     :invalid-namespaces (send error :invalid-namespaces)))))
+
+;;;
+
+;;; Called with values from above, add into namespaces.
+;;; Called with *NAMESPACE* being the namespace we are dealing with primarily,
+;;; either from file attribute bindings or network.
+(defun add-or-change-object (class name property-list &optional (namespace *namespace*)
+			     &aux object changed-p global-object names other-ns)
+  (declare (values object changed-p))
+  ;; Always make a copy so we can hack with it.
+  (setf property-list (copytree property-list))
+  (let ((*inhibit-validity-checking* t))
+    (setf global-object (class-globally-named-p class))
+    ;;Make sure that NAMESPACE is set correctly.
+    (if global-object
+	(setf namespace (class-namespace-for-object-update class name property-list))
+	(unless (ns-eq namespace (send name :namespace))
+	  (ferror "~A ~A cannot be updated in namespace ~A." class name namespace)))
+    ;;Collect names
+    (loop for indicator in (class-get-template class :other-naming-properties)
+	  do (loop for n in (get (locf property-list) indicator)
+		   do (cond ((typep n 'name-fixup)
+			     ;; Presume that NAME-FIXUP's are in another namespace.
+			     ;; Get the name out of this local property list.  Resolution
+			     ;; of the fixup will generate a new view instead.
+			     (setf (get (locf property-list) indicator)
+				   (delq n (get (locf property-list) indicator))))
+			    (global-object (push n names))
+			    ((not (ns-eq (send n :namespace) namespace))
+			     (push n other-ns)
+			     (setf (get (locf property-list) indicator)
+				   (delq n (get (locf property-list) indicator))))
+			    (t (push n names)))))
+    (push name names)
+    ;;Find the object if it already exists.
+    (if global-object
+	(setf object (send namespace :find-object-named class name))
+	(multiple-value (object changed-p)
+	  (add-or-change-object-process-names namespace class names other-ns)))
+    ;;Create the object if it does not already exist.
+    (unless object
+      (let ((flavor (namespace-flavor-for-class class property-list)))
+	(setf object (make-instance flavor :class class))))
+    ;;Patch it in to its own property list.
+    (setq property-list (nsubst object '**self** property-list))
+    ;;Handle creating a new namespace.
+    (when (and (eq class :namespace) (not (ns-eq object namespace)))
+      (setf namespace object))
+    ;;Tell the object about the new situation
+    (when (send object :set-valid-for-namespace namespace name property-list)
+      (setf changed-p t))
+    (when (send object :set-other-namespaces other-ns)
+      (setf changed-p t))
+    ;; Fix things up.
+    (when (and *collect-unknown-object-fixups*
+	       (not (null *this-object-unknown-object-fixups*)))
+      (without-interrupts
+	(let ((entry (ns-assq object *unknown-object-fixups*)))
+	  (if entry
+	      (setf (rest1 entry) (nconc *this-object-unknown-object-fixups*
+					 (rest1 entry)))
+	      (push (cons object *this-object-unknown-object-fixups*)
+		    *unknown-object-fixups*)))))
+    ;; Probably this will send itself messages, don't recurse, just use what's there.
+    (when changed-p
+      (send object ':change-of-attributes))
+    ;;Return
+    (values object changed-p)))
+
+(defun add-or-change-object-process-names
+       (namespace class names other-ns &aux object changed-p
+	replaced-objects other-ns-objects partially-replaced-objects partially-replaced-names)
+  ;; Process the names in this namespace.
+  (loop for name in names
+	for find = (send namespace :find-object-named class name)
+	when find
+	  do (when (ns-memq find *collected-objects*)
+	       (namespace-warning "~A ~A has already been loaded as ~A."
+				  class name (send find :primary-name namespace)))
+	     (unless (ns-memq find replaced-objects)
+	       (if (eq name (send find :primary-name namespace))
+		   (push find replaced-objects)
+		   (progn (push name partially-replaced-names)
+			  (push find partially-replaced-objects)))))
+  ;; Process any links to other namespaces.
+  (loop for name in other-ns
+	for ns = (send name :namespace)
+	for find = (send ns :find-object-named class name)
+	for find-nss = (and find (send find :namespaces))
+	when (and find
+		  ;; Don't link to an object in another namespace which also has a view in
+		  ;; this one unless we already found it above.
+		  (not (when (ns-memq namespace find-nss)
+			 (unless (ns-memq find (or replaced-objects
+						   partially-replaced-objects))
+			   (namespace-warning
+			     "Attempt to link ~A ~A to the ~A namespace as ~A, which is already a nickname for ~A.  The link will not be made."
+			     class (first names) ns name
+			     (send find :primary-name namespace)))
+			 t))
+		  ;; Don't link to an object in another namespace unless its namespaces are
+		  ;; disjoint from all other objects we are linking to.
+		  (loop for other-object in (append (or replaced-objects
+							partially-replaced-objects)
+						    other-ns-objects)
+			for other-nss = (send other-object :namespaces)
+			never (loop for check-ns in find-nss
+				    when (ns-memq check-ns other-nss)
+				      do (unless (ns-eq find other-object)
+					   (namespace-warning
+					     "Attempt to link ~A ~A to the ~A namespace as ~A, which led to a conflict in namespace ~A between ~A and ~A.  The link will not be made."
+					     class (first names) ns name check-ns
+					     (send find :primary-name check-ns)
+					     (send other-object :primary-name check-ns)))
+					 (return t))))
+	  do (push find other-ns-objects))
+  ;; If we found several objects, we will have to merge them.
+  (cond (replaced-objects
+	 ;; We found at least one object in the the namespace whose primary name was one of
+	 ;; our names.  Use the first and merge all other in.
+	 ;;
+	 ;; (NREVERSE REPLACED-OBJECTS) makes us keep the object whose name was
+	 ;; found earliest in the list of names, and structure-forward the later
+	 ;; ones to it, which may be less likely to cause EQ-ness problems.
+	 (setq replaced-objects (nreverse replaced-objects))
+	 (setf object (pop replaced-objects))
+	 (loop for obj in replaced-objects do
+	   ;; Forward one object to the other.
+	   ;; The next time the objects get into oldspace during a garbage
+	   ;; collection, the GC will see the forwarding pointers and will replace
+	   ;; all references to the either object with references to a single object.
+	   ;; In the meantime, the two copies of the object will not be EQ,
+	   ;; which could cause problems.  A normal garbage collection will not fix
+	   ;; the problem, because namespace objects live in a static area,
+	   ;; *NAMESPACE-OBJECT-AREA*.  SI:FULL-GC will fix the problem because this
+	   ;; area is in SI:FULL-GC-STATIC-AREAS.  This is why the namespace system
+	   ;; is always careful to use NS-EQ.
+	   (namespace-warning "Merging ~S with ~S.  This may cause problems in ~
+			dealing with these objects until the next use of (SI:FULL-GC)."
+			      obj object)
+	   (delete-object-from-namespace obj namespace t)
+	   (namespace-structure-forward obj object)))
+	;; No primary name matches locally but there were some in other namespaces.
+	(other-ns-objects
+	 (setf object (pop other-ns-objects)))
+	;; No primary name matches anywhere, but we did find a nickname match.
+	(partially-replaced-objects
+	 (pop partially-replaced-names)
+	 (setf object (pop partially-replaced-objects))))
+  ;; Merge any remaining objects in other namespaces.
+  (loop for obj in other-ns-objects
+	do
+    (namespace-warning "Merging ~S with ~S.  This may cause problems in dealing ~
+                                  with these objects until the next use of (SI:FULL-GC)."
+		       obj object)
+    (setf changed-p t)
+    (send obj :copy-object object)
+    (namespace-structure-forward obj object))
+  ;; Remove any remaining conflicting names.
+  (loop for fn in partially-replaced-names
+	for obj in partially-replaced-objects
+	unless (or (ns-eq obj object)
+		   (ns-memq obj replaced-objects))
+	  do (namespace-warning "Moving name ~A from ~S to ~S." fn obj object)
+	     (delete-name-from-namespace fn namespace obj))
+  ;; Return to ADD-OR-CHANGE-OBJECT.
+  (values object changed-p))
+
+;;;
+
+(defflavor namespace-fixup
+	(namespace name-string)
+	()
+  (:initable-instance-variables namespace name-string))
+
+(defmethod (:print-self namespace-fixup) (stream ignore slashify-p)
+  (let ((*inhibit-validity-checking* t))	;Inconvenient if happens here.
+    (if slashify-p
+	(si:printing-random-object (self stream :typep)
+	  (princ self stream))
+	(format stream "Fixup for ~A ~A in namespace ~A"
+		(send self :class) name-string namespace))))
+
+;;;
+
+(defflavor object-fixup
+	(class)
+	(namespace-fixup)
+  :gettable-instance-variables
+  :initable-instance-variables)
+
+(defun-in-flavor (get-fixup-object object-fixup) (object decache-first)
+  (loop doing
+    (condition-case (error)
+	 (let ((name (parse-and-intern-name class name-string namespace nil)))
+	   (when decache-first
+	     ;; The incorrect information that this object doesn't exist
+	     ;; may have been encached when the error was signalled.
+	     (let ((entry (send namespace ':get-name-entry class name nil)))
+	       (when (and entry (null (name-entry-object entry)))
+		 (reset-boot-timestamp (name-entry-timestamp entry))))
+	     (setf decache-first nil))
+	   (condition-case (error)
+		(return-from get-fixup-object
+		  (find-object-named-in-namespace class name namespace))
+	      (object-not-found
+		(cond ((class-globally-named-p class)
+		       ;; We have no real choice at this point but to ask the user.
+		       (format query-io "~&The object ~S in namespace ~A contained a reference to ~A ~A which could not be resolved.~%~A"
+			       object namespace class name-string error)
+		       (find-local-site name))		       
+		      (t
+		       (namespace-warning "The object ~S in namespace ~A contained a reference to ~A ~A which could not be resolved.~%~A"
+					  object namespace class name-string error)
+		       ;; Dummy one up.
+		       (return-from get-fixup-object
+			 (let ((real-namespace (send name :namespace)))
+			   (if (send real-namespace :loaded)
+			       nil
+			       (add-or-change-object class name nil real-namespace)))))
+		      ))))
+       (namespace-not-found
+	 (format query-io "~&The object ~S in namespace ~A contained a reference to ~A ~A which could not be resolved.~%~A"
+		 object namespace class name-string error)
+	 (find-local-site (send error :name))))))
+
+(defmethod (:resolve object-fixup) (object decache-first)
+  (let ((fixup-object (get-fixup-object object decache-first)))
+    (dolist (ns (send object :namespaces))
+      (multiple-value-bind (nil plist)
+	  (send object :namespace-view-internal ns)
+	(nsubst fixup-object self plist)))))
+
+;;;
+
+(defflavor name-fixup ()
+	   (namespace-fixup)
+  )
+
+(defmethod (:class name-fixup) () :name)
+
+(defmethod (:resolve name-fixup) (object ignore)
+  ;; A name attribute in some other namespace, make sure that there is
+  ;; a view there.
+  (condition-case (error)
+      (let* ((name (parse-name name-string nil namespace))
+	     (name-namespace (send name :namespace)))
+	(when (and (null (send object :primary-name-in-namespace name-namespace))
+		   (not (send name-namespace :loaded)))
+	  (send object :set-valid-for-namespace name-namespace name nil)))
+    (namespace-not-found
+      (namespace-warning "The namespace ~A was never found.~%~
+                          Unable to add ~S to it as ~A."
+			 (send error :name) object name-string))))
+
+(compile-flavor-methods object-fixup name-fixup)
+
+;;;
+
+(defun do-unknown-object-fixups-if-necessary ()
+  (let ((inhibit-scheduling-flag t))
+    (unwind-protect
+	(when (and (eq (first *doing-unknown-object-fixups*) current-process)
+		   (null (rest1 *doing-unknown-object-fixups*)))
+	  (let ((inhibit-scheduling-flag nil))
+	    (do-unknown-object-fixups t)))
+      ;; Reset after doing fixups, so that fixups generated by the fixups themselves
+      ;; are handled by the do-unknown-object-fixups call rather than by a recursive
+      ;; call.
+      (setf *doing-unknown-object-fixups*
+	    (delq current-process *doing-unknown-object-fixups*)))))
+
+(defun do-unknown-object-fixups (&optional decache-first)
+  ;; The fixups might generate their own fixups.  But we need to keep around
+  ;; *UNKNOWN-OBJECT-FIXUPS* for the ones we are working on in case there are
+  ;; some namespace server hosts that we might otherwise try to use to find out
+  ;; about themselves.  Cf. the kludge in OPEN-NAMESPACE-SERVER.
+  (loop for (object . fixups) = (without-interrupts (pop *unknown-object-fixups*))
+	as *now-fixing-up* = object
+	while object
+	do (condition-case (error)
+	       (loop for entry in fixups
+		     do (condition-case (error)
+			    (send entry :resolve object decache-first)
+			  (error (namespace-warning "Error resolving fixup ~S for ~S: ~A"
+						    entry object error)))
+		     finally (send object :change-of-attributes))
+	     (error (namespace-warning "Error resolving fixups for ~S: ~A" object error)))))
+
+;;;
+
+(defun namespace-structure-forward (from to)
+  (let ((real-from (follow-structure-forwarding from)))
+    (loop for ns in (send real-from :namespaces)
+	  do (send ns :note-structure-forwarding (send real-from :class) real-from to))
+    (structure-forward real-from to)))
+
+(defun recompute-property-lists-for-object (object namespace)
+  (with-namespace-locked (namespace)
+    (loop with relevant-class = (send object :class)
+	  for cache-entry being the hash-elements
+	      of (send namespace :object-property-list-cache) with-key key
+	  when (eq (first key) relevant-class)
+	    do (if (send object :property-list-compare (rest1 key))
+		   (unless (ns-memq object (property-list-cache-entry-objects cache-entry))
+		     (push-in-area object (property-list-cache-entry-objects cache-entry)
+				   *namespace-object-area*))
+		   (when (ns-memq object (property-list-cache-entry-objects cache-entry))
+		     (setf (property-list-cache-entry-objects cache-entry)
+			   (ns-delq object
+				    (property-list-cache-entry-objects cache-entry))))))))
+
+(defun delete-name-from-namespace (name namespace object)
+  (unless (ns-eq namespace (send name :namespace))
+    (ferror "Deleting a name from the wrong namespace."))
+  (unless (memq name (send object :names))
+    (ferror "Deleting a name from the wrong object."))
+  (multiple-value-bind (primary-name property-list)
+      (send object :namespace-view-internal namespace)
+    (when (eq name primary-name)
+      (ferror "You can't delete the primary name this way yet."))
+    (loop for (ind . lval) on property-list by 'cddr
+	  do (ignore ind)
+	     (setf (car lval) (delq name (car lval))))
+    (send object :change-of-attributes)))
+
+(defun delete-object-from-namespace (object namespace &optional dont-update-files)
+  (unless dont-update-files
+    (delete-object-through-network namespace object))
+  (with-namespace-locked (namespace)
+    ;; Remove it from any property lists.
+    (send namespace :delete-object object)
+    (send object :delete-from-namespace namespace)))
+
+;;; ERROR-P NIL should only be used by above iterative case, or when you
+;;; know you don't have a qualified name, since it is overridden by that
+;;; case.  This could be changed to ':MAYBE if necessary.  It's better to
+;;; CONDITION-CASE for OBJECT-NOT-FOUND.
+(defun find-object-named-in-namespace (class name namespace &optional (error-p t)
+				       &aux interned-name qualified-p
+				       name-entry object valid-p global-p)
+  (declare (values object valid-p))
+  (collecting-namespace-errors-if error-p
+    (block find-object
+      (multiple-value (interned-name namespace qualified-p)
+	(parse-and-intern-name class name namespace nil))
+      (when qualified-p (setq error-p t))
+      (setf global-p (class-globally-named-p class))
+      ;;Look it up
+      (setf name-entry (send namespace :get-name-entry class interned-name t))
+      (setf object (name-entry-object name-entry))
+      ;;Can't check anything.
+      (when (or *inhibit-validity-checking*
+		(unblockable-process-p))
+	(return-from find-object))
+      ;;Handle the fast case of the name entry already valid.
+      (when (boot-timestamp-valid-p (name-entry-timestamp name-entry)
+				    (cond ((not global-p) namespace)
+					  (object (global-object-namespace object))
+					  (t nil)))
+	(setf valid-p t)
+	(return-from find-object))
+      ;;Talk to the server if necessary
+      (when (or global-p
+		(not (send namespace :loaded)))
+	(setf valid-p (query-namespace-server class
+					      (if (and global-p object)
+						  (global-object-namespace object)
+						  namespace)
+					      :name interned-name))
+	(setf object (name-entry-object name-entry))
+	(when valid-p
+	  (if object
+	      (send object :set-object-valid
+		    (if global-p
+			(global-object-namespace object)
+			namespace))
+	      (set-boot-timestamp-timestamp (name-entry-timestamp name-entry)
+					    (if global-p
+						1
+						(send namespace :validation-timestamp)))))))
+    ;; Signal an error if asked.
+    (when (and error-p (null object))
+      (error 'object-not-found-in-namespace ':class class ':namespace namespace
+	     ':name name ':interned-name interned-name ':valid-p valid-p))
+    ;;Return
+    (values object valid-p)))
+
+(defun boot-timestamp-valid-p (boot-timestamp namespace)
+  (let ((timestamp (boot-timestamp-timestamp boot-timestamp)))
+    (if (plusp timestamp)
+	(cond ((and *validate-once-per-boot*
+		    (= (boot-timestamp-boot-count boot-timestamp)
+		       *namespace-boot-count*)
+		    ;; If we are advertizing as a server, always recompute plists
+		    ;; when the timestamp changes.
+		    (or (null namespace) (not (send namespace :local-server-p))))
+	       t)
+	      ((and namespace
+		    (multiple-value-bind (nil valid-p)
+			(send namespace :get-latest-timestamp nil)
+		      valid-p)
+		    ( timestamp (send namespace :validation-timestamp)))
+	       t)
+	      ((and (= (boot-timestamp-boot-count boot-timestamp) *namespace-boot-count*)
+		    (not (time-elapsed-p
+			   *validation-retry-minimum-wait*
+			   (boot-timestamp-last-validation-time boot-timestamp))))
+	       t)
+	      (t nil))
+	;; Negative values have special meanings
+	(selector timestamp =
+	  (-1 nil)				;always validate
+	  (-2 t)))))				;never validate
+
+(defun finding-objects (class property-list function &rest other-args)
+  (declare (sys:downward-funarg function))
+  (keeping-namespace-server
+    ;; Do namespaces in standard order.
+    (dolist (namespace *namespace-search-list*)
+      (multiple-value-bind (objects valid-p)
+	  (lexpr-funcall #'find-objects-from-property-list-in-namespace
+			 class namespace property-list)
+	(lexpr-funcall function objects valid-p other-args)))))
+
+(defun map-over-objects-of-class-in-namespace (namespace class function &rest args)
+  (declare (sys:downward-funarg function))
+  (lexpr-send namespace :map-over-objects-of-class class function args))
+
+(defun find-objects-from-property-list-in-namespace
+       (class namespace &rest property-list &key name &allow-other-keys)
+  (declare (values objects valid-p))
+  ;; Simple case where name given, a unique object either satisfies the rest of the
+  ;; attributes or it does not.
+  (if name
+      (condition-case (object valid-p)
+	  (find-object-named-in-namespace class name namespace)
+	(object-not-found
+	  (values nil (send object :valid-p)))
+	(:no-error
+	 (values (when (find-object-from-property-list-compare object class property-list)
+		   (list object))
+		 valid-p)))
+      ;; Hard search case, try cache first
+      (let ((elem (send namespace :get-object-property-list-entry class property-list nil))
+	    (valid-p)
+	    (objects)
+	    (have-objects))
+	;; Query a server if needed.
+	(cond ((or *inhibit-validity-checking*
+		   (unblockable-process-p))
+	       (setf valid-p nil))
+	      ((send namespace :loaded)
+	       (setf valid-p t))
+	      ((and elem
+		    (boot-timestamp-valid-p (property-list-cache-entry-timestamp elem)
+					    namespace))
+	       (setf valid-p t))
+	      (t (multiple-value (valid-p objects)
+		   (let ((timestamp nil))
+		     (when elem
+		       (setf timestamp (boot-timestamp-timestamp
+					 (property-list-cache-entry-timestamp elem)))
+		       (unless (plusp timestamp) (setf timestamp nil)))
+		     (lexpr-funcall #'query-namespace-server
+				    class namespace :names-only t :timestamp timestamp
+				    property-list)))))
+	;; Search all the objects
+	(condition-case ()
+	     (with-namespace-locked (namespace)
+	       (unless (or have-objects elem)
+		 (setf objects nil)
+		 (map-over-objects-of-class-in-namespace
+		   namespace class
+		   #'(lambda (object)
+		       (when (find-object-from-property-list-compare
+			       object class property-list)
+			 (push object objects)))))
+	       ;; Create a cache entry
+	       (unless elem
+		 (setf elem (send namespace :get-object-property-list-entry
+				  class property-list t))
+		 (setf (property-list-cache-entry-objects elem)
+		       (copylist objects *namespace-object-area*)))
+	       (when valid-p
+		 (set-boot-timestamp-timestamp (property-list-cache-entry-timestamp elem)
+					       (send namespace :validation-timestamp))))
+	   (namespace-unlockable
+	     (setq objects nil)))
+	;; Make sure the objects are all valid.
+	(dolist (object objects)
+	  (send object :check-validity namespace))
+	;; Return
+	;; Check-validity above may have side-effected object list.
+	(values (property-list-cache-entry-objects elem) valid-p))))
+
+(defun find-object-from-property-list-compare (object class property-list)
+  (loop with object-property-list = (send object :property-list-location)
+	for (ind val) on property-list by 'cddr
+	for oval = (get object-property-list ind)
+	always (or (eq ind ':name)		;Handled at a higher level
+		   (equal val oval)		;Always check first
+		   (if (memq (first (class-get-template class ind))
+			     '(:element :pair :triple))
+		       (when (cl:listp val)
+			 (loop for v in val
+			       always (loop for ov in oval
+					    thereis (find-object-from-property-list-compare-1
+						      v ov))))
+		       (find-object-from-property-list-compare-1 val oval)))))
+
+(defun find-object-from-property-list-compare-1 (pattern value)
+  (cond ((equal pattern value))
+	((null value) nil)
+	((member pattern '(:* "*")))
+	((listp pattern)
+	 (and (listp value)
+	      (loop for v in value
+		    for p in pattern
+		    always (find-object-from-property-list-compare-1 p v))))))
+
+
+
+;;; User interface functions for dealing with namespaces.
+
+;;; Make an object which is NOT interned in the database.
+(defun make-object-from-property-list (class-name name property-list)
+  (let* ((flavor (namespace-flavor-for-class class-name property-list))
+	 (object (make-instance flavor ':class class-name)))
+    (send object :set-names (list name))
+    (send object ':set-property-list property-list)
+    (send object ':change-of-attributes)
+    object))
+
+;;; Main interface for finding things given a name.
+(defun find-object-named (class name &optional (error-p t))
+  (declare (values object valid-p))
+  (if (and (typep name 'object)
+	   (eq (send name :class) class))
+      ;; If he gave us an object, just return it after checking if it's valid
+      (multiple-value-bind (was-valid-p valid-p)
+	  (send name :check-validity)
+	was-valid-p				;gobble this up
+	(values name valid-p))
+      (keeping-namespace-server
+	(collecting-namespace-errors-if error-p
+	  (let ((valid-p t))
+	    (multiple-value-bind (interned-name namespace qualified-p)
+		(parse-and-intern-name class name nil nil)
+	      (if qualified-p
+		  (find-object-named-in-namespace class interned-name namespace error-p)
+		  (loop for namespace in *namespace-search-list*
+			do (multiple-value-bind (object this-valid-p)
+			       (find-object-named-in-namespace class name namespace nil)
+			     (unless this-valid-p
+			       (setq valid-p nil))
+			     (when object
+			       (return (values object valid-p))))
+			finally (if error-p
+				    (error 'object-not-found-in-search-list :class class :name name
+					   :search-list (copylist *namespace-search-list*)
+					   :valid-p valid-p)
+				    (return (values nil valid-p)))))))))))
+
+(defun find-objects-from-property-list (class &rest property-list)
+  (declare (values objects valid-p))
+  (let ((objects nil)
+	(valid-p t))
+    (finding-objects class property-list
+		     #'(lambda (these-objects this-valid-p)
+			 (unless this-valid-p
+			   (setf valid-p nil))
+			 (loop for object in these-objects
+			       unless (ns-memq object objects)
+				 do (push object objects))))
+    (values objects valid-p)))
+
+(defun find-object-from-property-list (class &rest property-list)
+  (declare (values object valid-p))
+  (let ((valid-p t))
+    (finding-objects class property-list
+		     #'(lambda (these-objects this-valid-p)
+			 (unless this-valid-p
+			   (setf valid-p nil))
+			 (when these-objects
+			   (return-from find-object-from-property-list
+			     (values (first these-objects) valid-p)))))
+    (return-from find-object-from-property-list (values nil valid-p))))
+
+(defun delete-object (object &optional dont-update-files)
+  (keeping-namespace-server
+    (loop for namespace in (send object :namespaces)
+	  do (delete-object-from-namespace object namespace dont-update-files))))
+
+(defun update-object-permanently (class namespace name property-list
+				  &optional dont-update-files)
+  (keeping-namespace-server
+    (let ((object (add-or-change-object class name property-list namespace)))
+      (if dont-update-files
+	  (send object :set-object-valid namespace :timestamp -2)
+	  (update-object-through-network namespace object))
+      object)))
+
+(defun decache-object-named (class name &aux (objects-and-names-decached nil))
+  (declare (values objects-and-names-decached))
+  (dolist (namespace *namespace-search-list*)
+    (multiple-value-bind (name namespace)
+	(parse-and-intern-name class name namespace t)
+      (unless (null name)
+	(let ((entry (send namespace ':get-name-entry class name nil)))
+	  (unless (null entry)
+	    (let ((bts (name-entry-timestamp entry)))
+	      (let ((x (or (name-entry-object entry) name)))
+		(or (and (= (boot-timestamp-boot-count bts) -1)
+			 (= (boot-timestamp-timestamp bts) -1))		
+		    (ns-memq x objects-and-names-decached)
+		    (push x objects-and-names-decached)))
+	      (reset-boot-timestamp bts)))))))
+  (nreverse objects-and-names-decached))
+
+
+
+(defun complete-namespace-object-name (class string &optional (action :complete))
+  (let* ((bar-idx (string-search-char #/| string))
+	 (namespace (and bar-idx
+			 (condition-case ()
+			      (find-namespace-named (substring string 0 bar-idx))
+			    (namespace-not-found nil)))))
+    (if namespace
+	(with-stack-list (*namespace-search-list* namespace)
+	  (complete-namespace-object-name class (substring string (1+ bar-idx)) action))
+	(dw:suggestion-completer (string :action action)
+	  (keeping-namespace-server
+	    (dolist (namespace *namespace-search-list*)
+	      (map-over-possible-object-name-completions class string namespace
+		(lambda (name) (dw:suggest name)))))))))
+
+(defun map-over-possible-object-name-completions (class string namespace function)
+  (declare (downward-funarg function))
+  (keeping-namespace-server
+    (let ((*inhibit-validity-checking* t))
+      (condition-case (error)
+	   (let ((nap (find-namespace-access-path namespace)))
+	     (send nap :map-over-possible-object-name-completions class string
+		   namespace function))
+	 (error
+	   ;(NAMESPACE-WARNING "Error while completing /"~A/".~%~A" STRING ERROR)
+	   (map-over-local-object-name-completions class string namespace function))))))
+
+;;; *EMB-HOST* gets set to an object representing the embedding host,
+;;; on those embeddings where this is a meaningful concept.
+
+(defvar *emb-host*)
+
+#+IMach
+(defvar *solstice-required-emb-services*
+	'((:FILE :UDP :NFS)
+	  (:RPC :TCP :RPC)			; Symbolics port
+	  (:RPC :TCP :TCP-RPC)			; Portmapper port
+	  (:RPC :UDP :UDP-RPC)			; Portmapper port
+	  (:TAPE :TCP :UNIX-REXEC)
+	  (:TIME :UDP :TIME-SIMPLE-MSB)
+	  (:UNIX-REXEC :TCP :UNIX-REXEC)
+	  (:X-WINDOW-SYSTEM :TCP :X-WINDOW-SYSTEM)))
+
+#+VLM
+(defvar *VLM-required-emb-services*
+	'((:FILE :UDP :NFS)
+	  (:RPC :TCP :TCP-RPC)			; Portmapper port
+	  (:RPC :UDP :UDP-RPC)			; Portmapper port
+	  (:TAPE :TCP :UNIX-REXEC)
+	  (:UNIX-REXEC :TCP :UNIX-REXEC)
+	  #+VLM-Server (:X-WINDOW-SYSTEM :TCP :X-WINDOW-SYSTEM)))
+
+#+IMach
+(defun get-emb-host-addresses ()
+  (let* ((networks (let ((*inhibit-validity-checking* t))
+		     (searching-one-namespace (*namespace*)
+		       (find-objects-from-property-list :network)))))
+    (flet ((get-protocol-network (proto)
+	     (loop for network in networks
+		   for network-proto = (send-if-handles network :address-resolution-parameters)
+		   when (and network-proto (= proto network-proto))
+		     return network)))
+      (sys:system-case
+	(Embedded
+	  ;; Collect host network/address pairs from embedded network channels
+	  (loop with address-pairs = nil
+		for chanptr first (emb-channel-table) then (emb-disk-next chan)
+		until (= chanptr -1)
+		for chan = (emb-pointer-to-pma chanptr)
+		when (= (emb-disk-type chan) %emb-channel-type-network)
+		  do (let* ((address (emb-net-channel-host-primary-address chan))
+			    (proto (emb-net-channel-host-primary-protocol chan))
+			    (network (when (> proto -1) (get-protocol-network proto))))
+		       (when network
+			 (push (list network address) address-pairs)))
+		finally (return address-pairs)))
+	(Otherwise nil)))))
+
+#+IMach
+(defun get-emb-host (&optional name)
+  (flet ((get-host (address-pair)
+	   (when (car address-pair)
+	     (let* ((network (car address-pair))
+		    (address (send network :unparse-address (cadr address-pair)))
+		    (candidates (find-objects-from-property-list
+				  :host
+				  :address `((,network ,address))))
+		    (host (first candidates)))
+	       (cons host address-pair))))
+	 (unparse-address (address-pair)
+	   (setf (cadr address-pair)
+		 (send (car address-pair) :unparse-address (cadr address-pair)))))
+    (sys:system-case
+      (Embedded
+	(let* ((address-pairs (get-emb-host-addresses))
+	       (candidates (mapcar #'get-host address-pairs))
+	       (best-host (loop for (host) in candidates
+				when host
+				  return host)))
+	  ;; If the addressing situation is confused (the host has specified addresses
+	  ;; that we believe belong to more than one host, based on the namespace),
+	  ;; then give the poor user as much help as possible in straightening things out.
+	  (when (and (cdr candidates)
+		     (cl:some (lambda (list) (neq (car list) (caar candidates)))
+			      (cdr candidates)))
+	    (tv:notify
+	      nil 
+	      (with-output-to-string (string)
+		(let ((all-hosts
+			(mapcar (lambda (a)
+				  (list (first a)
+					(second a)
+					(send (second a) :unparse-address (third a))))
+				candidates)))
+		  (format
+		    string
+		    "The host (Unix) system claims addresses~{~#[~1; and~] ~{~*~A|~A~},~} ~%~
+which belong to hosts~{~#[~1; and~] ~{~:[<unknown>~;~:*~A~]~2*~},~} respectively.~%"
+		    all-hosts all-hosts)
+		  (loop for (host) in all-hosts
+			for addresses = (send host :address)
+			do
+		    (format string "~&  ~A's ~:[address~;addresses~]~:* in the namespace ~:[is~;are~] " host (cdr addresses))
+		    (format-textual-list
+		      addresses
+		      (lambda (pair stream)
+			(format stream "~A|~A" (first pair) (second pair)))
+		      :stream string
+		      :conjunction "and"))
+		  (format string "~&Either the namespace or the host system is confused.~%~
+Guessing that the host is named ~A; you should :Reset Network after fixing the namespace~%~
+or restart host life support and warm-boot after fixing the host."
+			  best-host)))))
+	  ;; If there was no host, but there were some addresses, create a host object
+	  (when (and (null best-host) address-pairs)
+	    (mapc #'unparse-address address-pairs)
+	    (let* ((required-services (system-case
+					(Solstice *solstice-required-emb-services*)
+					(VLM *VLM-required-emb-services*)
+					(otherwise nil)))
+		   (services
+		     (loop with services = (commonly-supported-services :unix42 :internet)
+			   for service in required-services
+			   unless (cl:member service services :test 'cl:equalp)
+			     do (push service services)
+			   finally (return services)))
+		   (plist `(:address ,address-pairs
+			    :machine-type ,(emb-machine-type)
+			    :service ,services
+			    :site ,*local-site*
+			    :system-type :unix42))
+		   (network (caar address-pairs)))
+	      (setf best-host
+		    (if (not (null name))
+			;; Create an interned host object
+			(update-object-permanently :host *namespace*
+						   (parse-name name nil) plist t)
+			;; No name specified, create an uninterned host object
+			(make-object-from-property-list
+			  :host
+			  (format nil "~a|~a|~a" *namespace* network (cadar address-pairs))
+			  plist)))))
+	  best-host))
+      (Otherwise
+	nil))))
+
+#+IMach
+(defun check-emb-host (host)
+  (let* ((required-services (system-case
+			      (Solstice *solstice-required-emb-services*)
+			      (VLM *vlm-required-emb-services*)
+			      (Otherwise nil))))
+    (loop with services = (send host :service)
+	  with added-services = nil
+	  for service in required-services
+	  unless (cl:member service services :test 'cl:equalp)
+	    do (push service added-services)
+	  finally
+	    (when added-services
+	      (setf services (append added-services services))
+	      (if (send host :uninterned-p)
+		  ;; For uninterned hosts, just make a new one to return
+		  (let ((plist (send host :property-list)))
+		    (setf (getf plist :service) services)
+		    (setf host (make-object-from-property-list :host (send host :name) plist)))
+		  ;; Interned objects can be updated
+		  ;; We prefer to frob things in our namespace, but any one will do in a pinch
+		  (let ((namespace (if (cl:member *namespace* (send host :namespaces)
+						  :test 'neti:ns-eq)
+				       *namespace*
+				       (first (send host :namespaces)))))
+		    (multiple-value-bind (name properties)
+			(send host :namespace-view namespace)
+		      (setf (cl:getf properties :service) services)
+		      (net:update-object-permanently :host namespace name properties t)
+		      (tv:notify
+			nil
+			"Host ~A does not support the following required services:~%~
+~{~{  ~A over ~A using ~A~%~}~}~
+The services have been added, but might be removed by future namespace updates.~%~
+The namespace needs to be fixed."
+			host added-services)))))))
+  host)
+
+#+IMach
+(defun set-emb-host (&optional (host (get-emb-host)))
+  (system-case
+    (Embedded
+      (if host
+	  (setf *emb-host* (check-emb-host host))
+	  (variable-makunbound *emb-host*))
+      (initializations 'emb-name-initialization-list))
+    (Otherwise
+      (variable-makunbound *emb-host*))))
+
+#+IMach
+(add-initialization "Flush EMB host"
+		    '(variable-makunbound neti:*emb-host*)
+		    '(:before-cold))
+
+
+;;; On Embedded systems, those that use Unix systems as the host that is, set the magic RPC
+;;; variable that allows us to inherit the userid of the user running the Genera program for
+;;; use when accessing the host file system
+(defun set-magic-rpc-variable ()
+  #+IMach
+  (setq rpc::*unix-authentication-use-logged-in-user*
+	(sys:system-case
+	  (embedded
+	    (or (ns-eq *namespace* *distribution-namespace*)
+		(loop for ns in (send net:*namespace* :objects-of-class :namespace)
+		      ;; :local-server-p will recompute our server type and unload any
+		      ;; namespaces as needed
+		      thereis (eq (send ns :local-server-p) :primary))))
+	  (otherwise nil))))
+
+(add-initialization "Set RPC Unix Authentication Variable"
+		    '(set-magic-rpc-variable)
+		    '(:site :normal))
+
+;;; Set to T when can access things locally.
+(defvar *namespaces-initialized* nil)
+
+;;; Hold on to your hats!  Here's where we turn on the network.  First, make sure namespaces
+;;; work a little, without touching a network or the local file system.  Next, make a guess at
+;;; the local host from whatever database we have loaded in, again staying away from network
+;;; or file system.  Then initialize the local ncp (the one we'd use to get to a name server
+;;; of type *PRIMARY-NETWORK-TYPE*).  Then do things that can be done with just the primary
+;;; network being initialized.  Still keep away from the local file system.   This is
+;;; AFTER-NETWORK-INITIALIZATION-LIST.  Now find out again the local host, this time using
+;;; network servers.  This might change the site too.  Namespaces should now work fully.  Can
+;;; now enable any other local networks.  Then run the after-all-networks-initialization-list
+;;; to get things like the time, which might require a secondary network.  A background
+;;; process is started to collect useful namespace information for later.
+
+(defun initialize-namespaces-and-network ()
+  "Bring up the network and namespace systems after cold or warm boot"
+  ;; Turn off the namespace system.
+  (setq *inhibit-validity-checking* t)
+  (setq *namespaces-initialized* nil)
+  ;; Assume that we're still where we were before.
+  (setq *namespace* (send *local-site* :get :local-namespace))
+  (setq *namespace-search-list* (send *namespace* :get :search-rules))
+  ;; Make a first guess about where we are now.
+  (get-primary-network-address)
+  (get-local-host)
+  ;; Turn on the primary network
+  (enable-primary-network *primary-network*)
+  (reset-all-namespace-server-access-paths)
+  (initializations 'after-network-initialization-list t)	;First round of initializations
+  ;; Namespace should work now
+  (setq *namespaces-initialized* t)
+  (incf *namespace-boot-count*)
+  (setq *inhibit-validity-checking* nil)
+  (set-magic-rpc-variable)
+  ;; If we now think that we're a primary server, reload the database.
+  (reload-primary-namespaces)
+  (keeping-namespace-server
+    ;; Check for the local host again now that the namespace works.
+    (when (not (get-local-host))
+      ;; Unable to check with server
+      (check-local-host-identity))
+    ;; Local host may have changed again.
+    (set-magic-rpc-variable)
+    (reload-primary-namespaces)
+    ;; Check for any changes in the local host or site.
+    (send *local-site* :check-validity)
+    (send *local-host* :check-validity)
+    ;; Turn on all networks except for the primary
+    (enable-other-networks *primary-network*)
+    ;; Now, do the initializations that might require all networks
+    (initializations 'after-all-networks-initialization-list t)
+    ))
+
+;;; A struct for keeping track of all the stuff we now get from the FEP in
+;;; SYS:PRIMARY-NETWORK-ADDRESS and SYS:CHAOS-ADDRESS
+(cl:defstruct primary-address
+  address-string
+  network-type
+  interface-name
+  options)
+
+(defvar *parsed-primary-network-data* nil
+  "A list of primary-address objects parsed from SYS:PRIMARY-NETWORK-ADDRESS or SYS:CHAOS-ADDRESS")
+
+(defun get-primary-address-entry-of-type (type &optional
+					  (network-data *parsed-primary-network-data*))
+  (cl:find type network-data :key #'primary-address-network-type))
+
+;;; Parse SYS:PRIMARY-NETWORK-ADDRESS or SYS:CHAOS-ADDRESS and store the results in
+;;; *parsed-primary-network-data*.  (3 0 (NIL 0) (:FIX NIL NIL) "CPTFONT")Each entry in 0SYS:PRIMARY-NETWORK-ADDRESS can have the
+;;; following format:
+;;; (4 0 (NIL 0) (:FIX :ITALIC NIL) "CPTFONTI")interface3:4network-type3|4network-address0;4option-name0=4option3;4option-name0=4option.  3Each entry
+0;;; 3is separated by a comma.  The options are network specific.  IP uses the first option for
+0;;; 3the address of a temporary gateway and the second option for a subnet-mask, if necessary.
+0(defun parse-primary-network-address (&optional (network-address sys:primary-network-address)
+				      (preserve t))
+  (let ((parsed-network-data nil)
+	(trim-set '(#\space)))
+    (cond ((not (zerop (string-length network-address)))
+	   ;; Set Network Address or Set Network-Address was used
+	   (loop with primary-string = (string-trim trim-set network-address)
+		 with start = 0
+		 as comma-or-end = (cl:position #\, primary-string :start start)
+		 as entry-string = (string-trim trim-set
+						(substring primary-string start comma-or-end))
+		 as bar = (cl:position #/| entry-string)
+		 3when bar
+0		   3do
+0		     3(let* (0(entry-end (cl:length entry-string))
+			    3(0colon (cl:position #\: entry-string :end bar)3)
+0			    3(name (when colon 0(string-trim trim-set
+							   3(substring entry-string 003 colon)))0)
+			    3(semi-colon (cl:position #/; entry-string 0:start 3bar
+0						     :end3 0entry-end3))
+0			    3(type
+			      (intern
+0				(string-upcase
+				  (string-trim trim-set
+3					       (substring entry-string
+0							  3(if colon (1+ colon) 003)0 bar3)0))
+				:keyword3)0)
+			    (address-string
+			      (string-trim trim-set
+						 (substring 3entry-string0 (1+ bar)
+							    (or semi-colon entry-end))))
+			    3(options
+			      (when semi-colon
+0				3(loop 0for 3option-start0 first semi-colon then option-end
+				      as 3option-end0 =
+3					 (or (cl:position #/; entry-string
+0							  :start 3(1+ option-start)
+0							  :end entry-3end)
+0					      entry-end3)
+0				      as equal-sign = (cl:position #\= entry-string
+								   :start 3(1+ option-start)
+0								   :end 3option-end0)
+				      unless equal-sign
+					do
+					  (fsignal
+					    "Can't find /"=/" in primary network option for ~
+primary network address entry ~A."
+					    entry-string)
+				      3collect
+0				      (cons
+					(string-trim
+					  trim-set
+					  (substring entry-string (1+ option-start)
+								equal-sign))
+3					0(string-trim
+					  trim-set 3(substring entry-string0 3(1+ 0equal-sign)
+								3option-end))0)
+					into option-var
+				      until (= option-end entry-end)
+				      finally (return option-var)3))0)
+			    3(0entry (get-primary-address-entry-of-type type)))
+		       (unless entry (setq entry (make-primary-address)))
+		       (setf (primary-address-address-string entry) address-string)
+		       (setf (primary-address-network-type entry) type)
+		       (setf (primary-address-interface-name entry) name)
+		       (setf (primary-address-options entry) options)
+		       (cl:pushnew entry parsed-network-data :test #'eq))
+		 else
+		   do
+		     (fsignal
+		       "Unable to parse primary-network-address ~A.  Address set incorrectly~
+ in the FEP."
+		       network-address)
+		 until (null comma-or-end)
+		 do (setq start (1+ comma-or-end))))
+	  #+3600
+	  (sys:chaos-address
+            (let ((entry (get-primary-address-entry-of-type :chaos)))
+		  (unless entry (setq entry (make-primary-address)))
+		  (setf (primary-address-address-string entry)
+			(format nil "~O" sys:chaos-address))
+		  (setf (primary-address-network-type entry) :chaos)
+		  (setf (primary-address-interface-name entry) nil)
+		  (setf (primary-address-options entry) nil)
+		  (cl:pushnew entry parsed-network-data :test #'eq))))
+    (when preserve
+      (setq *parsed-primary-network-data* parsed-network-data))
+    (values parsed-network-data)))
+
+;;; Find the primary network address of the machine.
+;;; This may have been specified with the Set Network-Address or Set Chaos-address command.
+;;; We don't really handle the case of no network address yet.
+(defun get-primary-network-address ()
+  ;; first parse the strings from the FEP
+  (parse-primary-network-address)
+  ;; 1Try chaos first and then Internet.  
+0  (loop for network-type in '(:chaos :internet)
+	as entry = (get-primary-address-entry-of-type network-type)
+	as network = (and entry
+			  (find-object-from-property-list :network :type network-type))
+	when network
+	  return
+	    (progn (setq *primary-network* network)
+		   (setq *primary-network-address* (primary-address-address-string entry)))
+	finally
+	(setq *primary-network* nil)
+	(setq *primary-network-address* nil)
+	(fsignal
+	  "No valid primary network address has been defined or the network specified in the ~
+         FEP could not be found.")))
+
+(defun local-machine-type ()
+  (let ((model (si:machine-model)))
+    (if (string-equal (cl:symbol-name model) "Virtual Lisp Machine" 0 0 20 20)
+	:VLM
+        (selectq model
+	  ((:unknown) :|3600|)
+	  ((:|MacIvory model 1| :|MacIvory model 2| :|MacIvory model 3|) :MacIvory)
+	  (otherwise model)))))
+
+#+IMach
+(defun emb-machine-type ()
+  (system-case
+    (MacIvory :Macintosh)
+    ((UX400S UX1200S) :Sun)
+    (VLM :DEC-AXP)
+    (otherwise nil)))
+
+#+imach
+;;; Either the host object or the FEP has to specify an Internet address 
+;;; in order to boot a Solstice or Domino.
+(defun check-address-and-systems-if-x-is-required ()
+  (system-case
+    ((Solstice Domino)
+      (unless (sct:get-system-version :ip-tcp)
+	;; There is no way to boot this machine
+	(let ((debug-io "Window system not working"))
+	  (ferror "You must have IP-TCP loaded to boot a ~A" (si:machine-model))))
+      (unless (sct:get-system-version :x-remote-screen)
+	;; There is no way to boot this machine
+	(let ((debug-io "Window system not working"))
+	  (ferror "You must have X-Remote-Screen loaded to boot a ~A" (si:machine-model))))
+      (unless (or (cl:find :internet (send *local-host* :address)
+			   :test #'(lambda (type net) (send net :network-typep type))
+			   :key #'car)
+		  (get-primary-address-entry-of-type :internet))
+	;; There is no way to boot this machine
+	(let ((debug-io "Window system not working"))
+	  (ferror "You must specify an Internet address to boot a ~A" (si:machine-model)))))
+    (otherwise nil)))
+
+(defun get-local-host ()
+  (declare (values valid-p))
+  (let (host valid-p)
+    (cond ((ns-eq *local-site* *distribution-site*)
+	   (set-local-host (get-distribution-local-host))
+	   #+imach (set-emb-host (get-emb-host "DIS-EMB-HOST"))
+	   (setq valid-p t))
+	  (t
+	   1;; Must call 2get-host-from-address 1instead of using the
+0	   1;; 2:network-address-host-object1 method so we can ask for a psuedo host during
+0	   1;; 2set-site1 operations when we are called without validity checking once
+	   ;; to find the namespace servers and then are called again to do real work.
+0	   (cl:multiple-value-setq (host valid-p)
+	     (get-host-from-address
+	       (send *primary-network*
+		     :parse-address *primary-network-address*)
+	       *primary-network* nil
+	       :site *local-site* :system-type :lispm))
+	   (set-local-host host)
+	   #+imach (set-emb-host (get-emb-host))))
+    #+imach (check-address-and-systems-if-x-is-required)
+    valid-p))
+
+
+;;; If NO-CREATE-P and the host is not found, return NIL instead of creating
+;;; an unknown-chaos-host.
+(defun get-host-from-address (address network &optional no-create-p
+			      &rest additional-attributes)
+  (declare (values host valid-p))
+  (keeping-namespace-server
+    (when (symbolp network)
+      (setq network (local-network-of-type network)))
+    (multiple-value-bind (host valid-p)
+	(lexpr-send network
+		    ':network-address-host-object
+		    address
+		    additional-attributes)
+      (unless (or host no-create-p)
+	(let ((unparsed-address (send network :unparse-address address)))
+	  (setq host (make-object-from-property-list
+		       :host (format nil "~A|~A" network unparsed-address)
+		       `(:address ((,network ,unparsed-address))
+			 :service ,(send network :default-services)
+			 ,@(copylist additional-attributes default-cons-area)))
+		valid-p nil)))
+      (values host valid-p))))
+
+(defun get-host-from-network-address
+       (address network &rest additional-attributes)
+  (let ((host)
+	(valid-p)
+	(network-name (send network :global-network-name))
+	(local-namespace (send (send network :name) :namespace))
+	(unparsed-address (send network :unparse-address address)))
+    (block found
+      (stack-let ((addresses (list (list network unparsed-address))))
+	(keeping-namespace-server 
+	  ;; check the local namespace before going off and validating other namespaces
+	  (searching-one-namespace (local-namespace)
+	    (multiple-value (host valid-p)
+	      (lexpr-funcall
+		#'find-object-from-property-list
+		:host :address addresses additional-attributes))
+	    (when host
+	      (return-from found)))
+	  ;; Now try other networks multi-homed into our's.  Yes, I know this will search our
+	  ;; namespace again, but we should have that all cached.
+	  (searching-one-network (network)
+	    (multiple-value (host valid-p)
+	      (lexpr-funcall
+		#'find-object-from-property-list
+		:host :address addresses additional-attributes))
+	    (when host
+	      (return-from found)))
+	  ;; Try all networks that have the same global-network-name as our's
+	  (when network-name
+	    (searching-all-namespaces ()
+	      (loop for net in (find-objects-from-property-list
+				 :network :type (send network :type)
+				 :global-network-name network-name)
+		    do (unless (eq net network)
+			 ;; must cast address in foreign net form to find it!
+			 (stack-let ((addresses (list (list net unparsed-address))))
+			   (searching-one-network (net)
+			     (multiple-value (host valid-p)
+			       (lexpr-funcall
+				 #'find-object-from-property-list
+				 :host :address addresses additional-attributes))))
+			 (when host
+			   (return-from found)))))))))
+    (values host valid-p)))
+
+(defun set-local-host (host)
+  (unless (ns-eq host *local-host*)
+    (setq *local-host* host)
+    (initializations 'local-name-initialization-list t)))
+
+;; Reload any namespaces for which we are the primary server.
+;; We can get by without the secondaries until the common property list process runs.
+(defun reload-primary-namespaces ()
+  (keeping-namespace-server
+    (with-fixups
+      (map-over-objects-of-class-in-namespace
+	*namespace* :namespace
+	#'(lambda (ns)
+	    (when (eq (send ns :local-server-p) :primary)
+	      (send ns :get-latest-timestamp t)))))))
+
+;; Reload any secondaries and cache useful property lists.
+(defun encache-property-lists-in-background ()
+  (process-run-function '(:name "Get common property lists" :priority -10.)
+    #'encache-property-lists))
+
+(defvar *get-common-property-lists-process* (process:make-lock "Get Common Property Lists"))
+
+(defconstant *secondary-server-update-interval*2 015.
+  "The number of minutes between secondary namespace server updates.")	1;15 minutes
+
+0(defvar *secondary-server-update-timer*2 0nil
+  "The timer for the Secondary Server Update.")
+
+(defun encache-property-lists ()
+  (when *secondary-server-update-timer*
+    (process:clear-timer *secondary-server-update-timer*))
+  (process:with-lock (*get-common-property-lists-process*)
+    (let ((*inhibit-obsolete-information-warning* t)
+	  (i-am-a-secondary nil))
+      (keeping-namespace-server
+	(with-fixups
+	  (map-over-objects-of-class-in-namespace
+	    *namespace* :namespace
+	    #'(lambda (ns)
+		(with-namespace-locked (ns)
+		  (send ns :get-latest-timestamp t)
+		  (if (eq (send ns :local-server-p) :secondary)
+		      (setq i-am-a-secondary t))))))
+	(initializations 'commonly-used-property-lists t))
+      (when i-am-a-secondary
+	(unless *secondary-server-update-timer*
+	  (setq *secondary-server-update-timer*
+		(process:create-timer-call #'encache-property-lists ()
+					   :name "Secondary Server Update")))
+	(process:reset-timer-relative *secondary-server-update-timer*
+				      ;; Convert minutes to seconds
+				      (* 60. *secondary-server-update-interval*))))))
+
+
+(defun get-local-printers ()
+  ;; Assume all local objects are in the local namespace
+  (searching-one-site ()
+    (find-objects-from-property-list ':printer ':site *local-site*)))
+
+(add-initialization "Get Local Printers"
+		    '(get-local-printers)
+		    nil
+		    'commonly-used-property-lists)
+
+;;; Make sure that everything is really encached before doing a disk-save.
+;;; Wait for the background process to complete, and then do it again, which
+;;; will take almost no time unless the background process died with an error before
+;;; completing, in which case the namespace server will be queried for the rest of the data.
+
+(add-initialization "Get common property lists"
+		    '(encache-property-lists)
+		    '(before-cold))
+
+;;; When the local host is of the UX embedding types, make sure it has the :EMBEDDED-IN
+;;; user property.
+#+IMach
+(defun verify-embedded-host ()
+  (when (and (neq *namespace* *distribution-namespace*)
+	     (null (send *local-site* :standalone))
+	     (system-case ((Solstice VLM) t) (otherwise nil))
+	     (variable-boundp *emb-host*)
+	     (not (send *emb-host* :uninterned-p)))
+    (let* ((machine-type (local-machine-type))
+	   (acceptable-machine-types (cl:ecase machine-type
+				       (:UX400S '(:UX400S :UX400 :SOLSTICE))
+				       ((:UX400G :UX1200G :UX1200S) (list machine-type))
+				       (:VLM (list machine-type)))))
+      (when (not (memq (send *local-host* :machine-type) acceptable-machine-types))
+	(tv:notify
+	  nil
+	  "The local host is a ~A but the machine-type in the namespace object does not match.  ~&Edit Namespace Object Host ~A and change the machine-type to ~A."
+	  machine-type *local-host* machine-type))
+      (let ((embedded-host (send *local-host* :user-get :embedded-in)))
+	(cond
+	  ((null embedded-host)
+	   (tv:notify
+	     nil
+	     "The local host has a machine-type of an embedded system but does not have an embedded-in user property.  ~&Edit Namespace Object Host ~A and add the user-property EMBEDDED-IN ~A."
+	     *local-host* *emb-host*))
+	  ((not (ns-eq (parse-host embedded-host t) *emb-host*))
+	   (tv:notify
+	     nil
+	     "The EMBEDDED-IN user-property does not match the host that the local-host is embedded in.  ~&Edit Namespace Object Host ~A and change the user-property EMBEDDED-IN ~A to EMBEDDED-IN ~A" *local-host* embedded-host *emb-host*)))))))
+
+
+;;; Garbage Collection
+
+(defvar *objects-to-keep*)
+
+(si:define-gc-optimization gc-namespace :layered-system-release
+  (:documentation "Allow namespace objects to be GC'd")
+  (:before-flip (ignore)
+    ;; Make the property lists be up to date.
+    (loop for network in *local-networks* do
+      (send-if-handles network :clear-address-table))
+    (loop for namespace in (send *namespace* :objects-of-class :namespace)
+	  do (clrhash (send namespace :object-property-list-cache)))
+    (encache-property-lists)
+    ;; Get rid of all internal pointers to objects except the property lists fixed above.
+    (setf *objects-to-keep* nil)
+    (let ((namespaces (send *namespace* :objects-of-class :namespace)))
+      (loop for namespace in namespaces
+	    unless (send namespace :local-server-p)
+	      do (send namespace :before-full-gc))
+      (loop for class-entry in *shared-class-table* do
+	(maphash #'(lambda (object ignore)
+		     (when (send (global-object-namespace object) :local-server-p)
+		       (cl:pushnew object *objects-to-keep*)))
+		 (class-entry-object-table class-entry))
+	(setq *objects-to-keep* (copylist (cl:delete-duplicates *objects-to-keep*)))
+	(clrhash (class-entry-object-table class-entry))
+	(clrhash (class-entry-name-table class-entry)))))
+  (:after-reclaim-oldspace (ignore)
+    (variable-makunbound *objects-to-keep*)
+    (si:map-over-objects-in-area *namespace-object-area* #'si:region-predicate-structure
+      #'(lambda (ignore ignore object ignore ignore)
+	  (when (typep object 'object)
+	    (loop with class = (send object :class)
+		  for namespace in (send object :namespaces)
+		  do (send namespace :re-intern-object class object)))))))
+
+
+;;; Really early (cold load) initialization.
+
+;;; This is called by QLD to set up the namespace system during cold load.
+(defun qld-initialize-namespaces ()
+  ;; Initialize the shared class table.  This is never modified.
+  (setq *shared-class-table*
+	(list-in-area *namespace-object-area*
+		      (make-class-entry class :namespace)
+		      (make-class-entry class :site)))
+  ;; Create an initial namespace
+  (setq *distribution-namespace* (make-instance 'namespace))
+  (send *distribution-namespace* :set-valid-for-namespace *distribution-namespace*
+	:distribution `(:search-rules (,*distribution-namespace*)))
+  ;; Tell the namespace system about it.
+  (setq *namespace* *distribution-namespace*)
+  (send *namespace* :change-of-attributes)
+  ;; Set up the domain namespace.
+  (setf *domain-namespace*
+	(add-or-change-object :namespace :domain () *namespace*))
+  ;; Create the initial site object.
+  (setq *distribution-site*
+	(add-or-change-object :site :distribution
+			      `(:pretty-name "Distribution"
+				:local-namespace ,*namespace*
+				:site-directory "DIS-SYS-HOST:>sys>site>"
+				:standalone "YES"
+				:timezone :est)
+			      *namespace*))
+  (setq *local-site* *distribution-site*)
+  ;; and the chaos network (we do Internet later when it is defined.)
+  (setq *distribution-networks*
+	(add-or-change-object :network (parse-name "CHAOS" nil *distribution-namespace*)
+				'(:type :chaos)
+				*namespace*))
+  ;; and an initial user object
+  (add-or-change-object :user (parse-name "LISP-MACHINE" nil *distribution-namespace*)
+			'(:lispm-name "LISPM" :type :daemon)
+			*namespace*)
+  ;; and a magic user to be the value of SI:*USER* when we're not logged in.
+  (setq si:*not-logged-in-user*
+	(make-object-from-property-list ':user "NOT LOGGED IN"
+					`(:lispm-name "" :affiliation "-")))
+  ;; Create the initial network and host objects 
+  (get-primary-network-address)
+  (setf *distribution-local-host* (get-distribution-local-host))
+  ;; Use them for now
+  (setq si:*user* si:*not-logged-in-user*)
+  (change-to-distribution-site)
+  ;; Create and hang onto stuff for Dialnet.
+  (setq dial:*dialnet-namespace* (add-or-change-object
+				   :namespace :dial
+				   (copytree '(:search-rules (neti:**self**)))
+				   *namespace*))
+  (setq dial:*dialnet-dial-network*
+	(add-or-change-object :network (neti:parse-name "DIAL" nil dial:*dialnet-namespace*)
+			      (copytree '(:type :dial))
+			      dial:*dialnet-namespace*))
+  (setq dial:*dialnet-telenet-network*
+	(add-or-change-object :network (neti:parse-name "TELENET" nil dial:*dialnet-namespace*)
+			      (copytree '(:type :x25))
+			      dial:*dialnet-namespace*))
+  ;; We don't need this anymore
+  #+IMach (setf *mini-ethernet-interface* nil))
+
+;;; Called when enough support for CLASS-NAME has been loaded to create real objects.
+(defun redefine-objects-of-class (class-name)
+  (map-over-objects-of-class-in-namespace
+    *namespace* :namespace
+    #'(lambda (namespace)
+	(map-over-objects-of-class-in-namespace
+	  namespace class-name
+	  #'(lambda (object) (send object :change-of-attributes))))))
+
+;;; Other object definitions needed during cold load.
+
+(define-namespace-class-object-flavor :site site)
+
+(defflavor site () (own-flavor-object)
+  (:default-init-plist :class :site))
+
+(defmethod (:change-of-attributes site) ()
+  (declare (special zl:site-name))		1;No compiler warnings about obsolete vars.
+0  (when (ns-eq self *local-site*)
+    (setq zl:site-name (send self :name))
+    (run-site-initialization-list)))
+
+(compile-flavor-methods site)
+
+;;; Someday, probably Release 8, just use the "official" property directly,
+;;; instead of using this function that looks at the obsolete user property.
+(defun get-other-sites-in-mail-area (site)
+  (or (send site :other-sites-in-mail-area)
+      (let ((old-other-sites (send site :user-get :other-sites-in-mail-area)))
+	(when old-other-sites
+	  (scl:with-standard-io-environment
+	    (let* ((package (pkg-find-package "KEYWORD"))
+		   (old-other-site-names
+		     (read-from-string old-other-sites)))
+	      (loop for old-other-site-name in old-other-site-names
+		    collect (net:find-object-named :site old-other-site-name))))))))
+
+;;; Someday, probably Release 8, just use the "official" property directly,
+;;; instead of using this function that looks at the obsolete user property.
+(defun all-mail-addresses-forward-at-site (site)
+  (or (equal (send site :all-mail-addresses-forward) "YES")
+      (equal (send site :user-get :all-mail-addresses-forward) "YES")))
+
+
+
+(defun recompute-namespace-server-access-paths
+       (&optional (namespace (send *local-site* :local-namespace)))
+  (send (if (typep namespace 'namespace)
+	    namespace
+	    (let ((*inhibit-validity-checking* t))
+	      (find-namespace-named namespace)))
+	:compute-local-server-type))
+
+(defun recompute-all-namespace-server-access-paths ()
+  (send *namespace* :map-over-objects-of-class :namespace
+	#'(lambda (ns) (send ns :compute-local-server-type))))
+
+(defun reset-namespace-server-access-path
+       (&optional (namespace (send *local-site* :local-namespace)))
+  (invalidate-namespace-server-access-paths
+    (if (typep namespace 'namespace)
+	namespace
+	(let* ((*inhibit-validity-checking* t))
+	  (find-namespace-named namespace)))))
+
+(defun reset-all-namespace-server-access-paths ()
+  (send *namespace* :map-over-objects-of-class :namespace
+	#'invalidate-namespace-server-access-paths))
+
+(defun shutdown-namespace-system ()
+  (when *local-host-is-default-secondary-namespace-server*
+    (setq *local-host-is-default-secondary-namespace-server* nil)
+    (reset-all-namespace-server-access-paths))
+  nil)
+
+(add-initialization "Shutdown Namespace System"
+		    '(shutdown-namespace-system)
+		    '(:system-shutdown))
+
+(add-initialization "Secondary namespace server?"
+		    '(reset-all-namespace-server-access-paths)
+		    ()
+		    'local-name-initialization-list)
+
+;;debugging any analysis function.
+(defun show-namespace-server-access-paths
+       (&optional (namespace (send *local-site* :local-namespace)))
+  (let* ((ns (if (typep namespace 'namespace)
+		 namespace
+		 (find-namespace-named namespace)))
+	 (elts (send ns :server-access-paths)))
+    (format t "~&Server access paths for namespace ~A:~%" ns)
+    (formatting-table ()
+      (formatting-column-headings ()
+	(formatting-cell () "Host")
+	(formatting-cell () "via")
+	(formatting-cell () "Desirability"))
+      (dolist (elt elts)
+	(scl:destructuring-bind (host nap ntap) elt
+	  ntap
+	  (formatting-row ()
+	    (formatting-cell ()
+	      (princ host))
+	    (formatting-cell ()
+	      (princ (service-access-path-medium nap)))
+	    (formatting-cell ()
+	      (princ (service-access-path-desirability nap)))))))))

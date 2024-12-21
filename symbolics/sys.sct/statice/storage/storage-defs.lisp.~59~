@@ -1,0 +1,379 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: STATICE-INDEX; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; 
+;;; Storage Definitions, and Macros for Statice Indexes
+;;; See Y:>Feinberg>Statice>Index-Design.MSS, .PRESS for details
+;;;
+
+
+(defparameter *debug* nil)
+(defvar *compiling-for-debug* NIL)
+
+;;; Every disk page that makes up a B-tree index starts with this header.
+(defstruct (index-record (:type :array) :conc-name)
+  ((header-word-1)
+   ;(type-code 0 :byte (byte 4 28))		;see index-record-page-type-code below
+   (page-number 0 :byte (byte 28 0)))		;page number in the file
+  segment-id					;id of the segment.
+  next						;Actually a pointer 
+  previous					;Actually a pointer
+  parent)					;Actually a pointer 
+
+;;; The value of this field is one of the storage level page type
+;;; codes, enumerated in record.lisp.  It also tells us whether a
+;;; given page is a branch or a leaf.
+(defsubst index-record-page-type-code (page)
+  (sys:%logldb (byte 4 28) (aref page 0)))  
+
+;;Any disk page which is represented by objects of flavor INDEX-RECORD (including
+;;this one) must record-type, next, previous, and parent as the first four words
+;;in the disk page, in that exact order.
+(defstruct (node (:type :array) (:size-symbol *index-record-header-size*)
+		 (:include index-record) :conc-name)
+  header-fill-pointer				;Fill pointer for fixed length area
+  data-fill-pointer)				;Fill pointer for variable length area
+
+;;Any disk page which is represented by objects of flavor INDEX-RECORD (including
+;;this one) must record-type, next, previous, and parent as the first four words
+;;in the disk page, in that exact order.
+(defstruct (overflow-record (:type :array) (:size-symbol *overflow-record-header-size*)
+			    (:include index-record) :conc-name)
+  total-length					;Number of data words in the entire chain
+						;of overflow records
+  data-fill-pointer)				;Index of next free word in this record
+
+(defconstant *number-of-header-words* 1)
+
+;;We always have at least one value plus *number-of-header-words*
+(defconstant *minimum-entry-size* (+ *number-of-header-words* 1))
+
+;;Maximum number of values per entry.  This value is a bit
+;;arbitrary.  If page sizes go below 100 words, maybe this should
+;;be reconsidered.  It is not worth recomputing this based on page size 
+;;differences, though.
+;;When we go through and optimize, this whole scheme should be thrown out in favor
+;;of computing maximum entry size.
+
+;; Debugging macro
+
+(defmacro when-debugging-and (condition &body body)
+  (if *compiling-for-debug*
+      `(when ,condition
+	 . ,body)
+    nil))
+
+;; File level will tell us how big a page is.  We then dynamically bind
+;; various other useful numbers.  It would be nice if we could think of a better
+;; way to do this, since the binding overhead is pretty severe.
+
+(defvar *words-per-page*)			;Number of words per page.
+(defvar *50%-point-of-page*)			;Half the number of data (non-header) words.
+ 						;Entries are not allowed to be greater
+						;than 50% of a page due to the pagination
+						;algorithm.
+
+;;Makes a bunch of accessors which do an LDB of a word.
+;;Also makes a constructor which takes keyword arguments for each field,
+;;and DPB's up a number from the specified fields.
+;;I bet there is some place in the system that already does this.
+
+(defmacro def-byte-fields (conc-name &rest byte-defs)
+  `(progn
+     (defmacro ,(intern (string-append "MAKE-" conc-name))
+	       (&key (start-value 0) . ,(loop for (field-name) on byte-defs by #'cddr
+			      collect field-name))	
+       (let ((.result. start-value))
+	 ,@(loop for (field-name byte-spec) on byte-defs by #'cddr 
+	     collect
+	      `(when ,field-name
+		 (setq .result.
+		       `(dpb ,,field-name (byte . ,',byte-spec) , .result.))))
+	 .result.))
+     . ,(loop for (field-name byte-spec) on byte-defs by #'cddr
+		   collect `(defmacro ,(intern (string-append conc-name "-" field-name))
+				      (word)
+			      `(ldb (byte ,',@byte-spec) ,word)))))
+
+;; This defines MAKE-ENTRY &key KEY-START KEY-LENGTH ... which is used to 
+;; to construct an entry header based on the keyword arguments to the macro.
+;; This also defines a set of accessors (ENTRY-KEY-START, ENTRY-KEY-LENGTH, ...)
+;; which access specific appropriate byte fields of the specified entry header.
+;; See the hairy macro above.
+
+(def-byte-fields entry 
+  compatible-key-start	       	(9 0)
+  key-length			(9 9)
+  number-of-values		(9 18)
+  key-overflow			(1 27)
+  value-overflow		(1 28)
+  ;; We should concatenate these bits, but that would make incompatible
+  ;; databases.  Start can actually be 1/2 page size and then biased,
+  ;; since headers are 1 word and there has to be at least one header
+  ;; per key, as RID's are.
+  start-overflow                (2 29))
+
+(defmacro extended-make-entry (&key (start-value 0) key-start key-length number-of-values key-overflow value-overflow)
+  `(extended-make-entry-internal
+     ,start-value ,key-start ,key-length ,number-of-values ,key-overflow ,value-overflow))
+
+(defun extended-make-entry-internal (&optional (start-value 0) key-start key-length number-of-values key-overflow value-overflow)
+  ;; See note on entry-key-start as to why we have to allow 2048
+  (check-type key-start (or null (integer 1 2048)))
+  (check-type key-length (or null (integer 0 #.(entry-key-length -1))))
+  (check-type number-of-values (or null (integer 0 #.(entry-number-of-values -1))))
+  (when key-start
+    (setq start-value (set-entry-key-start start-value key-start)))
+  (when key-length
+    (setf (entry-key-length start-value) key-length))
+  (when number-of-values
+    (setf (entry-number-of-values start-value) number-of-values))
+  (when key-overflow
+    (setf (entry-key-overflow start-value) key-overflow))
+  (when value-overflow
+    (setf (entry-value-overflow start-value) value-overflow))
+  start-value
+  )
+
+;; Horrendous design.  A zero-length key is stored for the right end of
+;; a branch-node.  If that node is completely full, the key-start is
+;; going to be page-size!
+(defun entry-key-start (header)
+  (let ((start (dpb (entry-start-overflow header) (byte 2 9) (ldb (byte 9 0) header))))
+    (if (zerop start)
+	2048
+	start)))
+
+(defun set-entry-key-start (entry key-start)
+  ;; See note on entry-key-start as to why we have to allow 2048
+  (check-type key-start (integer 1 2048))
+  (make-entry :start-value entry
+	      :compatible-key-start key-start
+	      :start-overflow (ldb (byte 2 9) key-start)))
+
+;;Inclusive
+(defsubst entry-start (header)
+  (- (entry-key-start header) (entry-number-of-values header)))
+
+;;Exclusive
+(defsubst entry-end (header)
+  (+ (entry-key-start header) (entry-key-length header)))
+
+(defsubst overflow-key-p (header)
+  (not (zerop (entry-key-overflow header))))
+
+(defsubst overflow-values-p (header)
+  (not (zerop (entry-value-overflow header))))
+
+
+(defstruct (header (:type :array) :conc-name)
+  ((header-word-1)
+   ;(type-code 0 :byte (byte 4 28))		;see index-record-page-type-code above
+   (page-number 0 :byte (byte 28 0)))		;page number in the file
+  segment-id					;id of the segment.
+  statice-version	
+  index-version 	
+  index-type					;Obsolete, not used any more
+  root)						;Actually a pointer
+
+;;; Association between the numeric type codes found in the page headers
+;;; (see the index-record structure) and the names of the resources.
+(defparameter *index-record-type-alist*
+	      `((,*b-tree-header-page-code* . INDEX)
+		(,*b-tree-branch-page-code* . BRANCH-NODE)
+		(,*b-tree-leaf-page-code* . LEAF-NODE)
+		(,*b-tree-overflow-page-code* . OVERFLOW-RECORD)))
+
+(defsubst index-record-type (disk-page)
+  (cdr (assoc (index-record-page-type-code disk-page)
+	      *index-record-type-alist*)))
+
+(defsubst index-record-type-code (resource-name)
+  (car (rassoc resource-name *index-record-type-alist*)))
+
+(defresource temp-page (&optional (size *words-per-page*))
+  :constructor
+  (make-array size :element-type '(unsigned-byte 32)))
+
+(defresource key (size)
+  :constructor
+  (make-array size :element-type '(unsigned-byte 32) :fill-pointer 0)
+  :initializer
+  (setf (fill-pointer object) size)
+  :matcher
+  (<= size (length object)))
+
+
+;;Maybe make some of these DEFSUBST-IN-FLAVORs someday.
+
+(defsubst compute-size-of-entry (key-length number-of-values)
+  (+ *number-of-header-words* key-length number-of-values))
+
+(defsubst data-space-used-by-existing-entry (entry-header)
+  (+ (entry-key-length entry-header)
+     (entry-number-of-values entry-header)))
+  
+(defsubst size-of-existing-entry (entry-header)
+  (+ *number-of-header-words*
+     (data-space-used-by-existing-entry entry-header)))
+
+(defsubst number-of-entries-in-disk-page (disk-page)
+  (- (node-header-fill-pointer disk-page)
+     *index-record-header-size*))
+
+(defsubst node-empty-p (disk-page)
+  (= (node-header-fill-pointer disk-page) *index-record-header-size*))
+
+(defsubst node-free-space (disk-page)
+  (- (node-data-fill-pointer disk-page) (node-header-fill-pointer disk-page)))
+
+(defsubst new-destination-p (destination-disk-page)
+  (< (node-parent destination-disk-page) 0))
+
+
+(defmacro with-resource (varlist &body body)
+  (declare (arglist (variable resource-name &rest parameters) . body))
+  ;; convert single-resource style to multiple-resource style.
+  (unless (listp (car varlist)) (setq varlist (ncons varlist)))
+  (let ((descriptor-vars (if (< (length varlist) 2)
+			'(.resource-descriptor.)
+			(loop repeat (length varlist) collect (gensym))))
+	(name-vars (if (< (length varlist) 2)
+			'(.resource-name.)
+			(loop repeat (length varlist) collect (gensym)))))
+    `(let (,@(mapcar #'car varlist)
+	   ,@(loop for name-var in name-vars
+		   for (nil name) in varlist
+		   collect (list name-var name))
+	   . ,descriptor-vars)
+	 (unwind-protect 
+	     (progn
+	       ,@(loop for (var name . parameters) in varlist
+		       for descriptor-var in descriptor-vars
+		       for name-var in name-vars
+		       collect `(multiple-value-setq (,var ,descriptor-var)
+				 (allocate-resource ,name-var . ,parameters))
+			 do (ignore name))
+	       . ,body)
+	   ,@(let (cleanups)
+	       (loop for (var name) in varlist
+		     for descriptor-var in descriptor-vars
+		     for name-var in name-vars
+		     do (ignore name)
+			(push `(when ,var
+				 (deallocate-resource ,name-var ,var ,descriptor-var))
+			      cleanups))
+	       cleanups)))))
+
+
+;; Debugging macros
+
+(defvar *test-points* (make-hash-table :size 300))
+(defvar *all-test-points* nil)
+(defvar *compiling-for-test-points* nil)
+
+(defmacro record-test-point (point-name)
+  (cond (*compiling-for-test-points*
+	 (si:push* point-name *all-test-points*)
+	 `(modify-hash *test-points* ',point-name
+		       #'(lambda (key value found-p &rest ignore)
+			   (ignore key)
+			   (if found-p (incf value) 1))))
+	(t
+	 nil)))
+
+
+;; Macros to help overcome problems with new flavors
+
+;; This is needed because defining defsubst-in-flavor on mixins will
+;; not cause split methods to be generated for the base flavor.
+(defmacro def-multi-flavor (type (method-name flavors) arglist &body body)
+  (let ((defining-symbol (intern (string-append "DEF" (string type)))))
+    `(progn . ,(loop for flavor in flavors
+		     collect `(,defining-symbol (,method-name ,flavor) ,arglist
+			       (declare (sys:function-parent ,method-name def-multi-flavor))
+			       . ,body)))))
+
+
+
+
+;; Overflow mapping macros
+
+;; Not used yet.
+(defmacro map-over-overflow-record ((word-var record) &body body)
+  `(loop for current-address first (index-record-disk-page-address ,record)
+			     then next-address
+	 as current-page = (read-page *current-segment* current-address)
+	 as next-address = (overflow-record-next current-page) do
+     (loop for i from *overflow-record-header-size*
+		 below (overflow-record-data-fill-pointer current-page)
+	   as ,word-var = (aref current-page i)
+	   . ,body)
+     until (zerop next-address)
+	 finally do
+		 (let ((,word-var nil))
+		   . ,body)))
+
+;;Under development
+;(defmacro map-over-multiple-overflow-keys ((word-vars-and-records) &body body)
+;  (let ((number-of-records  (length word-vars-and-records)))
+;    (let ((current-address-vars  (make-array number-of-records))
+;	  (current-page-vars     (make-array number-of-records))	
+;	  (next-address-vars     (make-array number-of-records)))
+;      (loop for i from 0 below number-of-records do
+;	(setf (aref current-address-vars i) (gensym))
+;	(setf (aref current-page-vars i) (gensym))
+;	(setf (aref next-address-vars i) (gensym)))
+;      `(loop ,@(loop 
+

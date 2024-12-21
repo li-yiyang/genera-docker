@@ -1,0 +1,765 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SCT; Base: 10; Lowercase: T -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; SCT substrate for Distribution
+
+(defflavor distribution-system
+	((default-module-type :distribution)
+	 (patchable nil)		;distribution-systems are never compiled
+	 (maintain-journals nil)
+	 (advertised-in nil)
+	 (initial-status nil)
+	 (status nil))
+	(system)
+  (:conc-name system-)
+  :writable-instance-variables)
+
+(defmethod (:init distribution-system :after) (init-plist)
+  (when (member :default-module-type (location-contents init-plist))
+    ;;--- It would sure be nice if this worked!
+    (ferror "You can't supply a default module-type in distribution-systems")))
+
+(defwhopper (with-system-environment-internal distribution-system) (&rest args)
+  (let ((*destination-file-types* t))
+    (lexpr-continue-whopper args)))
+
+(defprop define-distribution-system "Distribution system" si:definition-type-name)
+(defmacro define-distribution-system (system-name options &body body)
+  (declare (zwei:indentation 1 3 2 1))
+  (when (memq :name options)
+    (ferror "You may not explicitly specify :NAME in a DEFINE-DISTRIBUTION-SYSTEM form"))
+  (let ((system-name (canonicalize-system-name system-name)))
+    `(progn
+       (record-source-file-name ',system-name 'defsystem)
+       (define-system-internal  ',system-name 'distribution-system ',options
+				',(expand-short-form body)))))
+
+
+;; Compiling and loading are no-ops for :DISTRIBUTION modules
+(define-module-type :distribution nil nil
+  no-load-or-compile-module)
+
+;; Return the list of pathnames with wildcards resolved
+(defmethod (collect-module-inputs-and-outputs distribution-module) (&optional merge-version
+								    &key vc-branch)
+  (declare (values module-inputs module-outputs))
+  (ignore merge-version)
+  (loop for (input-pattern) in inputs
+	append
+	  (loop for (input . properties)
+		    in (if (or (let ((name (send input-pattern :name)))
+				 (or (eq name :wild)
+				     (string-search-char #/* name)))
+			       (eq (send input-pattern :type) :wild))
+			   (cdr (fs:directory-list input-pattern))
+			 (list (list input-pattern)))
+		as input-file = (let* ((vcb (or (send input :vc-branch) vc-branch))
+				       (physical (send input :new-pathname
+							     :vc-branch vcb
+							     :vc-version (and vcb :newest))))
+				  ;; Always try to use logical pathnames, please
+				  (send input-pattern :back-translated-pathname physical))
+		;; Files which represent directories never get distributed
+		when (not (cl:getf properties :directory))
+		  collect input-file) into all-inputs
+	finally (return (values all-inputs all-inputs))))
+
+(defmethod (version-control-defaults distribution-module) (system)
+  (declare (values (version-controlled branch-mapping)))
+  (ignore system)
+  (values nil nil))
+
+(defmethod (distribution-defaults distribution-module) (system)
+  (declare (values distribute-sources distribute-binaries source-category))
+  (values (system-distribute-sources system)
+	  (system-distribute-binaries system)
+	  (system-source-category system)))
+
+(defmethod (module-special-source-category distribution-module) (pathname)
+  (ignore pathname)
+  :basic)
+
+
+(defun destination-file-p (pathname &optional (destination-types *destination-file-types*))
+  (or (eq destination-types t)
+      (mem #'string-equal
+	   (send pathname :canonical-type) destination-types)))
+
+(define-system-operation :distribute
+  #'(named-lambda distribute-system-driver
+		  (file ignore module &rest keys
+		   &key distribution-stream flatten-files compress-files &allow-other-keys)
+      (let ((pathname (lexpr-funcall #'distribution-pathname module file keys)))
+	(when pathname
+	  (if (typep pathname 'basic-system)
+	      (cl:apply #'dis:write-distribution-system pathname distribution-stream keys)
+	    (dis:write-specific-file distribution-stream *system* pathname nil
+				     (if (destination-file-p pathname)
+					 "BINARY-FILE" "SOURCE-FILE")
+				     :flatten-files flatten-files
+				     :compress-files compress-files)))))
+  #'(named-lambda distribute-system-documentation
+		  (file ignore module &rest keys
+		   &key flatten-files &allow-other-keys)
+      (let ((pathname (lexpr-funcall #'distribution-pathname module file keys)))
+	(when pathname
+	  (if (typep pathname 'basic-system)
+	      (format standard-output "~&Distribut~[e~;ing~;ed~] system ~A"
+		*system-pass* pathname)
+	    (let ((flatten (and flatten-files (not (null (send pathname :vc-branch))))))
+	      (format standard-output
+		  "~&Distribut~[e~;ing~;ed~] ~:[~;flattened ~]file ~A~:[~*~; (~A)~]"
+		*system-pass* flatten pathname
+		flatten (fs:flatten-version-control-pathname pathname)))))))
+  :arglist
+    (system-name &rest keys
+     &key (machine-types :all) distribution-stream
+	  (source-category :basic) distribute-sources distribute-binaries
+	  (include-journals t) (include-sysdcl t)
+	  (include-patches t) (distribute-patch-sources nil)
+	  (suppress-detail-printing nil) (flatten-files t)
+	  (compress-files nil)
+	  (included-files-checkpoint :none) (use-cached-checkpoint nil)
+	  additional-destination-types
+     &allow-other-keys)
+  :class :normal :funny-p t :encache nil
+  :system-branch-required t
+  :additional-plan-constructor #'make-plan-for-journals-and-patches
+  :plan-filter #'distribute-file-p
+  :body-wrapper
+    `(progn
+       (unless (or (assq source-category *category-rank-alist*)
+		   (memq source-category '(:optional-only :restricted-only)))
+	 (ferror "~S is not a valid :SOURCE-CATEGORY specification"
+	   source-category))
+       (let ((*pathname-mark-table* (scl:make-hash-table :number-of-values 0))
+	     (*current-checkpoint-tick*
+	       (incf *global-checkpoint-tick*))
+	     (*destination-file-types*
+	       (append *destination-file-types*
+		       additional-destination-types
+		       (all-file-types-for-machine-type machine-types))))
+	 ,@BODY)))
+
+;; Note well that distributing version :NEWEST of a system distributes the
+;; .NEWEST versions of all of the files in the system, but distributes the
+;; :LATEST (or whatever) versions of the sysdcl and all of the journal files.
+(defvar *journals-to-use-when-distributing-newest* :latest)
+(defun make-plan-for-journals-and-patches (system-op &rest keys
+					   &key distribute-sources distribute-binaries
+					        include-journals (include-sysdcl t)
+						include-patches distribute-patch-sources
+						source-category
+						included-files-checkpoint
+					   &allow-other-keys)
+  (ignore system-op keys distribute-sources)
+  (when (or (typep *system* 'subsystem)
+	    (typep *system* 'distribution-system))
+    ;; Do nothing for subsystems or distribution-systems
+    (return-from make-plan-for-journals-and-patches (values nil nil)))
+  (let ((definitions-module
+	  (make-instance 'plan-overhead-module
+			 :name "Definitions"
+			 :source-category (list (list source-category))
+			 ;; Don't include the definitions if this is a
+			 ;; patches-only distribution.  Perhaps this
+			 ;; can be done better later.
+			 :distribute-sources (if (or distribute-sources
+						     distribute-binaries
+						     include-journals)
+						 :always
+					       nil)
+			 :distribute-binaries distribute-binaries))	;---??
+	(journals-module
+	  (make-instance 'plan-overhead-module
+			 :name "Journals"
+			 :source-category (list (list source-category))
+			 :distribute-sources :always
+			 :distribute-binaries distribute-binaries))	;---??
+	(patch-module
+	  (make-instance 'plan-overhead-module
+			 :name "Patch"
+			 :source-category (list (list source-category))
+			 :distribute-sources :always	;list already filtered
+			 :distribute-binaries :always))	;when this is used
+	(*version*
+	  (if (and (eq *version* :newest)
+		   (system-maintain-journals *system*))
+	      (or (get-system-major-version-from-directory
+		    *system* *journals-to-use-when-distributing-newest* t)
+		  (when (neq *journals-to-use-when-distributing-newest* :latest)
+		    (sct-inform
+			"~&No ~@(~A~) version designated for system ~A, ~
+			   will try to use Latest"
+		      *journals-to-use-when-distributing-newest* *system*)
+		    (get-system-major-version-from-directory *system* :latest t)))
+	    *version*))
+	plans-to-prepend plans-to-append)
+    ;; This includes the defsystem file in the list to be distributed.  It doesn't
+    ;; really belong here, and a more modular solution should be created later, but
+    ;; we'll put it here for now as the simplest way to make Distribution work.
+    ;; The defsystem needs to be first so that Restore Distribution can read
+    ;; it in and get the patch file translations, by the skin of its teeth.
+    (let* ((inputs
+	     (when include-sysdcl
+	       (nconc
+		 (get-sys-site-pointer-files *system*)
+		 (loop for (file) in
+			   (block get-sysdcl
+			     (dbg:with-debugger-special-command
+			       (system-declaration-not-found
+				 "Don't include the sysdcl file in the plan")
+				 (return-from get-sysdcl nil)
+			       (get-system-input-and-output-defsystem-files
+				 *system*
+				 (if (system-maintain-journals *system*) *version* nil))))
+		       as real-path = (if (system-maintain-journals *system*)
+					  file
+					(send file :new-version :newest))
+		       collect real-path))))
+	   (sysdcl-plan (make-plan definitions-module *system* :inputs inputs)))
+      (when sysdcl-plan (push sysdcl-plan plans-to-prepend)))
+    (when (and include-journals (system-maintain-journals *system*))
+      (let* ((inputs (distribution-journal-pathnames *system* *version*))
+	     (journals-plan (make-plan journals-module *system* :inputs inputs)))
+	(when journals-plan 
+	  (push journals-plan plans-to-prepend))))
+    (when (and include-patches
+	       (system-patchable *system*))
+      (let* ((inputs (distribution-patch-file-pathnames
+		       *system* *version*
+		       :distribute-sources distribute-patch-sources
+		       :distribute-binaries :always
+		       :include-patches include-patches
+		       :included-files-checkpoint included-files-checkpoint))
+	     (patches-plan (make-plan patch-module *system* :inputs inputs)))
+	(when patches-plan
+	  (push patches-plan plans-to-append))))
+    (values (nreverse plans-to-prepend) (nreverse plans-to-append))))
+
+(defun distribute-file-p (system-op pathname module
+			  &key (source-category :basic)
+			       (distribute-sources :use-system-value)
+			       (distribute-binaries :use-system-value)
+			       (included-files-checkpoint :none)
+			       (use-cached-checkpoint nil)
+			       parent-version
+			  &allow-other-keys)
+  (ignore system-op)
+  ;; Only distribute this file once per top-level distribution operation
+  (when (scl:gethash pathname *pathname-mark-table*)
+    (return-from distribute-file-p nil))
+  (setf (scl:gethash pathname *pathname-mark-table*) t)
+  ;; Sometimes people put #+/#- in their DEFSYSTEM forms, and we aren't
+  ;; running in the same environment, so the module cannot be found.
+  ;; In that case, we need to do something.
+  (when (null module)
+    (setq module *kludge-for-null-module*))
+  (let* ((this-category
+	   (or (module-special-source-category module pathname)
+	       (pathname-source-category pathname)))
+	 (file-rank (cdr (assq this-category *category-rank-alist*)))
+	 (passed-rank (cdr (assq source-category *category-rank-alist*)))
+	 (binary-file-p
+	   (destination-file-p pathname (destination-file-types-for-distribution)))
+	 (source (if (eq distribute-sources :use-system-value)
+		     (module-distribute-sources module)
+		   (or distribute-sources
+		       (eq (module-distribute-sources module) :always))))
+	 (binary (if (eq distribute-binaries :use-system-value)
+		     (module-distribute-binaries module)
+		   (or distribute-binaries
+		       (eq (module-distribute-binaries module) :always))))
+	 (ok-by-rank
+	   ;; Distribute a file if :DISTRIBUTE-SOURCES/BINARIES was explicitly T,
+	   ;; or if its module declaration says to distribute it.  Do not distribute
+	   ;; a file if :DISTRIBUTE-SOURCES/BINARIES was explicitly NIL.  Furthermore,
+	   ;; do not distribute a source file if it's source-category is higher than
+	   ;; the one passed to DISTRIBUTE-SYSTEM.
+	   (and (or binary-file-p		;only check ranks for source files
+		    (eq this-category source-category)
+		    (and (numberp file-rank) (numberp passed-rank)
+			 ( file-rank passed-rank))
+		    ;; This is a bit of a kludge here...
+		    (and (eq source-category :optional-only)
+			 (eq this-category :optional))
+		    (and (eq source-category :restricted-only)
+			 (eq this-category :restricted)))
+		(or (and (not binary-file-p) source)
+		    (and binary-file-p binary))))
+	 (ok-by-cutoff-and-rank
+	   (and ok-by-rank			;don't do this if unnecessary
+		(if (eql included-files-checkpoint :none) t
+		  (if binary-file-p t
+		    (if (typep module 'plan-overhead-module) t
+		      (file-follows-checkpoint-p 
+			pathname included-files-checkpoint
+			:use-cached-checkpoint use-cached-checkpoint
+			:parent-version parent-version)))))))
+    ok-by-cutoff-and-rank))
+
+;; A bit of user-interface: given a pathname, find its source category
+(defun pathname-source-category (pathname)
+  (let* ((pathname (send (fs:parse-pathname pathname) :generic-pathname))
+	 (system (send pathname :get 'sct:system))
+	 (category (send pathname :get 'sct:source-category)))
+    ;; Quick outs: we've cached it already, or it doesn't exist at all
+    (when category
+      (return-from pathname-source-category category))
+    (when (null system)
+      (return-from pathname-source-category nil))
+    ;; OK, cache all of the source-categories for this system
+    (flet ((find-category (pathname category-list)
+	     (loop with default-category = nil
+		   for (category . pathnames) in category-list
+		   do (if (null pathnames)
+			  (setq default-category category)
+			(when (memq pathname pathnames)
+			  (return-from find-category category)))
+		   finally (return-from find-category default-category))))
+      (setq system (load-system-declaration-if-compressed system))
+      (loop for module in (system-modules system)
+	    doing
+	(unless (typep module 'system-module)
+	  (loop for (source) in (module-inputs module)
+		doing
+	    (when (cl:pathnamep source)
+	      (let* ((generic (send source :generic-pathname))
+		     (category (or (find-category generic (module-source-category module))
+				   (find-category generic (system-source-category system)))))
+		(send generic :putprop category 'sct:source-category)))))))
+    ;; Now it's cached, use it
+    (send pathname :get 'sct:source-category)))
+
+(defun distribution-journal-pathnames (system version)
+  (list
+    (current-version-patch-system-pathname system :system-directory)
+    (current-version-patch-system-pathname system :component-directory version)))
+
+;; Return a list of all of the completed patch-files for this system
+(defun distribution-patch-file-pathnames (system version &rest keys
+					  &key distribute-sources distribute-binaries
+					       included-files-checkpoint
+					  &allow-other-keys)
+  (ignore keys)
+  (multiple-value-bind (checkpoint last-patch)
+      (interpret-checkpoint-spec system version included-files-checkpoint)
+    (let* ((patch-system (make-patch-system
+			   name-and-atom (patch-system-name-and-atom system)
+			   version version))
+	   (patch-dir (read-patch-directory patch-system))
+	   (current-patch-directory
+	     (current-version-patch-system-pathname system :patch-directory version))
+	   (all-potential-patch-files
+	     ;; Collect all of the files which could potentially be patch-files
+	     (cdr (fs:directory-list
+		    (send (send current-patch-directory :translated-pathname)
+			  :new-pathname
+			  :name :wild
+			  :type :wild
+			  :version :newest)
+		    :fast))))
+      (flet ((pathname-equalp (logical physical)
+	       ;; Very fast pathname compare
+	       (multiple-value-bind (host1 device1 directory1 name1)
+		   (send (send logical :translated-pathname) :all-components)
+		 (multiple-value-bind (host2 device2 directory2 name2)
+		     (send physical :all-components)
+		   (and (pathname-component-compare name1 name2)
+			;; These may be unnecessary, but what the heck...
+			(pathname-component-compare directory1 directory2)
+			(pathname-component-compare device1 device2)
+			(pathname-component-compare host1 host2))))))
+	(nconc
+	  (ncons current-patch-directory)
+	  ;; Loop over the patch-dir, using only the patches which are complete
+	  (loop for (minor comment) in (second patch-dir)
+		as patch-files =
+		   (when (and (> minor checkpoint)
+			      (or (null last-patch) ( minor last-patch))
+			      (not (null comment)))
+		     ;; First, cons up a likely patch-file pathname, then see
+		     ;; if it exists on disk (with any file-type), and collect
+		     ;; it if it does exist.  Of course, this gets filtered by
+		     ;; what kind of files we want to distribute.
+		     (let* ((pathname (patch-system-pathname
+					system :patch-file version minor))
+			    (patch-files
+			      (loop with destination-types = (destination-file-types-for-distribution)
+				    for p on all-potential-patch-files
+				    as potential = (first (car p))
+				    ;; Don't extract the canonical-type here, because
+				    ;; it is a very slow operation which should only
+				    ;; be done when absolutely necessary
+				    when (and potential
+					      (pathname-equalp pathname potential)
+					      (or (and distribute-binaries
+						       (destination-file-p
+							 potential
+							 destination-types))
+						  (and distribute-sources
+						       (destination-file-p
+							 potential
+							 *source-file-types*))))
+				      ;; We have a match, so save the pathname we consed
+				      ;; up (with the appropriate type, of course)
+				      collect (send pathname
+						    :new-pathname
+						    :type (send potential :canonical-type)
+						    :version :newest)
+				      ;; Optimization to avoid extra pathname hacking
+				      and do (setf (car p) nil))))
+		       patch-files))
+		when patch-files nconc patch-files))))))
+
+;; Find the "pointer files" to the system, if there are any.  By universal convention,
+;; these are SYS:SITE;<name>.SYSTEM, which contains the system-source-file definition,
+;; and SYS:SITE;<name>.TEXT is sometimes used for comments about setting up the system
+;; or needed logical pathname host definitions.  The SYS:SITE;<name>.SYSTEM file makes
+;; it possible for a machine that doesn't have a system loaded to find its definition,
+;; load that, and then load the system.
+;;
+;; A system may not have one, for various reasons:
+;; 1> It is normally always installed, e.g., ZMAIL.
+;; 2> It is not released for general use, so the creator wishes NOT to have just anybody
+;;    at the site loading it.
+(defun get-sys-site-pointer-files (system)
+  (setq system (find-system-named system))
+  (let ((name (system-name system)))
+    (loop for type in '(:system :text)
+	  as pathname = (make-system-site-file-pathname name type)
+	  as stream = (open pathname :direction :probe)
+	  as version = (when stream (send (send stream :truename) :version))
+	  when stream
+	    collect (send pathname :new-version version))))
+
+;;--- Including :BFD here makes for schizophrenic .BFD file behavior.
+;;--- :SAGE-BINARY files are just like :BFD files in this respect,
+;;--- so include them too.
+(defvar *destination-file-types-for-distribution* '(:bfd :sage-binary))
+
+;;--- Temporary fix to make distribution do the right thing for font
+;;--- files, which are strange beasts in that they are specified in
+;;--- the source position in a module, but are used as product files
+;;--- when being loaded.  
+(defun destination-file-types-for-distribution ()
+  (if (eq *destination-file-types* t)
+      t
+    (append *destination-file-types* *destination-file-types-for-distribution*)))
+
+(defun interpret-checkpoint-spec (system version checkpoint-spec)
+  (declare (values exclusive-lower inclusive-upper))
+  (cond ((listp checkpoint-spec)
+	 ;; The checkpoint is of the form (inclusive-lower inclusive-upper),
+	 ;; so just change it to the canonical form.
+	 (values (1- (first checkpoint-spec)) (second checkpoint-spec)))
+	((numberp checkpoint-spec)
+	 ;; Important distinction: if the user gave a specific number, this
+	 ;; is interpreted as an inclusive lower limit on patches to check
+	 ;; over.  (The presentation type requires that an integer be  1.)
+	 ;; So subtract 1 to transform it into an exclusive lower limit.
+	 (1- checkpoint-spec))
+	((stringp checkpoint-spec)		;maybe allow other forms?  	  
+	 ;; But if it's a string, the user specified a recorded release spec.
+	 ;; These contain the highest patch included for various systems, so
+	 ;; extracting that patch number gives an exclusive lower limit, directly.
+	 (let* ((release-spec (find-release-spec checkpoint-spec))
+		(system-version-spec
+		  (ass #'(lambda (a b)
+			   (equal a (find-system-named b)))
+		       system (cl:getf (cdr release-spec) :versions))))
+	   (cond ((null system-version-spec)
+		  ;; Release spec unknown or system not mentioned
+		  0)
+		 ((< (second system-version-spec) version)
+		  ;; It names an earlier major ver
+		  0)
+		 ((= (second system-version-spec) version)
+		  ;; This major version
+		  (third system-version-spec))
+		 (t 99999))))
+	(t
+	 ;; :NONE or NIL, et al 
+	 0)))
+
+(defun file-follows-checkpoint-p (pathname checkpoint-spec
+				  &key use-cached-checkpoint parent-version)
+  (let* ((system (subsystem-parent-system *system*))
+	 (version (or parent-version *version*)))
+    (or (typep system 'distribution-system)	;always distribute everything
+	(get-info-for-pathname (send pathname :new-pathname :version nil)
+			       (system-pathnames-after-patch-checkpoint
+				 system version checkpoint-spec
+				 :use-cached-checkpoint use-cached-checkpoint)))))
+
+;; This is the object that caches checkpoint computation.  For a given system and
+;; patch number, find all the sources that have changed since that patch number,
+;; according to the SI:PATCH-SECTION-SOURCE-FILE forms in the patch sources of all
+;; later patches.  This is an expensive computation, so the result is cached.
+(defstruct (checkpointed-system-files (:conc-name checkpoint-))
+  system				;the system involved
+  version				;its major version number
+  checkpoint-spec			;the checkpoint patch number
+  tick					;the tick this was created with
+  files)				; a list of files
+
+;; Place to cache the expensive computation of what source names are found in
+;; the patches that follow the checkpoint patch level for the system being
+;; considered by Distribution
+(defvar *global-checkpoint-tick* 0)
+(defvar *current-checkpoint-tick*)
+(defvar *system-checkpoint-alist* nil)
+
+(defun system-pathnames-after-patch-checkpoint (system version checkpoint-spec
+						&key use-cached-checkpoint)
+  (let* ((old-checkpoint-entry
+	   (cl:find `(,(system-name system) ,*current-machine-type*) *system-checkpoint-alist*
+		    :key #'first :test #'equal))
+	 (old-checkpoint (second old-checkpoint-entry)))
+    (multiple-value-bind (checkpoint last-patch)
+	(interpret-checkpoint-spec system version checkpoint-spec)
+      (cond ((or (and old-checkpoint
+		      (= *current-checkpoint-tick* (checkpoint-tick old-checkpoint)))
+		 (and use-cached-checkpoint
+		      old-checkpoint
+		      (eql version (checkpoint-version old-checkpoint))
+		      (equal checkpoint-spec (checkpoint-checkpoint-spec old-checkpoint))))
+	     (setf (checkpoint-tick old-checkpoint) *current-checkpoint-tick*)
+	     (checkpoint-files old-checkpoint))
+	    (t
+	     (let ((new-checkpoint
+		     (make-checkpointed-system-files system system
+						     version version
+						     checkpoint-spec checkpoint-spec
+						     tick *current-checkpoint-tick*)))
+	       (setf (checkpoint-files new-checkpoint)
+		     (collect-source-files-changed-since-checkpoint
+		       system version checkpoint last-patch))
+	       (if old-checkpoint-entry
+		   (setf (second old-checkpoint-entry) new-checkpoint)
+		 (push `((,(system-name system) ,*current-machine-type*) ,new-checkpoint)
+		       *system-checkpoint-alist*))
+	       (checkpoint-files new-checkpoint)))))))
+
+(defun distribution-post-checkpoint-patch-source-file-pathnames
+       (system version checkpoint last-patch)
+  (let* ((patch-system (make-patch-system
+			 name-and-atom (patch-system-name-and-atom system)
+			 version version))
+	 (patch-dir (read-patch-directory patch-system)))
+    ;; Loop over the patch-dir, using only the patches which are complete
+    ;; and which follow the checkpoint
+    (loop for (minor comment) in (second patch-dir)
+	  as patch-files =
+	     (when (and (> minor checkpoint)
+			(or (null last-patch) ( minor last-patch))
+			(not (null comment)))
+	       ;; Collect all of the files with the patch-file name
+	       (let* ((pathname (patch-system-pathname system :patch-file version minor))
+		      ;;--- For now, this will only work for :LISP sources.  It needs
+		      ;;--- to be made more modular to deal with any patchable type.
+		      (all-patch-sources (cdr (fs:directory-link-opaque-dirlist
+						(send pathname :new-pathname
+						      :type :lisp :version :newest)))))
+		 (loop for (file) in all-patch-sources
+		       ;; Can't just use the pathname returned in the directory
+		       ;; list, because it might have been heuristicated (e.g., VMS)
+		       collect (send pathname :new-type (send file :canonical-type)))))
+	  when patch-files nconc patch-files)))
+
+(defun collect-source-files-changed-since-checkpoint
+       (system version checkpoint-patch last-patch)
+  (let* ((patch-sources
+	   (distribution-post-checkpoint-patch-source-file-pathnames
+	     system version checkpoint-patch last-patch))
+	 (changed-sources (make-pathname-info-table (* 2 (length patch-sources)))))
+    (tv:noting-progress
+	((format nil "Gathering checkpoint information for ~A" system) *sct-progress-note*)
+      (loop with denominator = (length patch-sources)
+	    for patch-source in patch-sources
+	    for numerator upfrom 1
+	    as generic-pathname = (send patch-source :generic-pathname)
+	    doing
+	(tv:note-progress numerator denominator *sct-progress-note*)
+	(block read-patch-file
+	  (scl:with-standard-io-environment
+	    (error-restart ((error) "Retry reading patch file ~A" patch-source)
+	      (catch-error-restart ((error) "Skip reading patch file ~A" patch-source)
+		(with-open-file (s patch-source)
+		  ;; Establish default bindings for the whole file
+		  (fs:read-attribute-list generic-pathname s)
+		  (multiple-value-bind (vars vals)
+		      (fs:file-attribute-bindings generic-pathname)
+		    (progv vars vals
+		      (loop for expr = (cl:read s nil :end)
+			    ;; If any patch file contains a top-level :end, too bad
+			    while (neq expr :end)
+			    doing
+			(cond
+			  ((nlistp expr))
+			  ((eql (first expr) 'si:files-patched-in-this-patch-file)
+			   ;; Loop over all of the pathnames checkpointing them
+			   (loop for pathname in (cdr expr)
+				 do (checkpoint-one-source-file pathname changed-sources))
+			   ;; No need to go any further
+			   (return-from read-patch-file nil))
+			  ((eql (first expr) 'si:patch-section-source-file)
+			   ;; Checkpoint the source file name for this patch section
+			   (checkpoint-one-source-file (second expr) changed-sources))
+			  ((eql (first expr) 'si:patch-section-attributes)
+			   ;; Establish proper attribute bindings for each patch section
+			   (eval expr)))))))))))))
+    changed-sources))
+
+(defun checkpoint-one-source-file (pathname info-table)
+  (let* ((pathname (fs:parse-pathname pathname))
+	 (versionless-pathname (send pathname :new-version nil))
+	 (file-version (send pathname :version)))
+    (multiple-value-bind (old-version nil found-p)
+	(get-info-for-pathname versionless-pathname info-table)
+      ;;--- We assume here that if the pathname recorded has no version number,
+      ;;--- this is some kind of bogus patch.  A real case we have seen involved
+      ;;--- patching functions from different systems.
+      (when (numberp file-version)
+	(if found-p
+	    (when (< old-version file-version)
+	      ;; Update the file version info with the new version
+	      (setf (get-info-for-pathname versionless-pathname info-table) file-version))
+	  (setf (get-info-for-pathname versionless-pathname info-table) file-version))))))
+
+;; There are two styles of maintaining patches and sources: one camp accurately
+;; patches all source changes (and probably does source "splits" of some kind
+;; at major release boundaries), the other camp does not.  For the former, we
+;; distribute the versions of the source files extracted from the patch-files.
+;; For the latter, we distribute the versions of the source files gotten from
+;; the journal for the system; set this variable to NIL to get that behavior.
+(defvar *patches-accurately-reflect-sources* t)
+
+;; Regardless of checkpointing directives, never replace file versions of
+;; these types in the original file list derived from the component-dir.
+;; The only present example of this is :SAGE-BINARY (.SAB) files; Sage
+;; insists that the exact version compiled for a system version be
+;; loaded, regardless of later patching of material in it.
+(cl:defparameter *file-types-never-to-merge-changed-sources-for* '(:sage-binary))
+
+;; Destructively merge encached file-info against a checkpoint spec
+;; This can potentially blow up while reading patch-files, due to reading
+;; unexported symbols and the like.  Really, this should be done after
+;; plan-building, but by then it is too late for it to do us any good.
+;; SI:FILES-PATCHED-IN-THIS-PATCH-FILE will prevent most problems.
+(defun merge-changed-source-files (original-files system version checkpoint-spec
+				   &key use-cached-checkpoint)
+  (when (and (not *patches-accurately-reflect-sources*)
+	     (not (null checkpoint-spec))
+	     (neq checkpoint-spec :none))
+    (cl:cerror "Ignore the checkpoint spec and continue"
+	       "The checkpoint-spec, ~A, does not make sense when patches do not ~
+	        accurately reflect sources"
+      checkpoint-spec)
+    (setq checkpoint-spec :none))
+  (when (and *patches-accurately-reflect-sources*
+	     (system-patchable system))
+    (when (eq version :newest)
+      (setq version
+	    (or (get-system-major-version-from-directory
+		 *system* *journals-to-use-when-distributing-newest* t)
+		(when (neq *journals-to-use-when-distributing-newest* :latest)
+		  (get-system-major-version-from-directory *system* :latest t))
+		:newest)))
+    (loop with changed-file-alist = (system-pathnames-after-patch-checkpoint
+				      system version checkpoint-spec
+				      :use-cached-checkpoint use-cached-checkpoint)
+	  for original-file-l on original-files
+	  as original-file = (first original-file-l)
+	  as changed-version =
+	     (and (not (memq (send original-file :canonical-type)
+			     *file-types-never-to-merge-changed-sources-for*))
+		  (get-info-for-pathname original-file changed-file-alist))
+	  as original-version = (if (fs:pathname-vc-p original-file)
+				    (send original-file :vc-version)
+				  (send original-file :version))
+	  when changed-version
+	    ;; Smash the encached file-info into ORIGINAL-FILES
+	    do (if ( changed-version original-version)
+		   (if (fs:pathname-vc-p original-file)
+		       (setf (first original-file-l)
+			     (send original-file :new-vc-version changed-version))
+		     (setf (first original-file-l)
+			   (send original-file :new-version changed-version)))
+		 ;; Err here if the changed-version derived is clearly wrong.
+		 ;;--- This is somewhat bogus, because for the condition to be
+		 ;;--- caught here, D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")all0 the versions named in the patches
+		 ;;--- scanned must be lower than or equal to the recorded one.
+		 ;;--- What really should be done later is to check for this
+		 ;;--- condition in each patch source, and err when it is found.
+		 ;;--- In addition, the case where the versions are equal is an
+		 ;;--- ambiguous case.  It often will be correct, as where an unchanged
+		 ;;--- definition is patch out of an unmodified buffer in order to
+		 ;;--- recompile the callers of a changed macro.  But it could also
+		 ;;--- be an error.
+		 (let ((erring-pathname
+			 (if (fs:pathname-vc-p original-file)
+			     (send original-file :new-vc-version nil)
+			   (send original-file :new-version nil))))
+		   (cl:cerror
+		       (format nil "Distribute version ~D of ~A"
+			 original-version erring-pathname)
+		       "The highest patched version of ~A is ~D,~@
+		        but the version number recorded in the component directory for ~A~@
+			is ~D.  This may indicate that a patch was made from an obsolete~@
+			version of the source.  You should examine the patches by hand to~@
+			determine whether or not they are correct."
+		     erring-pathname changed-version system original-version)))))
+  original-files)

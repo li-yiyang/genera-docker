@@ -1,0 +1,416 @@
+;;; -*- Mode: LISP; Base: 10; Package: NETWORK-INTERNALS; Syntax: Zetalisp; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;
+;;; The low level ethernet driver and MINI support for embedded networks.
+;;; Much of this is stolen from the VSBC variant
+;;;
+
+(defwiredvar *n-emb-ethernet-interfaces*)
+(defwiredvar *emb-ethernet-interfaces*)
+
+(defwiredfun initialize-embedded-network ()
+  (unless storage::*disk-exists-p*
+    (setf *emb-ethernet-interfaces* (storage::allocate-unmapped-array 32)))
+  (setf *n-emb-ethernet-interfaces* 0)
+  (loop with net-address-set-p = nil
+	for ptr first (emb-channel-table) then (emb-net-channel-next channel)
+	until (= ptr -1)
+	for channel = (emb-pointer-to-pma ptr)
+	when (= (emb-net-channel-type channel) %emb-channel-type-network)
+	  do (unless net-address-set-p
+	       (setq sys:net-address-1 (emb-net-channel-hardware-address-high channel)
+		     sys:net-address-2 (emb-net-channel-hardware-address-low channel)
+		     net-address-set-p t))
+	     (let ((interface (or (aref *emb-ethernet-interfaces* *n-emb-ethernet-interfaces*)
+				  (setf (aref *emb-ethernet-interfaces* *n-emb-ethernet-interfaces*)
+					(storage::allocate-unmapped-array (emb-ethernet-driver-size))))))
+	       (fill-emb-ethernet-driver channel interface))
+	     (incf *n-emb-ethernet-interfaces*)))
+
+(defwiredfun emb-ethernet-periodic-timer-function ()
+  (dotimes (i *n-emb-ethernet-interfaces*)
+    (let ((interface (aref *emb-ethernet-interfaces* i)))
+      (when (not (null (eei-transmit-list-head interface)))
+	(cli::enqueue-interrupt-task-not-io #'emb-ethernet-do-transmit-work interface 2)))))
+
+;;;
+;;; utils for doing buffer/queue maintainance
+;;;
+
+;;;
+;;; this is used for both transmitting packets, and giving the other
+;;; side empty packets to receive into.
+;;;
+(defwiredfun enqueue-emb-net-buffer (driver queue buffer)
+  (declare (ignore driver))
+  (let ((buf-pma (sys:emb-buf-pma buffer)))
+    (unless (pma-inside-comm-area buf-pma)
+      (wired-ferror :proceedable-halt "Bogus outgoing PMA ~S" buf-pma))
+    (wired-emb-queue-put queue (pma-to-emb-pointer buf-pma))))
+
+(defwiredfun dequeue-emb-net-buffer (driver queue)
+  (declare (ignore driver))
+  (let ((embp (wired-emb-queue-take queue)))
+    (when embp
+      (let ((pma (emb-pointer-to-pma embp)))
+	(unless (pma-inside-comm-area pma)
+	  (wired-ferror :proceedable-halt "Bogus incoming PMA ~S" pma))
+	(buf-pma-to-handle pma)))))
+
+
+;;;
+;;; this is a driver, usable in wired code.  I haven't decided
+;;; yet whether the 'real' ethernet interface should be one of these,
+;;; use one of these, or be something totally separate.
+;;;
+
+(cl:defstruct (emb-ethernet-driver 
+		(:type cl:vector)
+		(:conc-name "EEI-")
+		(:include proto-network-interface)
+		(:make-array (:area wired-control-tables))
+		(:constructor make-emb-ethernet-driver-raw)
+		:size-macro)
+  transmit-list-head				; first pkt being xmitted
+  transmit-list-tail				;  last...
+  receive-list-head				; next being received
+  receive-list-tail				;  last...
+  n-packets-transmitted				; now many we've sent
+  n-packets-received				; .. recvd
+  channel					; the emb-channel we're talking thru
+  xmit-guest-to-host-queue			; handy handle to this, saves dereferencing
+  xmit-host-to-guest-queue
+  recv-guest-to-host-queue
+  recv-host-to-guest-queue
+  ;;
+  recv-wakeup-process				; proc to wake up when incoming pkt
+  recv-queue-target-length			; n bufs we try to put in recv g->h q
+  recv-queue-underruns				; n times recv queue ran out of packets
+						;  before we got to refill it
+  receiver-active-p				; Interlock for interrupt tasks
+  receiver-lock					; Real lock for user code
+  spare-1 spare-2
+  )
+
+(defresource emb-ethernet-driver ()
+  :initial-copies 1
+  :constructor (make-emb-ethernet-driver-raw))
+
+;;;
+;;; Interrupt handling.  The idea here is that all network-receive
+;;; interrupts go thru here.  This fun is installed as the signal
+;;; handler for a driver's incoming queue, with the driver as the single
+;;; arg.
+;;;
+(defwiredfun emb-check-for-received-packets (driver)
+  (when (not (cli::emb-queue-empty-p (eei-recv-host-to-guest-queue driver)))
+    ;; At most 3 packets can come in while we process the queue.  Make
+    ;; sure that there are buffers there to receive them while we work.
+    (emb-ethernet-recycle-packets driver)
+    ;; Receive queued packets
+    (loop for epacket = (and (pni-enabled driver)
+			     (allocate-wired-packet-buffer-internal))
+	  for incoming-buf-handle = (dequeue-emb-net-buffer
+				      driver (eei-recv-host-to-guest-queue driver))
+	  while incoming-buf-handle
+	  for incoming-buf-pma = (emb-buf-pma incoming-buf-handle)
+	  do
+      (let ((nbytes (emb-net-buffer-nbytes incoming-buf-pma)))
+	;;
+	;; check the size for reasonablness
+	;;
+	(when (> nbytes 1514.)
+	  (wired-ferror :proceedable-halt
+			"Attempt to receive a packet with bogus size ~D." nbytes)
+	  (setq nbytes 1514.))			; in case proceeded
+	;;
+	;;copy the data in
+	;;
+	(when epacket
+	  (let ((buffer (locf (emb-net-buffer-header incoming-buf-pma))))
+	    (with-hardware-bit-shuffling (buffer :byte)
+	      (%block-copy-3232 buffer (locf (aref epacket 0)) (ceiling nbytes 4))))
+	  (setf (epacket-data-length epacket) (- nbytes 14.))
+	  ;; Stick epacket on received-list
+	  (let ((last-epacket (eei-receive-list-tail driver)))
+	    (setf (eei-receive-list-tail driver) epacket)
+	    (cond ((eq last-epacket %net-null)
+		   (setf (eei-receive-list-head driver) epacket)
+		   (si:aux-process-wakeup (eei-recv-wakeup-process driver)))
+		  (t
+		   (setf (epacket-link last-epacket) epacket))))
+	  (setf epacket nil)))
+      ;; Return the emb buffer.  Call the wired- entry point, since we're an interrupt task.
+      (wired-deallocate-emb-buffer incoming-buf-handle)
+	  finally (when epacket (deallocate-wired-packet-buffer-internal epacket)))
+    ;; Done receiving epackets
+    (emb-ethernet-recycle-packets driver)))
+
+;;;
+;;; this is the dispatcher of messages to this beast
+;;;
+
+(defwiredfun emb-driver-dispatch (driver op &rest args)
+  (if ( 0 op %interface-kill)
+      ;; These ops take the driver as their first arg
+      (cl:apply (select op
+		  (%interface-reset #'reset-emb-ethernet-driver)
+		  (%interface-enable #'enable-emb-ethernet-driver)
+		  (%interface-disable #'disable-emb-ethernet-driver)
+		  (%interface-transmit-packet #'emb-ethernet-transmit-epacket)
+		  (%interface-receive-packet #'emb-ethernet-get-next-received-epacket)
+		  (%interface-packet-listen #'emb-ethernet-listen)
+		  (%interface-kill #'emb-driver-kill))
+		driver args)
+      ;; These ops don't
+      (wired-ferror :proceedable-halt "Invalid operation.")))
+
+(defwiredfun fill-emb-ethernet-driver (channel driver)
+  ;; Stop the host
+  (setf (emb-net-channel-status channel)
+	(cl:logandc2 (emb-net-channel-status channel) 2))	;kludge
+  ;;
+  (setf (pni-enabled driver) nil)
+  (setf (pni-number driver) (emb-net-channel-unit channel))
+  (setf (pni-dispatch-function driver) #'emb-driver-dispatch)
+  ;;
+  (setf (eei-recv-wakeup-process driver) nil)
+  (setf (eei-channel driver) channel)
+  ;;
+  (flet ((flush (q)
+	   (when q
+	     (loop for buf-handle = (dequeue-emb-net-buffer driver q)
+		   while buf-handle do
+	       (wired-deallocate-emb-buffer buf-handle)))))
+    (flush (setf (eei-xmit-guest-to-host-queue driver)
+		 (emb-pointer-to-pma (emb-net-channel-xmit-guest-to-host-queue channel))))
+    (flush (setf (eei-xmit-host-to-guest-queue driver)
+		 (emb-pointer-to-pma (emb-net-channel-xmit-host-to-guest-queue channel))))
+    (flush (setf (eei-recv-guest-to-host-queue driver)
+		 (emb-pointer-to-pma (emb-net-channel-recv-guest-to-host-queue channel))))
+    (flush (setf (eei-recv-host-to-guest-queue driver)
+		 (emb-pointer-to-pma (emb-net-channel-recv-host-to-guest-queue channel)))))
+
+  ;; Always try to keep the queue of available receive buffer half full
+  (setf (eei-recv-queue-target-length driver)
+	(floor (emb-queue-queue-size (eei-recv-guest-to-host-queue driver)) 2))
+  (setf (emb-queue-signal (eei-recv-host-to-guest-queue driver))
+	(cli::install-wired-emb-signal-handler #'emb-check-for-received-packets driver 2))
+  (setf (emb-queue-signal (eei-xmit-host-to-guest-queue driver))
+	(cli::install-wired-emb-signal-handler #'emb-ethernet-recycle-packets driver 2))
+  (system-case
+    (solstice
+      (setf (emb-net-channel-guest-primary-protocol channel) -1)
+      (setf (emb-net-channel-guest-primary-address channel) -1))
+    (otherwise nil))
+  ;;
+  (reset-emb-ethernet-driver driver)
+  ;;
+  ;; set the status bit that says we're ready
+  ;;
+  ;; need to be able to do this uninterruptibly
+  (setf (emb-net-channel-status channel)
+	(logior (emb-net-channel-status channel) 2))	;kludge
+  driver)
+
+;;;
+;;; turn it on.  if receiver-process supplied, and not already enabled,
+;;; install the process as a signal handler, and shove the signal number
+;;; into recv-host-to-guest-queue.
+;;;
+
+(defwiredfun enable-emb-ethernet-driver (driver &optional (receiver-process nil))
+  ;; if have a listener process, install hook to it.
+  (when receiver-process
+    (setf (eei-recv-wakeup-process driver) receiver-process))
+  (setf (pni-enabled driver) t))
+
+;;;
+;;; turn it off
+;;;
+(defwiredfun disable-emb-ethernet-driver (driver)
+  (setf (pni-enabled driver) nil)
+  (setf (eei-recv-wakeup-process driver) nil))
+
+;;;
+;;; set to virgin state
+;;;
+(defwiredfun reset-emb-ethernet-driver (driver)
+  (setf (eei-receive-list-tail driver) %net-null)
+  (setf (eei-receive-list-head driver) %net-null)
+  (setf (eei-transmit-list-tail driver) %net-null)
+  (setf (eei-transmit-list-head driver) %net-null)
+  (setf (eei-n-packets-received driver) 0)
+  (setf (eei-n-packets-transmitted driver) 0)
+  (setf (eei-recv-queue-underruns driver) 0))
+
+(defwiredfun emb-driver-kill (driver)
+  (when (eei-channel driver)
+    ;;
+    ;; clear our 'ready' bit
+    ;;
+    (setf (emb-net-channel-status (eei-channel driver))
+	  (cl:logandc2 (emb-net-channel-status (eei-channel driver)) 2)))
+  ;; if there's a listener proc here, remove the signal-handler that  points to it
+  (let ((queue (emb-pointer-to-pma (emb-net-channel-recv-host-to-guest-queue
+				     (eei-channel driver)))))
+    (unless (eql (emb-queue-signal queue) -1)
+      (cli::remove-wired-emb-signal-handler
+	#'emb-check-for-received-packets driver (emb-queue-signal queue))
+      (setf (emb-queue-signal queue) -1)))
+  ;; more paranoia...
+  (setf (eei-xmit-guest-to-host-queue driver) nil)
+  (setf (eei-xmit-host-to-guest-queue driver) nil)
+  (setf (eei-recv-guest-to-host-queue driver) nil)
+  (setf (eei-recv-host-to-guest-queue driver) nil)
+  (setf (eei-channel driver) nil)
+  )
+
+;;;
+;;; this fun recycles packets from the transmit-return q, and attempts to
+;;; make sure there are some packets in the receive outgoing q.
+;;; I'm not sure when this should be called...
+;;;
+(defwiredfun emb-ethernet-recycle-packets (driver)
+  (when (zerop (emb-queue-filled (eei-recv-guest-to-host-queue driver)))
+    (incf (eei-recv-queue-underruns driver)))
+  (loop for emb-buf-handle = (dequeue-emb-net-buffer
+			       driver (eei-xmit-host-to-guest-queue driver))
+	while emb-buf-handle
+	do (wired-deallocate-emb-buffer emb-buf-handle))
+  (loop while (and				; protect against possible
+						; deadlock, til I figure out
+						; what's going on...
+		(< (+ (emb-queue-filled (eei-recv-guest-to-host-queue driver))
+		      (emb-queue-filled (eei-recv-host-to-guest-queue driver)))
+		   (1- (emb-queue-queue-size (eei-recv-host-to-guest-queue driver))))
+		(< (+ (emb-queue-filled (eei-recv-guest-to-host-queue driver))
+		      ;;(emb-queue-filled (eei-recv-host-to-guest-queue driver))
+		      )
+		   (eei-recv-queue-target-length driver)))
+	for emb-buf-handle = (wired-allocate-emb-buffer 380.)
+	while emb-buf-handle
+	do (enqueue-emb-net-buffer driver (eei-recv-guest-to-host-queue driver)
+				   emb-buf-handle)))
+
+(defwiredfun emb-ethernet-transmit-epacket (driver epacket free-flag data-length)
+  (unless (= (epacket-ref-count epacket) 1)
+    (wired-ferror :proceedable-halt
+		  "Attempt to transmit packet ~S, whose ref-count is not 1"
+		  epacket))
+  (let ((length (max data-length 44.)))
+    (when (> length 1500.)
+      (wired-ferror :proceedable-halt "~S Packet too long" length))
+    (setf (epacket-data-length epacket) length))
+  (setf (epacket-link epacket) nil)
+  (sys:%set-trap-mode sys:trap-mode-io)
+  (unless free-flag
+    (incf (epacket-ref-count epacket)))
+  (let ((last-epacket (eei-transmit-list-tail driver)))
+    (setf (eei-transmit-list-tail driver) epacket)
+    (cond (last-epacket
+	   (setf (epacket-link last-epacket) epacket))
+	  (t
+	   (setf (eei-transmit-list-head driver) epacket)
+	   (when t
+	     (cli::enqueue-interrupt-task #'emb-ethernet-do-transmit-work driver 2)
+	     (cli::execute-interrupt-tasks))))
+    nil))
+
+(defwiredfun emb-ethernet-do-transmit-work (driver)
+  (loop do
+    (let ((epacket (eei-transmit-list-head driver)))
+      (when (null epacket) (return nil))
+      (let* ((nbytes (+ (epacket-data-length epacket) 14.))
+	     (nwords (ceiling nbytes 4))
+	     (outgoing-buf-handle (wired-allocate-emb-buffer (1+ nwords))))
+	(when (null outgoing-buf-handle) (return nil))
+	(let* ((outgoing-buf (emb-buf-pma outgoing-buf-handle))
+	       (buffer (locf (emb-net-buffer-header outgoing-buf))))
+	  (with-hardware-bit-shuffling (buffer :byte)
+	    (%block-copy-3232 (locf (aref epacket 0)) buffer nwords))
+	  (setf (emb-net-buffer-nbytes outgoing-buf) nbytes))
+	(enqueue-emb-net-buffer
+	  driver (eei-xmit-guest-to-host-queue driver) outgoing-buf-handle))
+      (emb-ethernet-recycle-packets driver)
+      (let ((next-epacket (epacket-link epacket)))
+	(setf (eei-transmit-list-head driver) next-epacket)
+	(unless next-epacket
+	  (setf (eei-transmit-list-tail driver) %net-null)))
+      (wired-deallocate-epacket epacket))))
+
+(defwiredfun emb-ethernet-listen (driver)
+  (neq (eei-receive-list-head driver) %net-null))
+
+(defwiredfun emb-ethernet-get-next-received-epacket (driver)
+  (let ((epacket (eei-receive-list-head driver)))
+    (when epacket
+      (let ((next-epacket (epacket-link epacket)))
+	(setf (eei-receive-list-head driver) next-epacket)
+	(when (eq next-epacket %net-null)
+	  (unless (store-conditional (locf (eei-receive-list-tail driver))
+				     epacket next-epacket)
+	    ;; If the above store failed, then we were interrupted by the
+	    ;; reception of a new packet.  This type of interrupt atomically
+	    ;; updates, and we must have been the tail previously, so our link now
+	    ;; contains the new list.
+	    (setf (eei-receive-list-head driver) (epacket-link epacket)))))
+      (unless (= (epacket-ref-count epacket) 0)
+	(wired-ferror :proceedable-halt
+		      "About to allocate packet ~S which has a non-zero ref-count"
+		      epacket))
+      (incf (epacket-ref-count epacket))
+      (incf *pkts-allocated*)
+      epacket)))

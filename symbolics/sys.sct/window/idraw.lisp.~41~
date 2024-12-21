@@ -1,0 +1,1402 @@
+;; -*- Mode: LISP; Package: COMMON-LISP-INTERNALS; Syntax: Common-Lisp; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+(defvar *bitblt-dest-only-alus* #(0 3 0 3 12 15 12 15 0 3 0 3 12 15 12 15))
+
+(defmacro with-drawing-environment ((alu array) &body body)
+  `(MULTIPLE-VALUE-BIND (D-BEG-ADDR D-BEG-BITPOS D-ROW-LENGTH D-ROW-SPAN D-HEIGHT
+			 D-BITS-PER-ELT d-valid-height)
+       (BITBLT-DECODE-ARRAY ,array T)
+     (CHECK-TYPE ,alu FIXNUM)
+     (unless (minusp ,alu)
+       (setq ,alu (aref *bitblt-dest-only-alus* (ldb (byte 4 0) ,alu))))
+     ,@body))
+
+(defmacro sort-points (predicate x1 y1 x2 y2 &optional side-effect)
+  `(WHEN ,predicate
+     (ROTATEF ,x1 ,x2)
+     (ROTATEF ,y1 ,y2)
+     ,@(if side-effect `(,side-effect))))
+
+;;;*********************************************************************
+;;; Character and string drawing support
+;;;
+
+(defmacro with-draw-char-environment ((alu from-array to-array) &body body)
+  `(progn
+     (check-type ,alu fixnum)
+     (multiple-value-bind (s-beg-addr s-beg-bitpos s-row-length s-row-span
+				      s-height s-bits-per-elt s-valid-height)
+	 (bitblt-decode-array ,from-array (source-dependent-alu-p ,alu))
+       (multiple-value-bind (d-beg-addr d-beg-bitpos d-row-length d-row-span
+					d-height d-bits-per-elt d-valid-height)
+	   (bitblt-decode-array ,to-array t)
+	 ,@body))))
+
+;;; This macro takes a list of clipping boundaries and transfers them
+;;; to local variables for clipping tests. It validates the clipping
+;;; region against the array dimensions (D-HEIGHT, D-ROW-LENGTH) which 
+;;; are expected to be in the local environment (by use of 
+;;; WITH-DRAW-CHAR-ENVIRONMENT for example).
+
+(defmacro with-clipping-region ((bounds left top right bottom) &body body)
+  `(LET ((,left (POP ,bounds))
+	 (,top (POP ,bounds))
+	 (,right (POP ,bounds))
+	 (,bottom (POP ,bounds)))
+
+	;; validate the clipping region
+	(WHEN (< D-HEIGHT ,bottom)    (SETQ ,bottom D-HEIGHT))
+	(WHEN (< D-ROW-LENGTH ,right) (SETQ ,right D-ROW-LENGTH))
+	(WHEN (< ,left 0) (SETQ ,left 0))
+	(WHEN (< ,top 0)  (SETQ ,top 0))
+
+	,@body))
+
+;;;*********************************************************************
+;;; Point Drawing
+;;;
+
+;;; This routine essentially simulates what the microcode does for the others.
+;;; I wonder if this would work faster doing a 1x1 %DRAW-RECTANGLE?
+;;; This also might want to be a SUBST.
+
+(defun TV:%draw-point (x y alu raster &optional value)
+  (ignore value)				;for compatibility only
+  (let* ((oldval (raster-aref raster x y))
+	 (newval (cond ((not (minusp alu))
+			(boole alu tv:bitblt-unpacking-constant oldval))
+
+		       ;; Color operations waiting for general color to be done
+		       ((zerop (%logldb %%EXTENDED-ALU-OPCODE alu))  ;Masked case.
+			(logior (logand TV:BITBLT-UNPACKING-MASK
+					(BOOLE (LDB (BYTE 4 0) ALU)
+					       TV:BITBLT-UNPACKING-CONSTANT
+					       oldval))
+				(logandc1 TV:BITBLT-UNPACKING-MASK oldval)))
+
+		       (t ;Magic ALU case.
+			(let ((fn (assoc alu COLOR:*ALL-THE-ALU-FNS*)))
+			  (if fn
+			      (funcall (cadr fn) TV:BITBLT-UNPACKING-CONSTANT
+				       oldval TV:BITBLT-UNPACKING-MASK)
+			      (error "~A is an undefined alu" alu)))
+			))))
+    (setf (raster-aref raster x y) newval)))
+
+
+;; For completeness...
+(defsubst TV:%point (x y raster)
+  (raster-aref raster x y))
+;;;*********************************************************************
+;;; Rectangle Drawing
+;;;
+
+(defun TV:%draw-rectangle-internal (width height x y alu raster)
+  (with-drawing-environment (alu raster)
+    (ignore d-height d-row-length)
+    (when (and (plusp width) (plusp height))
+      (setq width (lsh width d-bits-per-elt)
+	    x (lsh x d-bits-per-elt)
+	    d-row-length (lsh d-row-length d-bits-per-elt))
+      (bounds-check-parameters width height x y)
+      (bitblt-loop-call :forwards nil alu width nil nil x y)
+      )))
+
+(defun tv:%draw-multiple-rectangles-internal (alu rects raster)
+  (let ((rects rects))
+    (declare (sys:array-register rects))
+    (with-drawing-environment (alu raster)
+      (ignore d-height d-row-length)
+      (with-alu-inner-loop (:forwards alu bitblt-loop)
+        (loop with d-row-length = (lsh d-row-length d-bits-per-elt)
+              for index below (tv:array-active-length rects) by 4 do
+          (let* ((x (aref rects index))
+                 (y (aref rects (+ index 1)))
+                 (width (- (aref rects (+ index 2)) x))
+                 (height (- (aref rects (+ index 3)) y)))
+            (when (and (plusp width) (plusp height))
+              (setq width (lsh width d-bits-per-elt)
+                    x (lsh x d-bits-per-elt))
+              (bounds-check-parameters width height x y)
+              (bitblt-loop-call :forwards nil alu width nil nil x y bitblt-loop)
+              )))))))
+
+;;;*********************************************************************
+;;; Line drawing
+
+;;; Generation of alu operation codes - Desired results map
+;;; ALU  0/0  1/0  0/1  1/1  (dest/source pairs) (might be reversed - can't remember)
+;;; clr   0    1   0    0   => 0100
+;;; 2     0    1   0    1   => 0101
+;;; c2    0    1   1    0   => 0110
+;;; set   0    1   1    1   => 0111
+
+(defvar *draw-alu-map* #(#b0100 0 0 #b0101 0 0 0 0 0 0 0 0 #b0110 0 0 #b0111))
+
+(defsubst draw-alu-op (alu)
+  (if (minusp alu)
+      (ldb (byte 4 0) alu)
+      (aref *draw-alu-map* alu)))
+
+(defmacro set-draw-alu-register (draw-alu)
+  `(si:set-alu-and-rotate-control
+     :function-bits ,draw-alu
+     :function-class %alu-function-class-boolean
+     :byte-r 0 :byte-s 0))
+
+(defun tv:%draw-horizontal-segment (address bitpos width)
+  (let* ((d-bitpos (sys:%fixnum-mod bitpos 32))
+	 (d-endpos (+ d-bitpos width)))
+    (setf (sys:%block-register 1) (sys:%pointer-plus address (sys:%fixnum-floor bitpos 32)))
+    (setf (sys:%block-register 2) (sys:%block-register 1))
+    (if ( d-endpos 32)			;single word case
+	(sys:%block-write 2
+	  (sys:%alu (sys:%block-read 1 :fixnum-only t :prefetch nil)
+		    (sys:%32-bit-difference (lsh 1 d-endpos) (lsh 1 d-bitpos))))
+      (sys:%block-write 2
+        (sys:%alu (sys:%block-read 1 :fixnum-only t :prefetch t) (lsh -1 d-bitpos)))
+      (let ((words (1- (sys:%fixnum-floor d-endpos 32))))
+	(when (> words 0)
+	  ;; If the ALU operation produces a constant result, just loop writing constants.
+	  ;; Use BAR 1 for this, so it's got the proper value for the last word, below.
+	  (selector (sys:%alu 1 -1) =
+	    (-1 (dotimes (ignore words) (sys:%block-write 1 -1)))
+	    (0 (dotimes (ignore words) (sys:%block-write 1 0)))
+	    (t (dotimes (ignore words)
+		 (sys:%block-write 2 (sys:%alu (sys:%block-read 1 :fixnum-only t) -1)))))))
+      (let ((d-endpos (sys:%fixnum-mod d-endpos 32)))
+	(when ( d-endpos 0)
+	  (sys:%block-write 1
+	    (sys:%alu (sys:%block-read 1 :fixnum-only t :no-increment t)
+		      (sys:%32-bit-difference (lsh 1 d-endpos) 1))))))))
+
+;;; More compact inlineable version of the above, for widths less than or equal to 32,
+;;; meaning at most two words are affected.
+(defsubst tv:%draw-short-horizontal-segment (address bitpos width)
+  (let* ((d-bitpos (sys:%fixnum-mod bitpos 32))
+	 (d-endpos (+ d-bitpos width)))
+    (setf (sys:%block-register 1) (sys:%pointer-plus address (sys:%fixnum-floor bitpos 32)))
+    (setf (sys:%block-register 2) (sys:%block-register 1))
+    (if ( d-endpos 32)				;single word case
+	(sys:%block-write 2
+	  (sys:%alu (sys:%block-read 1 :fixnum-only t :prefetch nil)
+		    (sys:%32-bit-difference (lsh 1 d-endpos) (lsh 1 d-bitpos))))
+      (sys:%block-write 2
+        (sys:%alu (sys:%block-read 1 :fixnum-only t :prefetch t) (lsh -1 d-bitpos)))
+      ;; Note that (sys:%fixnum-mod d-endpos 32) cannot be 0 here...
+      (sys:%block-write 2
+        (sys:%alu (sys:%block-read 1 :fixnum-only t :prefetch nil)
+		  (sys:%32-bit-difference (lsh 1 (sys:%fixnum-mod d-endpos 32)) 1))))
+    nil))
+
+(defsubst tv:%draw-vertical-segment (address offset width height span)
+  (let ((mask (lsh (sys:%32-bit-difference (lsh 1 width) 1) (sys:%fixnum-mod offset 32)))
+	(span (1- span)))
+    (setf (sys:%block-register 1)
+	  (sys:%pointer-plus address (sys:%fixnum-floor offset 32)))
+    (dotimes (ignore height)
+      (sys:%block-write 1 (sys:%alu (sys:%block-read 1 :fixnum-only t :no-increment t) mask))
+      (setf (sys:%block-register 1) (sys:%pointer-plus (sys:%block-register 1) span)))))
+
+;;; Callers need to have variables named: X1 Y1 X2 Y2 ALU RASTER DRAW-ALU DRAW-END-POINT?
+;;;  and an enclosing block named DRAW-LINE to return from
+(defmacro tv:%draw-line-internal-internal (&key single-bitblt-loop forwards-bitblt-loop)
+  `(let ((draw-p1 t)
+	 (draw-p2 draw-end-point?))
+     (when (< x2 x1)
+       (rotatef x1 x2)
+       (rotatef y1 y2)
+       (rotatef draw-p1 draw-p2))
+     (bounds-check-point x1 y1 draw-p1)
+     (bounds-check-point x2 y2 draw-p2)
+     (multiple-value-bind (dx dy ddy yspan)
+	 (if (> y2 y1)
+	     (values (- x2 x1) (- y2 y1) 1 d-row-span)
+	   (values (- x2 x1) (- y1 y2) -1 (- d-row-span)))
+       ;; Special treatment for horizontal lines
+       (when (= dy 0)
+	 (if (and draw-p1 draw-p2)
+	     (incf dx)
+	   (or draw-p1 (incf x1)))
+	 (if (< alu 0)
+	     ;; General case for extended ALUs
+	     (bitblt-loop-call :single nil alu
+			       (lsh dx d-bits-per-elt)
+			       nil nil
+			       (lsh x1 d-bits-per-elt)
+			       y1
+			       ,single-bitblt-loop)
+	   (set-draw-alu-register draw-alu)
+	   (tv:%draw-horizontal-segment
+	     (sys:%pointer-plus d-beg-addr (* y1 d-row-span))
+	     (+ (lsh x1 d-bits-per-elt) d-beg-bitpos)
+	     (lsh dx d-bits-per-elt)))
+	 (return-from draw-line nil))
+       ;; Special treatment for vertical lines
+       (when (= dx 0)
+	 (if (and draw-p1 draw-p2)
+	     (incf dy)
+	   (if (not draw-p1) (incf y1 ddy) (decf y2 ddy)))
+	 (let ((height dy))
+	   (if (< alu 0)
+	       ;; General case for extended ALUs
+	       (bitblt-loop-call :forwards nil alu
+				 (lsh 1 d-bits-per-elt)
+				 nil nil
+				 (lsh x1 d-bits-per-elt)
+				 (min y1 y2)
+				 ,forwards-bitblt-loop)
+	     (set-draw-alu-register draw-alu)
+	     (tv:%draw-vertical-segment
+	       (sys:%pointer-plus d-beg-addr (* (min y1 y2) d-row-span))
+	       (+ (lsh x1 d-bits-per-elt) d-beg-bitpos)
+	       (lsh 1 d-bits-per-elt)
+	       height
+	       d-row-span)))
+	 (return-from draw-line nil))
+       ;; General case for sloped lines
+       (when ( dx dy)
+	 (if (and (> (sys:%fixnum-multiply dy 2) dx) ( alu 0) (= d-bits-per-elt 0))
+	     ;; Fast pixel-at-a-time algorithm for steep lines on single-bit rasters
+	     (let ((pixels (if (not draw-p2) (1- dx) dx))
+		   (accumulator (sys:%fixnum-floor dx 2))
+		   (address (sys:%pointer-plus d-beg-addr
+			      (+ (* y1 d-row-span)
+				 (sys:%fixnum-floor (+ d-beg-bitpos x1) 32))))
+		   (mask (rot 1 (sys:%fixnum-mod (+ d-beg-bitpos x1) 32))))
+	       (set-draw-alu-register draw-alu)
+	       (when draw-p1
+		 (sys:%memory-write address
+		   (sys:%alu (sys:%memory-read address :fixnum-only t) mask)))
+	       (dotimes (ignore pixels)
+		 ;; Increment in the X direction, by rotating the mask left
+		 ;; one pixel, and incrementing the address iff the mask
+		 ;; wraps around
+		 (setq address (sys:%pointer-plus address
+				 (logand (setq mask (rot mask 1)) 1)))
+		 (when (< (decf accumulator dy) 0)
+		   (setq address (sys:%pointer-plus address yspan))
+		   (incf accumulator dx))
+		 (sys:%memory-write address
+		   (sys:%alu (sys:%memory-read address :fixnum-only t) mask)))
+	       (return-from draw-line nil))
+	   ;; Use a different approach for hairier cases
+	   (multiple-value-bind (x y pixels width accumulator)
+	       ;; Compute initial conditions for Bresenham algorithm
+	       (let ((x x1)
+		     (pixels dx))
+		 (multiple-value-bind (width accumulator)
+		     (progn
+		       #+ignore
+		       ;; This is the explicit derivation of the initial accumulator.
+		       (loop for accumulator first (sys:%fixnum-ceiling dx 2)
+					     then (+ accumulator dy)
+			     until (> accumulator dx)
+			     counting t into width
+			     finally (return (values width (- accumulator dx))))
+		       ;; This is a faster way of saying the same thing.
+		       (multiple-value-bind (width remainder)
+			   (ceiling (1+ (- dx (sys:%fixnum-ceiling dx 2))) dy)
+			 (values width (1+ (- remainder)))))
+		   ;; To draw the last pixel, simply step the algorithm an extra time...
+		   (when draw-p2
+		     (incf pixels))
+		   ;; Not drawing the first pixel is a bit tricky...
+		   (when (not draw-p1)
+		     (incf x)
+		     (decf width)
+		     (decf pixels))
+		   (values x y1 pixels width accumulator)))
+	     ;; We compute two slice widths; for each horizontal line except the first
+	     ;; and last, we pick one width based on the error term.
+	     (multiple-value-bind (large large-increment)
+		 (ceiling dx dy)
+	       (multiple-value-bind (small small-increment)
+		   (floor dx dy)
+		 (if (< alu 0)             ;extended ALU case
+		     ,(let ((core `(loop do
+				     (let ((width (min width pixels)))
+				       (bitblt-loop-call :single nil alu
+							 (lsh width d-bits-per-elt)
+							 nil nil
+							 (lsh x d-bits-per-elt)
+							 y
+							 ,(or single-bitblt-loop
+							      'horizontal-bitblt-loop))
+				       (incf x width)
+				       (incf y ddy)
+				       (when (= (decf pixels width) 0)
+					 (return-from draw-line nil)))
+				     (multiple-value-bind (increment new-width)
+					 (if (> accumulator small-increment)
+					     (values small-increment small)
+					     (values large-increment large))
+				       (decf accumulator increment)
+				       (setq width new-width)))))
+			(if single-bitblt-loop
+			    core
+			    `(with-alu-inner-loop (:single alu horizontal-bitblt-loop)
+						  ,core)))
+		   (let ((address
+			   (sys:%pointer-plus d-beg-addr (* y d-row-span)))
+			 (offset (+ (lsh x d-bits-per-elt) d-beg-bitpos))
+			 (width (lsh width d-bits-per-elt))
+			 (small (lsh small d-bits-per-elt))
+			 (large (lsh large d-bits-per-elt))
+			 (pixels (lsh pixels d-bits-per-elt)))
+		     (set-draw-alu-register draw-alu)
+		     (if (> large 32)
+			 (loop do
+			   (let ((width (min width pixels)))
+			     (tv:%draw-horizontal-segment address offset width)
+			     (incf offset width)
+			     (setq address (sys:%pointer-plus address yspan))
+			     (when (= (decf pixels width) 0)
+			       (return-from draw-line nil)))
+			   (multiple-value-bind (increment new-width)
+			       (if (> accumulator small-increment)
+				   (values small-increment small)
+				 (values large-increment large))
+			     (decf accumulator increment)
+			     (setq width new-width)))
+		       ;; Inline loop for slice widths guaranteed to fit in two words.
+		       (loop do
+			 (let ((width (min width pixels)))
+			   (tv:%draw-short-horizontal-segment address offset width)
+			   (incf offset width)
+			   (setq address (sys:%pointer-plus address yspan))
+			   (when (= (decf pixels width) 0)
+			     (return-from draw-line nil)))
+			 (multiple-value-bind (increment new-width)
+			     (if (> accumulator small-increment)
+				 (values small-increment small)
+			       (values large-increment large))
+			   (decf accumulator increment)
+			   (setq width new-width)))))))))))
+       ;; Sloped line, DY > DX
+       (if (and (> (sys:%fixnum-multiply dx 16) dy) ( alu 0) (= d-bits-per-elt 0))
+	   ;; Fast pixel-at-a-time algorithm for all but the
+	   ;; steepest lines, on single-bit rasters
+	   (let ((pixels (if (not draw-p2) (1- dy) dy))
+		 (accumulator (sys:%fixnum-floor dy 2))
+		 (address (sys:%pointer-plus d-beg-addr
+			    (+ (* y1 d-row-span)
+			       (sys:%fixnum-floor (+ d-beg-bitpos x1) 32))))
+		 (mask (rot 1 (sys:%fixnum-mod (+ d-beg-bitpos x1) 32))))
+	     (set-draw-alu-register draw-alu)
+	     (when draw-p1
+	       (sys:%memory-write address
+		 (sys:%alu (sys:%memory-read address :fixnum-only t) mask)))
+	     (dotimes (ignore pixels)
+	       (setq address (sys:%pointer-plus address yspan))
+	       (when (< (decf accumulator dx) 0)
+		 ;; Increment in the X direction, by rotating the mask left
+		 ;; one pixel, and incrementing the address iff the mask
+		 ;; wraps around
+		 (setq address (sys:%pointer-plus address
+				 (logand (setq mask (rot mask 1)) 1)))
+		 (incf accumulator dy))
+	       (sys:%memory-write address
+		 (sys:%alu (sys:%memory-read address :fixnum-only t) mask)))
+	     (return-from draw-line nil))
+	 ;; Use a different approach for hairier cases
+	 (multiple-value-bind (x y pixels height accumulator)
+	     ;; Compute initial conditions for Bresenham algorithm
+	     (let ((y y1)
+		   (pixels dy))
+	       (multiple-value-bind (height accumulator)
+		   (progn
+		     #+ignore
+		     ;; This is the explicit derivation of the initial accumulator.
+		     (loop for accumulator first (sys:%fixnum-ceiling dy 2)
+					   then (+ accumulator dx)
+			   until (> accumulator dy)
+			   counting t into height
+			   finally (return (values height (- accumulator dy))))
+		     ;; This is a faster way of saying the same thing.
+		     (multiple-value-bind (height remainder)
+			 (ceiling (1+ (- dy (sys:%fixnum-ceiling dy 2))) dx)
+		       (values height (1+ (- remainder)))))
+		 ;; To draw the last pixel, simply step the algorithm an extra time...
+		 (when draw-p2
+		   (incf pixels))
+		 ;; Not drawing the first pixel is a bit tricky...
+		 (when (not draw-p1)
+		   (incf y ddy)
+		   (decf height)
+		   (decf pixels))
+		 (values x1 y pixels height accumulator)))
+	   ;; We compute two slice heights; for each vertical line except the first
+	   ;; and last, we pick one height based on the error term.
+	   (multiple-value-bind (large large-increment)
+	       (ceiling dy dx)
+	     (multiple-value-bind (small small-increment)
+		 (floor dy dx)
+	       (if (< alu 0)
+		   ,(let ((core
+			    `(loop do
+			       (let ((height (min height pixels)))
+				 (bitblt-loop-call :forwards nil alu
+						   (lsh 1 d-bits-per-elt)
+						   nil nil
+						   (lsh x d-bits-per-elt)
+						   (if (< ddy 0) (- y height -1) y)
+						   ,(or forwards-bitblt-loop
+							'vertical-bitblt-loop))
+				 (incf y (* height ddy))
+				 (incf x)
+				 (when (= (decf pixels height) 0)
+				   (return-from draw-line nil)))
+			       (multiple-value-bind (increment new-height)
+				   (if (> accumulator small-increment)
+				       (values small-increment small)
+				       (values large-increment large))
+				 (decf accumulator increment)
+				 (setq height new-height)))))
+		      (if forwards-bitblt-loop
+			  core
+			  `(with-alu-inner-loop (:forwards alu vertical-bitblt-loop)
+						,core)))
+		 (let ((address (sys:%pointer-plus d-beg-addr (* y d-row-span)))
+		       (offset (+ (lsh x d-bits-per-elt) d-beg-bitpos))
+		       (width (lsh 1 d-bits-per-elt)))
+		   (set-draw-alu-register draw-alu)
+		   (loop do
+		     (let ((height (min height pixels)))
+		       (tv:%draw-vertical-segment address offset width height yspan)
+		       (setq address (sys:%pointer-plus address (* yspan height)))
+		       (incf offset width)
+		       (when (= (decf pixels height) 0)
+			 (return-from draw-line nil)))
+		     (multiple-value-bind (increment new-height)
+			 (if (> accumulator small-increment)
+			     (values small-increment small)
+			   (values large-increment large))
+		       (decf accumulator increment)
+		       (setq height new-height))))))))))))
+
+(defun tv:%draw-line-internal (x1 y1 x2 y2 alu draw-end-point? raster)
+  (with-block-registers (1 2)
+    (with-drawing-environment (alu raster)
+      d-height							;can't declare this ignored...
+      (block draw-line
+	(let ((draw-alu (draw-alu-op alu)))
+	  (tv:%draw-line-internal-internal))))))
+
+(defun tv:%draw-multiple-lines-internal (alu lines draw-end-point? raster)
+  (with-block-registers (1 2)
+    (with-drawing-environment (alu raster)
+      d-height                                                  ;can't declare this ignored...
+      (cli::with-alu-inner-loop (:forwards alu forwards-bitblt-loop)
+	(cli::with-alu-inner-loop (:single alu single-bitblt-loop)
+	  (let ((draw-alu (draw-alu-op alu))
+		(lines lines))
+	    (declare (sys:array-register lines))
+	    (loop for index below (tv:array-active-length lines) by 4 do
+	      (block draw-line
+		(let ((x1 (aref lines index))
+		      (y1 (aref lines (+ index 1)))
+		      (x2 (aref lines (+ index 2)))
+		      (y2 (aref lines (+ index 3))))
+		  (tv:%draw-line-internal-internal
+		    :single-bitblt-loop single-bitblt-loop
+		    :forwards-bitblt-loop forwards-bitblt-loop))))))))))
+
+;;;*********************************************************************
+;;;  Draw-Triangle based on original L-machine macro and microcode
+;;;
+;;; This accepts any coordinates, and clips the triangle to the part within the sheet (raster)
+;;; or the given limits.
+
+(defun %triangle-initial-state-calc (dy x1 x2)
+  (if (zerop dy)
+      (values 0 0 0 0 0)			;Horizontal line segment
+						;Slanted line segment
+      (let* (b i q r				;Temps to hold computations
+	     (dx (- x1 x2))	
+	     (l (- (* (1+ (* x1 2)) dy) dx)))
+	(setq dy (lsh dy 1)			;Multiply by 2
+	      dx (lsh dx 1))
+	(multiple-value-setq (b i) (truncate l dy))
+	(multiple-value-setq (q r) (truncate dx dy))
+	(values dy b q i r))))
+
+(defmacro %draw-triangle-core (body-macro row-macro)
+  `(progn    ;; First sort points so that   Y1 > Y2 > Y3
+     (sort-points (> y2 y1) x1 y1 x2 y2)
+     (sort-points (> y3 y1) x1 y1 x3 y3)
+     (sort-points (> y3 y2) x2 y2 x3 y3)
+      
+     (let ((determinant (- (* (- x1 x2) (- y1 y3))
+			   (* (- x1 x3) (- y1 y2)))))
+       (when (not (zerop determinant))
+	 (,body-macro 
+	   (macrolet ((triangle-side-setup
+	       (x1 y1 x2 y2)
+	       `(LET ((DY (- ,y1 ,y2)))
+		  (IF (PLUSP DETERMINANT)	;Setup parms for Left or Right side
+		      (MULTIPLE-VALUE-SETQ (LY XL XLI XLR XLIR)
+			(%triangle-initial-state-calc DY ,x1 ,x2))
+		      (MULTIPLE-VALUE-SETQ (RY XR XRI XRR XRIR)
+			(%triangle-initial-state-calc DY ,x1 ,x2)))
+		  (SETQ DETERMINANT (- DETERMINANT)))))	;Det used as flag
+		
+    (let (ly xl					;Left side starting Y, X
+	  xli xlir				;     x incr integer, x incr remainder
+	  xlr					;     ???
+			 
+	  ry xr					;Right side starting Y, X
+	  xri xrir				;     x incr integer, x incr remainder
+	  xrr)					;     ???
+		  
+      ;;**************************************************
+      ;; Setup parameters for left and right side of P1-based segment
+		  
+      (triangle-side-setup x1 y1 x2 y2)
+      (triangle-side-setup x1 y1 x3 y3)
+		  
+      ;;**************************************************
+      ;; Do the P1-P2, P1-P3 sided triangle segment from Y1 to Y2
+      ;; then if Y is still greater than Y3, there is a
+      ;;    second segment to be done so set up for P1-P3,P2-P3
+      ;; otherwise P2-P3 is horizontal and we're done
+		  
+      (do ((y-limit y2 y3)			;Ending Y value
+	   (y (1- y1)))				;Starting Y value - used in computing row addr
+		      
+	  ((cond ((< y y3))			;The P2-P3 segment is horizontal or just done
+		 ((< y-limit y2)		;Otherwise setup for second triangle
+		  (triangle-side-setup x2 y2 x3 y3)
+		  nil)))
+		    
+	(do ()
+	    ((< y y-limit))
+		      
+	  ;; ******************** Setup for Next Line, Optional Draw
+		      
+	  (when (and (<= ymin y) (< y ymax))	;Setup drawing parms when in bounds
+	    (let* ((l-x (max xl xmin))		;Clip on Left
+		   (width (- (min xr xmax) l-x)))	;Clip XR on the right
+	      (,row-macro width l-x)
+	      ))
+		      
+	  ;; ******************** After Drawing Parameter Adjustments
+		      
+	  (decf y)				;Decrement Row counter
+		      
+	  (decf xl xli)				;Increment Left Side parameters
+	  (cond ((minusp (decf xlr xlir))	;Reached a Jag, XLR-NEGATE
+		 (incf xlr ly)
+		 (decf xl))
+		((>= xlr ly)			;XLR-WRAP
+		 (decf xlr ly)
+		 (incf xl)))
+		      
+	  (decf xr xri)				;Increment Right side parameters
+	  (cond ((minusp (decf xrr xrir))	;XRR-NEGATE
+		 (incf xrr ry)
+		 (decf xr))
+		((>= xrr ry)			;XRR-WRAP
+		 (decf xrr ry)
+		 (incf xr)))
+	  )))))))))
+
+(defun TV:%draw-triangle-internal (x1 y1 x2 y2 x3 y3 alu raster limits)
+  (with-drawing-environment (alu raster)
+    (ignore d-beg-addr)
+    (macrolet ((draw-triangle-internal (body)
+		 `(with-alu-inner-loop (:single alu bitblt-loop)
+		    (let ((xmin (pop limits))
+			  (ymin (pop limits))
+			  (xmax (pop limits))
+			  (ymax (pop limits)))
+
+		      (or ymin (setq ymin 0))	;If limits not given set to array bounds
+		      (or xmin (setq xmin 0))
+		      (or ymax (setq ymax d-height))
+		      (or xmax (setq xmax d-row-length))
+	    
+		      (when (and (> ymax d-valid-height)
+				 (>= y1 d-valid-height))
+			(error 'bitblt-row-out-of-bounds :row y1 :height d-valid-height))
+		      ,body)))
+	       (draw-triangle-row (width l-x)
+		 `(if (> width 0 )		;Draw if non-zero, non-negative width
+		      (bitblt-loop-call :single nil alu
+					(lsh ,width d-bits-per-elt) nil nil
+					(lsh ,l-x d-bits-per-elt) y 
+					bitblt-loop))
+		 ))
+
+    (%draw-triangle-core draw-triangle-internal draw-triangle-row))))
+
+;;;*********************************************************************
+;;; KHS: Here are the optimal inner loops for drawing narrow characters.  After
+;;; staring at the architecture for a while, this is the best I can come up
+;;; with.  It's actually considerably better than I thought;  a Merlin
+;;; drawing CPTFONT characters should average about 300 cycles per character
+;;; in the inner loop.  My 3640 takes about 400 cycles to do the same thing.
+;;; 
+;;; I'm pretty sure these'll work, but I haven't tried them and there might
+;;; be some fencepost of sign errors.  Let me know if there are any problems.
+
+;;; Specialized drawing routines for narrow ( 32 bit) characters.
+
+;;; There are four possible cases when drawing a 32-bit (or less) character: both the source
+;;; and the destination could fit in one word, either could span two words, or both could span
+;;; two words.  We use a separate routine optimized for each of these cases.  Each routine
+;;; handles all (monochromatic) ALU operations, there's no need for the depends-on-* cases
+;;; used by bitblt.  Each routine is a separate function, so the decision of which one
+;;; to used can be optimized out of the %draw-string inner loop.
+
+;;; The general strategy is to set up the BYTE-R and BYTE-S registers so that one or more
+;;; %block-read-shift instructions will read and align the source word(s) to the destination,
+;;; and the ALUF register to perform the specified ALU operation with a %alu instruction.
+;;; After the source has been read, but before it's combined with the destination, we mask it
+;;; with precomputed masks.
+
+;;; The four routines all take the same arguments, as follows:
+;;;   HEIGHT - the number of scan lines in the character
+;;;   WIDTH - the number of bits wide
+;;;   ALU - the alu operation to be performed (in hardware form)
+;;;   S-ADDRESS - the address of the first source word in the first row
+;;;   D-ADDRESS - the address of the first destination word in the first row
+;;;   S-SPAN - the increment between each source row (independent of the character width)
+;;;   D-SPAN - the increment between each destination row (independent of the character width)
+;;;   S-POSITION - the lowest bit number in the first source word to be transferred
+;;;   D-POSITION - the lowest bit number in the first destination word to be transferred
+
+;;; Approximate inner loop cycle counts:
+;;;   1 source word, 1 destination word: 20 cycles
+;;;   1 source word, 2 destination words: 27 cycles
+;;;   2 source words, 1 destination word: 22 cycles
+;;;   2 source words, 2 destination words: 30 cycles
+;;; These counts assume the Merlin memory and display systems, and that the
+;;; compiler generates the loop-decrement-tos instruction when appropriate.
+
+;;; In all these routines, block register 1 is used to address the source, and block register
+;;; 2 is used to address the destination.  We use the following macro to express the iteration
+;;; over the scan lines, and it performs the last iteration specially to avoid incrementing
+;;; past the end of the screen.
+
+(defmacro %draw-narrow-character-loop (&body body)
+  `(loop repeat (1- height)
+	 do (progn ,@body)
+	    (setf (sys:%block-register 1) (%pointer-plus (sys:%block-register 1) s-span))
+	    (setf (sys:%block-register 2) (%pointer-plus (sys:%block-register 2) d-span))
+	 finally (progn ,@body)))
+
+(defun %draw-narrow-character-1-1 (height width alu s-address d-address s-span d-span
+					  s-position d-position)
+  (setf (sys:%block-register 1) s-address
+	(sys:%block-register 2) d-address)
+  (let* ((d-span (- d-span 1))			;compensate for autoincrement
+	 ;; Have to use LSH otherwise we begin to pick up sign bit in boundary case 
+	 (s-mask (sys:%32-bit-difference (lsh 1 (+ d-position width)) (rot 1 d-position)))
+	 (s-negmask (lognot s-mask)))
+    ;; Byte-S: No Masking
+    ;; Byte-R: Rotate as needed to align source and destination
+    (si:set-alu-and-rotate-control :byte-r (- d-position s-position)
+				   :byte-s -1
+				   :function alu)
+    (si:prepare-for-block-write)
+    (%draw-narrow-character-loop
+      (%block-write 2
+	(logior (logand (%alu (%block-read-shift 1 :fixnum-only t :prefetch nil
+						 :no-increment t)
+			      (%block-read 2 :fixnum-only t :prefetch nil :no-increment t))
+			s-mask)
+		(logand (%block-read 2 :fixnum-only t :prefetch nil :no-increment t)
+			s-negmask)))
+      )))
+
+;;; One source word, two destination word case.
+(defun %draw-narrow-character-1-2 (height width alu s-address d-address s-span d-span
+				   s-position d-position)
+  (cl:setf (sys:%block-register 1) s-address
+	   (sys:%block-register 2) d-address)
+  (let* ((d-span (- d-span 2))			;compensate for autoincrement
+	 ;; S-MASK-HI masks off the low-order bits of the source that get rotated and combined
+	 ;; with the high-order bits of the first word of the destination.
+	 (s-mask-hi (lognot (sys:%32-bit-difference (rot 1 d-position) 1)))
+	 (s-negmask-hi (lognot s-mask-hi))
+	 ;; S-MASK-LO masks off the high-order bits of the source that get rotated and 
+	 ;; combined with the low-order bits of the second word of the destination.
+	 (s-mask-lo (sys:%32-bit-difference (rot 1 (+ d-position width)) 1))
+	 (s-negmask-lo (lognot s-mask-lo)))
+    ;; Byte-S: No Masking
+    ;; Byte-R: Rotate as needed to align source and destination
+    (si:set-alu-and-rotate-control :byte-r (- d-position s-position)
+				   :byte-s -1
+				   :function alu)
+    (%draw-narrow-character-loop
+      (%memory-write (sys:%block-register 2)
+	;; Read first destination word, prefetch second
+	(logior (logand (%alu (%block-read-shift 1
+				:fixnum-only t :prefetch nil :no-increment t)
+			      (%block-read 2 :fixnum-only t :no-increment t))
+			s-mask-hi)
+		(logand (%block-read 2 :fixnum-only t)
+			s-negmask-hi)))
+      ;; Read second destination word, don't increment until write.
+      (%block-write 2
+	(prog1
+	  (logior (logand (%alu (%block-read-shift 1 :fixnum-only t :prefetch nil
+						   :no-increment t)
+				(%block-read 2 :fixnum-only t :prefetch nil :no-increment t))
+			  s-mask-lo)
+		  (logand (%block-read 2 :fixnum-only t :prefetch nil :no-increment t)
+			  s-negmask-lo))
+	  (si:prepare-for-block-write)))
+      )))
+
+;;; Two source words, one destination word case.
+(defun %draw-narrow-character-2-1 (height width alu s-address d-address s-span d-span
+				   s-position d-position)
+  (cl:setf (sys:%block-register 1) s-address
+	   (sys:%block-register 2) d-address)
+  (let* ((s-span (- s-span 1))			;compensate for autoincrement
+	 (d-span (- d-span 1))			;compensate for autoincrement
+	 ;; Have to use LSH otherwise we begin to pick up sign bit in boundary case 
+	 (s-mask (sys:%32-bit-difference (lsh 1 (+ d-position width)) (rot 1 d-position)))
+	 (s-negmask (lognot s-mask))
+	 (bit-offset (- d-position s-position)))
+	 
+    ;; Byte-S: During the second %block-read-shift below, the top (1+ byte-s) bits come
+    ;;     from the second source word.  We want (- 32. d-position) bits to come from
+    ;;     the first source word, and all the rest from the second.
+    ;; Byte-R: Rotate as needed to align source and destination
+    (si:set-alu-and-rotate-control :byte-r bit-offset
+				   :byte-s (1- (- bit-offset))
+				   :function alu)
+    (si:prepare-for-block-write) ;Outside loop since no inline BAR-0 traffic.
+    (%draw-narrow-character-loop
+      ;; The first block-read-shift reads the first partial word, rotates it, and saves it in
+      ;; the rotate latch (the result in source0 is irrelevant gubbish).  The second one reads
+      ;; the second partial and combines it with the first such that source1 contains the
+      ;; concatenated partials rotated to align with the destination.  The low order bits of
+      ;; the rotated source combine with the first destination word, and the high order bits
+      ;; combine with the second destination word.
+      (if (minusp bit-offset) (%block-read-shift 1 :fixnum-only t))	;PreLoad rotate-latch
+      (let ((source1 (%block-read-shift 1 :fixnum-only t :prefetch nil :no-increment t)))
+	;; Read second destination word, don't increment until write.
+	(%block-write 2
+	  (logior (logand (%alu source1
+				(%block-read 2 :fixnum-only t :prefetch nil :no-increment t))
+			  s-mask)
+		  (logand (%block-read 2 :fixnum-only t :prefetch nil :no-increment t)
+			  s-negmask)))
+	))))
+
+;;; Two source words, two destination words case.
+(defun %draw-narrow-character-2-2 (height width alu s-address d-address s-span d-span
+				   s-position d-position)
+  (cl:setf (sys:%block-register 1) s-address
+	   (sys:%block-register 2) d-address)
+  (let* ((s-span (- s-span 1))			;compensate for autoincrement
+	 (d-span (- d-span 2))			;compensate for autoincrement
+	 ;; S-MASK-HI masks off the low-order bits of the source that get rotated and combined
+	 ;; with the high-order bits of the first word of the destination.
+	 (s-mask-hi (lognot (sys:%32-bit-difference (rot 1 d-position) 1)))
+	 (s-negmask-hi (lognot s-mask-hi))
+	 ;; S-MASK-LO masks off the high-order bits of the source that get rotated and 
+	 ;; combined with the low-order bits of the second word of the destination.
+	 (s-mask-lo (sys:%32-bit-difference (rot 1 (+ d-position width)) 1))
+	 (s-negmask-lo (lognot s-mask-lo))
+	 (bit-offset (- d-position s-position)))
+
+    ;; BYTE-S: During the second %block-read-shift below, the top (1+ byte-s) bits come
+    ;;    from the second source word.  We want (- 32. d-position) bits to come from
+    ;;    the first source word, and all the rest from the second.
+    ;; BYTE-R: Rotate as needed to align source and destination.
+    (si:set-alu-and-rotate-control :byte-r bit-offset
+				   :byte-s (1- (- bit-offset))
+				   :function alu)
+    (%draw-narrow-character-loop
+      ;; The first block-read-shift reads the first partial word, rotates it, and saves it in
+      ;; the rotate latch (the result in source0 is irrelevant gubbish).  The second one
+      ;; reads the second partial and combines it with the first such that source1 contains
+      ;; the concatenated partials rotated to align with the destination.  The third one
+      ;; reads the second partial again, which produces the contents of the rotate latch
+      ;; read the previous time.  The low order bits of source1 combine with the high-order
+      ;; bits of the first destination word, and the high order bits of source2 combine
+      ;; with the low-order bits of the second destination word.
+      (let ((source1 (if (not (minusp bit-offset))
+			 (%block-read-shift 1)	;Read first word, setup for second
+
+			 (%block-read-shift 1)	;Preload rotate-latch as first, read second
+			 (%block-read-shift 1 :prefetch nil :no-increment t)))
+	    ;; Note: this only takes one cycle since the last word is internally buffered.
+	    (source2 (%block-read-shift 1 :prefetch nil :no-increment t)))
+	(%memory-write (sys:%block-register 2)
+          ;; Read first destination word, prefetch second
+	  (logior (logand (%alu source1
+				(%block-read 2 :fixnum-only t :prefetch nil :no-increment t))
+			  s-mask-hi)
+		  (logand (%block-read 2 :fixnum-only t) s-negmask-hi)))
+	  
+	;; Read second destination word, don't increment until write.
+	(%block-write 2
+	  (prog1
+	    (logior (logand (%alu source2
+			      (%block-read 2 :fixnum-only t :prefetch nil :no-increment t))
+			    s-mask-lo)
+		    (logand (%block-read 2 :fixnum-only t :prefetch nil :no-increment t)
+			    s-negmask-lo))
+	    (si:prepare-for-block-write)))))
+    ))
+
+;;;*********************************************************************
+;;; Shared call for narrow and wide characters
+;;;
+
+(defmacro char-inner-loop-call (height width alu sx sy dx dy
+				&optional alu-inner-loop use-bitblt-inner-loop)
+  ;;; Expects an environment providing
+  ;;;    S/D-BEG-ADDR, S/D-ROW-SPAN, S/D-BEG-BITPOS S/D bits-per-elt
+
+  `(IF ,(or use-bitblt-inner-loop
+	   `(bitblt-inner-loop-p
+	       ,alu s-bits-per-elt d-bits-per-elt tv:bitblt-unpacking-mask))
+       (LET* (	  
+	      ;; Finish setup and error checking
+	      (width (lsh ,width d-bits-per-elt))
+	      (S-POS (+ S-BEG-BITPOS (lsh ,sx s-bits-per-elt)))
+	      (D-POS (+ D-BEG-BITPOS (lsh ,dx d-bits-per-elt)))
+	      (S-ADDRESS (%POINTER-PLUS S-BEG-ADDR (+ (* ,sy S-ROW-SPAN)
+						      (%FIXNUM-FLOOR S-POS 32))))
+	      (D-ADDRESS (%POINTER-PLUS D-BEG-ADDR (+ (* ,dy D-ROW-SPAN)
+						      (%FIXNUM-FLOOR D-POS 32))))
+	      (S-BITPOS (%FIXNUM-MOD S-POS 32))
+	      (D-BITPOS (%FIXNUM-MOD D-POS 32)))
+
+	 (IF (and ( width 32)
+		  (source-dependent-alu-p ,alu nil))
+
+	     ;;    narrow-version
+	     (SYS:WITH-BLOCK-REGISTERS (1 2)
+	       (MACROLET ((DRAW-CHAR (FUNCTION)
+			    (cons function '(,height width ,alu S-ADDRESS D-ADDRESS
+					     S-ROW-SPAN D-ROW-SPAN S-BITPOS D-BITPOS))))
+		 (IF ( (+ S-BITPOS width) 32.)	;Is source char in one word ?
+		     (IF ( (+ D-BITPOS width) 32.)	;Is destination in one word ?
+			 (DRAW-CHAR %DRAW-NARROW-CHARACTER-1-1)
+			 (DRAW-CHAR %DRAW-NARROW-CHARACTER-1-2))
+		     (IF ( (+ D-BITPOS width) 32.)	;Is destination in one word ?
+			 (DRAW-CHAR %DRAW-NARROW-CHARACTER-2-1)
+			 (DRAW-CHAR %DRAW-NARROW-CHARACTER-2-2)))))
+ 
+	     ;;  Bitblt is used for wide characters (> 32 bits wide or color)
+	     (LET* ((BIT-OFFSET (- D-BITPOS S-BITPOS))
+		    (D-END-BITPOS (+ width D-BITPOS))
+		    (D-END-BITPOS-MOD32 (%FIXNUM-MOD D-END-BITPOS 32))
+		    (WORD-WIDTH (- (%FIXNUM-FLOOR D-END-BITPOS 32) (IF (ZEROP D-BITPOS) 0 1)))
+		    (FIRST-COLUMN-MASK (IF (ZEROP D-BITPOS) 0 (LSH -1 D-BITPOS)))
+		    (LAST-COLUMN-MASK  (LSH -1 (- D-END-BITPOS-MOD32 32)))
+		    (SOURCE-OVERHANG?  (> D-END-BITPOS-MOD32 (%FIXNUM-MOD BIT-OFFSET 32)))) 
+	   
+	       (WHEN (MINUSP WORD-WIDTH)
+		 (SETQ WORD-WIDTH 0
+		       LAST-COLUMN-MASK (LOGAND FIRST-COLUMN-MASK LAST-COLUMN-MASK)
+		       FIRST-COLUMN-MASK 0))
+	       (FUNCALL ,(if alu-inner-loop
+			     alu-inner-loop
+			     `(BITBLT-INNER-LOOP-FUN :FORWARDS ,alu))
+			,alu S-ADDRESS S-ROW-SPAN D-ADDRESS D-ROW-SPAN
+			,height BIT-OFFSET WORD-WIDTH FIRST-COLUMN-MASK LAST-COLUMN-MASK
+			SOURCE-OVERHANG?))
+	     ))
+       (tv:%draw-char-unpacked-internal
+	 ,width ,height ,alu
+	 s-beg-addr ,sx ,sy s-row-span s-bits-per-elt s-beg-bitpos
+	 d-beg-addr ,dx ,dy d-row-span d-bits-per-elt d-beg-bitpos
+	 ,alu-inner-loop)))
+
+;;;*********************************************************************
+;;; This macro loads the fields of a font descriptor using the block-read instruction 
+;;; for the best performance. It is handcoded and needs to be updated if changes are 
+;;; made in the font descriptor. If the WITH-DESTRUCTURED-NAMED-STRUCT macro is revived in 
+;;; SYS;SYS2;TABLE that may be worth considering though this is slightly more efficient as it
+;;; doesn't load fields past the last one required. 
+
+(defmacro with-font-fields ((font &rest font-fields) &body body)
+  (let* ((field-list '(FILL-POINTER
+			STRUCT-NAME FONT-NAME FONT-CHAR-HEIGHT FONT-CHAR-WIDTH
+			FONT-RASTER-HEIGHT FONT-RASTER-WIDTH FONT-BASELINE FONT-BLINKER-WIDTH
+			FONT-BLINKER-HEIGHT FONT-CHARS-EXIST-TABLE FONT-CHAR-WIDTH-TABLE
+			FONT-INDEXING-TABLE FONT-LEFT-KERN-TABLE))
+	 (last-field-used (loop for ff in font-fields
+				with last-field = 0
+				for field-pos = (cl:position ff field-list) do
+			    (if (> field-pos last-field)
+				(setq last-field field-pos))
+				finally (return last-field)))
+	 (fields-loaded (subseq field-list 0 (1+ last-field-used)))
+	 (fields-unused (loop for f in fields-loaded
+			      with fields-unused = nil do
+			  (unless (member f font-fields)
+			    (setq fields-unused (cons f fields-unused)))
+			  finally (return fields-unused))))
+    `(WITH-BLOCK-REGISTERS (1 2)
+       (SETF (SYS:%BLOCK-REGISTER 1)
+	     (%POINTER-PLUS (LOCF (ZL:FONT-FILL-POINTER ,FONT)) ,(- last-field-used)))
+       ;; NOTE: Fields in the array-leader are in reverse order !
+       (LET ,(loop for f in (reverse fields-loaded)
+		   with count = (length fields-loaded)
+		   for n from 1 
+		   collect
+		     (list f `(SYS:%BLOCK-READ 1 ;:SET-CDR-NEXT NIL :FIXNUM-ONLY T
+					   ,@(if (>= n (- count 1)) `(:PREFETCH NIL))
+					   ,@(if (= n count) `(:NO-INCREMENT T)))))
+	 ,@(if fields-unused
+	       `((IGNORE ,@(reverse fields-unused))))
+	 ,@body))))
+;;;*********************************************************************
+;;; %DRAW-CHAR-(CLIPPED-)INTERNAL
+;;;
+
+;;Draw a character, clipping.  
+;; This is like %draw-char-internal, except it clips properly to the specified clipping region
+;; %draw-char-internal ought to be removed, any use of it which remains in the
+;; system is almost certainly incorrect.   If anyone can find one and thinks
+;; it is correct, please show it to me.
+
+(defun TV:%draw-char-clipped-internal (index font x y alu raster bounds)
+  (with-draw-char-environment (alu font raster)
+    (ignore s-height s-row-length s-valid-height)
+    (with-clipping-region (bounds left top right bottom)
+      (with-font-fields (font fill-pointer font-raster-height font-raster-width
+			      font-chars-exist-table font-indexing-table font-left-kern-table)
+        (let (temp cx width
+	       (cy 0)
+	       (height font-raster-height)
+	       )
+
+	    (when (and (> bottom d-valid-height)
+		       (> (+ y height) d-valid-height))
+	      (error 'bitblt-row-out-of-bounds :row (+ y height -1) :height d-valid-height))
+
+	  ;; Find character subarray of font array
+	  (when (and (< index fill-pointer)
+		     (or (null font-chars-exist-table)
+			 (aref font-chars-exist-table index)))
+	    (if font-indexing-table
+		(setq cx (aref font-indexing-table index)
+		      width (- (aref font-indexing-table (1+ index)) cx))
+		(setq width font-raster-width
+		      cx (* width index)))
+	  
+	    ;; Do kerning - Only code not used in other routine
+	    (when font-left-kern-table
+	      (decf x (aref font-left-kern-table index)))
+	  
+	    ;; Clip.
+	    (when (< x left)
+	      (setq temp (- left x)
+		    cx (+ cx temp)
+		    width (- width temp)
+		    x left))
+	    (when (minusp (setq temp (- right width x)))
+	      (setq width (+ width temp)))
+	    (unless (plusp width)
+	      (return-from tv:%draw-char-clipped-internal nil))
+	  
+	    (when (< y top)
+	      (setq temp (- top y)
+		    cy (+ cy temp)
+		    height (- height temp)
+		    y top))
+	    (when (minusp (setq temp (- bottom height y)))
+	      (incf height temp))
+	    (unless (plusp height) 
+	      (return-from tv:%draw-char-clipped-internal nil))
+
+	    (char-inner-loop-call height width alu cx cy x y)
+	    ))))))
+
+(compiler:make-obsolete TV:%draw-char-internal "Use TV:%DRAW-CHAR-CLIPPED-INTERNAL")
+
+(defun TV:%draw-char-internal (index font x y alu raster)
+;; Alu-setup
+;;  ((IF (MINUSP ALU)				
+;;	 (IF (BIT-TEST #O20 ALU) ALU-SETA ALU-SETO)	;so set-up is handled right.
+;;	 ALU)
+  (with-stack-list (bounds 0 0 10000 10000)	;Trigger clip region validation correction
+    (TV:%draw-char-clipped-internal index font x y alu raster bounds)))
+
+;;;*********************************************************************
+;;; %DRAW-STRING(-CLIPPED)-INTERNAL
+;;;
+
+;;; Draw a segment of a string that is all in one font.
+;;; NOTE: The FONT argument supplied here must be consistent with the
+;;;       font for the first character of the string, since this 
+;;;       routine hasn't the necessary context to detect an inconsistency.
+;;; This will now work for variable-width fonts.  In the simplest case
+;;; (completely simple fixed-width fonts), we use the %draw-narrow-character
+;;; inner-loop functions above. For wide characters (> 32 bits) we use BITBLT.
+;;; The simple case has been especially optimized and the other cases could use
+;;; some work when time permits to reduce the work in the inner loop.
+;;;
+;;; This can be called with coordinates that are outside any of the four window edges.
+;;; The XLIM argument is not guaranteed to be valid, since it may have come from the user.
+;;; It's not clear whether callers rely on this to do clipping, or merely to error-check.
+;;; This implementation does full clipping.
+
+(defvar *idraw-string-switch* nil)		;temp for below
+
+(defun TV:%draw-string-clipped-internal (raster alu x y string font index limit bounds)
+  (declare (values x index done-p))
+  ;; Decode arrays and get s-xxx and d-xxx parameters for array manipulation
+  (with-draw-char-environment (alu font raster)
+    (ignore s-height s-valid-height s-row-length)
+    (with-font-fields (font fill-pointer font-char-width font-raster-height
+			    font-raster-width font-chars-exist-table font-char-width-table
+			    font-indexing-table font-left-kern-table)
+
+      (let* ((write-mask tv:bitblt-unpacking-mask)
+	     (fill-data tv:bitblt-unpacking-constant)
+	     (use-bitblt-inner-loop
+	       (bitblt-inner-loop-p alu s-bits-per-elt d-bits-per-elt write-mask))
+	     (alu-inner-loop (if use-bitblt-inner-loop
+				 (cli::bitblt-inner-loop-fun :forwards alu)
+				 (color:%draw-masked-bits-function
+				   alu
+				   (lsh 1 s-bits-per-elt)
+				   (lsh 1 d-bits-per-elt)	
+				   fill-data write-mask)))
+	     (char-width  font-char-width)	;keep it in pixels for now
+	     (height      font-raster-height)
+	     (string-array-reg string)
+	     char width last-font)
+	  (declare (array-register string-array-reg))
+	
+	  (with-clipping-region (bounds left top right bottom)
+
+	    (when (and (> bottom d-valid-height)
+		       (> (+ y height) d-valid-height))
+	      (error 'bitblt-row-out-of-bounds :row (+ y height -1) :height d-valid-height))
+
+	    (Let* ((left-kern 0)
+		   (first-char (aref string-array-reg index))
+		   (subindex-is-index (si:%char-subindex-is-index-p first-char))
+		   sy)
+	    
+	      (cond ((or font-char-width-table font-indexing-table font-left-kern-table
+			 font-chars-exist-table
+			 *idraw-string-switch*
+			 ( fill-pointer #o200)	;Variable width hair => slow case.
+			 (< x left) (< y top)	;Or clipping hair => slow case.
+			 (> (+ y height) bottom)
+			 (not subindex-is-index)
+			 ( s-bits-per-elt d-bits-per-elt)
+			 )
+
+		     ;;**************************************************
+		     ;; do clipping in the Y coordinate outside of the loop
+		     
+		     (if ( y top)
+			 (setq sy 0)
+
+			 (incf height (- y top))
+			 (setq sy (- top y)
+			       y top))
+		   
+		     (when (> (+ y height) bottom)
+		       (setq height (- bottom y)))
+		   
+		     ;;**************************************************
+		     (loop with (cx screen-x fdx)
+			   as ch = (aref string-array-reg index)
+			   while (setf fdx (si:%chars-share-device-font-p
+					     ch first-char subindex-is-index))
+			   while (< fdx fill-pointer)
+			   do (when font-char-width-table
+				(setq char-width (aref font-char-width-table fdx)))
+			   until (> (+ char-width x) right)	;Room before margin?
+			   while (if (not (null font-chars-exist-table))
+				     (aref font-chars-exist-table fdx)
+				   (graphic-char-p ch))
+			   do
+		       ;; Draw char here...
+		       ;; Find character subarray of font array
+ 		       (if font-indexing-table
+			   (setq cx (aref font-indexing-table fdx)
+				 width (- (aref font-indexing-table (1+ fdx)) cx))
+			 (setq width font-raster-width cx (* width fdx)))
+		       (when font-left-kern-table	;Left kern for this char.
+			 (setq left-kern (aref font-left-kern-table fdx)))
+			     
+		       ;;**************************************************
+		       ;; Finish setup and error checking
+			     
+		       (setq screen-x (- x left-kern))
+		       (let ((xoff (- left screen-x)))
+			 (when (plusp xoff)
+			   ;; Left kern moved the character off the window, so clip it
+			   (incf cx xoff)
+			   (decf width xoff)
+			   (setq screen-x left)))
+			     
+		       ;; May be zero-width after clipping X direction, or clipped in Y
+		       (when (and (plusp width) (plusp height))
+			 (char-inner-loop-call height width alu cx sy screen-x y
+					       alu-inner-loop use-bitblt-inner-loop))
+		       (setq x (+ x char-width))
+		       (and (>= (incf index) limit)
+			    (return (values x index t)))
+			   finally (return (values x index nil))))
+;;;*********************************************************************
+;;; Simple case - unchanging font, fixed spacing, etc. 
+;;;
+
+		    (t				;Simplest fixed width case.  Use microcode.
+		     ;; Test X and INDEX, fetches char, draws, and increments X and INDEX.
+
+		     (setq char-width (rot char-width d-bits-per-elt)	;width is in bits
+			   width (rot font-raster-width s-bits-per-elt)
+			   x (rot x d-bits-per-elt)	                ;X in bits..
+			   bounds (rot right d-bits-per-elt))	;right in bits(compare with X)
+		   
+		     (setf last-font (si:%char-all-but-subindex first-char))
+		      
+		     (if ( width 32)
+			 ;; Narrow version - best optimized
+			 (sys:with-block-registers (1 2)
+			   (loop with width-limit = (- 32. width) 
+				 with dest-y-offset = (* y d-row-span) do
+			     (if (or (>= index limit) (> (+ x char-width) bounds))
+				 (return))
+			     (setq char (aref string-array-reg index))
+			     ;; Format effector bit - return if different font
+			     (if (or ( (si:%char-all-but-subindex char) last-font)
+				     (not (graphic-char-p char)))
+				 (return))
+			     (let* ((sx (* width (char-code char)))
+				    (s-pos (+ s-beg-bitpos sx))
+				    (d-pos (+ d-beg-bitpos x))
+				    (s-address (%pointer-plus s-beg-addr
+							      (%fixnum-floor s-pos 32)))
+				    (d-address (%pointer-plus d-beg-addr
+							      (+ dest-y-offset
+								 (%fixnum-floor d-pos 32))))
+				    (s-bitpos (%fixnum-mod s-pos 32))
+				    (d-bitpos (%fixnum-mod d-pos 32)))
+
+			       (macrolet ((draw-char (function)
+					    `(,function height width alu s-address d-address
+					      s-row-span d-row-span s-bitpos d-bitpos)))
+				 ;Is source char in one word ?
+				 (if ( s-bitpos width-limit)	; Source is single word?
+				     (if ( d-bitpos width-limit) ;Dest is one word ?
+					 (draw-char %draw-narrow-character-1-1)
+					 (draw-char %draw-narrow-character-1-2))
+				     (if ( d-bitpos width-limit) ;Dest is one word ?
+					 (draw-char %draw-narrow-character-2-1)
+					 (draw-char %draw-narrow-character-2-2))))
+			       (incf index)
+			       (incf x char-width))))
+
+			 ;;  Bitblt is used for wide characters (> 32 bits or color)
+			 (loop with dest-y-offset = (* y d-row-span) do
+			   (if (or (>= index limit)             ;Char bounds check
+				    (> (+ x width) bounds)) 
+			       (return))
+			   (setq char (aref string-array-reg index))
+			       
+			   ;Format effector bit - return if different font
+			   (if (or ( (si:%char-all-but-subindex char) last-font)
+				   (not (graphic-char-p char)))
+			       (return))
+
+			   (let* ((sx (* width (char-code char)))
+				  (s-pos (+ s-beg-bitpos sx))
+				  (d-pos (+ d-beg-bitpos x))
+				  (s-address (%pointer-plus s-beg-addr
+							    (%fixnum-floor s-pos 32)))
+				  (d-address (%pointer-plus d-beg-addr
+							    (+ dest-y-offset
+							       (%fixnum-floor d-pos 32))))
+				  (s-bitpos (%fixnum-mod s-pos 32))
+				  (d-bitpos (%fixnum-mod d-pos 32))
+				  (bit-offset (- d-bitpos s-bitpos))
+				  (d-end-bitpos (+ width d-bitpos))
+				  (d-end-bitpos-mod32 (%fixnum-mod d-end-bitpos 32))
+				  (word-width (- (%fixnum-floor d-end-bitpos 32)
+						 (if (zerop d-bitpos) 0 1)))
+				  (first-column-mask (if (zerop d-bitpos)
+							 0 (lsh -1 d-bitpos)))
+				  (last-column-mask  (lsh -1 (- d-end-bitpos-mod32 32)))
+				  (source-overhang?  (> d-end-bitpos-mod32
+							(%fixnum-mod bit-offset 32))))
+				     
+			     (when (minusp word-width)
+			       (setq word-width 0
+				     last-column-mask (logand first-column-mask
+							      last-column-mask)
+				     first-column-mask 0))
+			     (funcall (if alu-inner-loop
+					  alu-inner-loop
+					  (bitblt-inner-loop-fun :forwards alu))
+				      alu s-address s-row-span d-address d-row-span
+				      height bit-offset word-width first-column-mask
+				      last-column-mask source-overhang?))
+			   (incf index)
+			   (incf x char-width)))
+		     (values (rot x (- d-bits-per-elt)) index (<= limit index)))))
+	  )))))
+
+(compiler:make-obsolete TV:%draw-string-internal "Use TV:%DRAW-STRING-CLIPPED-INTERNAL")
+
+(defun TV:%draw-string-internal (raster alu x y string font index limit xlim)
+  (with-stack-list (bounds 0 0 xlim 10000)
+    (TV:%draw-string-clipped-internal raster alu x y string font index limit bounds)))
+;;;*********************************************************************
+;;; Compatibility Definitions
+;;; Only changes were adding TV package explicitly and changing types from keywords
+;;; and changing FERROR to ERROR (%DRAW-CHAR was originally ERROR maybe should be WARNING?)
+
+(DEFUN TV:%DRAW-CHAR (CHAR X Y ALU RASTER STYLE-DEFAULT DEVICE-TYPE)
+  (TYPECASE RASTER
+    (ARRAY
+      (MULTIPLE-VALUE-BIND (INDEX FONT)
+	  (SI:LOOKUP-INDEX-AND-FONT CHAR DEVICE-TYPE STYLE-DEFAULT)
+	(COMPILER:INHIBIT-STYLE-WARNINGS
+	  (TV:%DRAW-CHAR-INTERNAL INDEX FONT X Y ALU RASTER))))
+    (OTHERWISE
+      (ERROR "~S now only works on rasters. ~S is not a raster: ~S:" 'TV:%DRAW-CHAR RASTER))))
+
+(DEFUN TV:%DRAW-RECTANGLE (WIDTH HEIGHT X Y ALU SHEET-OR-RASTER)
+  (TYPECASE SHEET-OR-RASTER
+    (ARRAY
+      (TV:%DRAW-RECTANGLE-INTERNAL WIDTH HEIGHT X Y ALU SHEET-OR-RASTER))
+    (INSTANCE
+      (TV:SHEET-DRAW-RECTANGLE WIDTH HEIGHT X Y ALU SHEET-OR-RASTER))
+    (OTHERWISE
+      (ERROR "Not a sheet or raster: ~S:" SHEET-OR-RASTER))))
+
+(DEFUN TV:%DRAW-LINE (X1 Y1 X2 Y2 ALU DRAW-END-POINT SHEET-OR-RASTER)
+  (TYPECASE SHEET-OR-RASTER
+    (ARRAY
+      (TV:%DRAW-LINE-INTERNAL X1 Y1 X2 Y2 ALU DRAW-END-POINT SHEET-OR-RASTER))
+    (INSTANCE
+      (TV:SHEET-DRAW-LINE X1 Y1 X2 Y2 ALU DRAW-END-POINT SHEET-OR-RASTER))
+    (OTHERWISE
+      (ERROR "Not a sheet or raster: ~S:" SHEET-OR-RASTER))))
+
+(DEFUN TV:%DRAW-TRIANGLE (X1 Y1 X2 Y2 X3 Y3 ALU SHEET-OR-RASTER)
+  (TYPECASE SHEET-OR-RASTER
+    (ARRAY
+      (TV:%DRAW-TRIANGLE-INTERNAL X1 Y1 X2 Y2 X3 Y3 ALU SHEET-OR-RASTER NIL))
+    (INSTANCE
+      (TV:SHEET-DRAW-TRIANGLE X1 Y1 X2 Y2 X3 Y3 ALU SHEET-OR-RASTER))
+    (OTHERWISE
+      (ERROR "Not a sheet or raster: ~S:" SHEET-OR-RASTER))))
+
+(DEFUN TV:%DRAW-STRING (SHEET-OR-RASTER ALU X Y STRING FONT INDEX LIMIT XLIM)
+  (TYPECASE SHEET-OR-RASTER
+    (ARRAY
+      (COMPILER:INHIBIT-STYLE-WARNINGS
+	(TV:%DRAW-STRING-INTERNAL SHEET-OR-RASTER ALU X Y STRING FONT INDEX LIMIT XLIM)))
+    (INSTANCE
+      (TV:SHEET-DRAW-STRING SHEET-OR-RASTER ALU X Y STRING FONT INDEX LIMIT XLIM))
+    (OTHERWISE
+      (ERROR "Not a sheet or raster: ~S:" SHEET-OR-RASTER))))
+
+;;;*********************************************************************
+;;;
+;;;
+
+(DEFMACRO OBSOLETE-SHEET-OR-RASTER (FUNCTION ARGLIST SHEET-REPLACEMENT)
+  (LET ((NTH (OR (CL:POSITION 'SHEET-OR-RASTER ARGLIST)
+		 (ERROR "Arglist must contain SHEET-OR-RASTER"))))
+    `(DEFUN (:PROPERTY ,FUNCTION COMPILER:STYLE-CHECKER) (FORM)
+       (CHECK-OBSOLETE-SHEET-OR-RASTER FORM ',NTH ',SHEET-REPLACEMENT))))
+
+(DEFUN CHECK-OBSOLETE-SHEET-OR-RASTER (FORM NTH REPLACEMENT)
+  (LET ((ARG (NTH NTH (CDR FORM))))
+    (WHEN (AND (SYMBOLP ARG)
+	       (OR (EQ ARG 'SELF)
+		   (EQ ARG 'SHEET)
+		   (EQ ARG 'WINDOW)
+		   (STRING-EQUAL ARG "SHEET")
+		   (STRING-EQUAL ARG "WINDOW")))
+      (IF REPLACEMENT
+	  (WARN '(:BAD-STYLE T)
+		"For drawing on sheets, you should use ~s instead of ~s."
+		REPLACEMENT (FIRST FORM))
+	  (WARN '(:BAD-STYLE T)
+		"~s no longer works for drawing on sheets."
+		(FIRST FORM))))))
+
+(OBSOLETE-SHEET-OR-RASTER TV:%DRAW-CHAR
+			  (CHAR X Y ALU SHEET-OR-RASTER STYLE-DEFAULT DEVICE-TYPE)
+			  TV:SHEET-DRAW-CHAR)
+
+(OBSOLETE-SHEET-OR-RASTER TV:%DRAW-RECTANGLE
+			  (WIDTH HEIGHT X Y ALU SHEET-OR-RASTER)
+			  TV:SHEET-DRAW-RECTANGLE)
+
+(OBSOLETE-SHEET-OR-RASTER TV:%DRAW-LINE
+			  (X1 Y1 X2 Y2 ALU DRAW-END-POINT SHEET-OR-RASTER)
+			  TV:SHEET-DRAW-LINE)
+
+(OBSOLETE-SHEET-OR-RASTER TV:%DRAW-TRIANGLE
+			  (X1 Y1 X2 Y2 X3 Y3 ALU SHEET-OR-RASTER)
+			  TV:SHEET-DRAW-TRIANGLE)
+
+(OBSOLETE-SHEET-OR-RASTER TV:%DRAW-STRING
+			  (SHEET-OR-RASTER ALU X Y STRING FONT INDEX LIMIT XLIM)
+			  TV:SHEET-DRAW-STRING)

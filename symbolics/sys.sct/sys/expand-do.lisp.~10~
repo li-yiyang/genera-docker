@@ -1,0 +1,330 @@
+;;; -*- Mode: LISP; Package: SI; Base: 8; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; The DO special form is currently so hairy it has its own file.
+
+(defun expand-do (vars endtest body block-name sequential env)
+  ;; If this is an old-style DO, convert it
+  (when (not (cl:listp vars))
+    (setq vars `((,vars ,endtest ,(pop body))))
+    (setq endtest `(,(pop body) nil)))
+  ;; MACLISP useless once-only DO.
+  (when (null endtest)
+    (return-from expand-do
+      `(,(if sequential 'prog* 'prog)
+	,@(when (not (null block-name))
+	    `(,block-name))
+	,vars
+	,@body)))
+  ;; Hairy optimizer
+  (loop for dcls in (env-declarations env)
+	for declaration = (assq 'sys:optimize-array-references-in-loops dcls)
+	when declaration
+	  do (return-from expand-do
+	       (strength-reduce-one-do-form
+		 vars endtest body block-name sequential env
+		 :check-for-row-outreferences (second declaration))))
+  ;; The normal case.
+  (expand-do-internal vars endtest body block-name sequential env))
+
+;; This heuristic looks at the end test and tries to decide whether
+;; it is reasonable to repeat the endtest twice, once at the entry to
+;; the loop and once at the end of the loop.  If the endtest is repeated,
+;; then the number of branches is cut down and things go faster.  Additionally,
+;; loop instructions can be generated on architectures which support them.
+;; This is at the expense of code size on architectures without loop instructions.
+;; This doesn't really belong here!
+;; Returns true if the predicate is an atom, a list of  3 elements, or 
+;; the negation of a valid endtest.
+(defun simple-endtest-p (endtest)
+  (loop for endtest = endtest then (cadr endtest)
+	when (atom endtest)
+	  return t
+	unless (memq (car endtest) '(not null))
+	  return
+	    (loop for element in endtest
+		  for count from 0
+		  when (> count 2) return nil
+		  when (not (atom element)) return nil
+		  finally (return t))))
+
+(defun expand-do-internal (vars endtest body block-name sequential env)
+  (multiple-value-bind (declarations body)
+      (si:find-body-declarations body env)
+    (let* ((simple-endtest-p (simple-endtest-p (first endtest)))
+	   (loop-tag (gensym))
+	   (test-tag (gensym))
+	   (exit-tag (gensym)))
+      `(,(if sequential 'prog* 'prog)
+	,@(when (not (null block-name))
+	    `(,block-name))
+	,(mapcar #'(lambda (entry)
+		     (if (or (atom entry)
+			     (< (length entry) 3))
+			 entry
+			 (list (first entry) (second entry))))
+		 vars)
+	,@declarations
+	,(if simple-endtest-p
+	     `(when ,(first endtest)
+		(go ,exit-tag))
+	     `(go ,test-tag))
+	,loop-tag
+	,@body
+	(,(if sequential 'setq 'psetq)
+	 ,@(loop for entry in vars
+		 when (and (listp entry)
+			   (> (length entry) 2))
+		   collect (first entry)
+		   and collect (third entry)))
+	,test-tag
+	(unless ,(first endtest)
+	  (go ,loop-tag))
+	,exit-tag
+	(return-from ,block-name (progn ,@(rest1 endtest)))))))
+
+
+;;;  The hairy strength reducer.
+
+(defvar *functions-with-no-effect-on-specials-and-locals*
+	'(aset))
+
+(defun find-written-and-bound-variables-and-function-calls (body env)
+  (declare (values written-and-bound function-calls))
+  (let ((written-and-bound nil)
+	(function-calls nil))
+    (lt:mapforms
+      #'(lambda (form kind ignore ignore)
+	  (selectq kind
+	    (quote)
+	    ;; locf's of variables come through as sets
+	    ((set let) (push form written-and-bound))
+	    ;; if nil then some kind of function call
+	    (nil
+	     (when
+	       ;; if the form is a list with an atom char
+	       (and (listp form)
+		    (atom (car form))
+		    ;; and it is not a macro
+		    (null (macro-function (car form)))
+		    ;; and it is not one of the functions known to have no side effects
+		    (not (memq (car form)
+			       *functions-with-no-effect-on-specials-and-locals*))
+		    ;; and it might alter any special variables
+		    (eq 'lt::writer (lt::function-annotation-class (car form))))
+	       ;; then note that we have some function calls
+	       (setq function-calls t)))))
+      body :expand-substs t
+      :environment env)
+    (values written-and-bound function-calls)))
+
+(defun linear-function-of-variable (var expr env)
+  (flet ((without-the-s (form)
+	   (let ((value (macroexpand form env t)))
+	     (if (and (listp value) (eq (car value) 'cl:the))
+		 (third value)
+		 value))))
+    (let ((expr (without-the-s expr)))
+      (and (listp expr)
+	   ;; and it has a cdr
+	   (cdr expr)
+	   ;; and the var is the second element of the list
+	   (eq (without-the-s (cadr expr)) var)
+	   (selectq (car expr)
+	     (1+ 1) 
+	     (1- -1)
+	     (+ (when (and (= (length expr) 3)
+			   (numberp (without-the-s (third expr))))
+		  (third expr)))
+	     (- (when (and (= (length expr) 3)
+			   (numberp (without-the-s (third expr))))
+		  (third expr))))))))
+
+(defun match-array-form (form operator length)
+  (and (listp form)
+       ;; its an operator
+       (eq (car form) operator)
+       ;; the length matches
+       (= (length form) length)))
+
+;;; This is passed the original form so that it need not reconstruct it
+;;; it decides that there is nothing for it to do.
+(defun strength-reduce-one-do-form (var-phrases term-test body name sequential env
+				    &key (check-for-row-outreferences nil))
+  (when (= 1 (length var-phrases))
+    ;; get the body declarations, to put back when we reconstruct the do form
+    (multiple-value-bind (body-declarations declarationless-body)
+	(find-body-declarations body env)
+      (let* ((body (flavor::prognify declarationless-body))
+	     (check-body `(progn ,(first term-test) ,body))
+	     (var-phrase (car var-phrases))
+	     (var (car var-phrase))
+	     (step (caddr var-phrase))
+	     (increment (linear-function-of-variable var step env))
+	     (array-variables-vs-bindings nil)
+	     (array-and-first-index-vs-bindings nil))
+	;; set up the written variables and function calls
+	(multiple-value-bind (written-variables function-calls)
+	    (find-written-and-bound-variables-and-function-calls check-body env)
+	  (labels ((no-side-effects-on-variable (var)
+		     (not (or function-calls
+			      (memq var written-variables))))
+		   (2d-aref-checker (form)
+		     (and (loop for elt in form always (symbolp elt))
+			  ;; array expression is loop invariant
+			  (no-side-effects-on-variable (car form))
+			  ;; first expression is looop invariant
+			  (no-side-effects-on-variable (cadr form))
+			  ;; and finally, the do-loop variable is the 2nd index
+			  (eq (caddr form) var)))
+		   (find-and-replace-arefs-and-asets (form ignore ignore)
+		     ;; when its a 2d aref, all of whose args are symbols, and
+		     ;; whose array-var and first index are loop-invariant
+		     ;;(format t "~%~A" form)
+		     (cond ((or (and (match-array-form form 'aref 4)
+				     (2d-aref-checker (cdr form)))
+				(and (match-array-form form 'aset 5)
+				     (2d-aref-checker (cddr form))))
+			    ;; Then this aref/aset is a candidate.  Find or create the support
+			    ;; gensyms
+			    (let* ((array-and-indices
+				     (if (eq (car form) 'aref) (cdr form) (cddr form)))
+				   (array-variable-bindings
+				     (assq (car array-and-indices) array-variables-vs-bindings))
+				   (array-and-first-index `(,(car array-and-indices)
+							    ,(cadr array-and-indices)))
+				   (index-variable-bindings
+				     (assoc array-and-first-index
+					    array-and-first-index-vs-bindings)))
+			      ;; If no support gensyms, create them
+			      (unless array-variable-bindings
+				(setq array-variable-bindings
+				      `(,(car array-and-indices)
+					(,(gensym) ,(car array-and-indices))
+					(,(gensym)
+					 (array-dimension-n 2 ,(car array-and-indices)))))
+				(push array-variable-bindings array-variables-vs-bindings))
+			      (unless index-variable-bindings
+				(setq index-variable-bindings
+				      `(,array-and-first-index
+					(,(gensym)
+					 (* ,(cadr array-and-first-index)
+					    ,(caar (last array-variable-bindings))))))
+				(push index-variable-bindings array-and-first-index-vs-bindings))
+			      ;; Now return the actual aref
+			      (values
+				(if (eq (car form) 'aref)
+				    `(aref ,(caadr array-variable-bindings)
+					   (+ ,var ,(caadr index-variable-bindings)))
+				    `(aset ,(lt:copyforms #'find-and-replace-arefs-and-asets
+							  (cadr form)
+							  :environment
+							  lt::*mapforms-lexical-function-environment*)
+					   ,(caadr array-variable-bindings)
+					   (+ ,var ,(caadr index-variable-bindings))))
+				t)))
+			   ;; otherwise, just return the original form
+			   (t form))))
+	    (when (and ;; the step value is an increment function of the variable
+		    increment
+		    ;; there are no side effects on the var in the body
+		    (no-side-effects-on-variable var))
+	      ;; for this hack to work, the array must be 2d, and
+	      ;; the array expression and the first index must be
+	      ;; loop-invariant variables map over the body
+	      ;; replacing the arefs in question with the 1d version
+	      ;; of the arefs.  If we didn't find any, then return
+	      ;; nil, indicating that the optimizer failed.
+	      (let ((new-body (lt:copyforms #'find-and-replace-arefs-and-asets
+					    ;; The aref finder mapforms runs on the body
+					    body
+					    :environment
+					    env)))
+		;; if there were any arefs found, then 
+		(when (or array-variables-vs-bindings
+			  array-and-first-index-vs-bindings)
+		  ;; make the do form
+		  (return-from strength-reduce-one-do-form
+		    `(let* ,(loop for thing in
+				      (append array-variables-vs-bindings
+					      array-and-first-index-vs-bindings)
+				  append (cdr thing))
+		       ,(when array-variables-vs-bindings
+			  `(declare (sys:array-register-1d
+				      ,@(mapcar #'caadr array-variables-vs-bindings))))
+		       ,(expand-do-internal
+			  var-phrases
+			  term-test
+			  `(,@body-declarations
+			    ;; The commented-out code checks for references past
+			    ;; the end of rows.  Commented out because it slows
+			    ;; things down, and does not affect storage integrity.
+			    ,@(and check-for-row-outreferences
+				   (loop for (array-var array-binding dimension-binding)
+					     in array-variables-vs-bindings
+					 do (ignore array-binding)
+					 collect
+					   `(unless (< ,var ,(car dimension-binding))
+					      (ferror
+						,(string-append
+						   "The second index to the array ~A, in variable "
+						   array-var
+						   ", was out of bounds")
+						,array-var))))
+			    ,new-body)
+			  name
+			  sequential
+			  env)))))))))))
+  
+  (expand-do-internal var-phrases term-test body name sequential env))

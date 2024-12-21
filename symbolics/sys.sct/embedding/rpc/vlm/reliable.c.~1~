@@ -1,0 +1,364 @@
+/* -*- Mode: C; Tab-Width: 4; Search-list: RPC -*- */
+/*>
+ *> *****************************************************************************************
+ *> ** (c) Copyright 1993-1988 Symbolics, Inc.  All rights reserved.
+ *> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+ *>
+ *>    The software, data, and information contained herein are proprietary 
+ *> to, and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+ *> to keep such software, data, and information confidential and to preserve 
+ *> them as trade secrets.  They are given in confidence by Symbolics pursuant 
+ *> to a written license agreement, and may be used, copied, transmitted, and 
+ *> stored only in accordance with the terms of such license.
+ *> 
+ *> Symbolics, Symbolics 3600, Symbolics 3670 (R), Symbolics 3675 (R), Symbolics
+ *> 3630, Symbolics 3640, Symbolics 3645 (R), Symbolics 3650 (R), Symbolics 3653,
+ *> Symbolics 3620 (R), Symbolics 3610 (R), Symbolics Common Lisp (R),
+ *> Symbolics-Lisp (R), Zetalisp (R), Genera (R), Wheels (R), Dynamic Windows (R),
+ *> SmartStore (R), Semanticue (R), Frame-Up (R), Firewall (R), Document Examiner (R),
+ *> Delivery Document Examiner, "Your Next Step in Computing" (R), Ivory, MacIvory,
+ *> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+ *> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal (R),
+ *> Symbolics Prolog, Symbolics Fortran (R), CLOE (R), CLOE Application Generator,
+ *> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia, Joshua,
+ *> Statice (R), and Minima are trademarks of Symbolics, Inc.
+ *> 
+ *> RESTRICTED RIGHTS LEGEND
+ *>    Use, duplication, and disclosure by the Government are subject to restrictions 
+ *> as set forth in subdivision (c)(1)(ii) of the Rights in Technical Data and Computer 
+ *> Software Clause at DFAR 52.227-7013.
+ *> 
+ *>      Symbolics, Inc.
+ *>      6 Concord Farms
+ *>      555 Virginia Road
+ *>      Concord, Massachusetts 01742-2727
+ *>      United States of America
+ *>      508-287-1000
+ *>
+ *> *****************************************************************************************
+ *>
+ */
+
+/* This file is SYS:EMBEDDING;RPC;GENERIC;RELIABLE.C. */
+
+#include "bsagent.h"
+
+#define RS_header_length 4
+#define RS_max_data_length 251
+
+#define RS_retransmit_interval 20
+#define RS_ack_interval 3600
+
+typedef enum {
+  RS_state_empty = 0,
+  RS_state_filling,
+  RS_state_full,
+  RS_state_retransmitting
+} RS_state;
+
+#define RS_op_even_ack 1
+#define RS_op_even_data 2
+#define RS_op_data 4
+
+typedef struct {
+  unsigned char opcode;
+  unsigned char length;
+  short checksum;
+  char real_data[RS_max_data_length];
+  RS_state state;
+  short read_pointer;
+  LongInt last_transmit_time;
+} RS_packet;
+
+typedef struct {
+  BS_XDRAgent handlers;
+
+  BS_XDRAgent *agent;
+
+  RS_packet *input_packet_1, *input_packet_2, *user_input_packet, *system_input_packet;
+  RS_packet *output_packet_1, *output_packet_2, *user_output_packet, *system_output_packet;
+
+  LongInt last_ack_time;
+  
+} RS_XDRAgent;
+
+#ifdef RPC_USE_PROTOTYPES
+static OSErr	reliable_agent_listen PROTO_ARGS((RS_XDRAgent* self, LongInt* count));
+static OSErr	reliable_agent_input PROTO_ARGS((RS_XDRAgent* self, LongInt* count, char* pointer));
+static OSErr	reliable_agent_output PROTO_ARGS((RS_XDRAgent* self, LongInt* count, char* pointer, Boolean force));
+static OSErr	reliable_agent_close PROTO_ARGS((RS_XDRAgent* self));
+static OSErr 	reliable_agent_clear_input PROTO_ARGS((RS_XDRAgent* self));
+static short 	RS_checksum_packet PROTO_ARGS((RS_packet* packet));
+static RS_packet*	RS_create_packet PROTO_ARGS((void));
+static OSErr	RS_FSM PROTO_ARGS((RS_XDRAgent* self));
+#else
+static short 	RS_checksum_packet();
+#endif
+
+static RS_packet* RS_create_packet ()
+{
+  RS_packet *packet;
+
+  AllocateMemory((LongInt)sizeof(RS_packet), (void **)&packet);
+  
+  packet->state = RS_state_empty;
+
+  return(packet);
+}
+
+static OSErr RS_FSM (self)
+  RS_XDRAgent *self;
+{
+  RS_packet *packet;
+  short state, limit, opcode;
+  LongInt count;
+  
+  packet = self->system_input_packet;
+  state = packet->state;
+  if (RS_state_full != state) {
+      BS_XDRAgent_listen(self->agent, &count);
+      if (count > 0) {
+          for (;;) {
+              switch (state) {
+                case RS_state_empty:
+                  packet->read_pointer = 0;
+                  limit = 1;
+                  break;
+                case RS_state_filling:
+                  limit = (packet->read_pointer < RS_header_length) ? RS_header_length : packet->length;
+                  break;
+              }
+              BS_XDRAgent_listen(self->agent, &count);
+              if (count > limit - packet->read_pointer)
+                count = limit - packet->read_pointer;
+              if (0 == count) break;
+              if (count < 0) {                  /* Length byte corrupted */
+                  BS_XDRAgent_clear_input(self->agent);
+                  state = RS_state_empty;
+                  break;
+                  }
+              BS_XDRAgent_input(self->agent, &count, ((char *)packet) + packet->read_pointer);
+              packet->read_pointer += count;
+              opcode = packet->opcode;
+              switch (state) {
+                case RS_state_empty:
+                  if (!(opcode >> 3 == (opcode & 1) + (opcode >> 1 & 1) + (opcode >> 2 & 1))) {
+                      BS_XDRAgent_clear_input(self->agent);
+                      break;
+                    }
+                  if (((opcode & RS_op_even_ack) != 0) == 
+                      (self->system_output_packet == self->output_packet_1))
+                    self->system_output_packet->last_transmit_time = 0;
+                  else {
+                      self->system_output_packet->state = RS_state_empty;
+                      self->system_output_packet = (self->system_output_packet == self->output_packet_1) ? self->output_packet_2 : self->output_packet_1;
+                    }
+                  if (opcode & RS_op_data)
+                    state = RS_state_filling;
+                  break;
+                case RS_state_filling:
+                  if ((packet->read_pointer >= RS_header_length) &&
+                      (packet->read_pointer == packet->length)) {
+                      self->last_ack_time = 0;
+                      if (((opcode & RS_op_even_data) != 0) !=
+                          (packet == self->input_packet_1))
+                        /* out of sequence */
+                        state = RS_state_empty;
+                      else if (packet->checksum != RS_checksum_packet(packet))
+                          /* bad checksum */
+                          state = RS_state_empty;
+                        else
+                          /* good data */
+                          state = RS_state_full;
+                    }
+                  break;
+              }
+              if (RS_state_full == state) break;
+            }
+          packet->state = state;
+          if (RS_state_full == state) {
+              packet->read_pointer = RS_header_length;
+              self->system_input_packet = (packet == self->input_packet_1) ? self->input_packet_2 : self->input_packet_1;
+            }}}
+
+  packet = self->system_output_packet;
+  state = packet->state;
+  if ((RS_state_full == state) || 
+      ((RS_state_retransmitting == state) && 
+       (SystemClock() - packet->last_transmit_time) >= RS_retransmit_interval)) {
+      opcode = RS_op_data;
+      if (self->system_input_packet == self->input_packet_1)
+        opcode |= RS_op_even_ack;
+      if (self->system_output_packet == self->output_packet_1)
+        opcode |= RS_op_even_data;
+      opcode += ((opcode & 1) + (opcode >> 1 & 1) + (opcode >> 2 & 1)) << 3;
+      packet->opcode = opcode;
+      count = packet->length;
+      BS_XDRAgent_output(self->agent, &count, (char*)&packet, true);
+      packet->state = RS_state_retransmitting;
+      packet->last_transmit_time = SystemClock();
+    }
+  else if ((SystemClock() - self->last_ack_time) >= RS_ack_interval) {
+        opcode = 0;
+        if (self->system_input_packet == self->input_packet_1)
+          opcode |= RS_op_even_ack;
+        if (self->system_output_packet == self->output_packet_1)
+          opcode |= RS_op_even_data;
+        opcode += ((opcode & 1) + (opcode >> 1 & 1) + (opcode >> 2 & 1)) << 3;
+        count = 1;
+        BS_XDRAgent_output(self->agent, &count, (char*)&opcode, true);
+        self->last_ack_time = SystemClock();
+      }
+  return(noErr);
+}
+
+static OSErr reliable_agent_listen (self, count)
+  RS_XDRAgent *self;
+  LongInt *count;
+{
+  RS_packet *packet;
+  OSErr err;
+
+  err = RS_FSM(self);
+  if (err) return(err);
+  packet = self->user_input_packet;
+  
+  if (RS_state_full == packet->state)
+    *count = packet->length - packet->read_pointer;
+  else 
+    *count = 0;
+  return(noErr);
+}
+
+static OSErr reliable_agent_input (self, count, pointer)
+  RS_XDRAgent *self;
+  LongInt *count;
+  char *pointer;
+{
+  LongInt the_count;
+  short next;
+  RS_packet *packet;
+  OSErr err;
+  
+  for (the_count = 0; the_count < *count;) {
+      packet = self->user_input_packet;
+      if (RS_state_full == packet->state) {
+          next = packet->length - packet->read_pointer;
+          if (the_count + next > *count)
+            next = *count - the_count;
+          CopyMemory((void *)((char *)packet + packet->read_pointer),
+                     (void *)(pointer + the_count),
+                     (LongInt)next);
+          packet->read_pointer += next;
+          if (packet->read_pointer == packet->length) {
+              packet->state = RS_state_empty;
+              self->user_input_packet = (packet == self->input_packet_1) ? self->input_packet_2 : self->input_packet_1;
+            }
+          the_count += next;
+        }
+      err = RS_FSM(self);
+      if (err) return(err);
+    }
+  *count = the_count;
+  return(noErr);
+}
+
+static OSErr reliable_agent_output (self, count, pointer, force)
+  RS_XDRAgent *self;
+  LongInt *count;
+  char *pointer;
+  Boolean force;
+{
+  LongInt the_count;
+  short next;
+  RS_packet *packet;
+  OSErr err;
+  
+  for (the_count = 0; the_count < *count;) {
+      packet = self->user_output_packet;
+      if (RS_state_empty == packet->state) {
+          next = *count - the_count;
+          if (next > RS_max_data_length)
+            next = RS_max_data_length;
+          CopyMemory((void *)(pointer + the_count), (void *)packet->real_data, (LongInt)next);
+          packet->length = next + RS_header_length;
+          packet->checksum = RS_checksum_packet(packet);
+          packet->state = RS_state_full;
+          self->user_output_packet = (packet == self->output_packet_1) ? self->output_packet_2 : self->output_packet_1;
+          the_count += next;
+        }
+      err = RS_FSM(self);
+      if (err) return(err);
+    }
+  return(noErr);
+}
+
+static OSErr reliable_agent_close (self)
+  RS_XDRAgent *self;
+{
+  FreeMemory((void **)&self->input_packet_1);
+  FreeMemory((void **)&self->input_packet_2);
+  FreeMemory((void **)&self->output_packet_1);
+  FreeMemory((void **)&self->output_packet_2);
+
+  CloseAgent(((XDRAgent)(self->agent)));
+  FreeMemory((void **)&self);
+  return(noErr);
+}
+
+static OSErr reliable_agent_clear_input (self)
+  RS_XDRAgent *self;
+{
+  /* what can we do and not get out of sync? */
+  return(noErr);
+}
+
+OSErr reliable_agent_open (agent)
+  XDRAgent agent;
+{
+  RS_XDRAgent *self;
+  OSErr err;
+  
+  err = AllocateMemory((LongInt)sizeof(RS_XDRAgent), (void **)&self);
+  if (err) return(err);
+
+  self->agent = (BS_XDRAgent*) agent;
+
+  self->handlers.listen = (FunctionPtr)reliable_agent_listen;
+  self->handlers.input = (FunctionPtr)reliable_agent_input;
+  self->handlers.output = (void*)reliable_agent_output;
+  self->handlers.close = (FunctionPtr)reliable_agent_close;
+  self->handlers.clear_input = (FunctionPtr)reliable_agent_clear_input;
+
+  self->input_packet_1 = RS_create_packet();
+  self->input_packet_2 = RS_create_packet();
+  self->user_input_packet = self->input_packet_1;
+  self->system_input_packet = self->input_packet_1;
+
+  self->output_packet_1 = RS_create_packet();
+  self->output_packet_2 = RS_create_packet();
+  self->user_output_packet = self->output_packet_1;
+  self->system_output_packet = self->output_packet_1;
+  
+  self->last_ack_time = SystemClock();
+
+  BS_XDRAgent_fill_handlers((BS_XDRAgent *)self);
+  return(noErr);
+}
+
+static short RS_checksum_packet (packet)
+  RS_packet *packet;
+{
+  short sum;
+  register unsigned char *p;
+  register short i;
+  
+  sum = 0;
+  p = (unsigned char *)packet->real_data;
+  for (i = RS_header_length; i < packet->length; i++)
+    sum += (*p++);
+#ifdef LITTLE_ENDER
+  sum = (sum >> 8) + ((sum & 0377) << 8);
+#endif
+  return(sum);
+}

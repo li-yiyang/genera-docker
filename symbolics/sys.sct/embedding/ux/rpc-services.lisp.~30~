@@ -1,0 +1,617 @@
+;;; -*- Mode: LISP; Syntax: Lisp+C; Package: RPC; Base: 10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;(let ((string "SunOS is a trademark of Sun Microsystems, Inc. "))
+;  (unless (string-search string si:*additional-fine-print*)
+;    (setf si:*additional-fine-print* (string-append si:*additional-fine-print* string))))
+
+(pushnew '("SunOS" "Sun Microsystems, Inc") si:*trademark-database*)
+
+(DEFINE-REMOTE-MODULE UNIX-SUPPORT-SERVER	; Unix is server
+		      (:NUMBER #x7F000141)
+		      (:VERSION 1)
+		      (:SERVER :C)
+		      (:CLIENT :LISP))
+
+(DEFINE-REMOTE-MODULE UNIX-SUPPORT-CLIENT	; Unix is client
+		      (:NUMBER #x7F000142)
+		      (:VERSION 2)
+		      (:SERVER :LISP)
+		      (:CLIENT :C))
+
+(DEFINE-REMOTE-MODULE UX400-RUN-LIGHTS		; Unix is server
+		      (:NUMBER #x7F000143)
+		      (:VERSION 1)
+		      (:SERVER :C)
+		      (:CLIENT :LISP))
+
+(defvar *default-unix-rpc-timeout* 10.
+  "Seconds to wait for UNIX RPC responses")
+
+
+;;; Errors
+
+
+;; UNIX errors signalled by RPC servers
+
+(defflavor remote-unix-error
+	()
+	(rpc-remote-operating-system-error))
+
+(defmethod (dbg:report remote-unix-error) (stream)
+  (format stream "~:[Unknown error number ~D~;~:*~A~]"
+	  (rpc-remote-operating-system-error-string agent error-code) error-code))
+
+(defmethod (dbg:condition-type remote-unix-error) ()
+  "UNIX Error")
+
+(compile-flavor-methods remote-unix-error)
+
+(define-remote-error unix-error nil
+  (:arguments (errno integer-32))
+  (:number -42)
+  (:handler (signal-unix-error xdr-agent errno)))
+
+(defun signal-unix-error (agent errno)
+  (declare (dbg:error-reporter))
+  (signal 'remote-unix-error :error-code errno :agent agent))
+
+
+;; Lisp errors signalled by RPC servers
+
+(define-remote-error console-error nil
+  (:number -43)
+  (:arguments (description c-string) (fatal boolean)))
+
+(defun make-translation-table (translations)
+  (let ((table (make-array 256)))
+    (dotimes (code 256)
+      (setf (aref table code) (char-to-ascii (code-char code))))
+    (loop for (char . translation) in translations
+	  do (setf (aref table (char-code char)) translation))
+    table))
+
+(defparameter *console-error-translation-table*
+	      (make-translation-table '((#\bs . #o010)
+					(#\tab . #o011)
+					(#\cr . #o012)	;UNIX likes it this way
+					(#\ff . #o014)
+					(#\line . #o015)	;Might as well be symmetric
+					(#\rubout . #o177)
+					;; LispM chars without an ASCII counterpart
+					(#\ #o55 #o76)	;"->"
+					(#\ #o74 #o55) ;"<-"
+					(#\ #o74 #o75 #o76))))	;"<=>"
+
+
+;; This conses strings, but they're small and it only happens when errors happen
+(defun console-error-string (source)
+  (let* ((source source)
+	 (source-length (length source))
+	 (table *console-error-translation-table*)
+	 (destination-length (ceiling (* 1.5 source-length)))
+	 (destination (make-array destination-length
+				  :element-type 'string-char
+				  :fill-pointer destination-length)))
+    (declare (sys:array-register source table destination))
+    (loop with dest-index = 0
+	  for source-index from 0 below source-length
+	  for xlate = (aref table (char-code (aref source source-index)))
+	  if (consp xlate)
+	    do (loop for ch in xlate
+		     do (setf (aref destination dest-index) (code-char ch))
+			(incf dest-index))
+	  else
+	    do (setf (aref destination dest-index) (code-char xlate))
+	       (incf dest-index)
+	  finally (setf (fill-pointer destination) (1+ dest-index)))
+    destination))
+
+
+;;; Marking time
+
+(defconstant *unix-epoch* #.(time:parse-universal-time "Jan 1, 1970 GMT")
+  "Universal time corresponding to 0, Unix time")
+
+#|| CJL won't let me use this
+;; Time is communicated in Unix time, which is measured in seconds since 1/1/1970.
+(DEFINE-REMOTE-ENTRY REMOTE-TIME UNIX-SUPPORT-SERVER
+  (:NUMBER 10)
+  (:ARGUMENTS)
+  (:VALUES (TIME CARDINAL-32))
+  (:C
+    (:SERVER 
+      #{ {
+        RPCValues(time(0));
+      }
+      }))
+  (:LISP
+    (:SERVER (RPC-VALUES (- (time:get-universal-time) *unix-epoch*)))))
+
+(defun get-unix-time (&optional (host "Host"))
+  ;;(make-instance 'big-ender-port-mapping-udp-transport-agent :host
+  (with-open-stream (stream (open-tcp-agent (net:parse-host host)))
+    (+ *unix-epoch* (remote-time :transport-agent stream))))
+||#
+
+(DEFINE-REMOTE-ENTRY SET-BSD-UNIX-CLOCK UNIX-SUPPORT-SERVER
+  (:NUMBER 11)
+  (:ARGUMENTS (SECONDS INTEGER-32) (MICROSECONDS INTEGER-32))
+  (:VALUES)
+  (:WHOSTATE "Set Host Clock")
+  (:C
+    (:SERVER
+      #{ {
+      struct timeval new;
+
+      new.tv_sec = seconds;
+      new.tv_usec = microseconds;
+      if (settimeofday(&new, (struct timezone *) NULL)) {
+        RPCError(unix_error, errno);
+      } else {
+        RPCValues();
+      } } } )))
+
+(defun solstice-set-calendar-clock-internal (ut &key error-p (host net:*emb-host*)
+					     (timeout *default-unix-rpc-timeout*))
+  (declare (values error))
+  (unless (typep host 'net:host)
+    (setf host (net:parse-host host)))
+  (let* ((agent (host-udp-transport-agent host))
+	 (ux-time (- ut *unix-epoch*)))
+    (condition-case (error)
+	 (process:with-timeout (timeout)
+	   (set-bsd-unix-clock ux-time 0 :transport-agent agent)
+	   (return-from solstice-set-calendar-clock-internal nil))
+       (error
+	 (when error-p
+	   (error "~A: ~~A~~%Unable to set calendar clock."
+		  (dbg:condition-type error) (dbg:report-string error)))
+	 t)
+       (:no-error
+	 (when error-p
+	   (error "Unable to set calendar clock: operation timed out"))
+	 t))))
+
+
+;;; NFS Support
+;;; Provide enough information for NFS to work on a diskless client
+
+;; Look up the Unix's Yellow Pages domain name
+(DEFINE-REMOTE-ENTRY YP-DOMAIN-NAME UNIX-SUPPORT-SERVER
+  (:NUMBER 20)
+  (:ARGUMENTS)
+  (:VALUES (YP-DOMAIN-NAME C-STRING))
+  (:WHOSTATE "YP domain")
+  (:C
+    (:SERVER
+      #{ {
+      char buf[BUFSIZ];
+      
+      if (getdomainname(buf, BUFSIZ) == -1) {
+        RPCError(unix_error, errno);
+      } else {
+        RPCValues(buf);
+      } } } )))
+
+(DEFINE-REMOTE-TYPE NFS-MOUNT-POINTS-REGISTRY ()
+  (:ABBREVIATION-FOR '(MEMBER :FSTAB :MTAB)))
+
+(DEFINE-REMOTE-ENTRY NFS-MOUNT-POINTS UNIX-SUPPORT-SERVER
+  (:NUMBER 21)
+  (:WHOSTATE "NFS Mount Points")
+  (:ARGUMENTS (REGISTRY NFS-MOUNT-POINTS-REGISTRY) (LAST-MTIME INTEGER-32))
+  (:VALUES (MOUNT-POINTS C-STRING) (MTIME (INTEGER-32)))
+  (:C
+    (:SERVER
+      #{ {
+      FILE *fp = NULL;
+      struct stat st;
+      char *cp = NULL, *file = NULL, *calloc();
+
+      /* Choose file name */
+      if (registry == fstab)
+        file = "/etc/fstab";
+      else if (registry == mtab)
+        file = "/etc/mtab";
+      else {
+        RPCError(unix_error, ENOENT);
+        goto done;
+      }
+
+      /* Check mtime */
+      if (stat(file, &st) == -1) {
+        perror(file);
+        RPCError(unix_error, errno);
+        goto done;
+      } else if (last_mtime == st.st_mtime) {
+        RPCValues("", st.st_mtime);
+        goto done;
+      }
+
+      /* Open file and slurp it in */
+      cp = calloc(st.st_size+1, sizeof(char));
+      if (cp == NULL) {
+        RPCError(unix_error, EFBIG);
+	goto done;
+      }
+      if ((fp = fopen(file, "r")) == NULL) {
+        RPCError(unix_error, errno);
+        goto done;
+      }
+      fread(cp, sizeof(char), st.st_size, fp);
+      cp[st.st_size] = '\0';
+      RPCValues(cp, st.st_mtime);
+
+      done:
+      if (cp != NULL) free(cp);
+      if (fp != NULL) fclose(fp);
+      }} )))
+
+
+;;; Multicast hackery
+
+(DEFINE-REMOTE-ENTRY ADD-MULTICAST-MASK UNIX-SUPPORT-SERVER
+  (:NUMBER 30)
+  (:ARGUMENTS (NAME C-STRING) (MASK (VECTOR CARDINAL-8 6)))
+  (:VALUES)
+  (:WHOSTATE "Add Multicast")
+  (:C
+    (:SERVER
+      #{
+      struct ifreq ifr;
+      int s;
+
+      strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+      ifr.ifr_addr.sa_family = AF_UNSPEC;
+      bcopy(mask, ifr.ifr_addr.sa_data, 6);
+      if ((s = socket(AF_UNSPEC, SOCK_RAW, 0)) == -1) {
+        RPCError(unix_error, errno);
+      } else {
+        if (ioctl(s, SIOCADDMULTI, ifr) == -1) {
+          RPCError(unix_error, errno);
+	} else {
+          RPCValues();
+	}
+        close(s);
+      } } )))
+
+(DEFINE-REMOTE-ENTRY DELETE-MULTICAST-MASK UNIX-SUPPORT-SERVER
+  (:NUMBER 31)
+  (:ARGUMENTS (NAME C-STRING) (MASK (VECTOR CARDINAL-8 6)))
+  (:VALUES)
+  (:WHOSTATE "Delete Multicast")
+  (:C
+    (:SERVER
+      #{
+      struct ifreq ifr;
+      int s;
+
+      strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+      ifr.ifr_addr.sa_family = AF_UNSPEC;
+      bcopy(mask, ifr.ifr_addr.sa_data, 6);
+      if ((s = socket(AF_UNSPEC, SOCK_RAW, 0)) == -1) {
+        RPCError(unix_error, errno);
+      } else {
+        if (ioctl(s, SIOCDELMULTI, ifr) == -1) {
+          RPCError(unix_error, errno);
+	} else {
+	  RPCValues();
+	}
+        close(s);
+      } } )))
+
+
+;;; Show Herald support
+
+;; Dig up the raw kernel ID string
+(DEFINE-REMOTE-ENTRY RAW-OS-RELEASE UNIX-SUPPORT-SERVER
+  (:NUMBER 40)
+  (:ARGUMENTS)
+  (:VALUES (RELEASE C-STRING))
+  (:WHOSTATE "OS Release")
+  (:C
+    (:SERVER
+      #{ char *release, *lookup_os_release();
+         release = lookup_os_release();
+	 if (release == NULL) {
+	   RPCError(unix_error, errno);
+	 } else {
+           RPCValues(release);
+	 } } )))
+
+;; This parses "SunOS Release 4.0.1_Export (UX400S)..." into
+;; "4.0.1_Export" and "SunOS (UX400S)", but it's no good for (e.g.) "4.3 BSD UNIX #1: ..."
+(defun unix-os-version (&key (host net:*emb-host*) (timeout *default-unix-rpc-timeout*)
+			(default-unix-name nil default-unix-name-p))
+  (declare (values release name valid-p))
+  (unless (typep host 'net:host)
+    (setf host (net:parse-host host)))
+  (unless default-unix-name-p
+    (let* ((machine-type (string (send host :machine-type)))
+	   (machine-type-length (length machine-type)))
+      (setf default-unix-name
+	    (cond ((and (> machine-type-length 2)
+			(string-equal machine-type "SUN" :end1 3))
+		   "SunOS")
+		  ((and (> machine-type-length 2)
+			(string-equal machine-type "SGI" :end1 3))
+		   "IRIX")
+		  (t "UNIX")))))
+  (let* ((raw (process:with-timeout (timeout)
+		(ignore-errors
+		  (raw-os-release :transport-agent (host-udp-transport-agent host)))))
+	 (name-end (when raw (position #\Space raw)))
+	 (release-start (when name-end (position #\Space raw :start (1+ name-end))))
+	 (ident-start (when release-start (position #\Open raw :start release-start)))
+	 (ident-end (when ident-start (position #\Close raw :start ident-start))))
+    (values (if ident-start
+		(substring raw (1+ release-start) (1- ident-start))
+		"??")
+	    (string-append (if name-end (substring raw 0 name-end) default-unix-name) " "
+			   (if name-end (substring raw ident-start (1+ ident-end)) "(??)")))))
+
+
+;; Console hacking
+
+(DEFINE-REMOTE-ENTRY START-X-SCREEN UNIX-SUPPORT-CLIENT
+  (:NUMBER 55)
+  (:ARGUMENTS
+    (address c-string)
+    (network c-string)
+    (display-number integer-16)
+    (screen-number integer-16)
+    (reuse-old-screen-p cardinal-16)		;0=unspec, 1=t, 2=nil
+    (window-geometry c-string)
+    (initial-state cardinal-16)			;0=unspec, 1=iconic, 2=normal
+    (remote-program-name c-string)
+    (activity c-string)
+    (foreground-color c-string)
+    (background-color c-string)
+    (border-color c-string)
+    (border-width integer-16)
+    (who-line-p cardinal-16)			;0=unspec, 1=t, 2=nil
+    (embedded-appropriate-p boolean))
+  (:VALUES (window-id integer-32))
+  (:LISP
+    (:SERVER
+      (flet ((start-x-screen-internal (host protocol transport-agent)
+	       (apply #'x-screen:start-x-screen
+		      :host host
+		      :protocol protocol
+		      :run-lights-positioner
+		      (lambda (display-number screen-number window-id
+			       nlights width height x y dx dy
+			       foreground background plane-mask)
+			(when (agent-connected-p transport-agent)
+			  (position-run-lights-on-x-window
+			    address network display-number screen-number window-id
+			    nlights width height x y dx dy foreground background plane-mask
+			    :transport-agent transport-agent)))
+		      :run-lights-remover
+		      (lambda (display-number screen-number window-id)
+			(when (agent-connected-p transport-agent)
+			  (remove-run-lights-from-x-window
+			    address network display-number screen-number window-id
+			    :transport-agent transport-agent)))
+		      ;; Allow Unix to punt defaults to Genera
+		      `(,@(when (plusp display-number) `(:display-number ,display-number))
+			,@(when (plusp screen-number) `(:screen-number ,screen-number)) 
+			,@(when (plusp (length window-geometry))
+			    `(:window-geometry ,window-geometry))
+			,@(when (plusp (length foreground-color))
+			    `(:foreground-color ,foreground-color))
+			,@(when (plusp (length background-color))
+			    `(:background-color ,background-color))
+			,@(when (plusp border-width) `(:border-width ,border-width))
+			,@(when (plusp (length border-color)) `(:border-color ,border-color))
+			,@(when (plusp (length remote-program-name))
+			    `(:remote-program-name ,remote-program-name))
+			,@(when (plusp (length activity)) `(:activity ,activity))
+			,@(select initial-state
+			    (0 nil)
+			    (1 `(:initial-state :iconic))
+			    (2 `(:initial-state :normal)))
+			,@(select reuse-old-screen-p
+			    (0 nil)
+			    (1 '(:reuse-old-screen-p t))
+			    (2 '(:reuse-old-screen-p nil)))
+			,@(select who-line-p
+			    (0 nil)
+			    (1 '(:who-line-p t))
+			    (2 '(:who-line-p nil)))))))
+	(ignore embedded-appropriate-p)		; For now
+	(cond ((not (fboundp 'x-screen:start-x-screen))
+	       (rpc-error console-error (console-error-string
+					  (format nil "World load ~A does not support X."
+						  si:loaded-band-name)) t))
+	      ((or (zerop (length address)) (zerop (length network)))
+	       (rpc-error console-error
+			  (console-error-string
+			    "START-X-SCREEN must specify a network and address") t))
+	      (t
+	       (let* ((network-type (intern (string-upcase network) 'keyword))
+		      (network (neti:local-network-of-type network-type))
+		      (host (neti:get-host-from-address
+			      (send network :parse-address address) network))
+		      (protocol (if (eq network-type :internet) :tcp network-type))
+		      (requesting-host (rpc::remote-host *default-transport-agent*))
+		      (requesting-address
+			(send network :parse-address
+			      (second (assoc network (send requesting-host :address))))))
+		 (if (send network :address-trusted-p requesting-address)
+		     ;; Trusted host, or we're in the distribution site
+		     (condition-case (error)
+			  (start-x-screen-internal host protocol *default-transport-agent*)
+			(xlib:connection-failure
+			  (rpc-error console-error
+				     (console-error-string (dbg:report-string error)) nil))
+			(error
+			  (rpc-error console-error
+				     (console-error-string (dbg:report-string error)) t))
+			(:no-error
+			  ;; Return window-id
+			  (rpc-values error)))
+		     ;; Untrusted host; refuse access
+		     (rpc-error
+		       console-error
+		       (console-error-string
+			 (format nil "Host ~A is not trusted" requesting-host)) t)))))))))
+
+(DEFINE-REMOTE-ENTRY HALT-X-SCREEN UNIX-SUPPORT-CLIENT
+  (:NUMBER 56)
+  (:ARGUMENTS
+    (address c-string)
+    (network c-string)
+    (display-number integer-16)
+    (screen-number integer-16)
+    (window-id integer-32))
+  (:VALUES)
+  (:LISP
+    (:SERVER
+      (cond ((not (fboundp 'x-screen:halt-x-screen))
+	     (rpc-error console-error (console-error-string
+					(format nil "World load ~A does not support X."
+						si:loaded-band-name)) t))
+	    ((or (zerop (length address)) (zerop (length network)))
+	     (rpc-error console-error (console-error-string
+				     "HALT-X-SCREEN must specify a network and address") t))
+	    (t
+	     (condition-case (error)
+		  (let* ((network-type (intern (string-upcase network) 'keyword))
+			 (network (neti:local-network-of-type network-type))
+			 (host (neti:get-host-from-address
+				 (send network :parse-address address) network)))
+		    (apply #'x-screen:halt-x-screen
+			   :host host
+			   :window-id window-id
+			   ;; Allow Unix to punt defaults to Genera
+			   `(,@(when (plusp display-number)
+				 `(:display-number ,display-number))
+			     ,@(when (plusp screen-number)
+				 `(:screen-number ,screen-number)))))
+		(error
+		  (rpc-error console-error
+			     (console-error-string (dbg:report-string error)) t))
+		(:no-error
+		  (rpc-values))))))))
+
+
+;;; Run lights
+
+(DEFINE-REMOTE-ENTRY POSITION-RUN-LIGHTS-ON-X-WINDOW UX400-RUN-LIGHTS
+  (:NUMBER 61)
+  (:ARGUMENTS
+    (address c-string) 
+    (network c-string)
+    (display-number integer-16)
+    (screen-number integer-16)
+    (window-id integer-32)
+    (nlights integer-16)
+    (width cardinal-32)
+    (height cardinal-32)
+    (x cardinal-32)
+    (y cardinal-32)
+    (dx cardinal-32)
+    (dy cardinal-32)
+    (foreground cardinal-32)
+    (background cardinal-32)
+    (plane-mask cardinal-32))
+  (:VALUES)
+  (:ASYNCHRONOUS T)
+  (:C
+    (:SERVER
+      #{  
+	  position_run_lights(address, network, display_number, screen_number, window_id,
+			      nlights, width, height, x, y, dx, dy,
+			      foreground, background, plane_mask);
+       }
+       )))
+
+(DEFINE-REMOTE-ENTRY REMOVE-RUN-LIGHTS-FROM-X-WINDOW UX400-RUN-LIGHTS
+  (:NUMBER 62)
+  (:ARGUMENTS
+    (address c-string)
+    (network c-string)
+    (display-number integer-16)
+    (screen-number integer-16)
+    (window-id integer-32))
+  (:VALUES)
+  (:ASYNCHRONOUS T)
+  (:C
+    (:SERVER
+      #{ 
+	 remove_run_lights(address, network, display_number, screen_number, window_id);
+       }
+       )))
+
+
+
+#+IMach
+(DEFINE-REMOTE-C-PROGRAM UNIX-SUPPORT-SERVER
+  (:SERVER (:FILE "unix-support-server.c")
+	   (:INCLUDE "<sys/types.h>" "<sys/stat.h>" "<sys/time.h>"
+		     "<sys/socket.h>" "<sys/ioctl.h>" "<net/if.h>" "<netinet/in.h>"
+		     "<stdio.h>" "<errno.h>" "RPC.h")))
+
+#+IMach
+(DEFINE-REMOTE-C-PROGRAM UNIX-SUPPORT-CLIENT
+  (:CLIENT-EXTERN (:FILE "unix-support-client.h"))
+  (:CLIENT (:FILE "unix-support-client.c")
+	   (:INCLUDE "<stdio.h>" "RPC.h")
+	   (:ERRORS CONSOLE-ERROR)))
+
+#+IMach
+(DEFINE-REMOTE-C-PROGRAM UX400-RUN-LIGHTS
+ (:SERVER (:FILE "ux400-run-lights.c")))

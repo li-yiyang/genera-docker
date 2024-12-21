@@ -1,0 +1,326 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: METERING; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+
+;; nest one more level of restriction.  Returns new process and region restrictions.
+(defun register-restriction (form process region control)
+  (declare (values process region))
+  (case (car form)
+    (:process
+      (values (get-valid-process (cadr form)) region))
+    (:region
+      (values process (register-region (get-valid-trigger-region
+					 (cadr form) control :force 't)
+				       process
+				       region
+				       nil)))
+    (:simultaneously
+      (error ":SIMULTANEOUSLY is not implemented yet. ~S" form))
+    (otherwise
+      (error "Invalid restriction clause: ~S, must be a region or a process." form))))
+(defun-with-cache create-control-scope-testing-function (lambda-list body &optional defaults)
+  (() body)
+  (let* ((tick compiler:new-compiler-warnings-tick)
+	 (compiled-function
+	   (fdefinition
+	     (compile (prog1 (gensym "METERING-ENABLED?")
+			     (gensym "G")) ;; restore standard prefix
+		      `(lambda ,lambda-list
+			 (let ((.counter. -1)
+			       ,@defaults)
+			   (ignore .counter.)
+			   (flet ((control-enabled? (process user-code-allowed)
+				    (ignore process user-code-allowed)
+				    ,body))
+			     #'control-enabled?)))))))
+    (if (and ( tick compiler:new-compiler-warnings-tick)
+	     (not (y-or-n-p "There are compiler warnings for the scope testing function.  Do you still want to set the scope? ")))
+	(signal 'sys:abort)
+	compiled-function)))
+
+;; Put in accelerators for common cases. for example.
+;; (1) (:process p) (2) (:region r) (3) (:within r p) (4) :switch (5) (and (:process p) (:region r))
+(defun generate-code-for-control (scope control
+				  &key code-for-process-switch code-for-per-process)
+  (declare (values testing-function processes depends-on-user-code))
+  (let ((scope (simplify-description-of-scope scope))
+	(processes-for-closure nil)
+	(regions-for-closure nil)
+	(counters-for-closure nil)
+	(counter-bounds-for-closure nil)
+	(region-uid 0)
+	(process-uid 0)
+	(bounds-uid 0)
+	(counter-uid 0)
+	(allow-computation-to-proceed nil))	; nil for ORs and 't for ANDs.
+    (declare (special allow-computation-to-proceed))
+    (labels ((get-process-id (process)
+	       (let ((proc (get-valid-process process)))
+		 (or (cdr (assoc proc processes-for-closure))
+		     (let ((proc-id (intern
+				      (string-append "PROCESS-"
+						     (format nil "~D" (incf process-uid)))
+				      (pkg-find-package "METERING"))))
+		       (push (cons proc proc-id) processes-for-closure)
+		       proc-id))))
+	     (get-region-id (region)
+	       (or (cdr (assoc region regions-for-closure))
+		   (let ((region-id
+			   (intern (string-append "REGION-"
+						  (format nil "~D" (incf region-uid)))
+				   (pkg-find-package "METERING"))))
+		     (push (cons region region-id) regions-for-closure)
+		     region-id)))
+	     (get-bounds-id (count)
+	       (or (and (zerop count) 0)
+		   (cdr (assoc count counter-bounds-for-closure))
+		   (let ((bound-id
+			   (intern
+			     (string-append "BOUND-" (format nil "~D" (incf bounds-uid)))
+			     (pkg-find-package "METERING"))))
+		     (push (cons count bound-id) counter-bounds-for-closure)
+		     bound-id)))
+	     (get-counter (count1 count2)
+	       (declare (values counter-id low-bound high-bound))
+	       (let ((high-bound-id (get-bounds-id count1))
+		     (low-bound-id (get-bounds-id count2)))
+		 (values '.counter. low-bound-id high-bound-id)))
+	     (get-relative-counter (count1 count2)
+	       (declare (values counter low-bound high-bound))
+	       (let ((high-bound-id (get-bounds-id count1))
+		     (low-bound-id (get-bounds-id count2))
+		     (counter-id
+		       (intern (string-append "COUNTER-" (format nil "~D" (incf counter-uid)))
+			       (pkg-find-package "METERING"))))
+		 (push (list counter-id 0) counters-for-closure)
+		 (values counter-id low-bound-id high-bound-id)))
+	     (walk-list-replacing (form process region already-noted-dependence)
+	       (declare (values form syntactically-depends-on-user-code))
+	       (let ((operator (if (listp form) (car form) form)))
+		 (case operator
+		   ((and or)
+		    (let* ((user-dependent nil)	; is any part of the form user-dependent?
+			   (old-user-dependent nil)	; are any clauses, other than the
+						; last, user dependent?
+			   (allow-computation-to-proceed (if (eq operator 'and) 't nil))
+			   (generated-form
+			     (cons
+			       operator
+			       (loop for clause in (cdr form)
+				     collect
+				       (multiple-value-bind (form dependent)
+					   (walk-list-replacing
+					     clause process region user-dependent)
+					 (setq old-user-dependent user-dependent
+					       user-dependent (or user-dependent dependent))
+					 form)))))
+		      (declare (special allow-computation-to-proceed))
+		      ;; It's important not to think that the value of the form depends on
+		      ;; user code unless it really does.  If an AND is NIL or an OR is not
+		      ;; NIL, then clearly the user code won't make a difference.
+		      ;; If only the last clause is user-dependent, then we don't need to
+		      ;; clear the depends-on-user-code bit, because it wouldn't have been
+		      ;; set unless the expression needed the user code.  (This is one of
+		      ;; those optimizations that probably just make the code confusing for
+		      ;; *very* little gain.
+		      (values
+			(if (or (and user-dependent old-user-dependent)
+				(and code-for-per-process processes-for-closure))
+			    `(let ((scope ,generated-form))
+			       (when ,(if (eq operator 'and) '(not scope) 'scope)
+				 ,@(when (and user-dependent old-user-dependent)
+				     '((setq depends-on-user-code nil)))
+				 ,@(when (and code-for-per-process processes-for-closure)
+				     '((setq depends-on-process nil))))	;
+			       scope)
+			    generated-form)
+			user-dependent)))
+		   (not
+		     (let ((allow-computation-to-proceed (not allow-computation-to-proceed)))
+		       (declare (special allow-computation-to-proceed))
+		       (multiple-value-bind (generated-form dependent)
+			   (walk-list-replacing
+			     (cadr form) process region already-noted-dependence)
+			 (values `(null ,generated-form) dependent))))
+		   (:process
+		     (let ((proc-id (get-process-id (cadr form))))
+		       (cond (code-for-process-switch
+			      (values `(if (null process)
+					   ,(if already-noted-dependence
+						allow-computation-to-proceed
+						`(progn (setq depends-on-user-code 't)
+							,allow-computation-to-proceed))
+					   (member ,proc-id process))
+				      't))
+			     (code-for-per-process
+			      (values `(progn
+					 (setq depends-on-process 't)
+					 (if (null process)
+					     ,allow-computation-to-proceed
+					     (eq process ,proc-id)))
+				      nil))
+			     (t (values `(eq process ,proc-id) nil)))))
+		   (:switch
+		     (let* ((switch (register-region control process region control))
+			   (switch-id (get-region-id switch)))
+		      (setf (region-count switch) 0)
+		      (values 
+			`(let* ((switch ,switch-id)
+				(switch-count (region-count switch)))
+			   (and (numberp switch-count) (plusp switch-count)))
+			nil)))
+		   ((:count :relative-count)
+		     (multiple-value-bind (counter low high)
+			 (funcall (if (eq operator :count)
+				      #'get-counter
+				      #'get-relative-counter)
+				  (second form) (third form))
+		       (values `(when ( ,counter ,high)
+				  ,@(when (eq operator :relative-count)
+				      `((incf ,counter)))
+				  (setq needs-checking 't)
+				  ,@(unless (zerop (third form))
+				      `((< ,low ,counter))))
+			       nil)))
+		   (:always
+		     (error
+		       "Bug in parsing scope (:ALWAYS present after simplification).  Please send backtrace to BUG-METERING-TOOL"))
+		   (:region
+		     (let ((region-id
+			     (get-region-id
+			       (register-region
+				 (get-valid-trigger-region (cadr form) control :force 't)
+				 process region control))))
+		       (values 
+			 `(let* ((region ,region-id)
+				 (count (region-count region)))
+			    (and (numberp count) (plusp count)))
+			 nil)))
+		   (:within
+		     (multiple-value-bind (new-process new-region)
+			 (register-restriction (third form) process region control)
+		       (walk-list-replacing
+			 (second form) new-process new-region already-noted-dependence)))
+		   (t (values
+			(if already-noted-dependence
+			    `(if user-code-allowed ,form ,allow-computation-to-proceed)
+			    `(progn (setq depends-on-user-code 't)
+				    (if user-code-allowed
+					,form
+					,allow-computation-to-proceed)))
+			't))))))
+      ; return TESTING-FUNCTION PROCESSES DEPENDS-ON-USER-CODE
+      (if (member scope '(t nil))
+	  (values (if scope #'true #'false) nil nil)
+	  (multiple-value-bind (form dependent)
+	      (let ((flag nil))
+		(unwind-protect
+		    (multiple-value-prog1
+		      (walk-list-replacing scope nil nil nil)
+		      (setq flag 't))
+		  (unless flag (set-scope control nil))))
+	    (let* ((lambda-list (append (mapcar #'cdr processes-for-closure)
+					(mapcar #'cdr regions-for-closure)
+					(mapcar #'cdr counter-bounds-for-closure)))
+		   (processes-of-interest (mapcar #'car processes-for-closure))
+		   (regions-of-interest (mapcar #'car regions-for-closure))
+		   (counter-bounds-of-interest (mapcar #'car counter-bounds-for-closure))
+		   (control-function
+		     (create-control-scope-testing-function
+		       lambda-list
+		       (if (or dependent
+			       counter-bounds-for-closure
+			       (and code-for-per-process processes-for-closure))
+			   `(let (,@(and dependent '((depends-on-user-code nil)))
+				  ,@(and counter-bounds-for-closure '((needs-checking nil)))
+				  ,@(and code-for-per-process processes-for-closure
+					 '((depends-on-process nil))))
+			      ,@(when counter-bounds-for-closure
+				  '((when user-code-allowed (incf .counter.))))
+			      (values ,form
+				      ,(cond ((and counter-bounds-for-closure dependent)
+					      `(or needs-checking depends-on-user-code))
+					     (dependent 'depends-on-user-code)
+					     (counter-bounds-for-closure 'needs-checking)
+					     (t nil))
+				      ,(when code-for-per-process
+					 (if (> (length processes-for-closure) 1)
+					    `depends-on-process
+					    (when (= (length processes-for-closure) 1)
+					      '(and (not user-code-allowed)
+						    depends-on-process))))))
+			   `(values ,form nil nil))
+		       counters-for-closure)))
+	      (values 
+		(apply control-function (append processes-of-interest
+						regions-of-interest
+						counter-bounds-of-interest))
+		processes-of-interest
+		dependent)))))))
+
+
+
+#||
+(let ((restriction (third form)))
+  (unless (if (listp restriction)
+	      (memq (car restriction)
+		    *valid-scopes-with-expressions*)
+	      (memq restriction
+		    *valid-scopes-without-expressions*))
+    (error
+      "The restriction must be a valid scope.  ~S is illegal."
+      retriction)))
+||#
+
+;; user extensible keywords?  Mix it in to basic-control?  Build our mechanism out of it.

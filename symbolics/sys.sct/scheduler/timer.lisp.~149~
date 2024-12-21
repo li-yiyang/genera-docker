@@ -1,0 +1,1465 @@
+;;; -*- Syntax: Common-lisp; Package: process; Base: 10; Mode: LISP; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;; Timer facility is known about by sequence break.
+
+;; A timer is a memo for some asynchronous operation.  The only
+;; operations we can perform on a timer is to create it, set some time
+;; for it to go off, clear it, and check whether it has gone off.
+
+;; A timer can either be in state :NEUTRAL, :PENDING, or :EXPIRED.  A
+;; timer is in state :PENDING if, and only if, it is on the timer-queue,
+;; *pending-timers*.
+
+
+
+;; Initialization
+(defun timer-process-predicate (me)
+  (and %*timer-wakeup-queued*
+       (eq me *timer-task*)
+       (optimize-wakeups *pending-timers*)
+       ;; so that the deadline gets set from *now*.  We have half
+       ;; a millisecond to respond.
+       *timer-priority*))
+
+(defresource timer-processes ()
+  :constructor (make-process "Timer"
+			     :priority *timer-priority*
+			     :initial-function #'timer-process-top-level
+			     :warm-boot-action 'process-warm-boot-restart
+			     :flags '(:system-process t :no-kbd-arrest t :no-run-light t)
+			     :simple-p t
+			     :verify-function #'true
+			     :top-level-whostate "Timer Process"
+			     :interrupt-handler 't))
+
+(defun system-timer-call (function arg-array)
+  (apply function (g-l-p arg-array)))
+
+(defresource system-timers (&optional (function #'ignore) &rest args)
+  :constructor (make-timer :function #'system-timer-call
+			   :args (list #'ignore
+				       (zl:make-array 4 :type 'si:art-q-list :fill-pointer 0)))
+  :initializer (locally (declare (inline timer-args))
+		 (setf (first (timer-args object)) function)
+		 (loop for arg in args do
+		   (vector-push-extend arg (second (timer-args object)))))
+  :deinitializer (locally
+		     (declare (inline (setf timer-name) (setf timer-priority) timer-args))
+		   (clear-timer object)
+		   (setf (timer-name object) "")
+		   (setf (timer-priority object) *default-timer-entry-priority*)
+		   (setf (first (timer-args object)) #'ignore)
+		   (loop while (vector-pop (second (timer-args object)) nil)))
+  :matcher true)
+
+(defun initialize-timer-facility-data-structures ()
+  (declare (inline timer-warm-boot-action timer-universal-time (setf timer-state)
+		   timer-expires timer-high-order-bits (setf timer-descriptor)))
+  (let ((resettable-timers nil))
+    ;; Make sure sequence break doesn't try to make us do anything.
+    (%clear-next-timer-wakeup)
+    (with-scheduler-locked
+      (condition-case ()				;in case the heap itself is screwed up:
+	   (progn (map-heap *pending-timers*
+			    #'(lambda (time high-bits timer)
+				(ignore time high-bits)
+				(let ((action (timer-warm-boot-action timer)))
+				  ;; can't do anything until universal time set up.
+				  (if (and (timer-universal-time timer)
+					   (or (eq action 't) (eq action :save)))
+				      (push timer resettable-timers)
+				      (setf (timer-state timer) :neutral)))))
+		  (clear *pending-timers*))
+	 (error
+	   ;; Oh well, give up and make a new one
+	   (setq *pending-timers* (make-instance 'simple-timer-queue))))
+      (loop for timer in resettable-timers do
+	;; if UT isn't initialized, push all these guys
+	;; onto *TIMERS-SET-BEFORE-UT-INITIALIZATION*
+	(multiple-value-bind (ignore ignore ignore ignore descriptor)
+	    (insert *pending-timers*
+		    (timer-expires timer) (timer-high-order-bits timer)
+		    timer)
+	  (setf (timer-descriptor timer) descriptor))))))
+
+(defun initialize-timer-facility ()
+  (let ((timer-procs nil)
+	(free-timer-procs nil)
+	(n-timer-procs 0))
+    #-ignore ;; until the +ignore is restored
+    (declare (ignore timer-procs free-timer-procs n-timer-procs))
+    #+ignore ;; until remove-object-from-resource is implemented.
+    (progn
+      (si:map-resource 'timer-processes #'(lambda (timer-process in-use-p ignore)	;
+					    (setf (process-name timer-process) "Timer")
+					    (incf n-timer-procs)
+					    (if in-use-p
+						(push timer-process timer-procs)
+						(push timer-process free-timer-procs))))
+      (loop for timer-process in timer-procs do
+	(condition-case ()
+	     (deallocate-resource 'timer-processes timer-process)
+	   (si:resource-error nil))))
+    (when *spare-timer-task*
+      (condition-case ()
+	   (deallocate-resource 'timer-processes *spare-timer-task*)
+	 (si:resource-error nil)))
+    (when si:warm-booted-process
+      (condition-case ()
+	   (deallocate-resource 'timer-processes si:warm-booted-process)
+	 (si:resource-error nil)))
+    (setq *spare-timer-task* nil))
+  (%set-next-timer-task *next-timer-wakeup-time* (si:allocate-resource 'timer-processes)))
+
+;--- Uses the DISK-SAVE-RUN-LIGHT, but might be flushed
+(defsubst frob-timer-light (value)
+  (when *use-timer-run-light*
+    (if value
+	(si:set-run-light sys:disk-save-run-light)
+	(si:clear-run-light sys:disk-save-run-light))))
+
+
+
+;;; The timer process
+
+(defvar *useless-timers* 0)
+(defvar *useful-timer-wakeups* 0)
+(defvar *timer-hits* 0)
+(defvar *timer-resets* 0)
+(defvar *timer-resets-in-place* 0)
+(defvar *spare-timer-task* nil)
+(defvar *timer-task-resource-allocations* 0)
+(defvar *use-timer-run-light* nil)
+
+(defun get-new-timer-task ()
+  (let ((task (if *spare-timer-task*
+		  (prog1 *spare-timer-task* (setq *spare-timer-task* nil))
+		  (progn
+		    (incf *timer-task-resource-allocations*)
+		    (si:allocate-resource 'timer-processes)))))
+    (unless (process-wakeable-p task)
+      (process-reset task nil nil :force)
+      (process-enable task))
+    task))
+
+(defun return-timer-task (proc)
+  (unless (store-conditional (locf *spare-timer-task*) nil proc)
+    (condition-case ()
+	 (deallocate-resource
+	   'timer-processes proc #||resource-descriptor||#)
+       (si:resource-error nil))))
+
+(defun timer-process-top-level (#||resource-descriptor||#)
+  (declare (inline timer-expires timer-high-order-bits timer-name timer-priority
+		   timer-function timer-args (setf timer-state) (locf timer-state)))
+  (with-process-priority *timer-priority*
+    (loop as i-am-timer-task = 't doing
+      (setf %*timer-wakeup-queued* nil)
+      (set-process-priority *current-process* *timer-priority*)
+      (frob-timer-light 't)
+      (stack-let ((timers-done (list nil nil nil nil nil)))	;loop protection
+        (loop with (next-time next-high-bits)
+	    repeat 20				;loop protection
+	    for first-time = 't then nil
+	    as timer-entry =
+	       (with-scheduler-locked
+		 (let ((top? (top *pending-timers*)))
+		   (if top?
+		       (let ((top top?))
+			 (declare (sys:array-register top))
+			 (multiple-value-bind (clock-now high-clock-bits)
+			     (time:full-microsecond-time)
+			   (setq clock-now (multiple-value-bind (sum carry)
+					       (sys:%add-bignum-step clock-now
+								     *timer-resolution* 0)
+					     (setq high-clock-bits
+						   (sys:%32-bit-plus high-clock-bits carry))
+					     sum))
+			   (setq next-time (timer-expires top))
+			   (setq next-high-bits (timer-high-order-bits top))
+			   (if (and (not (full-time-< clock-now high-clock-bits
+						      next-time next-high-bits))
+				    (not (member top timers-done)))
+			       ;; We have something to do.
+			       ;; We must re-arm sequence break so it knows when next to wake up
+			       ;; a timer process.
+			       (let ((next-timer? (next *pending-timers*)))
+				 (if next-timer?
+				     (let ((next-timer next-timer?))
+				       (declare (sys:array-register next-timer))
+				       (if i-am-timer-task
+					   ;; Since we are about to call some arbitrary function,
+					   ;; we had better provide another process in case we
+					   ;; take too long, or error out.
+					   (progn
+					     (%set-next-timer-task
+					       ;; this is a good approximation of when to wake
+					       ;; up *no matter what the high bits are*
+					       (sys:%32-bit-plus *timer-resolution*
+								 (timer-expires next-timer))
+					       (get-new-timer-task))
+					     (setf i-am-timer-task nil))
+					   ;; There already is another timer-process free to
+					   ;; respond to sequence break, so we just have to reset
+					   ;; the time.
+					   (let ((later-time (timer-expires next-timer)))
+					     ;; but we just snarfed a timer, so let's check for the
+					     ;; race condition, so the other guy doesn't have to wake
+					     ;; up for nothing.
+					     ;; first, has it been awakened?
+					     (when (and %*timer-wakeup-queued*
+							;; is there other work to do anyway?
+							(full-time-< clock-now high-clock-bits
+								     later-time (timer-high-order-bits next-timer))
+							*timer-task*)
+					       ;; but, it can't be inside the
+					       ;; monitor, so it is safe to
+					       ;; make it unrunnable.
+					       (setq %*timer-wakeup-queued* nil)
+					       (process-reconsider-wakeup *timer-task*))
+					     (%set-next-timer-wakeup later-time))))
+				     (progn
+				       (%clear-next-timer-wakeup)
+				       (when i-am-timer-task
+					 ;; Since we are about to call some arbitrary function,
+					 ;; we had better provide another process in case we
+					 ;; take too long, or error out.
+					 (setq *timer-task* (get-new-timer-task))
+					 (setf i-am-timer-task nil))))
+				 (let ((real-top (remove-top *pending-timers*)))
+				   ;; TOP might lie (within the bounds of *TIMER-RESOLUTION*
+				   ;; when there is a cache)
+				   ;; so we have to make sure that we reset the state of the
+				   ;; real timer that is removed by REMOVE-TOP, so we have to
+				   ;; do the REMOVE-TOP before setting the state.
+				   ;; 
+				   ;; reset state inside the WITH-MONITOR-HELD.
+				   (setf (timer-state real-top) :executing)
+				   ;; we now return a value for timer-entry
+				   real-top))
+			       ;; We woke up too early, reset sequence-break to the correct
+			       ;; time.
+			       ;; We don't have to change processes, because we won't be busy.
+			       (%set-next-timer-wakeup next-time)
+			       ;; so timer entry is nil
+			       nil)))
+		       (%clear-next-timer-wakeup)
+		       ;; return NIL for timer-entry
+		       nil)))
+	    when first-time
+	      do (if (not timer-entry)
+		     (incf *useless-timers*)
+		     (incf *useful-timer-wakeups*))
+	    while timer-entry 
+	    do (incf *timer-hits*)
+	       (let ((timer-entry timer-entry))
+		 (declare (sys:array-register timer-entry))
+		 (loop for l on timers-done do
+		   (when (null (car l))
+		     (setf (car l) timer-entry)
+		     (return)))
+		 (unwind-protect
+		     (let ((name (timer-name timer-entry))
+			   (priority (timer-priority timer-entry))
+			   (function (timer-function timer-entry))
+			   (args (timer-args timer-entry)))
+		       (progn
+			 (setf (process-name *current-process*)
+			       (or (timer-name timer-entry) "Timer"))
+			 (metering:meter-form (timer-fired "Processing timer entry")
+					      (name function args)
+			     (if priority 
+				 (process:with-process-priority priority
+				   (apply function args))
+				 (apply function args))
+			   name function args)
+			 (setf (process-name *current-process*) "Timer")))
+		   ;atomically update outside of monitor
+		   (store-conditional (locf (timer-state timer-entry)) :executing :expired)))
+	       ;; the other guy is going to wake up anyway.
+	    until %*timer-wakeup-queued*))
+      (frob-timer-light nil)
+      (with-scheduler-locked
+	(unless (eql *current-process* *timer-task*) (return-timer-task *current-process*))
+	(set-simple-process-predicate-function
+	  *current-process* #'timer-process-predicate *current-process*)
+	(return)))))
+
+
+(defvar *invalid-timer-states* 0)
+
+;; Set timer needs to mung sequence breaks idea of what
+(defmacro set-timer (ltime htime timer &environment env)
+  (once-only (ltime htime &environment env)
+    (let ((tag (gensym))
+	  (ftimer (gensym)))
+      `(block ,tag
+	 (let ((,ftimer ,timer))
+	   (declare (sys:array-register ,ftimer))
+	   (declare (inline timer-state timer-descriptor timer-expires timer-high-order-bits
+			    (setf timer-state) (setf timer-descriptor) (setf timer-expires)
+			    (setf timer-high-order-bits)))
+	   (with-scheduler-locked
+	     (when (eq (timer-state ,ftimer) :pending)
+	       (incf *timer-resets*)
+	       #-ignore
+	       (multiple-value-bind (done new-top)
+		   (reset-in-place *pending-timers* ,ftimer (timer-descriptor ,ftimer) ,ltime ,htime)
+		 (if done
+		     (progn
+		       (incf *timer-resets-in-place*)
+		       (setf (timer-expires ,ftimer) ,ltime)
+		       (setf (timer-high-order-bits ,ftimer) ,htime)
+		       (when (and new-top (eq ,ftimer (top *pending-timers*)))
+			 (%set-next-timer-wakeup ,ltime))
+		       (return-from ,tag ,ftimer))
+		     (condition-case ()
+			  (delete-by-item *pending-timers* ,ftimer #'eql (timer-descriptor ,ftimer))
+			(heap-item-not-found (incf *invalid-timer-states*)))))
+	       #+ignore
+	       (condition-case ()
+		    (delete-by-item *pending-timers* ,ftimer #'eql (timer-descriptor ,ftimer))
+		  (heap-item-not-found (incf *invalid-timer-states*)))
+	       )
+	     ;; if sequence break wakes up a timer-process here, and we
+	     ;; just deleted the last timer in the heap, that's the only
+	     ;; chance for a race condition.  I don't think it is a
+	     ;; problem, because we immediately set a new timer, and if
+	     ;; it is now the only thing in the heap, it will certainly
+	     ;; set up sequence-break.  Still, I flag this for future
+	     ;; carefulness.
+	     (multiple-value-bind (item low-key high-key new-top descriptor)
+		 (insert *pending-timers* ,ltime ,htime ,ftimer)
+	       (when (not (eql item ,ftimer))
+		 (let ((*debug-io* "Inconsistency in timer facility"))
+		   (cerror "Continue normally" "Tried to insert ~S, but ~S inserted" ,ftimer item)))
+
+	       (setf (timer-descriptor ,ftimer) descriptor)
+	       (setf (timer-expires ,ftimer) low-key)
+	       (setf (timer-high-order-bits ,ftimer) high-key)
+	       (setf (timer-state ,ftimer) :pending)
+	       ;; Only defer sequence breaks if there is a chance that it is necessary.
+	       (when new-top
+						;(with-sequence-breaks-deferred
+						;(when (eq ,ftimer (top timers))
+		 (%set-next-timer-wakeup low-key)	;)	;)
+		 ))) 
+	   ,ftimer)))))
+
+;; returns t if the timer went off before we got to it.  It doesn't return 't if someone else
+;; already cleared the timer, just if it actually went off.
+(defmacro clear-timer-entry (timer)
+  `(locally (declare (inline timer-state (setf timer-state) timer-descriptor timer-expires))
+     (if (eq (timer-state timer) :pending)
+	 (condition-case (e)
+	      (if (eq (timer-state timer) :pending)
+		  (when si:*new-scheduler-enabled*
+		    (with-scheduler-locked
+		      (if (eq (timer-state timer) :pending)
+			  (progn
+			    (incf *timer-resets*)
+			    (setf (timer-state ,timer) :neutral)
+			    (let ((top (top *pending-timers*)))
+			      (delete-by-item *pending-timers* ,timer #'eql (timer-descriptor ,timer))
+			      (when (eql top ,timer)
+				(let ((new-top (top *pending-timers*)))
+				  (if new-top
+				      (%set-next-timer-wakeup (timer-expires ,timer))
+				      (%clear-next-timer-wakeup)))))
+			    nil)
+			  (when (eq (timer-state timer) :expired) 't))))
+		  (when (eq (timer-state timer) :expired) 't))
+	    ;; signal the error outside of the monitor!
+	    (heap-item-not-found
+	      (incf *invalid-timer-states*)
+	      ;; it is wrong to signal this error.  There's nothing you,
+	      ;; or the user, can do.  If you want to debug the
+	      ;; timer-facility it might be a good idea to re-enable the
+	      ;; signal, but it will probably reveal a bug in the
+	      ;; timer-heap, rather than in timers themselves.
+	      #+ignore
+	      (signal 'heap-item-not-found
+		      :heap (heap-item-not-found-heap e) :key (heap-item-not-found-key e))))
+	 (when (eq (timer-state timer) :expired) 't))))
+
+;;; The visible interface
+
+
+(defun create-timer-call (function args &key (name "Timer") (priority *default-timer-entry-priority*))
+  (declare (inline (setf timer-args)))
+  (let ((timer (make-timer :length (+ (length args) (timer-length))	;leave room for args
+			   :function function :name name :priority priority)))
+    ;; Copy the arguments into the timer to improve virtual memory locality
+    (when args
+      (setf (timer-args timer)
+	    (sys:%make-pointer sys:dtp-list (locf (aref timer (timer-length)))))
+      (loop for (arg . more) on args
+	    for i from (timer-length) do
+	(sys:%p-store-cdr-and-contents (locf (aref timer i)) arg
+				       (if more sys:cdr-next sys:cdr-nil))))
+    timer))
+
+(defun create-timer-wakeup (&optional (process *current-process*)
+			    &key (name "Timer Wakeup") force-p)
+  (declare (inline (setf timer-args)))
+  (let ((timer (make-timer :length (1+ (timer-length))	;leave room for arg
+			   :name name
+			   :function (if force-p 'process-force-wakeup 'process-wakeup)
+			   :priority nil)))
+    ;; The function PROCESS-BLOCK-WITH-TIMEOUT depends on the process being the
+    ;; argument, so if you change one, change the other.
+    ;; Store the argument in the timer to improve virtual memory locality
+    (sys:%p-store-cdr-and-contents (locf (aref timer (timer-length)))
+				   process sys:cdr-nil)
+    (setf (timer-args timer)
+	  (sys:%make-pointer sys:dtp-list (locf (aref timer (timer-length)))))
+    timer))
+
+;; takes its argument in relative seconds
+(defun reset-timer-relative (timer delta-t)
+  (declare (inline (setf timer-warm-boot-action) (setf timer-universal-time)))
+  (multiple-value-bind (clock high-bits)
+      (time:full-microsecond-time)
+    (let ((delta-interval (floor (* 1000000. delta-t))))
+      (multiple-value-bind (expires high-order-bits)
+	  (if (and (zl:fixnump delta-interval) (plusp delta-interval))
+	      ;; common case, don't cons, and be quick
+	      (multiple-value-bind (expires high-order-bits)
+		  (si:%add-bignum-step delta-interval clock 0)
+		(values expires (+ high-order-bits high-bits)))
+	      ;; OK.  Long time away; this is rare.
+	      (let ((new-time (+ (si:%make-bignum-from-fixnum-components
+				   0 2 clock high-bits)
+				 delta-interval)))
+		(if (zL:fixnump new-time)
+		    (values new-time 0)
+		    (values (si:bignum-ref new-time 0) (si:bignum-ref new-time 1)))))
+	(set-timer expires high-order-bits timer))
+	(setf (timer-warm-boot-action timer) nil)
+	(setf (timer-universal-time timer) nil)
+      delta-interval)))
+
+;; absolute time is UniversalTime.
+(defun reset-timer-absolute (timer universal-time)
+  (declare (inline (setf timer-universal-time) (setf timer-warm-boot-action)
+		   (setf timer-state) (setf timer-descriptor)))
+  (if time:*timebase-initialized*
+      (multiple-value-bind (base offset)
+	  (time:get-universal-time-and-offset)
+	(multiple-value-bind (clock high-bits)
+	    (time:full-microsecond-time)
+	  (let ((delta-interval (* (- (- universal-time base) offset) 1000000.)))
+	    (multiple-value-bind (expires high-order-bits)
+		(if (and (zl:fixnump delta-interval) (plusp delta-interval))
+		    ;; common case, don't cons, and be quick
+		    (multiple-value-bind (expires high-order-bits)
+			(si:%add-bignum-step delta-interval clock 0)
+		      (values expires (+ high-order-bits high-bits)))
+		    ;; OK.  Long time away; this is rare.
+		    (let ((new-time (+ (si:%make-bignum-from-fixnum-components
+					 0 2 clock high-bits)
+				       delta-interval)))
+		      (if (zL:fixnump new-time)
+			  (values new-time 0)
+			  (values (si:bignum-ref new-time 0) (si:bignum-ref new-time 1)))))
+	      (set-timer expires high-order-bits timer))
+	    (setf (timer-universal-time timer) universal-time)
+	    (setf (timer-warm-boot-action timer) 't)
+	    delta-interval)))
+      (progn
+	(clear-timer-entry timer)
+	(with-scheduler-locked
+	  (setf (timer-state timer) :pending)
+	  (setf (timer-descriptor timer) nil)
+	  (setf (timer-universal-time timer) universal-time)
+	  (setf (timer-warm-boot-action timer) 't)
+	  (pushnew timer *timers-set-before-ut-initialized*))
+	universal-time)))
+
+(defun reset-timer-relative-timer-units (timer delta-t)
+  (declare (inline (setf timer-warm-boot-action) (setf timer-universal-time)))
+  (if (or (zl:fixnump delta-t) (zl:fixnump (setq delta-t (floor delta-t))))
+      (multiple-value-bind (clock high-bits)
+	  (time:full-microsecond-time)
+	(multiple-value-bind (expires high-order-bits)
+	    (si:%add-bignum-step delta-t clock 0)
+	  (set-timer expires (+ high-order-bits high-bits) timer)))
+      (unless (zl:bigp delta-t)
+	(error "The argument, DELTA-T, to ~S, must either be an integer, or coerceable to an integer."
+	       'RESET-TIMER-RELATIVE-TIMER-UNITS))
+      (let ((low-delta (si:bignum-ref delta-t 0))
+	    (high-delta (if (> (si:bignum-length delta-t) 1) (si:bignum-ref delta-t 1) 0)))
+	(multiple-value-bind (clock high-bits)
+	    (time:full-microsecond-time)
+	  (multiple-value-bind (expires high-order-bits)
+	      (si:%add-bignum-step low-delta clock 0)
+	    (set-timer expires (+ high-order-bits high-bits high-delta) timer)))))
+  (setf (timer-warm-boot-action timer) nil)
+  (setf (timer-universal-time timer) nil)
+  delta-t)
+
+      
+;; absolute time is a microsecond-clock value.
+(defun reset-timer-absolute-timer-units (timer clock-time)
+  (declare (inline (setf timer-warm-boot-action) (setf timer-universal-time)))
+  (unless (zl:fixnump clock-time)
+    (error "CLOCK-TIME must be a 32 bit microsecond-clock time"))
+  (multiple-value-bind (clock high-bits)
+      (time:full-microsecond-time)
+    (when (time-lessp clock clock-time)
+      (incf high-bits))
+    (set-timer clock-time high-bits timer))
+  (setf (timer-warm-boot-action timer) nil)
+  (setf (timer-universal-time timer) nil)
+  clock-time)
+
+(defun clear-timer (timer)
+  (clear-timer-entry timer))
+
+(defun set-timer-universal-time-internal (timer)
+  (declare (inline (setf timer-universal-time) timer-state
+		   timer-expires timer-high-order-bits))
+  (when time:*timebase-initialized*
+    (with-scheduler-locked
+      (setf (timer-universal-time timer)
+	    (and (eq (timer-state timer) :pending)
+		 (multiple-value-bind (clock high)
+		     (time:full-microsecond-time)
+		   (multiple-value-bind (base offset)
+		       (time:get-universal-time-and-offset)
+		     (+ base
+			(floor
+			  (- (si:%make-bignum-from-fixnum-components
+			       0 2
+			       (timer-expires timer) (timer-high-order-bits timer))
+			     (si:%make-bignum-from-fixnum-components 0 2
+								     clock high))
+			  1000000.)
+			offset))))))))
+
+(defun set-timer-warm-boot-action (timer warm-boot-action)
+  (declare (inline (setf timer-warm-boot-action) timer-universal-time
+		   (setf timer-universal-time)))
+  (setf (timer-warm-boot-action timer) warm-boot-action)
+  (if warm-boot-action
+      (unless (timer-universal-time timer)
+	(if time:*timebase-initialized*
+	    (set-timer-universal-time-internal timer)
+	    (cerror "Leave WARM-BOOT-ACTION as before"
+		    "The system's calendar clock has not been initialized yet, so times specified now will have no meaning after a warm-boot.")))
+      (setf (timer-universal-time timer) nil))
+  warm-boot-action)
+
+(defun timer-expiration-time (timer)
+  (declare (values full-microsecond-time-low full-microsecond-time-high))
+  (declare (inline timer-expires timer-high-order-bits))
+  (values (timer-expires timer) (timer-high-order-bits timer)))
+
+(defun timer-universal-time-of-expiration (timer)
+  (declare (inline timer-universal-time))
+  (or (timer-universal-time timer)
+      (progn
+	(set-timer-universal-time-internal timer)
+	(timer-universal-time timer))))
+
+;; predicates
+
+(defun timer-expired-p (timer)
+  (declare (inline timer-state))
+  (let ((state (timer-state timer)))
+    (or (eq state ':expired)
+	(eq state ':executing))))
+
+(defun timer-pending-p (timer)
+  (declare (inline timer-state))
+  (eq (timer-state timer) ':pending))
+
+(defun timer-should-have-expired-p (timer)
+  (declare (inline timer-expires timer-high-order-bits))
+  (multiple-value-bind (clock high)
+      (time:full-microsecond-time)
+    (full-time-< (timer-expires timer) (timer-high-order-bits timer) clock high)))
+
+(defun timer-expires-by (timer relative-time)
+  (timer-expires-by-relative-timer-units timer (floor relative-time *timer-units*)))
+
+(defun timer-expires-by-relative-timer-units (timer relative-time)
+  (declare (inline timer-expires timer-high-order-bits))
+  (multiple-value-bind (lt1 ht1) (time:full-microsecond-time)
+    (multiple-value-bind (lt1 carry)
+	(si:%add-bignum-step lt1 relative-time 0)
+      (incf ht1 carry)
+      (full-time-< (timer-expires timer) (timer-high-order-bits timer) lt1 ht1))))
+
+(defun safe-to-use-timers (process)
+  (not (eql process *timer-task*)))
+
+
+
+;;; A plug-in replacement for the timer wheels facility with the goals:
+;;;  - be so simple that it can be bug-free by inspection
+;;;  - be reasonably efficient in current practice
+;;;  - avoid a lot of overhead for dynamic allocation of descriptors, caching,
+;;;    keeping redundantly stored information consistent, etc.
+;;;  - accept asymptotic slowness as the price of efficiency
+
+;;; The basic idea is to maintain a sorted, doubly-linked list of TIMER objects.
+;;; This makes top, next, remove-top, and delete fast.
+;;; To make number-of-entries fast, we also remember the length of the list.
+;;; To speed up insertion, there is an array of hints.
+;;; The nth hint is the first timer that could possibly be scheduled for
+;;; 2n timer units in the future, or NIL.  NIL does not mean that we
+;;; are sure that there no timers 2n or more into the future.
+;;; The hint array cuts the overhead of insert by remembering information
+;;; gleaned during previous inserts.  This works because time never goes backwards.
+;;; The asymptotic behavior of insert is a linear search, but in practice the
+;;; most common insert operations are very close to the front of the queue,
+;;; and the others are helped by the hints to an increasing degree as the
+;;; queue gets longer.
+
+;; This many hints are not maintained because they would cost more than they are worth
+(defconstant first-hint-bit 19)		;1/2 second
+
+;; This many hints are actually stored
+(defconstant number-of-hints (- 64 first-hint-bit))
+
+;; this only works for fixnums
+(defsubst unsigned-< (n1 n2)
+  #+3600
+  (if (minusp n1)
+      (and (minusp n2) (< n1 n2))
+      (or (minusp n2) (< n1 n2)))
+  #+imach
+  (sys:%unsigned-lessp n1 n2))
+
+(defsubst full-time-< (lt1 ht1 lt2 ht2)
+  (or (< ht1 ht2)
+      (and (= ht1 ht2)
+	   (unsigned-< lt1 lt2))))
+
+;; The index in the hint array for the range of times that includes this one
+(defsubst timer-hint-index (low-key high-key low-now high-now)
+  (multiple-value-bind (low-difference borrow)
+      (sys:%sub-bignum-step low-key low-now 0)
+    (let ((high-difference (- high-key high-now borrow)))
+      (cond ((zerop high-difference) (integer-length (lsh low-difference (- first-hint-bit))))
+	    ((minusp high-difference) 0)
+	    (t (+ (integer-length high-difference) (- 32 first-hint-bit)))))))
+
+;; The earliest time with the given hint-index
+(defsubst timer-hint-start-time (hint-index low-now high-now)
+  (declare (values hint-low hint-high))
+  (cond ((zerop hint-index) (values low-now high-now))
+	(( hint-index (- 32 first-hint-bit))
+	 (multiple-value-bind (sum carry)
+	     (sys:%add-bignum-step low-now (lsh 1 (+ hint-index first-hint-bit -1)) 0)
+	   (values sum (+ high-now carry))))
+	(t (values low-now (+ high-now (ash 1 (- hint-index (- 32 first-hint-bit) 1)))))))
+
+(defflavor heap-item-not-found
+	(heap key)
+	(error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(defmethod (:report heap-item-not-found) (stream)
+  (format stream "Could not find item for key ~S in heap ~S." key heap))
+
+(compile-flavor-methods heap-item-not-found)
+
+(eval-when (compile load eval)  ;eval-when needed by optimize-wakeups
+(defparameter *optimized-timer-functions*
+	      '(process-wakeup
+		process-force-wakeup
+		start-polling-processes
+		set-process-priority-after-time-1
+		tv:who-line-screen-update
+		tv:who-line-screen-mouse-documentation-update)))
+
+
+
+;; This is the value of *pending-timers*, which follows heap protocol
+(defflavor simple-timer-queue
+	   ((first-timer nil)			;head of queue, goes off earliest
+	    (last-timer nil)			;tail of queue, goes off latest
+	    (hint (make-array number-of-hints))	;array of hints to speed up insert
+	    (length 0)				;number of timers in queue
+	    ;; Metering
+	    (number-of-deletes 0)
+	    (number-of-remove-tops 0)
+	    (number-of-inserts 0)
+	    (number-of-search-steps 0)
+	    (number-of-missing-hints 0)
+	    (number-of-corrected-hints 0)
+	    (number-of-additional-hint-correction-steps 0)
+	    (number-of-additional-corrected-hints 0))
+	   ())
+
+(defmethod (clear simple-timer-queue) ()
+  (declare (inline timer-next timer-current-queue (setf timer-current-queue)))
+  (loop for timer = first-timer then (timer-next timer) until (null timer) do
+    (when (eq (timer-current-queue timer) self)
+      (setf (timer-current-queue timer) nil)))
+  (setq first-timer nil last-timer nil length 0)
+  (fill hint nil))
+
+(defmethod (empty-p simple-timer-queue) ()
+  (null first-timer))
+
+(defmethod (number-of-entries simple-timer-queue) ()
+  length)
+
+;; Calls function on each timer in order, args are time-low, time-high, timer
+(defmethod (map-heap simple-timer-queue) (function)
+  (declare (sys:downward-funarg function))
+  (declare (inline timer-next timer-expires timer-high-order-bits))
+  (with-scheduler-locked
+    (loop for timer = first-timer then (timer-next timer) until (null timer) do
+      (funcall function (timer-expires timer) (timer-high-order-bits timer) timer))))
+
+(defmethod (:describe simple-timer-queue) (&optional (stream *standard-output*))
+  (format stream "~&~S is the system's collection of pending timers, ~
+		  it contains ~D element~:P."
+	  self (number-of-entries self))
+  (when (and (not (empty-p self))
+	     (y-or-n-p "Do you want to see the contents of the heap? "))
+    (let ((list nil))
+      (multiple-value-bind (low-now high-now)
+          (time:full-microsecond-time)
+	(map-heap self #'(lambda (low-key high-key item)
+			   (push (list low-key high-key item) list)))
+	(setq list (nreverse list))
+	(fresh-line)
+	(formatting-table (*standard-output* :inter-column-spacing 2)
+	  (formatting-column-headings (*standard-output* :underline-p t)
+	    (formatting-cell () "Absolute Time")
+	    (formatting-cell () "Relative")
+	    (formatting-cell () "Timer"))
+	  (loop for (low-key high-key item) in list do
+	    (formatting-row ()
+	      (formatting-cell () (format t "~D,~D" high-key low-key))
+	      (formatting-cell (*standard-output* :align-x :right)
+		(let ((diff (* (+ (ash (- high-key high-now) 32)
+				  (multiple-value-bind (difference borrow)
+				      (sys:%sub-bignum-step low-key low-now 0)
+				    (+ difference
+				       (ash (- borrow) 32)
+				       (if (minusp difference) (ash 1 32) 0))))
+			       (float *timer-units*))))
+		  (cond ((< diff 10) (format t "~3$" diff))
+			((< diff 60) (format t "~1$~2@T" diff))
+			((< diff 3600)
+			 (format t "~D:~2,'0D~4@T"		;mm:ss
+				 (floor diff 60) (round (mod diff 60))))
+			(t
+			 (format t "~D:~2,'0D:~2,'0D~4@T"	;hh:mm:ss
+				 (floor diff 3600) (floor (mod diff 3600) 60)
+				 (round (mod diff 60)))))))
+	      (formatting-cell () (prin1 item))))))))
+  (format stream "~&Meters: ~:D insert~:P, ~:D remove-top~:P, ~:D delete~:P.~@
+		  ~:D search step~:P (~$ avg/insert), ~:D missing, ~:D corrected hints.~@
+		  ~:D additional hint correction step~:P resulting in ~:D correction~:P."
+	  number-of-inserts number-of-remove-tops number-of-deletes
+	  ;; Compute the average number of search steps.  Note that the insert method
+	  ;; did not count the first step (full-time-< comparison with start)
+	  (+ number-of-search-steps number-of-inserts)
+	  (if (plusp number-of-inserts)
+	      (/ (float (+ number-of-search-steps number-of-inserts)) number-of-inserts)
+	      0)
+	  number-of-missing-hints number-of-corrected-hints
+	  number-of-additional-hint-correction-steps number-of-additional-corrected-hints))
+
+(defmethod (top simple-timer-queue) ()
+  (declare (values item low-key high-key exists-p))
+  (declare (inline timer-expires timer-high-order-bits))
+  (let ((timer first-timer))
+    (and timer
+	 (values timer (timer-expires timer) (timer-high-order-bits timer) t))))
+
+(defmethod (next simple-timer-queue) ()
+  (declare (values item low-key high-key exists-p))
+  (declare (inline timer-next timer-expires timer-high-order-bits))
+  (let ((timer first-timer))
+    (and timer
+	 (setq timer (timer-next timer))
+	 (values timer (timer-expires timer) (timer-high-order-bits timer) t))))
+
+(defsubst-in-flavor (delete-internal simple-timer-queue) (timer)
+  (declare (inline timer-hint-reference-count timer-lowest-hint
+		   (setf timer-hint-reference-count) (setf timer-lowest-hint)
+		   timer-next timer-previous timer-current-queue
+		   (setf timer-next) (setf timer-previous) (setf timer-current-queue)))
+  (unless (zerop (timer-hint-reference-count timer))
+    (let ((hint hint))
+      (declare (sys:array-register hint))
+      (loop for i from (timer-lowest-hint timer) below number-of-hints
+	    with c = (timer-hint-reference-count timer)
+	    with next = (timer-next timer) do
+	(when (eq (aref hint i) timer)
+	  (setf (aref hint i) next)
+	  (unless (null next)
+	    (incf (timer-hint-reference-count next))
+	    (setf (timer-lowest-hint next) (min (timer-lowest-hint next) i)))
+	  (when (zerop (decf c)) (return))))))
+  (decf length)
+  (setf (timer-next timer) nil
+	(timer-previous timer) nil
+	(timer-current-queue timer) nil))
+
+(defmethod (remove-top simple-timer-queue) ()
+  (declare (values item low-key high-key top))
+  (declare (inline timer-next timer-expires timer-high-order-bits
+		   (setf timer-previous)))
+  (let ((timer first-timer))
+    (when timer
+      (if (setq first-timer (timer-next timer))
+	  (setf (timer-previous first-timer) nil)
+	  (setq last-timer nil))
+      (delete-internal timer)
+      (si:incf* number-of-remove-tops)
+      (values timer (timer-expires timer) (timer-high-order-bits timer) t))))
+
+;; Signals heap-item-not-found if we think it's not in the heap
+;; To avoid taking linear time this has to assume the descriptor is accurate
+;; We can ignore the equal-predicate and descriptor arguments because we
+;; know that clear-timer-entry and set-timer don't do anything special with them
+;; The only reason to accept those arguments is to make patching easier
+(defmethod (delete-by-item simple-timer-queue) (timer &optional ignore ignore)
+  (declare (values item low-key high-key))
+  (declare (inline timer-current-queue timer-next timer-previous (setf timer-next)
+		   (setf timer-previous) timer-expires timer-high-order-bits))
+  (compiler:%error-unless (eq (timer-current-queue timer) self)
+    (signal 'heap-item-not-found :heap self :key timer)
+    (return-from delete-by-item nil))
+  (si:incf* number-of-deletes)
+  (let ((next (timer-next timer))
+	(previous (timer-previous timer)))
+    (if next
+	(setf (timer-previous next) previous)
+	(setq last-timer previous))
+    (if previous
+	(setf (timer-next previous) next)
+	(setq first-timer next))
+    (delete-internal timer)
+    (values timer (timer-expires timer) (timer-high-order-bits timer))))
+
+;; No need to bother implementing this, the caller will call delete and insert
+(defmethod (reset-in-place simple-timer-queue) (timer descriptor low-time high-time)
+  (ignore timer descriptor low-time high-time)
+  nil)
+
+;; This is where the hair is, primarily because of the "hint" optimization
+(defmethod (insert simple-timer-queue) (low-key high-key timer)
+  (declare (values timer low-key high-key new-top descriptor))
+  (declare (inline timer-current-queue (setf timer-current-queue)
+		   timer-hint-reference-count (setf timer-hint-reference-count)
+		   timer-lowest-hint (setf timer-lowest-hint)
+		   timer-next (setf timer-next) timer-previous (setf timer-previous)
+		   timer-expires timer-high-order-bits timer-descriptor))
+  (compiler:%error-when (eq (timer-current-queue timer) self)
+    (cerror "Remove from queue and continue"
+	    "Internal CONSISTENCY ERROR: Timer ~S already in queue" timer)
+    (delete-by-item self timer))
+
+  (setf (timer-current-queue timer) self
+	(timer-hint-reference-count timer) 0
+	(timer-lowest-hint timer) number-of-hints)
+  (incf length)
+  (si:incf* number-of-inserts)
+  (multiple-value-bind (low-now high-now) (time:full-microsecond-time)
+
+    ;; Figure out where to begin searching for the right place to insert it
+    (let ((hint-index (timer-hint-index low-key high-key low-now high-now))
+	  (hint hint))
+      (declare (sys:array-register hint))
+      (multiple-value-bind (hint-low hint-high)
+	  (timer-hint-start-time hint-index low-now high-now)
+	(let* ((initial-hint (aref hint hint-index))
+	       (start initial-hint))
+	  ;; If there is no hint yet, find one.  We can always use the head of the
+	  ;; queue, but if the tail works, that's better.  start can remain nil
+	  ;; if the queue is completely empty.
+	  (compiler:%error-when (and (null start) (not (null last-timer)))
+	    (si:incf* number-of-missing-hints)
+	    (setq start (if (full-time-< (timer-expires last-timer)
+					 (timer-high-order-bits last-timer)
+					 hint-low hint-high)
+			    last-timer
+			    first-timer)))
+
+	  ;; We know where to start searching, so find the exact place to insert this timer
+	  ;; If the current hint is stale, set update-hint to the new hint
+	  (loop for where = start then (timer-next where) until (null where)
+		with update-hint = nil
+		as low = (timer-expires where) as high = (timer-high-order-bits where)
+		until (full-time-< low-key high-key low high)
+		do (si:incf* number-of-search-steps)
+		   (unless update-hint
+		     (unless (full-time-< low high hint-low hint-high)
+		       (setq update-hint where)))
+		finally
+		  ;; Insert in front of where, or at the end of the queue if where is nil
+		  (let ((previous (if where (timer-previous where) last-timer)))
+		    (setf (timer-next timer) where
+			  (timer-previous timer) previous)
+		    (if where
+			(setf (timer-previous where) timer)
+			(setq last-timer timer))
+		    (if previous
+			(setf (timer-next previous) timer)
+			(setq first-timer timer))
+		    ;; Update the hint
+		    (when (or (null update-hint) (eq update-hint where))
+		      (setq update-hint timer))
+		    (unless (eq update-hint initial-hint)
+		      (si:incf* number-of-corrected-hints)
+		      (unless (null initial-hint)
+			(decf (timer-hint-reference-count initial-hint)))
+		      (incf (timer-hint-reference-count update-hint))
+		      (setf (timer-lowest-hint update-hint)
+			    (min (timer-lowest-hint update-hint) hint-index))
+		      (setf (aref hint hint-index) update-hint))
+		    ;; The timer we just inserted might be the correct hint for
+		    ;; other hint-indexes as well.  This can only happen for
+		    ;; earlier hint-indexes (for later ones, it is already stale),
+		    ;; and can only happen if we inserted directly in front of the old hint.
+		    (unless (null where)
+		      (loop while (> (timer-hint-reference-count where) 0)
+			    for index from (timer-lowest-hint where) below hint-index do
+			(si:incf* number-of-additional-hint-correction-steps)
+			(when (and (eq (aref hint index) where)
+				   (multiple-value-bind (hint-low hint-high)
+				       (timer-hint-start-time index low-now high-now)
+				     (not (full-time-< low-key high-key hint-low hint-high))))
+			  (si:incf* number-of-additional-corrected-hints)
+			  (decf (timer-hint-reference-count where))
+			  (incf (timer-hint-reference-count timer))
+			  (setf (timer-lowest-hint timer)
+				(min (timer-lowest-hint timer) index))
+			  (setf (aref hint index) timer))))
+		    (return-from insert
+		      (values timer low-key high-key (not previous) (timer-descriptor timer)))
+		    )))))))
+
+(defmethod (optimize-wakeups simple-timer-queue) ()
+  (declare (inline timer-expires timer-high-order-bits timer-function (locf timer-state)
+		   timer-name timer-args))
+  ;; also inlines *optimized-timer-functions* to save a page fault on the list
+  (multiple-value-bind (low-now high-now) (time:full-microsecond-time)
+    (multiple-value-bind (low-alarm high-alarm)
+	(multiple-value-bind (sum carry) (sys:%add-bignum-step low-now *timer-resolution* 0)
+	  (values sum (+ high-now carry)))
+      (loop as timer = first-timer until (null timer)
+	    while (full-time-< (timer-expires timer) (timer-high-order-bits timer)
+			       low-alarm high-alarm)
+	    do
+	(let ((function (timer-function timer)))
+	  (cond ((member function '#.*optimized-timer-functions*)
+		 (store-conditional (locf (timer-state timer)) :pending :executing)
+		 (remove-top self)
+		 (unwind-protect-case ()
+		     (let ((name (timer-name timer))
+			   (args (timer-args timer)))
+		       (metering:meter-form (timer-optimized "Processing timer entry")
+					    (name function args)
+			   (apply function args)
+			 name function args))
+		   (:normal
+		     (store-conditional (locf (timer-state timer)) :executing :expired))
+		   (:abort
+		     ;; An error or stack overflow inside the function can cause a throw
+		     ;; through here.  Do not leave the timer in a messed up state.
+		     (when (store-conditional (locf (timer-state timer)) :executing :pending)
+		       ;; The timer had not been reset, so put it back in the queue.
+		       ;; If this was a throw to 'TRIED-TO-BLOCK-IN-VERIFY-FUNCTION or
+		       ;; a stack-overflow, the process will be awakened and will handle
+		       ;; this timer immediately in a more pleasant environment.
+		       (multiple-value-bind (item low-key high-key new-top descriptor)
+			   (insert self low-now high-now timer)
+			 (declare (ignore item))	;Don't bother with consistency check
+			 (setf (timer-descriptor timer) descriptor)
+			 (setf (timer-expires timer) low-key)
+			 (setf (timer-high-order-bits timer) high-key)
+			 (when new-top
+			   (%set-next-timer-wakeup low-key)))))))
+		(t
+		 (return-from optimize-wakeups t)))))	;only the process can handle this timer
+	;; we've done all the work that the timer process would have done, so return nil
+	;; and reset the timer wakup.
+	(when first-timer
+	  (unless (= (timer-high-order-bits first-timer) high-now)
+	    (return-from optimize-wakeups t)))	;Duuh...
+	(%set-next-timer-wakeup (and first-timer (timer-expires first-timer)))
+	nil)))
+
+(compile-flavor-methods simple-timer-queue)
+
+
+;; Periodic actions are a veneer that sits on top of the timer facility.  It is supposed to
+;; handle a series of issues that might be either difficult or inconvenient for a programmer
+;; to do from scratch each time.
+
+;; It captures the concept of a function that wants to be executed every INTERVAL seconds.
+
+;; The interval can either be measured from the start of execution of
+;; each function (:PERIOD-STARTS :FROM-START), 
+;; or a measure of the gap between the end of one execution of the
+;; function to the beginning of the next. (:PERIOD-STARTS :FROM-END)
+
+;; Whenever you deal with such a beast you have to worry about the race
+;; condition of starting and stopping the periodic action.  (If you
+;; clear the timer while the timer is executing, and the timer
+;; re-enables itself at the end of the form, then you have no way of
+;; knowing whether you shut if off, or not.)
+
+;; Similarly, there's the question of stopping (resetting or disabling)
+;; the processes currently executing the function.
+
+;; Finally, there's the error recovery and control of how many
+;; outstanding instances of the function do you allow executing
+;; simultaneously.  (If the function is :FROM-START and it takes longer
+;; than INTERVAL to run then you'll have more than one.  Likewise, if
+;; the periodic-action is :FROM-END, and the function takes a lot longer
+;; than INTERVAL, you might want to start up a second instance of the
+;; function.
+
+
+(DEFVAR *PERIODIC-ACTIONS* NIL)   			;; all known periodic actions
+(SYS:DEFVAR-RESETTABLE *CURRENT-PERIODIC-ACTION* NIL)	;; Used so we know if we're inside
+                                                        ;; a periodic-action
+  
+
+(DEFUN MAP-OVER-PERIODIC-ACTIONS (FUNCTION)
+  (MAP NIL FUNCTION *PERIODIC-ACTIONS*))
+
+(DEFFLAVOR PERIODIC-ACTION
+	((NAME "Periodic Action")
+	 (FUNCTION #'IGNORE)
+	 (ARGUMENTS NIL)
+	 (RUN-REASONS (LIST :ENABLE))
+	 (ARREST-REASONS NIL)
+	 (LOCK NIL)
+	 (INTERVAL NIL)
+	 (TIMER NIL)
+	 (PRIORITY *DEFAULT-TIMER-ENTRY-PRIORITY*)
+	 (PERIOD-STARTS :FROM-START) ;; or :FROM-END
+	 ;;Recovery time: if :FROM-END, when to start a new-one, even though
+	 ;;the old one hasn't finished *yet*
+	 ;;If :FROM-START, when to start suppressing new ones.
+	 (RECOVERY-TIME NIL)
+	 (RECOVERY-ACTION NIL)
+	 ;; when the outstanding count passes MAX-OUTSTANDING on the way down, immediately
+	 ;; start a new one.
+	 (MAX-OUTSTANDING 2)
+	 (STATE :DEAD)
+	 (DEBUG-FLAG 0)
+	 (PROCESSES NIL)    ;; processes can be NIL, a PROCESS, or an array.
+	 (IDLE-WAITERS NIL) ;; list of processes that are waiting for us to become idle.
+	 (SPARE-SLOT-1 NIL))
+	()
+  (:INITABLE-INSTANCE-VARIABLES NAME RUN-REASONS ARREST-REASONS INTERVAL PERIOD-STARTS
+				RECOVERY-TIME MAX-OUTSTANDING)
+  (:READABLE-INSTANCE-VARIABLES NAME MAX-OUTSTANDING RUN-REASONS ARREST-REASONS DEBUG-FLAG)
+  (:WRITABLE-INSTANCE-VARIABLES SPARE-SLOT-1)
+  (:CONSTRUCTOR DEFINE-PERIODIC-ACTION
+   (NAME INTERVAL FUNCTION
+	 &KEY ARGUMENTS RUN-REASONS ARREST-REASONS PRIORITY
+	 PERIOD-STARTS RECOVERY-TIME MAX-OUTSTANDING)))
+
+;; maybe the recover mechanism should have a seperate timer?
+;; maybe :from-start and :from-end should have seperate top-level functions?
+
+(DEFMETHOD (MAKE-INSTANCE PERIODIC-ACTION :AFTER) (&rest init-options)
+  (DECLARE (IGNORE INIT-OPTIONS))
+  (DBG:CHECK-ARG PERIOD-STARTS
+		 (OR (EQL PERIOD-STARTS :FROM-START) (EQL PERIOD-STARTS :FROM-END))
+		 "either :FROM-START or :FROM-END")
+  (DBG:CHECK-ARG RECOVERY-TIME (OR (AND (NUMBERP RECOVERY-TIME) (PLUSP RECOVERY-TIME))
+				   (NULL RECOVERY-TIME))
+		 "a positive number or NIL")
+  (DBG:CHECK-ARG MAX-OUTSTANDING (AND (INTEGERP MAX-OUTSTANDING) (PLUSP MAX-OUTSTANDING))
+		 "a positive integer")
+  (DBG:CHECK-ARG INTERVAL (AND (NUMBERP INTERVAL) (PLUSP INTERVAL))
+		 "a positive number")
+  (CHECK-TYPE NAME (OR STRING NULL))
+  (SETF INTERVAL (FLOOR INTERVAL *TIMER-UNITS*))
+  (SETF RECOVERY-TIME (AND RECOVERY-TIME (FLOOR RECOVERY-TIME *TIMER-UNITS*)))
+  (SETF TIMER (CREATE-TIMER-CALL #'PERIODIC-ACTION-TOP-LEVEL (LIST SELF)
+					 :NAME NAME :PRIORITY PRIORITY))
+  (SETF LOCK (MAKE-LOCK NAME))
+  (WITH-LOCK (LOCK)
+    (PROCESS-CONSIDER-RUNNABILITY SELF)))
+
+(DEFMETHOD (PERIODIC-ACTION-INTERVAL PERIODIC-ACTION) ()
+  (LET ((SECONDS (* INTERVAL *TIMER-UNITS*)))
+    (IF (INTEGERP SECONDS)
+	SECONDS
+	(FLOAT SECONDS))))
+
+(DEFMETHOD (PERIODIC-ACTION-RECOVERY-TIME PERIODIC-ACTION) ()
+  (WHEN RECOVERY-TIME
+    (LET ((SECONDS (* RECOVERY-TIME *TIMER-UNITS*)))
+      (IF (INTEGERP SECONDS)
+	  SECONDS
+	  (FLOAT SECONDS)))))
+
+(DEFVAR *PERIODIC-ACTION-ARREST-REASON* (SI:GENSYMBOL "PERIODIC-ACTION"))
+
+;; The next two functions need to be called with the periodic-action locked.
+
+;; Make this periodic-action alive, by making it "known"
+(DEFUN-IN-FLAVOR (ENABLE-PERIODIC-ACTION PERIODIC-ACTION) (&OPTIONAL (NEW-STATE :ARRESTED))
+  (WHEN (EQ STATE :DEAD)
+    (SETQ STATE NEW-STATE)
+    ;; interlock against other periodic-actions
+    (ATOMIC-PUSH SELF *PERIODIC-ACTIONS*)))
+
+;; Make this periodic-action dead, by removing it from "known" periodic-actions
+(DEFUN-IN-FLAVOR (DISABLE-PERIODIC-ACTION PERIODIC-ACTION) (&OPTIONAL (NEW-STATE :DEAD))
+  ;; interlock against other periodic-actions
+  (WITH-SCHEDULER-LOCKED
+    (SETQ STATE NEW-STATE)
+    (SETQ *PERIODIC-ACTIONS* (DELETE SELF *PERIODIC-ACTIONS*))))
+
+;; must be called with the lock for this periodic-action held.
+(DEFMETHOD (PROCESS-CONSIDER-RUNNABILITY PERIODIC-ACTION) ()
+  (IF (AND RUN-REASONS (NULL ARREST-REASONS))
+      (PROGN
+	(WHEN (EQ STATE :DEAD)
+	  ;; don't set it :ALIVE yet, so it can share code below
+	  (ENABLE-PERIODIC-ACTION :ARRESTED))
+	(UNLESS (EQ STATE :ALIVE)
+	  (SETQ STATE :ALIVE)
+	  (RESET-TIMER-RELATIVE-TIMER-UNITS TIMER INTERVAL)
+	  (WHEN PROCESSES
+	    (IF (ARRAYP PROCESSES)
+		(MAP NIL #'ENABLE PROCESSES)
+		(ENABLE PROCESSES)))))
+      (WHEN (EQ STATE :ALIVE)
+	(SETQ STATE :ARRESTED)
+	(CLEAR-TIMER TIMER)
+	(WHEN PROCESSES
+	  (IF (ARRAYP PROCESSES)
+	      (MAP NIL
+		   #'(LAMBDA (PROC)
+		       (ENABLE-ARREST-REASON PROC *PERIODIC-ACTION-ARREST-REASON*))
+		   PROCESSES)
+	      (ENABLE-ARREST-REASON PROCESSES *PERIODIC-ACTION-ARREST-REASON*))))))
+
+;; needs to be called with lock held for consistency
+(DEFUN-IN-FLAVOR (NUMBER-OUTSTANDING PERIODIC-ACTION) ()
+  (IF (ARRAYP PROCESSES)
+      (FILL-POINTER PROCESSES)
+      (IF PROCESSES 1 0)))
+
+
+;; We can make this a lot more efficient by having seperate top-level
+;; functions for :from-start vs, :from-end, for periodic-actions that
+;; have max-outstanding of 1, and so on.
+(DEFMETHOD (PERIODIC-ACTION-TOP-LEVEL PERIODIC-ACTION) ()
+  (CATCH-ERROR-RESTART ((ERROR) "Stop this periodic action")
+    (UNWIND-PROTECT
+	(ERROR-RESTART ((ERROR) "Restart this periodic action")
+	  (LET (REAL-FUNCTION REAL-ARGS)        ;so that we can get a consistent snapshot
+						;with lock held
+	    (WITH-LOCK (LOCK)
+	      (WHEN (OR (NOT (EQ STATE :ALIVE))
+			( (NUMBER-OUTSTANDING) MAX-OUTSTANDING))
+		(RETURN-FROM PERIODIC-ACTION-TOP-LEVEL NIL))
+	      (COND ((EQL PERIOD-STARTS :FROM-START)
+		     (RESET-TIMER-RELATIVE-TIMER-UNITS TIMER INTERVAL))
+		    ((EQL PERIOD-STARTS :FROM-END)
+		     (WHEN RECOVERY-TIME
+		       (RESET-TIMER-RELATIVE-TIMER-UNITS TIMER RECOVERY-TIME))))
+	      (IF (NULL PROCESSES)
+		  (SETF PROCESSES *CURRENT-PROCESS*)
+		  (IF (ARRAYP PROCESSES)
+		      (VECTOR-PUSH-EXTEND *CURRENT-PROCESS* PROCESSES)
+		      (LET ((OTHER-PROCESS PROCESSES))
+			(SETF PROCESSES (MAKE-ARRAY 4 :FILL-POINTER 0))
+			(VECTOR-PUSH-EXTEND OTHER-PROCESS PROCESSES)
+			(VECTOR-PUSH-EXTEND *CURRENT-PROCESS* PROCESSES))))
+	      (SETF REAL-FUNCTION FUNCTION REAL-ARGS ARGUMENTS)
+	      )
+	    (CATCH 'PERIODIC-ACTION-TOP-LEVEL
+	      (LET ((*CURRENT-PERIODIC-ACTION* SELF))
+		(APPLY REAL-FUNCTION REAL-ARGS)))))
+      (LET ((WAKEES NIL))
+	(UNWIND-PROTECT
+	    (WITH-LOCK (LOCK)
+	      (IF (ARRAYP PROCESSES)
+		  (WHEN (PLUSP (FILL-POINTER PROCESSES))
+		    (LET ((THE-PROCESSES PROCESSES))
+		      (DECLARE (SYS:ARRAY-REGISTER THE-PROCESSES))
+		      (LET ((PROCESS-X (AREF THE-PROCESSES (1- (FILL-POINTER THE-PROCESSES)))))
+			(IF (EQL PROCESS-X *CURRENT-PROCESS*)
+			    (VECTOR-POP THE-PROCESSES)
+			    (LOOP FOR I FROM 0 BELOW (FILL-POINTER THE-PROCESSES) DO
+			      (WHEN (EQL (AREF THE-PROCESSES I) *CURRENT-PROCESS*)
+				(SETF (AREF THE-PROCESSES I) (VECTOR-POP THE-PROCESSES))
+				(RETURN)))))))
+		  (WHEN (EQL PROCESSES *CURRENT-PROCESS*)
+		    (SETF PROCESSES NIL)))
+	      (WHEN (AND IDLE-WAITERS
+			 (OR (NULL PROCESSES)
+			     (AND (ARRAYP PROCESSES) (ZEROP (FILL-POINTER PROCESSES)))))
+		(SETF WAKEES IDLE-WAITERS)
+		(SETF IDLE-WAITERS NIL))
+	      (UNLESS (EQ STATE :ALIVE) (RETURN-FROM PERIODIC-ACTION-TOP-LEVEL NIL))
+	      (COND ((EQL PERIOD-STARTS :FROM-END)
+		     (RESET-TIMER-RELATIVE-TIMER-UNITS TIMER INTERVAL))
+		    ((EQL PERIOD-STARTS :FROM-START)
+		     (WHEN (= (NUMBER-OUTSTANDING) MAX-OUTSTANDING)
+		       (RESET-TIMER-RELATIVE-TIMER-UNITS TIMER INTERVAL)))))
+	  (WHEN WAKEES
+	    (MAP NIL #'WAKEUP WAKEES)))))))
+
+;; 
+;; enable and disable.
+(DEFMETHOD (PROCESS-ENABLE PERIODIC-ACTION) ()
+  (WITH-LOCK (LOCK) 
+    (SETF RUN-REASONS (LIST ':ENABLE))
+    (SETF ARREST-REASONS NIL)
+    (PROCESS-CONSIDER-RUNNABILITY SELF)))
+
+(DEFMETHOD (PROCESS-DISABLE PERIODIC-ACTION) ()
+  (WITH-LOCK (LOCK)
+    (SETF RUN-REASONS NIL)
+    (SETF ARREST-REASONS NIL)
+    (PROCESS-CONSIDER-RUNNABILITY SELF)))
+
+(DEFMETHOD (PROCESS-ENABLE-RUN-REASON PERIODIC-ACTION) (&OPTIONAL (REASON ':USER))
+  (WITH-LOCK (LOCK)
+    (COND ((NOT (MEMBER REASON RUN-REASONS))
+	   (PUSH REASON RUN-REASONS)
+	   (PROCESS-CONSIDER-RUNNABILITY SELF)))))
+
+(DEFMETHOD (PROCESS-DISABLE-RUN-REASON PERIODIC-ACTION) (&OPTIONAL (REASON ':USER))
+  (WITH-LOCK (LOCK)
+    (SETQ RUN-REASONS (DELETE REASON RUN-REASONS))
+    (PROCESS-CONSIDER-RUNNABILITY SELF)))
+
+(DEFMETHOD (PROCESS-ENABLE-ARREST-REASON PERIODIC-ACTION) (&OPTIONAL (REASON ':USER))
+  (WITH-LOCK (LOCK)
+    (COND ((NOT (MEMBER REASON ARREST-REASONS))
+	   (PUSH REASON ARREST-REASONS)
+	   (PROCESS-CONSIDER-RUNNABILITY SELF)))))
+
+(DEFMETHOD (PROCESS-DISABLE-ARREST-REASON PERIODIC-ACTION) (&OPTIONAL (REASON ':USER))
+  (WITH-LOCK (LOCK)
+    (SETQ ARREST-REASONS (DELETE REASON ARREST-REASONS))
+    (PROCESS-CONSIDER-RUNNABILITY SELF)))
+
+;;
+;; RESET, PRESET, and KILL
+(DEFMETHOD (PROCESS-PRESET PERIODIC-ACTION) (PERIODIC-FUNCTION &REST ARGS)
+  (WITH-LOCK (LOCK)
+    (SETF FUNCTION PERIODIC-FUNCTION)
+    (SETF ARGUMENTS (COPY-LIST ARGS)))
+  ;; We don't keep the lock held around the process-reset, since the
+  ;; lock isn't recursive.  This doesn't make a difference in terms of
+  ;; correctness (we get a consistent version of function and args even
+  ;; if we're interrupted), but you might occasionally reset a couple of
+  ;; processes unnecessarily (they might already have the new function).
+  (PROCESS-RESET SELF))
+
+(DEFUN RESTART-PERIODIC-ACTION (ACTION)
+  (WHEN (EQL ACTION *CURRENT-PERIODIC-ACTION*)
+    (THROW 'PERIODIC-ACTION-TOP-LEVEL NIL)))
+
+(DEFMETHOD (PROCESS-RESET PERIODIC-ACTION)
+	   (&OPTIONAL UNWIND-OPTION KILL (WITHOUT-ABORTS ':ASK))
+  (WITH-LOCK (LOCK)
+    ;;; Why propogate the SI: crock?
+    (IGNORE UNWIND-OPTION)
+    ;; implement this later:
+    (IGNORE WITHOUT-ABORTS)
+    (IF (ARRAYP PROCESSES)
+	(PROGN
+	  (MAP NIL #'(LAMBDA (PROC)
+		       ; make it work to reset CURRENT-PROCESS.  We can't do the interrupt now,
+		       ; otherwise the rest of the function won't get executed.  Special case
+		       ; this at end.
+		       (UNLESS (EQL PROC *CURRENT-PROCESS*)
+			 (INTERRUPT PROC #'RESTART-PERIODIC-ACTION SELF)))
+	       PROCESSES)
+	  (SETF (FILL-POINTER PROCESSES) 0))
+	(WHEN PROCESSES
+	  (UNLESS (EQL PROCESSES *CURRENT-PROCESS*)
+	    (INTERRUPT PROCESSES #'RESTART-PERIODIC-ACTION SELF))
+	  (SETF PROCESSES NIL)))
+    (WHEN KILL
+      (SETF ARREST-REASONS NIL)
+      (SETF RUN-REASONS NIL)
+      (PROCESS-CONSIDER-RUNNABILITY SELF)
+      (WHEN (LDB-TEST PROCESS-DEBUG-KILL-PROCESS-ON-RESET DEBUG-FLAG)
+	(DISABLE-PERIODIC-ACTION :DEAD)))
+    (WHEN (EQL *CURRENT-PERIODIC-ACTION* SELF)
+      (RESTART-PERIODIC-ACTION SELF))))
+
+(DEFMETHOD (RESET-AND-RELEASE-RESOURCES PERIODIC-ACTION)
+	   (&KEY (IF-CURRENT-PROCESS T) (IF-WITHOUT-ABORTS :ASK))
+  (SETF (LDB PROCESS-DEBUG-KILL-PROCESS-ON-RESET DEBUG-FLAG) 0)
+  (PROCESS-RESET SELF
+		 (IF IF-CURRENT-PROCESS :ALWAYS :UNLESS-CURRENT)
+		 T
+		 IF-WITHOUT-ABORTS))
+
+(DEFMETHOD (KILL PERIODIC-ACTION) (&KEY (IF-CURRENT-PROCESS T) (IF-WITHOUT-ABORTS :ASK))
+  (SETF (LDB PROCESS-DEBUG-KILL-PROCESS-ON-RESET DEBUG-FLAG) 1)
+  (PROCESS-RESET SELF
+		 (IF IF-CURRENT-PROCESS :ALWAYS :UNLESS-CURRENT)
+		 T
+		 IF-WITHOUT-ABORTS))
+
+;;
+
+(DEFMETHOD (PROCESS-INITIAL-FUNCTION-AND-ARGUMENTS PERIODIC-ACTION) ()
+  (VALUES FUNCTION ARGUMENTS))
+
+(DEFMETHOD (PERIODIC-ACTION-NUMBER-OUTSTANDING PERIODIC-ACTION) ()
+  (WITH-LOCK (LOCK) (NUMBER-OUTSTANDING)))
+  
+(DEFMETHOD (PERIODIC-ACTION-IDLE-P PERIODIC-ACTION) ()
+  (WITH-LOCK (LOCK)
+    (IF (ARRAYP PROCESSES)
+	(ZEROP (FILL-POINTER PROCESSES))
+	(NULL PROCESSES))))
+
+(DEFMETHOD (PERIODIC-ACTION-DO-IF-IDLE PERIODIC-ACTION) (FUNCTION)
+  (WITH-LOCK (LOCK)
+    (WHEN (IF (ARRAYP PROCESSES)
+	      (ZEROP (FILL-POINTER PROCESSES))
+	      (NULL PROCESSES))
+      (FUNCALL FUNCTION SELF))))
+
+(DEFMETHOD (PERIODIC-ACTION-DO-WHEN-IDLE PERIODIC-ACTION) (FUNCTION)
+  (LOOP DOING
+    (WITH-LOCK (LOCK)
+      (PUSH *CURRENT-PROCESS* IDLE-WAITERS))
+    (BLOCK-PROCESS "Idle Wait for Periodic Action" #'PERIODIC-ACTION-IDLE-P SELF)
+    (WITH-LOCK (LOCK)
+      (WHEN (IF (ARRAYP PROCESSES)
+		(ZEROP (FILL-POINTER PROCESSES))
+		(NULL PROCESSES))
+	(RETURN-FROM PERIODIC-ACTION-DO-WHEN-IDLE (FUNCALL FUNCTION SELF))))))
+
+;; These can't be this simple.  They have to recover from some
+;; assumptions made in top-level.  The simplest thing to do is to have
+;; each of these guys start the timing again (trusting
+;; number-outstanding to fix things up).  On the other hand, for the
+;; short-term these are OK.  Don't document them though.
+(DEFMETHOD ((SETF PERIODIC-ACTION-INTERVAL) PERIODIC-ACTION) (NEW-VALUE)
+  (CHECK-TYPE NEW-VALUE (NUMBER (0)) "a positive number")
+  (SETF INTERVAL (FLOOR NEW-VALUE *TIMER-UNITS*)))
+
+;;
+(DEFMETHOD ((SETF PERIODIC-ACTION-MAX-OUTSTANDING) PERIODIC-ACTION) (NEW-VALUE)
+  (CHECK-TYPE NEW-VALUE (INTEGER 0) "a non-negative integer")
+  (SETF MAX-OUTSTANDING NEW-VALUE))
+
+;;
+(DEFMETHOD ((SETF PERIODIC-ACTION-RECOVERY-TIME) PERIODIC-ACTION) (NEW-VALUE)
+  (DBG:CHECK-ARG NEW-VALUE (OR (NULL NEW-VALUE) (AND (NUMBERP NEW-VALUE)
+						     (> NEW-VALUE 0)))
+		 "NIL or a positive number")
+  (SETF RECOVERY-TIME (AND NEW-VALUE (FLOOR NEW-VALUE *TIMER-UNITS*))))
+
+;; should go in SYS:SCHEDULER;COMETH? not if anything in the scheduler will use
+;; it, like process-scheduler or something.
+(COMPILE-FLAVOR-METHODS PERIODIC-ACTION)
+
+
+
+(defun peek-at-timers ()
+  (tv:peek-hidden-data
+    "Insert or remove information about timers."
+    (tv:scroll-maintain-list
+      #'(lambda ()
+	  (let ((tqes nil))
+	    (multiple-value-bind (nowlow nowhigh)
+		(time:full-microsecond-time)
+	      (map-heap *pending-timers*
+			#'(lambda (ignore ignore tqe)
+			    (let ((ntqe (copy-timer tqe)))
+			      (unless (timer-universal-time ntqe)
+				(setf (timer-state ntqe)
+				      (multiple-value-bind (difflow borrow)
+					  (sys:%sub-bignum-step (timer-expires ntqe)
+								nowlow 0)
+					(/ (dpb difflow (byte 32 0)
+						(ash (- (timer-high-order-bits ntqe)
+							nowhigh borrow)
+						     32))
+					   1s6))))
+			      (push ntqe tqes)))))
+	    (nreverse tqes)))
+      #'(lambda (tqe)
+	  (tv:scroll-parse-item
+	    `(:function timer-name (,tqe) 30. ("~A"))
+	    (if (timer-universal-time tqe)
+		`(:function time:print-universal-time (,(timer-universal-time tqe) nil) 30. ("~A"))
+		`(:function identity (,(timer-state tqe)) 30. ("~\\TIME-INTERVAL\\")))
+	    `(:function
+	       ,#'(lambda (function args)
+		    (let ((name (sys:function-name function)))
+		      (if (eq name 'process:process-wakeup)
+			  (format nil "Wakeup ~A"
+				  (process:process-name (first args)))
+			  (let ((*package* si:*scl-package*))
+			    (format nil "~S" name)))))
+	       (,(timer-function tqe) ,(timer-args tqe)) 42. ("~A"))
+	    )))
+    "Timers"))

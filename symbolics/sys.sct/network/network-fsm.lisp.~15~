@@ -1,0 +1,378 @@
+;;; -*- Mode: LISP; Package: NETI; Base: 8; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+(defconst fsm-directives '(remove-unreferenced-labels
+			    utility
+			    fsm-var
+			    fsm-state))
+
+;;; code is stored in the CDR of a cons.  The CAR points to the last cons of
+;;; the code.
+
+(defun make-code (initial-form &aux (code (cons nil nil)))
+  (setf (car code) code)
+  (if initial-form (append-code (copylist initial-form) code))
+  code)
+
+(defun push-code (new code &aux (new-cons (ncons new)))
+  (setf (cdar code) new-cons)
+  (setf (car code) new-cons))
+
+(defun append-code (new code)
+  (setf (cdar code) new)
+  (setf (car code) (last new)))
+
+(defsubst code-code (code) (cdr code))
+
+(defmacro fsm-invoke (&rest body &aux (fsm (list 'fsm)))
+  (putprop fsm (copylist body) 'body)
+  (fsm-categorize-body fsm)
+  (fsm-parse-statevars fsm)
+  (fsm-cache-statevars fsm)
+  (fsm-normalize-states fsm)
+
+
+  (fsm-write-prog fsm)
+  (when (first (first (get fsm 'remove-unreferenced-labels)))
+    (fsm-remove-unreferenced-labels fsm))
+
+  `(let* ,(get fsm 'bindings)
+     ,(code-code (get fsm 'code))))
+
+(defun fsm-gensym (&rest strings)
+  (intern (lexpr-funcall #'fsm-gen-string strings)))
+
+(defun fsm-gen-string (&rest strings)
+  (format nil "~{~A~}" strings))
+
+(defun fsm-categorize-body (fsm &aux mem)
+  (loop for (type . body) in (get fsm 'body)
+	do (if (and (nlistp type)
+		    (setq mem (mem #'string-equal type fsm-directives)))
+	       (putprop fsm (nconc (get fsm (first mem)) (ncons body)) (car mem))
+	     (fsignal "Unknown directive ~A in ~A" type (cons type body)))))
+
+(defconst fsm-statevar-types '(:form :number :field :bit))
+(defconst fsm-statevar-any '(:value :accessor :cached))
+(defconst fsm-statevar-some '((:form :quoted :null-value :compare-with)
+			      (:field :ppss)
+			      (:bit :bitpos)))
+
+(defun fsm-parse-statevars (fsm)
+  (loop for statevar in (get fsm 'fsm-var)
+	as (name type . pairs) = statevar
+	as plist = (list name ':type type)
+	do (if (memq type fsm-statevar-types)
+	       (loop for (keyword value) on pairs by 'cddr
+		     do (if (or (memq keyword fsm-statevar-any)
+				(memq keyword (cdr (assoc type fsm-statevar-some))))
+			    (putprop plist value keyword)
+			  (fsignal "Not allowed to use keyword ~A with type ~A (in ~A)"
+				   keyword type statevar)))
+	     (fsignal "Invalid type ~A in ~A" type statevar))
+	   (let* ((value (get plist ':value)) (accessor (get plist ':accessor)))
+	     (unless (or value accessor)
+	       (fsignal "Neither :value form nor :accessor form specified for ~A in ~A"
+			name pairs))
+	     (selectq type
+	       ((:form :number)
+		(and accessor (putprop plist accessor ':access-form))
+		(and value    (putprop plist value    ':value-form)))		
+	       (:field
+		(let ((ppss (get plist ':ppss)))
+		  (or ppss (fsignal "Must specify a :ppss for field in ~A" statevar))
+		  (and accessor (putprop plist `(ldb ,ppss ,accessor) ':access-form))
+		  (and value    (putprop plist `(ldb ,ppss ,value)    ':value-form))))
+	       (:bit
+		(let* ((bitpos (get plist ':bitpos))
+		       (bit (and bitpos (lsh 1 bitpos))))
+		  (or bitpos (fsignal "Must specify a :bitpos for bit in ~A" statevar))
+		  (and accessor (putprop plist `(bit-test ,bit ,accessor) ':access-form))
+		  (and value    (putprop plist `(bit-test ,bit ,value)	  ':value-form)))))
+	     (push plist (get fsm 'statevars)))))
+
+(defun fsm-gen-ref (fsm var &optional (cached-too 't)
+		    &aux (plist (assoc var (get fsm 'statevars))))
+  (or plist (fsignal "Can't generate ref for variable ~A" var))
+  (or (and cached-too (get plist ':cached))
+      (get plist ':value-form)
+      (get plist ':access-form)))
+
+(defun fsm-gen-test (fsm var val &aux (plist (assoc var (get fsm 'statevars))))
+  (or plist (fsignal "Can't generate test for variable ~A" var))
+  (let* ((ref (fsm-gen-ref fsm var))
+	 (type (get plist ':type)))
+    (selectq type
+      (:form (let ((null-val (get plist ':null-value)))
+	       (if (eq val null-val)
+		   `(null ,ref)
+		 `(,(or (get plist ':compare-with) 'eq)
+		   ,ref
+		   ,(if (get plist ':quoted) (list 'quote val) val)))))
+      ((:number :field) `(= ,ref ,val))
+      (:bit `(,(if (string-equal val ':ON) 'progn 'not) ,ref)))))
+
+(defun fsm-gen-set (fsm var value
+		    &aux (plist (assoc var (get fsm 'statevars)))
+			 (type (get plist ':type))
+			 (accessor (get plist ':accessor)))
+  (or (and plist accessor) (fsignal "Can't generate set for ~A to ~A" var value))
+  (let* ((ref (selectq type
+		((:form :number :field) (get plist ':access-form))
+		(:bit `(ldb ,(* 0100 (get plist ':bitpos)) (get plist ':accessor)))))
+	 (val (selectq type
+		(:form (if (get plist ':quoted)
+			   (list 'quote value)
+			 value))
+		((:number :field) value)
+		(:bit (selectq value
+			(:ON 1)
+			(:OFF 0)
+			(otherwise value)))))
+	 (cached (get plist ':cached)))
+  (list 'setf ref (if cached `(setq ,cached ,val) val))))
+
+(defun fsm-cache-statevars (fsm)
+  (putprop fsm (loop for def in (get fsm 'statevars)
+		     when (get def ':cached)
+		     collect (let* ((name (first def))
+				    (ref (fsm-gen-ref fsm name nil))
+				    (var (intern (string-append (first def) "-cached"))))
+			       (putprop def var ':cached)
+			       `(,var ,ref)))
+	   'bindings))
+
+(defun fsm-normalize-states (fsm &aux new-states)
+  (dolist (state (get fsm 'fsm-state))
+    (let* ((tests (first state))
+	   (code (cdr state))
+	   (all (fsm-cross-multiply-tests fsm tests))
+	   (primary (first all))
+	   (others (cdr all)))
+      (push (cons primary code) new-states)
+      (dolist (other others)
+	(push `(,other (same-as . ,primary)) new-states))))
+  (putprop fsm (reverse new-states) 'states))
+
+
+(defun fsm-cross-multiply-tests (fsm tests)
+  (loop with rest-tests = (and (cdr tests)
+				 (fsm-cross-multiply-tests fsm (cdr tests)))
+	for test in (fsm-expand-tests fsm (first tests))
+	nconc (if rest-tests
+		  (loop for rest-test in rest-tests
+			collect (cons test rest-test))
+		(list (list test)))))
+
+(defun fsm-expand-tests (fsm test)
+  fsm						;currently ignored
+  (cond ((nlistp test) (list test))
+	((eq (first test) 'or)
+	 (apply #'nconc (mapcar #'fsm-expand-tests (circular-list fsm) (cdr test))))
+	((eq (first test) 'not) (list test))
+	(T (loop with (name . values) = test
+		 for value in values
+		 collect (list name value)))))
+
+(defun fsm-write-prog (fsm &aux (code (make-code '(prog ()))))
+  (putprop fsm code 'code)
+  (fsm-state-dispatch fsm (get fsm 'states) code ""))
+
+(defun fsm-state-dispatch (fsm states code label-prefix)
+  (setq states (fsm-sort-states fsm states))
+  (loop with var with val with forms with sub-states 
+	with there-was-a-default
+	while states
+	do (multiple-value (var val forms sub-states states)
+	     (fsm-pop-state-collect-similars states))
+	as try-label     = (fsm-gensym label-prefix "TRY-"   var "=" val)
+	as label         = (fsm-gensym label-prefix          var "=" val)
+	as not-label     = (fsm-gensym label-prefix          var "" val)
+	as as-if-label   = (fsm-gensym "AS-IF-" label-prefix var "=" val)
+	as default-label = (fsm-gensym label-prefix          var "=" "DEFAULT")
+	do (if (eq val ':default)
+	       (setq there-was-a-default t)
+	     (push-code try-label code)
+	     (push-code `(if (not ,(fsm-gen-test fsm var val))
+			     ,(fsm-gen-go fsm not-label))
+			code))
+	   (push-code label code)
+	   (putprop fsm as-if-label 'as-if-label)
+	   (if sub-states
+	       (progn (fsm-maybe-put-as-if-label fsm code)
+		      (fsm-state-dispatch fsm sub-states code (fsm-gen-string label "-"))
+		      (unless (eq val ':default)
+			(push-code (fsm-gen-go fsm default-label) code)))
+	     (funcall (get 'progn 'fsm-writer) fsm code forms t)
+	     (push-code '(return nil) code))
+	   (unless (eq val ':default) (push-code not-label code))
+	finally (unless there-was-a-default (push-code default-label code))))
+
+(defun fsm-sort-states (fsm states &aux (vars (get fsm 'statevars)))
+  (loop with high with med with low
+	for state in states
+	as (tests . forms) = state
+	as ((var val) . more-tests) = tests
+	do (ignore forms more-tests)
+	   (cond ((null tests) (push state low))
+		 ((eq val ':default) (push state low))
+		 ((eq val (get (assoc var vars) ':null-value)) (push state med))
+		 (T (push state high)))
+	finally (return (append (reverse high) (reverse med) (reverse low)))))
+
+(defun fsm-pop-state-collect-similars (states &aux (state (pop states)))
+  (declare (values var val forms sub-states states))
+  (destructuring-bind (((var val) . other-tests) . forms) state
+    (if (not other-tests)
+	(values var val forms () states)
+      ;; now we run around pulling out all occurences of (field value) 
+      (loop with sub-states with new-states
+	    with var-val = (list var val)
+	    for state in states
+	    as (tests . other-forms) = state
+	    do (if (member var-val tests)
+		   (push `(,(remove var-val tests) . ,other-forms) sub-states)
+		 (push state new-states))
+	    finally (setq sub-states (reverse sub-states))
+		    (setq new-states (reverse new-states))
+		    (return (values var val ()
+				    (cons `(,other-tests . ,forms) sub-states)
+				    new-states))))))
+
+(defun fsm-maybe-put-as-if-label (fsm code &aux (label (get fsm 'as-if-label)))
+  (when label
+    (push-code label code)
+    (putprop fsm nil 'as-if-label)))
+
+(defun fsm-gen-go (fsm label)
+  (putprop fsm (cons label (get fsm 'needed-labels)) 'needed-labels)
+  (list 'go label))
+
+(defun fsm-remove-unreferenced-labels (fsm
+				       &aux (code (code-code (get fsm 'code)))
+				       (ncode (make-code ())))
+  (push-code (pop code) ncode)
+  (push-code (pop code) ncode)
+  (loop with needed-labels = (get fsm 'needed-labels)
+	for form in code
+	do (when (or (listp form)
+		     (memq form needed-labels))
+	     (push-code form ncode)))
+  (putprop fsm ncode 'code))
+
+
+(defun (progn fsm-writer) (fsm code forms last-form-p)
+  (loop for ((action . body) . more) on forms
+	as fun = (get (intern action (pkg-find-package #.(pkg-name package))) 'fsm-writer)
+	do (if fun
+	       (funcall fun fsm code body (and last-form-p (not more)))
+	     (fsignal "~A is not a known FSM action in ~A" action (cons action body)))))
+
+(defun (new fsm-writer) (fsm code forms ignore)
+  (push-code (fsm-gen-set fsm (first forms) (second forms)) code))
+
+(defun (incf fsm-writer) (ignore code forms ignore)
+  (push-code `(incf ,@forms) code))
+
+(defun (when fsm-writer) (fsm code forms last-form-p)
+  (fsm-maybe-put-as-if-label fsm code)
+  (let ((false-tag (intern (string-append "when-false-" (string (gensym))))))
+    (push-code `(unless (and ,@(loop for clause in (car forms)
+				     collect `(or ,@(loop with (var . vals) = clause
+							  for val in vals
+							  collect
+							      (fsm-gen-test fsm var val)))))
+		  ,(fsm-gen-go fsm false-tag))
+	       code)
+    (funcall (get 'progn 'fsm-writer) fsm code (cdr forms) last-form-p)
+    (push-code false-tag code)))
+
+(defun (if fsm-writer) (fsm code forms last-form-p)
+  (fsm-maybe-put-as-if-label fsm code)
+  (let* ((gensym (string (gensym)))
+	 (false-tag (intern (string-append "if-false-" gensym)))
+	 (finish-tag (intern (string-append "if-finish-" gensym))))
+    (push-code `(unless (and ,@(loop for clause in (car forms)
+				     collect `(or ,@(loop with (var . vals) = clause
+							  for val in vals
+							  collect
+							      (fsm-gen-test fsm var val)))))
+		  ,(fsm-gen-go fsm false-tag))
+	       code)
+    (funcall (get 'progn 'fsm-writer) fsm code (ncons (cadr forms)) last-form-p)
+    (push-code (fsm-gen-go fsm finish-tag) code)
+    (push-code false-tag code)
+    (funcall (get 'progn 'fsm-writer) fsm code (cddr forms) last-form-p)
+    (push-code finish-tag code)))
+
+(defun (lisp fsm-writer) (fsm code forms last-form-p)
+  (fsm-maybe-put-as-if-label fsm code)
+  (push-code (if last-form-p
+		 `(return (progn . ,(copylist forms)))
+	       `(progn . ,(copylist forms)))
+	     code))
+
+(defun (as-if fsm-writer) (fsm code forms ignore)
+  (fsm-maybe-put-as-if-label fsm code)
+  (push-code (fsm-gen-go fsm (fsm-gen-tag "AS-IF-" forms)) code))
+
+(defun (same-as fsm-writer) (fsm code forms ignore)
+  (fsm-maybe-put-as-if-label fsm code)
+  (push-code (fsm-gen-go fsm (fsm-gen-tag "" forms)) code))
+
+(defun fsm-gen-tag (prefix tests)
+  (loop with s = prefix
+	for ((var val) . more) on tests
+	do (setq s (fsm-gen-string s var "=" val (if more "-" "")))
+	finally (return (fsm-gensym s))))

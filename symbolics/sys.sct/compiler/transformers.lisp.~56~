@@ -1,0 +1,659 @@
+;;; -*- Mode: Lisp; Package: COMPILER; Lowercase: T; Base: 8 -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; These are the transformers on functions.  They are like optimizers in that they
+;;; do not have to be run, and like transformers in that they can produce code which
+;;; cannot be evaluated.  The output of these transformers is not macro-expanded or optimized,
+;;; so you have to know what you are doing.
+
+(defun expt-to-*-optimizer (form)
+  (matchp form
+    ((* base power)
+     ;; we could change (^ base -power) => (// 1 (^ base power)) [or rational-quotient]
+     ;; but that couldn't signal zero-to-negative-power
+     (selector power eql
+       ;; don't do 0, since we'd have to check for (^ 0 0), and we'd have to
+       ;; coerce the 1 to the type of base
+       (1 base)
+       ;; use *-internal so noone screws with evaluation order
+       ;; also to save another transformation
+       (2 `(*-internal ,base (%push-stack-value 0)))
+       ;; the next two save time, but take more code space
+       (3 `(*-internal ,base (*-internal (%push-stack-value 0) (%push-stack-value 0))))
+       (4 `(*-internal (*-internal ,base (%push-stack-value 0)) (%push-stack-value 0)))
+       ;; we could go on, but then we're really blowing up the code size
+       (otherwise form)))
+    (* form)))
+
+(add-transformer '^ 'expt-to-*-optimizer '*-internal)
+(add-transformer 'expt 'expt-to-*-optimizer '*-internal)
+(add-transformer 'cl:expt 'expt-to-*-optimizer '*-internal)
+
+(deftransformer (*-internal *-by-certain-constants-optimizer +-internal - *rational-quotient)
+		(form)
+  (matchp form
+    ;; multiply is fast enough that only these cases are clear wins (remember the FPA)
+    (('*-internal expr multiplier)
+     (cl:typecase multiplier
+       (cl:integer
+	 (cl:case multiplier
+	   ;; 1 was done by the commutative-constant-folder
+	   (2 `(+-internal ,expr (%push-stack-value 0)))
+	   (-1 `(minus ,expr))
+	   (otherwise form)))
+       (cl:ratio
+	 (if (eql (abs (numerator multiplier)) 1)
+	     `(*rational-quotient ,expr ,(cl:// multiplier))
+	     form))
+       (otherwise form)))
+    (* form)))
+
+(deftransformer (+-internal +---optimizer) (form)
+  (block optimizer
+    (matchp form
+      (('+-internal expr1 ('minus expr2))
+       ;; this comes from:
+       ;; (+ x y (- z) ...)
+       ;; can't do (+ (- ...) ...) because that would change execution order
+       (return-from optimizer
+	 `(--internal ,expr1 ,expr2))))
+    form))
+
+(deftransformer (--internal ----optimizer) (form)
+  (block optimizer
+    (matchp form
+      (('--internal expr1 ('minus expr2))
+       (return-from optimizer
+	 `(+-internal ,expr1 ,expr2)))
+      (('--internal ('minus expr1) expr2)
+       ;; move the minus outside, in hopes that somebody else can do something with it
+       (return-from optimizer
+	 `(minus (+-internal ,expr1 ,expr2)))))
+    form))
+
+(deftransformer (minus minus-minus-optimizer) (form)
+  (block optimizer
+    (matchp form
+      (('minus ('minus expr))
+       (return-from optimizer
+	 expr)))
+    form))
+
+(defun divide-to-multiply-optimizer (form)
+  (matchp form
+    ((* expr1 expr2)
+     (typecase expr2
+       (:float
+	(condition-case ()
+	    (let ((old-status (float-operation-status)))
+	      (setf (float-operation-status) 0)
+	      (let* ((inverse (cl:// expr2))
+		     (new-status (float-operation-status)))
+		(prog1 (if (si:float-flag? :inexact-result new-status)
+			   form
+			   ;; if the inverse is exact, use it
+			   `(*-internal ,expr1 ,inverse))
+		       ;; gratuitously maintain status [if it doesn't trap]
+		       (setf (float-operation-status) (logior old-status new-status)))))
+	  ;; on overflow or divide-by-zero, don't do the optimization
+	  (arithmetic-error form)))
+       (:rational				;but not integer
+	 `(*-internal ,expr1 ,(cl:// 1 expr2)))
+       (otherwise form)))
+    (* form)))
+
+(add-transformer '//-internal 'divide-to-multiply-optimizer '*-internal)
+(add-transformer '*rational-quotient 'divide-to-multiply-optimizer '*-internal)
+
+(deftransformer (%double-floating-divide double-divide-to-multiply-optimizer *) (form)
+  (matchp form
+    (('%double-floating-divide expr1-high expr1-low expr2-high expr2-low)
+     (if (and (fixnump expr2-high) (fixnump expr2-low))
+	 (condition-case ()
+	      (let ((old-status (float-operation-status)))
+		(setf (float-operation-status) 0)
+		(si:with-double-names (expr2)
+		  (si:double-let* ((inverse (si:double-// 1.0d0 expr2)))
+		    (let ((new-status (float-operation-status)))
+		      (prog1 (if (si:float-flag? :inexact-result new-status)
+				 form
+				 ;; if the inverse is exact, use it
+				 `(%double-floating-multiply ,expr1-high ,expr1-low
+							     ,inverse-high ,inverse-low))
+			     ;; gratuitously maintain status [if it doesn't trap]
+			     (setf (float-operation-status)
+				   (logior old-status new-status)))))))
+	    ;; on overflow or divide-by-zero, don't do the optimization
+	    (arithmetic-error form))
+	 form))
+    (* form)))
+
+;;;; Transformers for associative arithmetic functions.
+
+(defmacro defarith (functions internal-function &optional (identity nil))
+  `(progn ,@(loop for f in functions
+		  collect `(defprop ,f ,internal-function internal-function)
+		  collect `(add-transformer ',f 'arith-transformer))
+	  ,@(if (not (null identity))
+		`((defprop ,internal-function ,identity arithmetic-identity)))))
+
+(defarith (+) +-internal 0)
+(defarith (- difference) --internal)
+(defarith (*) *-internal 1)
+(defarith (//) //-internal)
+(defarith (cl://) *rational-quotient)
+
+(defarith (logand) logand-internal)
+(defarith (logior) logior-internal)
+(defarith (logxor) logxor-internal)
+
+(defarith (cl:logand) logand-internal -1)
+(defarith (cl:logior) logior-internal 0)
+(defarith (cl:logxor) logxor-internal 0)
+
+;;; These are system: because they happen not to be in microcode.  This requires a better
+;;; model somewhere to fix.
+(defarith (min) system:min-internal)
+(defarith (max) system:max-internal)
+(defarith (\\) system:\\-internal)
+
+(defun arith-transformer (form)
+  (matchp form
+    ((function . arguments)
+     (let ((internal (get function 'internal-function)))
+       (if (null internal) (llc-error "Undefined arith function??"))
+       (selectq (length arguments)
+	 (0
+	  (or (get internal 'arithmetic-identity)
+	      ;;
+	      ;;        Don't signal an error.  It's already been checked.
+	      ;;
+	      form))
+	 (1
+	  (selectq function
+	    ((-)
+	     `(minus . ,arguments))
+	    ((//)
+	     `(//-internal 1 . ,arguments))
+	    ((cl://)
+	     `(*rational-quotient 1 . ,arguments))
+	    (otherwise
+	     (first arguments))))
+	 (otherwise
+	  ;; the whole form was constant-folded, but sub-parts generated
+	  ;; by the next clause haven't yet
+	  (loop with result = (pop arguments)
+		for next in arguments
+		do (setq result
+			 (if (and (numberp result)
+				  (numberp next))
+			     (funcall function result next)
+			     `(,internal ,result ,next)))
+		finally (return result))))))
+    (* (llc-error "Huh?"))))
+
+
+;;; LDB/DPB.  There is also an optimizer
+
+(add-transformer 'cli::deposit-byte-internal 'dpb-to-logxxx 'logior-internal 'logand-internal)
+(add-transformer 'cli::fixnum-deposit-byte-internal 'dpb-to-logxxx 'logior-internal 'logand-internal)
+
+;;; Replaces dpb of a constant to logior or logand where appropriate.
+;;; This might more properly be a peephole on the constant, but you'd
+;;; have to look 2 ahead in the byte codes to figure it out; it's easier
+;;; to do as a transformer.
+(defun dpb-to-logxxx (form)
+  (block optimize
+    (matchp form
+      ((dpb value size position background)
+       (when (and (cl:constantp size *transform-environment*)
+		  (cl:constantp position *transform-environment*))
+	 (let ((size (lt:evaluate-constant size *transform-environment*))
+	       (position (lt:evaluate-constant position *transform-environment*))
+	       (immed nil))
+	   ;; Ensure it would generate DPB
+	   (when (cond ((eq dpb 'cli::fixnum-deposit-byte-internal)
+			( (+ size position) (byte-size %%q-fixnum)))
+		       ((eq dpb 'cli::deposit-byte-internal)
+			( (+ size position) (1- (byte-size %%q-fixnum)))))		     
+	     ;; Optimize DPB at 0 that will smash background into LDB
+	     (when (and (= position 0)
+			(cl:constantp background *transform-environment*))
+	       (let ((background (lt:evaluate-constant background *transform-environment*)))
+		 (when (= (deposit-byte background position size 0) 0)
+		   #+meter-usage
+		   (progn (incf *reducer-calls*)
+			  (incf *dpbldb*))
+		   (return-from optimize
+		     `(,(if (eq dpb 'cli::fixnum-deposit-byte-internal )
+			    'cli::fixnum-load-byte-internal
+			    'cli::load-byte-internal)
+		       ,size ,position ,value)))))
+	     (when (cl:constantp value *transform-environment*)
+	       (let ((value (lt:evaluate-constant value *transform-environment*)))
+		 (cond ((and (= (load-byte value 0 size) (load-byte -1 0 size))
+			     ;; only transform if worth it
+			     (format-fits-arg
+			       *compiler*
+			       (built-in-format (get-built-in *compiler* 'logior-internal 2))
+			       (setq immed (mask-field (byte size position) -1))))
+			#+meter-usage
+			(progn (incf *reducer-calls*)
+			       (incf *dpblogior*))
+			(return-from optimize
+			  ;; immed second to save commute-for-immediates
+			  `(logior-internal ,background ,immed)))
+		       ((and (= (load-byte value 0 size) 0)
+			     ;; only transform if worth it
+			     (format-fits-arg
+			       *compiler*
+			       (built-in-format (get-built-in *compiler* 'logand-internal 2))
+			       (setq immed (lognot (mask-field (byte size position) -1)))))
+			#+meter-usage
+			(progn (incf *reducer-calls*)
+			       (incf *dpblogiand*))
+			(return-from optimize
+			  ;; immed second to save commute-for-immediates
+			  `(logand-internal ,background ,immed)))
+		       ;; Sign extend value through unused bits, in hopes that
+		       ;; it can be an immediate value
+		       (( (load-byte value 0 size)
+			   (load-byte
+			     (setq immed (if (zerop (load-byte value (1- size) 1))
+					     (deposit-byte 0 0 size value)
+					     (deposit-byte -1 0 size value)))
+			     0 size))
+			#+meter-usage
+			(progn (incf *reducer-calls*)
+			       (incf *dpb-value-sign-extend*))
+			(return-from optimize
+			  `(,dpb ,immed ,size ,position ,background)))
+		       ))))))))
+    form))
+
+;;;
+
+(add-transformer 'floor 'division-transformer 'floor-internal)
+(add-transformer 'ceiling 'division-transformer 'ceiling-internal)
+(add-transformer 'truncate 'division-transformer 'truncate-internal)
+#-(and IMach (not VLM))
+(add-transformer 'round 'division-transformer 'round-internal)
+
+(defprop floor sys:floor-internal internal-function)
+(defprop ceiling sys:ceiling-internal internal-function)
+(defprop truncate sys:truncate-internal internal-function)
+#-(and IMach (not VLM))
+(defprop round sys:round-internal internal-function)
+
+;;; This intentionally does not optimize the single-argument case.  The macrocode is
+;;; faster than the microcode in all cases when the second argument is 1.
+(defun division-transformer (form)
+  (matchp form
+    ((function arg1 arg2)
+     #+3600					; instruction will trap, so don't use it
+     (if (or (and (numberp arg1)
+		  (not (fixnump arg1)))
+	     (and (numberp arg2)
+		  (not (fixnump arg2))))
+	 form
+	 (list (get function 'internal-function) arg1 arg2))
+     #+IMach					; the function just uses the instruction
+     (list (get function 'internal-function) arg1 arg2))
+    (* form)))
+
+
+;;;; Transformers for arithmetic comparison.
+
+(defun transform-comparison (form)
+  (matchp form
+    ((function . args)
+     (let ((expander (get function 'comparison-expander)))
+       (flet ((expand (x y)
+		;; constant-fold the parts
+		(if (and (numberp x) (numberp y))	;already optimized
+		    (funcall function x y)
+		    (funcall expander x y))))
+	 (if expander
+	     (cl:case (length args)
+	       (2 (expand (first args) (second args)))
+	       ((3 4)
+		(let ((temps (loop repeat (length args) collect (gensym))))
+		  (lt:let-subst
+		    temps args
+		    `(and ,@(loop for x = (first temps) then y
+				  for y in (rest1 temps)
+				  for x-arg = (first args) then y-arg
+				  for y-arg in (rest1 args)
+				  collect (expand (if (numberp x-arg) x-arg x)
+						  (if (numberp y-arg) y-arg y))))
+		    *transform-environment*)))
+	       (1 (let ((number-arg (car args)))
+		    (if (and (cl:constantp number-arg *transform-environment*)
+			     (numberp (lt:evaluate-constant number-arg
+							    *transform-environment*)))
+			t
+			(lt:let-subst '(number) `(,number-arg)
+				      `(progn
+					 (cl:check-type number cl:number)
+					 t)
+				      *transform-environment*))))
+	       (otherwise form))
+	     form))))
+    (* (phase-1-bad-form))))
+
+(defun transform-not-equal-comparison (form)
+  (matchp form
+    ((function . args)
+     (let ((expander (get function 'comparison-not-equal-expander)))
+       (flet ((expand (x y)
+		;; constant-fold the parts
+		(if (and (numberp x) (numberp y))
+		    (funcall function x y)
+		    (funcall expander x y))))
+	 (if expander
+	     (cl:case (length args)
+	       (2 (expand (first args) (second args)))
+	       ((3 4)
+		(let ((temps (loop for x in args do (ignore x) collect (gensym))))
+		  (lt:let-subst
+		    temps args
+		    `(and ,@(loop for (x . rest) on temps
+				  for (x-arg . rest-args) on args
+				  as x-expand-arg = (if (numberp x-arg) x-arg x)
+				  while rest
+				  nconc (loop for y in rest
+					      for y-arg in rest-args
+					      collect
+						(expand x-expand-arg
+							(if (numberp y-arg) y-arg y)))))
+		    *transform-environment*)))
+	       (1 `(progn
+		     (cl:check-type ,(car args) cl:number)
+		     t))
+	       (otherwise form))
+	     form))))
+    (* (phase-1-bad-form))))
+
+(deftransformer (internal-= =-zero-transformer zerop) (form)
+  (matchp form
+    (('internal-= expr1 expr2)
+     ;; It isn't exactly equivalent to change (= x 0.0) to (zerop x), since the
+     ;; floating of x might overflow or something nasty.  But it's right.
+     (cond ((and (numberp expr1) (zerop expr1))
+	    `(zerop ,expr2))
+	   ((and (numberp expr2) (zerop expr2))
+	    `(zerop ,expr1))
+	   (t form)))
+    (* form)))
+
+(deftransformer (internal-< <-zero-transformer plusp minusp) (form)
+  (matchp form
+    (('internal-< expr1 expr2)
+     (cond ((and (numberp expr1) (zerop expr1))
+	    `(plusp ,expr2))
+	   ((and (numberp expr2) (zerop expr2))
+	    `(minusp ,expr1))
+	   (t form)))
+    (* form)))
+
+(deftransformer (internal-> >-zero-transformer plusp minusp) (form)
+  (matchp form
+    (('internal-> expr1 expr2)
+     (cond ((and (numberp expr1) (zerop expr1))
+	    `(minusp ,expr2))
+	   ((and (numberp expr2) (zerop expr2))
+	    `(plusp ,expr1))
+	   (t form)))
+    (* form)))
+
+
+#||
+(defun associative-transformation (form)
+  (matchp form
+    ((function . arguments)
+     (let ((n-args (length arguments))
+	   (int (get function 'internal-function)))
+       (if (null int) (llc-error "Can't find internal function"))
+       (cond ((< n-args 2)
+	      (phase-1-warning "Too few arguments in ~S" form)
+	      form)
+	     ((= n-args 2)
+	      `(,int . ,arguments))
+	     ((every (cdr arguments) #'trivial-form-p)
+	      (cons 'and (loop for arg in (cdr arguments)
+			       and for last-arg first (car arguments) then arg
+			       collect (list int last-arg arg))))
+	     (( n-args 4)
+	      ;; open code up to 4 args
+	      (loop for int-arg1 = nil then int-arg2
+		    and int-arg2 in arguments
+		    when (not (trivial-form-p int-arg2))
+		      collect (let ((gensym (gensym)))
+				(prog1 `(,gensym ,int-arg2)
+				       (setq int-arg2 gensym)))
+			into let-vars
+		    when int-arg1
+		      collect `(,int ,int-arg1 ,int-arg2)
+			into and-forms
+		    finally (return `(let ,let-vars
+				       (and ,@and-forms)))))		    
+	     (t form))))))
+
+(defun trivial-form-p (x)
+  (or (numberp x)
+      (symbolp x)
+      (and (not (atom x))
+	   (eq (car x) 'quote))))
+||#
+
+
+
+(deftransformer (aref aref-expand) (form)
+  (selectq (length form)
+    (3 (cons 'ar-1 (cdr form)))
+    (4 (cons 'ar-2 (cdr form)))
+    (otherwise
+     (if (< (length form) 2) (phase-1-bad-form "Not enough arguments to AREF"))
+     form)))
+
+(deftransformer (aset aset-expand) (form)
+  (selectq (length form)
+    (4 (cons 'as-1 (cdr form)))
+    (5 (cons 'as-2 (cdr form)))
+    (otherwise
+     (if (< (length form) 3) (phase-1-bad-form "Not enough arguments to ASET"))
+     form)))
+
+(deftransformer (aloc aloc-expand) (form)
+  (selectq (length form)
+    (3 (cons 'ap-1 (cdr form)))
+    (4 (cons 'ap-2 (cdr form)))
+    (otherwise
+     (if (< (length form) 2) (phase-1-bad-form "Not enough arguments to ALOC"))
+     form)))
+
+;;;; Transformers for other random things.
+(deftransformer (progv progv-expand) (form)
+  (matchp form
+    (('progv symbol-list-form val-list-form . body)
+     (let ((symbol-var (generate-symbol "SYMBOL-"))
+	   (rest-of-vals-var (generate-symbol "REST-OF-VALS-")))
+       `(%with-binding-stack-level
+	  (loop for ,symbol-var in ,symbol-list-form
+		for ,rest-of-vals-var = ,val-list-form then (cdr ,rest-of-vals-var)
+		do (%bind-location (follow-cell-forwarding (value-cell-location ,symbol-var)
+							   nil)
+				   (car ,rest-of-vals-var)))
+	  ,@body)))
+    (* (phase-1-bad-form))))
+
+(deftransformer (cl:progv cl-progv-expand) (form)
+  (matchp form
+    (('cl:progv symbol-list-form val-list-form . body)
+     (let ((symbol-var (generate-symbol "SYMBOL-"))
+	   (loc-var (generate-symbol "SYMBOL-LOC-"))
+	   (rest-of-vals-var (generate-symbol "REST-OF-VALS-")))
+       `(%with-binding-stack-level
+	  (loop for ,symbol-var in ,symbol-list-form
+		for ,loc-var = (follow-cell-forwarding (value-cell-location ,symbol-var) nil)
+		with ,rest-of-vals-var = ,val-list-form
+		do (if ,rest-of-vals-var
+		       (%bind-location ,loc-var (pop ,rest-of-vals-var))
+		       (%bind-location ,loc-var nil)
+		       (location-makunbound ,loc-var ,symbol-var)))
+	  ,@body)))
+    (* (phase-1-bad-form))))
+
+(deftransformer (progw progw-expand) (form)
+  (matchp form
+    (('progw vars-and-vals . body)
+     (let ((var (gensym)))
+       `(%with-binding-stack-level
+	  (dolist (,var ,vars-and-vals)
+	    (if (listp ,var)
+		(%bind-location (follow-cell-forwarding (value-cell-location (first ,var))
+							nil)
+				(eval (second ,var)))
+		(%bind-location (follow-cell-forwarding (value-cell-location ,var) nil) nil)))
+	  . ,body)))
+    (* (phase-1-bad-form))))
+
+(deftransformer (let-if let-if-expand) (form)
+  (matchp form
+    (('let-if conditional vars-and-vals . body)
+     (dolist (x vars-and-vals)
+       (unless (and (listp x)
+		    (= (length x) 2))
+	 (phase-1-bad-form "~S is not a list of a variable and a value" x))
+       (validate-var-name (first x) "bind" x)
+       (let ((type (variable-type (lookup-variable (first x)))))
+	 (unless (eq type 'special)
+	   (phase-1-bad-form
+	     "~S is a ~A variable; only SPECIAL variables are allowed in LET-IF."
+	     (first x) type))))
+     (setq conditional (transform-predicate conditional *destination-stack-predicate*))
+     (cond ((false-form-p conditional)
+	    `(progn . ,body))
+	   ((true-form-p conditional)
+	    `(let ,vars-and-vals . ,body))
+	   (t
+	    `(%with-binding-stack-level
+	       (if ,conditional ,(parallel-%bind vars-and-vals 'variable-location))
+	       . ,body))))
+    (* (phase-1-bad-form))))
+
+(defun parallel-%bind (vars-and-vals locative-function)
+  (if vars-and-vals
+      `(%bind-location (,locative-function ,(caar vars-and-vals))
+		       (prog1 ,(cadar vars-and-vals)
+			      ,(parallel-%bind (cdr vars-and-vals) locative-function)))))
+
+(deftransformer (letf* letf*-expand) (form)
+  (matchp form
+    (('letf* places-and-values . body)
+     `(%with-binding-stack-level
+	,@(loop for (place value) in places-and-values
+		collect `(%bind-location (locf ,place) ,value))
+	. ,body))
+    (* (phase-1-bad-form))))
+
+(deftransformer (letf*-if letf*-if-expand) (form)
+  (matchp form
+    (('letf*-if condition places-and-values . body)
+     `(%with-binding-stack-level
+	(if ,condition
+	    (progn ,@(loop for (place value) in places-and-values
+			   collect `(%bind-location (locf ,place) ,value))))
+	,@body))
+    (* (phase-1-bad-form))))
+
+(deftransformer (letf letf-expand) (form)
+  (matchp form
+    (('letf places-and-values . body)
+     `(%with-binding-stack-level
+	,(parallel-%bind places-and-values 'locf)
+	. ,body))
+    (* (phase-1-bad-form))))
+
+(deftransformer (letf-if letf-if-expand) (form)
+  (matchp form
+    (('letf-if condition places-and-values . body)
+     `(%with-binding-stack-level
+	(if ,condition
+	    ,(parallel-%bind places-and-values 'locf))
+	,@body))
+    (* (phase-1-bad-form))))
+
+(add-transformer eval-at-load-time-marker 'execution-context-eval-warning)
+
+(defun execution-context-eval-warning (form)
+  (llc-error "Load-time eval (#,) for form ~S not inside quoted structure" (cdr form))
+  (eval (cdr form)))
+
+
+;;;; Transformers for various pseudo special forms (functions with "quoted arguments")
+;;;; Mostly old gubbish from Maclisp
+
+;; Barf if DECLARE not gobbled up by PARSE-DECLARES
+(deftransformer (declare misplaced-declare) (form)
+  (phase-1-warning "The declaration ~S is in a place
+where declarations are not allowed; it will be ignored." form)
+  nil)
+
+(defun only-at-top-level-transformer (form)
+  (phase-1-bad-form "~S can only be used at top level." (first form)))
+
+(deftransformer (future-common-lisp:load-time-value transform-load-time-value) (form)
+  (list* 'load-time-value-1 form))

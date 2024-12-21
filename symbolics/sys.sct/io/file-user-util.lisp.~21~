@@ -1,0 +1,175 @@
+;;; -*- Package: FILE-SYSTEM; Base: 8; Mode: LISP -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Common stuff needed by NFILE and QFILE users, and partly by servers.
+
+(DEFVAR *FILE-UNIQUE-NUMBER* 259.)
+(DEFVAR *FILE-PENDING-TRANSACTIONS* NIL)
+
+(DEFUN FILE-GENSYM (LEADER)
+  (WITHOUT-INTERRUPTS
+    (FORMAT NIL "~A~4,'0D" LEADER (SETQ *FILE-UNIQUE-NUMBER*
+					(\ (1+ *FILE-UNIQUE-NUMBER*) 10000.)))))
+
+
+
+(DEFVAR *FILE-DATA-LIFE* 43200.)				;12 minutes
+(DEFVAR *FILE-ADDITIONAL-DATA-LIFE* 10800.)			;3 minutes
+(DEFCONST *FILE-CONNECTION-SCAVENGE-WAKEUP-INTERVAL* 3600.)	;1 minute
+
+(DEFVAR *FILE-CONNECTION-SCAVENGERS* (CL:MAKE-HASH-TABLE :SIZE 10))
+
+(DEFUN REGISTER-FOR-FILE-CONNECTION-SCAVENGER (KEY FUNCTION)
+  (WHEN (NULL (GETHASH KEY *FILE-CONNECTION-SCAVENGERS*))
+    (SETF (GETHASH KEY *FILE-CONNECTION-SCAVENGERS*)
+	  (FILE-CONNECTION-SCAVENGER-PROCESS KEY FUNCTION)))
+  NIL)
+
+(DEFUN FILE-CONNECTION-SCAVENGER-PROCESS (KEY FUNCTION)
+  (LET* ((NAME (FORMAT NIL "Scavenger for ~A" KEY))
+	 (PROCESS (PROCESS:MAKE-PROCESS NAME
+					:SIMPLE-P T :TOP-LEVEL-WHOSTATE "Scavenge Wait"
+					:SYSTEM-PROCESS T))
+	 (TIMER (PROCESS:CREATE-TIMER-WAKEUP PROCESS :NAME NAME)))
+    (PROCESS:PRESET-SIMPLE-PROCESS
+      PROCESS
+      #'(LAMBDA ()
+	  (LET ((RESCHEDULE T))
+	    (UNWIND-PROTECT
+		(WHEN (NOT (SETF RESCHEDULE (FUNCALL FUNCTION)))
+		  (PROCESS:CLEAR-TIMER TIMER)
+		  (UNREGISTER-FOR-FILE-CONNECTION-SCAVENGER KEY)
+		  (PROCESS:KILL *CURRENT-PROCESS*))
+	      (WHEN RESCHEDULE
+		(PROCESS:RESET-TIMER-RELATIVE
+		  TIMER (CL:// *FILE-CONNECTION-SCAVENGE-WAKEUP-INTERVAL* 60))))))
+      NIL
+      #'(LAMBDA () (NOT (PROCESS:TIMER-PENDING-P TIMER)))
+      NIL)
+    ;; Perhaps this is only for LOCALIZE-SCHEDULER-TABLES
+    (SETF (LDB PROCESS::%%PROCESS-DEBUG-NOT-RESTARTABLE (PROCESS::PROCESS-DEBUG-FLAG PROCESS))
+	  1)
+    (PROCESS:ENABLE PROCESS)
+    PROCESS))
+
+(DEFUN UNREGISTER-FOR-FILE-CONNECTION-SCAVENGER (KEY)
+  (LET ((PROCESS (GETHASH KEY *FILE-CONNECTION-SCAVENGERS*)))
+    (WHEN PROCESS
+      (REMHASH KEY *FILE-CONNECTION-SCAVENGERS*)
+      (PROCESS:KILL PROCESS)))
+  NIL)
+
+
+
+(DEFVAR *DONT-HACK-LOGIN* NIL)
+
+;; This is the flavor to bind for to catch unknown capabilities.
+;; We only signal a warning, since it may well not matter, and
+;; if it does, an access error will result later on.
+;; Unfortunately, warnings do not print out unless you kludge
+;; around.  So we kludge around.  This warning simulates the
+;; New New Error System, encapsulating a series of errors into
+;; a single warning.
+
+(DEFFLAVOR UNHANDLED-CAPABILITIES (ERRORS HOST OPERATION)
+	   (WARNING)
+  (:INITABLE-INSTANCE-VARIABLES ERRORS HOST OPERATION))
+
+;;; NNES !!
+(DEFMETHOD (:REPORT UNHANDLED-CAPABILITIES) (STREAM)
+  (FORMAT STREAM "Host ~A did not ~A the following capabilities:"
+	  HOST (STRING-DOWNCASE OPERATION))
+  (MAPC #'(LAMBDA (ERROR)
+	    (FORMAT STREAM "~&  ~A: ~A" (CAR ERROR) (CDR ERROR)))
+	ERRORS))
+
+(COMPILE-FLAVOR-METHODS UNHANDLED-CAPABILITIES)
+
+(DEFUN STREAM-COPY-16-TO-8 (FROM TO)
+  (IF (NOT (OPERATION-HANDLED-P FROM :READ-INPUT-BUFFER))
+      (LOOP AS BYTE = (SEND FROM :TYI)
+	    WHILE BYTE
+	    DO (SEND TO :TYO (LDB (BYTE 8 0) BYTE))
+	       (SEND TO :TYO (LDB (BYTE 8 8) BYTE)))
+      (DO (8LEN) (())
+	(MULTIPLE-VALUE-BIND (BUF START LASTX)
+	    (SEND FROM ':READ-INPUT-BUFFER)
+	  (IF (NULL BUF) (RETURN NIL))
+	  (SETQ 8LEN (* 2 (- LASTX START)))
+	  (WHEN (ARRAY-INDEXED-P BUF)		;assume 16..
+	    (OR (EQ (ARRAY-TYPE BUF) 'ART-16B)
+		(FERROR "Odd kind of array, art-16b expected - ~S." BUF))
+	    ;; try to snap out extra indirections
+	    (PSETQ BUF (SI:ARRAY-INDIRECT-TO BUF)
+		   START (+ START (SI:ARRAY-INDEX-OFFSET BUF))))
+	  ;; It's probably faster to allocate and deallocate the data
+	  ;; stack than to always to change-indirect-array
+	  (SYS:WITH-STACK-ARRAY (INDIRECT 8LEN :TYPE 'ART-8B
+					  :DISPLACED-TO BUF
+					  :DISPLACED-INDEX-OFFSET (* START 2))
+	    (SEND TO ':STRING-OUT INDIRECT 0 8LEN))
+	  (SEND FROM ':ADVANCE-INPUT-BUFFER LASTX)))))
+
+(DEFUN STREAM-COPY-8-TO-16 (FROM TO)
+  (SYS:WITH-DATA-STACK
+    (LET* ((N16 2048.)
+	   (N8 (* N16 2))
+	   (16B (SYS:MAKE-STACK-ARRAY N16 :TYPE 'ART-16B))
+	   (8B (SYS:MAKE-STACK-ARRAY N8 :TYPE 'ART-8B :DISPLACED-TO 16B)))
+      (LOOP DO
+	(MULTIPLE-VALUE-BIND (NEXT EOF)
+	    (SEND FROM ':STRING-IN NIL 8B 0 N8)
+	  (SEND TO ':STRING-OUT 16B 0 (// NEXT 2))
+	  (IF EOF (LOOP-FINISH)))))))

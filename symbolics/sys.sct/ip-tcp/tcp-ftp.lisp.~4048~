@@ -1,0 +1,1386 @@
+;;; -*- Mode: Lisp; Syntax: Common-Lisp; Package: FILE-SYSTEM; Base: 10; Lowercase: Yes -*-
+;;; TCP FTP Servers as file jobs.  Protocol from RFC 765.
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;;; This is the flavor that understand the TCP FTP protocol.
+;;; TELNET-STREAM is the control connection.  For convenience, it talks our character set.
+
+(defflavor tcp-ftp-file-access-path
+	((conns))
+	(fs:font-encapsulating-access-path-mixin user-file-access-path))
+(define-file-protocol :tcp-ftp (:tcp)
+  (:desirability .5)
+  (:access-path-flavor (host)
+   (cl:case (send host :system-type)
+     (:its 'its-tcp-ftp-file-access-path)
+     (:tops-20 'tops20-tcp-ftp-file-access-path)
+     (:multics 'multics-tcp-ftp-file-access-path)
+     ((:unix :unix42 :ultrix :xenix) 'unix-tcp-ftp-file-access-path)
+     ((:msdos) 'ms-dos-tcp-ftp-file-access-path)
+     (:os/2 'os2-tcp-ftp-file-access-path)
+     (otherwise 'tcp-ftp-file-access-path))))
+
+(defflavor tcp-ftp-conn
+	((file-access-path)
+	 (service-access-path)
+	 (telnet-stream)
+	 (login-state)
+	 (aux-stream)
+	 (data-stream)
+	 (xfer-mode :stream)
+	 (state :free)
+	 (time-last-used (time:time)))
+	()
+  (:gettable-instance-variables data-stream)	;for :status
+  (:initable-instance-variables file-access-path service-access-path))
+
+;; Errors
+
+(eval-when (eval load compile)
+  
+  (defconstant *tcp-ftp-error-code-alist*
+	       `((421 tcp-ftp-host-not-available host-not-available)
+		 (425 tcp-ftp-cannot-open-data network-lossage)
+		 (426 tcp-ftp-data-connection-closed network-lossage)
+		 (450 tcp-ftp-file-busy file-locked)
+		 (451 tcp-ftp-local-error misc-problems)
+		 (452 tcp-ftp-not-enough-storage-in-system not-enough-resources)
+		 (500 tcp-ftp-unrecognized-command file-system-bug)
+		 (501 tcp-ftp-syntax-error inconsistent-options)
+		 (502 tcp-ftp-unimplemented-command unknown-operation)
+		 (503 tcp-ftp-bad-command-sequence file-system-bug)
+		 (504 tcp-ftp-unimplemented-parameter unimplemented-option)
+		 ;; Cannot distinguish not logged in, invalid user, and invalid password!
+		 ;; So have a special state for what command this is a response to.
+		 (530 tcp-ftp-not-logged-in not-logged-in)
+		 (:user tcp-ftp-unknown-user unknown-user)
+		 (:pass tcp-ftp-invalid-password invalid-password)
+		 (532 tcp-ftp-need-account login-problems)
+		 (550 tcp-ftp-file-not-found file-not-found)
+		 (552 tcp-ftp-no-more-room no-more-room)
+		 (553 tcp-ftp-file-name-not-allowed file-lookup-error)
+    
+		 ;; The following are determined empirically and do not appear
+		 ;; in RFC 765.
+
+		 ;; You get this from ITS for link target not found and
+		 ;; directory not found.
+		 (555 tcp-ftp-random-lookup-error file-lookup-error)
+		 ))
+  )
+
+(defflavor tcp-ftp-error ((response)) (file-error)
+  :abstract-flavor
+  :initable-instance-variables)
+
+(defmethod (:report-without-pathname tcp-ftp-error) (stream)
+  (format stream "Error reported by foreign host: ~~A~" response))
+
+(defmacro define-tcp-ftp-error-codes ()
+  `(progn ,@(loop for (num tcp-err sys-err) in *tcp-ftp-error-code-alist*
+		  collect `(defflavor ,tcp-err () (tcp-ftp-error ,sys-err))
+		  collect `(compile-flavor-methods ,tcp-err))))
+
+(define-tcp-ftp-error-codes)
+
+(defflavor tcp-ftp-protocol-violation
+	(response number-expected number-received)
+	(file-error)
+  :initable-instance-variables)
+
+(defmethod (:report-without-pathname tcp-ftp-protocol-violation) (stream)
+  (format stream "Unknown response from foreign host: ~A (expecting ~D)."
+	  response number-expected))
+
+(compile-flavor-methods tcp-ftp-protocol-violation)
+
+(defflavor tcp-ftp-not-a-dir () (tcp-ftp-error fs:wrong-kind-of-file))
+
+(compile-flavor-methods tcp-ftp-not-a-dir)
+(defsubst ftp-command-equal (string1 string2)
+  (string-equal string1 string2 0 0 4 4))
+
+;; Connection management
+
+(defmethod (:reset tcp-ftp-file-access-path) ()
+  (loop for conn in conns
+	do (send conn :reset))
+  (setq conns nil)
+  (fs:unregister-for-file-connection-scavenger self))
+
+(defmethod (file-access-path-login tcp-ftp-file-access-path) (login-p &key force-password)
+  (loop for conn in conns
+	do (tcp-ftp-conn-login conn login-p nil :force-password force-password)))
+(defmethod (:scavenge tcp-ftp-file-access-path) ()
+  (if conns
+      (let ((scavenge-time (send self :control-connection-lifetime)))
+	(when scavenge-time
+	  (dolist (conn conns)
+	    (send conn :scavenge scavenge-time)))
+	(process:with-no-other-processes
+	  (unless
+	    (loop for conn in conns
+		  with conns-remaining = nil
+		  when (ftp-connected-p conn)
+		    do (setq conns-remaining t)
+		  else do (setq conns (delete conn conns))
+		  finally (return conns-remaining))
+	    (send self :reset))
+	  t))
+   nil))
+
+;; Connections
+
+(defmethod (:reset tcp-ftp-conn) (&optional (free t))
+  (process:with-no-other-processes
+    (setq login-state nil)
+    (when free
+      (setq state :free))
+    (when telnet-stream
+      (send telnet-stream :close :abort)
+      (setq telnet-stream nil))
+    (when data-stream
+      (send data-stream :close :abort))
+    (when aux-stream
+      (send aux-stream :close :abort)
+      (setq aux-stream nil))))
+
+(defmethod (ftp-connected-p tcp-ftp-conn) ()
+  (and telnet-stream
+       (send telnet-stream :connected-p)))
+
+(defun-in-flavor (tcp-ftp-get-command-response tcp-ftp-conn) ()
+  (declare (values number line))
+  (loop with (the-line num delim)
+	do (cl:multiple-value-setq (the-line num delim)
+	     (tcp-ftp-parse-reply telnet-stream))
+	while (null num)
+	finally
+	(when (char= delim #\-)
+	  (loop doing
+		(multiple-value-bind (line new-num new-delim)
+		    (tcp-ftp-parse-reply telnet-stream)
+		  (setq the-line (string-append the-line #\cr line))
+		  (when (and new-num (= num new-num) (not (char= new-delim #\-)))
+		    (loop-finish)))))
+	(return (values num the-line))))
+
+(defun tcp-ftp-parse-truename (string pathname)
+  (let ((fs:*inhibit-validity-checking* t))
+    (fs:merge-pathnames (fs:parse-pathname string (send pathname :host)) pathname)))
+
+(defun tcp-ftp-parse-reply (stream &aux line eof niac)
+  (loop doing
+	(cl:multiple-value-setq (line eof) (send stream :line-in))
+	(when eof (error "FTP control connection closed unexpectedly."))
+	(when tcp:*tcp-ftp-debug-p* (send trace-output :line-out line))
+	while (string-equal line (string (code-char 0))))
+  (setq niac (string-search-set
+	       '(#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)
+	       line
+	       (or (scl:string-search #\line line :from-end t) 0)))
+  (if (null niac)
+      (values line nil #\cr)
+      (multiple-value-bind (num delim)
+	  (parse-number line niac)
+	(values line num (if (= delim (string-length line)) #\cr (aref line delim))))))
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");;; This is used to maintain synchronization by clearing any lines already in the
+;;; telnet-stream that might have been left over from previous commands.
+0(defun-in-flavor (clear-telnet-stream tcp-ftp-conn) ()
+  (when telnet-stream
+    1;; We can't use :tyi or :line-in since they don't have no-hang-p args
+0    (multiple-value-bind (string start end)
+	(send telnet-stream :read-input-buffer nil t)
+      (when string
+	(when tcp:*tcp-ftp-debug-p*
+	  (format trace-output "~&Ignoring Response: ~A"
+		  (substring string start end)))
+	(send telnet-stream :advance-input-buffer)))))
+
+(defun-in-flavor (tcp-ftp-check-command-response tcp-ftp-conn)
+	      (expected-value &optional ctl-string &rest args)
+  (unwind-protect
+    (let ((old-state state))
+      (setq state :response)
+      (when ctl-string
+	(clear-telnet-stream)			1;Make sure there isn't an old response.
+0	(when tcp:*tcp-ftp-debug-p*
+	  (send trace-output :fresh-line)
+	  (cl:apply #'format trace-output ctl-string args)
+	  (send trace-output :tyo #\cr))
+	(if (null args)
+	    (send telnet-stream :line-out ctl-string)
+	    (cl:apply #'format telnet-stream ctl-string args)
+	    (send telnet-stream :tyo #\cr))
+	(send telnet-stream :force-output))
+      (loop with (num line)
+	    do (cl:multiple-value-setq (num line) (tcp-ftp-get-command-response))
+	    while (< num 100)
+	    finally
+	    (setq state old-state)
+	    1;; Check to see if the response is what we expect allowing positive responses
+0	    1;; to range from 200 to 299.
+0	    (if (if (listp expected-value)
+		    (loop for item in expected-value
+			  when (or (= num item)
+				   (and ( 200 item 299)
+					( 200 num 299)))
+			    return t)
+		    (or (= num expected-value)
+			(and ( 200 expected-value 299)
+			     ( 200 num 299))))
+		(return (values line num))
+		(let ((elem (assoc (if (or (= num 530)
+					  (and (typep file-access-path
+						      'multics-tcp-ftp-file-access-path)
+					       (= num 421)))	;KLUDGE!
+				      login-state
+				      num)
+				  *tcp-ftp-error-code-alist*)))
+		  (if elem
+		      ;; Standard error code
+		      (condition-case-if (and (null login-state) ctl-string)
+					 (condition)
+			   (signal (second elem)
+				   :response line
+				   :pathname (and data-stream
+						  (send data-stream :pathname)))
+			 (correctable-login-problems
+			   (tcp-ftp-conn-login self t condition)))
+		      ;; Otherwise someone is confused.
+		      (error 'tcp-ftp-protocol-violation
+			     :number-received num
+			     :number-expected expected-value
+			     :response line))))))
+    (when (eq state :response) (send self :reset))))
+
+
+(defun-in-flavor (tcp-ftp-validate-conn tcp-ftp-conn) ()
+  (unless (condition-case ()
+	      (and (ftp-connected-p self)
+		   (tcp-ftp-check-command-response 200 "NOOP"))
+	    (error nil))
+    (send self :reset nil)			;Don't change the state of the conn!
+    (setq telnet-stream
+	  (net:get-connection-for-service service-access-path :ascii-translation t))
+    (loop while (< (second (multiple-value-list (tcp-ftp-check-command-response '(120 220))))
+		   200))
+    (tcp-ftp-conn-login self t)))
+
+(defmethod (tcp-ftp-conn-login tcp-ftp-conn) (login-p &optional condition &key force-password)
+  (if login-p
+      ;;log in
+      (when (ftp-connected-p self)
+	(unwind-protect
+	  (progn
+	    (loop with user with password = force-password
+		  doing
+		  (cl:multiple-value-setq (user password)
+		    (get-user-id-and-password file-access-path user password condition))
+		  (cond ((or password
+			     (send file-access-path :no-passwords)
+			     (string-equal user "anonymous"))
+			 (condition-case (condition2)
+			     (progn
+			       (setq login-state :user)
+			       (multiple-value-bind (ignore num)
+				   (tcp-ftp-check-command-response
+				     `(230 331) "USER ~A" user)
+				 (when (= num 230) (loop-finish)))
+			       (setq login-state :pass)
+			       (tcp-ftp-check-command-response 230 "PASS ~A" password)
+			       (loop-finish))
+			   (correctable-login-problems
+			     (setq condition condition2))))
+			(t (setf condition 'tcp-ftp-invalid-password)))
+		  finally (setq login-state nil))
+	    ;;This is a kludge because Multics doesn't work.
+	    (unless (typep file-access-path 'multics-tcp-ftp-file-access-path)
+	      (condition-case ()
+		  (progn
+		    (tcp-ftp-check-command-response 200 "MODE B")
+		    (setq xfer-mode :block))
+		(tcp-ftp-unimplemented-command)	;keep UNIX happy
+		(tcp-ftp-unrecognized-command)  ;keep MSDOS happy
+		(tcp-ftp-unimplemented-parameter))))
+	  (when login-state (send self :reset))))
+      ;;log out
+      (ignore-errors
+	(unwind-protect
+	  (when (ftp-connected-p self)
+	    (tcp-ftp-check-command-response 221 "QUIT"))
+	  (send self :reset)))))
+
+;; Connection allocation
+
+(defun-in-flavor (tcp-ftp-find-conn tcp-ftp-file-access-path) ()
+  (loop for conn in conns
+	when (send conn :allocate)
+	  return conn
+	finally
+	  (let ((new-conn (make-instance 'tcp-ftp-conn
+					 :file-access-path self
+					 :service-access-path service-access-path)))
+	    (without-interrupts
+	      (push new-conn conns))
+	    (fs:register-for-file-connection-scavenger self
+						       #'(lambda () (send self :scavenge)))	    (return new-conn))))
+
+(defmacro with-tcp-ftp-conn ((conn) &body body)
+  `(let ((,conn (tcp-ftp-find-conn)))
+     (progn . ,body)))
+
+(defmacro with-tcp-ftp-conn-locked (&body body)
+  `(unwind-protect
+     (progn ,@body)
+     (when (eq state :allocated)
+       (send self :free))
+     (unless (member state '(:free :open))
+      (send self :reset))))
+
+(defmacro define-tcp-ftp-method (message args &body body)
+  `(progn (record-source-file-name ',message 'define-tcp-ftp-method)
+	  (defmethod (,message tcp-ftp-file-access-path) (&rest args)
+	    (declare (sys:function-parent ,message define-tcp-ftp-method))
+	    (with-tcp-ftp-conn (conn)
+	      ,(if (keywordp message)
+		   `(lexpr-send conn ',message args)
+		   `(cl:apply (function ,message) conn args))))
+	  (defmethod (,message tcp-ftp-conn) ,args
+	    (declare (sys:function-parent ,message define-tcp-ftp-method))
+	    (with-tcp-ftp-conn-locked . ,body))))
+
+(defprop define-tcp-ftp-method "TCP-FTP method" si:definition-type-name)
+
+(defmethod (:init tcp-ftp-conn) (ignore)
+  (unless (send self :allocate)
+    (error "Unable to open FTP control connection.")))
+
+(defmethod (:allocate tcp-ftp-conn) ()
+  (when (store-conditional (locf state) :free :allocating)
+    (tcp-ftp-validate-conn)
+    (setq time-last-used (time:time))
+    (process:with-no-other-processes
+      (when (member state '(:free :allocating))
+	(setq state :allocated)
+	t))))
+
+(defmethod (:free tcp-ftp-conn) ()
+  (setf time-last-used (time:time))
+  (setq state :free))
+
+(defmethod (:scavenge tcp-ftp-conn) (scavenge-time)
+  (when (and (eq state :free)
+	     (time-elapsed-p scavenge-time time-last-used))
+    (process-run-function "Kill FTP connection"
+      #'send self :scavenge-connection scavenge-time)))
+
+(defmethod (:scavenge-connection tcp-ftp-conn) (scavenge-time)
+  (when (store-conditional (locf state) :free :scavenge)
+    (cond ((not (time-elapsed-p scavenge-time time-last-used))
+	   (setq state :free))
+	  ((condition-case ()
+		(and (ftp-connected-p self)
+		     (tcp-ftp-check-command-response 200 "NOOP"))
+	      (error nil))
+	   (tcp-ftp-conn-login self nil))
+	  (t
+	   (send self :reset)))))
+
+;;; Utilities
+
+;;; Use the data connection for file or directory transfer.
+(defun-in-flavor (tcp-ftp-make-data-connection tcp-ftp-conn)
+	      (translated pathname byte-size command &aux (using-image-mode nil))
+  (ignore pathname)
+  (when (and aux-stream (not (send aux-stream :connected-p)))
+    (send aux-stream :close :abort)
+    (setq aux-stream nil))
+  ;; Get into right byte size mode
+  (if byte-size
+      (multiple-value-bind (image-mode force-p)
+	  (send file-access-path :send-if-handles :image-decoding-parameters byte-size)
+	(cond (force-p
+	       (tcp-ftp-check-command-response 200 "TYPE I")
+	       (setf using-image-mode image-mode))
+	      (t
+	       (condition-case-if image-mode ()
+		    (tcp-ftp-check-command-response 200 "TYPE L ~D" byte-size)
+		  (tcp-ftp-unimplemented-parameter
+		    (tcp-ftp-check-command-response 200 "TYPE I")
+		    (setf using-image-mode image-mode))))))
+      (tcp-ftp-check-command-response 200 "TYPE A"))
+  ;; Open another bidirectional connection for use in the data transfer
+  ;; Because of the way this procotol works, we must first set up a listen
+  ;; on the right port, then send the command, then wait for the response.
+  ;; It would be a whole lot easier if more than just a few hosts implemented
+  ;; the PASV command.
+  ;; To avoid the TCP design bug with opening two connections between the same
+  ;; pair of ports within a finite time, let's try to use the PORT command
+  ;; if the server implements it.
+  (values
+    (send file-access-path :parse-xfer-response
+	  (if aux-stream
+	      (tcp-ftp-check-command-response
+		125 "~A ~A" command (send translated :string-for-host))
+	      (multiple-value-bind (astream port)	;Allocate a local port and listen on it
+		  (send telnet-stream :start-open-auxiliary-stream nil
+			:local-id nil :foreign-id nil :stream-options '(:characters nil))
+		(unwind-protect
+		    (progn
+		      (multiple-value-bind (ignore num)
+			  (tcp-ftp-check-command-response '(200 500) "PORT ~A" port)
+			(when (= num 500)	;Server doesn't support PORT, too bad
+			  (send astream :close :abort)
+			  (setq astream (send telnet-stream :start-open-auxiliary-stream nil
+					      :local-id :same :foreign-id nil
+					      :stream-options '(:characters nil)))))
+		      (multiple-value-bind (line num)
+			  (tcp-ftp-check-command-response
+			    '(125 150 530) "~A ~A" command
+			    (send translated :string-for-host))
+			(when (= num 530)	;Connection wants User/Password
+			  (tcp-ftp-conn-login self t)
+			  (cl:multiple-value-setq (line num) 
+			    (tcp-ftp-check-command-response
+			      '(125 150) "~A ~A" command
+			      (send translated :string-for-host))))
+			(send astream :complete-connection)
+			(setf aux-stream (prog1 astream (setf astream nil)))
+			line))
+		  (when astream
+		    (send astream :close :abort)))))
+	  translated)
+    using-image-mode))
+
+(defun tcp-ftp-default-byte-size (pathname)
+  (let ((cantype (send pathname :canonical-type)))
+    (and (symbolp cantype)
+	 (get cantype :binary-file-byte-size))))    
+
+(defun-in-flavor (tcp-ftp-open-data-connection tcp-ftp-conn)
+		 (translated pathname direction binary-byte-size command
+			     &key fake-characters)
+  (multiple-value-bind (truename using-image-mode)
+      (tcp-ftp-make-data-connection translated pathname binary-byte-size command)
+    (setq data-stream
+	  (make-instance (tcp-ftp-stream-flavor
+			   xfer-mode direction binary-byte-size using-image-mode)
+			 :byte-size binary-byte-size :stream aux-stream
+			 :file-access-path file-access-path
+			 :conn self :command command
+			 :pathname pathname :truename truename)))
+  (setq state :open)
+  (if (and fake-characters (null binary-byte-size))
+      (values
+	(make-instance 'si:unbuffered-character-to-8bit-stream :stream data-stream)
+	nil)
+      (values data-stream t)))
+
+(defun-in-flavor (tcp-ftp-directory-lister tcp-ftp-conn) (dir-cmd dir-path pathname)
+  (selector dir-cmd ftp-command-equal
+    (("NLST" "LIST")
+     (with-open-stream
+       (stream (tcp-ftp-open-data-connection dir-path dir-path :input nil dir-cmd))
+       (loop with line and eof
+	     do (cl:multiple-value-setq (line eof) (send stream :line-in))
+	     until eof
+	     when tcp:*tcp-ftp-debug-p*
+	       do (send trace-output :line-out line)
+	     when (send file-access-path :parse-directory-response line pathname dir-cmd)
+	       collect it)))
+    ("STAT"
+     (multiple-value-bind (line num)
+	 (tcp-ftp-check-command-response '(212 213) "STAT ~A"
+					 (send dir-path :string-for-host))
+       (send file-access-path :parse-stat-response pathname line num t)))
+    (otherwise (error "Unknown listing command ~S." dir-cmd))))
+
+(defun-in-flavor (tcp-ftp-directory-list-internal tcp-ftp-conn) (pathname options)
+  (multiple-value-bind (dir-cmd dir-path selective)
+      (send file-access-path :directory-command pathname options)
+    (let ((listing (tcp-ftp-directory-lister dir-cmd dir-path pathname)))
+      (when selective
+	(setf listing (del-if-not #'(lambda (entry)
+				      (send pathname :pathname-match (first entry)))
+				  listing)))
+      (values listing dir-cmd))))
+(defun-in-flavor (tcp-ftp-properties-internal tcp-ftp-conn) (pathname for-list)
+  (cond ((send file-access-path :operation-handled-p :parse-stat-response)
+	 (multiple-value-bind (line num)
+	     (tcp-ftp-check-command-response '(212 213) "STAT ~A"
+					     (send pathname :string-for-host))
+	   (send file-access-path :parse-stat-response pathname line num for-list)))
+	((not (ftp-command-equal "NLST"
+				 (send file-access-path :directory-command pathname nil)))
+	 (let ((list (tcp-ftp-directory-list-internal pathname nil)))
+	   (when (null list)
+	     (error 'tcp-ftp-file-not-found :pathname pathname :response ""))
+	   (first list)))
+	(t
+	 (let ((list (tcp-ftp-directory-list-internal pathname '(:fast))))
+	   (when (null list)
+	     (error 'tcp-ftp-file-not-found :pathname pathname :response ""))
+	   (list* pathname	 
+		(let ((byte-size (tcp-ftp-default-byte-size pathname)))
+		  (if byte-size
+		      `(:characters nil :byte-size ,byte-size)
+		      '(:characters t))))))))
+
+(define-tcp-ftp-method :create-directory (pathname)
+  (flet ((try-with-XMKD ()
+	   (tcp-ftp-check-command-response
+	     257
+	     "XMKD ~A"
+	     (send (send pathname :directory-pathname-as-file) :string-for-host))))
+    (condition-case ()
+	 (tcp-ftp-check-command-response
+	   257
+	   "MKD ~A" (send (send pathname :directory-pathname-as-file) :string-for-host))
+       (tcp-ftp-unrecognized-command
+1	 ;; For compatibility with 4.2 BSD that doesn't understand MKD
+0	 (try-with-XMKD))
+       (tcp-ftp-unimplemented-command
+1	 ;; For compatibility with 4.2 BSD that doesn't understand MKD
+0	 (try-with-XMKD)))))
+       
+
+(define-tcp-ftp-method :delete (pathname)
+  (tcp-ftp-check-command-response 250
+				  "DELE ~A" (send pathname :string-for-host)))
+
+(defmethod (:expunge tcp-ftp-file-access-path) (ignore &rest ignore) 0)
+
+(define-tcp-ftp-method :properties (pathname)
+  (tcp-ftp-properties-internal pathname nil))
+
+
+(define-tcp-ftp-method :rename (from-pathname to-pathname)
+  (tcp-ftp-check-command-response 350 "RNFR ~A" (send from-pathname :string-for-host))
+  (tcp-ftp-check-command-response 250 "RNTO ~A" (send to-pathname :string-for-host))
+  nil)
+
+
+;;;
+;;; this function allows users to change the sets of valid responses to various 
+;;; FTP requests.  It's here because UNIX (and maybe others) don't adhere to the
+;;; FTP spec about what to return when.  This lets users work around (read kludge)
+;;; error returns
+;;;
+1;;; This is no longer necessary.  tcp-ftp-check-command-response has been changed to 
+;;; be more lenient about positive response codes.  This will just return request-type
+;;; until customers stop using it.
+
+0(defun permit-invalid-unix-response-codes (request-type)
+  (format cl:*error-output* "~&FS:PERMIT-INVALID-UNIX-RESPONSE-CODES is no longer needed.  FS::TCP-FTP-CHECK-COMMAND-RESPONSE has been changed to allow positive response codes that are not listed in the FTP specification.  Please remove any references to FS:PERMIT-INVALID-UNIX-RESPONSE-CODES that you may have.")
+  request-type)
+
+
+;;;
+
+(defconstant *tcp-ftp-xfer-patterns* '(("retrieve of " ", ")
+				    ("retrieve of " " started")
+				    ("Beginning transfer of " "
+")
+				    ;;("Opening data connection for " " (")
+				    ("LOOK OUT! HERE COMES " "")
+				    ("Look out!  Here comes " "")
+				    ("store of " ", ")
+				    ("store of " " started")))
+
+(defmethod (:parse-xfer-response tcp-ftp-file-access-path) (line pathname)
+  (loop for pattern in *tcp-ftp-xfer-patterns*
+	for i = (string-search (first pattern) line 4)
+	for j = (string-reverse-search (second pattern) line nil 4)
+	when (and i j (> j (incf i (string-length (first pattern)))))
+	  return (tcp-ftp-parse-truename (substring line i j) pathname)
+	finally (return pathname)))
+
+;; Data transfers
+
+(defflavor tcp::ftp-probe-stream
+	(truename plist)
+	(si:file-stream-mixin)
+  (:initable-instance-variables truename plist)
+  (:gettable-instance-variables truename plist))
+
+(defmethod (:characters tcp::ftp-probe-stream) ()
+  (send self :get :characters))
+
+(defmethod (:close tcp::ftp-probe-stream) (&optional abort-p)
+  abort-p)
+
+(defmethod (:info tcp::ftp-probe-stream) ()
+  (cons (send self :truename)
+	(send self ':creation-date)))		;Do the best we can.
+
+(defmethod (:status tcp::ftp-probe-stream) ()
+  :closed)
+
+(compile-flavor-methods tcp::ftp-probe-stream)
+
+(defun tcp-ftp-stream-flavor (xfer-mode direction binary-byte-size using-image-mode)
+  (cl:case xfer-mode
+    (:stream
+      (cl:case direction
+	(:input (cond ((null binary-byte-size)
+		       'tcp::ftp-stream-mode-character-input-stream)
+		      ((null using-image-mode)
+		       (if (= binary-byte-size 8)
+			   'tcp::ftp-stream-mode-image-input-stream
+			   'tcp::ftp-stream-mode-binary-input-stream))
+		      (t (cl:case using-image-mode
+			   (:image 'tcp::ftp-stream-mode-image-input-stream)
+			   (:big 'tcp::ftp-stream-mode-binary-input-stream)
+			   (:little
+			     'tcp::ftp-stream-mode-little-end-binary-input-stream)
+			   (otherwise (error "Bad image format."))))))
+	(:output (cond ((null binary-byte-size)
+			'tcp::ftp-stream-mode-character-output-stream)
+		       ((null using-image-mode)
+			(if (= binary-byte-size 8)
+			    'tcp::ftp-stream-mode-image-output-stream
+			    'tcp::ftp-stream-mode-binary-output-stream))
+		       (t (cl:case using-image-mode
+			    (:image 'tcp::ftp-stream-mode-image-output-stream)
+			    (:big 'tcp::ftp-stream-mode-binary-output-stream)
+			    (:little
+			      'tcp::ftp-stream-mode-little-end-binary-output-stream)
+			    (otherwise (error "Bad image format."))))))
+	))
+    (:block
+      (cl:case direction
+	(:input (cond ((null binary-byte-size)
+		       'tcp::ftp-block-mode-character-input-stream)
+		      ((null using-image-mode)
+		       (if (= binary-byte-size 8)
+			   'tcp::ftp-block-mode-image-input-stream
+			   'tcp::ftp-block-mode-binary-input-stream))
+		      (t (cl:case using-image-mode
+			   (:image 'tcp::ftp-block-mode-image-input-stream)
+			   (:big 'tcp::ftp-block-mode-binary-input-stream)
+			   (:little
+			     'tcp::ftp-block-mode-little-end-binary-input-stream)
+			   (otherwise (error "Bad image format."))))))
+	(:output (cond ((null binary-byte-size)
+			'tcp::ftp-block-mode-character-output-stream)
+		       ((null using-image-mode)
+			(if (= binary-byte-size 8)
+			    'tcp::ftp-block-mode-image-output-stream
+			    'tcp::ftp-block-mode-binary-output-stream))
+		       (t (cl:case using-image-mode
+			    (:image 'tcp::ftp-block-mode-image-output-stream)
+			    (:big 'tcp::ftp-block-mode-binary-output-stream)
+			    (:little
+			      'tcp::ftp-block-mode-little-end-binary-output-stream)
+			    (otherwise (error "Bad image format."))))))
+	))))
+
+;;; Default is to use name list unless we know how to parse something else.
+(defmethod (:directory-command tcp-ftp-file-access-path :default) (pathname ignore)
+  (values "NLST" pathname nil))
+
+(defmethod (:parse-directory-response tcp-ftp-file-access-path)
+	   (line pathname ignore)
+  (list* (tcp-ftp-parse-truename line pathname)
+	  nil))
+
+(define-tcp-ftp-method :directory-list (pathname options)
+  (list* nil
+	 (tcp-ftp-directory-list-internal pathname options)))
+
+(define-tcp-ftp-method fs:file-access-path-open
+		       (translated pathname
+				   &key
+				   direction
+				   element-type
+				   if-exists
+				   fake-characters
+				   estimated-length
+				   direct
+				   &allow-other-keys)
+  (when direct
+    (error "Direct access is not permitted over TCP-FTP.")
+    (return-from file-access-path-open))
+  (when (eq element-type :default)
+    (setq element-type (fs:default-element-type-from-canonical-type
+			 (send pathname :canonical-type))))
+  ;; We do not handle (CL:UNSIGNED-BYTE *), aka :BYTE-SIZE :DEFAULT.
+  ;; Would it be better to claim to (by not passing in this :LEGAL-TYPES),
+  ;; and then silently switching :DEFAULT or NIL for BYTE-SIZE to 16 below?
+  (fs:check-stream-element-type element-type :protocol "TCP-FTP"
+				:legal-types '(cl:character cl:string-char
+					       (cl:unsigned-byte 8.) (cl:unsigned-byte 16.)))
+  (let ((byte-size (and (not (cl:subtypep element-type 'cl:character))
+			(fs:byte-size-from-element-type element-type))))
+    (cl:case direction
+      (:input
+	(tcp-ftp-open-data-connection
+	  translated pathname :input byte-size "RETR"
+	  :fake-characters fake-characters))
+      (:output
+	(when estimated-length			1;Allow simple implementations to barf on this
+0						1;without screwing us up.
+0	  (tcp-ftp-check-command-response '(200 202 500(2 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB") 0501 502) "ALLO ~D" estimated-length))
+	(tcp-ftp-open-data-connection translated pathname :output byte-size
+				      (if (eq if-exists :append) "APPE" "STOR")
+				      :fake-characters fake-characters))
+      ((:probe :probe-link)
+       (loop for prop = (tcp-ftp-properties-internal translated nil)
+	     unless (and (neq direction :probe-link) (get prop :link-to))
+	       return (make-instance 'tcp::ftp-probe-stream :truename (first prop)
+				     :plist (rest1 prop) :pathname pathname)
+	     do (setq translated
+		      (fs:merge-pathnames (get prop :link-to) translated))))
+      ((:probe-directory)
+       (error "Sorry, PROBE-DIRECTORY cannot be supported over this protocol."))
+      (otherwise (error "Unknown direction ~A" direction)))))
+
+(defmethod (:data-stream-close tcp-ftp-conn) (stream &optional abort-p)
+  (when (eq data-stream stream)
+    (setq data-stream nil)
+    (when (ftp-connected-p self)
+      (cond (abort-p
+	     (send aux-stream :close :abort)
+	     (setq aux-stream nil)
+	     (condition-case ()
+		  (tcp-ftp-check-command-response '(226 250 426 451 502) "ABOR")
+		(error nil)))
+	    (t
+	     1;; There is a screw case where we are trying to do a close before reading the
+0	     1;; entire file.  When that happens, tcp-ftp-parse-reply will barf with an EOF,
+0	     1;; and we close the stream in abort mode.
+0	     (condition-case () 
+		  (multiple-value-bind (ignore num)
+		      (tcp-ftp-check-command-response '(226 250 426 451))
+		    (unless (= num 250)
+		      (send aux-stream :close)
+		      (setq aux-stream nil)))
+		(error
+		  (send self :data-stream-close stream t))))))
+    (send self :free)))
+
+
+;;; Auxiliary streams used for data transfer.  The STREAM here is just an 8-bit byte stream.
+;;; Character set translation and byte packing are handled here.
+(defflavor tcp::ftp-aux-stream
+	(conn
+	 command
+	 tcp::stream
+	 truename
+	 (plist))
+	(si:file-data-stream-mixin)
+  :abstract-flavor
+  (:initable-instance-variables conn tcp::stream truename command)
+  (:gettable-instance-variables truename plist))
+
+(defflavor tcp::ftp-aux-input-stream
+	()
+	(si:unrewindable-buffered-input-stream-mixin	;allow READ-ATTRIBUTE-LIST
+						;to stop us before we leave the first
+						;input buffer.
+	 tcp::ftp-aux-stream)
+  :abstract-flavor)
+
+
+(defflavor tcp::ftp-aux-output-stream
+	()
+	(tcp::ftp-aux-stream)
+  :abstract-flavor)
+
+
+(defmethod (:close tcp::ftp-aux-stream :after) (&optional abort-p)
+  (send conn :data-stream-close self abort-p))
+
+(defmethod (:status tcp::ftp-aux-stream) ()
+  (if (eq self (send conn :data-stream))
+      :open
+      :closed))
+
+;;; No way to know the length ahead of time
+(defmethod (:length tcp::ftp-aux-stream) () nil)
+(defmethod (:qfaslp tcp::ftp-aux-stream) () nil)
+(defmethod (:creation-date tcp::ftp-aux-stream) ()
+  (or (send self ':get ':creation-date)
+      (condition-case ()
+	   (let ((properties (send-if-handles self :properties)))
+	     (when properties
+	       (getf (cdr properties) ':creation-date)))
+	 (error nil))))
+
+(defflavor tcp::ftp-stream-mode-character-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-stream-mode-character-input-mixin))
+
+(defflavor tcp::ftp-stream-mode-binary-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-stream-mode-binary-input-mixin))
+
+(defflavor tcp::ftp-stream-mode-image-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-stream-mode-image-input-mixin))
+
+(defflavor tcp::ftp-stream-mode-little-end-binary-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-stream-mode-little-end-binary-input-mixin))
+
+(defflavor tcp::ftp-block-mode-character-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-block-mode-character-input-mixin))
+
+(defflavor tcp::ftp-block-mode-binary-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-block-mode-binary-input-mixin))
+
+(defflavor tcp::ftp-block-mode-image-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-block-mode-image-input-mixin))
+
+(defflavor tcp::ftp-block-mode-little-end-binary-input-stream ()
+	   (tcp::ftp-aux-input-stream tcp::ftp-block-mode-little-end-binary-input-mixin))
+
+(defflavor tcp::ftp-stream-mode-character-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-stream-mode-character-output-mixin))
+
+(defflavor tcp::ftp-stream-mode-binary-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-stream-mode-binary-output-mixin))
+
+(defflavor tcp::ftp-stream-mode-image-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-stream-mode-image-output-mixin))
+
+(defflavor tcp::ftp-stream-mode-little-end-binary-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-stream-mode-little-end-binary-output-mixin))
+
+(defflavor tcp::ftp-block-mode-character-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-block-mode-character-output-mixin))
+
+(defflavor tcp::ftp-block-mode-binary-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-block-mode-binary-output-mixin))
+
+(defflavor tcp::ftp-block-mode-image-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-block-mode-image-output-mixin))
+
+(defflavor tcp::ftp-block-mode-little-end-binary-output-stream ()
+	   (tcp::ftp-aux-output-stream tcp::ftp-block-mode-little-end-binary-output-mixin))
+
+
+(compile-flavor-methods tcp::ftp-stream-mode-character-input-stream
+			tcp::ftp-stream-mode-binary-input-stream
+			tcp::ftp-stream-mode-image-input-stream
+			tcp::ftp-stream-mode-little-end-binary-input-stream
+			tcp::ftp-stream-mode-character-output-stream
+			tcp::ftp-stream-mode-binary-output-stream
+			tcp::ftp-stream-mode-image-output-stream
+			tcp::ftp-stream-mode-little-end-binary-output-stream
+			tcp::ftp-block-mode-character-input-stream
+			tcp::ftp-block-mode-binary-input-stream
+			tcp::ftp-block-mode-image-input-stream
+			tcp::ftp-block-mode-little-end-binary-input-stream
+			tcp::ftp-block-mode-character-output-stream
+			tcp::ftp-block-mode-binary-output-stream
+			tcp::ftp-block-mode-image-output-stream
+			tcp::ftp-block-mode-little-end-binary-output-stream
+			)
+
+
+;; System-specific knowledge
+
+;; ITS
+
+(defflavor its-tcp-ftp-file-access-path ()
+	   (no-password-access-path-mixin tcp-ftp-file-access-path))
+;;; MS-DOS
+
+(defflavor ms-dos-tcp-ftp-file-access-path ()
+	   (no-password-access-path-mixin tcp-ftp-file-access-path))
+(defmethod (:image-decoding-parameters ms-dos-tcp-ftp-file-access-path) (byte-size)
+  (values (cond ((= byte-size 8) :image)
+		((zerop (\\ byte-size 8)) :little))
+	  t))
+;;; OS/2
+(defflavor os2-tcp-ftp-file-access-path () (tcp-ftp-file-access-path))
+
+
+(defmethod (:image-decoding-parameters os2-tcp-ftp-file-access-path) (byte-size)
+  (values (cond ((= byte-size 8) :image)
+		((zerop (\\ byte-size 8)) :little))
+	  t))
+
+(defmethod (:directory-command os2-tcp-ftp-file-access-path) (pathname options)
+  ;;
+  ;; os2 has funny behaviour in top-level directories; when asking for
+  ;; *.*, the server croaks.  need to leave out the filename entirely.
+  ;;
+  (when (and (eq (send pathname ':directory) ':root)
+	     (eq (send pathname ':name) ':wild)
+	     (eq (send pathname ':type) ':wild))
+    (setq pathname (send pathname ':new-pathname ':name nil ':type nil)))
+  (if (member ':fast options)
+      (values "NLST" pathname nil)
+      (values "LIST" pathname nil)))
+(defmethod (:parse-directory-response os2-tcp-ftp-file-access-path) (line pathname dir-cmd)
+  (selector dir-cmd ftp-command-equal
+    ("NLST"
+     (list* (tcp-ftp-parse-truename line pathname) nil))
+    ("LIST"
+     ;; OS2 ftp server generates output of the form
+     ;;             <size>   <props>          <date> <time> <truname>
+     ;; eg:
+     ;; LIST g:\jrd\*.*
+     ;; 150 Opening ASCII mode data connection for g:\jrd\*.*.
+     ;;                  0    DIR           04-20-93 10:07  g:\jrd\.
+     ;;                  0    DIR           01-01-80 00:00  g:\jrd\..
+     ;;                  0    DIR           04-22-93 12:08  g:\jrd\GNU
+     ;;                  0    DIR           04-22-93 12:09  g:\jrd\GNULIB
+     ;;               2847                  04-20-93 11:39  g:\jrd\LL.CPP
+     ;;              26768                  04-20-93 15:23  g:\jrd\LL.EXE
+     ;;               2215                  04-20-93 15:22  g:\jrd\LL.OBJ
+     ;; 226 Transfer complete.
+     ;;
+     (when (plusp (string-length line))		; skip empties
+       (let (size props date time name
+	     (tokens (loop with length = (string-length line)
+			   for i first (string-search-not-char #\space line) then k
+			   for j = (or (string-search-char #\space line i) length)
+			   for k = (string-search-not-char #\space line (1+ j))
+			   collect (substring line i j)
+			   while k))
+	     (plist nil))
+	 (setq size (pop tokens))
+	 ;; collect props
+	 (loop while (and tokens (not (digit-char-p (aref (car tokens) 0))))
+	       do (push (pop tokens) props))
+	 (setq date (pop tokens))
+	 (setq time (pop tokens))
+	 (setq name (pop tokens))
+	 ;; make sure we got everything
+	 (unless name 
+	   (error "Wierd line ~S" line))
+	 ;; if this line is one of the fake directories, . and .., skip it.
+	 (unless (let* ((dir (send (send pathname ':directory-pathname-as-file)
+				   ':string-for-host))
+			(dirname (format nil "~A\\.." dir)))
+		   (or (cl:string-equal name ".")
+		       (cl:string-equal name "..")
+		       (cl:string-equal name dirname)
+		       (cl:string-equal name dirname :end2 (1- (string-length dirname)))))
+	   ;; now parse everything
+	   (loop for prop in props
+		 do
+	     (cond ((string-equal prop "DIR")
+		    (setq plist `(:directory t ,@plist)))
+		   ((string-equal prop "A")
+		    ;; "Not archived".  Translate to :not-backed-up?
+		    )
+		   (t
+		    (error "Unknown property spec ~S" prop))))
+	   ;; if not directory, parse size; it's only meaningful for non-dirs
+	   (unless (getf plist ':directory)
+	     (setq plist `(:length-in-bytes ,(parse-number size) :byte-size 8)))
+	   (multiple-value-bind (nil nil nil day month year nil dst-p)
+	       (time:parse date)
+	     (multiple-value-bind (sec min hour)
+		 (time:parse time)
+	       (ignore dst-p)			; can't use this???
+	       (setq plist `(:creation-date 
+			      ,(time:encode-universal-time sec min hour day month year)
+			      ,@plist))))
+	   (setq name (fs:merge-pathnames (fs:parse-pathname name host) pathname))
+	   (cons name plist)))))))
+
+;; Unix (4.2bsd)
+
+(defflavor unix-tcp-ftp-file-access-path () (tcp-ftp-file-access-path))
+
+(defmethod (:allow-anonymous-logins tcp-ftp-file-access-path) () "anonymous")	1;Lowercase!
+
+0(defmethod (:image-decoding-parameters unix-tcp-ftp-file-access-path) (byte-size)
+  (cond ((= byte-size 8) :image)
+	((zerop (\\ byte-size 8)) :little)))
+
+(defmethod (:directory-command unix-tcp-ftp-file-access-path) (pathname options)
+  (let ((cmd (if (member :fast options)
+		 "NLST -d"	1		;-d so we can get directory properties
+0		 "LIST -d")))
+    (values cmd pathname nil)))
+
+(defmethod (:parse-directory-response unix-tcp-ftp-file-access-path) (line pathname dir-cmd)
+  (selector dir-cmd ftp-command-equal
+    ("NLST"
+     (list* (tcp-ftp-parse-truename line pathname) nil))
+    ("LIST"
+     (when (plusp (string-length line))		1;skip empty lines (/**/* example)
+0       (let ((tokens (loop with length = (string-length line)
+			   for i first 0 then k
+			   for j = (or (string-search-char #\space line i) length)
+			   for k = (string-search-not-char #\space line (1+ j))
+			   collect (substring line i j)
+			   while k))
+	     name
+	     (plist nil))
+	 (labels ((link-separator-p (token)
+		    (string-equal token "->"))
+		  (collect-tokens (stop-at-link-separator)
+		    (loop with name = (pop tokens)
+			  until (and stop-at-link-separator
+				     (link-separator-p (car tokens)))
+			  for tok = (pop tokens)
+			  while tok
+			  do (setf name (string-append name #\space tok))
+			  finally (return name))))
+	   (macrolet ((add-property (prop val)
+			`(progn (push ,val plist)
+				(push ,prop plist))))
+	     (when (mem #'char-equal (aref (first tokens) 0) '(#\d #\l #\-))
+	       ;; Protection
+	       (let* ((prot (pop tokens))
+		      (link-p (char-equal (aref prot 0) #\l)))
+		 (when (char-equal (aref prot 0) #\d)
+		   (add-property :directory t))
+		 (add-property :protection (substring prot 1))
+		 ;; Unit number?
+		 (pop tokens)
+		 ;; Author
+		 (add-property :author (pop tokens))
+		 ;; Group (sometimes) -- look ahead for month name
+		 (loop until (ass #'string-equal (second tokens) time:*month-symbols*)
+		       do (pop tokens))
+		 ;; Length
+		 (add-property :length-in-bytes (parse-number (pop tokens) 0 nil 10 t))
+		 (add-property :byte-size 8)
+		 ;; Date
+		 (let ((month (pop tokens))
+		       (day (pop tokens))
+		       (year (pop tokens)))
+		   (add-property :creation-date (parse-unix-date month day year)))
+		 ;; Name (could have spaces in it)
+		 (setf name (tcp-ftp-parse-truename (collect-tokens link-p) pathname))
+		 ;; Link
+		 (when (and tokens link-p)
+		   (when (link-separator-p (pop tokens))
+		     (add-property :link-to (tcp-ftp-parse-truename (collect-tokens nil)
+								    pathname))))
+		 ;; All done
+		 (list* name plist))))))))))
+
+
+(defvar *unix-date-year-hysteresis* (* 60. 60. 24. 28. 6.)	;Six months.
+  "If we see a date this many seconds in the future, it must have been last year.")
+
+(defun parse-unix-date (month day year-or-time)
+  (if (string-search-char #\: year-or-time)
+      (multiple-value-bind (nil nil nil nil nil this-year nil nil)
+	  (cl:get-decoded-time)
+	(let ((time-this-year
+		(time:parse-universal-time
+		  (string-append month #\space day
+				 #\space (format nil "~D" this-year)
+				 #\space year-or-time))))
+	  (if (< (- time-this-year (time:get-universal-time))
+		 *unix-date-year-hysteresis*)
+	      time-this-year
+	      (time:parse-universal-time
+		(string-append month #\space day
+			       #\space (format nil "~D" (1- this-year))
+			       #\space year-or-time)))))
+      (time:parse-universal-time (string-append month #\space day #\space year-or-time))))
+
+(defmethod (pwd-command tcp-ftp-conn) ()
+  (tcp-ftp-check-command-response '(257) "PWD"))
+
+(defmethod (:update-homedir unix-tcp-ftp-file-access-path) (ignore)
+  (condition-case ()
+       (with-tcp-ftp-conn (c)
+	 (multiple-value-bind (result ignore)
+	     ;; This works because the lispm never does a CWD, and the server sets the
+	     ;; working dir to the homedir when you login
+	     (pwd-command c)
+	   ;; Result is: 257 "/u/name" is current directory.
+	   (setq homedir-pathname
+		 (send (send (send host :sample-pathname)
+			     :parse-truename (cl:read-from-string result t nil :start 4))
+		       :pathname-as-directory))))
+     ((tcp-ftp-unrecognized-command tcp-ftp-unimplemented-command)
+      ;; Standard lossage in the standard operating system's
+      ;; implementation of a network standard.
+      (setq homedir-pathname (send (send host :sample-pathname)
+				   :new-directory (list "usr" host-user-id))))))
+
+;; Multics
+
+(defflavor multics-tcp-ftp-file-access-path ()
+	   (tcp-ftp-file-access-path))
+
+(defmethod (:parse-stat-response multics-tcp-ftp-file-access-path)
+	   (pathname line num for-list)
+  (selector num =
+    (212
+      (if for-list
+	  (let (list entry)
+	    (flet ((add-entry ()
+		     (when entry
+		       (loop with matched = nil
+			     for name on (third entry)
+			     for path = (car (send self :parse-directory-response (car name) pathname "STAT"))
+			     do (setf (car name) path)
+			     unless matched
+			       when (send pathname :pathname-match path)
+				 do (setq matched t)
+			     finally (when matched
+				       (setf (first entry) (first (third entry)))
+				       (push entry list))))))
+	      (loop with label
+		    for start = (1+ (string-search-char #\cr line)) then (1+ end)
+		    for end = (string-search-char #\cr line start)
+		    while end
+		    when (> end start)
+		      unless (zerop (aref line start))
+			do (if (eq label 'link)
+			       (if (char= (aref line start) #\sp)
+				   (push (substring line (+ start 2) end) (third entry))
+				   (let* ((i (string-search-char #\> line start end)))
+				     (add-entry)
+				     (setq entry `(nil
+						    :names (,(string-right-trim '(#\tab #\sp)
+										(substring line start i)))
+						    :link-to ,(substring line i end)))))
+			       (selector (aref line start) char=
+				 (#\S (setq label 'segment))
+				 (#\M (setq label 'msf))
+				 (#\D (setq label 'directory))
+				 (#\L (setq label 'link))
+				 (otherwise
+				   (cl:case label
+				     ((segment msf)
+				      (if (char= (aref line (+ start 7)) #\sp)
+					  (push (substring line (+ start 10) end) (third entry))
+					  (add-entry)
+					  (setq entry `(nil
+							 :names (,(substring line (+ start 10) end))
+							 :length-in-blocks
+							 ,(parse-number
+							    line
+							    (string-search-not-char
+							      #\sp line (+ start 5) (+ start 8))
+							    (+ start 8))
+						;access
+							 ))))
+				     (directory
+				       (if (char= (aref line (+ start 5)) #\sp)
+					   (push (substring line (+ start 7) end) (third entry))
+					   (add-entry)
+					   (setq entry `(nil
+							  :names (,(substring line (+ start 5) end))
+							  :directory t
+							  ;;access
+							  ))))))))
+		    finally (add-entry)))
+	    list)
+	  (list* pathname '(:directory t))))
+    (213
+      (when for-list (error 'tcp-ftp-not-a-dir))
+      (let ((alist nil))
+	(loop for start = (1+ (string-search-char #\cr line)) then (1+ end)
+	      for end = (string-search-char #\cr line start)
+	      while end
+	      do (let ((i (string-search-not-set '(#.(int-char 0) #\sp #\tab) line start end)))
+		   (unless (null i)
+		     (when (= i start)
+		       (let ((c (string-search-char #\: line start end)))
+			 (unless (null c)
+			   (push (ncons (substring line start c)) alist)
+			   (setq i (string-search-not-set '(#.(int-char 0) #\sp #\tab) line (1+ c) end)))))
+		     (unless (null i)
+		       (setf (cdr (last (car alist))) (ncons (substring line i end)))))))
+	(list* (car (send self :parse-directory-response (second (assoc "names" alist)) pathname "STAT"))
+	       `(:names ,(cdr (assoc "names" alist))
+		 ,@(selector (second (assoc "type" alist)) string-equal
+		     ("segment"
+		      `(:length-in-blocks ,(parse-number (second (assoc "records used" alist)))
+			:modification-date ,(time:parse-universal-time
+					      (second (assoc "date modified" alist)))
+			:creation-date ,(time:parse-universal-time
+					  (second (assoc "date modified" alist)))
+			:reference-date ,(time:parse-universal-time
+					   (second (assoc "date used" alist)))
+			:length-in-bytes ,(truncate (parse-number
+						      (second (assoc "bit count" alist))) 9)
+			:characters t
+			:byte-size 9
+;mode
+			))
+		     ("multisegment file"
+		      `(:length-in-blocks ,(parse-number
+					     (second (assoc "total records used" alist)))
+			:modification-date ,(time:parse-universal-time
+					      (second (assoc "date modified" alist)))
+			:creation-date ,(time:parse-universal-time
+					  (second (assoc "date modified" alist)))
+			:reference-date ,(time:parse-universal-time
+					   (second (assoc "date used" alist)))
+			:length-in-bytes ,(truncate (parse-number
+						      (second (assoc "total bit count" alist))) 9)
+			:characters t
+			:byte-size 9
+;mode
+			))
+		     ("link"
+		      `(:link-to ,(second (assoc "links to" alist))
+			:modification-date ,(time:parse-universal-time
+					      (second (assoc "date link modified" alist)))
+			:creation-date ,(time:parse-universal-time
+					  (second (assoc "date link modified" alist)))
+			))
+		     )))))))
+
+
+
+
+#||
+
+(defmethod (:multics-directory-list tcp-ftp-conn) (pathname options)
+  (with-tcp-ftp-conn-locked
+    (let ((dlist
+	    (cond ((not (send pathname :wild-p))
+		   (multiple-value-bind (truename props)
+		       (send self :properties-internal pathname nil)
+		     `((,truename ,@props))))
+		  ((eq (send pathname :raw-directory) :root)	;bug in STAT of ROOT
+		   (fsignal "Can't find directories or links in the ROOT (FTP bug).
+Resume to list files only.")
+		   (rest1 (send self :directory-list pathname options)))
+		  (t (list (send self :properties-internal pathname t))))))
+      #+ignore (
+	(when (and (not (member :fast options))
+		   (or (send pathname :wild-p)
+		       (get (first dlist) :directory)))
+	  (loop for elem in dlist
+		unless (get elem :directory)
+		  do (setf (rest1 elem)
+			   (rest1 (first (send self :properties-internal (first elem) nil)))))))
+      (when (member :sorted options)
+	(setq dlist (sortcar dlist #'pathname-lessp)))
+      (cons '(nil) dlist))))
+
+(defmethod (:parse-directory-response multics-tcp-ftp-file-access-path)
+	   (line pathname ignore)
+  (values (tcp-ftp-parse-truename line pathname)
+	  '(:characters t)))
+||#
+
+;; TOPS-20
+
+(defflavor tops20-tcp-ftp-file-access-path ()
+	   (allow-anonymous-logins-access-path-mixin
+	    tcp-ftp-file-access-path))
+
+(defmethod (:directory-command tops20-tcp-ftp-file-access-path) (pathname options)
+  ;; The server only sends over all the information when there is exactly one
+  ;; file, regardless of how it was specified.  So, to be safe, we must assume that
+  ;; any wildcards can cause lossage.  This protocol was not designed for use by other
+  ;; programs.
+  (if (or (send pathname :wild-p)
+	  (not (numberp (send pathname :version)))
+	  (member :fast options))
+      (values "NLST" pathname)
+      (values "LIST" pathname)))
+
+(defmethod (:parse-directory-response tops20-tcp-ftp-file-access-path) (line pathname ignore)
+  (unless (string-equal line "? Not found.")
+    (parse-tops20-jfns pathname line)))
+
+(defmethod (:parse-stat-response tops20-tcp-ftp-file-access-path)
+	   (pathname line num for-list)
+  (when for-list (error "Can't do this."))
+  (selector num =
+    (212 (let* ((start (1+ (string-search-char #\space line)))
+		(last-dot (string-reverse-search-char #\. line nil start))
+		(last-comma (string-reverse-search-char #\, line nil start)))
+	   (list* (tcp-ftp-parse-truename
+			 (if last-comma
+			     (string-append (substring line start (1+ last-dot))
+					    (substring line (1+ last-comma)))
+			     (substring line start))
+			 pathname)
+		   nil)))
+    (213 (parse-tops20-jfns pathname line (string-search-char #\space line)))))
+(defun parse-tops20-jfns (pathname line &optional (index-1 0) &aux truename properties)
+  (let ((index-2 (string-search-char #\, line index-1)))
+    (let ((index-3 (string-search-char #\; line index-1 index-2)))
+      (when (char= #\; (send pathname :version-delimiter))
+	   (setq index-3 (string-search-char #\; line (1+ index-3) index-2)))
+      (setq truename (tcp-ftp-parse-truename (substring line index-1 index-3) pathname))
+      (loop until (null index-3)
+	    do (setq index-1 (1+ index-3)
+		     index-3 (string-search-char #\; line index-1 index-2))
+	    as property = (selector (aref line index-1) char-equal
+			    (#\P :protection)
+			    (#\A :account))
+	    when property
+	      do (setq properties (list* property
+					 (substring line (1+ index-1) (or index-3 index-2))
+					 properties))))
+    (loop for (parse-function property)
+	    in '((parse-number :length-in-blocks)
+		 ()				;Read creation date
+		 (time:parse-universal-time :creation-date)
+		 (time:parse-universal-time :reference-date)
+		 ()				;Creator
+		 (substring :author))
+	  until (null index-2)
+	  do (setq index-1 (1+ index-2)
+		   index-2 (string-search-char #\, line index-1))
+	  when property
+	    do (setq properties (list* property
+				       (funcall parse-function line index-1 index-2)
+				       properties)))
+    (list* truename properties)))
+(compile-flavor-methods tcp-ftp-file-access-path tcp-ftp-conn
+			its-tcp-ftp-file-access-path unix-tcp-ftp-file-access-path
+			ms-dos-tcp-ftp-file-access-path
+			tops20-tcp-ftp-file-access-path multics-tcp-ftp-file-access-path)

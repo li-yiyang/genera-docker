@@ -1,0 +1,497 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Base: 10; Package: COMMON-LISP-INTERNALS; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;
+;;; This file contains defs and code for managing buffers in the communication area.
+;;;
+
+;;;
+;;; The basic scheme here is that there's a large-ish art-q allocated by the cold-load
+;;; generator, out of which all handles into the comm area are built.  The handles 
+;;; themselves are defined by defstorage, and pointed to by locatives.  
+;;;
+
+(defwiredvar *emb-handle-array*
+    #+ignore (make-array (+ (* (length *buf-sizes-and-counts*) (defstorage-size emb-pool))
+			    (* (loop for (nil n nil) in *buf-sizes-and-counts*
+				     sum n)
+			       (defstorage-size emb-buf-handle))
+			    100)))		; slush
+
+(defwiredvar *emb-handle-array-next-free*)	;index in the array
+
+(defwiredvar *all-emb-pools*)
+(defwiredvar *emb-pool-count*)			; how many pools there are
+
+(defwiredvar *comm-area-next-free-offset*)	; allocation offset in comm area
+(defwiredvar *comm-area-top-offset*)		; offset of top we are allowed
+
+;;;
+;;; list of bufsize and how many to alloc at once
+;;; I don't know how to make a defconstant list get wired, so use a function
+;;; must do smallest first
+;;;
+(defwiredfun map-over-emb-buf-sizes-and-counts (function)
+  (declare (sys:downward-funarg function))
+  (funcall function 8 4)			; random small buffer
+  (funcall function 32 8)			; other random buffer
+  (funcall function 40 1)			; embedded DQE
+  (funcall function 128 1)			; mac page
+  #-VLM (funcall function 320 2)		; IMach page
+  (funcall function 380 4)			; ethernet packet
+  #+VLM (funcall function 2048 2))		; VLM disk block
+
+;;;
+;;; faking an array of buf pools
+;;;
+
+(defmacro emb-pool (index)
+  `(location-contents (%make-pointer-offset dtp-locative *all-emb-pools* ,index)))
+
+;;; Back-pointer from the buffer in the comm area to the handle in main memory
+(defsubst emb-buf-handle (pma)
+  (%p-contents-as-locative (%pointer-plus pma -1)))
+
+(defsetf emb-buf-handle (pma) (new-value)
+  `(%memory-write (%pointer-plus ,pma -1) ,new-value))
+
+;;; Called very early in cold booting
+(defwiredfun initialize-emb-comm-area ()
+  (let ((comm-area *emb-communication-area*))	;code space bum
+    ;;--- Later this consistency check will be in the FEP and there
+    ;;--- will be little use in doing it here too
+    (unless (and (eql (emb-identifier comm-area)
+		      #.(loop for char being the array-elements of "EMBD"
+			      and position from 0 by 8
+			      sum (rot (char-code char) position)))
+		 (eql (emb-version comm-area) 1)
+		 (eql (emb-system-type comm-area) *system-type*))
+      (wired-ferror :fatal "Embedding communication area clobbered"))
+    ;; Identify ourselves
+    (when (variable-boundp syscom-major-version-number)
+      (setf (emb-guest-major-version comm-area) syscom-major-version-number))
+    (when (variable-boundp syscom-minor-version-number)	;not set in the same place as major!
+      (setf (emb-guest-minor-version comm-area) syscom-minor-version-number))
+    ;; Resynchronize host and guest
+    (loop until (zerop (emb-reset-request)))
+    (setf (emb-reset-request) 1)
+    (send-emb-host-interrupt)
+    (loop until (zerop (emb-reset-request)))
+    ;; Get rid of all dynamically allocated channels
+    (loop with limit = (min (emb-guest-buffer-start comm-area)
+			    (emb-host-buffer-start comm-area)
+			    (emb-fep-buffer-start comm-area))
+	  for channel first (emb-channel-table comm-area) then (emb-disk-next cp)
+	  and previous first nil then cp
+	  as cp = (emb-pointer-to-pma channel)
+	  until (null cp)
+	  do (when ( channel limit)
+	       (if previous
+		   (setf (emb-disk-next previous) (emb-disk-next cp))
+		   (setf (emb-channel-table comm-area) (emb-disk-next cp)))))
+    ;; Initialize buffer allocation
+    (setq *comm-area-next-free-offset* (emb-guest-buffer-start comm-area))
+    (setq *comm-area-top-offset* (+ *comm-area-next-free-offset* 
+				    (emb-guest-buffer-size comm-area)))
+    (setq *emb-handle-array-next-free* 0)))
+
+(defwiredfun emb-handle-array-allocate (n-words)
+  (declare (values emb-handle-locative))
+  (prog1 (locf (aref *emb-handle-array* *emb-handle-array-next-free*))
+	 ;; Trap if array overflow
+	 (aref *emb-handle-array* (1- (incf *emb-handle-array-next-free* n-words)))))
+
+(defwiredfun construct-emb-pool (size)
+  (let ((pool (emb-handle-array-allocate (defstorage-size emb-pool))))
+    (setf (emb-pool-buffer-size pool) size)
+    (setf (emb-pool-buffer-count pool) 0)
+    (setf (emb-pool-all-buffers pool) nil)
+    (setf (emb-pool-free-buffers pool) nil)
+    pool))
+
+;;;
+;;; is this useful any more?
+;;;
+;(defun print-emb-buffer (buf stream ignore)
+;  (sys:printing-random-object (buf stream :typep)
+;    (format stream "Size ~D. PMA #o~O" (emb-buf-size buf) (emb-buf-pma buf))))
+
+;Add another buffer to the specified pool and return its handle
+;or return NIL if we are out of space
+(defwiredfun construct-emb-buf-handle (pool)
+  (unless ( (+ *emb-handle-array-next-free* (defstorage-size emb-buf-handle))
+	     (array-total-size *emb-handle-array*))
+    (return-from construct-emb-buf-handle nil))	; Handle space exhausted
+  (let* ((handle (emb-handle-array-allocate (defstorage-size emb-buf-handle)))
+	 (emb-chunk-size (1+ (emb-pool-buffer-size pool)))	
+						; leave a word for back-pointer to the
+						; handle.
+	 (pma (%pointer-plus *emb-communication-area*
+			     (+ *comm-area-next-free-offset* 1))))
+    ;; give up if we are out of space
+    (when (> (+ *comm-area-next-free-offset* emb-chunk-size) *comm-area-top-offset*)
+      (return-from construct-emb-buf-handle nil))
+    ;;
+    ;; account for the chunk
+    ;;
+    (incf *comm-area-next-free-offset* emb-chunk-size)
+    ;;
+    ;; set up the handle
+    ;;
+    (setf (emb-buf-size handle) (emb-pool-buffer-size pool))
+    (setf (emb-buf-pool handle) pool)
+    (setf (emb-buf-next handle) (emb-pool-all-buffers pool))
+    (setf (emb-buf-next-free handle) (emb-pool-free-buffers pool))
+    (setf (emb-buf-allocated handle) nil)
+    (setf (emb-buf-pma handle) pma)
+    ;;
+    ;; attach it to the pool
+    ;;
+    (setf (emb-pool-all-buffers pool) handle)
+    (setf (emb-pool-free-buffers pool) handle)
+    ;;
+    ;; set the back pointer
+    ;;
+    (setf (emb-buf-handle pma) handle)
+    handle))
+
+(defwiredfun initialize-comm-buffers ()
+  (let ((n-pools 0) (i 0))
+    (map-over-emb-buf-sizes-and-counts #'(lambda (ignore ignore) (incf n-pools)))
+    (setq *all-emb-pools* (emb-handle-array-allocate n-pools))
+    (setq *emb-pool-count* n-pools)
+    (map-over-emb-buf-sizes-and-counts #'(lambda (buf-size ignore)
+					   (setf (emb-pool i) (construct-emb-pool buf-size))
+					   (incf i)))
+    (loop with space-exhausted = nil		;use up the entire guest-buffer-area
+	  as found-space = nil			;fill in with small buffers at the last
+	  as first = t then nil
+	  do (setq i 0)
+	     (map-over-emb-buf-sizes-and-counts
+	       #'(lambda (ignore n-bufs)
+		   (loop repeat n-bufs
+			 as buf = (construct-emb-buf-handle (emb-pool i)) do
+		     (cond (buf (setq found-space t))
+			   (t
+			    (when first		;Need at least one batch of each size
+			      (wired-ferror :fatal "Guest buffer space too small"))
+			    (return (setq space-exhausted t))))
+		     (incf (emb-pool-buffer-count (emb-pool i))))
+		   (incf i)))
+	  until (and space-exhausted (not found-space)))))
+
+;;;
+;;; utilities
+;;;
+
+;;;--- later, may need to use something other than with-stack-array
+;;;--- what's here perhaps only works in unwired code?
+;;;--- Is this ever called?
+(defmacro with-emb-buffer ((var handle &key (element-type t)) &body body)
+  (let ((elts-per-word (if (eql element-type '(unsigned-byte 8)) 4 1))	; be brighter later
+	)
+    `(with-stack-array (,var 
+			(* ,elts-per-word (emb-buf-size handle))
+			:element-type ,element-type
+			:displaced-to (emb-buf-pma ,handle))
+       ,@body)))
+
+(defwiredsubst pma-inside-comm-area (pma)
+  (%unsigned-lessp (%pointer-difference pma *emb-communication-area*)
+		   (emb-comm-memory-size)))
+
+(defwiredsubst ptr-inside-handle-array (ptr)
+  (%unsigned-lessp (1- (%pointer-difference ptr *emb-handle-array*))
+		   *emb-handle-array-next-free*))
+
+(defwiredsubst emb-pointer-to-pma (embp)
+  (and ( embp -1)				; The NULL emb ptr turns into NIL
+       (%pointer-plus *emb-communication-area* embp)))
+
+(defwiredsubst pma-to-emb-pointer (pma)
+  (if (null pma)				; NIL PMA
+      -1					; yields NULL emb ptr
+      (%pointer-difference pma *emb-communication-area*)))
+
+;;;
+;;; this is expected to be called with a pma that came back from the host side.
+;;;
+(defwiredfun buf-pma-to-handle (pma)
+  (declare (values handle))
+  ;;
+  ;; a bit of sanity checking on the pma...
+  ;;
+  (compiler:%error-unless (pma-inside-comm-area pma)
+    (wired-ferror :fatal "buf-pma-to-handle: emb pointer out of bounds"))
+  (let ((handle (emb-buf-handle pma)))
+    (compiler:%error-unless (ptr-inside-handle-array handle)
+      (wired-ferror :fatal "buf-pma-to-handle: backpointer out of bounds"))
+    ;;
+    ;; make sure it's the RIGHT handle
+    ;;
+    (compiler:%error-unless (eq (emb-buf-pma handle) pma)
+      (wired-ferror :fatal "buf-pma-to-handle: backpointer and forepointer disagree"))
+    ;;
+    ;; Whew! done.
+    ;;
+    handle))
+
+
+;;;
+;;; allocation and deallocation
+;;; must be called at extra-stack level only (no higher interrupt levels, no emulator)
+;;; for locking
+
+(defvar *emb-waiter* nil)     			; Holds a process that is currently blocked
+						; waiting for an emb-buffer.
+
+;;; Allocate a buffer from the specified pool or any larger pool.  Won't block, and
+;;; is guaranteed atomic.
+(defwiredfun allocate-emb-buffer-internal (pool-index)
+  (labels ((allocate (pool)
+	     (%set-trap-mode trap-mode-io)
+	     (let ((buffer (emb-pool-free-buffers pool)))
+	       (when (not (null buffer))
+		 (shiftf (emb-pool-free-buffers pool) (emb-buf-next-free buffer) nil)
+		 (setf (emb-buf-allocated buffer) t)
+		 buffer))))
+    (loop thereis (allocate (emb-pool pool-index))
+	  until ( (incf pool-index) *emb-pool-count*))))
+
+(defwiredfun free-emb-buffer-p (pool-index)
+  (loop while (< pool-index *emb-pool-count*)
+	when (emb-pool-free-buffers (emb-pool pool-index))
+	  do (return t)
+	do (incf pool-index)))
+
+(defwiredfun first-appropriate-buffer-pool (nwords)
+  (dotimes (i *emb-pool-count*
+	    (wired-ferror :fatal "~D is larger than the maximum emb buffer size" nwords))
+    (when ( (emb-pool-buffer-size (emb-pool i)) nwords)
+      (return i))))
+
+;;;
+;;; this one is not wired, and may process-wait
+;;;
+(defun allocate-emb-buffer (size-in-words &optional (wait-p t))
+  (declare (values handle))
+  ;;
+  ;; first find the right pool index to start at
+  ;;
+  (let ((pool-index (first-appropriate-buffer-pool size-in-words)))
+    (loop for buf = (si:%funcall-in-aux-stack #'allocate-emb-buffer-internal pool-index)
+	  until (or buf (not wait-p))
+	  do (store-conditional (locf *emb-waiter*) nil *current-process*)
+	     (process-wait "EMB Buffer" #'free-emb-buffer-p pool-index)
+	  finally 
+;Turn this on if you need it for debugging, but it makes this function 7 times slower
+;	    (when buf
+;	      (sanity-check-buffer buf))
+	    (return buf))))
+
+;;;
+;;; this one will never wait and must be called at extra-stack level
+;;;
+(defwiredfun wired-allocate-emb-buffer (size-in-words)
+  (allocate-emb-buffer-internal (first-appropriate-buffer-pool size-in-words)))
+
+;;; Deallocate a buffer.  Won't block and is guaranteed atomic.
+(defwiredfun wired-deallocate-emb-buffer (buffer)
+  (compiler:%error-unless (emb-buf-allocated buffer)
+    (wired-ferror :fatal "Attempt to free emb buffer that is already free"))
+  (setf (emb-buf-allocated buffer) nil)
+  (let ((head-location (locf (emb-pool-free-buffers (emb-buf-pool buffer)))))
+    (loop do
+      (let ((head (location-contents head-location)))
+	(setf (emb-buf-next-free buffer) head)
+	(when (store-conditional head-location head buffer)
+	  (return nil))))))
+
+;;;
+;;;  this one is not wired
+;;;
+(defun deallocate-emb-buffer (buf)
+;Turn this on if you need it for debugging, but it makes this function 7 times slower
+; (sanity-check-buffer buf)
+  (si:%funcall-in-aux-stack #'wired-deallocate-emb-buffer buf)
+  (let ((waiter *emb-waiter*))
+    (when waiter
+      (when (store-conditional (locf *emb-waiter*) waiter nil)
+	(process:wakeup waiter)))))
+
+
+;;; Convert a string stored by Life Support in the communications area into a Lisp string
+;;; (This function doesn't really belong here but I am loath to create a new file for it.)
+(defun copy-emb-string (emb-pointer)
+  (let ((address (emb-pointer-to-pma emb-pointer)))
+    (when address
+      (let* ((length (emb-string-length address))
+	     (pointer (locf (emb-string-string address)))
+	     (string (make-string length)))
+	(dotimes (i (ceiling length 4))
+	  (let ((count (min 4 (- length (* i 4))))
+		(word (%memory-read pointer :fixnum-only t)))
+	    (setf (aref string (+ (* i 4) 0)) (code-char (ldb (byte 8 0) word)))
+	    (when (> count 1)
+	      (setf (aref string (+ (* i 4) 1)) (code-char (ldb (byte 8 8) word))))
+	    (when (> count 2)
+	      (setf (aref string (+ (* i 4) 2)) (code-char (ldb (byte 8 16) word))))
+	    (when (> count 3)
+	      (setf (aref string (+ (* i 4) 3)) (code-char (ldb (byte 8 24) word)))))
+	  (setf pointer (%pointer-plus pointer 1)))
+	string))))
+
+;;;
+;;; debug code
+;;;
+
+(defun describe-emb-pool (pool)
+  (zl:format t "~&Pool ~S" pool)
+  (zl:format t "~&  has size ~D. count ~D. free count ~D, next free ~S"
+	  (emb-pool-buffer-size pool) (emb-pool-buffer-count pool) 
+	  (loop for buf = (emb-pool-free-buffers pool) then (emb-buf-next buf)
+		while buf count t)
+	  (emb-pool-free-buffers pool)))
+
+
+(defun describe-all-emb-pools ()
+  (loop for i below *emb-pool-count*
+	do (describe-emb-pool (emb-pool i))))
+
+
+(defun describe-emb-buffer (buf)
+  (zl:format t "~&  Buffer ~S pool ~S next ~S free ~S PMA ~S size ~S alloc ~S" buf
+	  (emb-buf-pool buf) (emb-buf-next buf) (emb-buf-next-free buf)
+	  (emb-buf-pma buf) (emb-buf-size buf) (emb-buf-allocated buf)))
+
+(defun describe-pool-buffers (pool)
+  (zl:format t "~&Buffers in pool ~S" pool)
+  (loop for buf first (emb-pool-all-buffers pool)
+		then (emb-buf-next buf)
+	while buf
+	do
+    (describe-emb-buffer buf)))
+
+(defun describe-all-pool-buffers ()
+  (loop for i below *emb-pool-count*
+	do (describe-pool-buffers (emb-pool i))))
+
+(defun sanity-check-locative (loc)
+  ;; for my purposes, the locative should be inside *emb-handle-array*
+  (ptr-inside-handle-array loc))
+
+(defun sanity-check-buffer (buf)
+  (let ((ok t))
+    (unless (block nil
+	      (map-over-emb-buf-sizes-and-counts
+		#'(lambda (buf-size ignore)
+		    (when (= buf-size (emb-buf-size buf)) (return t)))))
+      ;;--- zl:format so it works in the cold-load
+      (zl:format t "~&  Buf ~S has bogus size ~S" buf (emb-buf-size buf))
+      (setq ok nil))
+    (unless (pma-inside-comm-area (emb-buf-pma buf))
+      (zl:format t "~&  Buf ~S has bogus pma ~S" buf (emb-buf-pma buf))
+      (setq ok nil))
+    (unless (eq (emb-buf-handle (emb-buf-pma buf)) buf)
+      (zl:format t "~&  Buf ~S pma ~S has bogus back-pointer ~S" 
+		 buf (emb-buf-pma buf) (emb-buf-handle (emb-buf-pma buf)))
+      (setq ok nil))
+    (unless (or (null (emb-buf-next buf))
+		(sanity-check-locative (emb-buf-next buf)))
+      (zl:format t "~&  Buf ~S has bogus next pointer ~S" buf (emb-buf-next buf))    
+      (setq ok nil))
+    (unless (or (null (emb-buf-next-free buf))
+		(sanity-check-locative (emb-buf-next-free buf)))
+      (zl:format t "~&  Buf ~S has bogus next free pointer ~S" buf (emb-buf-next-free buf))
+      (setq ok nil))
+    (unless (sanity-check-locative (emb-buf-pool buf))
+      (zl:format t "~&  Buf ~S has bogus pool pointer ~S" buf (emb-buf-pool buf))
+      (setq ok nil))
+    ok))
+
+(defun sanity-check-pool (pool)
+  (unless (block nil
+	    (map-over-emb-buf-sizes-and-counts
+	      #'(lambda (buf-size ignore)
+		  (when (= buf-size (emb-pool-buffer-size pool)) (return t)))))
+    (zl:format t "~&  Pool ~S has bogus buffer-size ~S" pool (emb-pool-buffer-size pool)))
+  (unless (sanity-check-locative (emb-pool-all-buffers pool))
+    (zl:format t "~&  Pool ~S has bogus all-buffers slot ~S" pool (emb-pool-all-buffers pool)))
+  (unless (or (null (emb-pool-free-buffers pool))
+	      (sanity-check-locative (emb-pool-free-buffers pool)))
+    (zl:format t "~&  Pool ~S has bogus free-buffers slot ~S" pool 
+	    (emb-pool-free-buffers pool))))
+
+(defun sanity-check-pool-and-bufs (pool)
+  (sanity-check-pool pool)
+  (loop for buf first (emb-pool-all-buffers pool)
+		then (emb-buf-next buf)
+	while buf
+	do (sanity-check-buffer buf)))
+
+(defun sanity-check-all-pools-and-bufs ()
+  (loop for i below *emb-pool-count* do
+    (sanity-check-pool-and-bufs (emb-pool i))))
+
+(defun describe-comm-area ()
+  (zl:format t "~&Comm area ~S" *emb-communication-area*)
+  (zl:format t "~&  N words            ~S" (emb-comm-memory-size))
+  (zl:format t "~&  guest buffer start ~S" (emb-guest-buffer-start))
+  (zl:format t "~&  guest buffer size  ~S" (emb-guest-buffer-size)))
+
+
+(defun emb-buffer-check-or-error (buf-handle)
+  (unless (and (typep buf-handle 'locative)
+	       (sanity-check-buffer buf-handle))
+    (error "Help!")))

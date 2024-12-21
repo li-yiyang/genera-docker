@@ -1,0 +1,772 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SYSTEM-INTERNALS; Base: 10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+
+;;; Fast I/O to FEP files.  This goes on the principle that if enough disk I/O
+;;; operations are queued together it runs faster.  That's what it says here.
+
+;;; To Do:  Have the reader and writer hack the map themselves, thus
+;;;           bypassing the losing system code which copies the disk-array
+;;;           one sector at a time when you try to write over a map
+;;;           boundary.
+;;; (Partly done) What it does now is check the data map and shrink the transfers
+;;;               when they would cross a break.  Not optimum; the BLOCK-R/W fcn.
+;;;               should be able to enqueue the darn thing the right way.
+;;;               DCP tells me that this requires a remod of the disk stuff; I'll
+;;;               try it when he gives me some hints.
+
+(defconst fep-file-io-path-defaults (fs:make-pathname-defaults))
+
+(defconst dss si:disk-sector-data-size32)
+
+;;; DCP claims that 40 is more or less optimum for 
+(defconst ffdab 40.)
+
+
+
+; Principal implementation for binary streams
+;
+(defflavor fep-iman-stream-mixin (byte-size buffer pointer block-no limit length)
+	   ()
+  (:required-flavors basic-indirect-stream-mixin stream)
+  (:initable-instance-variables byte-size))
+
+(DEFMETHOD (:WITH-BIT-ARRAY fep-iman-stream-mixin) (&REST ARGS)
+  (CL:APPLY #'tv:BIT-ARRAY-STREAM-AS-BIT-ARRAY SELF ARGS))
+
+(DEFMETHOD (:WITH-BIT-ARRAY-OR-STREAM fep-iman-stream-mixin) (&REST ARGS)
+  (CL:APPLY #'tv:WITH-BIT-ARRAY-STREAM SELF ARGS))
+
+(DEFMETHOD (:WITH-BIT-ARRAY-STREAM fep-iman-stream-mixin) (&REST ARGS)
+  (CL:APPLY #'tv:STREAM-AS-BIT-ARRAY-STREAM SELF ARGS))
+
+(defmethod (:BYTE-SIZE fep-iman-stream-mixin) () byte-size)
+
+(defmethod (:init fep-iman-stream-mixin :after) (ignore)
+  (setq buffer (allocate-resource
+		 'si:disk-array
+		 (* (// 32. byte-size) si:disk-sector-data-size32)
+		 :type (color:data-array-type byte-size)))
+  )
+
+(defmethod (:read-pointer fep-iman-stream-mixin) ()
+  (if block-no
+      (let ((blksiz (* dss (// 32. byte-size))))
+	(+ (* block-no blksiz) (or pointer 0)))
+      0))
+
+(defmethod (:set-pointer fep-iman-stream-mixin) (new)
+  (let* ((blksiz (* dss (// 32. byte-size)))
+	 (new-block (// new blksiz))
+	 (blocks (// (+ length blksiz -1) blksiz)))
+
+    (when (or (null block-no)
+	      ( block-no new-block))
+      (unwind-protect
+	  (progn
+	    (setq block-no nil)
+	    (si:wire-disk-array buffer)
+	    (send stream :block-in new-block 1 buffer :hang-p t)
+	    (setq block-no new-block))
+	(si:unwire-disk-array buffer)))
+
+    (setq pointer (\ new blksiz))
+    (if (= block-no (1- blocks))
+	(setq limit (\ length blksiz))
+	(setq limit blksiz))
+    new))
+
+(defflavor fep-iman-output-stream ()
+	   (fep-iman-stream-mixin basic-indirect-stream-mixin stream)
+  )
+
+(DEFMETHOD (:DIRECTION FEP-IMAN-OUTPUT-STREAM) () ':output)
+
+(defmethod (:init fep-iman-output-stream) (ignore)
+  (setq pointer 0
+	block-no 0))
+
+(defmethod (:tyo fep-iman-output-stream) (char)
+  (aset char buffer pointer)
+  (incf pointer)
+  (when (>= pointer (array-length buffer))
+    (send self :send-output-buffer)))
+
+(defmethod (:string-out fep-iman-output-stream)
+	   (str &optional (start 0) (length (string-length str)))
+  (loop as space = (- (array-length buffer) pointer)
+	while (> (- length start) space)
+	do
+    (copy-array-portion str start (+ start space)
+			buffer pointer (array-length buffer))
+    (incf start space)
+    (send self :send-output-buffer)
+	finally
+	  (copy-array-portion str start length
+			      buffer pointer (array-length buffer))
+	  (incf pointer (- length start))
+	  (when (>= pointer (array-length buffer))
+	    (send self :send-output-buffer)))
+  )
+
+(defmethod (:close fep-iman-output-stream) (&optional abort-p)
+  (unless abort-p
+    (send stream :change-properties nil
+	  :length-in-bytes (+ (* pointer (// byte-size 8))
+			      (* block-no dss (// 32. 8))))
+    (send self :send-output-buffer))
+  (send stream :close abort-p)
+  (send self :return-buffer))
+
+(defmethod (:send-output-buffer fep-iman-output-stream) ()
+  (send stream :map-block-no block-no t)
+  (unwind-protect
+      (progn
+	(si:wire-disk-array buffer)
+	(send stream :block-out block-no 1 buffer :hang-p t))
+    (si:unwire-disk-array buffer))
+  (incf block-no)
+  (setq pointer 0))
+
+(defmethod (:return-buffer fep-iman-output-stream) ()
+  (deallocate-resource 'si:disk-array buffer))
+
+
+;;; New plan for this:  Do everything by bits.  
+(defmethod (:write-2d-array-real-fast fep-iman-output-stream)
+	   (array &key width height (x 0) (y 0))
+  (check-arg array (and (arrayp array)
+			(not (null (array-bits-per-element
+				     (sys:array-type-field array))))
+			(= (cl:array-rank array) 2))
+	     "A 2d numeric array")
+  (multiple-value-bind (array-width array-height)
+      (decode-raster-array array)
+
+    (let* ((bpe (array-element-byte-size array)) ;Bits per element
+	   (bpbe (array-element-byte-size buffer))	;" buffer "
+	   (array-bit-width (* array-width bpe))
+	   (x-offset (* x bpe))
+	   (width (or width array-width))
+	   (height (or height array-height))
+	   (ylim (+ y height))
+	   (bit-width (* width bpe))
+	   (stored-bit-width (if (zerop (\ bit-width 32)) bit-width
+				 (+ bit-width (- 32 (\ bit-width 32)))))
+	   (blox (// (+ (* stored-bit-width height) (* dss 32) -1) (* dss 32)))
+	   swapped
+	   (fp 0)
+	   blocks-to-fill
+	   fplim)
+      (when (or (> (+ x width) array-width)
+		(> (+ y height) array-height))
+	(ferror "The specified rectangle exceeds the bounds of the array."))
+      (send stream :map-block-no (+ block-no blox (if (zerop pointer) -1 0)) t)
+      ;; All set up, now get our disk arrays.
+      
+      (using-resource (disk-array si:disk-array (* dss ffdab) :type 'art-fixnum)
+	(using-resource (other-disk-array si:disk-array (* dss ffdab) :type 'art-fixnum)
+	  (using-resource (disk-event si:disk-event)
+	    (with-stack-list (dimlist 1 (* dss 32))
+	      (with-stack-array
+		(ffio-from-array dimlist :type 'art-1b
+				 :displaced-to buffer)
+		(with-stack-array
+		  (ffio-to-array dimlist :type 'art-1b :displaced-to disk-array)
+		  
+		  (unwind-protect
+		      (let ((current-y y)
+			    (leftover-line-x-offset 0))
+			;; Wire up the disk i/o things...
+			(si:wire-disk-array disk-array)
+			(si:wire-disk-array other-disk-array)
+			(si:wire-disk-event disk-event)
+			
+			
+			;; First see what's sitting in BUFFER.  Copy what's there to disk-array.
+			(let ((bufbits (* pointer bpbe)))
+			  (unless (zerop bufbits)
+			    (bitblt tv:alu-seta bufbits 1
+				    ffio-from-array 0 0
+				    ffio-to-array 0 0))
+			  (setq fp bufbits))
+			
+			;; While we're at it, set up the indirect source array.
+			(with-stack-list (dimlist array-height array-bit-width)
+			  (si:change-indirect-array ffio-from-array 'art-1b dimlist array 0))
+			
+			;; Loop over the disk arrays, blasting maximum numbers of lines,
+			;; and trickling the beginnings and ends.
+			(loop doing
+			  ;; First see how full we can go without tripping over the data map.
+			  ;; Set our limits accordingly.
+			  (multiple-value (nil blocks-to-fill)
+			    (send stream :map-block-no block-no nil))
+			  (setq blocks-to-fill (min ffdab blocks-to-fill)
+				fplim (* blocks-to-fill dss 32.))
+			  ;; Now transfer the source array into the disk-array.
+			  (unless (zerop leftover-line-x-offset)
+			    ;; Beginning partial line.
+			    (let* ((room-in-da (- fplim fp))
+				   (partial-copy-width (max 0 (min room-in-da (- bit-width leftover-line-x-offset)))))
+			      (when (> partial-copy-width 0)
+				(with-stack-list (dimlist 1 stored-bit-width)
+				  (si:change-indirect-array ffio-to-array 'art-1b dimlist
+							    disk-array 0))
+				(bitblt tv:alu-seta partial-copy-width 1
+					ffio-from-array leftover-line-x-offset current-y
+					ffio-to-array 0 0)
+				(incf fp partial-copy-width)
+				(incf leftover-line-x-offset partial-copy-width))
+			      (when (eql leftover-line-x-offset bit-width)
+				(incf current-y)
+				(setq leftover-line-x-offset 0))
+			      ))	;partial line done.
+			      while (< current-y ylim)
+			      doing
+			  
+			  ;; Okay, now the world is our disk-array!  Blast the whole thing.
+			  (when (zerop leftover-line-x-offset)
+			    (let* ((lines-to-go (- ylim current-y))
+				   (room-in-da (- fplim fp))
+				   (dalines (min lines-to-go
+						 (// room-in-da stored-bit-width)))
+				   (daspoor (if (< dalines lines-to-go)
+						(- room-in-da (* dalines stored-bit-width))
+						0)))
+										      
+			      (with-stack-list (dimlist dalines stored-bit-width)
+				(si:change-indirect-array ffio-to-array 'art-1b dimlist
+							  disk-array fp))
+			      (bitblt tv:alu-seta bit-width dalines
+				      ffio-from-array 0 current-y
+				      ffio-to-array 0 0)
+			      (incf current-y dalines)
+			      (incf fp (* dalines stored-bit-width))
+			      (setq leftover-line-x-offset daspoor)
+			      ))
+			  
+			      while (or (< current-y ylim) (not (zerop leftover-line-x-offset)))
+			      doing
+			  
+			  ;; If there's any final partial-line, do it.
+			  (unless (zerop leftover-line-x-offset)
+			    (let* ((last-width (min bit-width leftover-line-x-offset))
+				   (last-full-width (* 32 (ceiling last-width 32))))
+			      (with-stack-list (dimlist 1 last-full-width)
+				(si:change-indirect-array ffio-to-array 'art-1b dimlist
+							  disk-array
+							  (- fp (- last-full-width
+								   last-width))))
+			      (when (> last-width 0)
+				(bitblt tv:alu-seta last-width 1
+					ffio-from-array
+					x-offset
+					current-y
+					ffio-to-array (- last-full-width last-width) 0)))
+			    (incf fp leftover-line-x-offset))
+			  
+			  ;; Finished this disk array.  Wait for the next & start a new batch.
+			  (si:wait-for-disk-event disk-event)
+			  (setq swapped (not swapped)
+				fp 0)
+			  (swapf disk-array other-disk-array)
+			  (send stream :block-out block-no blocks-to-fill other-disk-array
+				:hang-p nil :disk-event disk-event)
+			  (incf block-no blocks-to-fill))
+			
+			;; Finished!  Write out any "full" blocks and spill the partial one
+			;; back into BUFFER.
+			(let ((blx (// fp (* dss 32)))
+			      (fpoff (\ fp (* dss 32))))
+			  (when (plusp blx)
+			    ;; Oops, don't enqueue a 0 block transfer!
+			    (si:wait-for-disk-event disk-event)
+			    (send stream :block-out block-no blx disk-array
+				  :hang-p nil :disk-event disk-event)
+			    (incf block-no blx))
+			  (let ((last-w (* 32 (ceiling fpoff 32))))
+			    (with-stack-list (dimlist 1 last-w)
+			      (si:change-indirect-array ffio-from-array
+							'art-1b dimlist disk-array
+							(* blx dss 32))
+			      (si:change-indirect-array ffio-to-array 'art-1b dimlist buffer 0))
+			    (when (> fpoff 0)
+			      (bitblt tv:alu-seta fpoff 1
+				      ffio-from-array 0 0
+				      ffio-to-array 0 0)))
+			  (setq pointer (// (+ fpoff bpbe -1) bpbe))
+			  (si:wait-for-disk-event disk-event)))
+		    
+		    (si:unwire-disk-array disk-array)
+		    (si:unwire-disk-array other-disk-array)
+		    (si:unwire-disk-event disk-event)
+		    (when swapped (swapf disk-array other-disk-array)))
+		  )))))
+	))))
+
+(defflavor fep-iman-input-stream ( buffer-base)
+	   (fep-iman-stream-mixin basic-indirect-stream-mixin stream)
+  )
+
+(DEFMETHOD (:DIRECTION FEP-IMAN-INPUT-STREAM) () ':input)
+
+(defmethod (:init fep-iman-input-stream) (ignore &aux props)
+  (setq props (send (send stream :truename) :properties)
+	pointer nil
+	block-no nil
+	length (// (* (get props :length-in-bytes) 8) byte-size)))
+
+(defmethod (:tyi fep-iman-input-stream) (&optional eof)
+  (unless pointer
+    (send self :get-next-input-buffer))
+  (if pointer					;if pointer STILL null, EOF.
+      (prog1
+	(aref buffer pointer)
+	(incf pointer)
+	(when (>= pointer limit)
+	  (setq pointer nil)))
+      eof))
+
+(defmethod (:string-in fep-iman-input-stream) (eof-option string &optional (start 0) end)
+  (unless end
+    (setq end (string-length string)))
+  (unless pointer
+    (send self :get-next-input-buffer)
+    )
+  (let ((space (- end start)))
+    (loop while (> space 0)
+	  when (null pointer)
+	    do
+	    (when eof-option
+	      (error 'sys:end-of-file :format-string eof-option :stream self))
+	    (when (array-has-leader-p string)
+	      (setf (fill-pointer string) start))
+	    (return (values start t))
+	  as stuff = (- limit pointer)
+	  while (> space stuff)
+	  do
+      (copy-array-portion buffer pointer limit
+			  string start (+ start stuff))
+      (decf space stuff)
+      (incf start stuff)
+      (setq pointer nil)
+      (send self :get-next-input-buffer)
+	  finally
+	    (copy-array-portion buffer pointer limit
+				string start end)
+	    (incf pointer space)
+	    (when (>= pointer limit)
+	      (setq pointer nil))
+	    (when (array-has-leader-p string)
+	      (setf (fill-pointer string) start))
+	    (return start))))
+
+(defmethod (:get-next-input-buffer fep-iman-input-stream) ()
+  (let* ((blksiz (* dss (// 32. byte-size)))
+	 (blocks (// (+ length blksiz -1) blksiz)))
+    (if block-no
+	(incf block-no)
+	(setq block-no 0))
+    (if ( block-no blocks)
+
+	(setq block-no (1- block-no)
+	      pointer nil)
+
+	;; Not EOF.  Go on...
+	(unwind-protect
+	    (progn
+	      (si:wire-disk-array buffer)
+	      (send stream :block-in block-no 1 buffer :hang-p t))
+	  (si:unwire-disk-array buffer))
+	(setq pointer 0)
+	(if (= block-no (1- blocks))
+	    (let ((rem (\ length blksiz)))
+	      (if (zerop rem)
+		  (setq limit blksiz)
+		  (setq limit rem)))
+	    (setq limit blksiz))))
+  )
+
+      
+(defmethod (:close fep-iman-input-stream) (&optional abort-p)
+  abort-p
+  (send stream :close)
+  (si:deallocate-resource 'si:disk-array buffer))
+
+
+;;; Abandon all hope, ye who enter here.
+
+(defmethod (:read-2d-array-real-fast fep-iman-input-stream)
+	   (array &key width height (x 0) (y 0)
+		  (stored-width width) (stored-x-offset 0)
+		  (stored-height height) (stored-y-offset 0))
+
+  (check-arg array (and (arrayp array)
+			(not (null (array-bits-per-element
+				     (sys:array-type-field array))))
+			(= (cl:array-rank array) 2))
+	     "A 2d numeric array")
+
+  (multiple-value-bind (array-width array-height) (decode-raster-array array)
+    (let* ((bpe (array-element-byte-size array)) ;Bits per element
+	   (bpbe (array-element-byte-size buffer))	;" buffer "
+	   (array-bit-width (* array-width bpe))
+	   (stored-bit-width (* stored-width bpe))
+	   (stored-bit-offset (* stored-x-offset bpe))
+	   (dest-height (min (+ y height) array-height))
+	   (height (min height (- array-height y) stored-height))
+	   (x-offset (* x bpe))
+	   (bit-width (* width bpe))
+	   swapped
+	   (fp 0)
+	   disklim
+	   blocks-being-copied
+	   blocks-being-read
+	   block-reading-in)
+      (when (> (+ x width) array-width)
+	(ferror "The specified rectangle exceeds the bounds of the array."))
+      ;; All set up, now get our disk arrays.
+      (using-resource (disk-array si:disk-array (* dss ffdab) :type 'art-fixnum)
+	(using-resource (other-disk-array si:disk-array (* dss ffdab) :type 'art-fixnum)
+	  (using-resource (disk-event si:disk-event)
+	    (with-stack-list (dimlist array-height array-bit-width)
+	      (with-stack-list (stored-dims 1 stored-bit-width)
+		(with-stack-array (ffio-to-array dimlist :type 'art-1b
+						 :displaced-to array :displaced-conformally t)
+		  (with-stack-array
+		    (ffio-from-array stored-dims :type 'art-1b :displaced-to buffer)
+		    (unwind-protect
+			(let ((source-y 0)
+			      (dest-y y)
+			      (leftover-line-x-offset 0))
+			  ;; Wire up the disk i/o things...
+			  (si:wire-disk-array disk-array)
+			  (si:wire-disk-array other-disk-array)
+			  (si:wire-disk-event disk-event)
+			  
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")			  ;; Before we do anything else, start the first moby disk array
+			  ;; loading.
+0			  (if block-no (incf block-no) (setq block-no 0))
+			  (multiple-value (nil blocks-being-copied)
+			    (send stream :map-block-no block-no nil))
+			  (setq blocks-being-copied (min ffdab blocks-being-copied))
+			  (send stream :block-in block-no blocks-being-copied
+				disk-array :disk-event disk-event :hang-p nil)
+			  
+1			  ;; First see what's sitting in BUFFER.
+			  ;; Copy any whole lines in a blast,
+			  ;; then the remaining trickle.
+0			  (when pointer
+			    (let* ((bufoffset (* pointer bpbe))
+				   (bufbits (- (* dss 32.) bufoffset))
+				   (buflines (min (// bufbits stored-bit-width)
+						  height))
+				   (copylines (- buflines stored-y-offset))
+				   ;; By definition, if everything's in BUFFER, no spoor.
+				   (bufspoor (if (< buflines (+ height stored-y-offset))
+						 (- bufbits (* buflines stored-bit-width))
+						 0)))
+			      
+			      (with-stack-list (dimlist (1+ buflines) stored-bit-width)
+				(si:change-indirect-array ffio-from-array 'art-1b
+							  dimlist buffer bufoffset))
+			      (when (plusp copylines)
+				;; First the blast...
+				(tv:bitblt-by-segments
+				  tv:alu-seta bit-width copylines
+				  ffio-from-array stored-bit-offset stored-y-offset
+				  ffio-to-array x-offset dest-y)
+				(incf dest-y copylines))
+			      (incf source-y buflines)
+
+			      (unless (or (zerop bufspoor)
+					  (< source-y stored-y-offset)
+					  ( dest-y dest-height))
+				;; Now the remaining partial line, if any.
+				(let ((buffer-partial-width
+					(min (- bufspoor stored-bit-offset)
+					     bit-width)))
+				  (when (plusp buffer-partial-width)
+				    (let* ((b-offset (+ (* buflines stored-bit-width)
+							bufoffset))
+					   (desired-width (+ stored-bit-offset
+							     buffer-partial-width))
+					   (actual-width (* 32. (ceiling desired-width 32.)))
+					   (buffer-offset (- b-offset
+							     (- actual-width desired-width)))
+					   (stored-bit-offset
+					     (+ stored-bit-offset
+						(- actual-width desired-width))))
+
+				      (with-stack-list
+					(dimlist 1 actual-width)
+					(si:change-indirect-array ffio-from-array 'art-1b
+								  dimlist buffer
+								  buffer-offset))
+
+				    (tv:bitblt-by-segments tv:alu-seta buffer-partial-width 1
+					    ffio-from-array stored-bit-offset 0
+					    ffio-to-array x-offset dest-y)
+				    ))))
+
+			      (setq leftover-line-x-offset bufspoor)))
+
+1			  ;; Now start doing moby disk array reading.
+			  ;; Await the first batch.
+0			  (si:wait-for-disk-event disk-event)
+			  (setq disklim (* blocks-being-copied dss 32)
+				fp 0)
+			  
+1			  ;; Okay, now get the next batch reading in.
+0			  (setq block-reading-in (+ block-no blocks-being-copied))
+			  (multiple-value (nil blocks-being-read)
+			    (send stream :map-block-no block-reading-in nil))
+			  (setq blocks-being-read (and blocks-being-read (min ffdab blocks-being-read)))
+			  (when (and blocks-being-read
+				     (< blocks-being-read ffdab)))
+			  (when blocks-being-read
+			    (send stream :block-in block-reading-in blocks-being-read
+				  other-disk-array :disk-event disk-event :hang-p nil))
+			  
+1			  ;; Loop over the disk arrays, blasting maximum numbers of lines,
+			  ;; and trickling the beginnings and ends.
+0			  (loop1 0as end-of-disk-buffer = nil
+				doing
+
+			    (unless (zerop leftover-line-x-offset)
+			      (let* ((width-available (min disklim (- stored-bit-width leftover-line-x-offset)))
+				     (width-wanted (min disklim (- (+ stored-bit-offset bit-width) leftover-line-x-offset)))
+				     (partial-x-offset (max 0 (- stored-bit-offset leftover-line-x-offset)))
+				     (partial-width (- width-wanted partial-x-offset))
+				     )
+
+				(unless (or (< source-y stored-y-offset)
+					    ( dest-y dest-height))
+
+				  (unless ( partial-width 0)
+				    ;; Beginning partial line.
+				    (with-stack-list (dimlist
+						       1
+						       (* 32 (ceiling width-wanted 32)))
+				      (si:change-indirect-array ffio-from-array
+								'art-1b dimlist
+								disk-array 0))	
+				  
+				    (tv:bitblt-by-segments tv:alu-seta
+							   partial-width 1
+							   ffio-from-array partial-x-offset 0
+							   ffio-to-array
+							   (+ x-offset
+							      (max 0 (- leftover-line-x-offset stored-bit-offset)))
+							   dest-y)				    
+				    )
+				  )		;partial line done.
+				(incf leftover-line-x-offset width-available)
+				(incf fp width-available)
+				(cond (( leftover-line-x-offset stored-bit-width)
+				       (unless (< source-y stored-y-offset)
+					 (incf dest-y))
+				       (incf source-y))
+				      (t (setq end-of-disk-buffer t)))
+				))
+				while (< source-y stored-height)
+				doing
+
+			    (unless end-of-disk-buffer
+1			      ;; Okay, now the world is our disk-array!  Blast the whole thing.
+0			      (let* ((lines-to-go (- stored-height source-y))
+				     (lines-in-buffer (min (// (- disklim fp) stored-bit-width)
+							   lines-to-go))
+				     (first-line (- stored-y-offset source-y))
+				     (lines-to-copy (min (- lines-in-buffer first-line)
+							 (- (+ stored-y-offset height) source-y
+							    (max 0 first-line))
+							 lines-in-buffer)))
+				(when (plusp lines-to-copy)
+				  (with-stack-list (dimlist lines-in-buffer stored-bit-width)
+				    (si:change-indirect-array ffio-from-array 'art-1b dimlist
+							      disk-array fp))
+				  (tv:bitblt-by-segments tv:alu-seta bit-width lines-to-copy
+							 ffio-from-array stored-bit-offset (max 0 first-line)
+							 ffio-to-array x-offset dest-y)
+				  (incf dest-y lines-to-copy))
+				(incf source-y lines-in-buffer)
+				(incf fp (* lines-in-buffer stored-bit-width))
+				(setq leftover-line-x-offset
+				      (if (>= source-y stored-height)
+					  0
+					  (\ (- disklim fp) stored-bit-width)))
+				))
+
+				while (< source-y stored-height)
+				doing
+
+1			    ;; If there's the start of a partial-line, do it.
+0			    (unless (or (zerop leftover-line-x-offset) end-of-disk-buffer)
+			      (unless (or (< source-y stored-y-offset)
+					  ( dest-y dest-height))
+				(let* ((last-w (max 0 (min bit-width
+							   (- leftover-line-x-offset stored-bit-offset))))
+				       (last-s (* 32 (ceiling last-w 32)))
+				       )
+				  (when (> last-s 0)
+				    (with-stack-list (dimlist 1 last-s)
+				      (si:change-indirect-array ffio-from-array 'art-1b dimlist
+								disk-array
+								(+ fp
+								   (- stored-bit-offset
+								      (- last-s last-w))
+								   )))
+				    ;(format t "~& e bb last-w ~S from ~S to ~S" last-w (- last-s last-w) x-offset)
+				    (tv:bitblt-by-segments tv:alu-seta
+							   last-w 1
+							   ffio-from-array (- last-s last-w) 0
+							   ffio-to-array x-offset dest-y))
+				  ))
+			      (incf fp leftover-line-x-offset))
+
+1			    ;; Finished this disk array.  Wait for the next & start a new batch.
+0			    (when (null blocks-being-read)
+			      (error 'sys:end-of-file :stream self))
+			    (si:wait-for-disk-event disk-event)
+			    (setq swapped (not swapped))
+			    (swapf disk-array other-disk-array)
+			    (setq block-no block-reading-in
+				  block-reading-in (+ block-reading-in blocks-being-read)
+				  blocks-being-copied blocks-being-read
+				  disklim (* blocks-being-copied dss 32)
+				  fp 0)
+			    (multiple-value (nil blocks-being-read)
+			      (send stream :map-block-no block-reading-in nil))
+			    (setq blocks-being-read (and blocks-being-read
+							 (min blocks-being-read ffdab)))
+			    (when blocks-being-read
+			      (send stream :block-in block-reading-in
+				    blocks-being-read other-disk-array
+				    :hang-p nil :disk-event disk-event)))
+			  
+			  ;; Finished!  Now copy the remainder of the "current" block
+			  ;; from disk-array into buffer.
+			  (cond ((= fp disklim)
+				 (incf block-no (1- (// (+ disklim (* dss 32) -1) (* dss 32))))
+				 (setq pointer nil))
+				(t 
+				 (let ((blk (// fp dss 32))
+				       (blkoff (\ fp (* dss 32))))
+				   (with-stack-list (dimlist 1 (* dss 32.))
+				     (si:change-indirect-array ffio-from-array 'art-1b dimlist
+							       disk-array (* blk dss 32))
+				     (si:change-indirect-array ffio-to-array 'art-1b dimlist
+							       buffer 0))
+				   (tv:bitblt-by-segments tv:alu-seta (* dss 32) 1
+					   ffio-from-array 0 0
+					   ffio-to-array 0 0)
+				   (setq pointer (// (+ blkoff bpbe -1) bpbe))
+				   (incf block-no blk)
+				   (let* ((blksiz (* dss (// 32 byte-size)))
+					  (blocks (// (+ length blksiz -1)
+						      blksiz)))
+				     (setq limit (if (= block-no (1- blocks))
+						     (\ length blksiz)
+						     blksiz))
+				     (when (= pointer limit)
+				       ;; OOPS!  This is really empty, and pointer should be...
+				       (setq pointer nil))
+				     )))))
+		      
+		      (si:unwire-disk-array disk-array)
+		      (si:unwire-disk-array other-disk-array)
+		      (si:unwire-disk-event disk-event)
+		      (when swapped (swapf disk-array other-disk-array))))
+		  )))))))))
+
+(defun pathname-is-local-fep-p (pathname)
+  (let ((pn (fs:parse-pathname pathname)))
+    (and (typep pn 'fs:fep-pathname)
+	 (eq (send (send pn :host) :host) net:*local-host*))))
+
+(defun open-fep-image-stream (pathname &rest open-args)
+  (let* ((direction (cl:getf open-args :direction :in))
+	 (exists (cl:getf open-args :if-exists 'not-supplied))
+	 (doesnt (cl:getf open-args :if-does-not-exist 'not-supplied))
+	 (chars (cl:getf open-args :characters t))
+	 (bsiz (cl:getf open-args :byte-size (if chars 8. 16.)))
+	 (flavor (selectq direction
+		   ((:in :input) 'fep-iman-input-stream)
+		   ((:out :output) 'fep-iman-output-stream)
+		   (otherwise (ferror "Direction ~s unrecognized.")))))
+
+    (when (eq exists 'not-supplied)
+      (setq exists (if (memq direction '(:in :input))
+		       :overwrite
+		       (if (eq (send pathname :version) :newest)
+			   :new-version :error))))
+    (when (eq doesnt 'not-supplied)
+      (setq doesnt (if (or (memq direction '(:in :input))
+			   (memq exists '(:overwrite :truncate :append)))
+		       :error :create)))
+    (let* ((stream (open pathname :direction :block
+			       :if-exists exists
+			       :if-does-not-exist doesnt
+			       :byte-size bsiz
+			       :characters chars))
+	   (real-stream (make-instance flavor
+				       :stream stream
+				       :byte-size bsiz
+				       )))
+      real-stream)))
+
+(compile-flavor-methods fep-iman-input-stream  fep-iman-output-stream)

@@ -1,0 +1,516 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: RPC; Base: 10; Lowercase: T -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;>
+
+;;; TCP Transport agent
+
+(export '(
+	  host-tcp-transport-agent close-all-port-mapping-tcp-transport-agents
+	  tcp-agent-note-dependent dependent-note-tcp-agent-closed
+	  tcp-rpc-stream-closed))
+
+(defflavor tcp-transport-agent-mixin
+	((dependents nil))
+	()
+  (:required-flavors arrays-for-xdr-blocks)
+  (:abstract-flavor))
+
+(defmethod (tcp-agent-note-dependent tcp-transport-agent-mixin)
+	   (dependent &optional delete-p)
+  (if delete-p
+      (setq dependents (delete dependent dependents))
+    (pushnew dependent dependents)))
+
+(defmethod (network-agent-p tcp-transport-agent-mixin) () t)
+
+(defgeneric dependent-note-tcp-agent-closed (tcp-tcp-agent-dependent tcp-agent)
+  "Called for each noted dependent by a TCP agent as it is closing.")
+
+(defmethod (:close tcp-transport-agent-mixin :after) (ignore)
+  (loop for dependent in dependents
+	do (dependent-note-tcp-agent-closed dependent self)))
+
+(defmethod (rpc-dispatch-process-priority tcp-transport-agent-mixin) ()
+  ;; Lower than the priority of the Ethernet Receiver process.  The TCP
+  ;; Background process runs at a deadline priority, so we don't have to worry
+  ;; about it.
+  (process:make-process-priority :fg 9 :preemptive t))
+
+(defmacro-in-flavor (with-stream-lock tcp-transport-agent-mixin) ((lock) &body body)
+  `(process:with-lock (,lock)
+     (without-aborts ("I/O is being performed on the RPC stream.~@
+		       Aborting this will probably unsynchronize the record formatting~@
+		       in the stream and cause RPC to stop working completely.")
+       ,@body)))
+
+(zwei:defindentation (with-stream-lock 0 4 1 1))
+
+(defparameter *tcp-notify* nil)
+
+(defmethod (send-xdr-block-stream tcp-transport-agent-mixin)
+	   (stream lock block &optional dont-release)
+  (when *tcp-notify* (tv:notify nil "TCP RPC Send ~S:~%~S" stream block))
+  (unwind-protect 
+      (let ((n-bytes (* (xdr-block-data-size self block) 4)))
+	(stack-let ((array (make-array n-bytes :element-type '(unsigned-byte 8)
+				       :displaced-to block)))
+	  (with-stream-lock (lock)
+	    ;; only one fragment
+	    (write-byte (dpb 1 (byte 1 7) (ldb (byte 8 24) n-bytes)) stream)
+	    (write-byte (ldb (byte 8 16) n-bytes) stream)
+	    (write-byte (ldb (byte 8 8) n-bytes) stream)
+	    (write-byte (ldb (byte 8 0) n-bytes) stream)
+	    (send stream :string-out array)
+	    (force-output stream))))
+    (unless dont-release (release-xdr-block self block))))
+
+(defun-in-flavor (merge-fragments tcp-transport-agent-mixin) (fragments)
+  (declare (values block))
+  (let ((block nil)
+	(nbytes (loop for fragment in fragments summing (array-total-size fragment))))
+    (unwind-protect
+	(prog1
+	  (setq block (allocate-xdr-block self (ceiling nbytes 4)))
+	  (loop with array = (make-stack-array nbytes
+					       :element-type '(unsigned-byte 8)
+					       :displaced-to block)
+		for fragment in fragments
+		for fragment-end = (array-total-size fragment)
+		for array-start first 0 then array-end
+		for array-end = (+ array-start fragment-end)
+		do (copy-array-portion fragment 0 fragment-end array array-start array-end))
+	  (prog1 block (setq block nil)))
+      (when block (release-xdr-block self block)))))
+
+(defun-in-flavor (multi-fragment-receive tcp-transport-agent-mixin) (stream byte1)
+  (with-data-stack
+    (loop for hibyte first byte1 then (read-byte stream)
+	  for header = (%logdpb hibyte (byte 8 24)
+				(%logdpb (read-byte stream) (byte 8 16)
+					 (%logdpb (read-byte stream) (byte 8 8)
+						  (read-byte stream))))
+	  for last-fragment-p = (minusp header)
+	  for n-bytes = (%logdpb 0 (byte 1 31) header)
+	  for fragment = (make-stack-array n-bytes :element-type '(unsigned-byte 8))
+	  do (send stream :string-in "EOF in middle of RPC record" fragment)
+	  collect fragment into fragments
+	  until last-fragment-p
+	  finally (return (merge-fragments fragments)))))
+
+(defun-in-flavor (single-fragment-receive tcp-transport-agent-mixin) (stream byte1)
+  (let* ((header (%logdpb byte1 (byte 8 24)
+			  (%logdpb (read-byte stream) (byte 8 16)
+				   (%logdpb (read-byte stream) (byte 8 8)
+					    (read-byte stream)))))
+	 (n-bytes (%logdpb 0 (byte 1 31) header)))
+    (assert (minusp header))
+    (let ((block nil))
+      (unwind-protect
+	  (progn
+	    (setq block (allocate-xdr-block self (ceiling n-bytes 4)))
+	    (stack-let ((array (make-array n-bytes :element-type '(unsigned-byte 8)
+					   :displaced-to block)))
+	      (send stream :string-in "EOF in middle of RPC record" array))
+	    (prog1 block (setq block nil)))
+	(when block (release-xdr-block self block))))))
+
+(defmethod (receive-xdr-block-stream tcp-transport-agent-mixin) (stream lock no-wait-p)
+  (loop thereis
+	  (with-stream-lock (lock)
+	    (let ((byte1 (send stream :tyi-no-hang)))
+	      (when byte1
+		(let ((block
+			(if (logbitp 7 byte1)
+			    (single-fragment-receive stream byte1)
+			  (multi-fragment-receive stream byte1))))
+		  (when *tcp-notify* (tv:notify nil "TCP RPC Receive ~S:~%~S" stream block))
+		  block))))
+	until no-wait-p
+	;; Wait for input to arrive without locking the lock
+	do (si:stream-input-block stream "Await Remote Call")))
+
+(defmethod (high-latency-p tcp-transport-agent-mixin) () t)
+
+(defmethod (rpc-dispatch-process-name tcp-transport-agent-mixin) ()
+  (format nil "RPC Dispatch (~A via TCP)" (remote-host self)))
+
+(defwhopper (report-error-while-executing-server tcp-transport-agent-mixin)
+	    (transaction-id module-number module-version entry-number description
+			    &optional verifier dont-stack-allocate)
+  (condition-case ()
+       (continue-whopper
+	 transaction-id module-number module-version entry-number description
+	 verifier dont-stack-allocate)
+     ((remote-network-error network-stream-closed end-of-file fatal-error))))
+
+(defflavor port-mapping-tcp-transport-agent-mixin
+	(host
+	 (streams nil)
+	 (reply-stream-alist nil)
+	 (local-port-gensym-counter 1023))
+	(tcp-transport-agent-mixin)
+  (:required-flavors std-transport-agent server-process-mixin)
+  (:initable-instance-variables host)
+  (:init-keywords :stream))
+
+(defmethod (make-instance port-mapping-tcp-transport-agent-mixin) (&rest init-options)
+  (let ((stream (getf init-options :stream)))
+    (when stream
+      (setq host (send stream :foreign-host))
+      (setq streams (list (list stream 
+				(time:time)
+				(process:make-lock "TCP RPC Output Lock")
+				(process:make-lock "TCP RPC Input Lock")))))))
+
+(defmethod (remote-host port-mapping-tcp-transport-agent-mixin) ()
+  host)
+
+(defflavor tcp-rpc-stream-closed () (network-stream-closed rpc-error))
+
+(compile-flavor-methods tcp-rpc-stream-closed)
+
+(defun-in-flavor (close-stream-entry port-mapping-tcp-transport-agent-mixin)
+		 (stream-entry &optional mode)
+  (close (first stream-entry) :abort (not (null mode)))
+  (process:atomic-replacef streams (remove stream-entry streams))
+  (process:atomic-replacef
+    reply-stream-alist
+    (remove stream-entry reply-stream-alist :key #'rest))
+  (loop for queue-entry in reply-queue
+	for (transaction-id reply-block process . entry) = queue-entry
+	initially (progn reply-block)
+	when (and (null (second queue-entry)) (eq entry stream-entry))
+	  do (setf (second queue-entry)
+		   (make-instance 'tcp-rpc-stream-closed
+				  :attempt "receive an RPC reply from"
+				  :stream (first stream-entry)
+				  :agent self
+				  :transaction-id transaction-id))
+	     (process:atomic-replacef reply-queue (remove queue-entry reply-queue))
+	     (process:wakeup process)))
+
+;;; Local port numbers are kept low (below 1024) because Sun considers them to
+;;; be privileged and doesn't allow some RPC access from ports other than
+;;; these low numbered ports.
+(defun-in-flavor (local-port-gensym port-mapping-tcp-transport-agent-mixin)
+		 ()
+  (loop for local-port-gensym =
+	    (process:atomic-replacef
+	      local-port-gensym-counter
+	      (+ 512 (mod (- local-port-gensym-counter 511) 512)))
+	when (and (null (tcp:tcp-port-protocol-name local-port-gensym))
+		  (process:with-no-other-processes
+		    (loop for tcb in tcp::*tcb-list*
+			  never (= (tcp::tcb-local-port tcb) local-port-gensym))))
+	  return local-port-gensym))
+
+(defun-in-flavor (port-stream-entry port-mapping-tcp-transport-agent-mixin) (foreign-port)
+  (declare (values stream-entry))
+  (or (loop for stream-entry in streams
+	    when (eql foreign-port (send (first stream-entry) :foreign-port))
+	      return stream-entry)
+      (let ((stream-entry
+	      (list (tcp:open-tcp-stream host foreign-port (local-port-gensym)
+					 :direction :io :characters nil)
+		    (time:time)
+		    (process:make-lock "TCP RPC Output Lock")
+		    (process:make-lock "TCP RPC Input Lock"))))
+	(process:atomic-push stream-entry streams)
+	(when process (process:wakeup process))
+	(setf (second stream-entry) (time:time))
+	(values stream-entry))))
+
+(defun-in-flavor (module-stream-entry port-mapping-tcp-transport-agent-mixin)
+		 (module-number module-version transaction-id)
+  (declare (values stream-entry))
+  (let ((port (module-port self module-number module-version *pmap-tcp-protocol-number*
+			   nil t transaction-id))
+	(stream-entry nil)
+	(cached-port t))
+    (error-restart (tcp::tcp-connection-refused "Try portmapper again.")
+      (loop until (not (null stream-entry)) doing
+	(when (not cached-port)
+	  (forget-module-port self module-number module-version)
+	  (setq port nil))
+	(when (null port)
+	  ;; We don't have a port cached or the last one didn't work, so ask for a new one
+	  (setq port (module-port self module-number module-version *pmap-tcp-protocol-number*
+				  t nil transaction-id))
+	  (setq cached-port nil))
+	(condition-case-if cached-port nil
+	     (progn     
+	       (setq cached-port nil)
+	       (when port
+		 (setq stream-entry (port-stream-entry port))))
+	   (tcp::tcp-connection-refused))))	     
+    stream-entry))
+
+;;; Make sure we send the reply back the right stream.
+(defmethod (xdr-send-reply port-mapping-tcp-transport-agent-mixin)
+	   (block &optional dont-release)
+  (let ((entry (assoc (reply-block-transaction-id self block) reply-stream-alist)))
+    (cond (entry
+	   (process:atomic-replacef reply-stream-alist (remove entry reply-stream-alist))
+	   (send-xdr-block-stream self (second entry) (fourth entry) block dont-release))
+	  (t
+	   (unless dont-release (release-xdr-block self block))))))
+
+;;; Send errors just like replies.
+(defmethod (xdr-send-error port-mapping-tcp-transport-agent-mixin)
+	   (block &optional dont-release)
+  (xdr-send-reply self block dont-release))
+
+;;; Only calls come through this since replies get sent directly through
+;;; SEND-XDR-BLOCK-STREAM.
+(defmethod (send-xdr-block port-mapping-tcp-transport-agent-mixin)
+	   (block &optional dont-release)
+  (multiple-value-bind (transaction-id module-number module-version ignore)
+      (decode-call-block self block)
+    (let ((stream-entry (module-stream-entry module-number module-version transaction-id)))
+      (cond (stream-entry
+	     (let ((queue-entry (assoc transaction-id reply-queue)))
+	       (when queue-entry (setf (rest (last queue-entry)) stream-entry)))
+	     (send-xdr-block-stream
+	       self (first stream-entry) (third stream-entry) block dont-release))
+	    (t
+	     (unless dont-release (release-xdr-block self block)))))))
+
+;;; For each call block we receive, record its transaction-id and stream
+;;; on the reply-stream-alist so the replies go to the right place.
+(defwhopper (receive-xdr-block-stream port-mapping-tcp-transport-agent-mixin)
+	    (stream lock no-wait-p)
+  (let ((xdr-block (continue-whopper stream lock no-wait-p)))
+    (when (and xdr-block (zerop (xdr-block-message-type self xdr-block)))	;call
+      (multiple-value-bind (transaction-id module-number module-version entry-number)
+	  (decode-call-block self xdr-block)
+	(let ((module (gethash module-number *remote-module-table*)))
+	  (when (and module (= (remote-module-version module) module-version))
+	    (let ((entry (find entry-number (remote-module-entries module)
+			       :key #'remote-entry-number)))
+	      (when (and entry (null (remote-entry-asynchronous entry)))
+		(let ((alist-entry (cons transaction-id (find stream streams :key #'first))))
+		  (process:atomic-push alist-entry reply-stream-alist))))))))
+    xdr-block))
+
+(defparameter *rpc-stream-idle-timeout* (* 5 60 60))
+
+(defmethod (receive-xdr-block port-mapping-tcp-transport-agent-mixin) ()
+  (loop
+    thereis
+      (loop for stream-entry in streams
+	    for (stream time output-lock input-lock) = stream-entry
+	    initially (progn time)
+	    when (not (send stream :connected-p))
+	      do (close-stream-entry stream-entry)
+	    when (and (process:lock-idle-p input-lock) (send stream :listen))
+	      do (setf (second stream-entry) (time:time))
+	      and thereis
+		    (condition-case (error)
+			 (receive-xdr-block-stream self stream (fourth stream-entry) t)
+		       ((tcp::tcp-connection-error tcp::tcp-stream-closed end-of-file)
+			(close-stream-entry stream-entry error)
+			nil))
+	    unless (and (process:lock-idle-p output-lock)
+			(process:lock-idle-p input-lock))
+	      do (setf (second stream-entry) (time:time)))
+      do (loop for (transaction-id reply-block process . stream-entry) in reply-queue
+	       initially (progn transaction-id reply-block process)
+	       when stream-entry
+		 do (setf (second stream-entry) (time:time)))
+	 (loop for stream-entry in streams
+	       for (stream time output-lock input-lock) = stream-entry
+	       initially (progn stream)
+	       when (and (time:time-elapsed-p *rpc-stream-idle-timeout* time)
+			 (process:lock-idle-p output-lock)
+			 (process:lock-idle-p input-lock))
+		 do (process:with-lock (output-lock)
+		      (process:with-lock (input-lock)
+			(when (time:time-elapsed-p *rpc-stream-idle-timeout* time)
+			  (close-stream-entry stream-entry)))))
+    if streams
+      do (loop for (stream time output-lock input-lock) in streams
+	       initially (progn time output-lock input-lock)
+	       do (setf (tcp::stream-reading-process stream) *current-process*))
+	 (process:block-with-timeout
+	   (/ (float (loop with current-time = (time:time)
+			   for (stream time output-lock input-lock) in streams
+			   for idle = (time:time-difference current-time time)
+			   initially (progn stream output-lock input-lock)
+			   minimize (- *rpc-stream-idle-timeout* idle)))
+	      60.0)
+	   "Await Remote Call"
+	   #'(lambda (process)
+	       (loop for (stream time output-lock input-lock) in streams
+		     initially (progn output-lock input-lock)
+		     when
+		       (or (send stream :listen)
+			   (null (send stream :connected-p))
+			   (time:time-elapsed-p *rpc-stream-idle-timeout* time)
+			   (neq (tcp::stream-reading-process stream) process))
+		       return t))
+	   *current-process*)
+    else
+      do (process:process-block
+	   "Await Streams"
+	   #'(lambda ()
+	       (not (null streams))))))
+
+(defmethod (:close port-mapping-tcp-transport-agent-mixin) (&optional abort-p)
+  (loop for stream-entry in streams
+	if abort-p
+	  do (close-stream-entry stream-entry abort-p)
+	do (process:with-lock ((third stream-entry))
+	     (process:with-lock ((fourth stream-entry))
+	       (close-stream-entry stream-entry abort-p)))))
+
+(defflavor big-ender-port-mapping-tcp-transport-agent ()
+	   (port-mapping-tcp-transport-agent-mixin
+	    server-process-mixin
+	    unix-authentication-mixin
+	    call-retrying-mixin
+	    port-mapping-transport-agent-mixin
+	    std-big-ender-array-transport-agent))
+
+(compile-flavor-methods big-ender-port-mapping-tcp-transport-agent)
+
+(defun host-tcp-transport-agent (host)
+  (check-type host net:host)
+  (or (find host *all-transport-agents*
+	    :test
+	    #'(lambda (host agent)
+		(and (typep agent 'big-ender-port-mapping-tcp-transport-agent)
+		     (neti:ns-eq (remote-host agent) host))))
+      (make-instance 'big-ender-port-mapping-tcp-transport-agent :host host)))
+
+(defflavor single-connection-tcp-transport-agent
+	(stream
+	 (output-lock (process:make-lock "TCP RPC Output Lock"))
+	 (input-lock (process:make-lock "TCP RPC Input Lock")))
+	(tcp-transport-agent-mixin)
+  (:initable-instance-variables stream)
+  :abstract-flavor)
+
+(defmethod (print-self single-connection-tcp-transport-agent)
+	   (print-stream ignore ignore)
+  (printing-random-object (self print-stream :typep)
+    (when stream
+      (let ((network (neti:local-network-of-type :internet))
+	    (local-address (send stream :local-address))
+	    (local-port (send stream :local-port))
+	    (foreign-address (send stream :foreign-address))
+	    (foreign-port (send stream :foreign-port))
+	    (connected-p (send stream :connected-p))
+	    (*print-pretty* nil)
+	    (*print-length* nil))
+	(format print-stream
+		"~@[~A~]~@[(~A)~]~@[.~D~]~@[(~S)~]~@[~A~]~@[(~A)~]~@[.~D~]~@[(~S)~]~@[ ~A~]"
+		(and local-address (neti:unparse-internet-address local-address))
+		(and local-address (net:get-host-from-address local-address network t))
+		local-port
+		(and local-port (tcp:udp-port-protocol-name local-port))
+		(and foreign-address (neti:unparse-internet-address foreign-address))
+		(and foreign-address (net:get-host-from-address foreign-address network t))
+		foreign-port
+		(and foreign-port (tcp:udp-port-protocol-name foreign-port))
+		connected-p)))))
+
+(defmethod (send-xdr-block single-connection-tcp-transport-agent)
+	   (block &optional dont-release)
+  (send-xdr-block-stream self stream output-lock block dont-release))
+
+(defmethod (receive-xdr-block single-connection-tcp-transport-agent) ()
+  (receive-xdr-block-stream self stream input-lock nil))
+
+(defmethod (agent-connected-p single-connection-tcp-transport-agent) ()
+  (send stream :connected-p))
+
+(defmethod (remote-host single-connection-tcp-transport-agent) ()
+  (send stream :foreign-host))
+
+(defmethod (:close single-connection-tcp-transport-agent) (&optional abort-p)
+  (close stream :abort abort-p))
+
+(defflavor big-ender-single-connection-tcp-transport-agent ()
+	   (single-connection-tcp-transport-agent
+	    server-process-mixin
+	    unix-authentication-mixin
+	    call-retrying-mixin
+	    port-mapping-transport-agent-mixin
+	    std-big-ender-array-transport-agent))
+
+(compile-flavor-methods big-ender-single-connection-tcp-transport-agent)
+
+(net:define-protocol :tcp-rpc (:rpc :tcp)
+  (:desirability 0.85)	;a little bit more robust than normal stream agent
+  (:invoke-with-stream ((stream :characters nil) &key (process t))
+    (make-instance 'big-ender-port-mapping-tcp-transport-agent
+		   :stream stream :process process)))
+
+(net:define-server :tcp-rpc
+    (:medium :byte-stream
+     :stream (stream :characters nil)
+     :process-name "TCP-RPC server"
+     :error-disposition (:ignore remote-network-error network-stream-closed end-of-file)
+     :reject-unless-trusted t
+     :trusted-p trusted-p)
+   (fs:with-automatic-login-to-sys-host
+     (with-open-stream (agent (make-instance 'big-ender-single-connection-tcp-transport-agent
+					     :stream stream
+					     :process nil
+					     :trusted-p trusted-p))
+       (server-top-level agent))))
+
+(tcp:add-tcp-port-for-protocol :tcp-rpcD,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB") 0111)	;Port mapper port
+
+

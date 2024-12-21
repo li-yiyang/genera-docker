@@ -1,0 +1,552 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: Statice-Model; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+ 
+;;; We should really have fs:dbfs-pathname presentation types so make
+;;; the history a little better.
+
+(cp:define-command (com-dump-database
+		     :command-table "Statice"
+		     :provide-output-destination-keyword nil)
+    ((dbfs-pathname 'fs:dbfs-pathname
+		    :prompt "a DBFS file name")
+     (lmfs-file 'pathname
+		:default (fs:merge-pathnames (fs:parse-pathname
+					       (string-append "dump-"
+							      (send dbfs-pathname :name)
+							      ".lisp")))
+		:prompt "to file"))
+   (dump-database dbfs-pathname lmfs-file))
+
+(cp:define-command (com-load-database
+		     :command-table "Statice"
+		     :provide-output-destination-keyword nil)
+    ((dbfs-pathname 'fs:dbfs-pathname
+		    :prompt "a DBFS file name")
+     (lmfs-file 'pathname
+		:default (fs:merge-pathnames (fs:parse-pathname
+					       (string-append "dump-"
+							      (send dbfs-pathname :name)
+							      ".lisp")))
+		:prompt "from file")
+     &key
+     (data-only 'boolean
+		:default nil
+		:mentioned-default t
+		:documentation "Restore the data but not the schema")
+     (if-exists '(member :error :create)
+		:default :error
+		:mentioned-default :create
+		:documentation "Action to take if database exists already"))
+   (restore-database dbfs-pathname lmfs-file :data-only data-only :if-exists if-exists))
+
+(defvar *cluster-count*)
+
+;;; database is a portal.  File is a file name to dump the data to.
+;;; Dump all user (as opposed to system) schema information, all
+;;; entities, and all tuples.  Probably ok to leave this as one
+;;; big transaction since it is read only.  At least until we get some
+;;; sort of lock-database protocol.
+(defun dump-database (portal file)
+  (with-database (db portal)
+    (with-transaction ()
+      ;; with-open-file must be inside with-transaction since the
+      ;; transaction could abort maybe we should turn off optimistic
+      ;; locking for a dump?
+      (with-open-file (stream file :direction :output :if-does-not-exist :create)
+	(let ((clusters (make-hash-table))
+	      (*cluster-count* 0))
+	  (with-standard-io-environment
+	    (dump-domains stream)
+	    (dump-relations stream)
+	    (dump-indexes stream)
+	    (dump-entities stream clusters portal)
+	    (dump-tuples stream clusters portal)))))))
+
+;;; Write all user domain information onto stream.  Format is to prefix
+;;; each line with the keyword DOMAIN:.  Then write out a list of domain
+;;; name followed by a list of all parent domain names.  This could be
+;;; speeded up by not using the system schema to find domains and parent
+;;; domains, but rather by using the encached schema.  When all the
+;;; domains have been written out, put a COMMIT-DOMAINS keyword into the
+;;; stream.  This will signal to the restore program that all domain
+;;; information has been read back.
+(defun dump-domains (stream)
+  (let* ((domain (get-relation "%%domain"))
+	 (domain-is (get-attribute domain "is"))
+	 (domain-name (get-attribute domain "name"))
+	 (domain-area (get-attribute domain "area"))
+	 (domain-domain-indexed (get-attribute domain "domain-indexed"))
+	 (subdomain (get-relation "%%subdomain"))
+	 (subdomain-is (get-attribute subdomain "is"))
+	 (subdomain-of (get-attribute subdomain "of")))
+    (do-relation (dom domain)
+      (let ((dom-is (get-value dom domain-is)))
+	(unless (multiple-value-bind (ignore system-relation-p)
+		    (entity-type-of dom-is)
+		  system-relation-p)
+	  (format stream "~%(:DOMAIN (~S ~S ~S ("
+		  (get-value dom domain-name)
+		  (get-value dom domain-area)
+		  (get-value dom domain-domain-indexed))
+	  (let ((first t))
+	    (do-relation (sub-dom subdomain (:where subdomain-is dom-is))
+	      (do-relation (dom domain (:where domain-is (get-value sub-dom subdomain-of)))
+		(if first (setq first nil) (format stream " "))
+		(format stream "~S" (get-value dom domain-name))))
+	    (format stream ")))")))))
+    (format stream "~%(:COMMIT-DOMAINS)")))
+
+;;; Dump all relation schema information to stream.  Format is RELATION:
+;;; relation-name followed by a list of lists, each of which contains an
+;;; attribute specification.  An attribute specification is composed of
+;;; its name, its type, unique-p, and group-indexed-p.  The type may be
+;;; either a datatype name or a domain name.  This should be easy to fix
+;;; if it is ever necessary.  D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")NOTE:  Currently this thing doesn't handle
+0;;; 1foreign entities0 1very well.  Needs to be fixed at some point.
+0(defun dump-relations (stream)
+  (let* ((relation (get-relation "%%relation"))
+	 (relation-is (get-attribute relation "is"))
+	 (relation-name (get-attribute relation "name"))
+	 (relation-area (get-attribute relation "area"))
+	 (relation-relation-indexed (get-attribute relation "relation-indexed"))
+	 (attribute (get-relation "%%attribute"))
+	 (attribute-of (get-attribute attribute "of"))
+	 (attribute-name (get-attribute attribute "name"))
+	 (attribute-type (get-attribute attribute "type"))
+	 (attribute-unique (get-attribute attribute "unique"))
+	 (attribute-group-indexed (get-attribute attribute "group-indexed"))
+	 (attribute-surrogate-p (get-attribute attribute "surrogate-p"))
+	 (attribute-delete-nullifies (get-attribute attribute "delete-nullifies"))
+	 (attribute-no-nulls (get-attribute attribute "no-nulls")))
+    (do-relation (rel relation)
+      (let ((rel-is (get-value rel relation-is)))
+	(unless (multiple-value-bind (ignore system-relation-p)
+		    (entity-type-of rel-is)
+		  system-relation-p)
+	  (format stream "~%(:RELATION ~S ~S ~S ("
+		  (get-value rel relation-name)
+		  (get-value rel relation-area)
+		  (get-value rel relation-relation-indexed))
+	  (let ((first t))
+	    (do-relation (att attribute (:where attribute-of rel-is))
+	      (if first (setq first nil) (format stream " "))
+	      (format stream
+		      "(~S "
+		      (get-value att attribute-name))
+	      (let* ((type (get-value att attribute-type)))
+		(cond ((typep type 'entity-handle)
+		       (let ((type-domain (domain-of type)))
+			 (format stream "~S "
+					(cond ((eq type-domain :unknown)
+					       "(foreign)")
+					      (t
+					       (domain-handle-name type))))))
+		      ;; new version.  write out the type as a symbol
+		      (t (format stream "~S " type))))
+	      (let ((unique (get-value att attribute-unique))
+		    (surrogate-p (get-value att attribute-surrogate-p)))
+		;; Fix obsolete databases so they can be restored.  This kludge
+		;; only applies to pre-1988 database and can only happen at SCRC.
+		(when (and surrogate-p (not unique))
+		  (warn "Attribute ~A of ~A is surrogate but not unique; changing to unique"
+			(get-value att attribute-name)
+			(get-value rel relation-name))
+		  (setq unique t))
+		(format stream "~S ~S ~S ~S ~S)"
+			unique
+			surrogate-p
+			(get-value att attribute-group-indexed)
+			(get-value att attribute-delete-nullifies)
+			(get-value att attribute-no-nulls))))
+	    (format stream "))")))))))
+
+;;; Write out the index schema information.  Format is INDEX: followed
+;;; by the relavent relation name, the unique-p bit, and the list of
+;;; attributes.  This could also be made faster by reading the encached
+;;; schema instead of the saved schema.
+(defun dump-indexes (stream)
+  (let* ((index (get-relation "%%index"))
+	 (index-is (get-attribute index "is"))
+	 (index-on (get-attribute index "on"))
+	 (index-unique (get-attribute index "unique"))
+	 (index-case-sensitive (get-attribute index "case-sensitive"))
+	 (index-attribute (get-relation "%%index-attribute"))
+	 (index-attribute-is (get-attribute index-attribute "is"))
+	 (index-attribute-of (get-attribute index-attribute "of"))
+	 (index-attribute-order (get-attribute index-attribute "order"))
+	 (relation (get-relation "%%relation"))
+	 (relation-is (get-attribute relation "is"))
+	 (relation-name (get-attribute relation "name"))
+	 (attribute (get-relation "%%attribute"))
+	 (attribute-is (get-attribute attribute "is"))
+	 (attribute-of (get-attribute attribute "of"))
+	 (attribute-name (get-attribute attribute "name")))
+    (do-relation (idx index)
+      ;; currently no system indexes, so no need to worry
+      (format stream "~%(:INDEX ~S ~S ~S ("
+	      (do-relation (rel relation (:where relation-is (get-value idx index-on)))
+		(return (get-value rel relation-name)))
+	      (get-value idx index-unique)
+	      (get-value idx index-case-sensitive))
+      (let ((first t))
+	(do-relation (idx-att index-attribute
+			      (:where index-attribute-of (get-value idx index-is))
+			      (:order-by (index-attribute-order :ascending)))
+	  (if first (setq first nil) (format stream " "))
+	  (do-relation (att attribute (:where (:and attribute-is
+					       (get-value idx-att index-attribute-is)
+					       attribute-of
+					       (get-value idx index-on))))
+	    (format stream "~S" (get-value att attribute-name))))
+	(format stream "))")))))
+
+(defun intern-cluster (table rid opening)
+  (or (gethash (statice-storage::rid-page-number rid) table)
+      (let ((cc *cluster-count*))
+	(map-over-pages-in-cluster opening rid
+				   #'(lambda (page)
+				       (setf (gethash page table) *cluster-count*)))
+	(incf *cluster-count*)
+	cc)))
+
+;;; Write out information concerning all user entities.  Format is
+;;; ENTITY: followed by the entity's domain name, its rid, and the three
+;;; uid words, and finally nil, t, or a cluster-id.  The rid is used to
+;;; resolve entity valued attributes on the restoral.
+(defun dump-entities (stream clusters opening)
+  (let* ((entity-domain (get-relation "%%entity-domain"))
+	 (entity-domain-of (get-attribute entity-domain "of"))
+	 (entity-domain-is (get-attribute entity-domain "is")))
+    (do-relation (ed entity-domain)
+      (let ((ed-of (get-value ed entity-domain-of)))
+	(unless (multiple-value-bind (entity-type system-p)
+		    (entity-type-of ed-of)
+		  (or (not (eq entity-type :entity)) system-p))
+	  (let ((rid (handle-rid ed-of)))
+	    (format stream "~%(:ENTITY (~S ~S ~S ~S ~S ~S))"
+		    (domain-handle-name (get-value ed entity-domain-is))
+		    rid
+		    (entity-handle-uid-word-1 ed-of)
+		    (entity-handle-uid-word-2 ed-of)
+		    (entity-handle-uid-word-3 ed-of)
+		    (when (clustered-p opening rid)
+		      (intern-cluster clusters rid opening)))))))))
+
+;;; Write out all tuples in the database.  Format is RELATION-DATA:
+;;; keyword, the relation name, the cluster-id or t/nil, and the list of
+;;; attribute values in the same order as was written out when the
+;;; relation/attribute schema information was written.  Once again, all
+;;; would be faster if we didn't go to the system schema, but rather to
+;;; the encached schema.
+(defun dump-tuples (stream clusters opening)
+  (let* ((relation (get-relation "%%relation"))
+	 (relation-is (get-attribute relation "is"))
+	 (relation-name (get-attribute relation "name"))
+	 (attribute (get-relation "%%attribute"))
+	 (attribute-is (get-attribute attribute "is"))
+	 (attribute-of (get-attribute attribute "of")))
+    (do-relation (rel relation)
+      (let ((rel-is (get-value rel relation-is))
+	    (att-list nil))
+	(unless (multiple-value-bind (ignore1 system-relation-p)
+		    (entity-type-of rel-is)
+		  (declare (ignore ignore1))
+		  system-relation-p)
+	  (do-relation (att-tuple attribute (:where attribute-of rel-is))
+	    (let ((att (get-value att-tuple attribute-is)))
+	      (push (list att (attribute-handle-type att))
+		    att-list)))
+	  (setq att-list (nreverse att-list))
+	  (do-relation (r rel-is)
+	    (format stream "~%(:RELATION-DATA ~S ~S ("
+		    (get-value rel relation-name)
+		    (let ((rid (handle-rid r)))
+		      (when (clustered-p opening rid)
+			(intern-cluster clusters rid opening))))
+	    (loop for first = t then nil
+		  for (att type) in att-list do
+	      (unless first
+		(format stream " "))
+	      (format-data type att r stream))
+	    (format stream "))")))))))
+
+;;; The list of domain names (and parents) prior to commit time.
+(defvar *non-committed-domains*)
+
+;;; The list of domain (name . domain-handle) after commit time.  Note
+;;; that datatypes are on this list also in the form (name .
+;;; datatype-handle).
+(defvar *committed-domains*)
+
+;;; A hash table keywed on relation name.  The entries are
+;;; (relation-handle .  list of (attribute-name . attribute-handle).
+;;; The attributes are in the same order as they were read in, and hence
+;;; in the same order as the data.
+(defvar *cached-relations*)
+
+;;; hash table of entities which have been recreated.  Key is old rid.  Data
+;;; is new entity-handle.
+(defvar *cached-entities*)
+
+;;; hash table (keyed on relation name) of att-value lists.  Avoids consing
+;;; a new list each time a new tuple is created.
+(defvar *cached-att-values*)
+
+;;; hash table keyed on cluster number.  Contains an entity in the cluster
+;;; which can be used for passing as the :cluster arg.
+(defvar *cluster-table*)
+
+;;; Restore a database from a source dump file.  Each line either contains
+;;; nothing, or a keyword with some information.
+(defun restore-database (portal file &key data-only (if-exists :error))
+  (with-database (db portal
+		     :create-p (not data-only)
+		     :if-exists if-exists
+		     :flavor 'statice::functional-database)
+    (with-open-file (stream file :direction :input :if-does-not-exist :error)
+      (with-standard-io-environment
+	(let ((*non-committed-domains* nil)
+	      (*committed-domains* nil)
+	      (*cached-relations* (scl::make-hash-table :test #'string-equal
+							:locking nil
+							:ignore-gc nil))
+	      (*cached-entities* (scl::make-hash-table :locking nil :ignore-gc t))
+	      (*cached-att-values* (scl::make-hash-table :locking nil :ignore-gc t))
+	      (*cluster-table* (scl::make-hash-table :locking nil)))
+	  (loop for line = (read stream nil nil)
+		while line do
+	    (let* ((keyword (first line))
+		   (rest (rest line))
+		   (fcn (cdr (assoc keyword
+				    `((:domain . ,#'restore-domain)
+				      (:relation . ,#'restore-relation)
+				      (:index . ,#'restore-index)
+				      (:entity . ,#'restore-entity)
+				      (:relation-data . ,#'restore-data)
+				      (:commit-domains . ,#'commit-domains))))))
+	  
+	      (unless fcn
+		(error "Unknown keyword encountered (~S)" keyword))
+	      (funcall fcn rest :data-only data-only)))))))
+  (terminate-database portal))
+
+;;; (:DOMAIN ("dogs" 1 t ("mammals")))
+;;; Just read the information about the domains into a cache.  Dont
+;;; actually create them until the COMMIT-DOMAINS message comes through.
+;;; If data-only, then we just have to get-domain.
+(defun restore-domain (rest &key data-only)
+  (cond (data-only
+	 (with-transaction ()
+	   (let ((domain (caar rest)))
+	     (push (cons domain (get-domain domain)) *committed-domains*))))		 
+	(t
+	 (push (first rest) *non-committed-domains*))))
+
+;;; (:COMMIT-DOMAINS)
+;;; Create the domains that have been read in from the file up to this
+;;; point.  They must be created in the proper order since make-domain
+;;; forces us to create from the top of the structure down.  Hence, make
+;;; sure that all the domains specified in the parents have been created
+;;; before creating any entry.
+;;; If data-only, then no need to make-domain or commit anything.  *committed-domains*
+;;; already has the handles.
+(defun commit-domains (ignore1 &key data-only)
+  (declare (ignore ignore1))
+  (unless data-only
+    (with-transaction ()
+      (loop while *non-committed-domains*
+	    with did-something = nil do
+	(loop for prev-sublist = nil then sublist
+	      for sublist on *non-committed-domains* do
+	  (let* ((entry (first sublist))
+		 (domain (first entry))
+		 (area (second entry))
+		 (bset (third entry))
+		 (parents (fourth entry)))
+	    (when (loop for p in parents
+			always (assoc p *committed-domains* :test #'string-equal))
+	      ;; all parents have been created.  ok to create domain.
+	      (loop for p on parents do
+		(setf (car p)
+		      (cdr (assoc (first p) *committed-domains* :test #'string-equal))))
+	      (push (cons domain (make-domain domain parents :area area :domain-index-p bset))
+		    *committed-domains*)
+	      (setq did-something t)
+	      (cond (prev-sublist
+		     (setf (cdr prev-sublist) (cdr sublist))
+		     (setq sublist (cdr sublist)))
+		    (t (setq *non-committed-domains* (cdr sublist))
+		       (setq sublist nil))))))
+	(unless did-something
+	  (error "Stopped dead committing domains"))))))
+
+;;; (:RELATION "name" 2 t (("is" ("short-string") NIL NIL) ("of" "living-thing" T NIL)))
+;;; Restore a relation and its attributes.  Once they are re-incarnated,
+;;; cache the handles in the *cached-relations* hash table.
+;;; If data-only, just get the relation and attribute handles and save it in the
+;;; *cached-relations* table.
+(defun restore-relation (rest &key data-only)
+  (with-transaction ()
+    (cond (data-only
+	   (let* ((relation-name (first rest))
+		  (relation (get-relation relation-name))
+		  (attribute-handles
+		    (loop for (att-name) in (fourth rest)
+			  collect (cons att-name (get-attribute relation att-name)))))
+	     (setf (gethash relation-name *cached-relations*)
+		   (cons relation attribute-handles))))
+	  (t
+	   (let* ((relation-name (first rest))
+		  (relation-area (second rest))
+		  (relation-relation-indexed-p (third rest))
+		  (relation (make-relation relation-name
+					   :area relation-area
+					   :relation-index-p relation-relation-indexed-p))
+		  (atts-and-specs (fourth rest))
+		  (attribute-handles
+		    (loop for (att-name att-type unique-p surrogate-p
+					group-indexed-p delete-nullifies no-nulls)
+			      in atts-and-specs
+			  for att-handle =
+			      (make-attribute
+				relation
+				att-name
+				(if (stringp att-type)
+				    (cdr (assoc att-type *committed-domains*
+						:test #'string-equal))
+				    att-type)
+				:unique-p unique-p
+				:surrogate-p surrogate-p
+				:delete-nullifies delete-nullifies
+				:no-nulls no-nulls)
+			  collect (cons att-name att-handle)
+			  when group-indexed-p
+			    do (make-group-index att-handle))))
+	     (setf (gethash relation-name *cached-relations*)
+		   (cons relation attribute-handles)))))))
+
+;;; (:INDEX "phones" T ("is" "of"))
+;;; Re-incarnate a b-tree index.
+(defun restore-index (rest &key data-only)
+  (unless data-only
+    (with-transaction ()
+      (let* ((relation-name (first rest))
+	     (attribute-handles (cdr (gethash relation-name *cached-relations*)))
+	     (unique-p (second rest))
+	     (case-sensitive (third rest))
+	     (atts (fourth rest)))
+	(loop for a on atts do
+	  (setf (car a) (cdr (assoc (car a) attribute-handles :test #'string-equal))))
+	(make-index atts :unique-p unique-p :case-sensitive case-sensitive)))))
+
+;;; (:ENTITY ("plant" 10272 977611 7463818 3147232 T/NIL/n))
+;;; Re-incarnate an entity.  Use the special side-door to make-entity
+;;; (recreate-entity).  Note that the rid of the new entity may not be
+;;; the same as the rid of the old entity, but the old is used to map
+;;; between the old entity and the new one.  Rid is suitable since we
+;;; only dump one database at a time.  The item after the uid is the
+;;; cluster number.  T if this is the first entity in the cluster, nil
+;;; if not clustered, or a number in which case we look up an entity in
+;;; *cluster-table*.
+(defun restore-entity (rest &key data-only)
+  (declare (ignore data-only))
+  (with-transaction ()
+    (let* ((desc (first rest))
+	   (domain (cdr (assoc (first desc) *committed-domains* :test #'string-equal)))
+	   (rid (second desc))
+	   (uid-1 (third desc))
+	   (uid-2 (fourth desc))
+	   (uid-3 (fifth desc))
+	   (cid (sixth desc))
+	   (cluster (when cid (or (gethash cid *cluster-table*) t)))
+	   (eh (recreate-entity domain uid-1 uid-2 uid-3 :cluster cluster)))
+      (when (eq cluster t)
+	(setf (gethash cid *cluster-table*) eh))
+      (setf (gethash rid *cached-entities*) eh))))
+
+;;; (:RELATION-DATA "phones" T/NIL/n (NIL 2123230093 (10256)))
+;;; This conses an awful lot.  We might be able to fix this up by
+;;; preallocating the conses for each relation and then just changing
+;;; pointers around for each tuple created.
+(defun restore-data (rest &key data-only)
+  (declare (ignore data-only))
+  (with-transaction ()
+    (let* ((relation-name (first rest))
+	   (cid (second rest))
+	   (cluster (when cid (or (gethash cid *cluster-table*) t)))
+	   (new-att-values (third rest))
+	   (relation-and-atts (gethash relation-name *cached-relations*))
+	   (relation-handle (first relation-and-atts))
+	   (att-value-list (gethash relation-name *cached-att-values*))
+	   null-value-attributes)
+      (unless att-value-list
+	(let ((new-list (make-list (* 2 (1- (length relation-and-atts))))))
+	  (loop for att on new-list by #'cddr
+		for (nil . handle) in (rest relation-and-atts) do
+	    (setf (car att) handle))
+	  (setf (gethash relation-name *cached-att-values*)
+		(setq att-value-list new-list))))
+      (loop for value-slot on (rest att-value-list) by #'cddr
+	    for att-slot in att-value-list by #'cddr
+	    for att-value in new-att-values do
+	(multiple-value-bind (value value-null-p)
+	    (unformat-data (attribute-handle-type att-slot) att-value *cached-entities*)
+	  (when value-null-p
+	    (push att-slot null-value-attributes))
+	  (setf (car value-slot) value)))
+      (let ((rship (apply #'make-clustered-tuple relation-handle cluster att-value-list)))
+	(when (eq cluster t)
+	  (setf (gethash cid *cluster-table*) rship))
+	(loop for attribute in null-value-attributes do
+	  (set-to-null-value rship attribute))))))

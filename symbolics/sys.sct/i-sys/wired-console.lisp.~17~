@@ -1,0 +1,707 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SI; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; (Possibly multiple) mouse and SLB console handling that's wired.
+
+;;; Note that you have to be careful about variables used in wired code and make sure
+;;; they are referenced first in the file by a wired function so that the locatives
+;;; dumped out as table references are resolved properly by the cold load generator.
+
+(defvar *wired-console-area* (make-area :name '*wired-console-area*
+					:gc :static
+					'sys:%%region-level sys:%safeguarded-level))
+
+;;;; I/O Buffers that are cheap and can be wired.
+
+(defstruct (wired-io-buffer :named-array-leader :conc-name
+			    (:make-array (:length 64 :area *wired-console-area*)))
+  (size 64)
+  (input-pointer 0)				;Index in which data is next stored
+  (output-pointer 0)				;Index from which data is next to be taken
+						; If out ptr = inp ptr, then the buffer
+						; is empty.  If inp ptr + 1 = out ptr, then
+						; the buffer is full (This wastes a location
+						; when the buffer is full)
+  (overrun nil)					;Detect overruns
+  (process nil)					;Process to awaken
+  )
+
+(defsubst wired-io-buffer-empty-p (buffer)
+  (= (wired-io-buffer-input-pointer buffer)
+     (wired-io-buffer-output-pointer buffer)))
+
+(defun wired-io-buffer-clear (buffer)
+  (without-interrupts
+    (setf (wired-io-buffer-input-pointer buffer) 0)
+    (setf (wired-io-buffer-output-pointer buffer) 0)))
+
+(defun wired-io-buffer-get (buffer)
+  (without-interrupts
+    (unless (wired-io-buffer-empty-p buffer)
+      (let* ((output-pointer (wired-io-buffer-output-pointer buffer))
+	     (elt (aref buffer output-pointer)))
+	(setf (wired-io-buffer-output-pointer buffer)
+	      (mod (1+ output-pointer) (wired-io-buffer-size buffer)))
+	(values elt t)))))
+
+;;; This is the only one that needs to run wired.
+(defwiredfun wired-io-buffer-put (buffer char)
+  (cond ((wired-io-buffer-overrun buffer)
+	 nil)
+	;; Always leave room for at least one unget to be done
+	((= (\ (+ (wired-io-buffer-input-pointer buffer) 2) (wired-io-buffer-size buffer))
+	    (wired-io-buffer-output-pointer buffer))
+	 (setf (wired-io-buffer-overrun buffer) t)
+	 nil)
+	(t
+	 (let ((input-pointer (wired-io-buffer-input-pointer buffer)))
+	   (setf (aref buffer input-pointer) char)
+	   (setf (wired-io-buffer-input-pointer buffer)
+		 (mod (1+ input-pointer) (wired-io-buffer-size buffer)))
+	   (when (= input-pointer (wired-io-buffer-output-pointer buffer))
+	     (let ((process (wired-io-buffer-process buffer)))
+	       (when (not (null process))
+		 (aux-process-wakeup process)))))
+	 t)))
+
+
+;;;; Mouse stuff
+
+;;; Mouse variables except for the ones declared in SYSDF1 in the system communication area
+;;; namely FEP-MOUSE-X, FEP-MOUSE-Y, MOUSE-BUTTONS, and MOUSE-WAKEUP
+
+;;; Variables with names compatible with LM-2.  Forward into the main mouse's wired object.
+
+(defwiredvar fep-mouse-x 0)
+(defwiredvar fep-mouse-y 0)
+(defwiredvar mouse-buttons 0)
+(defwiredvar mouse-wakeup nil)
+(defwiredvar tv:mouse-x)				;Mouse position in screen coordinates
+(defwiredvar tv:mouse-y)
+(defwiredvar tv:mouse-cursor-state)			;0 disabled, 1 open, 2 off, 3 on
+(defwiredvar tv:mouse-cursor-x-offset)		;From top-left of pattern
+(defwiredvar tv:mouse-cursor-y-offset)		;to the reference point
+(defwiredvar tv:mouse-cursor-width)
+(defwiredvar tv:mouse-cursor-height)
+(defwiredvar tv:mouse-cursor-pattern)
+(defwiredvar tv:mouse-x-speed)			;100ths per second, time averaged
+(defwiredvar tv:mouse-y-speed)			;with time constant of 1/6 second
+(defwiredvar tv:mouse-x-scale-array)
+(defwiredvar tv:mouse-y-scale-array)
+(defwiredvar tv:mouse-buttons-buffer)		;4-word entries for button clicks
+(defwiredvar tv:mouse-buttons-buffer-in-index)	;Next entry to put in
+(defwiredvar tv:mouse-buttons-buffer-out-index)	;Next entry to take out
+(defwiredvar tv:mouse-process)
+(defwiredvar tv:mouse-usurped-process nil)
+
+(defconstant %mouse-cursor-open 1)
+(defconstant %mouse-cursor-invisible 2)
+(defconstant %mouse-cursor-visible 3)
+(defconstant %mouse-cursor-suspended 4)
+
+
+;;; This is the one you always need, so it's in wired-control-tables.
+(defwiredvar *main-mouse-wired-mouse* nil)
+
+(defmacro define-wired-mouse-state (&body vars)
+  `(progn
+     (defstruct (wired-mouse :named :conc-name
+			     (:constructor make-wired-mouse-internal)
+			     (:make-array (:area *wired-console-area*)))
+       (mouse nil)
+       . ,(loop for (var init) in vars
+		collect `(,var ,init)))
+     (defconst *wired-mouse-variable-forwardings*
+	       ',(loop for (nil nil specvar communications-p) in vars
+		       for offset from 0
+		       when specvar
+			 collect (list specvar communications-p offset)))
+     ))
+
+(define-wired-mouse-state
+  ;; Communications area stuff
+  ;; For now make these variables, SI globals rather than communications area variables
+  (fep-x 0 fep-mouse-x)
+  (fep-y 0 fep-mouse-y)
+  (buttons 0 mouse-buttons)
+  (wakeup nil mouse-wakeup)
+
+  ;; Variable forwarded stuff
+  (x-position 0 tv:mouse-x)
+  (y-position 0 tv:mouse-y)
+  (cursor-state 0 tv:mouse-cursor-state)
+  (cursor-x-offset 0 tv:mouse-cursor-x-offset)
+  (cursor-y-offset 0 tv:mouse-cursor-y-offset)
+  (cursor-width 0 tv:mouse-cursor-width)
+  (cursor-height 0 tv:mouse-cursor-height)
+  (cursor-pattern (make-array '(32. 32.) :type 'art-1b :area *wired-console-area*)
+		  tv:mouse-cursor-pattern)
+  (x-speed 0 tv:mouse-x-speed)
+  (y-speed 0 tv:mouse-y-speed)
+  (x-scale-array (make-array 16. :area *wired-console-area*
+				 :type art-fixnum
+				 :initial-value 2000)
+		 tv:mouse-x-scale-array)
+  (y-scale-array (make-array 16. :area *wired-console-area*
+				 :type art-fixnum
+				 :initial-value 2000)
+		 tv:mouse-y-scale-array)
+  (buttons-buffer (make-array 32. :area *wired-console-area*)
+		  tv:mouse-buttons-buffer)
+  (buttons-buffer-in-index 0 tv:mouse-buttons-buffer-in-index)
+  (buttons-buffer-out-index 0 tv:mouse-buttons-buffer-out-index)
+
+  ;; Stuff internal to what's here.
+  (last-buttons 0)
+  (cursor-x 0)					;Last place the cursor was drawn
+  (cursor-y 0)
+  (last-fep-x 0)				;Last physical coordinates sent by FEP
+  (last-fep-y 0)
+  (last-check-time 0)				;Microsecond time mouse was last checked
+  (x-fraction 0)				;Low-order bits of MOUSE-X
+  (y-fraction 0)
+
+  (process nil tv:mouse-process)
+
+  (screen-buffer-address)			;Current screen and its decoded attributes
+  (screen-locations-per-line)
+  (screen-buffer-bit-offset)
+  (screen-width)
+  (screen-height)
+  (screen-bits-per-pixel)
+
+  (prepared-sheet-valid nil)			;The currently prepared sheet on the screen.
+  (prepared-sheet-left 0)
+  (prepared-sheet-right 0)
+  (prepared-sheet-top 0)
+  (prepared-sheet-bottom 0)
+
+  (usurped-process nil tv:mouse-usurped-process)
+
+  )
+
+;;;; SLB Console stuff
+
+(defstruct (wired-slb-console :named :conc-name (:make-array (:area *wired-console-area*)))
+  console
+  first-byte
+  (keystroke-buffer (make-wired-io-buffer))
+  wired-mouse
+  (serial-buffer (make-wired-io-buffer))
+  (serial-window-size 4)
+  (meter-bad-bytes 0)
+  (brightness 70) (volume 70)
+  (switchpack nil)
+  (modem-status 0)
+  (process-input-lock nil)			;Used to avoid multiple callers to 
+						;   wired-console-handler
+  )
+
+(defwiredvar *slb-console-buffer*)		;set up by cold-load generator
+(defwiredvar *slb-console-empty* 0)
+(defwiredvar *slb-wired-consoles*)		;set up by cold-load generator
+
+(defwiredfun wired-console-handler ()
+  (system-case
+    ((merlin Zora)
+      (%p-dpb (ldb (byte 1. 18.) (%microsecond-clock)) (byte 1 0)
+	      (%make-physical-address #o01200000000)))
+    (Domino
+      (%p-dpb (ldb (byte 1 20) (%microsecond-clock)) cli::%%domino-heartbeat-led
+	      cli::%domino-reset-register))
+    (otherwise))
+  (when *main-mouse-wired-mouse*		;work before this is allocated
+    (let ((locked-p nil)
+	  (main-console (aref *slb-wired-consoles* 31.)))
+      (when main-console
+	(unwind-protect 
+	    (progn
+	      (when (store-conditional 
+		      (locf (wired-slb-console-process-input-lock main-console))
+		      nil t)
+		(setq locked-p t)
+		;; Removed loop since no multiple consoles yet.
+		(wired-slb-console-handler)
+		;; Update state from things maintained by the FEP or changed above.
+		(wired-mouse-handle-buttons *main-mouse-wired-mouse*)
+		(wired-mouse-handle-motion *main-mouse-wired-mouse*)))
+	  (when locked-p
+	    (setf (wired-slb-console-process-input-lock main-console) nil)))))))
+
+;;;*********************************************************************
+;;; L-Machine equivalent looks at a shared buffer used by all the consoles
+;;; and takes out each byte seperately, looking at (byte 5 19) to determine 
+;;; which console (slot in *slb-wired-consoles*) it is addressed to.
+;;; After a byte is removed, it is overwritten with -1. If a -1 is encountered
+;;; as live data, it signals an automatic reinitialize of the console buffer
+
+(DEFENUMERATED *SLB-CONSOLE-BYTE-TYPES*
+	       (%TYPE-MOUSE-SWITCH 
+		%TYPE-MOUSE-MOVE
+		%TYPE-ALL-KEYS-UP
+		%TYPE-STATUS
+		%TYPE-KEY-DOWN
+		%TYPE-KEY-UP
+		%TYPE-SERIAL-WINDOW
+		%TYPE-SERIAL-IN))
+
+(defwiredfun wired-slb-console-handler ()
+  (let* ((wired-console (aref *slb-wired-consoles* 31)))	;Get the main console for now
+    (loop for command-data = (sys:cold-load-stream-read-hardware-character)
+	  until (or (null command-data) (zerop command-data)) do
+      (wired-slb-console-process-command wired-console command-data))
+    nil))
+
+(defwiredfun wired-slb-console-process-command (wired-console command-data)
+  (let* ((command (ldb (byte 8 8) command-data))
+	 (type    (ldb (byte 3 4) command))
+	 (data    (ldb (byte 8 0) command-data)))
+    (select type
+      (%type-mouse-move
+	(let ((wired-mouse (wired-slb-console-wired-mouse wired-console))
+	      (x-motion (ldb (byte 2 2) command))
+	      (y-motion (ldb (byte 2 0) command)))
+	  (incf (wired-mouse-fep-x wired-mouse) (if (= x-motion 2) -1 x-motion))
+	  (incf (wired-mouse-fep-y wired-mouse) (if (= y-motion 2) -1 y-motion))
+	  ;; This will get run soon enough
+	  ;(wired-mouse-handle-motion wired-mouse)
+	  ))
+
+      (%type-mouse-switch
+       (let ((wired-mouse (wired-slb-console-wired-mouse wired-console))
+	     (rotation (- (ldb (byte 3 0) command))))
+	 ;; Bits are backwards, do superfast reverse
+	 (setf (wired-mouse-buttons wired-mouse)
+	       (ldb (byte 3 0) (rot #o73516240 (+ rotation rotation rotation))))
+	 (wired-mouse-handle-buttons wired-mouse)))
+
+      (%type-serial-window
+       (setf (wired-slb-console-serial-window-size wired-console)
+	     (min* 4 (ldb (byte 3 0) command))))
+
+      ((%type-all-keys-up %type-key-down %type-key-up)
+       (wired-io-buffer-put (wired-slb-console-keystroke-buffer wired-console) command-data))
+
+      ;; In practice, Lisp should always "set" the volume and
+      ;; brightness to zero to initialize *brightness* and *volume*
+      (%type-status
+       (let ((value (ldb (byte 8 0) (dpb command (byte 1 7) data))))
+	 (selector (ldb (byte 3 1) command) =
+	   (0 (setf (wired-slb-console-brightness wired-console) value))
+	   (1 (setf (wired-slb-console-volume wired-console) value))
+	   (2 (setf (wired-slb-console-switchpack wired-console) value))	;power-up
+	   ;;(3 (tv:notify nil "Console error ~D." (ldb (byte 3 0) data)))      ;error
+	   (4 (setf (wired-slb-console-modem-status wired-console) data))	;modem
+	   (otherwise (incf* (wired-slb-console-meter-bad-bytes wired-console))))
+	 ))
+
+      (%type-serial-in
+	(if (ldb-test (byte 1 3) command)
+	    ;; Control event (---should only see window updates)
+	    (incf* (wired-slb-console-meter-bad-bytes wired-console))
+	    ;; Console serial data byte
+	    (wired-io-buffer-put (wired-slb-console-serial-buffer wired-console)
+				 (dpb command (byte 4 7) data))))
+      
+      (otherwise (incf* (wired-slb-console-meter-bad-bytes wired-console))
+		 ))))
+
+(defun initialize-slb-console-wired ()
+  ; Fill-array Might not have been available earlier on in development ?
+;  (SI:FILL-ARRAY *slb-wired-consoles* nil nil)
+  (loop for i from 0 below 32 do (setf (aref *slb-wired-consoles* i) nil))
+  (setf (fill-pointer *slb-wired-consoles*) 0))
+
+(defresource wired-slb-console () :constructor (make-wired-slb-console))
+
+(defun allocate-wired-slb-console (master-p slot)
+  (let ((wired-console (allocate-resource 'wired-slb-console)))
+    (wire-structure wired-console)
+    (setf (wired-slb-console-first-byte wired-console) nil)
+    (let ((buffer (wired-slb-console-keystroke-buffer wired-console)))
+      (wire-structure buffer)
+      (wired-io-buffer-clear buffer))
+    (let ((buffer (wired-slb-console-serial-buffer wired-console)))
+      (wire-structure buffer)
+      (wired-io-buffer-clear buffer))
+    (setf (wired-slb-console-serial-window-size wired-console) 4)
+    (setf (wired-slb-console-switchpack wired-console) nil)
+    (setf (wired-slb-console-wired-mouse wired-console) (allocate-wired-mouse master-p))
+    (setf (wired-slb-console-process-input-lock wired-console) nil)
+    (setf (aref *slb-wired-consoles* slot) wired-console)
+    ;; The wired console also goes into slot 31 for the single-console microcode.
+    (when master-p
+      (setf (aref *slb-wired-consoles* 31) wired-console))
+    ;; MAXF is not available early on in cold-load ?
+    (setf (fill-pointer *slb-wired-consoles*) (max (1+ slot) 
+						   (fill-pointer *slb-wired-consoles*)))
+    wired-console))
+
+(defun deallocate-wired-slb-console (wired-console slot)
+  (setf (aref *slb-wired-consoles* slot) nil)
+  ;; The wired console also goes into slot 31 for the single-console microcode.
+  (when (eq wired-console (aref *slb-wired-consoles* 31))
+    (setf (aref *slb-wired-consoles* 31) nil))
+  (when wired-console
+    (setf (wired-slb-console-console wired-console) nil)
+    (deallocate-wired-mouse (wired-slb-console-wired-mouse wired-console))
+    (setf (wired-slb-console-wired-mouse wired-console) nil)
+    (unwire-structure wired-console)
+    (unwire-structure (wired-slb-console-keystroke-buffer wired-console))
+    (unwire-structure (wired-slb-console-serial-buffer wired-console))
+    (deallocate-resource 'wired-slb-console wired-console)))
+
+(defwiredvar *mouse-time-kbd-in-pointers*)
+
+(defwiredfun wakeup-wired-mouse (wired-mouse)
+  (when (not (wired-mouse-wakeup wired-mouse))
+    (setf (wired-mouse-wakeup wired-mouse) t)
+    (aux-process-wakeup (wired-mouse-process wired-mouse))))
+
+(defwiredfun wired-mouse-handle-buttons (wired-mouse)
+  (let ((buttons (wired-mouse-buttons wired-mouse)))
+    (unless (eql buttons (wired-mouse-last-buttons wired-mouse))
+      (let ((time (ldb (byte 31. 0) (%microsecond-clock))))
+	(let ((i (wired-mouse-buttons-buffer-in-index wired-mouse))
+	      (b (wired-mouse-buttons-buffer wired-mouse)))
+	  (declare (array-register b))
+	  (aset time b i)
+	  (aset (wired-mouse-x-position wired-mouse) b (+ i 1))
+	  (aset (wired-mouse-y-position wired-mouse) b (+ i 2))
+	  (aset buttons b (+ i 3))
+	  (setf (wired-mouse-buttons-buffer-in-index wired-mouse) (logand (+ i 4) #o37))
+	  (setf (wired-mouse-last-buttons wired-mouse) buttons)
+	  (wakeup-wired-mouse wired-mouse))
+	(let* ((a *mouse-time-kbd-in-pointers*)
+	       (i (array-leader a 1)))
+	  (declare (array-register a))
+	  (setf (aref a i) time)
+	  (let* ((slb-console (loop for slb from 0 below (cl:length *slb-wired-consoles*)
+				    for slb-console = (aref *slb-wired-consoles* slb)
+				    ; Array-active length is not wired in imach (yet)
+				    ;for slb-console being the array-elements
+				    ;   of *slb-wired-consoles*
+				    when (and slb-console
+					      (eq (wired-slb-console-wired-mouse slb-console)
+						  wired-mouse))
+				      return slb-console))
+		 (kbd-in-ptr (if slb-console
+				 (si:wired-io-buffer-input-pointer
+				   (si:wired-slb-console-keystroke-buffer slb-console))
+				 kbd-buffer-in-ptr)))
+	    (setf (aref a (1+ i)) kbd-in-ptr))
+	  (setf (array-leader a 1) (mod (+ i 2) (array-leader a 0))))))))
+
+(defwiredfun wired-mouse-handle-motion (wired-mouse)
+  ;; Only check the mouse 60 times per second, to make the speed calculations come out right
+  (when (> (wired-time-difference-milliseconds (%microsecond-clock)
+					       (wired-mouse-last-check-time wired-mouse))
+	   15.)
+    (setf (wired-mouse-last-check-time wired-mouse) (%microsecond-clock))
+    (macrolet ((scale-one (coord fep-coord last-fep-coord speed scale fraction)
+		 ;; Compute physical speed, which involves time averaging.  To get
+		 ;; time averaging with a halflife of 1/6 second, every 1/60th of a second
+		 ;; take 15/16 of the former speed and add the current speed in mouse
+		 ;; ticks per 16th of a second.  Since sum((15/16)^i,i,0,inf)=16, the
+		 ;; averaged value is ticks per second.
+		 `(let* ((value (,fep-coord wired-mouse))
+			 (delta (%32-bit-difference value (,last-fep-coord wired-mouse)))
+			 (speed (,speed wired-mouse))
+			 (scale (,scale wired-mouse)))
+		    (setf (,last-fep-coord wired-mouse) value)
+		    (unless (zerop speed)
+		      ;;Multiply by 15/16
+		      (setq speed (- speed (ldb (byte 27. 4) speed) 1)))
+		    ;;Add ABS(DELTA)*4
+		    (incf speed (dpb (if (minusp delta) (- delta) delta) (byte 29. 2) 0))
+		    (setf (,speed wired-mouse) speed)
+		    ;; Do speed-dependent scaling to convert DELTA to logical coordinates
+		    ;; times 1024.
+		    (unless (zerop delta)
+		      (loop for i from 0 by 2 below 14.
+			    until (> (aref scale i) speed)
+			    finally (setq delta (* (aref scale (1+ i)) delta)))
+		      ;;Do "double-precision" add
+		      (setf value (+ (,fraction wired-mouse) delta))
+		      (setf (,fraction wired-mouse) (ldb (byte 10. 0) value))
+		      (setq value (%32-bit-plus (ash value -10.) (,coord wired-mouse)))
+		      (unless (= value (,coord wired-mouse))
+			(cl:setf (,coord wired-mouse) value)
+			(wakeup-wired-mouse wired-mouse))))))
+      (scale-one wired-mouse-x-position wired-mouse-fep-x wired-mouse-last-fep-x
+		 wired-mouse-x-speed wired-mouse-x-scale-array wired-mouse-x-fraction)
+      (scale-one wired-mouse-y-position wired-mouse-fep-y wired-mouse-last-fep-y
+		 wired-mouse-y-speed wired-mouse-y-scale-array wired-mouse-y-fraction))
+    ;; Now see if the mouse cursor needs attention.
+    (wired-mouse-handle-cursor wired-mouse)))
+
+;; See if the mouse cursor needs attention.
+;; If it is disabled or open, leave it alone.
+;; If it is off, turn it on.
+;; If it is on but in the wrong place, move it.
+(defwiredfun wired-mouse-handle-cursor (wired-mouse)
+  (let ((state (wired-mouse-cursor-state wired-mouse))
+	(nx (- (wired-mouse-x-position wired-mouse)
+	       (wired-mouse-cursor-x-offset wired-mouse)))
+	(ny (- (wired-mouse-y-position wired-mouse)
+	       (wired-mouse-cursor-y-offset wired-mouse))))
+    (select state
+      ((%mouse-cursor-invisible)		;Cursor is off, turn it on
+       (when (or				; unless it overlaps the prepared sheet
+	       (not (wired-mouse-prepared-sheet-valid wired-mouse))
+	       ( nx (wired-mouse-prepared-sheet-right wired-mouse))
+	       ( ny (wired-mouse-prepared-sheet-bottom wired-mouse))
+	       (< (+ nx 32.) (wired-mouse-prepared-sheet-left wired-mouse))
+	       (< (+ ny 32.) (wired-mouse-prepared-sheet-top wired-mouse)))
+	 (cl:setf (wired-mouse-cursor-x wired-mouse) nx
+		  (wired-mouse-cursor-y wired-mouse) ny)
+	 (xor-mouse-cursor wired-mouse)
+	 (setf (wired-mouse-cursor-state wired-mouse) %mouse-cursor-visible)))
+      ((%mouse-cursor-visible)
+       (when (not (and (= nx (wired-mouse-cursor-x wired-mouse))
+		       (= ny (wired-mouse-cursor-y wired-mouse))))
+	 (xor-mouse-cursor wired-mouse)		;Cursor is on in wrong place, erase old copy
+	 (cond ((or (not (wired-mouse-prepared-sheet-valid wired-mouse))
+		    ( nx (wired-mouse-prepared-sheet-right wired-mouse))
+		    ( ny (wired-mouse-prepared-sheet-bottom wired-mouse))
+		    (< (+ nx 32.) (wired-mouse-prepared-sheet-left wired-mouse))
+		    (< (+ ny 32.) (wired-mouse-prepared-sheet-top wired-mouse)))
+		;; Does not overlap the prepared sheet, so draw new copy
+		(cl:setf (wired-mouse-cursor-x wired-mouse) nx
+			 (wired-mouse-cursor-y wired-mouse) ny)
+		(xor-mouse-cursor wired-mouse))
+	       (t
+		;; Overlaps the prepared sheet, turn it off
+		(setf (wired-mouse-cursor-state wired-mouse) %mouse-cursor-invisible))))))))
+
+;;; Called from %OPEN-MOUSE-CURSOR
+;;; Must run on the aux stack for locking purposes
+(defwiredfun %aux-open-mouse-cursor (wired-mouse)
+  (select (wired-mouse-cursor-state wired-mouse)
+    ((%mouse-cursor-invisible)
+     (setf (wired-mouse-cursor-state wired-mouse) %mouse-cursor-open))
+    ((%mouse-cursor-visible %mouse-cursor-suspended)
+     (xor-mouse-cursor wired-mouse)
+     (setf (wired-mouse-cursor-state wired-mouse) %mouse-cursor-open))))
+
+(defwiredfun %aux-close-mouse-cursor (wired-mouse)
+  (wired-mouse-handle-cursor wired-mouse))
+
+;;; Must run on the aux stack for locking purposes
+(defwiredfun %aux-suspend-mouse-cursor (wired-mouse)
+  (wired-mouse-handle-cursor wired-mouse)
+  (select (wired-mouse-cursor-state wired-mouse)
+    ((%mouse-cursor-invisible)
+     (setf (wired-mouse-cursor-state wired-mouse) %mouse-cursor-open))
+    ((%mouse-cursor-visible)
+     (setf (wired-mouse-cursor-state wired-mouse) %mouse-cursor-suspended))))
+
+(defwiredfun xor-mouse-cursor (wired-mouse)
+  (let* ((bits-per-pixel (wired-mouse-screen-bits-per-pixel wired-mouse))
+	 (x (* (wired-mouse-cursor-x wired-mouse) bits-per-pixel))
+	 (y (wired-mouse-cursor-y wired-mouse))
+	 (width (wired-mouse-cursor-width wired-mouse))
+	 (height (wired-mouse-cursor-height wired-mouse)))
+    ;; Confine the reference position within the sheet and clip the cursor.
+    (when (minusp x)
+      (setq x 0))
+    (setf width (min* width (- (* (wired-mouse-screen-width wired-mouse) bits-per-pixel) x)))
+    (when (minusp y)
+      (setq y 0))
+    (setf height (min* height (- (wired-mouse-screen-height wired-mouse) y)))
+;    (when (and (plusp width) (plusp height))
+;      (let* ((d-beg-bitpos (wired-mouse-screen-buffer-bit-offset wired-mouse))
+;	     (d-row-span   (wired-mouse-screen-locations-per-line wired-mouse))
+;	     (d-bitpos (sys:%fixnum-mod (+ d-beg-bitpos x) 32))
+;	     (word-width (- (sys:%fixnum-floor (+ width d-bitpos) 32)
+;			    (if (zerop d-bitpos) 0 1)))
+;	     (first-column-mask (if (zerop d-bitpos) 0 (lsh -1 d-bitpos)))
+;	     (last-column-mask (lsh -1 (- (sys:%fixnum-mod (+ width d-bitpos) 32) 32))))
+;	(when (minusp word-width)
+;	  (setq word-width 0
+;		last-column-mask (logand first-column-mask last-column-mask)
+;		first-column-mask 0))
+;	(when *mouse-enabled*
+;	  (ignore d-row-span)
+;	(cli::bb-both-forwards			;Hardcoded since we know what operation used
+;	  cl:boole-xor				;skip first word as array-header
+;	  (%pointer-plus (wired-mouse-cursor-pattern wired-mouse) 1)
+;	  1 
+;	  (%pointer-plus (wired-mouse-screen-buffer-address wired-mouse)
+;			 (+ (* y d-row-span) (sys:%fixnum-floor (+ d-beg-bitpos x) 32)))
+;	  d-row-span height d-bitpos word-width first-column-mask last-column-mask
+;	  (> (sys:%fixnum-mod (+ width d-bitpos) 32) d-bitpos))
+;	nil)))))
+
+    ;; Mouse cursor pattern is 32-bits wide,
+    ;;    so never more than one word needs to be read per row
+    ;; Dest may or may not be word-aligned. 
+    (when (and (plusp width) (plusp height))
+      (let* ((d-beg-bitpos (wired-mouse-screen-buffer-bit-offset wired-mouse))
+	     (d-row-span   (wired-mouse-screen-locations-per-line wired-mouse))	
+	     (d-bitpos (sys:%fixnum-mod (+ d-beg-bitpos x) 32))
+	     ;; Assumes cursor-pattern is same type of array as that originally allocated
+	     ;;   and then jumps to data pointer within array header
+	     (mouse-address (sys:%memory-read
+			      (%make-pointer-offset dtp-locative
+						    (cli::follow-structure-forwarding
+						      (wired-mouse-cursor-pattern wired-mouse))
+						    3)))
+	     (dest-address  (%pointer-plus (wired-mouse-screen-buffer-address wired-mouse)
+					   (+ (* y d-row-span)
+					      (sys:%fixnum-floor (+ d-beg-bitpos x) 32)))))
+	(if (< (+ d-bitpos width) 32)
+	    ;; Case 1a: Dest is on word boundary-no shift needed, mask off right bits
+	    ;;      1b: Dest is within word - source-shift, mask start and end bits
+	    ;;      1c: Dest is right aligned - source-shift, mask start bits
+	    ;;
+	    ;; Shift to align mouse word is d-bitpos
+	    ;; IF unused mouse-bits (bits beyond the mouse-width) are 0, no need for mask 
+	 
+	    (loop for h from 0 below height
+		  for mouse-word = (%memory-read (%pointer-plus mouse-address h)
+						 :fixnum-only t) do
+	      (%memory-write dest-address
+			     (logxor (%memory-read dest-address :fixnum-only t)
+				     (lsh mouse-word d-bitpos)))
+		(setq dest-address (%pointer-plus dest-address d-row-span)))
+	
+	    ;; Case 2: Dest is across word boundary and both words are valid 
+	    ;;            (otherwise clipping reduces width)
+	    ;;      Shift and mask starting bits on first word
+	    ;;      Shift and mask ending bits on second word
+	    
+	    (loop for h from 0 below height
+		  with shift-2 = (- d-bitpos 32)
+		  for mouse-word = (%memory-read (%pointer-plus mouse-address h)
+						 :fixnum-only t)
+		  for dest-address-2 = (%pointer-plus dest-address 1) do
+	      (%memory-write dest-address
+			     (logxor (%memory-read dest-address :fixnum-only t)
+				     (lsh mouse-word d-bitpos)))
+	      (%memory-write dest-address-2
+			     (logxor (%memory-read dest-address-2 :fixnum-only t)
+				     (lsh mouse-word shift-2)))
+	      (setq dest-address (%pointer-plus dest-address d-row-span))))))
+    nil))
+
+(defun make-wired-mouse ()
+  (let ((mouse (make-wired-mouse-internal)))
+    (initialize-mouse-scale-arrays mouse)
+    mouse))
+
+(defun wired-mouse-initialize ()
+  (let ((wired-mouse (let ((*wired-console-area* wired-control-tables))
+		       (make-wired-mouse))))
+    (wire-wired-mouse wired-mouse)
+    (loop for (specvar nil offset) in *wired-mouse-variable-forwardings*
+	  for ptr = (%make-pointer-offset dtp-locative (locf (wired-mouse-fep-x wired-mouse))
+					  offset)
+	  as symbol-cell = (locf (symeval specvar))
+	  unless (eq ptr symbol-cell)
+	  ;; Point the array at the communications area.
+	  do (setf (location-contents symbol-cell) (location-contents ptr))
+	     (%p-store-tag-and-pointer ptr dtp-one-q-forward symbol-cell))
+    (setq *main-mouse-wired-mouse* wired-mouse)))
+
+(defresource wired-mouse () :constructor (make-wired-mouse))
+
+(defun allocate-wired-mouse (master-p)
+  (if master-p
+      *main-mouse-wired-mouse*
+      (let ((wired-mouse (allocate-resource 'wired-mouse)))
+	(wire-wired-mouse wired-mouse)
+	wired-mouse)))
+
+(defun wire-wired-mouse (wired-mouse)
+  (wire-structure (wired-mouse-cursor-pattern wired-mouse))
+  (wire-structure (wired-mouse-x-scale-array wired-mouse))
+  (wire-structure (wired-mouse-y-scale-array wired-mouse))
+  (wire-structure (wired-mouse-buttons-buffer wired-mouse))
+  (wire-structure wired-mouse)
+  wired-mouse)
+
+(defun deallocate-wired-mouse (wired-mouse)
+  (unless (eq wired-mouse *main-mouse-wired-mouse*)
+    (unwire-wired-mouse wired-mouse)
+    (deallocate-resource 'wired-mouse wired-mouse)))
+
+(defun unwire-wired-mouse (wired-mouse)
+  (unwire-structure (wired-mouse-cursor-pattern wired-mouse))
+  (unwire-structure (wired-mouse-x-scale-array wired-mouse))
+  (unwire-structure (wired-mouse-y-scale-array wired-mouse))
+  (unwire-structure (wired-mouse-buttons-buffer wired-mouse))
+  (unwire-structure wired-mouse)
+  wired-mouse)
+
+;;; Most 3600s have Hawley mice (50 points per inch)
+;;; Use a scale of 2/3 in X, 3/5 in Y when moving at slow speed, double that at high speed
+(defun initialize-mouse-scale-arrays (wired-mouse)
+  (aset 80. (wired-mouse-x-scale-array wired-mouse) 0)
+  (aset (// (lsh 2 10.) 3) (wired-mouse-x-scale-array wired-mouse) 1)
+  (aset 80. (wired-mouse-y-scale-array wired-mouse) 0)
+  (aset (// (lsh 3 10.) 5) (wired-mouse-y-scale-array wired-mouse) 1)
+  (aset #o17777777777 (wired-mouse-x-scale-array wired-mouse) 2)
+  (aset (// (lsh 4 10.) 3) (wired-mouse-x-scale-array wired-mouse) 3)
+  (aset #o17777777777 (wired-mouse-y-scale-array wired-mouse) 2)
+  (aset (// (lsh 6 10.) 5) (wired-mouse-y-scale-array wired-mouse) 3))
+
+(defun mouse-time-kbd-in-pointer (time)
+  (let ((array *mouse-time-kbd-in-pointers*))
+    (declare (array-register array))
+    (loop for index below (fill-pointer array) by 2
+	  do (when (eql (aref array index) time)
+	       (return (aref array (1+ index)))))))
+
+(add-initialization "Build main wired mouse" '(wired-mouse-initialize) '(:once))

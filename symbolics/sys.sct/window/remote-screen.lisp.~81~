@@ -1,0 +1,1132 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: TV; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Common basis for remotely accessed screens.
+
+(defflavor basic-remote-console
+	((keystroke-buffer (make-io-buffer 128))
+	 output-process
+	 (need-refresh nil)
+	 (pending-output nil)
+	 (warp nil)
+	 (size-changed nil)
+	 (lock (process:make-lock "Remote Console"))
+	 )
+	(cli::console)
+  (:functions output-process-predicate output-process-top-level))
+
+(defmethod (make-instance basic-remote-console) (&key &allow-other-keys)
+  (setf output-process
+	(process:make-process "Remote Screen Output" :run-reasons nil
+			      :initial-function #'output-process-top-level
+			      :verify-function #'output-process-predicate
+			      :priority (process:make-process-priority :deadline 500000 :preemptive nil)
+			      :simple-p t :top-level-whostate "Remote Screen Output"
+			      :flags '(:system-process t :no-run-light t :no-kbd-arrest t))))
+
+(defmethod (sys:console-initialize basic-remote-console :after) ()
+  (process-reset-and-enable output-process))
+
+(defmethod (sys:console-disable basic-remote-console :after) (&key abort)
+  (declare (ignore abort))
+  (process-kill output-process))
+
+
+(defmethod (sys:console-screen-acceptable-p basic-remote-console) (screen)
+  (ignore screen)
+  nil)
+
+(defmethod (sys:console-hardware-char-available basic-remote-console) (&optional ignore)
+  (not (io-buffer-empty-p keystroke-buffer)))
+
+(defmethod (sys:console-get-hardware-char basic-remote-console) ()
+  (io-buffer-get keystroke-buffer t nil nil))
+
+(defmethod (cli::console-note-keyboard-process basic-remote-console) (process)
+  (setf (io-buffer-last-output-process keystroke-buffer) process))
+
+;;;
+
+(defmethod (remote-console-asynchronous-refresh basic-remote-console)
+	   (screen left top right bottom &key (wakeup t))
+  (multiple-value-bind (screen-left screen-top screen-right screen-bottom)
+      (send screen :edges)
+    (setf left (max left screen-left))
+    (setf top (max top screen-top))
+    (setf right (min right screen-right))
+    (setf bottom (min bottom screen-bottom))
+    (when (and (< left right) (< top bottom))
+      (decf left screen-left)
+      (decf top screen-top)
+      (decf right screen-left)
+      (decf bottom screen-top)
+      (let ((rect `(nil ,left ,top ,right ,bottom)))
+	(process:with-lock (lock)
+	  (cond ((null need-refresh)
+		 (setf need-refresh `((,screen ,rect)))
+		 (when wakeup
+		   (process:wakeup output-process)))
+		(t
+		 (let ((entry (cl:assoc screen need-refresh)))
+		   (if (null entry)
+		       (push `(,screen ,rect) need-refresh)
+		       (push rect (cl:rest entry))))))))))
+  nil)
+
+(defvar *remote-console-output-interval* 100000)
+
+(defmethod (remote-console-note-pending-output basic-remote-console) ()
+  (if (store-conditional (locf pending-output) nil (sys:%microsecond-clock))
+      (process:wakeup output-process)
+    (let ((po pending-output))
+      (when (and (fixnump po)
+		 (> (%32-bit-difference (sys:%microsecond-clock) po)
+		    *remote-console-output-interval*))
+	(remote-console-force-output self)))))
+
+(defmethod (remote-console-force-output basic-remote-console :before) ()
+  (setf pending-output nil)
+  ;;(process::process-reconsider-wakeup output-process)
+  )
+
+(defmethod (remote-console-finish basic-remote-console :default) ()
+  (remote-console-force-output self))
+
+(defmethod (remote-console-finish-blinkers basic-remote-console :default) ()
+  (remote-console-finish self))
+
+(defmethod (remote-console-note-mouse-warp basic-remote-console) ()
+  (setf warp t)
+  (process:process-wakeup output-process))
+
+(defgeneric remote-console-note-size-changed (console))
+
+(defmethod (remote-console-note-size-changed basic-remote-console) ()
+  (setf size-changed t)
+  (process:process-wakeup output-process))
+
+(defun-in-flavor (output-process-predicate basic-remote-console) ()
+  (or warp (not (null pending-output)) (not (null need-refresh)) size-changed))
+
+(defun-in-flavor (output-process-top-level basic-remote-console) ()
+  (when size-changed
+    (setf size-changed nil)
+    (with-screen-safe (cli::screen)
+      (initialize-one-screen cli::screen self nil)))
+  (when warp
+    (setf warp nil)
+    (setf pending-output nil)
+    (let ((sheet (mouse-sheet cli::mouse)))
+      (remote-screen-warp-mouse (sheet-screen sheet) sheet (mouse-x cli::mouse) (mouse-y cli::mouse)))
+    (remote-console-finish self))
+  (when (not (null need-refresh))
+    (delaying-screen-management
+      (loop do
+	(let ((entry (process:with-lock (lock) (and need-refresh (pop need-refresh)))))
+	  (when (null entry) (return))
+	  (let ((windows-awaiting-refresh nil))
+	    (destructuring-bind (screen &rest rects) entry
+	      (setf rects (canonicalize-rectangle-set rects))
+	      (dolist (rect rects)
+		(setf windows-awaiting-refresh
+		      (cl:union windows-awaiting-refresh
+				;; tv:refresh-rectangle returns a list each of whose elements
+				;; is (window . rect).  We're simple-minded and refresh the
+				;; entire window, so discard the rects now, and if a window
+				;; appears more than once, only refresh it once.
+				(cl:delete-duplicates
+				  (mapcar #'first (cl:apply #'tv:refresh-rectangle screen
+							    (cl:rest rect))))))))
+	    ;; Now that we've done all the work we could do without
+	    ;; waiting for a lock, hang around and deal with the rest
+	    (when windows-awaiting-refresh
+	      (process-run-function "Refresh Windows"
+		#'(lambda (windows-awaiting-refresh)
+		    (loop for window in windows-awaiting-refresh do
+		      (tv:lock-sheet (window)
+			(send window :refresh))))
+		windows-awaiting-refresh)))))))
+  (when pending-output
+    (remote-console-force-output self)))
+
+(defflavor basic-remote-mouse
+	(console
+	 wired-mouse
+	 (max-n-buttons 3)
+	 (max-size 0)
+	 (last-cursor (make-array 32)))
+	()
+  (:required-flavors basic-mouse local-mouse-mixin)
+  (:initable-instance-variables console max-n-buttons max-size wired-mouse)
+  (:readable-instance-variables (mouse-max-n-buttons max-n-buttons)))
+
+(defmethod (make-instance basic-remote-mouse :after) (&rest ignore)
+  (scl:minf max-size 32))			;All blinker system keeps track of.
+
+(defmethod (open-mouse-cursor basic-remote-mouse) ()
+  (setf (mouse-cursor-state self) si:%mouse-cursor-open))
+
+(defmethod (close-mouse-cursor basic-remote-mouse) ()
+  (when (eq (mouse-cursor-state self) si:%mouse-cursor-invisible)
+    (setf (mouse-cursor-state self) si:%mouse-cursor-visible)))
+
+(defmethod (suspend-mouse-cursor basic-remote-mouse) ()
+  (select (mouse-cursor-state self)
+    ((si:%mouse-cursor-invisible)
+     (setf (mouse-cursor-state self) si:%mouse-cursor-open))
+    ((si:%mouse-cursor-visible)
+     (setf (mouse-cursor-state self) si:%mouse-cursor-suspended))))
+
+(defmethod (mouse-can-track-fast-p basic-remote-mouse) ()
+  (and (plusp max-size)
+       ( (mouse-cursor-width self) max-size)
+       ( (mouse-cursor-height self) max-size)))
+
+(defmethod ((cl:setf mouse-cursor-state) basic-remote-mouse) (new-value)
+  (let ((old-value (si:wired-mouse-cursor-state wired-mouse)))
+    (setf (si:wired-mouse-cursor-state wired-mouse) new-value)
+    (cond ((= new-value si:%mouse-cursor-visible)
+	   (stack-let ((cursor-now (make-array 32
+				     :displaced-to (si:wired-mouse-cursor-pattern
+						     wired-mouse)))
+		       (cursor-then last-cursor))
+	     (declare (sys:array-register cursor-now cursor-then))
+	     ;; Cursor pattern may have changed while open.
+	     (unless (cl:dotimes (i 32 t)
+		       (unless (eq (aref cursor-now i) (aref cursor-then i))
+			 (return nil)))
+	       (remote-mouse-install-cursor self)
+	       (copy-array-contents cursor-now last-cursor)))
+	   (remote-mouse-show-cursor self))
+	  ((= old-value si:%mouse-cursor-visible)
+	   (remote-mouse-hide-cursor self)))))
+
+(defwhopper-subst ((cl:setf mouse-cursor-closed-state) basic-remote-mouse) (new-value)
+  (let ((old-value (mouse-cursor-closed-state self)))
+    (continue-whopper new-value)
+    (when ( new-value old-value)
+      (selector new-value =
+	(1
+	  (remote-mouse-clear-cursor self)
+	  (cl:fill last-cursor nil))
+	(2 
+	  (remote-mouse-install-cursor self)
+	  (stack-let ((cursor-now (make-array 32
+				    :displaced-to (si:wired-mouse-cursor-pattern
+						    wired-mouse))))
+	    (cl:replace last-cursor cursor-now)))))))
+
+;;; Need one of these because mouse-cursor-state is cleared unconditionally sometimes.
+(defmethod (remote-mouse-clear-cursor basic-remote-mouse :default)  () )
+
+(defmethod (mouse-warp-1 basic-remote-mouse :after) (new-x new-y)
+  new-x new-y
+  (remote-console-note-mouse-warp console))
+
+(defmethod (remote-mouse-p basic-remote-mouse) () t)
+
+
+(defmacro-in-flavor (remote-console-adjust-mouse-coordinates basic-remote-console) (x y)
+  ;;+++ Maybe better would be to use mouse-fep-x/y as the remote position and adjust
+  ;;via deltas to mouse-x/y.
+  `(let* ((sheet (mouse-sheet cli::mouse))
+	  (screen (and sheet (sheet-screen sheet)))
+	  (cs (console-screen self)))
+     (when screen
+       (when (neq screen cs)
+	 (incf ,x (screen-mouse-x-offset screen))
+	 (incf ,y (screen-mouse-y-offset screen)))
+       (unless (eq sheet screen)
+	 (multiple-value-bind (dx dy)
+	     (sheet-calculate-offsets sheet screen)
+	   (decf ,x dx)
+	   (decf ,y dy)))
+       (center-remote-screen-mouse screen cs ,x ,y))
+     ))
+
+;;; Standard ways to process console events.
+(defsubst-in-flavor (remote-console-new-mouse-position basic-remote-console) (x y)
+  (without-interrupts
+    (unless warp
+      (remote-console-adjust-mouse-coordinates x y)
+      (setf (mouse-x cli::mouse) x)
+      (setf (mouse-y cli::mouse) y)
+      (mouse-wakeup cli::mouse))))
+
+(defsubst-in-flavor (remote-console-new-mouse-buttons basic-remote-console) 
+		    (buttons x y &optional (usec (ldb (byte 31 0) (%microsecond-clock))))
+  (without-interrupts
+    (let ((i (mouse-buttons-buffer-in-index cli::mouse))
+	  (b (mouse-buttons-buffer cli::mouse)))
+      (setf (mouse-buttons-internal cli::mouse) buttons)
+      (setf (aref b i) usec)
+      (remote-console-adjust-mouse-coordinates x y)
+      (setf (aref b (+ i 1)) x)
+      (setf (aref b (+ i 2)) y)
+      (setf (aref b (+ i 3)) (mouse-buttons-internal cli::mouse))
+      (setf (mouse-buttons-buffer-in-index cli::mouse)
+	    ;; buffer is 32 elements long
+	    (ldb (byte 5 0) (+ i 4)))
+      ;; Since we don't store anything into si:*mouse-time-kbd-in-pointers*, we
+      ;; must call console-process-input now to make sure the keyboard shifts in
+      ;; the mouse buttons buffer are up to date
+      (console-process-input self)
+      (mouse-wakeup cli::mouse))))
+
+
+
+;;; Define stubs for the standard drawing operations that work on vanilla raster arrays.
+;;; These are used if the drawable turns out to be a local raster.
+
+(defun with-old-alu-decoding-1 (continuation alu fill-data plane-mask raster type)
+  (declare (sys:downward-funarg continuation))
+  (if (= 1 (array-element-byte-size raster))
+      (let ((alu (cond ((not (cl:logtest 1 plane-mask))
+			cl:boole-2)
+		       ((cl:logtest 1 fill-data)
+			alu)
+		       (t
+			(color:combine-alu-and-data alu 0 -1)))))
+	(cl:ecase type
+	  ((nil))
+	  ((:masked-bits)
+	   (setf alu (logior (logand alu #b0101) #b0010)))
+	  ((:not-masked-bits)
+	   (setf alu (logior (ash (logand alu #b0101) 1) #b0001))))
+	(funcall continuation alu raster))
+      (multiple-value-bind (nil nil alu raster bitblt-unpacking-constant
+			    bitblt-unpacking-mask)
+	  (if (null type)
+	      (color:default-figure-usable-color-parameters plane-mask fill-data alu type
+							    :default raster)
+	      (color:default-figure-usable-color-parameters plane-mask fill-data alu :font
+							    type raster))
+	(funcall continuation alu raster))))
+
+(defmacro with-old-alu-decoding ((alu fill-data plane-mask raster) type &body body)
+  `(with-old-alu-decoding-1 #'(lambda (,alu ,raster) ,@body)
+			    ,alu ,fill-data ,plane-mask ,raster ,type ))
+
+;;;
+
+(defun raster-draw-1-bit-raster (width height pattern from-x from-y raster to-x to-y
+				 ones-alu ones-fill-data ones-plane-mask
+				 zeros-alu zeros-fill-data zeros-plane-mask)
+  (with-old-alu-decoding (ones-alu ones-fill-data ones-plane-mask raster) :masked-bits
+    (with-old-alu-decoding (zeros-alu zeros-fill-data zeros-plane-mask raster) :not-masked-bits
+      (cond ((or (minusp ones-alu) (minusp zeros-alu))
+	     (bitblt-unpacked ones-alu width height pattern from-x from-y raster to-x to-y)
+	     (bitblt-unpacked zeros-alu width height pattern from-x from-y raster to-x to-y))
+	    (t
+	     (bitblt (logior (logand ones-alu #b0101) (logand zeros-alu #b1010))
+		     width height pattern from-x from-y raster to-x to-y))))))
+
+(defun raster-draw-line (raster x1 y1 x2 y2 alu fill-data plane-mask draw-end-point)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) nil
+    (%draw-line-internal x1 y1 x2 y2 alu draw-end-point raster)))
+
+(defun raster-draw-multiple-lines (raster lines alu fill-data plane-mask draw-end-point)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) nil
+    (loop for i from 0 below (length lines) by 4 do
+      (%draw-line-internal (aref lines (+ i 0)) (aref lines (+ i 1))
+			   (aref lines (+ i 2)) (aref lines (+ i 3))
+			   alu draw-end-point raster))))
+
+(defun raster-draw-point (raster x y alu fill-data plane-mask)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) nil
+    (%draw-point x y alu raster)))
+
+(defun raster-draw-rectangle (width height raster x y alu fill-data plane-mask)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) nil
+    (%draw-rectangle-internal width height x y alu raster)))
+
+(defun raster-draw-multiple-rectangles (raster rects alu fill-data plane-mask)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) nil
+    (loop for i from 0 below (length rects) by 4 do
+      (let ((left (aref rects (+ i 0)))
+	    (top (aref rects (+ i 1))))
+	(%draw-rectangle-internal (- (aref rects (+ i 2)) left) (- (aref rects (+ i 3)) top)
+				  left top alu raster)))))
+
+(defun raster-draw-triangle (raster x1 y1 x2 y2 x3 y3 alu fill-data plane-mask &rest bounds)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) nil
+    (%draw-triangle-internal x1 y1 x2 y2 x3 y3 alu raster bounds)))
+
+
+(defun raster-draw-glyph (index font raster x y alu fill-data plane-mask &rest bounds)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) :masked-bits
+    (%draw-char-clipped-internal index font x y alu raster bounds)))
+
+
+(defun raster-draw-glyphs (raster font string index limit x y alu fill-data plane-mask
+			   &rest bounds)
+  (with-old-alu-decoding (alu fill-data plane-mask raster) :masked-bits
+    (%draw-string-clipped-internal raster alu x y string font index limit bounds)))
+
+
+
+
+(defflavor basic-remote-screen
+	(depth
+	 (root-drawable nil)
+	 (cached-fill-data -1)
+	 (cached-plane-mask -1)
+	 )
+	(main-screen-mixin basic-screen)
+  :abstract-flavor
+  (:gettable-instance-variables
+   (:bits-per-pixel depth)
+   (:buffer root-drawable))
+  (:initable-instance-variables
+   (:bits-per-pixel depth)
+   (:buffer root-drawable))
+  (:readable-instance-variables
+   (screen-bits-per-pixel depth)
+   (screen-buffer root-drawable))
+  (:required-methods
+   remote-copy-area
+   remote-get-image
+   remote-put-image
+   remote-draw-1-bit-raster
+   remote-draw-line
+   remote-draw-point
+   remote-read-point
+   remote-draw-rectangle
+   remote-draw-triangle
+   remote-draw-glyph
+   remote-draw-glyphs
+   remote-draw-multiple-lines
+   remote-draw-multiple-rectangles
+   ))
+
+(defmethod (:init basic-remote-screen :after) (&rest ignore)
+  (setf old-screen-array (send self :create-screen-array width height root-drawable))
+  nil)
+
+(defmethod (change-screen-shape basic-remote-screen)
+	   (new-drawable new-width new-height new-depth)
+  (cond ((and (eql new-drawable root-drawable)
+	      (= width new-width)
+	      (= depth new-depth)
+	      (= height new-height))
+	 nil)
+	(t
+	 (let ((change-of-depth (not (= depth new-depth))))
+	   (setf root-drawable new-drawable)
+	   (setf width new-width)
+	   (setf height new-height)
+	   (setf depth new-depth)
+	   (send self :adjust-screen-array old-screen-array root-drawable)
+	   (when change-of-depth
+	     (dolist (i inferiors)
+	       (send i :change-of-screen t))))
+	 t)))
+
+
+(defmethod (:create-screen-array basic-remote-screen) (w h displaced-to)
+  (make-remote-indirect-drawable displaced-to w h))
+
+(defmethod (:adjust-screen-array basic-remote-screen) (array new-pointer)
+  (send self :inferior-screen-array-adjusted self array width height
+	new-pointer x-offset y-offset)
+  (tv:adjust-inferior-screen-arrays self array 0 0))
+
+(defmethod (screen-follow-drawable-indirection basic-remote-screen)
+	   (drawable x-offset y-offset)
+  (follow-remote-drawable-indirection drawable x-offset y-offset))
+
+
+(defmethod (:inferior-screen-array-adjusted basic-remote-screen)
+	   (sheet raster w h new-pointer xoff yoff)
+  (set-remote-indirect-drawable-target raster new-pointer xoff yoff w h)
+  (setf (raster-sheet raster) sheet)
+  nil)
+
+
+(defmethod (:parse-font-descriptor basic-remote-screen) (fd)
+  (cl:etypecase fd
+    (symbol (symeval fd))
+    (font fd)))
+
+(defmethod (:kill basic-remote-screen :before) ()
+  (when (and console (eq self (console-screen console)))
+    (shutdown-this-mouse (console-mouse console))))
+
+(defmethod (:kill basic-remote-screen :after) ()
+  (when who-screen
+    (remove-active-who-line-screen who-screen))
+  (when (and console (eq self (console-screen console)))
+    (sys:console-disable console)))
+
+(defmethod (:accept-pop-up-notifications basic-remote-screen) () nil)
+
+(defmethod (:user-visible basic-remote-screen) () t)
+
+(defmethod (:mouse-standard-blinker basic-remote-screen) ()
+  (mouse-set-blinker-definition-internal (sheet-mouse self)
+					 :character 0 0 :on
+					 :set-character #\mouse:nw-arrow))
+
+;;; This message is worthless, since it wouldn't work to have anything other
+;;; than FONTS:MOUSE.
+(defmethod (:mouse-font basic-remote-screen) ()
+  (send self :parse-font-descriptor 'fonts:mouse))
+
+(defmethod (:magnifying-blinker-flavor basic-remote-screen) ()
+  'magnifying-blinker)
+
+(defmethod (screen-alu-presentation-type basic-remote-screen) ()
+  'microcoded-graphics-alu)
+
+(defmethod (:force-output basic-remote-screen) ()
+  (when console
+    (remote-console-force-output console)))
+
+(defmethod (:finish basic-remote-screen) ()
+  (when console
+    (remote-console-finish console)))
+
+(defmethod (:finish-blinkers basic-remote-screen) ()
+  (when console
+    (remote-console-finish-blinkers console)))
+
+(defmethod (remote-screen-note-pending-output basic-remote-screen) ()
+  (when console
+    (remote-console-note-pending-output console)))
+
+(defmethod (screen-has-remote-bitmaps basic-remote-screen) () t)
+
+
+
+
+(defflavor remote-indirect-drawable
+	(target (x-offset 0) (y-offset 0) width height (sheet :remote))
+	()
+  (:writable-instance-variables (raster-sheet sheet))
+  (:constructor make-remote-indirect-drawable (target width height)))
+
+
+(defmethod (sys:print-self remote-indirect-drawable) (stream depth slashify)
+  depth
+  (if slashify
+      (si:printing-random-object (self stream)
+	(princ self stream))
+      (format stream "Indirect Drawable ~Dx~D at (~D ~D) in ~A"
+	      width height x-offset y-offset target)))
+
+(defmethod (remote-indirect-drawable-target remote-indirect-drawable) ()
+  (values target x-offset y-offset width height))
+
+(defmethod (set-remote-indirect-drawable-target remote-indirect-drawable)
+	   (new-target new-x-offset new-y-offset new-width new-height)
+  (setf target new-target)
+  (setf x-offset new-x-offset)
+  (setf y-offset new-y-offset)
+  (setf width new-width)
+  (setf height new-height)
+  nil)
+
+(compile-flavor-methods remote-indirect-drawable)
+
+(defun follow-remote-drawable-indirection (drawable x-offset y-offset)
+  (loop while (typep drawable 'remote-indirect-drawable) do
+    (multiple-value-bind (next-drawable next-x-offset next-y-offset)
+	(remote-indirect-drawable-target drawable)
+      (setf drawable next-drawable)
+      (incf x-offset next-x-offset)
+      (incf y-offset next-y-offset)))
+  (values drawable x-offset y-offset))
+
+(defun local-raster-array-p (drawable)
+  (and (arrayp drawable)
+       (= 2 (cl:array-rank drawable))))
+
+
+(defwhopper (%screen-allocate-sheet-temporary-bit-array basic-remote-screen)
+	    (sheet width height)
+  (let ((pixmap (continue-whopper sheet width height)))
+    (cond ((not (null pixmap))
+	   (let ((raster (make-remote-indirect-drawable pixmap width height)))
+	     (setf (raster-sheet raster) sheet)
+	     raster))
+	  (t
+	   (make-temporary-sheet-bit-raster sheet width height)))))
+
+
+(defwhopper (%screen-deallocate-sheet-temporary-bit-array basic-remote-screen)
+	    (sheet drawable)
+  (if (local-raster-array-p drawable)
+      (deallocate-temporary-sheet-bit-raster drawable)
+      (continue-whopper sheet (remote-indirect-drawable-target drawable))))
+
+(defwhopper (verify-drawable basic-remote-screen) (drawable sheet direction)
+  (let ((drawable (follow-remote-drawable-indirection drawable 0 0)))
+    (if (local-raster-array-p drawable)
+	:local
+	(continue-whopper drawable sheet direction))))
+
+(defwhopper (%screen-page-in-sheet-temporary-bit-array basic-remote-screen)
+	    (sheet drawable direction)
+  (let ((drawable (follow-remote-drawable-indirection drawable 0 0)))
+    (if (local-raster-array-p drawable)
+	(page-in-raster-array drawable)
+	(continue-whopper sheet drawable direction))))
+
+(defwhopper (%screen-page-out-sheet-temporary-bit-array basic-remote-screen) (sheet drawable)
+  (let ((drawable (follow-remote-drawable-indirection drawable 0 0)))
+    (if (local-raster-array-p drawable)
+	(page-out-raster-array drawable)
+	(continue-whopper sheet drawable))))
+
+
+
+;; The various :%mumble methods take in coordinates relative to a sheet,
+;; and we need to get coordinates relative to the screen.
+(defmacro update-offsets (sheet array &rest xs-and-ys)
+  `(multiple-value-bind (.drawable. .x-offset. .y-offset. .width. .height.)
+       (update-offsets-internal ,array ,sheet)
+     ,@(loop for (x y) on xs-and-ys by 'cddr
+	     collect `(incf ,x .x-offset.)
+	     collect `(incf ,y .y-offset.))
+     (values .drawable. .x-offset. .y-offset. .width. .height.)))
+
+(defun-in-flavor (update-offsets-internal basic-remote-screen) (drawable sheet)
+  (when (null drawable)
+    (setf drawable (sheet-screen-array sheet))
+    (when (null drawable)
+      (error "The sheet ~S does not have a screen array." sheet)))
+  (if (local-raster-array-p drawable)
+      (multiple-value-bind (wid hei)
+	  (decode-raster-array drawable)
+	(values drawable 0 0 wid hei))
+      (multiple-value-bind (drawable xoff yoff wid hei)
+	  (remote-indirect-drawable-target drawable)
+	(multiple-value-bind (drawable xoff yoff)
+	    (follow-remote-drawable-indirection drawable xoff yoff)
+	  (values drawable xoff yoff wid hei)))))
+
+(defmethod (remote-screen-warp-mouse basic-remote-screen) (sheet x y)
+  (and (eq root-drawable (update-offsets sheet nil x y))
+       (remote-warp-mouse self (- x mouse-x-offset) (- y mouse-y-offset))))
+
+
+
+(defun-in-flavor (with-alu-decoded-internal basic-remote-screen) (sheet alu)
+  (cl:etypecase alu
+    ((cl:unsigned-byte 4)
+     (let ((data cached-fill-data) (mask cached-plane-mask))
+       #+ignore
+       (when (eql data -1)
+	 (select alu
+	   ((cl:boole-ior)
+	    (setf alu cl:boole-1))
+	   ((cl:boole-andc1)
+	    (setf data 0)
+	    (setf alu cl:boole-1))))
+       (values alu data mask)))
+    (scl:instance
+      (multiple-value-bind (nil mask nil data boole)
+	  (send alu :sc-parameters sheet)
+	(values boole data mask)))))
+
+(defmacro-in-flavor (with-alu-decoded basic-remote-screen)
+		    ((sheet alu fill-data plane-mask) &body body)
+  `(multiple-value-bind (,alu ,fill-data ,plane-mask)
+       (with-alu-decoded-internal ,sheet ,alu)
+     . ,body))
+
+(defmethod (:with-alu-cached basic-remote-screen) (sheet alu message &rest args)
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (letf ((cached-fill-data fill-data)
+	   (cached-plane-mask plane-mask))
+      (lexpr-send sheet message alu sheet args))))
+
+(defmethod (:with-alu-cached-source basic-remote-screen) (sheet alu message &rest args)
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (letf ((cached-fill-data fill-data)
+	   (cached-plane-mask plane-mask))
+      (lexpr-send sheet message alu sheet args))))
+
+(defmethod (:exchange-two-colors-aluf basic-remote-screen) (old-1 old-2)
+  (ignore old-1 old-2)
+  alu-xor)
+
+(defmethod (:default-inferior-alufs basic-remote-screen) ()
+  (values alu-ior alu-andca alu-xor))
+
+(defmethod (:%bitblt basic-remote-screen)
+	   (alu w h from-array from-x from-y to-array to-x to-y sheet)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (unless (or (zerop w) (zerop h))
+    (with-alu-decoded (sheet alu fill-data plane-mask)
+      (multiple-value-bind (from-drawable from-x-offset from-y-offset from-width from-height)
+	  (update-offsets sheet from-array)
+	(let ((to-drawable (update-offsets sheet to-array to-x to-y))
+	      (aw (abs w))
+	      (ah (abs h)))
+	  (if (local-raster-array-p from-drawable)
+	      (if (local-raster-array-p to-drawable)
+		  (bitblt alu w h from-drawable from-x from-y to-drawable to-x to-y)
+		  (remote-put-image self alu aw ah
+				    from-drawable from-x from-y to-drawable to-x to-y
+				    fill-data plane-mask))
+	      (if (or (< from-width (+ from-x aw))
+		      (< from-height (+ from-y ah)))
+		  (if (local-raster-array-p to-drawable)
+		      (let ((temp (make-temporary-sheet-bit-raster sheet from-width from-height)))
+			(unwind-protect
+			    (progn
+			      (remote-get-image self tv:alu-seta from-width from-height
+						from-drawable from-x-offset from-y-offset
+						temp 0 0)
+			      (bitblt alu aw ah temp from-x from-y to-drawable to-x to-y))
+			  (deallocate-temporary-sheet-bit-raster temp)))
+		      (remote-tile-area self alu aw ah
+					from-drawable from-x-offset from-y-offset
+					from-width from-height from-x from-y
+					to-drawable to-x to-y
+					fill-data plane-mask))
+		  (if (local-raster-array-p to-drawable)
+		      (remote-get-image self alu aw ah
+					from-drawable (+ from-x from-x-offset) (+ from-y from-y-offset)
+					to-drawable to-x to-y)
+		      (remote-copy-area self alu aw ah
+					from-drawable (+ from-x from-x-offset) (+ from-y from-y-offset)
+					to-drawable to-x to-y
+					fill-data plane-mask)))))))))
+
+(defmethod (remote-tile-area basic-remote-screen :default)
+	   (alu w h tile tile-x tile-y tile-width tile-height tile-x-offset tile-y-offset
+		drawable to-x to-y &optional (fill-data -1) (plane-mask -1))
+  (loop for this-y from (- to-y (mod tile-y-offset tile-height))
+		   by tile-height below (+ to-y h)
+	for this-ymin = (max this-y to-y)
+	for this-ymax = (min (+ this-y tile-height) (+ to-y h))
+	for this-height = (- this-ymax this-ymin)
+	for this-tile-y = (+ tile-y (- this-ymin this-y))
+	do
+    (loop for this-x from (- to-x (mod tile-x-offset tile-width))
+		     by tile-width below (+ to-x w)
+	  for this-xmin = (max this-x to-x)
+	  for this-xmax = (min (+ this-x tile-width) (+ to-x w))
+	  for this-width = (- this-xmax this-xmin)
+	  for this-tile-x = (+ tile-x (- this-xmin this-x))
+	  do
+      (remote-copy-area self alu this-width this-height
+			tile this-tile-x this-tile-y
+			drawable this-xmin this-ymin
+			fill-data plane-mask))))
+
+(defmethod (:%draw-1-bit-raster basic-remote-screen)
+	   (w h pattern from-x from-y array to-x to-y ones-alu zeros-alu sheet)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (unless (or (zerop w) (zerop h))
+    (with-alu-decoded (sheet ones-alu ones-fill-data ones-plane-mask)
+      (with-alu-decoded (sheet zeros-alu zeros-fill-data zeros-plane-mask)
+	(let ((drawable (update-offsets sheet array to-x to-y)))
+	  (if (local-raster-array-p drawable)
+	      (raster-draw-1-bit-raster w h pattern from-x from-y drawable to-x to-y
+					ones-alu ones-fill-data ones-plane-mask
+					zeros-alu zeros-fill-data zeros-plane-mask)
+	      (remote-draw-1-bit-raster self w h pattern from-x from-y drawable to-x to-y
+					ones-alu ones-fill-data ones-plane-mask
+					zeros-alu zeros-fill-data zeros-plane-mask)))))))
+
+(defmethod (:%draw-line basic-remote-screen) (x1 y1 x2 y2 alu draw-end-point sheet)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (let ((drawable (update-offsets sheet nil x1 y1 x2 y2)))
+      (if (local-raster-array-p drawable)
+	  (raster-draw-line drawable x1 y1 x2 y2 alu fill-data plane-mask draw-end-point)
+	  (remote-draw-line self drawable x1 y1 x2 y2 alu fill-data plane-mask
+			    draw-end-point)))))
+
+(defmethod (:%draw-point basic-remote-screen) (x y alu sheet &optional (value -1))
+  value						;obsolete
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (let ((drawable (update-offsets sheet nil x y)))
+      (if (local-raster-array-p drawable)
+	  (raster-draw-point drawable x y alu fill-data plane-mask)
+	  (remote-draw-point self drawable x y alu fill-data plane-mask)))))
+
+(defmethod (:%point basic-remote-screen) (x y sheet)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (let ((drawable (update-offsets sheet nil x y)))
+    (if (local-raster-array-p drawable)
+	(raster-aref drawable x y)
+        (remote-read-point self drawable x y))))
+
+(defmethod (:%read-1-bit-raster basic-remote-screen)
+	   (w h drawable from-x from-y array to-x to-y sheet &rest args)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (let ((drawable (update-offsets sheet drawable from-x from-y)))
+    (if (local-raster-array-p drawable)
+	(lexpr-funcall #'%read-1-bit-raster w h drawable from-x from-y array to-x to-y args)
+      (lexpr-funcall #'remote-read-1-bit-raster
+		     self w h drawable from-x from-y array to-x to-y sheet args))))
+
+(defmethod (remote-read-1-bit-raster basic-remote-screen)
+	   (w h drawable from-x from-y to-array to-x to-y sheet &rest args)
+  (stack-let* ((round-to (ceiling 32 depth))
+	       (rounded-w (* (ceiling w round-to) round-to))
+	       (dims (list h rounded-w)))
+    (tv:with-temp-sheet-raster (data dims :type (sheet-array-type sheet))
+      (remote-get-image self cl:boole-1 w h drawable from-x from-y data 0 0)
+      (lexpr-funcall #'%read-1-bit-raster w h data 0 0 to-array to-x to-y args))))
+
+(defmethod (:%draw-rectangle basic-remote-screen) (w h x y alu sheet &optional array)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (let ((drawable (update-offsets sheet array x y)))
+      (if (local-raster-array-p drawable)
+	  (raster-draw-rectangle w h drawable x y alu fill-data plane-mask)
+	  (remote-draw-rectangle self w h drawable x y alu fill-data plane-mask)))))
+
+(defmethod (:%draw-triangle basic-remote-screen)
+	   (x1 y1 x2 y2 x3 y3 alu sheet left top right bottom)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (when (null left) (setf left 0))
+  (when (null top) (setf top 0))
+  (when (null right) (setf right (sheet-width sheet)))
+  (when (null bottom) (setf bottom (sheet-height sheet)))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (let ((drawable (update-offsets sheet nil x1 y1 x2 y2 x3 y3 left top right bottom)))
+      (if (local-raster-array-p drawable)
+	  (raster-draw-triangle drawable x1 y1 x2 y2 x3 y3 alu fill-data plane-mask
+				left top right bottom)
+	  (with-stack-list (limits left top right bottom)
+	    (remote-draw-triangle self drawable x1 y1 x2 y2 x3 y3 alu fill-data plane-mask
+				  limits))))))
+
+(defmethod (:%draw-char basic-remote-screen) (char x y alu sheet)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (multiple-value-bind (index font)
+      (sheet-get-char-index-and-font char t sheet)
+    (destructuring-bind (left top right bottom) (sheet-clipping-region sheet)
+      (with-alu-decoded (sheet alu fill-data plane-mask)
+	(let ((drawable (update-offsets sheet nil x y left top right bottom)))
+	  (if (local-raster-array-p drawable)
+	      (raster-draw-glyph index font drawable x y alu fill-data plane-mask
+				 left top right bottom)
+	      (with-stack-list (limits left top right bottom)
+		(remote-draw-glyph self index font drawable x y alu fill-data plane-mask
+				   limits))))))))
+
+(defmethod (:%draw-glyph basic-remote-screen) (index font x y alu sheet &optional (drawable nil))
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (destructuring-bind (left top right bottom) (sheet-clipping-region sheet)
+      (let ((drawable (update-offsets sheet drawable x y left top right bottom)))
+	(if (local-raster-array-p drawable)
+	    (raster-draw-glyph index font drawable x y alu fill-data plane-mask
+			       left top right bottom)
+	    (with-stack-list (limits left top right bottom)
+	      (remote-draw-glyph self index font drawable x y alu fill-data plane-mask limits)))))))
+
+(defmethod (:%draw-string basic-remote-screen) (sheet alu x y string font index limit xlim)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (unless (< index limit)
+    (return-from :%draw-string (values x index t)))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (destructuring-bind (left top right bottom) (sheet-clipping-region sheet)
+      (scl:minf right xlim)
+      (let* ((original-x x)
+	     (drawable (update-offsets sheet nil x y left top right bottom))
+	     (string string))
+	(declare (sys:array-register string))
+	(let ((start-index index)
+	      (start-x x)
+	      (done-p nil))
+	  (let ((font-fill-pointer (font-fill-pointer font))
+		(chars-exist-table (font-chars-exist-table font))
+		(char-width (font-char-width font))
+		(char-width-table (font-char-width-table font)))
+	    (if (= (array-type-field string) art-string)
+		(loop do
+		  (compiler:%error-when ( index limit)
+		    (return (setq done-p t)))
+		  (let ((i (char-subindex (aref string index))))
+		    (unless (and (< i font-fill-pointer)
+				 (or (null chars-exist-table)
+				     (aref chars-exist-table i)))
+		      (return nil))
+		    (let ((new-x (+ (if (null char-width-table)
+					char-width
+				      (aref char-width-table i))
+				    x)))
+		      (compiler:%error-when (> new-x right)
+			(return nil))
+		      (setq x new-x)))
+		  (incf index))
+	      (let* ((initial-char (aref string index))
+		     (subindex-is-index-p (si:%char-subindex-is-index-p initial-char)))
+		(loop do
+		  (when ( index limit)
+		    (return (setq done-p t)))
+		  (let* ((c (aref string index))
+			 (i (if (and subindex-is-index-p
+				     (= (si:%char-all-but-subindex c)
+					(si:%char-all-but-subindex initial-char)))
+				(char-subindex c)
+			      (or (si:%chars-share-device-font-p c initial-char 
+								 subindex-is-index-p)
+				  (return nil)))))
+		    (unless (and (< i font-fill-pointer)
+				 (or (null chars-exist-table)
+				     (aref chars-exist-table i)))
+		      (return nil))
+		    (let ((new-x (+ (if (null char-width-table)
+					char-width
+				      (aref char-width-table i))
+				    x)))
+		      (when (> new-x right)
+			(return nil))
+		      (setq x new-x)))
+		  (incf index)))))
+	  (if (local-raster-array-p drawable)
+	      (raster-draw-glyphs drawable font string start-index index start-x y
+				  alu fill-data plane-mask left top right bottom)
+	    (with-stack-list (limits left top right bottom)
+	      (remote-draw-glyphs self string start-index index font drawable start-x y
+				  alu fill-data plane-mask limits)))
+	  ;; Return X motion in sheet coordinates, not screen corrdinates.
+	  (values (+ original-x (- x start-x)) index done-p))))))
+
+(defmethod (:%draw-multiple-lines basic-remote-screen) (sheet alu lines draw-end-point)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (multiple-value-bind (drawable dx dy)
+	(update-offsets sheet nil)
+      ;; We know that this is a unique stack consed array, so it's okay to change
+      (loop for index below (array-active-length lines) by 2 do
+	(incf (aref lines index) dx)
+	(incf (aref lines (1+ index)) dy))
+      (if (local-raster-array-p drawable)
+	  (raster-draw-multiple-lines drawable lines draw-end-point alu fill-data plane-mask)
+	  (remote-draw-multiple-lines self drawable lines draw-end-point
+				      alu fill-data plane-mask)))))
+
+(defmethod (:%draw-multiple-rectangles basic-remote-screen) (sheet alu rects)
+  (unless (eq sheet currently-prepared-sheet)
+    (error 'draw-on-unprepared-sheet :sheet sheet))
+  (with-alu-decoded (sheet alu fill-data plane-mask)
+    (multiple-value-bind (drawable dx dy)
+	(update-offsets sheet nil)
+      ;; We know that this is a unique stack consed array, so it's okay to change
+      (loop for index below (array-active-length rects) by 2 do
+	(incf (aref rects index) dx)
+	(incf (aref rects (1+ index)) dy))
+      (if (local-raster-array-p drawable)
+	  (raster-draw-multiple-rectangles drawable rects alu fill-data plane-mask)
+	  (remote-draw-multiple-rectangles self drawable rects alu fill-data plane-mask)))))
+
+
+
+(defflavor basic-remote-bitmap-screen
+	((parent-screen nil)
+	 (indirect-drawable nil))
+	(roving-bitmap-mixin bitmap-mixin graphics-mixin stream-mixin bitmap-screen-mixin
+	 basic-remote-screen)
+  :abstract-flavor
+  (:default-init-plist :expose-p nil :width 0 :height 0))
+
+(defun-in-flavor (ensure-drawable basic-remote-bitmap-screen) ()
+  (when (null indirect-drawable)
+    (setf indirect-drawable
+	  (%screen-allocate-sheet-temporary-bit-array parent-screen self width height))
+    (change-screen-shape self (remote-indirect-drawable-target indirect-drawable)
+			 width height depth)
+    (send self :expose)))
+
+(defun-in-flavor (flush-drawable basic-remote-bitmap-screen) ()
+  (when (not (null indirect-drawable))
+    (send self :deactivate)
+    (%screen-deallocate-sheet-temporary-bit-array parent-screen self indirect-drawable)
+    (setf indirect-drawable nil)))
+
+(defmethod (remote-bitmap-screen-initialize basic-remote-bitmap-screen)
+	   (new-parent-screen &rest args
+			      &key ((:width new-width)) ((:height new-height))
+			      &allow-other-keys)
+  (flush-drawable)
+  (setf parent-screen new-parent-screen)
+  (setf console (send parent-screen :console))
+  (setf depth (send parent-screen :bits-per-pixel))
+  (send self :set-size new-width new-height)
+  (ensure-drawable)
+  (cl:apply #'send self :reset args))
+
+(defmethod (:reset basic-remote-bitmap-screen :before)
+	   (&key ((:width new-width)) ((:height new-height)) &allow-other-keys)
+  (send self :set-size new-width new-height))
+
+(defwhopper (:set-size basic-remote-bitmap-screen) (new-width new-height &optional option)
+  (if (or (eq option :verify)
+	  (null indirect-drawable)
+	  (and (= new-width width) (= new-height height)))
+      (continue-whopper new-width new-height option)
+      (unwind-protect
+	  (progn
+	    (flush-drawable)
+	    (continue-whopper new-width new-height option))
+	(ensure-drawable))))
+
+(defmethod (tv:deallocate-bitmap-stream basic-remote-bitmap-screen :before) ()
+  (flush-drawable)
+  (setf parent-screen nil))
+
+;;;
+
+(defwhopper (:screen-allocate-bitmap-stream basic-remote-screen) (&rest args)
+  (let ((bitmap-stream (lexpr-continue-whopper args)))
+    (when (typep bitmap-stream 'basic-remote-bitmap-screen)
+      (cl:apply #'remote-bitmap-screen-initialize bitmap-stream self args))
+    bitmap-stream))
+
+;
+; Principle implementation for remote screens
+;
+(defvar *stream-preferred-size* (* 1024 2024 2))
+
+(defmethod (%with-bit-array-or-stream basic-remote-screen)
+	   (sheet direction continuation &rest args &key
+		  (width (sheet-width sheet))
+		  (height (sheet-height sheet))
+		  &allow-other-keys)
+D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI")  ;remote screens prefer the stream array variation, but small transfers are better
+  ;handled by a single transaction
+0  (cl:apply (if ( (* width height (send self :bits-per-pixel)) *stream-preferred-size*)
+		#'%with-bit-array-stream
+		#'%with-bit-array)
+	    self sheet direction continuation args)
+  )
+
+(defmethod (%with-bit-array basic-remote-screen)
+	   (sheet-or-raster direction continuation 
+		      &key
+		      (x-offset 0)
+		      (y-offset 0)
+		      (width)
+		      (height)
+		      from-field  to-field
+		      temporary-raster
+		      &allow-other-keys)
+  (let* ((raster (or temporary-raster
+		     (make-temporary-sheet-bit-raster self width height)))
+	 (real-sheet (when (typep sheet-or-raster 'sheet) sheet-or-raster))
+	 (sheet-array (if real-sheet
+			  (sheet-screen-array real-sheet)
+			  real-sheet))
+	 (sheet (or real-sheet self))
+	 )
+    (unwind-protect 
+	(multiple-value-bind (nil nil span) (decode-raster-array raster)
+	  (when (memq direction '(:input :both))
+	    (sheet-bitblt tv:alu-seta width height
+			  sheet-array x-offset y-offset
+			  raster 0 0 sheet))
+	  (let ((index 0)
+		(e-span span))
+	    (cond ((eq direction :input)
+		   (when (eql from-field 2) (setq index span))
+		   (when from-field (setq e-span (+ span span))))
+		  (t (unless (eq direction :output)
+		       (unless (eql from-field to-field)
+			 (ferror "from field must eql to-field if direction is :BOTH")))
+		     (when (eql to-field 2) (setq index span))
+		     (when to-field (setq e-span (+ span span)))))
+	    (funcall continuation raster index e-span))
+	  (when (memq direction '(:output :both))
+	    (sheet-bitblt tv:alu-seta width height
+			  raster 0 0
+			  sheet-array x-offset y-offset sheet))
+	  )
+      (when (neq raster temporary-raster)
+	(deallocate-temporary-sheet-bit-raster raster)))
+      ))
+
+(defmethod (%with-bit-array-stream basic-remote-screen)
+	   (sheet-or-raster direction continuation &rest args
+		  &key
+		  (width)
+		  (height)
+		  &allow-other-keys)
+  ;this is a completely dumb implementation.  A smarter one would
+  ;read ahead and write-behind the remote access
+  (cl:apply #'%with-bit-array self sheet-or-raster direction
+	#'(lambda (raster offset span)
+	    (multiple-value-bind (dy dx) (floor offset span)
+	      (cl:apply #'bit-array-as-bit-array-stream raster direction continuation
+			:x-offset dx
+			:y-offset dy
+			:width width
+			:height height
+			args)))
+	args))
+
+
+(compile-flavor-methods basic-remote-screen basic-remote-bitmap-screen)

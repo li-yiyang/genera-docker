@@ -1,0 +1,498 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: PROCESS; Base: 10 -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+(DEFRESOURCE PROCESS-BLOCK-TIMERS ()
+	     :CONSTRUCTOR (CREATE-TIMER-WAKEUP NIL :NAME "Process block timeout")
+	     :DEINITIALIZER (CLEAR-TIMER OBJECT)
+	     :INITIAL-COPIES 10)
+
+(DEFUN PROCESS-BLOCK-WITH-TIMEOUT (TIMEOUT WHOSTATE VERIFY-FUNCTION &REST ARGS)
+  (DECLARE (SYS:DOWNWARD-FUNARG VERIFY-FUNCTION))
+  (DECLARE (INLINE TIMER-ARGS))
+  (COND ((AND TIMEOUT SI:*NEW-SCHEDULER-ENABLED*)
+	 (USING-RESOURCE (TIMER PROCESS-BLOCK-TIMERS)
+	   ;; Yeah, we know about the internal representation of timers here.
+	   (SETF (CAR (TIMER-ARGS TIMER)) %REAL-CURRENT-PROCESS)
+	   (WITH-SCHEDULER-LOCKED
+	     (RESET-TIMER-RELATIVE TIMER TIMEOUT)
+	     (FLET ((TIMEOUT-OR-FUNCTION (TIMER FUNCTION ARGS)
+		      (OR (NOT (TIMER-PENDING-P TIMER)) (APPLY FUNCTION ARGS))))
+	       (PROCESS-BLOCK-INTERNAL
+		 %REAL-CURRENT-PROCESS 'BLOCKED NIL WHOSTATE
+		 #'TIMEOUT-OR-FUNCTION TIMER VERIFY-FUNCTION ARGS))
+	     (APPLY VERIFY-FUNCTION ARGS))))
+	((AND TIMEOUT (NOT SI:*NEW-SCHEDULER-ENABLED*))
+	 ;; scheduler isn't enabled, so don't even try to use timers.
+	 (WITH-SCHEDULER-LOCKED
+	   (FLET ((TIMEOUT-OR-FUNCTION (STOP-TIME FUNCTION ARGS)
+		    (OR (TIME-LESSP STOP-TIME (SI:%MICROSECOND-CLOCK))
+			(APPLY FUNCTION ARGS))))
+	     (PROCESS-BLOCK-INTERNAL
+	       %REAL-CURRENT-PROCESS 'BLOCKED NIL WHOSTATE
+	       #'TIMEOUT-OR-FUNCTION
+	       (SYS:%32-BIT-PLUS (FLOOR (* TIMEOUT 1000000.))
+				 (SI:%MICROSECOND-CLOCK))
+	       VERIFY-FUNCTION ARGS))
+	   (APPLY VERIFY-FUNCTION ARGS)))
+	(T (PROGN
+	     (APPLY #'PROCESS-BLOCK-INTERNAL
+		    %REAL-CURRENT-PROCESS 'BLOCKED NIL WHOSTATE VERIFY-FUNCTION ARGS)
+	     T))))
+
+(DEFMACRO WITH-PROCESS-BLOCK-TIMEOUT ((TIMEOUT &OPTIONAL TIMER-NAME) &BODY BODY)
+  (LET ((TIMER (OR (AND (SYMBOLP TIMER-NAME) TIMER-NAME) (GENSYM))))
+    `(USING-RESOURCE (,TIMER PROCESS-BLOCK-TIMERS)
+       (SETF (CAR (TIMER-ARGS ,TIMER)) *CURRENT-PROCESS*)
+       (RESET-TIMER-RELATIVE ,TIMER ,TIMEOUT)
+       ,@BODY)))
+
+;; WITH-TIMEOUT, which will cause a form to not take longer than N seconds.  After
+;; N seconds, the timer causes a PROCESS-INTERRUPT to throw out to the outer form, and
+;; conditionally signal an error.  If the form ends on time, clear-timer.
+
+(defstruct (form-timeout-info (:conc-name form-timeout-) (:list))
+  (process nil)
+  (continuation nil)
+  (tag nil)
+  (uid nil)
+  (state nil))
+
+(defstruct (form-timeout-state (:conc-name form-timeout-state-))
+  (lock (process:make-lock "Form timeout"))
+  (uid 0))
+
+(defresource form-timeout-timers ()
+  :constructor (create-timer-call 'form-timeout-expired
+				  (make-form-timeout-info :state (make-form-timeout-state))
+				  :priority nil
+				  :name "Timeout for form")
+  :deinitializer (process:with-lock ((form-timeout-state-lock
+				       (form-timeout-state (timer-args object))))
+		   (clear-timer object)
+		   (setf (form-timeout-continuation (timer-args object)) #'ignore)
+		   (si:incf* (form-timeout-state-uid
+			       (form-timeout-state (timer-args object))))))
+
+;; this is the timeoutD,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB") condition0 - used to control handling of time-outs
+(defflavor form-timeout (timer) (condition dbg:null-report)
+  :initable-instance-variables
+  :readable-instance-variables
+  (:gettable-instance-variables timer))
+
+;; this is the timeout1 error0 - for non abortable processes
+(defflavor form-timeout-expired () (cli::default-error))
+
+(defmethod (dbg:proceed form-timeout-expired :abort) ()
+  "Forcibly abort the process, disregarding its without-aborts protection"
+  :abort)
+
+(defwhopper (dbg:current-and-innermost-frames-for-debugger form-timeout-expired) (frame)
+  (multiple-value-bind (current innermost) (continue-whopper frame)
+    (loop repeat 4
+	  do (setq current (dbg:frame-previous-active-frame current)))
+    (values current innermost)))
+
+(compile-flavor-methods form-timeout form-timeout-expired)
+
+(defun form-timeout-expired (process continuation tag uid state)
+  (process:with-lock ((form-timeout-state-lock state))
+    ;; the race condition we are checking for is if this timer went off just as the
+    ;; form finished executing, and the original form preempted this timer between the call
+    ;; and first statement of this function (>before< the process:with-lock).
+    (when (eql (form-timeout-state-uid state) uid)
+      ;; follow forwarding on FP in case stack is grown.
+      (let ((bottom-frame (follow-cell-forwarding tag t)))
+	(when (consp (process-interrupt-when-abortable process continuation nil
+						       :throw-tag tag
+						       :bottom-frame bottom-frame))
+	  ;; Timed out
+	  (process-interrupt process
+	    (lambda (continuation)
+	      (declare (dbg:error-reporter))
+	      (flet ((report (reasons)
+		       (let ((specific nil)
+			     (first t))
+			 (dolist (reason reasons)
+			   (block suppress
+			     (if (eq (first reason)
+				     si:*unwind-protect-throw-inhibit-reason*)
+				 (when specific	;already gave a more specific message
+				   (return-from suppress))
+				 (setq specific nil))
+			     (fresh-line)		;Really fresh-line
+			     (unless first
+			       (fresh-line))	;Blank line separates reasons
+			     (setq first nil)
+			     (apply #'format *standard-output* reason))))))
+		(let ((reasons (si:throw-inhibit-reasons tag nil bottom-frame)))
+		  (if reasons
+		      (signal-proceed-case
+			  (() 'form-timeout-expired
+			   :format-string "A timeout expired but the process cannot be aborted:~vQ"
+			   :continue-format-string "Ignore the timeout and keep running"
+			   :format-args (list reasons #'report))
+			(:continue-cerror nil)
+			(:abort (funcall continuation)))
+		      (funcall continuation)))))
+	    continuation))))))
+
+;;; This exists so WITH-TIMEOUT will work in interpreted code
+(defsubst with-timeout-tag ()
+  (sys:%stack-frame-pointer))
+
+;; DOWNWARD LAMBDAs here?  Yes, the deinitializer clears them.  Look, even if it weren't 
+;; declared "downward", you'd still lose because RETURN-FROM is implicitly downward.
+;; The catch is purely to provide scoping for THROW-INHIBIT-REASONS
+(defun with-timeout-internal (timeout cont &key error-p)
+  (declare (sys:downward-funarg cont))
+  (block with-timeout
+     (let ((tag (with-timeout-tag)))
+       (condition-bind ((form-timeout
+			  #'(lambda (condition)
+			      (let* ((current-timer (form-timeout-timer condition))
+				     (args (timer-args current-timer)))
+				(when (eql (form-timeout-tag args) tag)
+				  (return-from with-timeout nil))
+				nil))))
+	 (catch tag
+	   (using-resource (timer form-timeout-timers)
+	     (let ((args (timer-args timer)))
+	       (setf (form-timeout-process args) *current-process*)
+	       (setf (form-timeout-continuation args)
+		     #'(lambda ()
+			 (declare (sys:downward-function))
+			 (if error-p
+			     (error "Timeout: body took longer than ~d second(s) to complete." 
+				    timeout)
+			     (signal 'form-timeout :timer timer))
+			 (return-from with-timeout nil)))
+	       ;; deal with recursive calls to a WITH-TIMEOUT function
+	       (setf (form-timeout-tag args) tag)
+	       (setf (form-timeout-uid args)
+		     (form-timeout-state-uid (form-timeout-state args))))
+	     (reset-timer-relative timer timeout)
+	     (return-from with-timeout
+	       (funcall cont))))))))
+
+(defmacro with-timeout ((timeout &key error-p) &body body)
+  `(with-timeout-internal
+     ,timeout
+     #'(lambda () (declare (sys:downward-function)) ,@body)
+     :error-p ,error-p))
+ 
+
+;; preliminary hack
+(defun set-process-priority-after-time (block)
+  (with-monitor-held (info block)
+    (set-priority-level (delayed-priority-process info)
+				(delayed-priority-priority info)
+				(delayed-priority-level info))
+    (let ((rest (delayed-priority-rest info)))
+      (when rest
+	(setf (delayed-priority-priority info) (second rest))
+	(setf (delayed-priority-rest info) (cddr rest))
+	(reset-timer-relative (delayed-priority-timer info) (car rest))))))
+
+;; we optimize the case where we don't need to set the timer again.
+(defun set-process-priority-after-time-1 (block)
+  (with-monitor-held (info block)
+    (set-priority-level (delayed-priority-process info)
+				(delayed-priority-priority info)
+				(delayed-priority-level info))))
+
+(defresource delayed-priority-timers ()
+  :constructor
+  (let* ((block (protect-object-with-monitor (make-delayed-priority)))
+	 (timer (create-timer-call 'set-process-priority-after-time (ncons block)
+				   :name "delayed priority timer"
+				   :priority (make-process-priority :deadline 2000))))
+    (with-monitor-held (info block)
+      (setf (delayed-priority-timer info) timer))
+    block)
+  :deinitializer
+  (with-monitor-held (info object)
+    (setf (delayed-priority-rest info) nil)
+    (clear-timer (delayed-priority-timer info)))
+  :initial-copies 5)
+
+;; The body can call (START-DELAYED-PRIORITIES) when it wants to start the delayed
+;; priorities up.  For example
+#||
+(with-delayed-process-priorities ((make-process-priority :fg -1)
+				  1/10 (make-process-priority :deadline 100000.))
+  (block-and-poll-wait-function "foo" .1
+				#'(lambda () (and (bar) (start-delayed-priorities))))
+  <frob around with whatever needs being done within 100000. microseconds>)
+||#
+(defmacro with-delayed-process-priorities ((priority &rest priorities) &body body)
+  `(with-delayed-process-priorities-internal
+	#'(lambda (start-delayed-priorities)
+	    (macrolet ((start-delayed-priorities () `(funcall start-delayed-priorities)))
+	      ,@body))
+	,priority ,@priorities))
+
+(defmacro with-process-priorities  ((priority &rest priorities) &body body)
+  `(with-delayed-process-priorities (,priority ,@priorities)
+     (start-delayed-priorities)
+     ,@body))
+
+(defun with-delayed-process-priorities-internal
+       (continuation priority &rest new-priorities)
+  (declare (sys:downward-funarg continuation))
+  (declare (inline (setf timer-function)))
+  (if (and si:*new-scheduler-enabled*
+	   (not dbg:*debugger-might-have-system-problems*)
+	   (funcall *policy-hook-region-priority* %real-current-process priority)
+	   (loop for p-list on (cdr new-priorities) by 'cddr
+		 do (check-type (car p-list) process::valid-process-priority)
+		 always
+		   (funcall *policy-hook-region-priority* %real-current-process (car p-list))))
+      (unwind-protect
+	  (let ((level (with-scheduler-locked
+			 (push-process-priority %real-current-process priority)
+			 (process-priority-level-internal %real-current-process))))
+	    (if new-priorities
+		(using-resource (mdpt delayed-priority-timers)
+		  (let ((process %real-current-process))
+		    (flet ((start-timers ()
+			     (declare (sys:downward-function))
+			     (with-monitor-held (dpt mdpt)
+			       (setf (delayed-priority-process dpt) process)
+			       (setf (delayed-priority-priority dpt) (second new-priorities))
+			       (setf (delayed-priority-level dpt) level)
+			       (setf (delayed-priority-rest dpt) (cddr new-priorities))
+			       (setf (timer-function (delayed-priority-timer dpt))
+				     (if (null (cddr new-priorities))
+					 'set-process-priority-after-time-1
+					 'set-process-priority-after-time))
+			       (reset-timer-relative (delayed-priority-timer dpt)
+						     (car new-priorities)))
+			     priority))
+		      (funcall continuation #'start-timers))))
+		(funcall continuation #'ignore)))
+	(with-scheduler-locked (pop-process-priority %real-current-process)))
+      (funcall continuation #'ignore)))
+
+
+(defmacro with-delayed-process-priorities-in-timer-units
+	  ((priority &rest priorities) &body body)
+  `(with-delayed-process-priorities-in-timer-units-internal
+	#'(lambda (start-delayed-priorities)
+	    (macrolet ((start-delayed-priorities () `(funcall start-delayed-priorities)))
+	      ,@body))
+	,priority ,@priorities))
+
+(defun with-delayed-process-priorities-in-timer-units-internal
+       (continuation priority &rest new-priorities)
+  (declare (sys:downward-funarg continuation))
+  (declare (inline (setf timer-function)))
+  (if (and si:*new-scheduler-enabled*
+	   (not dbg:*debugger-might-have-system-problems*)
+	   (funcall *policy-hook-region-priority* %real-current-process priority)
+	   (loop for p-list on (cdr new-priorities) by 'cddr
+		 do (check-type (car p-list) process::valid-process-priority)
+		 always
+		   (funcall *policy-hook-region-priority* %real-current-process (car p-list))))
+      (unwind-protect
+	  (let ((level (with-scheduler-locked
+			 (push-process-priority %real-current-process priority)
+			 (process-priority-level-internal %real-current-process))))
+	    (if new-priorities
+		(using-resource (mdpt delayed-priority-timers)
+		  (let ((process %real-current-process))
+		    (flet ((start-timers ()
+			     (declare (sys:downward-function))
+			     (with-monitor-held (dpt mdpt)
+			       (setf (delayed-priority-process dpt) process)
+			       (setf (delayed-priority-priority dpt) (second new-priorities))
+			       (setf (delayed-priority-level dpt) level)
+			       (setf (delayed-priority-rest dpt) (cddr new-priorities))
+			       (setf (timer-function (delayed-priority-timer dpt))
+				     (if (null (cddr new-priorities))
+					 'set-process-priority-after-time-1
+					 'set-process-priority-after-time))
+			       (reset-timer-relative-timer-units
+				 (delayed-priority-timer dpt)
+				 (car new-priorities)))
+			     priority))
+		      (funcall continuation #'start-timers))))
+		(funcall continuation #'ignore)))
+	(with-scheduler-locked (pop-process-priority %real-current-process)))
+      (funcall continuation #'ignore)))
+
+
+;; this function should be deleted in the 417 world.  It is obsolete
+(defun with-process-priorities-internal (continuation priority &rest new-priorities)
+  (declare (sys:downward-funarg continuation))
+  (if (and si:*new-scheduler-enabled*
+	   (not dbg:*debugger-might-have-system-problems*)
+	   (funcall *policy-hook-region-priority* %real-current-process priority)
+	   (loop for p-list on (cdr new-priorities) by 'cddr
+		 do (check-type (car p-list) valid-process-priority)
+		 always
+		   (funcall *policy-hook-region-priority* %real-current-process (car p-list))))
+      (unwind-protect
+	  (let ((level (with-scheduler-locked
+			 (push-process-priority %real-current-process priority)
+			 (process-priority-level-internal %real-current-process))))
+	    (using-resource (mdpt delayed-priority-timers)
+	      (with-monitor-held (dpt mdpt)
+		(setf (delayed-priority-process dpt) %real-current-process)
+		(setf (delayed-priority-priority dpt) (second new-priorities))
+		(setf (delayed-priority-level dpt) level)
+		(setf (delayed-priority-rest dpt) (cddr new-priorities))
+		(reset-timer-relative (delayed-priority-timer dpt)
+				      (car new-priorities)))
+	      (funcall continuation)))
+	(with-scheduler-locked (pop-process-priority %real-current-process)))
+      (funcall continuation)))
+
+#||
+
+;; test function:
+(defun test-foo (n)
+  (let ((flag nil)
+	(quit nil)
+	(array (make-array 10 :fill-pointer 0)))
+    (flet ((proc1-top-level ()
+	     (process::with-delayed-process-priorities
+	       ((process:make-process-priority :fg -3) 
+		.5 (process:make-process-priority :fg -1) 
+		1/2 (process:make-process-priority :fg 1))
+	       (vector-push-extend (list :block (sys:%microsecond-clock)) array)
+	       (process:block-process
+		 "wait for proc 2"
+		 #'(lambda ()
+		     (and flag
+			  (process::start-delayed-priorities))))
+	       (vector-push-extend (list :woke-up (sys:%microsecond-clock)) array)
+	       (setq quit t)))
+	   (proc2-top-level (proc1)
+	     (loop until quit do
+	       (when (and (null flag) (zerop (random 10000)))
+		 (setq flag t)
+		 (vector-push-extend (list :wake-up (sys:%microsecond-clock)) array)
+		 (process:wakeup proc1)))))
+      (let ((proc1 (process-run-function "proc1" #'proc1-top-level)))
+	;; let it get started
+	(sleep 1)
+	(process-run-function (list :name "proc2" :priority n) #'proc2-top-level proc1)
+	(process:block-and-poll-wait-function
+	  "Wait to finish" 2 #'(lambda () (not (null quit))))
+	array))))
+
+(defun tester (n)
+  (let ((results (test-foo n)))
+    (loop for last-time first nil then time 
+	  for (event time) being the array-elements of results do
+      (format t "~&~10S ~8D" event (if last-time (sys:%32-bit-difference time last-time) 0)))))
+
+;; results:
+
+;; preempts immediately because -3 is > -4
+Command: (tester -4)
+:BLOCK            0
+:WAKE-UP    1234672
+:WOKE-UP       2739
+NIL
+
+;; takes 1/2 second from wakeup to preempt, because it has to wait until the priority is
+;; raised to -1
+Command: (tester -2)
+:BLOCK            0
+:WAKE-UP    1635692
+:WOKE-UP     553416
+NIL
+
+;; takes 1 second from wakeup to preempt, because it has to wait until the priority is
+;; raised to 1, in 2 1/2 second steps.
+Command: (tester 0)
+:BLOCK            0
+:WAKE-UP    2021015
+:WOKE-UP    1091425
+NIL
+  
+
+||#
+
+#||
+(defun foo1 (time)
+  (let ((end-time (sys:%32-bit-plus (sys:%microsecond-clock) time))
+	(priority (process-priority *current-process*))
+	(results nil))
+    (flet ((record-priority ()
+	     (push (cons (sys:%microsecond-clock) priority) results)))
+      (record-priority)
+      (with-process-priorities ((make-process-priority :fg 2)
+				.166666 (make-process-priority :fg 3)
+				.333333 (make-process-priority :fg 5)
+				.500000 (make-process-priority :deadline 500000.))
+	(loop while (time-lessp (sys:%microsecond-clock) end-time) do
+	  (let ((new-priority (process-priority *current-process*)))
+	    (when (neq priority new-priority)
+	      (setf priority new-priority)
+	      (record-priority)))))
+      (setf priority (process-priority *current-process*))
+      (record-priority))
+    results))
+
+(defun show-delayed-priorities (results)
+  (let* ((results (reverse results))
+	 (initial-time (caar results)))
+    (loop for (time . priority) in results do
+      (format t "~&~6D: Class: ~D Priority: ~5D"
+	      (sys:%32-bit-difference time initial-time)
+	      (scheduler-priority-class priority)
+	      (scheduler-priority-priority priority)))))
+||#

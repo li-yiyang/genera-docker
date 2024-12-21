@@ -1,0 +1,722 @@
+;;;-*- Mode: LISP; Package: FS; Lowercase: T; base: 10; lowercase:yes; Syntax: Common-lisp -*-
+;;;
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;;
+
+;;; Generic file server shutdown/notify mechanism.
+;;;
+
+(defun file-server-shutdown (message &optional (in-minutes 5))
+  (setq *server-shutdown-message* message
+	*server-shutdown-time* (+ (time:get-universal-time) (* in-minutes 60.)))
+  (log-server-local-event "shutdown" "Shutdown scheduled for ~\\time\\, ~A."
+			  *server-shutdown-time* *server-shutdown-message*)
+  (process-run-function "Server shutdown" 'file-server-shutdown-1
+				  message (time-increment (time) (* in-minutes 3600.))))
+
+
+(defun file-server-cancel-shutdown (&optional (key ':cancel))
+  (let ((sdval *server-shutdown-message*))
+    (or
+      (null sdval)
+      (%store-conditional (locf *server-shutdown-message*) sdval key)))
+  (log-server-local-event "shutdown" "Shutdown canceled"))
+  
+(defun file-server-reschedule-shutdown (message &optional (in-minutes 5))
+  (file-server-cancel-shutdown ':reschedule)
+  (process-wait "Unshut" #'(lambda () (null *server-shutdown-message*)))
+  (file-server-shutdown message in-minutes)
+  (log-server-local-event "shutdown" "Shutdown rescheduled"))
+
+(defun file-server-shutdown-state ()
+  (values *server-shutdown-message* *server-shutdown-time*))
+
+(defun file-server-force-clear-shutdown ()
+  (setq *server-shutdown-message* nil))
+
+(defvar *server-notify-times* '(60. 30. 15. 5. 2. 1. 0.))
+
+(defun file-server-shutdown-1 (message at-time)
+  (loop with time-to-go and notify-interval
+	do (if (time-lessp at-time (time))	;Already passed
+	       (setq time-to-go nil
+		     notify-interval nil)
+	       (setq time-to-go (time-difference at-time (time))
+		     notify-interval (loop for times on *server-notify-times*
+					   when ( (* (car times) 3600.) time-to-go)
+					   return times)))
+	unless (eq message *server-shutdown-message*)
+	do (cond ((eq  *server-shutdown-message* ':reschedule)
+		  (blast-message-to-file-servers "File Server shutdown rescheduled"))
+		 (t (tv:notify nil "File Server shutdown cancelled.")
+		    (blast-message-to-file-servers "File Server shutdown cancelled.")))
+	   (setq *server-shutdown-message* nil)
+	   (setq *server-shutdown-time* 0)
+	   (return ':cancelled)
+	unless (eq notify-interval *server-notify-times*)
+	do (let* ((minutes-to-go (and time-to-go (/ (+ time-to-go 1800.) 3600.)))
+		  (current-message (format nil "File server shutting down~
+						~@[ in ~D minute~:P~] - ~A"
+					   minutes-to-go message)))
+	     (log-server-local-event "shutdown" "~A" current-message)
+	     (tv:notify nil "~A" current-message)
+	     (blast-message-to-file-servers current-message)
+	     (when (null minutes-to-go)
+	       (process-sleep 120.)	;Allow message to be sent.
+	       ;; Disable services and don't allow NXPs or UXs to reenable RPC, XDMCP, etc.
+	       (si:disable-services :all nil T)
+	       (close-all-file-servers)
+	       ;; Wait for servers to completely shutdown, but only for a minute
+	       (process-wait-with-timeout "Shutdown Wait" (* 60. 60.)
+		 #'(lambda ()
+		     (and (null net:*active-servers*)
+			  (null net:*services-enabled*))))
+	       (setq *server-shutdown-message* nil)
+	       (return t)))
+	do (process-wait "Shutdown Msg"
+			 #'(lambda (until-time)
+			     (or (neq *server-shutdown-message* message)
+				 (time-lessp until-time (time))))
+			 (time-difference at-time (* (car notify-interval) 3600.)))))
+
+(defun close-all-file-servers (&optional (reason "File Server Shutdown"))
+  (loop for server in net:*active-servers*
+	do (send server ':send-if-handles ':file-server-shutdown reason)))
+
+;; Hook for connection-less protocols (e.g. NFS) to learn about shutdowns
+(defvar *file-server-message-sending-functions* nil)
+
+(defun blast-message-to-file-servers (message)
+  (loop for server in net:*active-servers*
+	do (send server ':send-if-handles ':file-server-notification message))
+  (loop for function in *file-server-message-sending-functions*
+	do (funcall function message)))
+
+
+(defun login-file-server-machine-if-necessary (err-reporter)
+  (when (and server-login
+	     (or (null user-id)
+		 (zerop (string-length user-id))))
+    (condition-case (err)
+	(let ((standard-output 'si:null-stream))	;Don't print no-init-file message
+	  (condition-case ()
+	      (login server-login-id ':host si:local-host :load-init-file t)
+	    ((no-file-system file-lookup-error)
+	     (login server-login-id ':host si:local-host :load-init-file nil))))
+      (error (funcall err-reporter err "Server Login")))
+    (print-server-login-exegesis)))
+
+
+
+(defun print-server-login-exegesis ()
+  (tv:notify
+    nil
+    "This machine has been invoked as a remote file server, but is otherwise free."))
+
+(defun file-server-error-filter (error)
+  (declare (dbg:error-reporter))
+  (unless (cl:typep
+	    error
+	    `(or fs:file-error fs:pathname-error fs:server-error
+		 network-stream-closed
+		 connection-closed connection-closed-locally
+		 bad-connection-state
+		 connection-lost host-stopped-responding))
+    (cond (fs:*file-server-attended-service*
+	   (dbg:enter-debugger error "attended file service is enabled"
+			       '(((#\RESUME) :EXIT-DEBUGGER
+				  "Continue to signal this condition normally"))))
+
+	  (t (dbg:automatic-bug-report
+	       error
+	       :flavors
+	       '(condition neti:basic-server fs:file-stream-mixin fs:file-access-path
+			   si:stream)
+	       :structure-types
+	       '(
+		 fs:server-dataproc-comm fs:server-direct-dataproc-comm
+		 fs:nfile-server-data-channel fs:nfile-server-direct-data-channel
+		 lmfs:file-desc)
+
+	       :sender server-login-id
+	       :server *server-instance*
+	       :user (send *server-instance* :user-id))
+	     (log-server-event
+	       :server-bug-report
+	       (send *server-instance* :protocol)
+	       (send *server-instance* :foreign-host)
+	       "Automatic bug report generated to ~A"
+	       (dbg:autobug-recipients))
+	     )))
+  nil)				;keep on signaling...
+
+
+(defun report-file-server-error (protocol host err info)
+  (log-server-event :server-error protocol host "Server error ~A ~A" err info)
+  (tv:notify nil "~A server (~A@~A) got an error - ~A"
+	     protocol user-id
+	     (and host (send host :short-name)) err)
+  (let ((error (list (time:get-universal-time)
+		     info
+		     (format nil "~A" err)
+		     (typep err)
+		     user-id
+		     host
+		     protocol)))
+    (declare (special *server-log*))
+    (when *server-log*
+      (print-file-server-error error (send (file-server-log-frame *server-log*)
+					   :get-pane 'errors)))
+    (push error *file-server-errors*)))
+
+
+(defun print-server-errors (&optional (stream cl:*standard-output*) (listen-at-the-end t))
+  (if (null *file-server-errors*)
+      (format stream "~&No file server errors.")
+      (loop for error in *file-server-errors*
+	    do
+	(print-file-server-error error stream)
+	(when listen-at-the-end
+	  (when (send standard-input :listen)
+	    (let ((c (send standard-input :tyi)))
+	      (unless (char-equal c #\SP) (send standard-input :untyi c)))
+	    (return nil))))))
+
+(defun print-file-server-error (error stream)
+  (scl:destructuring-bind (time key err type user host protocol) error
+    (format stream "~&~\\time\\ (~A: ~A@~A)  ~A  ~S~%~10T~A"
+	    time protocol user (and host (send host :short-name))
+	    key type err)))
+
+;;; This implements the error code mapping of the Lisp Machine File Operations Semantics
+;;; Protocol (LMFOSP).
+(defun server-three-letter-code (err)
+  (cond ((typep err 'fs:parse-pathname-error) "IPS")
+	((loop for (code flav) in *error-code-flavor-alist*
+	       when (typep err flav)
+	       return code))
+	(t "MSC")))
+
+
+;;; Access control based on trusted-ness of the host. 
+;;; Needs better integration with rest of ACL scheme.
+
+(defvar root-node-pathname nil)
+
+(defun file-server-check-access (path required)
+  (if (null root-node-pathname)
+      (setq root-node-pathname
+	    (send (send path :new-pathname
+			':directory ':root ':name nil ':type nil ':version nil)
+		  ':directory-pathname-as-file)))
+  (loop with access-path
+	as dirpath = (send path ':directory-pathname-as-file)
+	   then (send dirpath ':directory-pathname-as-file)
+	as modes = (cond ((send dirpath ':operation-handled-p
+				':get-extended-property)
+			  (send dirpath ':get-extended-property
+				':unprivileged-protection))
+			 ((and (setq access-path
+				     (send (send dirpath ':host) ':file-access-path dirpath))
+			       (send access-path
+				     ':operation-handled-p ':get-extended-property))
+			  (send access-path ':get-extended-property dirpath
+				':unprivileged-protection))
+			 (t (get (fs:file-properties dirpath) ':unprivileged-protection)))
+	if modes
+	  return (loop for mode being the array-elements of modes
+		       if (char-equal mode required)
+			 return path
+		       finally (error
+				 'server-access-error
+				 ':pathname path
+				 ':report-string
+				 "Incorrect access to directory containing file."))
+	until (eq dirpath root-node-pathname)
+	finally (error 'server-access-error
+		       ':pathname path
+		       ':report-string
+		       "Incorrect access to directory containing file.")))
+
+
+;;; More fascism.
+
+(defun log-untrusted-transaction (protocol host cmd &optional (rest nil restp) strings)
+  (log-server-event :untrusted-transaction protocol host
+		    "~A ~:[~*~*~;~{ ~A~}~%~{~A~%~}~]" cmd restp rest strings)
+  nil)
+
+(defun user-name-from-login-name (user-name)
+  (let ((dot (string-search-char #\. user-name)))
+    (if dot (substring user-name 0 dot) user-name)))
+
+;;; The following will presently make the above go away
+
+(defvar D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :BOLD NIL) "CPTFONTCB")*server-logging-enabled*0 nil)
+
+(defvar 1*server-log*0 nil)
+
+(defvar1 *server-log-selector-keywords*
+0	`(t
+	   :untrusted-transaction
+	   :server-bug-report
+	   :server-error)
+  "This is a list of symbols. If the selector argument passed to LOG-SERVER-EVENT
+is a member of this, the message is logged.")
+
+(defun 1log-message-from-selector-p0 (selector)
+  (memq selector *server-log-selector-keywords*))
+
+;;; Boy, we could put a tiny peek pane in here, or at least a scrollable process list.
+(dw:define-program-framework 1file-server-program
+0  :pretty-name "File Server"
+  :command-definer define-file-server-command
+  :command-table (:inherit-from '("colon full command"
+				  "standard arguments"
+				  "standard scrolling"
+				  "global")
+		  :kbd-accelerator-p nil)
+  :configurations `((main
+		      (:layout
+			(command-and-status :row command-menu status errors)
+			(main :column title log command-and-status listener))
+		      (:sizes
+			(command-and-status
+			  (command-menu .25)
+			  :then
+			  (status .3)
+			  :then
+			  (errors :even))
+			(main
+			  (title 1 :lines)
+			  (command-and-status
+			   :limit (10 1000 :lines status)
+			   :ask-window self :size-for-pane command-menu)
+			  :then (log 0.6)
+			  :then (listener :even)))))
+  :panes ((title :title :redisplay-string "File Server")
+	  (log :display
+	       :more-p nil
+	       :end-of-page-mode :scroll
+	       :save-bits t
+	       :deexposed-typeout-action :permit
+	       :margin-components
+	       '((dw:margin-borders)
+		 (dw:margin-scroll-bar)
+		 (dw:margin-white-borders :thickness 3)
+		 (dw:margin-label
+		   :string "File Server Log"
+		   :style (:sans-serif :italic :normal))))
+	  (listener :listener
+		    :more-p nil)
+	  (command-menu :command-menu
+			:margin-components
+			'((dw:margin-borders)
+			  (dw:margin-white-borders)
+			  (dw:margin-label
+			    :string "File Server Commands"
+			    :style (:sans-serif :italic :normal))))
+	  (errors :display
+		  :margin-components
+		  '((dw:margin-borders)
+		    (dw:margin-white-borders)
+		    (dw:margin-scroll-bar)
+		    (dw:margin-label
+		      :string "File Server Errors"
+		      :style (:sans-serif :italic :normal)))
+		  :deexposed-typeout-action :permit
+		  :save-bits t
+		  :end-of-page-mode :truncate)
+	  (status :display
+		  :margin-components
+		  '((dw:margin-borders)
+			  (dw:margin-white-borders)
+			  (dw:margin-label
+			    :string "File Server Status"
+			    :style (:sans-serif :italic :normal)))
+		  :redisplay-function 'redisplay-server-status
+		  :redisplay-after-commands t
+		  :more-p nil))
+  :state-variables ((log-monitor)))
+
+(defmethod (redisplay-server-status file-server-program) (stream)
+  (multiple-value-bind (message time)
+      (file-server-shutdown-state)
+    (if (null message)
+	(format stream "~%No Shutdown scheduled")
+	(format stream "~%Shutdown scheduled for ~\\time\\~% ~A" time message))))
+
+(defflavor 1file-server-log
+0  	(program
+	 frame
+	 host)					;one of these for each of possibly multiple
+						;so-called hosts being served.
+	su::(log-interactive-mixin
+	     log-file-mixin log-monitor-mixin basic-log)
+  (:initable-instance-variables program frame host)
+  (:writable-instance-variables program frame host)
+  )
+
+(defmethod1 (su:server-description file-server-log)0 (open-reason)
+  (format nil "File server for host ~A: ~A." host open-reason))
+
+(compile-flavor-methods file-server-log)
+
+(cl:defparameter 1*server-log-directory*0 nil)
+
+(defun1 initialize-file-server-log-directory-pathname0 ()
+  (setq *server-log-directory* (parse-pathname #-VLM
+					       "local:>File-Server>Server-Logs>"
+					       #+VLM
+					       "host:/var/lib/symbolics/sys.sct/file-server/server-logs/"
+					       )))
+
+(add-initialization "File server log directory pathname"
+		    '(initialize-file-server-log-directory-pathname)
+		    '(:now)
+		    'net:local-name-initialization-list)
+
+(defun1 initialize-server-log0 (reason &optional (directory *server-log-directory*))
+  (when *server-log*
+    (su:forcibly-unlock-log *server-log*))
+  (let ((frame (if *server-log*
+		   (file-server-log-frame *server-log*)
+		 (2 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");; Find an existing frame or create a new one.
+0		 (dw::find-program-window 'file-server-program))))
+    (when (null (file-server-program-log-monitor (send frame :program)))
+      (let ((log-pane (send frame :get-pane 'log)))
+	(setf (file-server-program-log-monitor (send frame :program))
+	      (setq *server-log*
+		    (make-instance 'file-server-log
+				   :frame frame
+				   :program (send frame :program)
+				   :window log-pane
+				   :directory directory))
+	      )
+	(setf (file-server-log-host *server-log*) net:*local-host*)
+	(initialize-log-file reason)))
+    (send frame :activate)			2;Make sure that 0:Select Activity2 will find it.
+0    frame))
+
+;;;
+;;; Commented out by Stryker, in response to UIRB judgment that
+;;; this window should only be selectable from com-select-activity, and not
+;;; from the select key
+;;;
+;;;(tv:add-select-key #\& '(find-server-program) "File Server" nil)
+
+(defmethod1 (log-event file-server-log)0 (protocol host format-string &rest args)
+  (declare (special su:*log*))
+  (letf ((su:*log* self))
+    (letf (((su::log-herald su:*log*) (format nil "~A ~A" host user-id))
+	   ((su::log-process-id su:*log*) protocol))
+      (let ((lmfs:*local-privilege* 'server-logging))
+	(declare (special lmfs:*local-privilege*))
+	(cl:apply #'su:log-event :normal format-string args)))))
+
+;;; for use under with-log-output-to-user
+(defmethod 1(log-local-event file-server-log)0 (typeout-p herald format-string &rest args)
+  (declare (special su:*log* lmfs:*local-privilege*))
+  (letf ((su:*log* self)
+	 ((su:log-process-id  self) "!")
+	 ((su:log-herald self) herald)
+	 ((su:log-interactive-typeout self) typeout-p)
+	 (lmfs:*local-privilege* 'server-logging))
+    (cl:apply #'su:log-event :normal format-string args)))
+
+(defun 1log-server-local-event0 (herald format-string &rest args)
+  (when *server-logging-enabled*
+    (unless *server-log*
+      (initialize-server-log "Log auto-initialized."))
+    (cl:apply #'log-local-event *server-log* nil herald format-string args)))
+
+(defun 1log-server-login0 (protocol host user-name password-p)
+  (log-server-event :login protocol host
+		    "LOGIN ~A~:[~*~; with a password~]"
+		    user-name password-p))
+
+(defun 1log-server-logout0 (protocol host user-name)
+  (log-server-event :login protocol host "LOGOUT ~A" user-name))
+
+(defun 1log-server-event0 (event-code protocol host format-string &rest format-args)
+  (when *server-logging-enabled*
+    (unless *server-log*
+      (initialize-server-log "Log auto-initialized."))
+    (when (log-message-from-selector-p event-code)
+      (cl:apply #'log-event *server-log* protocol host format-string format-args))))
+
+(defvar 1*server-error-response0-1log-flavors*
+0	`(access-error)
+  "List of error flavors that cause logging if :server-error-response logging
+is turned on.")
+
+(defun 1log-server-error-event0 (error protocol host format-string &rest format-args)
+  (when (loop for flavor in *server-error-response-log-flavors*
+	      when (cl:typep error flavor)
+		do (return 't)
+		   finally (return nil))
+    (cl:apply #'log-server-event :server-error-response protocol host format-string
+	      format-args)))
+
+(defun1 find-server-program0 ()
+  (if *server-log* (file-server-log-frame *server-log*)
+      (dw::find-program-window 'file-server-program)	; but don't initialize the log.
+      ))
+
+(defun 1initialize-log-file0 (initialization-reason)
+  (let ((su:*log* *server-log*))
+    (declare (special su:*log*))
+    (letf (((su:log-herald *server-log*) "Log File setup"))
+      2;; If any log file is left around, close it.
+0      (su:close-log-file *server-log* t)
+      (su:open-log-file *server-log* initialization-reason))))
+
+
+(defmacro 1with-log-output-to-user0 ((herald) &body body)
+  `(flet ((message (format-string &rest format-args)
+	    (if *server-log*
+		(cl:apply #'log-local-event *server-log* t ,herald format-string format-args)
+		(format t "~&~A: ~A~%"
+			,herald
+			(cl:apply #'format nil format-string format-args)))))
+     ,@body))
+
+(cl:defparameter *file-server-directory* nil)
+
+(defun 1initialize-file-server-directory-pathname0 ()
+  (setq *file-server-directory* (parse-pathname #-VLM
+						"local:>File-Server>"
+						#+VLM
+						"host:/var/lib/symbolics/sys.sct/file-server/"
+						)))
+
+(add-initialization "File server directory pathname"
+		    '(initialize-file-server-directory-pathname)
+		    '(:now)
+		    'net:local-name-initialization-list)
+
+(defun 1setup-file-server0 ()
+  (with-log-output-to-user ("setup")
+    (flet ((create-if-needed (path)
+	     (unless (su:probe-path :directory path)
+	       (message "Creating directory ~A" (su:directory-string path))
+	       (send path :create-directory))))
+      (create-if-needed *file-server-directory*)
+      (create-if-needed *server-log-directory*)
+      #-VLM
+      (create-if-needed *fep-access-control-directory-pathname*))))
+
+(cl:defparameter *trusted-services*
+		 `(:UNIX-RWHO
+		    :IEN-116
+		    :TCP-FTP
+		    :TFTP
+		    :CHAOS-FOREIGN-INDEX
+		    :RTAPE
+		    :CONVERSE
+		    :SEND
+		    :SMTP
+		    :CHAOS-MAIL
+		    :CONFIGURATION
+		    :NFILE
+		    :QFILE
+		    :NOTIFY
+		    :CHAOS-ROUTING-TABLE
+		    :CHAOS-STATUS
+		    :NAMESPACE-TIMESTAMP
+		    :NAMESPACE
+		    :BAND-TRANSFER
+		    :WHO-AM-I
+		    :PRINT-DISK-LABEL
+		    :NAME
+		    :ASCII-NAME
+		    :LISPM-FINGER
+		    :UPTIME-SIMPLE
+		    :TIME-SIMPLE-MSB
+		    :TIME-SIMPLE)
+  "These servers do not permit the user side to take liberties with the server.")
+
+(cl:defparameter *default-secure-server-logging-keywords*
+		 '(:login
+		    :server-error-response	;includes ACCESS ERROR
+		    :untrusted-transaction
+		    :server-bug-report
+		    :server-error))
+
+(defvar 1*0default-secure-server-error-response-log-flavors*
+	`(access-error)
+  )
+
+
+
+(compiler:function-defined 'lmfs:ensure-lmfs-up)
+
+(defun 1initialize-server
+0       (&key
+	(logging t)
+	(logging-keywords *server-log-selector-keywords*)
+	(log-error-response-flavors *server-error-response-log-flavors*)
+	(lmfs-fspt-pathname nil)
+	(remote-login-mode ':notify)
+	)
+  #-VLM
+  (declare (special lmfs:*fspt-pathname*))
+  #-VLM
+  (setq lmfs:*fspt-pathname* (and lmfs-fspt-pathname (parse-pathname lmfs-fspt-pathname)))
+  #-VLM
+  (lmfs:ensure-lmfs-up)
+  (setup-file-server)
+  (setq *server-logging-enabled* logging)
+  (setq *server-log-selector-keywords* logging-keywords)
+  (setq *server-error-response-log-flavors* log-error-response-flavors)
+  (when logging
+    (initialize-server-log "File server initialization"))
+  (with-log-output-to-user ("initialization")
+    (message "Remote login enable set to ~A" remote-login-mode)
+    (net:remote-login-on remote-login-mode)
+    (when lmfs-fspt-pathname
+      (message "LMFS FSPT pathname set to ~A" lmfs-fspt-pathname))))
+
+
+(defun 1initialize-secure-server
+0       (&key
+	(access-permissive nil)
+	(login-required t)
+	(permitted-services *trusted-services*)
+	(logging-keywords *default-secure-server-logging-keywords*)
+	(log-error-response-flavors
+	  1*0default-secure-server-error-response-log-flavors*)
+	(lmfs-fspt-pathname nil)
+	)
+  (declare (special lmfs:*require-login* lmfs:*local-privilege* lmfs:*access-permissive*))
+  (initialize-server
+    :logging t
+    :logging-keywords logging-keywords
+    :log-error-response-flavors log-error-response-flavors
+    :remote-login-mode nil
+    :lmfs-fspt-pathname lmfs-fspt-pathname) 
+  (with-log-output-to-user ("secure initialization")
+    (message "Enabling access control checking")
+    (setq net:*system-secured* t)		;servers enforce access control at all.
+    (message "Login is~:[ not~;~*~] required" login-required)
+    (setq lmfs:*require-login* login-required)	;servers demand name & password for
+						;file access
+    (setq lmfs:*local-privilege* t)		;no access control locally.
+    (message "Access ~:[will not~;will~] be granted by default for LMFS directories with ~
+              empty ACL's." access-permissive)
+    (setq lmfs:*access-permissive* access-permissive)	; LMFS permits access to objects with
+						; empty acls.
+    (message "Newly defined servers will not be enabled.")
+    (message "Servers enabled by default: ~A"
+	     (if (eq permitted-services ':all) "All"
+		 (cl:with-output-to-string (ss)
+		   (format-textual-list permitted-services
+					#'princ
+					:stream ss))))
+    (setq neti:*standard-new-services-enable* nil neti:*new-services-enable* nil)
+    (setq neti:*standard-services-enabled* permitted-services)	;turn off nasty servers
+						;by default.
+    ))
+
+
+;;; Commands
+
+(define-file-server-command (com-schedule-file-server-shutdown
+			      :menu-accelerator "Shutdown File Server")
+  ((minutes '((cl:integer 0 *))
+	    :default 5
+	    :documentation "Minutes of warning time.")
+   (message 'cl:string
+	    :confirm t
+	    :documentation "Reason for shutdown"))
+  (file-server-shutdown message minutes))
+
+(define-file-server-command (com-cancel-file-server-shutdown
+			      :menu-accelerator "Cancel File Server Shutdown")
+  ()
+  (file-server-cancel-shutdown))
+
+(define-file-server-command (com-reschedule-file-server-shutdown
+			      :menu-accelerator "Reschedule File Server Shutdown")
+  ((minutes '((cl:integer 0 *))
+	    :default 5
+	    :documentation "Minutes of warning time.")
+   (message 'cl:string
+	    :confirm t
+	    :documentation "Reason for shutdown"))
+  (file-server-reschedule-shutdown message minutes))
+
+
+;;; General support for server login/logout.  Calls LMFS primitives.
+
+(compiler:function-defined 'lmfs:add-capability-raw)
+(compiler:function-defined 'lmfs:canonicalize-password-user)
+(compiler:function-defined 'lmfs:check-and-err-password)
+
+(defun neti:login-server (protocol host user-name password &key no-password-required)
+  "Call this from a network server with a user-name in User[.Capability] format."
+  (declare (special lmfs:*access-groups*))
+  (fs:log-server-login protocol host user-name (not (null password)))
+  (when net:*system-secured*
+    (setq lmfs:*access-groups* nil)
+    (if no-password-required
+	(lmfs:add-capability-raw (lmfs:canonicalize-password-user user-name))
+	(lmfs:add-capability-raw (lmfs:check-and-err-password user-name nil password)))))
+
+
+(defun neti:logout-server (protocol host)
+  (declare (special lmfs:*access-groups*))
+  (fs:log-server-logout protocol host user-id)
+  (when net:*system-secured*
+    (setq lmfs:*access-groups* nil)))

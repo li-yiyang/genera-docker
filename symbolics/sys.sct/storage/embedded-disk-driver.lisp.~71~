@@ -1,0 +1,525 @@
+;;; -*- Mode:Lisp; Syntax:Common-Lisp; Package:STORAGE; Base:10; Lowercase:T; -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;;; Unit definitions
+
+(defstorage (embedded-unit-queue :include unit-queue
+				 :structure nil :forwardable nil :preserve-cdr-codes nil)
+  (embedded-unit-pending-requests)
+  (embedded-unit-input-request)
+  (embedded-unit-input-request-offset)
+  (embedded-unit-command-queue)
+  (embedded-unit-status-queue)
+  (embedded-unit-error-address)
+  (embedded-unit-error-count))
+
+(si:defselect-cold ((:property embedded-unit-queue named-structure-invoke))
+  (:print-self (unit stream &rest ignore)
+   (printing-random-object (unit stream :typep)
+     (format stream "unit ~D" (unit-unit-number unit))))
+  (:describe (unit)
+   (format t "~&~S has fields:" unit)
+   (describe-unit-queue-fields unit *standard-output*)
+   (describe-embedded-unit-queue-fields unit *standard-output*)))
+
+(defun describe-embedded-unit-queue-fields (unit stream)
+  (format stream "~&  Embedded Command Queue: ~40T~S" (embedded-unit-command-queue unit))
+  (format stream "~&  Embedded Status Queue: ~40T~S" (embedded-unit-status-queue unit)))
+
+;;; Maximum number of commands active simultaneously.
+(defparameter-wired %embedded-disk-queue-size 3)
+;;; Size of each disk buffer (one page for now).
+(defconstant %embedded-disk-buffer-size %page-size32)
+;;; Maximum number of buffers per request (i.e. maximum request length in pages).
+(defconstant %embedded-disk-request-size 16)
+;;; DQEs available in pool.
+(defconstant %embedded-disk-dqes 8)
+
+;;; If there's an error, we need to be able to queue a reset command even if there aren't
+;;; any DQEs available.  So keep a dedicated DQE around for that purpose.
+(defwiredvar *embedded-reset-dqe* nil)
+
+
+;;;; Locking
+
+(defwiredvar *embedded-disk-allocation-lock* nil)
+
+(defmacro with-embedded-disk-allocation-lock ((unit) &body body)
+  `(loop
+     (when (store-conditional (locf *embedded-disk-allocation-lock*)
+			      %disk-lock-free
+			      %disk-lock-held)
+       (return
+	 (progn					;no unwind-protect needed
+	   (progn ,@body)
+	   (loop do
+	     (cond ((store-conditional (locf *embedded-disk-allocation-lock*)
+				       %disk-lock-held
+				       %disk-lock-free)
+		    (return nil))
+		   ;; --- can this cause unacceptable recursion?
+		   ((store-conditional (locf *embedded-disk-allocation-lock*)
+				       %disk-lock-poll
+				       %disk-lock-free)
+		    ;; Assumes that all disks in the system are embedded.
+		    (map-over-unit-queues
+		      (lambda (.unit.)
+			(when (neq .unit. ,unit)
+			  (unit-wakeup .unit.))))
+		    (return nil)))))))
+     (when (or (= *embedded-disk-allocation-lock* %disk-lock-poll)
+	       (store-conditional (locf *embedded-disk-allocation-lock*)
+				  %disk-lock-held
+				  %disk-lock-poll))
+       (return nil))))
+
+(defmacro promote-embedded-disk-allocation-lock ()
+  `(%memory-write (locf *embedded-disk-allocation-lock*) %disk-lock-poll))
+
+
+;;;; Disk buffer and DQE allocation
+
+;;; These values and routines are all protected by the allocation lock, above.
+
+;;; The free pool of disk queue elements (DQEs) is maintained as a contiguous block of
+;;; unmapped storage, between *...-base* and *...-bound*.  *...-pointer* points to the
+;;; first invalid entry, when (eq *...-base* *...-pointer*) the pool is empty.
+(defwiredvar *embedded-disk-dqe-pool-base* nil)
+(defwiredvar *embedded-disk-dqe-pool-bound* nil)
+(defwiredvar *embedded-disk-dqe-pool-pointer* nil)
+
+;;; The free pool of disk buffers (all page sized for now) is maintained the same way.
+(defwiredvar *embedded-disk-buffer-pool-base* nil)
+(defwiredvar *embedded-disk-buffer-pool-bound* nil)
+(defwiredvar *embedded-disk-buffer-pool-pointer* nil)
+
+;;; Try to allocate a DQE and enough embedded buffers for a data transfer of the specified
+;;; length.  If a DQE isn't available, or there are no buffers available, return NIL.
+;;; Otherwise, return the DQE (initialized with daps pointing to the allocated buffers)
+;;; and the size of the buffers actually allocated.
+(defwiredfun allocate-embedded-unit-buffers (length)
+  (declare (values dqe length))
+  (let ((dqe-pool-pointer *embedded-disk-dqe-pool-pointer*))
+    ;; If there aren't any DQEs left in the pool, give up.
+    (when* (eq *embedded-disk-dqe-pool-base* dqe-pool-pointer)
+      (return-from allocate-embedded-unit-buffers nil))
+    ;; Now we know there's a DQE available, but we haven't performed the side effects to
+    ;; actually allocate it.  ALLOCATE-DQE will do that, once we've determined that we
+    ;; really will use the DQE (might not if there aren't any buffers available).
+    (macrolet ((allocate-dqe ()
+		 `(let ((new-pointer (%pointer-plus dqe-pool-pointer -1)))
+		    (%memory-write (locf *embedded-disk-dqe-pool-pointer*) new-pointer)
+		    (%memory-read new-pointer))))
+      ;; Some requests don't include any data transfer, just allocate and return the DQE.
+      (when* (= length 0)
+	(let ((dqe (allocate-dqe)))
+	  (setf (emb-disk-queue-element-n-addresses dqe) 0)
+	  (return-from allocate-embedded-unit-buffers (values dqe 0))))
+      (let ((buffers (min (kilobitspages length)
+			  (%pointer-difference *embedded-disk-buffer-pool-pointer*
+					       *embedded-disk-buffer-pool-base*)
+			  %embedded-disk-request-size)))
+	;; If there aren't any buffers available, return without allocating the DQE.
+	(when* (= buffers 0)
+	  (return-from allocate-embedded-unit-buffers nil))
+	;; Allocate the buffers and initialize the DQE.
+	(let ((dqe (allocate-dqe))
+	      (new-pointer (%pointer-plus *embedded-disk-buffer-pool-pointer* (- buffers))))
+	  (with-system-block-registers (1 2)
+	    (setf (%block-register 1) new-pointer)
+	    (setf (%block-register 2) (locf (emb-disk-queue-element-addresses dqe)))
+	    (loop repeat buffers do
+	      (%block-write 2 (%block-read 1))
+	      (%block-write 2 %embedded-disk-buffer-size))
+	    (setf (emb-disk-queue-element-n-addresses dqe) buffers)
+	    (%memory-write (locf *embedded-disk-buffer-pool-pointer*) new-pointer))
+	  (return-from allocate-embedded-unit-buffers
+	    (values dqe (pageskilobits buffers))))))))
+
+;;; Deallocate a DQE and the buffers it points to.
+(defwiredfun deallocate-embedded-unit-buffers (dqe)
+  (let ((buffers (emb-disk-queue-element-n-addresses dqe)))
+    (with-system-block-registers (1 2)
+      (when ( buffers 0)
+	(let* ((old-pointer *embedded-disk-buffer-pool-pointer*)
+	       (new-pointer (%pointer-plus old-pointer buffers)))
+	  ;; If the buffer pool was empty beforehand, promote the allocation lock so
+	  ;; we'll wakeup any unit that may have been blocked waiting for buffers.
+	  (when* (eq *embedded-disk-buffer-pool-base* old-pointer)
+	    (promote-embedded-disk-allocation-lock))
+	  (when* (%pointer-lessp *embedded-disk-buffer-pool-bound* new-pointer)
+	    (wired-ferror :fatal "Embedded disk buffer overflow?!"))
+	  (setf (%block-register 1) (locf (emb-disk-queue-element-addresses dqe)))
+	  (setf (%block-register 2) old-pointer)
+	  ;; The pool might be allocated in virtual space, so we need to do this.
+	  (si:prepare-for-block-write)		;fmh
+	  (loop repeat buffers do
+	    (%block-write 2 (%block-read 1))
+	    (%block-read 1))
+	  (%memory-write (locf *embedded-disk-buffer-pool-pointer*) new-pointer)))
+      (let ((pointer *embedded-disk-dqe-pool-pointer*))
+	;; If the DQE pool was empty beforehand, promote the allocation lock so
+	;; we'll wakeup any unit that may have been blocked waiting for DQE buffers.
+	(when* (eq *embedded-disk-dqe-pool-base* pointer)
+	  (promote-embedded-disk-allocation-lock))
+	(when* (eq *embedded-disk-dqe-pool-bound* pointer)
+	  (wired-ferror :fatal "DQE pool overflow?!"))
+	(%memory-write (locf *embedded-disk-dqe-pool-pointer*) (%pointer-plus pointer 1))
+	(%memory-write pointer dqe)
+	nil))))
+
+
+;;;; Queue processing
+
+(defmacro emb-queue-location (queue index)
+  `(%pointer-plus ,queue (+ ,index (defstorage-size emb-queue))))
+
+;;; Essentially an open coded and bummed wired-emb-queue-put.
+(defwiredfun transmit-embedded-disk-command (unit queue dqe)
+  (incf (embedded-unit-pending-requests unit))
+  (let* ((original-put-index (emb-queue-put-index queue))
+	 (put-index original-put-index))
+    (%memory-write (emb-queue-location queue put-index) dqe)
+    (when ( (incf put-index) (emb-queue-queue-size queue))
+      (setq put-index 0))
+    (setf (emb-queue-put-index queue) put-index)
+    (when (= (emb-queue-take-index queue) original-put-index)
+      ;; The queue was empty, but isn't any more; signal the host.
+      (cli::send-emb-signal (emb-queue-signal queue)))
+    nil))
+
+(defwiredfun embedded-unit-wakeup-internal (unit)
+  (with-embedded-disk-allocation-lock (unit)
+    (loop with status-queue = (embedded-unit-status-queue unit)
+	  as take-index = (emb-queue-take-index status-queue)
+	  until (= (emb-queue-put-index status-queue) take-index)
+	  do
+      (let ((dqe (%memory-read (emb-queue-location status-queue take-index))))
+	(when ( (incf take-index) (emb-queue-queue-size status-queue))
+	  (setq take-index 0))
+	(setf (emb-queue-take-index status-queue) take-index)
+	(decf (embedded-unit-pending-requests unit))
+	(embedded-unit-process-output-request unit (emb-pointer-to-pma dqe))))
+    (loop as input-request = (or (embedded-unit-input-request unit) (unit-input-request unit))
+	  until (null input-request)
+	  as input-offset = (embedded-unit-input-request-offset unit)
+	  while (embedded-unit-process-input-request unit input-request input-offset)))
+  nil)
+
+;;; Attempt to deliver a request (or portion thereof) to the embedded command queue.  Return
+;;; T if the entire request is enqueued, NIL if it couldn't be due to lack of resources.
+(defwiredfun embedded-unit-process-input-request (unit request offset)
+  (let ((address (+ (disk-request-address request) offset))
+	(length (- (disk-request-length request) offset))
+	(transfer-type (disk-request-transfer-type request)))
+    (loop do
+      (when* ( (embedded-unit-pending-requests unit) %embedded-disk-queue-size)
+	(setf (embedded-unit-input-request unit) request)
+	(setf (embedded-unit-input-request-offset unit) offset)
+	(return nil))
+      (multiple-value-bind (dqe size)
+	  (allocate-embedded-unit-buffers length)
+	(when* (null dqe)
+	  (setf (embedded-unit-input-request unit) request)
+	  (setf (embedded-unit-input-request-offset unit) offset)
+	  (return nil))
+	(setf (emb-disk-queue-element-id dqe) (%pointer request))
+	;; +++ for now force everything to be executed in order
+	;; --- need to figure out how to use this in response to disk-request-serial-marker
+	;; --- we also need to transmit disk-request-serial-request somehow
+	;; in any event, split requests need to be executed in order, because the
+	;; dequeueing routine assumes that when the last chunk executes the entire
+	;; request is finished
+	(setf (emb-disk-queue-element-sync dqe) -1)
+	;; --- protocol should be changed to use the Genera command enumeration
+	(cond ((disk-transfer-read-p transfer-type)
+	       (setf (emb-disk-queue-element-op dqe) (dpbs 1 %%emb-disk-opcode-buffered
+							   0 %%emb-disk-opcode-tagged
+							   %emb-disk-read))
+	       ;; --- protocol should use kilobits for disk coordinates
+	       (setf (emb-disk-queue-element-page dqe) (kilobitspages address))
+	       (setf (emb-disk-queue-element-count dqe) (kilobitspages size)))
+	      ((disk-transfer-write-p transfer-type)
+	       (disk-copy-homunculus
+		 transfer-type
+		 (kilobitswords size)
+		 (locf (emb-disk-queue-element-addresses dqe))
+		 *emb-communication-area*
+		 (disk-request-memory-descriptors request)
+		 (kilobitswords offset))
+	       (setf (emb-disk-queue-element-op dqe) (dpbs 1 %%emb-disk-opcode-buffered
+							   0 %%emb-disk-opcode-tagged
+							   %emb-disk-write))
+	       ;; --- protocol should use kilobits for disk coordinates
+	       (setf (emb-disk-queue-element-page dqe) (kilobitspages address))
+	       (setf (emb-disk-queue-element-count dqe) (kilobitspages size)))
+	      (t
+	       ;; --- closest thing to a no-op
+	       (setf (emb-disk-queue-element-op dqe) %emb-disk-reset)))
+	(transmit-embedded-disk-command unit
+					(embedded-unit-command-queue unit)
+					(pma-to-emb-pointer dqe))
+	(decf length size)
+	(when (= length 0)
+	  (setf (embedded-unit-input-request unit) nil)
+	  (setf (embedded-unit-input-request-offset unit) 0)
+	  (return t))
+	(incf address size)
+	(incf offset size)))))
+
+;;; Process a completed command from the embedded status queue.
+(defwiredfun embedded-unit-process-output-request (unit dqe)
+  (let ((request (%make-pointer sys:dtp-array (emb-disk-queue-element-id dqe))))
+    (select (ldb %%emb-disk-opcode-opcode (emb-disk-queue-element-op dqe))
+      ((%emb-disk-read %emb-disk-write)
+       ;; --- need real error codes here
+       (select (emb-disk-queue-element-status dqe)
+	 (%emb-disk-won
+	  (let ((subrequest-address (emb-disk-queue-element-page dqe))
+		(subrequest-length (emb-disk-queue-element-count dqe))
+		(request-address (disk-request-address request))
+		(request-length (disk-request-length request)))
+	    (when (disk-transfer-read-p (disk-request-transfer-type request))
+	      (disk-copy-homunculus
+		(disk-request-transfer-type request)
+		(kilobitswords (pageskilobits subrequest-length))
+		(locf (emb-disk-queue-element-addresses dqe))
+		*emb-communication-area*
+		(disk-request-memory-descriptors request)
+		(kilobitswords
+		  (- (pageskilobits subrequest-address) request-address))))
+	    (deallocate-embedded-unit-buffers dqe)
+	    ;; Clear the error information if this was an erring request.
+	    (when (eq (embedded-unit-error-address unit) subrequest-address)
+	      (setf (embedded-unit-error-address unit) nil))
+	    ;; If this command spans the end of the original request, mark the
+	    ;; request as completed and return it to the master driver.
+	    (if (= (+ subrequest-address subrequest-length)
+		   (kilobitspages (+ request-address request-length)))
+		(unit-output-request unit request %disk-request-status-completed)
+	      ;; Otherwise, note that we've accomplished something.
+	      (setf (unit-activity-timestamp unit) (%microsecond-clock)))))
+	 (%emb-disk-lost
+	  ;; Error recovery non-strategy:  When an error is detected by the host, it provides
+	  ;; us with very little information.  In particular, all the host can tell us is that
+	  ;; an error occured somewhere within the request and it can provide us with an error
+	  ;; code which usually conveys no information (e.g., "I/O error").  When we get
+	  ;; an error, all we can do is retry the request up to 8 times in the hope that the
+	  ;; error is transient.  If, after 8 retries, the error persists, we'll mark the
+	  ;; request as failed and pass it back to the master driver for signalling.  Whenever
+	  ;; we retry a request, we first send a reset request to the host to force it to abort
+	  ;; any queued requests.  When it returns the aborted requests, we simply requeue them
+	  ;; so that they will be executed if the retry of the failing request succeeds.  If
+	  ;; we've decided to give up on the failing request, we'll also give up on the aborted
+	  ;; requests by returning them to the master driver.
+	  (if (eq (emb-disk-queue-element-page dqe) (embedded-unit-error-address unit))
+	      (incf (embedded-unit-error-count unit))
+	    (setf (embedded-unit-error-address unit) (emb-disk-queue-element-page dqe))
+	    (setf (embedded-unit-error-count unit) 0))
+	  ;; Enqueue a reset command; all the requests between here and there will
+	  ;; be aborted.  This enqueueing is guaranteed to work because the command-queue
+	  ;; is larger than the maximum number of requests we ever put into it, and
+	  ;; we're using a dedicated DQE.
+	  (transmit-embedded-disk-command unit
+					  (embedded-unit-command-queue unit)
+					  (pma-to-emb-pointer *embedded-reset-dqe*))
+	  (if (< (embedded-unit-error-count unit) 8)
+	      ;; Retry the failed request.
+	      (transmit-embedded-disk-command unit
+					      (embedded-unit-command-queue unit)
+					      (pma-to-emb-pointer dqe))
+	    ;; Inform the master driver that this request has failed.
+	    (deallocate-embedded-unit-buffers dqe)
+	    (unit-output-request unit request %disk-request-status-failed
+				 (embedded-unit-error-address unit))))
+	 (%emb-disk-aborted
+	  (if (< (embedded-unit-error-count unit) 8)
+	      ;; Retry the request which was aborted because of an earlier failed request.
+	      (transmit-embedded-disk-command unit
+					    (embedded-unit-command-queue unit)
+					    (pma-to-emb-pointer dqe))
+	    ;; Inform the master driver that this request has been aborted.
+	    (deallocate-embedded-unit-buffers dqe)
+	    (unit-output-request unit request %disk-request-status-aborted)))
+	 (otherwise
+	  (wired-ferror :fatal "Invalid dqe-status ~D" (emb-disk-queue-element-status dqe)))))
+      (%emb-disk-reset
+       ;; If this isn't the dedicated reset DQE, then this reset request was actually just
+       ;; being used as a no-op, so output the request normally.
+       (when (neq *embedded-reset-dqe* dqe)
+	 (select (emb-disk-queue-element-status dqe)
+	   (%emb-disk-won
+	    (unit-output-request unit request %disk-request-status-completed))
+	   (otherwise
+	    (wired-ferror :proceedable-halt "Invalid dqe-status ~D"
+			  (emb-disk-queue-element-status dqe))))
+	 (deallocate-embedded-unit-buffers dqe)))
+      (%emb-disk-initialize
+       (deallocate-embedded-unit-buffers dqe)))
+    nil))
+
+
+;;;; Initialization
+
+(defwiredvar *embedded-disk-channels* nil)
+
+(defwiredfun initialize-embedded-disk (unit-number channel-pma)
+  (declare (unsafeguarded-reference embedded-unit-queue))
+  (let ((command-queue (emb-pointer-to-pma (emb-disk-command-queue channel-pma)))
+	(status-queue (emb-pointer-to-pma (emb-disk-status-queue channel-pma)))
+	(size (pageskilobits (emb-disk-number-of-pages channel-pma))))
+    (setf (aref *embedded-disk-channels* unit-number) channel-pma)
+    (let ((unit-queue
+	    (or (aref *unit-table* unit-number)
+		(allocate-unmapped-array (1- (defstorage-size embedded-unit-queue))))))
+      (initialize-unit-queue unit-queue unit-number)
+      (setf (unit-named-structure-symbol unit-queue) 'embedded-unit-queue)
+      (initialize-disk-method (unit-wakeup-internal-method unit-queue)
+			      embedded-unit-wakeup-internal)
+      (setf (embedded-unit-command-queue unit-queue) command-queue)
+      (setf (embedded-unit-status-queue unit-queue) status-queue)
+      ;; Fake geometry info for now; assume 8-page tracks, one head per cylinder.
+      (let* ((cylinder-size (pageskilobits 8)))
+	(setf (unit-size unit-queue) size)
+	(setf (unit-cylinder-size unit-queue) cylinder-size)
+	(setf (unit-track-size unit-queue) cylinder-size)
+	(setf (unit-sector-size unit-queue) (pageskilobits 1))
+	(setf (unit-background-tracks unit-queue) 1)
+	(setf (unit-background-batch-p unit-queue) 1))
+      (setf (embedded-unit-pending-requests unit-queue) 0)
+      (setf (embedded-unit-input-request unit-queue) nil)
+      (setf (embedded-unit-input-request-offset unit-queue) 0)
+      (setf (embedded-unit-error-address unit-queue) nil)
+      (setf (embedded-unit-error-count unit-queue) 0)
+      (let ((signal (emb-queue-signal status-queue)))
+	(if (or (not (fixnump signal)) (< signal 0) (> signal 31))
+	    (setf (emb-queue-signal status-queue)
+		  (install-wired-emb-signal-handler #'unit-wakeup unit-queue 2))
+	  (setf (aref cli::*emb-signal-handler* signal) #'unit-wakeup)
+	  (setf (aref cli::*emb-signal-argument* signal) unit-queue)
+	  (setf (aref cli::*emb-signal-priority* signal) 2)))))
+  nil)
+
+;;; --- should share one signal number among all disk units?
+(defwiredfun initialize-embedded-disks ()
+  (when (not *disk-exists-p*)
+    (setq *embedded-disk-dqe-pool-base* nil)
+    (setq *embedded-disk-buffer-pool-base* nil)
+    (setq *embedded-disk-channels* nil))
+  (when (null *embedded-disk-channels*)
+    (setq *embedded-disk-channels* (allocate-unmapped-array 32)))
+  (%block-store-cdr-and-contents (locf (aref *embedded-disk-channels* 0)) 32 0 nil 0)
+  (setq *embedded-disk-allocation-lock* %disk-lock-free)
+  (let ((n-units 0))
+    (flet ((initialize-channel (unit channel-pma)
+	     (incf n-units)
+	     (initialize-embedded-disk unit channel-pma)))
+      (if (and (boundp '*disk-unit-table*) (arrayp *disk-unit-table*))
+	  (dotimes (unit 32)
+	    (let ((entry (aref *disk-unit-table* unit)))
+	      (when (and (fixnump entry)
+			 (eql (ldb %%disk-unit-type entry) %disk-unit-type-embedded))
+		(initialize-channel unit (emb-pointer-to-pma
+					   (ldb %%disk-unit-embedded-channel entry))))))
+	  (loop for channel = (emb-channel-table) then (emb-disk-next channel-pma)
+		until (minusp channel)
+		as channel-pma = (emb-pointer-to-pma channel)
+		do
+	    (when (= (emb-disk-type channel-pma) %emb-channel-type-disk)
+	      (initialize-channel (emb-disk-unit channel-pma) channel-pma)))))
+    (when #-VLM (plusp n-units)
+	  ;; The VLM doesn't use embedded disks for world loads or paging files so it's
+	  ;; quite OK for there to be no units at boot time.  However, as units may be
+	  ;; added dynamically (e.g., for Statice DBFS partitions), we'll setup the 
+	  ;; appropriate data structures now rather than try to do so after initialization
+	  ;; of the storage system.
+	  #+VLM t
+      ;; Allocate and fill the DQE pool.
+      (let ((pool (or *embedded-disk-dqe-pool-base*
+		      (locf (aref (allocate-unmapped-array %embedded-disk-dqes) 0)))))
+	(setq *embedded-disk-dqe-pool-base* pool)
+	(setq *embedded-disk-dqe-pool-bound* (%pointer-plus pool %embedded-disk-dqes))
+	(setq *embedded-disk-dqe-pool-pointer* *embedded-disk-dqe-pool-bound*)
+	(loop repeat %embedded-disk-dqes
+	      for p first pool then (%pointer-plus p 1) do
+	  (%memory-write p
+			 (emb-buf-pma (wired-allocate-emb-buffer
+					(+ 8 (*2 %embedded-disk-request-size)))))))
+      (let ((dqe (emb-buf-pma (wired-allocate-emb-buffer 8))))
+	(setf (emb-disk-queue-element-op dqe) %emb-disk-reset)
+	(setf (emb-disk-queue-element-page dqe) 0)
+	(setf (emb-disk-queue-element-count dqe) 0)
+	(setf (emb-disk-queue-element-n-addresses dqe) 0)
+	(setq *embedded-reset-dqe* dqe))
+      ;; Allocate and fill the buffer pool.
+      (let* ((nbuffers (system-case
+			 ((MacIvory) 16)
+			 ((Solstice) 12)
+			 ((VLM) 16)		;Will shrink once DMA is implemented...
+			 (Native (error))))
+	     (pool (or *embedded-disk-buffer-pool-base*
+		       (locf (aref (allocate-unmapped-array nbuffers) 0)))))
+	(setq *embedded-disk-buffer-pool-base* pool)
+	(setq *embedded-disk-buffer-pool-bound* (%pointer-plus pool nbuffers))
+	(setq *embedded-disk-buffer-pool-pointer* *embedded-disk-buffer-pool-bound*)
+	(loop for p first pool then (%pointer-plus p 1)
+	      repeat nbuffers
+	      do
+	  (%memory-write p
+			 (pma-to-emb-pointer
+			   (emb-buf-pma
+			     (or (wired-allocate-emb-buffer %embedded-disk-buffer-size)
+				 (wired-ferror :fatal "Couldn't allocate ~D disk buffers"
+					       nbuffers)))))))))
+  nil)

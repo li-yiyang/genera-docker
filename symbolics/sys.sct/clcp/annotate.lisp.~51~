@@ -1,0 +1,610 @@
+;;; -*- Mode:LISP; Package:Language-Tools; Syntax:Common-Lisp -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Written April 1983 by David A. Moon for use by the Common Lisp community
+;;; based on a design by Alan Bawden
+
+;;; Lisp code annotator
+;;; Gathers information on the side-effects and environment dependencies of a form
+
+;--- Common Lisp conversion issues:
+;--- The function lists are completely implementation-dependent right now
+;--- The function lists generally include everything in both ZL and CL global
+;---   packages.  There are probably some SI things needed as well, and some
+;---   ZL things that are never going to be called might be flushed (but why bother?)
+;--- Review the function lists for recent CL changes!
+
+;--- This could generate better code if it distinguished side-effects that cannot
+;--- change variables from side-effects that can change variables.  Admittedly
+;--- RPLACA could always change a variable, due to locatives to value cells,
+;--- but consider the expansion of (SETF (GETF (AREF A I) B) C) which unnecessarily binds
+;--- A and I to temporaries because it thinks that calling SET-GETF could change them.
+
+;; The entry function to this module is ANNOTATE-FORM
+;; The data structures defined on this page are also module interfaces
+;; These are not exported, since they are only used by other tools
+
+(EXPORT '(ANNOTATE-FORM *SIMPLE-VARIABLES*))
+	;--- Maybe the defstruct things should be exported, but for now I'm not
+	;--- going to, since probably user-written things shouldn't look at them
+
+;; We deal with two kinds of variables:
+;;  Substituted variables are those that we know the binding of.  We are
+;;   considering substituting the binding for each usage of the variable.
+;;   Only some callers of the annotator deal in substituted variables.
+;;  Ordinary variables are all others.  We are only interested in these
+;;   as a way of possibly partitioning side-effects.
+
+;Nothing warms the heart like simple variables.
+;These are ordinary variables that are known to be unaffected by side-effects;
+;they are guaranteed not to be special, not to be setq'ed, not to be locf'ed,
+;not to be forwarded, and not to be bound (causing name clashes).
+;SETF binds this variable.
+(DEFVAR *SIMPLE-VARIABLES* NIL)
+
+;;; A Notepad is used to record information about the effects of executing
+;;; some Lisp code, and the external influences that could affect it.
+
+(DEFSTRUCT (NOTEPAD (:TYPE LIST) :CONC-NAME (:DEFAULT-POINTER NOTEPAD))
+  (READ NIL)		;Read operations (dependencies on the side-effects of others)
+			;This is a list of ordinary variables that have been read,
+			;or T if we might have depended on anything.
+  (WRITTEN NIL)		;Write operations (side-effects)
+			;This is a list of ordinary variables that have been written,
+			;or T if we might have changed anything.
+  (SUBSTS NIL)		;List of substituted variables we have seen used
+  (CONTROL NIL))	;Control-structure summary (lowest-priority first)
+			;NIL if we are guaranteed to get all the way to here
+			;COND if we aren't guaranteed to get all the way to here
+			;GO if conditional because of a non-local go or return
+			; This is different from COND because they aren't well-nested
+			;LOOP if we can get here more than once
+			;--- Note that we are distinctly careless about nested control
+			;structures.  Once having seen a loop we assume that everything
+			;after it is inside it, which isn't true.  Main issue for fixing
+			;this is getting the correct scoping of GO and RETURN.
+
+;;; A Varnote is used to record information about the usage(s) of a substituted variable
+(DEFSTRUCT (VARNOTE (:TYPE LIST) :CONC-NAME (:DEFAULT-POINTER VARNOTE))
+  NAME			;Variable name.  Must be first so ASSOC can be used.
+  (N-USAGES 0)		;(Static) number of times used
+  (VARIABLE-ENV NIL)	;All variables bound around usages of the variable
+  (BLOCK-ENV NIL)	;All block names extant around usages of the variable
+  (TAG-ENV NIL)		;All go tags extant around usages of the variable
+  (NOTEPAD (MAKE-NOTEPAD))	;A notepad used to describe what has happened
+				; before the variable is used.  Set to NIL if we
+				; discover a reason this variable cannot be substituted.
+  (FUNCTION-ENV NIL)	;All functions bound around usages of the variable
+  (SPECIAL-P NIL)	;Variable is dynamic
+  (VALUE-TYPE T)	;Declared type of variable
+  ;;(MULTIPLE-VALUES NIL);Used in multiple-value context
+  )
+
+;;; Operations on notepads
+
+(DEFUN NOTE-VARIABLE-READ (NOTEPAD VAR)
+  (LET ((READ (NOTEPAD-READ NOTEPAD)))
+    (OR (EQ READ T)
+	(MEMBER VAR READ)
+	(SETF (NOTEPAD-READ NOTEPAD) (CONS VAR READ)))))
+
+(PROCLAIM '(INLINE NOTE-ANY-READ NOTE-ANY-WRITE))
+
+(DEFUN NOTE-ANY-READ (NOTEPAD)
+  (SETF (NOTEPAD-READ NOTEPAD) T))
+
+(DEFUN NOTE-VARIABLE-WRITTEN (NOTEPAD VAR)
+  (LET ((WRITTEN (NOTEPAD-WRITTEN NOTEPAD)))
+    (OR (EQ WRITTEN T)
+	(MEMBER VAR WRITTEN)
+	(SETF (NOTEPAD-WRITTEN NOTEPAD) (CONS VAR WRITTEN)))))
+
+(DEFUN NOTE-ANY-WRITE (NOTEPAD)
+  (SETF (NOTEPAD-WRITTEN NOTEPAD) T))
+
+;True if the code fragments represented by two notepads are independent
+;and hence may be executed in either order.  Maximally conservative
+;in that arbitrary side-effects are assumed to affect all variables
+;(we don't distinguish local variables that haven't been LOCF'ed).
+(DEFUN DISJOINT-NOTES (X Y)
+  (AND (DISJOINT-SETS (NOTEPAD-WRITTEN X) (NOTEPAD-WRITTEN Y))
+       (DISJOINT-SETS (NOTEPAD-READ X) (NOTEPAD-WRITTEN Y))
+       (DISJOINT-SETS (NOTEPAD-READ Y) (NOTEPAD-WRITTEN X))))
+
+;True if two sets (of the type used in notepads) are disjoint
+(DEFUN DISJOINT-SETS (X Y)
+  (COND ((NULL X) T)
+	((NULL Y) T)
+	((EQ X T) NIL)
+	((EQ Y T) NIL)
+	(T (LOOP FOR XX IN X NEVER (MEMBER XX Y)))))
+
+;Union of two sets (of the type used in notepads)
+(DEFUN JOIN-SETS (X Y)
+  (COND ((NULL X) Y)
+	((NULL Y) X)
+	((EQ X T) X)
+	((EQ Y T) Y)
+	(T (UNION X Y))))
+
+;Make a copy of a notepad, initially containing the same information
+(PROCLAIM '(INLINE FORK-NOTEPAD))
+(DEFUN FORK-NOTEPAD (NOTEPAD)
+  (COPY-LIST NOTEPAD))
+
+;Merge the information from JOINER into JOINEE
+(DEFUN JOIN-NOTEPADS (JOINEE JOINER)
+  (UNLESS (EQ JOINER JOINEE)	;merely efficiency
+    (SETF (NOTEPAD-READ JOINEE) (JOIN-SETS (NOTEPAD-READ JOINEE) (NOTEPAD-READ JOINER)))
+    (SETF (NOTEPAD-WRITTEN JOINEE)
+	  (JOIN-SETS (NOTEPAD-WRITTEN JOINEE) (NOTEPAD-WRITTEN JOINER)))
+    (SETF (NOTEPAD-SUBSTS JOINEE) (UNION (NOTEPAD-SUBSTS JOINEE) (NOTEPAD-SUBSTS JOINER)))
+    (SET-NOTEPAD-CONTROL JOINEE (NOTEPAD-CONTROL JOINER))))
+
+(DEFPARAMETER *NOTEPAD-CONTROLS* '(LAMBDA LOOP GO COND NIL))
+
+(DEFUN SET-NOTEPAD-CONTROL (NOTEPAD CONTROL)
+  (WHEN (< (POSITION CONTROL *NOTEPAD-CONTROLS*)
+	   (POSITION (NOTEPAD-CONTROL NOTEPAD) *NOTEPAD-CONTROLS*))
+    (SETF (NOTEPAD-CONTROL NOTEPAD) CONTROL))
+  NIL)
+
+;;; Conditional support
+
+;Execute the body with the notepad indicating locally-conditional execution
+;while being careful about the non-local-conditional and iteration flags
+;Returns no particular value (-not- the value of the body)
+(DEFMACRO ANNOTATE-CONDITIONAL (&BODY BODY)
+  `(LET ((PREVIOUS-CONTROL (NOTEPAD-CONTROL)))
+     (OR PREVIOUS-CONTROL
+	 (SETF (NOTEPAD-CONTROL) 'COND))
+     ,@BODY
+     (AND (NOT PREVIOUS-CONTROL)
+	  (EQ (NOTEPAD-CONTROL) 'COND)
+	  (SETF (NOTEPAD-CONTROL) NIL))
+     NIL))
+
+;;; Iteration support
+
+(DEFVAR *IN-LOOP*)		;NIL in normal once-through execution
+				;Inside a loop, this is the number of nested levels
+(DEFVAR *LOOP-JOIN-QUEUE*)	;Varnotes seen since the beginning of the loop
+				;These need to be joined with the notepad
+				;reflecting the full effects of the loop's body
+
+;Normally fork a notepad, but if inside an iteration, don't bother
+;as everything will be smushed back together at the end anyway
+(PROCLAIM '(INLINE FORK-NOTE-PAD-MAYBE))
+(DEFUN FORK-NOTEPAD-MAYBE (NOTEPAD)
+  (IF *IN-LOOP* NOTEPAD (FORK-NOTEPAD NOTEPAD)))
+
+;Called when an iteration is entered or exited.  When we get to the end of
+;the loop, feed the notepad that comes out the end of the loop back into
+;the beginning of the loop by joining it into any substitutable variables
+;that were used inside the loop.  When there are nested loops, wait until
+;we get to the end of the outermost one before really draining the queue.
+(DEFUN ANNOTATE-ITERATION (ENTER-P)
+  (LET ((NOTEPAD *MAPFORMS-STATE*))
+    (COND (ENTER-P
+	   (SETQ *IN-LOOP* (1+ (OR *IN-LOOP* 0)))
+	   (SET-NOTEPAD-CONTROL NOTEPAD (IF (EQ ENTER-P 'LAMBDA) 'LAMBDA 'LOOP)))
+	  (T
+	   (WHEN (ZEROP (SETQ *IN-LOOP* (1- *IN-LOOP*)))
+	     (SETQ *IN-LOOP* NIL)
+	     (DOLIST (VARNOTE *LOOP-JOIN-QUEUE*)
+	       (IF (VARNOTE-NOTEPAD)
+		   (JOIN-NOTEPADS (VARNOTE-NOTEPAD) NOTEPAD)))
+	     (SETQ *LOOP-JOIN-QUEUE* NIL))))))
+
+
+;;; Variables bound by ANNOTATE-FORM
+
+(DEFVAR *PARENT-ENVIRONMENT*)			;Environment when form enterred
+(DEFVAR *SUBST-ALIST*)	;List of varnotes for all the substituted variables of interest
+(DEFVAR *SUBST-NOTEPAD*)	;NIL or notepad describing context of evaluation of form
+
+(DEFVAR *FREE-VARIABLES*)	;Collect names used freely (not inside a binding)
+(DEFVAR *FREE-BLOCKS*)		;..
+(DEFVAR *FREE-TAGS*)		;..
+(DEFVAR *FREE-FUNCTIONS*)	;..
+(DEFVAR *REPLICABILITY*)	;Accumulates return value from ANNOTATE-FORM
+
+;;; Main function
+
+;Given a form, return a notepad for it, and optionally annotate some
+;substitutable variables as well.  The fourth argument is just used in
+;annotating those substitutable variables; it's a notepad describing
+;the context in which the given form will be evaluated.
+;In addition to the notepad, we return the sets of lexically-scoped names used freely,
+;and the "replicability" of the form, which is the number of times
+;it is worth evaluating it before binding a variable to it (this is 1
+;if this is any form that can't be evaluated multiple times and get
+;the same result as evaluating it once).
+;The free variables don't include the substituted variables.
+;The free variables -do- include special variables.
+;Note: the use of the MAPFORMS state variable herein is unusual, because the
+;value of the variable doesn't change.  Instead it is a structure and we change its fields.
+(DEFUN ANNOTATE-FORM (FORM &OPTIONAL (*SUBST-ALIST* NIL) ENV *SUBST-NOTEPAD*)
+  (DECLARE (VALUES NOTEPAD FREE-VARIABLES FREE-BLOCKS FREE-TAGS REPLICABILITY FREE-FUNCTIONS))
+  ;; Bind the variables being substituted for, to hide any symbol-macros with the same names
+  (SI:WITH-INTERPRETER-ENVIRONMENT
+    (NEW-ENV ENV
+	     (APPEND (MAPCAR #'(LAMBDA (X) (LIST (CAR X) NIL)) *SUBST-ALIST*)
+		     (POP ENV))
+	     (POP ENV) (POP ENV) (POP ENV) (POP ENV))
+    (LET ((*PARENT-ENVIRONMENT* NEW-ENV)
+	  (*IN-LOOP* NIL)
+	  (*LOOP-JOIN-QUEUE* NIL)
+	  (*FREE-VARIABLES* NIL)
+	  (*FREE-BLOCKS* NIL)
+	  (*FREE-TAGS* NIL)
+	  (*FREE-FUNCTIONS*)
+	  (*REPLICABILITY* 1000000))		;initially "infinity"
+      (VALUES (MAPFORMS #'ANNOTATE-FORM-INTERNAL FORM
+			:INITIAL-STATE (MAKE-NOTEPAD)
+			;;:EXPAND-SUBSTS T
+			:BOUND-VARIABLES NIL
+			:APPLY-FUNCTION #'ANNOTATE-FORM-AFTER-ARGS
+			:ITERATION-HOOK #'ANNOTATE-ITERATION
+			:ENVIRONMENT NEW-ENV)
+	      *FREE-VARIABLES*
+	      *FREE-BLOCKS*
+	      *FREE-TAGS*
+	      *REPLICABILITY*
+	      *FREE-FUNCTIONS*))))
+
+(DEFUN ANNOTATE-FORM-INTERNAL (FORM KIND USAGE NOTEPAD &AUX VARNOTE (BYPASS NIL))
+  (CASE KIND
+    (SYMEVAL
+      (COND ((MEMBER FORM *MAPFORMS-BOUND-VARIABLES*))
+			 ;Uninteresting if variable bound inside form being analyzed
+	    ((SETQ VARNOTE (ASSOC FORM *SUBST-ALIST*))
+			 ;Accessing a substitutable variable: remember circumstances
+	     (INCF (VARNOTE-N-USAGES))
+	     (SETF (VARNOTE-VARIABLE-ENV)
+		   (UNION (VARNOTE-VARIABLE-ENV) *MAPFORMS-BOUND-VARIABLES*))
+	     (SETF (VARNOTE-BLOCK-ENV) (UNION (VARNOTE-BLOCK-ENV) *MAPFORMS-BLOCK-NAMES*))
+	     (SETF (VARNOTE-TAG-ENV) (UNION (VARNOTE-TAG-ENV) *MAPFORMS-GO-TAGS*))
+	     (LOOP WITH PARENT-FUNCTIONS = (SI:ENV-FUNCTIONS *PARENT-ENVIRONMENT*)
+		   FOR ENTRY-CONS ON (SI:ENV-FUNCTIONS *MAPFORMS-LEXICAL-FUNCTION-ENVIRONMENT*)
+		   UNTIL (EQ ENTRY-CONS PARENT-FUNCTIONS)
+		   DO (PUSHNEW (CAR (CAR ENTRY-CONS)) (VARNOTE-FUNCTION-ENV)))
+	     #|(DOLIST (ENTRY (SI:ENV-DECLARATIONS *MAPFORMS-LEXICAL-FUNCTION-ENVIRONMENT*))
+	       (DOLIST (DCL ENTRY)
+	       (CASE (FIRST DCL)
+		 ((INLINE NOTINLINE)
+		  (SETF (VARNOTE-FUNCTION-ENV) (UNION (VARNOTE-FUNCTION-ENV) (REST DCL)))))))|#
+
+	     ;; If there is a context for the overall form, apply it to this variable
+	     (WHEN (AND *SUBST-NOTEPAD* (VARNOTE-NOTEPAD))
+	       (JOIN-NOTEPADS (VARNOTE-NOTEPAD) *SUBST-NOTEPAD*))
+
+	     ;; If in a loop, defer the join until we know everything about the
+	     ;; loop, since what goes around, comes around
+	     (COND (*IN-LOOP*
+		    (PUSHNEW VARNOTE *LOOP-JOIN-QUEUE*))
+		   ((VARNOTE-NOTEPAD)
+		    (JOIN-NOTEPADS (VARNOTE-NOTEPAD) NOTEPAD)))
+	     ;; Remember that we passed by a usage of this variable
+	     (PUSHNEW FORM (NOTEPAD-SUBSTS)))
+			;Accessing a simple variable: not to be kept track of
+	    ((MEMBER FORM *SIMPLE-VARIABLES*))
+	    (T		;Accessing a free variable
+	     (PUSHNEW FORM *FREE-VARIABLES*)
+	     (NOTE-VARIABLE-READ NOTEPAD FORM))))
+
+    (SET
+      (SETQ *REPLICABILITY* 1)		;Never do this multiple times
+      (COND ((MEMBER FORM *MAPFORMS-BOUND-VARIABLES*))
+			;Uninteresting if variable bound inside form being analyzed
+	    ((SETQ VARNOTE (ASSOC FORM *SUBST-ALIST*))
+			;Setting a substitutable variable makes it unsubstitutable
+	     (SETF (VARNOTE-NOTEPAD) NIL))
+	    (T		;Setting a free variable
+	     (PUSHNEW FORM *FREE-VARIABLES*)
+	     (NOTE-VARIABLE-WRITTEN NOTEPAD FORM))))
+
+    (GO
+      (SETQ *REPLICABILITY* 1)		;Never do this multiple times
+      (SET-NOTEPAD-CONTROL NOTEPAD 'GO)	;Non-local control sequencing has been seen
+      (UNLESS (MEMBER FORM *MAPFORMS-GO-TAGS*)
+	;; GO outside of the form being analyzed is a side-effect
+	(NOTE-ANY-WRITE NOTEPAD)
+	;; and furthermore is an environmental dependency
+	(PUSHNEW FORM *FREE-TAGS*)))
+
+    (RETURN-FROM
+      (SETQ *REPLICABILITY* 1)		;Never do this multiple times
+      (SET-NOTEPAD-CONTROL NOTEPAD 'GO)	;Non-local control sequencing has been seen
+      (UNLESS (MEMBER FORM *MAPFORMS-BLOCK-NAMES*)
+	;; RETURN outside of the form being analyzed is a side-effect
+	(NOTE-ANY-WRITE NOTEPAD)
+	(PUSHNEW FORM *FREE-BLOCKS*)))
+
+    (ARBITRARY
+      (SETQ *REPLICABILITY* 1)		;Never do this multiple times
+      (NOTE-ANY-WRITE NOTEPAD))
+
+    (QUOTE
+      (CASE USAGE
+	(CALL
+	  (COND ((NOT (SYMBOLP FORM)))
+		((NEQ (ASSOC FORM (SI:ENV-FUNCTIONS *MAPFORMS-LEXICAL-FUNCTION-ENVIRONMENT*))
+		      (ASSOC FORM (SI:ENV-FUNCTIONS *PARENT-ENVIRONMENT*))))
+		(T (PUSHNEW FORM *FREE-FUNCTIONS*))))))
+
+    ((LET DECLARE))			;Uninteresting to us
+
+    ((NIL)				;Macro or function combination
+     (COND ((SYMBOLP FORM)
+	    ;; Symbol macro reference is sort of like accessing a free variable
+	    ;; Any actual read or write will be noted from the symbol-macro's expansion
+	    (UNLESS (MEMBER FORM *MAPFORMS-BOUND-VARIABLES*)
+	      (PUSHNEW FORM *FREE-VARIABLES*)))
+	   ((NOT (LISTP FORM)))
+	   ((SETQ BYPASS (AND (SYMBOLP (CAR FORM))
+			      (GET (CAR FORM) 'ANNOTATE)))
+	    (FUNCALL BYPASS FORM USAGE NOTEPAD))
+	   (T				;Function combination
+	    (COND ((NOT (SYMBOLP (CAR FORM))))
+		  ((NEQ (ASSOC (CAR FORM)
+			       (SI:ENV-FUNCTIONS *MAPFORMS-LEXICAL-FUNCTION-ENVIRONMENT*))
+			(ASSOC (CAR FORM)
+			       (SI:ENV-FUNCTIONS *PARENT-ENVIRONMENT*))))
+		  (T (PUSHNEW (CAR FORM) *FREE-FUNCTIONS*))))))
+
+    (OTHERWISE				;Function combination with template, or special form
+      (COND ((NOT (LISTP KIND))
+	     (ERROR "~S unrecognized KIND symbol" KIND))
+	    ((NOT (LISTP FORM)))
+	    ((SETQ BYPASS (AND (SYMBOLP (CAR FORM))
+			       (GET (CAR FORM) 'ANNOTATE)))
+	     (FUNCALL BYPASS FORM USAGE NOTEPAD))
+	    ((AND (LISTP (CDR KIND)) (EQ (CADR KIND) 'COND))
+			;Special forms that we must understand in detail
+			;(just conditionals now)
+	     (ERROR "The ~A-type special form ~S does not have an ANNOTATE handler"
+		    (CADR KIND) (CAR FORM)))
+	    (T NIL))))	;Forms that MAPFORMS will analyze, no effects in or out (yet)
+
+  (VALUES NOTEPAD BYPASS))
+
+;Called after analyzing the arguments of a function, the arguments
+;and body of a lambda-combination, or all the subforms of a special form.
+;For a function combination, make our conservative estimate of the effects
+;of running the function, assuming the primitive functions we know about
+;are not redefined by the user to be something else.
+(DEFUN ANNOTATE-FORM-AFTER-ARGS (FORM KIND IGNORE NOTEPAD)
+  (WHEN (AND (NULL KIND)			;Function combination
+	     (SYMBOLP (CAR FORM)))		;and not a LAMBDA
+    (MULTIPLE-VALUE-BIND (CLASS REPLICABILITY REDUCIBLE)
+	(FUNCTION-ANNOTATION-CLASS (CAR FORM))
+      (COND ((EQ (CAR FORM) 'QUOTE))		;Constants are endlessly replicable
+	    ((AND REDUCIBLE
+		  (LOOP FOR ARG IN (CDR FORM)
+			ALWAYS (CONSTANTP ARG))))
+	    ((EQ REPLICABILITY 'TWO-TIMES)
+	     (SETQ *REPLICABILITY*
+		   (IF (> *REPLICABILITY* 2)
+		       2			;This thing could be done twice
+		       1)))			;But two of them should only be done once
+	    ((NULL REPLICABILITY)		;Don't know, do it only once
+	     (SETQ *REPLICABILITY* 1)))
+      (CASE CLASS
+	(SIMPLE )				;No side-effects in or out
+	(READER					;Depends on environment but doesn't change anything
+	  (NOTE-ANY-READ NOTEPAD))
+	(OTHERWISE				;Default is to assume that it could do anything
+	  (NOTE-ANY-WRITE NOTEPAD)))))
+  NOTEPAD)
+
+(DEFUN FORM-REFERENCES-ENVIRONMENT-P (FORM ENVIRONMENT &OPTIONAL MACROS-COUNT)
+  (MULTIPLE-VALUE-BIND (NOTEPAD FREE-VARS FREE-BLOCKS FREE-TAGS REPLICABILITY FREE-FUNCTIONS)
+      (LT:ANNOTATE-FORM FORM NIL ENVIRONMENT)
+    (DECLARE (IGNORE NOTEPAD REPLICABILITY))
+    (UNLESS (OR FREE-BLOCKS FREE-TAGS)
+      (LET ((VARS (SI:ENV-VARIABLES ENVIRONMENT)))
+	(WHEN (EVERY
+		#'(LAMBDA (VAR)
+		    (LET ((PAIR (ASSOC VAR VARS)))
+		      (OR (NULL PAIR)		;No local definition
+			  (AND (NOT MACROS-COUNT)
+			       (LET ((CELL (CDR PAIR)))
+				 (AND (CONSP CELL)
+				      (CDR CELL)))))))	;Symbol-macro
+		FREE-VARS)
+	  ;; None of the free variables refer to the environment
+	  (SETQ FREE-VARS NIL)))
+      (LET ((FUNS (SI:ENV-FUNCTIONS ENVIRONMENT)))
+	(WHEN (EVERY
+		#'(LAMBDA (FUN)
+		    (LET ((FUNCTION-PAIR (ASSOC FUN FUNS :TEST #'EQUAL)))
+		      (OR (NULL FUNCTION-PAIR)
+			  (AND (NOT MACROS-COUNT)
+			       (LET ((FUNCTION (SECOND FUNCTION-PAIR)))
+				 (AND (CONSP FUNCTION)
+				      (EQ (FIRST FUNCTION) 'SPECIAL)))))))
+		FREE-FUNCTIONS)
+	  ;; None of the free functions refer to the environment
+	  (SETQ FREE-FUNCTIONS NIL))))
+    (OR FREE-VARS FREE-BLOCKS FREE-TAGS FREE-FUNCTIONS)))
+
+(DEFUN FORM-FREE-VARIABLES-AND-SYMBOL-MACROS (FORM ENV)
+  (FUTURE-COMMON-LISP:NTH-VALUE
+    1
+    (SI:WITH-INTERPRETER-ENVIRONMENT 
+      (NEW-ENV ENV (PROGN (POP ENV) NIL) (POP ENV) (POP ENV) (POP ENV) (POP ENV))
+      ;; We will snapshot uses of symbol-macros as well as regular
+      ;; variables, so we don't want them to be expanded.  The easiest way
+      ;; to do this for our purposes is to just NIL out all the
+      ;; env-variables since that won't affect the free variables of the
+      ;; form.
+      (ANNOTATE-FORM FORM NIL NEW-ENV))))
+
+;;; Procedural knowledge of conditional and iteration special forms
+
+; Note that these functions will freely cdr off the end of the form when
+; that makes no difference to the ultimate result, to simplify the coding.
+
+(DEFPROP AND AND-OR-ANNOTATE ANNOTATE)
+(DEFPROP OR AND-OR-ANNOTATE ANNOTATE)
+(DEFPROP COMPILER:%ERROR-UNLESS AND-OR-ANNOTATE ANNOTATE)
+(DEFPROP COMPILER:%ERROR-WHEN AND-OR-ANNOTATE ANNOTATE)
+(DEFUN AND-OR-ANNOTATE (FORM IGNORE NOTEPAD)
+  (MAPFORMS-1 (CADR FORM))		;First clause executed unconditionally
+  (ANNOTATE-CONDITIONAL			;Everything after this is conditional
+    (ANNOTATE-FORMS (CDDR FORM))))
+
+;The hair in COND is primarily that the consequents of one clause
+;neither preceed nor follow the consequents of another, while the antecedents
+;follow each other.  Thus we must split the notepad into multiple independent pads.
+(DEFUN (COND ANNOTATE) (FORM IGNORE NOTEPAD)
+  (MAPFORMS-1 (CAADR FORM))		;First antecedent executed unconditionally
+  (ANNOTATE-CONDITIONAL			;Everything after this is conditional
+    (LOOP FOR (ANTE . CONSE) IN (CDR FORM)	;Iterate over clauses
+	  WITH SPLITS = NIL		;Collect split-off notepads for consequents
+	  AS FIRST-CLAUSE = T THEN NIL DO
+      (OR FIRST-CLAUSE
+	  (MAPFORMS-1 ANTE))		;Do antecedent if not done already
+      (UNLESS (NULL CONSE)		;Do consequents with a separate notepad
+	(LET ((SPLIT (FORK-NOTEPAD-MAYBE NOTEPAD)))
+	  (PUSH SPLIT SPLITS)
+	  (ANNOTATE-SPLIT-FORMS CONSE SPLIT)))
+      FINALLY				;Merge all the consequents consequences
+        (DOLIST (SPLIT SPLITS)
+	  (JOIN-NOTEPADS NOTEPAD SPLIT)))))
+
+;IF is just a simpler version of COND
+(DEFUN (IF ANNOTATE) (FORM IGNORE NOTEPAD)
+  (MAPFORMS-1 (CADR FORM) 'TEST)	;The test is executed unconditionally
+  (ANNOTATE-CONDITIONAL
+    (IF (NULL (CDDDR FORM))		;Check for 1-arm case (merely efficiency)
+	(MAPFORMS-1 (CADDR FORM))
+	(LET ((SPLIT (FORK-NOTEPAD-MAYBE NOTEPAD)))
+	  (MAPFORMS-1 (CADDR FORM))
+	  (ANNOTATE-SPLIT-FORMS (CDDDR FORM) SPLIT)
+	  (JOIN-NOTEPADS NOTEPAD SPLIT)))))
+
+;Annotate a list of forms, being careless about the USAGE
+;Fix this if we ever start depending on USAGE (will need to add more args)
+(DEFUN ANNOTATE-FORMS (LIST)
+  (DOLIST (FORM LIST)
+    (MAPFORMS-1 FORM)))
+
+;Annotate a list of forms with a different notepad, being careless about the USAGE
+(DEFUN ANNOTATE-SPLIT-FORMS (LIST NOTEPAD)
+  (LET ((*MAPFORMS-STATE* NOTEPAD))
+    (DOLIST (FORM LIST)
+      (MAPFORMS-1 FORM))))
+
+;;; Knowledge about various functions (not special forms)
+
+;; We have a little bit of knowledge of the primitive functions of the
+;; language: 
+
+;; Notice that we know nothing about any function that has any side effects.
+;; This is because all functions with side effects are equally uncontrolled.
+;; There is no point in going through the exercize of dividing them up into
+;; classes according to who can effect whom on a machine where RPLACA can be
+;; used to store into a local variable, or into an array...
+
+;; Notice that both classes of functions (simple and reader) have the
+;; property that it is always safe to not call them at all if it turns
+;; out that they are being called for effect.
+
+;; We record two attributes in the debugging info of a function:
+
+;; SIDE-EFFECTS which may be REDUCIBLE, SIMPLE, or READER, and
+;; REPLICABILITY which may be TWO-TIMES or MANY-TIMES.
+
+(EXPORT '(SIDE-EFFECTS REDUCIBLE SIMPLE READER))
+(EXPORT '(REPLICABILITY TWO-TIMES MANY-TIMES))
+
+(DEFPROP SIDE-EFFECTS T SI:DEBUG-INFO)
+(DEFPROP REPLICABILITY T SI:DEBUG-INFO)
+
+;The first value is:
+; SIMPLE - neither affects nor depends on the environment
+; READER - depends on the environment but doesn't change it
+; WRITER - may change the environment (and may also depend on it)
+;The second value is:
+; NIL - expensive to compute
+; TWO-TIMES - worth computing twice rather than binding a variable
+; MANY-TIMES - worth computing any number of times rather than binding a variable
+;The third value is:
+; NIL - ordinary
+; REDUCIBLE - do constant folding
+(DEFUN FUNCTION-ANNOTATION-CLASS (FUNCTION)
+  (DECLARE LT:(SIDE-EFFECTS READER)
+	   (VALUES SIDE-EFFECTS REPLICABILITY REDUCIBLE))
+  (LET ((INFO (DEBUGGING-INFO FUNCTION)))
+    (LET ((ATTR (CDR (ASSOC 'SIDE-EFFECTS INFO))))
+      (VALUES (COND ((NULL ATTR) 'WRITER)
+		    ((MEMBER 'SIMPLE ATTR) 'SIMPLE)
+		    ((MEMBER 'READER ATTR) 'READER)
+		    ((MEMBER 'REDUCIBLE ATTR) 'READER)
+		    (T 'WRITER))
+	      (SECOND (ASSOC 'REPLICABILITY INFO))
+	      (CAR (MEMBER 'REDUCIBLE ATTR))))))
+
+(DEFUN (SIDE-EFFECTS COMPILER:DEBUGGING-INFO-STYLE-CHECKER) (X)
+  (DOLIST (ATTR (CDR X))
+    (UNLESS (MEMBER ATTR '(SIMPLE READER REDUCIBLE WRITER))
+      (WARN '(:BAD-STYLE T)
+	    "~S is invalid in the declaration ~S; it will be ignored." ATTR X))))
+
+(DEFUN (REPLICABILITY COMPILER:DEBUGGING-INFO-STYLE-CHECKER) (X)
+  (DOLIST (ATTR (CDR X))
+    (UNLESS (MEMBER ATTR '(TWO-TIMES MANY-TIMES))
+      (WARN '(:BAD-STYLE T)
+	    "~S is invalid in the declaration ~S; it will be ignored." ATTR X))))

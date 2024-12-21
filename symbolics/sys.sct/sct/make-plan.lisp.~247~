@@ -1,0 +1,1825 @@
+;;; -*- Mode: LISP; Syntax: Zetalisp; Package: SCT; Base: 10; Lowercase: T -*-
+
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Plan builder for the System Construction Tool
+
+;; The WITH-SYSTEM-ENVIRONMENT-INTERNAL methods on systems and environments get to
+;; establish a dynamic environment in which plan-building takes place.
+(defmacro with-system-environment ((system system-op top-level-p keys) &body body)
+  `(lexpr-funcall #'with-system-environment-internal
+		  ,system ,system-op ,top-level-p
+		  #'(named-lambda with-system-environment-internal ()
+		      ;; Cache the system's file information, it will get
+		      ;; flushed later by FINISH-TOP-LEVEL-SYSTEM-OPERATION.
+		      (cl:pushnew ,system *system-caches-to-flush*)
+		      (lexpr-funcall #'encache-files-of-system
+				     ,system
+				     (operation-encache
+				       (assq ,system-op *system-operation-alist*))
+				     ,system-op ,keys)
+		      ;; Build the plan
+		      ,@body)
+		  ,keys))
+
+(defmethod (with-system-environment-internal basic-system)
+	   (system-op top-level-p continuation &rest keys)
+  (ignore system-op top-level-p keys)
+  (funcall continuation))
+
+(defmethod (with-system-environment-internal system)
+	   (system-op top-level-p continuation &rest keys)
+  (lexpr-funcall #'with-system-environment-internal
+		 environment
+		 system-op top-level-p continuation keys))
+
+;; Returns the system and a list of plan objects which, when executed, will carry
+;; out the requested operation on the named system
+;; Note that *SYSTEM*, *VERSION*, and *BRANCH* must be bound at a higher level
+;; Note that this does not recursively construct plans for component systems;
+;; that doesn't happen until you run the plans (with EXECUTE-PLAN) or flatten
+;; the plans (via FLATTEN-PLANS-FOR-COMPONENTS)
+(defun make-plan-for-system (system-op top-level-p &rest keys
+			     &key version system-branch machine-types
+				  original-system-op
+			     &allow-other-keys)
+  (declare (values plans system))
+  (validate-system-operation system-op top-level-p)
+  (setq original-system-op (or original-system-op system-op))
+  (let* ((*version* (canonicalize-system-version-number *system* version))
+	 (*branch* system-branch)
+	 (plans nil))
+    ;; Build the plan for each machine type.
+    ;; Note that building plans for multiple machine types can produce lots of
+    ;; duplicate operations, which should be eliminated at a higher level.
+    (si:with-rem-keywords (keys keys '(:original-system-op))
+      (loop for *current-machine-type* in machine-types doing
+	(condition-case-if (eq machine-types *all-machine-types*) ()
+	     (let ((plan (lexpr-funcall #'make-plan-for-system-1
+					system-op top-level-p
+					:original-system-op original-system-op
+					keys)))
+	       (when plan (setq plans (append plans plan))))
+	   ;; If the user specified :MACHINE-TYPES :ALL, then it's OK if
+	   ;; we don't happen to find any particular machine-type.
+	   (system-not-found-for-machine-type nil))))
+    ;; Remember that we have built this plan for this system,
+    ;; and remember to clean up later
+    (when (boundp '*systems-with-plans-built*)
+      (without-interrupts
+	(si:push* (system-name *system*) *systems-with-plans-built*)
+	(push system-op (system-plans-built *system*))))
+    ;; If this is a funny operation like :DISTRIBUTE, then what we do is
+    ;; make a plan to compile and load the entire system, then remove the
+    ;; driving and documentation functions so that the defined operation
+    ;; handlers can do the real work.  Don't zap the plan for system
+    ;; modules, because we still have to construct the plans for the
+    ;; component systems.
+    (when (operation-funny-p
+	    (assq original-system-op *system-operation-alist*))
+      (loop for plan in plans
+	    when (and plan (not (typep (plan-module plan) 'system-module)))
+	      do (setf (plan-driving-function plan) nil)
+		 (setf (plan-documentation plan) nil)))
+    (values plans *system*)))
+
+(defun make-plan-for-system-1 (system-op top-level-p &rest keys
+			       &key recompile reload original-system-op
+			       &allow-other-keys)
+  (with-system-environment (*system* system-op top-level-p keys)
+    (let* ((funny-p (operation-funny-p
+		      (assq original-system-op *system-operation-alist*)))
+	   (sys-op (if funny-p :compile system-op))
+	   (plans
+	     (unless (memq sys-op (system-plans-built *system*))
+	       ;; If we have already built a plan for this system-op for this
+	       ;; system during this run, don't do it again.  The algorithm we
+	       ;; use for plan-building ensures that the ordering we get will
+	       ;; be correct in the face of this optimization.  Not only does
+	       ;; this optimization get rid of redundant plan-building (which
+	       ;; can be slow), but it also eliminates lots of probes and
+	       ;; multiple-file-plists (which can be glacial).
+	       (si:with-rem-keywords (keys keys '(:reload :reload-for-components
+						  :recompile :original-system-op))
+		 (lexpr-funcall #'order-dependencies
+				*system* sys-op
+				;; For documentation and flattening purposes
+				:original-system-op original-system-op
+				:recompile (or recompile funny-p)
+				;; :RECOMPILE forces :RELOAD, but not for components
+				:reload (if (or top-level-p
+						(typep *system* 'subsystem))
+					    (or reload recompile funny-p)
+					  (or reload funny-p))
+				;; Component systems see the true value of :RELOAD
+				:reload-for-components (or reload funny-p)
+				keys)))))
+      (values plans *system*))))
+
+;; Like the above, but does not use the full plan-building mechanism
+(defun make-simple-plan-for-system (system-op top-level-p &rest keys
+				    &key version system-branch machine-types
+					 original-system-op
+				    &allow-other-keys)
+  (declare (values plans system))
+  (validate-system-operation system-op top-level-p)
+  (setq original-system-op (or original-system-op system-op))
+  ;; We need to go back to the passed version number, so that recursive
+  ;; calls will pass the version properly.
+  (let* ((*version* (canonicalize-system-version-number *system* version))
+	 (*branch* system-branch)
+	 (latest-version (canonicalize-system-version-number *system* :latest))
+	 (plans nil))
+    ;; Build the plan for each machine type.
+    ;; Note that building plans for multiple machine types can produce lots of
+    ;; duplicate operations, which should be eliminated at a higher level.
+    (loop for *current-machine-type* in machine-types doing
+      (condition-case-if (eq machine-types *all-machine-types*) ()
+	   (let ((inputs-and-outputs 
+		   (let-if (eq *version* :newest)
+			   ((*version* latest-version))
+		     (get-system-input-and-output-source-files
+		       *system* *version* :system-branch system-branch
+		       :machine-type *current-machine-type*))))
+	     (when (eq *version* :newest)
+	       ;; The journals told us too much in this case...
+	       (loop for input-and-output in inputs-and-outputs
+		     as (input output) = input-and-output
+		     doing
+		 (when (typep input 'fs:pathname)
+		   (setf (first input-and-output) (send input :new-version :newest)))
+		 (when (typep output 'fs:pathname)
+		   (setf (second input-and-output) (send output :new-version :newest)))))
+	     (let ((plan (lexpr-funcall #'make-simple-plan-for-system-1
+					inputs-and-outputs system-op top-level-p
+					keys)))
+	       (when plan (setq plans (append plans plan)))))
+	 (system-not-found-for-machine-type nil)))
+    (when (boundp '*systems-with-plans-built*)
+      (without-interrupts
+	(si:push* (system-name *system*) *systems-with-plans-built*)
+	(push system-op (system-plans-built *system*))))
+    (when (operation-funny-p
+	    (assq original-system-op *system-operation-alist*))
+      (loop for plan in plans
+	    when (and plan (not (typep (plan-module plan) 'system-module)))
+	      do (setf (plan-driving-function plan) nil)
+		 (setf (plan-documentation plan) nil)))
+    (values plans *system*)))
+
+(defun make-simple-plan-for-system-1 (inputs-and-outputs system-op top-level-p &rest keys
+				      &key parent-version (include-components t)
+					   no-reload-system-declaration
+				      &allow-other-keys)
+  (with-system-environment (*system* system-op top-level-p keys)
+    (let* ((driving-function (operation-driving-function
+			       (assq system-op *system-operation-alist*)))
+	   (documentation (operation-documentation
+			    (assq system-op *system-operation-alist*)))
+	   (plans nil))
+      (loop for (input output) in inputs-and-outputs
+	    as input-and-output =
+	       (when input
+		 (if output `(,input ,output) `(,input)))
+	    as plan =
+	       (if (stringp input)
+		   (let ((component (find-system-named input nil t)))
+		     ;; Only recursively build the plan if this is a subsystem
+		     ;; or we are including components.  Note that the call to
+		     ;; FIND-SYSTEM-NAMED will return NIL if the component has
+		     ;; not yet defined, which is OK since subsystems are
+		     ;; supposed to be defined in the same file as their parents.
+		     (when (or include-components
+			       (typep component 'subsystem))
+		       (multiple-value-bind (component-version component-branch)
+			   (component-system-version-and-branch (or component input))
+			 ;; Now that we have the branch and version, we can
+			 ;; get the right sysdcl for a true component system 
+			 (setq component
+			       (with-stack-list (s component component-version component-branch)
+				 (find-system-named s)))
+			 (when (not (system-maintain-journals component))
+			   (setq component-version :newest))
+			 (let* ((parent-version
+				  (if (typep *system* 'subsystem)
+				      (or parent-version *version*)
+				    *version*))
+				(*system* component)
+				(*version* (canonicalize-system-version-number
+					     *system* component-version
+					     :ignore-subsystems t))
+				(*branch* component-branch))
+			   (unless no-reload-system-declaration
+			     (setq *system* (reload-system-declaration-if-necessary
+					      *system* *version* *branch*)
+				   *branch* (or *branch*
+						(system-default-system-branch *system*))))
+			   (si:with-rem-keywords (keys keys
+						  '(:version :system-branch
+						    :top-level-p))
+			     (si:with-indentation (standard-output 2)
+			       ;; Now build the plan for the component
+			       (lexpr-funcall #'make-simple-plan-for-system
+					      system-op nil
+					      :version *version*
+					      :system-branch *branch*
+					      :top-level-p nil
+					      :parent-version parent-version
+					      keys)))))))
+		 (list (make-plan
+			 (module-from-pathname *system* (car input-and-output))
+			 *system*
+			 :inputs input-and-output
+			 :outputs input-and-output
+			 :driving-function driving-function
+			 :documentation documentation)))
+	    do (when plan (setq plans (append plans plan))))
+      (values plans *system*))))
+
+
+;; Surely we can do better than this, but the name says it all...
+(defconst *kludge-for-null-module*
+	  (make-instance 'lisp-module
+			 :name 'null-module-kludge
+			 :source-category '((:basic))
+			 :distribute-sources t
+			 :distribute-binaries t))
+
+;; Since we are building the plans from the journals rather than from the
+;; system object, we have to be able to map from a pathname to the module
+;; in which that pathname lives.
+(defun module-from-pathname (system pathname)
+  (let ((pathname (send pathname :generic-pathname))
+	(cached-module (send pathname :get 'sct:system-module)))
+    (when (neq (send pathname :get 'sct:system) system)
+      (return-from module-from-pathname *kludge-for-null-module*))
+    (when cached-module
+      (return-from module-from-pathname cached-module))
+    (labels ((cache-pathname-modules (system)
+	       (loop for module in (system-modules system) doing
+		 (if (typep module 'system-module)
+		     (loop for (component-name) in (module-inputs module)
+			   as component = (find-system-named component-name nil t) doing
+		       (when (typep component 'subsystem)
+			 (cache-pathname-modules component)))
+		   (loop for (input output) in (module-inputs module) doing
+		     (let ((igeneric (send input :generic-pathname))
+			   (ogeneric (and output (send output :generic-pathname))))
+		       (send igeneric :putprop module 'sct:system-module)
+		       (when (and output (neq igeneric ogeneric))
+			 (send ogeneric :putprop module 'sct:system-module))))))))
+      (cache-pathname-modules (subsystem-parent-system system)))
+    (or (send pathname :get 'sct:system-module)
+	(progn
+	  (send pathname :putprop *kludge-for-null-module* 'sct:system-module)
+	  *kludge-for-null-module*))))
+
+
+(defvar *inhibit-validating-system-operation* nil)
+(defun validate-system-operation (system-op top-level-p)
+  (when (and top-level-p
+	     (not *inhibit-validating-system-operation*)
+	     (typep *system* 'subsystem)
+	     (null (operation-subsystems-ok
+		     (assq system-op *system-operation-alist*))))
+    (ferror "You cannot do a top-level ~@(~A~) operation on the subsystem ~A"
+      system-op *system*)))
+
+(defun check-depended-upon-systems (system-op)
+  (let ((offenders (loop for required in (system-required-systems *system*)
+			 as system = (find-system-named required nil t)
+			 as svl = (and system (system-version-loaded system))
+			 when (memq svl '(nil :incomplete))
+			   collect required)))
+    (when offenders
+      (setq offenders (format:print-list nil "~A" offenders))
+      (cl:cerror "~@(~A~) the system anyway"
+		 "In order to ~@(~A~) the system ~A, ~
+		  the following systems must be loaded:~%  ~A"
+	system-op *system* offenders))))
+
+
+;; The purpose of this function is twofold: (1) recursively gather up all of the
+;; version and branch information for all components of this system, resolving
+;; any inconsistencies and conflicts, and (2) ensure that the digraph for all
+;; of the components is not circular.
+;;--- When describing a system, this should be less stringent.
+(defun gather-component-system-information (system version system-op
+					    &rest keys
+					    &key system-branch
+						 no-reload-system-declaration
+						 component-version (include-components t)
+						 (top-level-p t)
+						 machine-type-for-encaching
+					    &allow-other-keys)
+  (ignore keys)
+  ;; This is modelled after BUILD-DEPENDENCY-GRAPH
+  (when (system-component-systems system)
+    (let ((*current-machine-type*
+	    (or (and top-level-p machine-type-for-encaching)
+		*current-machine-type*))
+	  (circularity-alist nil)
+	  (dependency-graph nil)
+	  (*component-system-info* nil))
+      (labels ((add-system (system version system-branch component-version father)
+		 (let* ((system-branch (canonicalize-system-branch system-branch))
+			(system (with-stack-list (s system version system-branch)
+				  (find-system-named s)))
+			(real-version
+			  (and version (neq version :ask)
+			       (let ((*silent-p* t))
+				 (canonicalize-system-version-number system version)))))
+		   ;; Make sure we have the correct version of this system
+		   (unless no-reload-system-declaration
+		     (setq system (reload-system-declaration-if-necessary
+				    system real-version system-branch)
+			   system-branch (or system-branch
+					     (system-default-system-branch system))))
+		   (setq system (load-system-declaration-if-compressed
+				  system real-version system-branch))
+		   ;; Remember the branch and version
+		   (push `(,(system-name system) ,real-version ,system-branch)
+			 *component-system-info*)
+		   ;; Compute the piece of the dependency graph for this component
+		   (let* ((mod*op system)		;we'll just use the system here
+			  (node (car (mem #'(lambda (m*o node)
+					      (equal (node-module*operation node) m*o))
+					  mod*op dependency-graph)))
+			  (circularity-count (assq (system-name system) circularity-alist)))
+		     ;; Add this node if it doesn't already exist
+		     (when (null node)
+		       (push (setq node (make-node module*operation mod*op))
+			     dependency-graph))
+		     (when father
+		       (cl:pushnew node (node-dependents father))
+		       (incf (node-n-inward-edges node)))
+		     (when (null circularity-count)
+		       (setq circularity-count (list (system-name system) 0))
+		       (push circularity-count circularity-alist))
+		     ;; Now recurse over the dependencies in this module for this
+		     ;; operation, the father of the next being the current node.
+		     (when (and include-components
+				( (second circularity-count) 5))
+		       (incf (second circularity-count))
+		       (if (eq version :newest)
+			   (loop for module in (system-modules system)
+				 doing
+			     (when (typep module 'system-module)
+			       (loop for (comp-name) in (module-inputs module)
+				     doing
+				 ;; Need to do a bit of bootstrapping here, so that
+				 ;; we can compute the branch and version for the
+				 ;; component before we ever read its sysdcl
+				 (let* ((component (find-system-named comp-name nil t))
+					(comp-version
+					  (map-operation-and-version-to-component-version
+					    (or component comp-name) system-op
+					    version version
+					    (or component-version
+						(send module :get :version))))
+					(*system* component)
+					(comp-branch
+					  (vc-branch-if-appropriate module system-branch)))
+				   ;; Now that we've figured out the branch and version
+				   ;; for the component, go get the correct sysdcl
+				   (setq component (with-stack-list (s comp-name comp-version comp-branch)
+						     (find-system-named s))
+					 *system* component)
+				   ;; Revise our ideas based on the real system definition
+				   (when (not (system-maintain-journals component))
+				     (setq comp-version :newest))
+				   (when (not (system-version-controlled component))
+				     (setq comp-branch nil))
+				   (add-system component comp-version comp-branch
+					       component-version node)))))
+			 (when (eq version :ask)
+			   ;; If we have to ask about this version, then we have to
+			   ;; ask about everything underneath it, too.
+			   (setq version :latest
+				 component-version :ask))
+			 (multiple-value-bind (nil file-alist)
+			     (get-system-major-version system version)
+			   (loop for thing in (cdr (assq :inputs-and-outputs file-alist))
+				 as (comp-name comp-version) = thing
+				 doing
+			     (multiple-value-bind (type comp-version comp-branch)
+				 (decode-journalled-input-version comp-version)
+			       (when (eq type :system)
+				 ;; Get the correct sysdcl for this version of the
+				 ;; system.  COMP-VERSION and COMP-BRANCH came from
+				 ;; the journal of the parent, so the call later to
+				 ;; MAP-OPERATION-AND-VERSION-TO-COMPONENT-VERSION
+				 ;; shouldn't actually change the version.  If it
+				 ;; does, too bad, we will have to read the correct
+				 ;; version of the sysdcl file later.
+				 (let* ((module
+					  ;; We need to find the module which requested
+					  ;; this component system...
+					  (loop named find-module
+						for module in (system-modules system) doing
+					    (when (and (typep module 'system-module)
+						       (cl:assoc comp-name
+								 (module-inputs module)
+								 :test #'string-equal))
+					      (return-from find-module module))))
+					(comp-version
+					  ;; We can get away with doing this here
+					  ;; because we know that comp-name names
+					  ;; a true component system (since subsystems
+					  ;; are not journalled).
+					  (map-operation-and-version-to-component-version
+					    comp-name system-op
+					    version comp-version
+					    (or component-version
+						(when module
+						  (send module :get :version)))))
+					(component
+					  (find-system-named
+					    (list comp-name comp-version comp-branch)))
+					(*system* component))
+				   (when (not (system-maintain-journals component))
+				     (setq comp-version :newest))
+				   (when (not (system-version-controlled component))
+				     (setq comp-branch nil))
+				   (add-system component comp-version comp-branch
+					       component-version node))))))))))))
+	(add-system system version system-branch component-version nil))
+      ;; If there are circularities, this will complain
+      (let ((roots (loop for node in dependency-graph
+			 when (zerop (node-n-inward-edges node))
+			   collect node)))
+	(when (null roots)
+	  (ferror "The system ~A apparently has circular dependencies with ~
+		   all of its components" system))
+	(order-dependency-graph dependency-graph roots nil))
+      ;; Now do some consistency checks, namely, if the user is asking to load
+      ;; some version of a system, but there is already another version loaded,
+      ;; then we have to ask him what he really means.
+      ;;--- There's a bug here.  The problem is that, if we ask the user to
+      ;;--- resolve some problems by hand, the component information which
+      ;;--- we carefully gathered above may be obsolete, since changing the
+      ;;--- version of a component may necessitate gathering still more info.
+      ;;--- For example, the new version of a component may have some new
+      ;;--- components itself.  This whole function needs to iterate...
+      (setq *component-system-info* (sortcar *component-system-info* #'string<))
+      (loop with ask = nil
+	    with loaded-version with loaded-branch
+	    for c-v-b on *component-system-info*
+	    as (c v b) = (first c-v-b)
+	    as (cn vn bn) = (second c-v-b)
+	    as component = (find-system-named c)
+	    ;; Only loading and compiling systems care about inconsistencies
+	    ;;--- I dunno about this.  Maybe there should just be a top-level
+	    ;;--- binding of the environment, and then leave it at that.  Or
+	    ;;--- maybe component systems as well as subsystems should use
+	    ;;--- the environment of the parent.  Who knows.  --SWM
+	    do (letf (((system-environment (subsystem-parent-system component))
+		       (if (eq *current-machine-type* *local-machine-type*)
+			   (system-environment component)
+			   (find-environment *current-machine-type*
+					     (system-environment component)))))
+		 (setq loaded-version (if (memq system-op '(:load :compile))
+					  (system-version-loaded component)
+					  v)
+		       loaded-branch (canonicalize-system-branch
+				       (if (memq system-op '(:load :compile))
+					   (system-branch-loaded component)
+					   b))))
+	    ;; Don't ask about the top-level system, we have to assume that the
+	    ;; user knows what he is talking about.  Ask about component systems
+	    ;; which show up more than once in a different form, or are loaded as
+	    ;; a different version.
+	    do (when (and (neq (system-name system) c)
+			  (or (and loaded-version
+				   (neq loaded-version :incomplete)
+				   (or (neq v loaded-version)
+				       (neq b loaded-branch)))
+			      (and (eq c cn)
+				   (or (neq v vn)
+				       (neq b bn)))))
+		 (setf (second (first c-v-b)) `(:ask ,v)))
+	       (when (or (listp (second (first c-v-b)))
+			 (eq (second (first c-v-b)) :ask))
+		 (setq ask t))
+	    finally
+	      (setq *component-system-info*
+		    (si:eliminate-duplicates *component-system-info*
+					     (lambda (x y)
+					       (eq (first x) (first y)))))
+	      (when ask
+		;; To avoid visual clutter, ask only about ones which mismatch
+		(loop for c-v-b in *component-system-info*
+		      as (c v) = c-v-b
+		      as ask = (or (listp v) (eq v :ask))
+		      when ask
+			collect c-v-b into to-ask
+			and do (when (boundp '*cached-component-directories*)
+				 ;; Decache the component directories for any systems
+				 ;; whose versions can potentially be changed below
+				 (let ((cache (assq c *cached-component-directories*)))
+				   (when cache
+				     (setq *cached-component-directories*
+					   (delq cache *cached-component-directories*)))))
+		      when (not ask)
+			collect c-v-b into not-to-ask
+		      finally
+			;; Ask the user to supply everything we aren't sure about
+			(when to-ask		;in case we botched above...
+			  (setq *component-system-info*
+				(append not-to-ask
+					(collect-component-versions-from-menu
+					  system system-op to-ask))))))
+	      (return *component-system-info*)))))
+
+;; The default mapping from (operation x version)  component-version
+(defvar *default-version-mapping*
+	'(((:compile :newest) :released)	;compiling :NEWEST loads :RELEASED
+	  #---ignore ((:* :keyword) :number)	;keywords snapshot the number
+	  #+++ignore ((:* :keyword) :keyword)	;any other keyword passes through
+	  ((:* :number) :number)))		;any numeric version passes through
+
+;; There is a bootstrapping issue here: GATHER-COMPONENT-SYSTEM-INFORMATION
+;; can call this before it actually has read the sysdcl for COMPONENT (in
+;; which case COMPONENT is the name of the component).  If this is the
+;; case, we know that COMPONENT is not a subsystem (since they are always
+;; defined in the same place as the parent), so we just run the normal
+;; version mapping.  If COMPONENT turns out to be unjournalled, then who
+;; cares?  We'll throw out the version number and use :NEWEST.
+(defun map-operation-and-version-to-component-version
+       (component operation version numeric-version override)
+  (if (and (typep component 'basic-system)
+	   (or (not (system-maintain-journals component))
+	       (typep component 'subsystem)))
+      ;; Subsystems and unjournalled systems always use :NEWEST
+      :newest
+    (flet ((mapv (mapping)
+	     (loop for ((op ver) cver) in mapping
+		   ;; When the operation we have matches the operation in the map,
+		   ;; and the version we have matches the version in the map (taking
+		   ;; into account "wildcards"...)
+		   when (and (or (eq operation op)
+				 (string-equal op :*))
+			     (or (eq version ver)
+				 (string-equal ver :*)
+				 (and (numberp version)
+				      (eq ver :number))
+				 (and (keywordp version)
+				      (eq ver :keyword))))
+		     ;; ...then return the appropriate version
+		     do (return (selectq cver
+				  (:keyword version)
+				  (:number  numeric-version)
+				  (otherwise cver))))))
+      (let* ((*component-system* component)
+	     (*component-system-requested-version* numeric-version)
+	     (component-version
+	       (or (and override (eval override))	;user can supply this from the CP
+		   (eval				;there could be a form here...
+		     (or (mapv (system-version-mapping *system*))
+			 (mapv *default-version-mapping*)
+			 (cl:cerror "Use a menu to select the component version later"
+				    "Couldn't map from ~S x ~S in system ~A ~
+			             to a version for component system ~A"
+			   operation version *system* *component-system*)
+			 :ask)))))
+	component-version))))
+
+;; Can be "called" via :VERSION clause in a DEFSYSTEM...
+(defun component-loaded-or-already-requested ()
+  (let ((component (find-system-named *component-system* nil t)))
+    (when component
+      (or (get-system-version component)
+	  (second (assq (system-name component) *component-system-info*))))))
+
+;; Given the component-system version info, pop up an AVV menu, and collect
+;; the component-version as specified by the user
+(defun collect-component-versions-from-menu (system system-op component-info)
+  (multiple-value-bind (components versions loaded-versions branches loaded-branches)
+      ;; For each system, collect the suggested version, the loaded version,
+      ;; the suggested branch, and the loaded branch.  We do it up here to
+      ;; eliminate unnecessary AVV consing.
+      (loop for (component cversion cbranch) in component-info
+	    as system = (find-system-named component)	;system should be defined
+	    as loaded-version = (system-version-loaded system)
+	    as loaded-branch = (system-branch-loaded system)
+	    collect system into components
+	    collect (if (listp cversion) (second cversion) cversion) into versions
+	    collect cbranch into branches
+	    collect (if (or (null loaded-version) (eq loaded-version :incomplete))
+			nil loaded-version) into loaded-versions
+	    collect (if (or (null loaded-version) (eq loaded-version :incomplete))
+			nil loaded-branch) into loaded-branches
+	    finally (return (values components
+				    versions loaded-versions
+				    branches loaded-branches)))
+    ;; Now ask the user what he really wants
+    (dw:accepting-values (query-io :label "Component system versions")
+      (format query-io
+	  "~'bThe ~@(~A~) operation for system ~A specifies loading some component systems~@
+	       for which different versions are already loaded.~%~"
+	system-op system)
+      (let ((default-to-loaded-versions
+	      (scl:accept 'scl:boolean
+			  :default t
+			  :prompt "Use the loaded versions instead of the versions specified by the plan")))
+	(loop for component in components
+	      for version in versions
+	      for loaded-version in loaded-versions
+	      for branch in branches
+	      for loaded-branch in loaded-branches
+	      as initial-prompt = (format nil "For system ~A," component)
+	      collect 
+		`(,(system-name component)
+		  ,(scl:accept 'sct:system-version
+			       :default (if default-to-loaded-versions
+					    loaded-version
+					  (if (eq version :ask) nil version))
+			       :prompt (format nil
+					   "~A use what version~
+					    ~@[ (loaded version is ~@(~D~))~]"
+					 initial-prompt
+					 (and (neq loaded-version version)
+					      loaded-version)))
+		  ,(when (system-version-controlled component)
+		     (canonicalize-system-branch
+		       (scl:accept 'sct:system-branch
+				   :default (if default-to-loaded-versions
+						loaded-branch
+					      branch)
+				   :prompt (format nil
+					       "~VT use what branch~
+					        ~@[ (loaded branch is ~@(~A~))~]"
+					     (string-length initial-prompt)
+					     (and (neq loaded-branch branch)
+						  loaded-branch)))))))))))
+
+
+;; Return the bottommost system which contains SUBSYSTEM.  This is simpler than
+;; PATCHABLE-SYSTEM-INTERNAL because a subsystem can be a component of only one
+;; other system or subsystem.
+(defun subsystem-parent-system (subsystem)
+  (loop for system = subsystem then (car (system-component-of-systems system))
+	do (unless (typep system 'subsystem)
+	     (return system))))
+
+(defmethod (flush-patch-caches system) ()
+  (setq loaded-patches nil
+	loaded-patch-dir-creation-date nil
+	cached-patch-dir nil
+	cached-patch-dir-file-info nil))
+
+;; Looks for a pathname in a alist, matching on everything the version
+(defmethod (flush-file-property-list-cache basic-system) ()
+  (setq files-info nil))
+
+;; Pathname info hash keys are a pair consisting of the pathname and the
+;; value of *CURRENT-MACHINE-TYPE*
+(defun pathname-info-hash-function (key)
+  ;; The only two things we can have are pathname instances or keywords,
+  ;; which are the canonicalized representation of system names.
+  (destructuring-bind (pathname machine-type) key
+    (if (instancep pathname)
+	(multiple-value-bind (host device directory name type)
+	    (send pathname :all-components)
+	  (with-stack-list (key name type directory device host machine-type)
+	    (cli::xequal-hash key)))
+      (with-stack-list (key pathname machine-type)
+	(cli::xequal-hash key)))))
+
+(defmacro pathname-component-compare (x y)
+  ;; Highly bummed, since this is used so much.  There are some assumptions here
+  ;; which cannot be made in general: (1) all of the pathnames are canonicalized,
+  ;; so all of the components are either strings, lists of strings, or parsed
+  ;; objects, and (2) we never compare version numbers
+  `(or
+     ;; Quick test for host objects and canonical types
+     (eql ,x ,y)
+     ;; Compare directory lists
+     (equal ,x ,y)
+     ;; Compare pathnames and devices
+     (and (stringp ,x)
+	  (stringp ,y)
+	  (let ((lx (string-length ,x))
+		(ly (string-length ,y)))
+	    (and (= lx ly)
+		 (%string-equal ,x 0 ,y 0 lx))))))
+
+(defun pathname-info-compare-function (key1 key2)
+  (destructuring-bind (pathname1 machine-type1) key1
+    (destructuring-bind (pathname2 machine-type2) key2
+      (and (eql machine-type1 machine-type2)
+	   (or (eql pathname1 pathname2)	;quick way out
+	       (and (instancep pathname1)
+		    (instancep pathname2)
+		    (multiple-value-bind (host1 device1 directory1 name1 type1)
+			(send pathname1 :all-components)
+		      (multiple-value-bind (host2 device2 directory2 name2 type2)
+			  (send pathname2 :all-components)
+			(and (pathname-component-compare name1 name2)
+			     (pathname-component-compare type1 type2)
+			     (pathname-component-compare directory1 directory2)
+			     (pathname-component-compare device1 device2)
+			     (pathname-component-compare host1 host2))))))))))
+
+(defun make-pathname-info-table (size)
+  (scl:make-hash-table :size size
+		       :test #'pathname-info-compare-function
+		       :hash-function #'pathname-info-hash-function
+		       :store-hash-code t))
+
+(defun get-info-for-pathname (pathname table)
+  (declare (values info pathname found-p))
+  (and table					;better than explosions
+       (with-stack-list (key pathname *current-machine-type*)
+	 (multiple-value-bind (info found-p found-key)
+	     (scl:gethash key table)
+	   (values info (first found-key) found-p)))))
+
+(cl:defsetf get-info-for-pathname set-info-for-pathname)
+(defun set-info-for-pathname (pathname table info)
+  (setf (scl:gethash (list pathname *current-machine-type*) table) info))
+
+(defmethod (get-system-journal-directory system) ()
+  (cond (journal-directory)			;already cached
+	(default-pathname			; else create from default-pathname + "patch"
+	 (setq journal-directory
+	       (send (merge-pathname-with-defaults "patch" :lisp self)
+		     :pathname-as-directory)))
+	(t
+	 (setq journal-directory (create-fallback-journal-directory self)))))
+
+
+;; Encache the file-info for an entire system.
+
+;; We do a couple of optimizations here: (1) if we are loading a system for the
+;; very first time, then there is no need to look at the file system, (2) if we
+;; are compiling (or loading) a system, but have specified either recompile
+;; (reload) or no-compile (never-load), then there is no need to do anything
+;; (this is because we must be dealing with :NEWEST files in the case of
+;; reloading and recompiling), and (3) we only collect the files which each
+;; top-level operation is likely to use (i.e., the ENCACHE argument).  If any
+;; files are missed, we just pick up the information later, one piece at a time.
+;; *SYSTEM* and *VERSION* are implicit inputs, :VERSION is used to track the
+;; correct version for component systems.
+;; The ENCACHE argument does double duty: it controls how file version information
+;; is gathered, and how file creation-time information is gathered.  The special
+;; case of :ENCACHE NIL means to gather version info, but not creation-time info.
+;;*** Do not undertake changing this function lightly, it has very fragile
+;;*** interactions with the rest of SCT.  I consider this unmodularity worth
+;;*** the hair because the performance payoffs are large.  --SWM
+(defmethod (encache-files-of-system system) (&optional (encache :both) system-op
+					     &rest keys
+					     &key reload recompile
+						  never-load no-compile
+						  system-branch
+						  original-system-op
+						  (include-components t)
+						  distribute-sources
+						  included-files-checkpoint
+						  use-cached-checkpoint
+						  (top-level-p t)
+						  machine-type-for-encaching
+					     &allow-other-keys)
+  
+  (when (eq encache :nothing)
+    (return-from encache-files-of-system nil))
+  (if (not (boundp '*component-system-info*))
+      (ferror "Some plan-building procedure failed to bind ~S"
+	'*component-system-info*)
+    (when (and top-level-p (null *component-system-info*))
+      ;; The first time through, gather up all of the component-system version info
+      ;; while checking that there are not circular dependencies
+      (setq *component-system-info*
+	    (lexpr-funcall #'gather-component-system-information
+			   *system* *version* original-system-op keys))))
+  (tv:noting-progress-if (and *maintain-sct-progress-note*
+			      ;; The progress-note is just a red herring for these
+			      (not (null encache)))
+      ((format nil "Caching file properties for ~A" self) *sct-progress-note*)
+    (setq system-op (or original-system-op system-op))
+    (let* ((old-*current-machine-type* *current-machine-type*))
+      (labels
+	((collect-file-info (files file-alist &optional dont-get-properties)
+	   ;; If we are distributing source files, then we need to look at all
+	   ;; the patch files to see what source file versions are represented
+	   ;; in them; update the file list for the system to include the highest
+	   ;; version of each of these.
+	   (when (and (eq system-op :distribute) distribute-sources)
+	     ;; Don't do this if we will end up using .NEWEST and are not interested
+	     ;; in checkpoints at all
+	     (unless (and (eq file-alist :newest)
+			  (or (null included-files-checkpoint)
+			      (eq included-files-checkpoint :none)))
+	       (setq files (merge-changed-source-files
+			     files *system* *version* included-files-checkpoint
+			     :use-cached-checkpoint use-cached-checkpoint))))
+	   (when (null files-info)
+	     (setq files-info (make-pathname-info-table (* (length files) 2))))
+	   ;; Collect file-info for all of the files.
+	   (if (or dont-get-properties
+		   (null encache)
+		   (and (eq system-op :load)
+			;; Can't optimize if the loaded version in :INCOMPLETE,
+			;; because that means we might have loaded something.
+			(null (system-version-loaded (subsystem-parent-system *system*)))))
+	       ;; If we need no file-info or we are freshly loading a system,
+	       ;; then all we need is the version info
+	       (if (not-in-cold-load-environment environment)
+		   ;; Bind *CURRENT-MACHINE-TYPE* to its old self so that the pathnames
+		   ;; get entered with the correct key.
+		   (loop with *current-machine-type* = old-*current-machine-type*
+			 for file in files
+			 do (setf (get-info-for-pathname file files-info) nil))
+		 ;; If we are loading a system in the cold-load environment, then
+		 ;; assume that the cold-loader got all of the necessary information
+		 ;; right, and just gather it straight from the world.
+		 (loop with *current-machine-type* = old-*current-machine-type*
+		       for file in files
+		       do (setf (get-info-for-pathname file files-info)
+				(let ((info (get-file-loaded-info environment file nil)))
+				  (and info
+				       `(:creation-date ,(cdr info)
+					 :truename ,(car info)))))))
+	     (loop with *current-machine-type* = old-*current-machine-type*
+		   for (file . props) in (encache-file-properties
+					   environment (nreverse files))
+		   do (setf (get-info-for-pathname file files-info) props)))
+	   (collect-component-info file-alist))
+	 (component-system-version (component)
+	   (let ((component-name (system-name component)))
+	     (or (assq component-name *component-system-info*)
+		 (unless (or (typep component 'subsystem)
+			     (and (typep component 'basic-system)
+				  (not (system-maintain-journals component)))
+			     (not include-components)	;"don't care"
+			     (eq *version* :newest))
+		   ;; Let the user decide what to do
+		   (signal-proceed-case ((new-version)
+					 'no-component-version
+					 :system *system*
+					 :component component
+					 :version *version*)
+		     (:new-value (list component-name new-version))
+		     (:no-action (list component-name new-version))))
+		 ;; Unjournalled systems and subsystems just use :NEWEST
+		 (list component-name :newest))))
+	 (collect-component-info (file-alist)
+	   ;; Collect version numbers for all component systems (not subsystems,
+	   ;; since they are not recorded in the journal).  Note that, by default,
+	   ;; compiling a system loads the :RELEASED (not :NEWEST) version of its
+	   ;; components; use :INCLUDE-COMPONENTS NIL or :COMPONENT-VERSION <whatever>
+	   ;; to inhibit this.
+	   (when (null files-info)
+	     (setq files-info (make-pathname-info-table 50.)))
+	   (let ((component-info
+		   (if (eq file-alist :newest)
+		       (loop for module in modules
+			     when (typep module 'system-module)
+			       nconc
+				 (loop for (comp-name) in (module-inputs module)
+				       as component = (find-system-named comp-name)
+				       when (typep component 'basic-system)
+					 collect
+					   (component-system-version component)))
+		     (loop with type
+			   for thing in (cdr (assq :inputs-and-outputs file-alist))
+			   as (comp-name comp-version) = thing
+			   do (multiple-value (type nil nil)
+				(decode-journalled-input-version comp-version))
+			   when (eq type :system)
+			     collect
+			       (let ((component (find-system-named comp-name)))
+				 (component-system-version component))))))
+	     (loop with *current-machine-type* = old-*current-machine-type*
+		   for (component . info) in component-info
+		   do (setf (get-info-for-pathname component files-info) info)))))
+	(if (or *date-testing-off*
+		(and (eq *version* :newest)
+		     (or (and (eq system-op :load)
+			      (or reload never-load))
+			 (and (eq system-op :compile)
+			      (or recompile (and no-compile never-load)))
+			 (and (eq system-op :load)
+			      (null (system-version-loaded (subsystem-parent-system *system*)))
+			      (not-in-cold-load-environment environment)))))
+	    ;; For the case where we are reloading or recompiling an entire system
+	    ;; (with :VERSION :NEWEST), just gather information about the latest
+	    ;; versions of the components, since we will always be getting the
+	    ;; newest versions of the disk files.
+	    (collect-component-info :newest)
+	  (let ((*current-machine-type*
+		  ;; When we are compiling a system for a machine-type which has
+		  ;; not yet been compiled for, then we take our journal info from
+		  ;; the originally compiled machine-type.  This way, all the
+		  ;; various machine-types are built from the same source files
+		  ;; for the same version of the system.
+		  (or (and top-level-p machine-type-for-encaching)
+		      *current-machine-type*))
+		(*system* self)
+		(files nil))
+	    (if (eq *version* :newest)
+		;; If the version is :NEWEST, just collect the version info directly from
+		;; the file system, then get the file-info so that we can compare dates.
+		(labels
+		  ((collector (input output ignore &rest ignore)
+		     (declare (sys:downward-function))
+		     ;; Ensure that the file is a string or a pathname before
+		     ;; squirreling it away; it might be a symbol in the case
+		     ;; of a component system or a font-name.  Only encache what
+		     ;; is necessary.
+		     (when (and (typep input 'fs:pathname)
+				(or (memq encache '(:both :source))
+				    ;; If this is a version-controlled system, then
+				    ;; we need to collect this information even if
+				    ;; ENCACHE is NIL, because we need to compute
+				    ;; the VC branch names
+				    (and version-controlled (null encache))
+				    ;; .SAB files swing both ways
+				    (eq (send input :canonical-type) :sage-binary)))
+		       (cl:pushnew input files))
+		     (when (and (typep output 'fs:pathname)
+				(memq encache '(:both :destination)))
+		       (cl:pushnew output files)))
+		   (collection-driver (system)
+		     (declare (sys:downward-function))
+		     (loop for module in (system-modules system)
+			   do (if (typep module 'system-module)
+				  ;; Collect the files from the subsystems; collect
+				  ;; stuff from true components later
+				  (loop for (system-name) in (module-inputs module)
+					as system = (find-system-named system-name t nil t)
+					when (typep system 'subsystem)
+					  do (collection-driver system))
+				;; Collect the input and output files in this module
+				(multiple-value-bind (input-files output-files)
+				    (collect-module-inputs-and-outputs
+				      module nil
+				      :vc-branch (vc-branch-if-appropriate
+						   module system-branch))
+				  (map-over-inputs-and-outputs
+				    #'collector input-files output-files module nil))))))
+		  (collection-driver self)
+		  (collect-file-info (nreverse files) :newest))
+	      ;; If we were given a specific version, consult the component directory for
+	      ;; the file version info, and go out to disk to collect creation times.
+	      (multiple-value-bind (nil file-alist)
+		  (get-system-major-version *system* *version*)
+		;;--- If we had always journalled the entire input and output pathnames,
+		;;--- these ORs would be unnecessary, but it's too late now.
+		(loop with mtype-entry =
+			(assq default-module-type *module-type-file-type-alist*)
+		      with stype =
+			(or (second mtype-entry) :lisp)
+		      with dtype =
+			(filetype-for-machine
+			  (or (third mtype-entry)
+			      (default-binary-file-type environment))
+			  *current-machine-type*)
+		      for (file input-version output-version)
+			  in (cdr (assq :inputs-and-outputs file-alist))
+		      do (multiple-value-bind (type version vc-branch vc-version)
+			     (decode-journalled-input-version input-version)
+			   (unless (eq type :system)
+			     (let* ((pathname (fs:parse-pathname file))
+				    (new-type (or (send pathname :canonical-type)
+						  type stype)))
+			       (when (and input-version
+					  (or (memq encache '(:both :source nil))
+					      ;; .SAB files swing both ways
+					      (eq new-type :sage-binary)))
+				 (cl:pushnew
+				   (send pathname :new-pathname
+					 :type new-type
+					 :version version
+					 :vc-branch vc-branch
+					 :vc-version vc-version)
+				   files))
+			       (when (and output-version
+					  (memq encache '(:both :destination nil)))
+				 (let* ((output-pathname
+					  (resolve-destination-pathname
+					    self pathname output-version))
+					(real-output-pathname
+					  (pathname-from-journalled-output-version
+					    output-version output-pathname dtype)))
+				   ;; If we are building a plan for the :COMPILE operation
+				   ;; on a specific version of the system, and we have
+				   ;; our hands on a product file which was produced by
+				   ;; compiling a source file, then we have to use version
+				   ;; .NEWEST on that product file, since we are about to
+				   ;; create a new version of it.
+				   (when (and (eq system-op :compile) input-version)
+				     (setq real-output-pathname
+					   (send real-output-pathname :new-version :newest)))
+				   (cl:pushnew real-output-pathname files))))))
+		      finally
+			(collect-file-info (nreverse files) file-alist
+					   ;; No need to collect file-properties
+					   ;; when we are recompiling for a different
+					   ;; machine-type.
+					   (and recompile
+						(eq system-op :compile)
+						(neq *current-machine-type*
+						     old-*current-machine-type*)))
+			;; Need to make one more quick pass to collect information
+			;; about subsystems.  For example, Distribution needs this
+			;; to ensure that VC branches get correctly propagated
+			(loop with *current-machine-type* = old-*current-machine-type*
+			      for module in modules doing
+			  (when (typep module 'system-module)
+			    (loop for (sn) in (module-inputs module)
+				  as subsys-name = (canonicalize-system-name sn)
+				  as subsystem = (find-system-named subsys-name t nil t)
+				  when (typep subsystem 'subsystem)
+				    do (setf (get-info-for-pathname subsys-name files-info)
+					     `(:newest
+						,(vc-branch-if-appropriate
+						   module system-branch)))))))))))))))
+
+;; The parent system should have already cached everything
+(defmethod (encache-files-of-system subsystem) (&rest ignore)
+  nil)
+
+;; When the default pathname and the default destination pathname are not the
+;; same, we need to resolve an input pathname into an output pathname.  This is
+;; necessary because we do not used to journal the entire output file name.
+(defmethod (resolve-destination-pathname basic-system) (pathname output-version)
+  (if (or (eq default-pathname default-destination-pathname)
+	  (stringp output-version))
+      pathname
+    (multiple-value-bind (host device directory name)
+	(send pathname :all-components)
+      (loop for module in modules
+	    when (not (typep module 'system-module))
+	      do (loop for (input output) in (module-inputs module)
+		       when (typep input 'fs:pathname)
+			 do (multiple-value-bind (host1 dev1 dir1 name1)
+				(send input :all-components)
+			      (when (and (pathname-component-compare host host1)
+					 (pathname-component-compare device dev1)
+					 (pathname-component-compare directory dir1)
+					 (pathname-component-compare name name1))
+				(return-from resolve-destination-pathname output))))
+	    finally (return pathname)))))
+
+
+;; Utility to provide a merged pathname for all operations.  We are careful to
+;; not blow up when the system's default pathname is not supplied, but the
+;; result is not likely to be very useful.  FORCE-TYPE forces the file type to
+;; the default-type.  :DESTINATION-FILE T means that the pathname is merged
+;; against the system's default-destination-pathname.
+;; *SYSTEM* is an implicit input
+(defun merge-pathname-with-defaults (name default-type
+				     &optional (system *system*)
+				     &key force-type destination-file)
+  (let* ((possibly-null-default (or (if destination-file
+					(system-default-destination-pathname system)
+					(system-default-pathname system))
+				    ;; The "default default" pathname
+				    (cdr (assq nil fs:*default-pathname-defaults*))))
+	 (basic-default (and possibly-null-default
+			     (send possibly-null-default
+				   :new-pathname :version :newest
+						 :type default-type)))
+	 (merged-pathname (fs:merge-pathnames name basic-default))
+	 (result-pathname (if (or (null (send merged-pathname :type))
+				  force-type)
+			      ;; Might need to force the type...
+			      (send merged-pathname :new-type default-type)
+			    merged-pathname)))
+    result-pathname))
+
+;; If we are loading a specific version of the system, then shove the
+;; appropriate file version number into the result pathname.  In a way,
+;; this depends on the encaching mechanism to not include an entry for
+;; files which should have :NEWEST merged in, so beware!
+;; *SYSTEM* is an implicit input
+(defun merge-pathname-with-version (pathname)
+  (let* ((pathname-with-version
+	   (multiple-value-bind (nil pathname nil)
+	       (get-info-for-pathname
+		 pathname (system-files-info (subsystem-parent-system *system*)))
+	     pathname))
+	 (vc-branch (when pathname-with-version
+		      (send pathname-with-version :vc-branch)))
+	 (vc-version (when (and pathname-with-version vc-branch)
+		       (or (send pathname-with-version :vc-version) :newest)))
+	 (version (when (and pathname-with-version
+			     (null vc-branch))
+		    ;; File version, or NIL if we have a VC file
+		    (send pathname-with-version :version))))
+    (send pathname :new-pathname
+		   :version (or version :newest)
+		   :vc-branch vc-branch
+		   :vc-version vc-version)))
+
+
+;;; Build and order dependency graphs
+
+;; Order the module dependencies in SYSTEM for the operation SYSTEM-OP, and
+;; return a list of PLAN objects, which, when executed, will perform the
+;; operation on the system.
+(defun order-dependencies (system system-op &rest keys
+			   &key (transform t) (no-load nil) original-system-op
+			   &allow-other-keys)
+  (declare (values plans))
+  ;; Pathological case (system used only for patches)
+  (when (null (system-modules system))
+    (return-from order-dependencies nil))
+  (let* ((build-load-graph (and (eq system-op :compile) (not no-load)))
+	 (dependency-graph (build-dependency-graph system system-op
+						   original-system-op))
+	 (roots (loop for node in dependency-graph
+		      when (zerop (node-n-inward-edges node))
+			collect node))
+	 (load-dependency-graph (if build-load-graph
+				    (build-dependency-graph system :load
+							    original-system-op)))
+	 (load-roots (loop for node in load-dependency-graph
+			   when (zerop (node-n-inward-edges node))
+			     collect node)))
+    (when (or (null roots)
+	      (and load-dependency-graph (null load-roots)))
+      (ferror "The system ~A has no root modules for the ~@(~A~) system operation;~@
+	       there must be circular dependencies"
+	system (if (null roots) system-op :load)))
+    ;; Produce abstract module-operations from the nodes
+    (let* ((ordered-graph (order-dependency-graph dependency-graph roots system-op))
+	   (ordered-steps (loop for node in ordered-graph
+				when (not (zerop (node-ordering node)))
+				  collect (node-module*operation node)))
+	   ;; What :NO-LOAD T means is "don't load the root modules, but do
+	   ;; load modules which have :LOAD dependencies".  If you really
+	   ;; never want to load anything, use :NEVER-LOAD T
+	   (ordered-load-graph (if build-load-graph
+				   (order-dependency-graph
+				     load-dependency-graph load-roots :load)))
+	   (ordered-load-steps (loop for node in ordered-load-graph
+				     when (not (zerop (node-ordering node)))
+				       collect (node-module*operation node))))
+      (labels ((transform-step (step)
+		 ;; Transform an abstract module*operation into a PLAN object
+		 (destructuring-bind (module-op module-name) step
+		   (let ((module (find-module-named system module-name)))
+		     (multiple-value-bind (plan compilation-p)
+			 (lexpr-send module module-op system-op keys)
+		       ;; If anything in this module was compiled, force anyone
+		       ;; who :USES it to be compiled, too
+		       (when compilation-p
+			 (mark-all-users module-name)
+			 (when (module-compile-satisfies-load module)
+			   (setf (module-inhibit-loading module) t)))
+		       plan))))
+	       (mark-all-users (used-module)
+		 (loop for module in (system-modules system)
+		       when (memq used-module (module-uses-definitions-from module))
+			 do (setf (module-force-compilation module) t))))
+	(let* ((all-steps (si:eliminate-duplicates
+			    (append ordered-steps ordered-load-steps) #'equal))
+	       (plans (if transform
+			  (loop for step in all-steps
+				as plan = (transform-step step)
+				when plan collect plan)
+			all-steps)))
+	  plans)))))
+
+;; For a system and an operation, construct a directed (but not acyclic)
+;; dependency graph for all the modules in the system
+(defun build-dependency-graph (system system-op &optional original-system-op)
+  (let ((dependency-graph nil))
+    (labels ((add-module (module-name operation father)
+	       (let* ((module (find-module-named system module-name))
+		      (mod*op `(,operation ,module-name))
+		      (node (cdr (assq operation (module-operation-cache module)))))
+		 ;; If the node for this module*operation is not in the
+		 ;; dependency graph, then add it
+		 (when (null node)
+		   (push (setq node (make-node module*operation mod*op))
+			 dependency-graph)
+		   ;; Cache the node for this operation on this module
+		   (push (cons operation node) (module-operation-cache module)))
+		 (when father
+		   (cl:pushnew node (node-dependents father))
+		   ;; The only values that matter are 0 and non-0
+		   (incf (node-n-inward-edges node)))
+		 ;; Now recurse over the dependencies in this module for this
+		 ;; operation, the father of the next being the current node.
+		 (let ((dependencies
+			 ;; Don't loop forever if there are cycles
+			 (when ( (module-circularity-count module) 2)
+			   (incf (module-circularity-count module))
+			   (loop for (module-op . actions) in (module-dependencies module)
+				 do (when (eq operation module-op)
+				      (return actions)))))
+		       (internal-dependencies
+			 (internal-dependencies module system-op operation)))
+		   (loop for (op mod) in (reverse dependencies)
+			 do (add-module mod op node))
+		   (loop for (op mod) in (reverse internal-dependencies)
+			 do (add-module mod op node))))))
+      ;; Set the cycle-detection counts to 0 (the system object has already been
+      ;; locked against multiple processes at a higher level).
+      ;; This has the side-effect of pre-paging all of the modules in the system.
+      (loop for module in (system-modules system)
+	    do (setf (module-circularity-count module) 0)
+	       (setf (module-force-compilation module) nil)
+	       (setf (module-inhibit-loading module) nil)
+	       (setf (module-operation-cache module) nil))
+      (loop with not-special-op = (not (memq system-op *special-system-operations*))
+	    for module in (system-modules system)
+	    when (or (module-root-module module) not-special-op
+		     (operation-funny-p
+		       (assq original-system-op *system-operation-alist*)))
+	      ;; Only add this module if it claims to be a root module (which
+	      ;; is the default).  Note that the module can be added to the
+	      ;; graph if it has a dependency pointing to it.  Declaring a
+	      ;; module to not be a root is useful for, say, a module full of
+	      ;; macros which get loaded at compile-time, but not at run-time.
+	      ;; "Funny" operations don't respect :ROOT-MODULE NIL (for example
+	      ;; distribution wants to distribute it regardless).
+	      do (add-module (module-name module) system-op nil)))
+    ;; Let the EGC reclaim this junk
+    (loop for module in (system-modules system)
+	  do (setf (module-operation-cache module) nil))
+    ;; We reverse the dependency graph so that unconstrained modules are
+    ;; operated on in the order in which they appeared in the DEFSYSTEM.
+    ;; If ADD-MODULE pushed onto the end, this would be unnecessary. 
+    (nreverse dependency-graph)))
+
+;; Topologically sort a dependency graph, starting with the specified roots,
+;; and produce an ordering with all redundant steps eliminated.  If there are
+;; any circularities, report them.  The ROOTS and all the nodes are contained
+;; in GRAPH, which is side-effected by DFMS.  DFMS-MARKING-COUNT starts at 1,
+;; since 0 is used to detect circularities.
+;;
+;; The algorithm used, depth-first marking search DFMS(Node), is as follows:
+;;   1. If the Node is not marked:    
+;;	i.   Mark the Node.
+;;	ii.  For S in Successors(Node), call DFMS(S).
+;;	iii. Number the Node with the Count and increment Count.
+;;   2. If the Node is marked:
+;;	i.  If it's numbered, do nothing.
+;;	ii. If it's not numbered, this is a circularity, so signal an error.
+;;   3. Finally, sort all the nodes by their numbers.
+(defun order-dependency-graph (graph roots system-op)
+  (let ((dfms-marking-count 1)
+	(offenders nil))
+    (labels ((dfms (node)
+	       (declare (dbg:error-reporter))
+	       (cond ((zerop (node-marked node))
+		      (setf (node-marked node) 1)
+		      (loop for successor in (node-dependents node)
+			    do (dfms successor))
+		      (setf (node-ordering node) dfms-marking-count)
+		      (incf dfms-marking-count))
+		     (t
+		      (when (zerop (node-ordering node))
+			(collect-offenders (node-dependents node))
+			(let ((message (format:print-list nil "~A" offenders)))
+			  ;; SYSTEM-OP is NIL when we are ordering component systems,
+			  ;; otherwise (for ordering modules) it's the system-op
+			  (ferror "The ~:[systems~;modules~] ~A have circular dependencies ~
+				   ~@[for the~%~@(~A~) system operation~]"
+			    system-op message system-op))))))
+	     (collect-offenders (dependents)
+	       (loop for node in dependents
+		     do (when (not (zerop (node-marked node)))
+			  (let ((m*o (node-module*operation node)))
+			    (cl:pushnew (if (listp m*o) (second m*o) m*o) offenders))
+			  (setf (node-marked node) 0)
+			  (collect-offenders (node-dependents node))))))
+      ;; Perform the topological sort
+      (loop for root in roots do (dfms root))))
+  ;; Now the graph has the ordering numbers, so sort it
+  (setq graph (sort graph #'(lambda (n1 n2)
+			      (< (node-ordering n1) (node-ordering n2)))))
+  #+++ignore (graph-dependency-graph graph roots system-op)
+  graph)
+
+#+++ignore	;--- Just a rough debugging tool thus far...
+(defun graph-dependency-graph (graph roots system-op &optional (stream standard-output))
+  (ignore graph)	;the roots transitively point to everything in the graph
+  (setq system-op (or system-op :load))
+  (cl:fresh-line stream)
+  (flet ((print-node (node stream)
+	   (let* ((mod*op (node-module*operation node))
+		  (op (if (listp mod*op) (first mod*op) system-op))
+		  (module (if (listp mod*op)
+			      (find-module-named *system* (second mod*op))
+			    ;; Kludge, MOD*OP will be a system object!
+			    mod*op)))
+	     (cond ((typep module 'system-module)
+		    (loop for system-name in (module-inputs module)
+			  as system = (find-system-named system-name) doing
+		      (format stream "~@(~A~) system ~A~%" op system)))
+		   ((typep mod*op 'basic-system)
+		    (format stream "~@(~A~) system ~A" op mod*op))
+		   (t
+		    (loop for (input output) in (module-inputs module)
+			  as path = (if (eq op :load) output input) doing
+		      ;; Make the pathname as brief as possible
+		      (when (eq (send path :new-pathname :name nil :type nil :version nil)
+				(system-default-pathname *system*))
+			(setq path (send path :new-pathname :device nil :directory nil)))
+		      (setq path (send path :new-version nil))
+		      (setq path (send path :string-for-host))
+		      (format stream "~@(~A~) ~A~%" op path)))))))
+    (scl:format-graph-from-root roots #'print-node #'node-dependents
+				:stream stream
+				:root-is-sequence t
+				:dont-draw-duplicates t
+				:direction :before
+				:orientation :horizontal)))
+
+;; A useful debugging tool...
+(defun describe-dependency-graph (graph)
+  (loop for node in graph
+	as dependents = (node-dependents node)
+	doing
+    (format t "~&In order to ~@(~A~) ~A~@[ (a root)~], you must first "
+      (first (node-module*operation node)) (second (node-module*operation node))
+      (zerop (node-n-inward-edges node)))
+    (if (null dependents)
+	(format t "do nothing")
+      (scl:format-textual-list dependents
+			       #'(lambda (node ignore)
+				   (format t "~@(~A~) ~A"
+				     (first (node-module*operation node))
+				     (second (node-module*operation node))))
+			       :conjunction "and"))))
+
+
+;;; Plan construction and execution abstractions
+
+;; Make a plan instance, optimizing the case where there are no input and
+;; no outputs, in which case we just return nothing.
+(defun make-plan (module system &rest init-options
+		  &key inputs outputs &allow-other-keys)
+  (declare (arglist module system &rest init-options
+		    &key inputs outputs driving-function documentation &allow-other-keys))
+  (cond ((and (null inputs) (null outputs))
+	 nil)
+	((and module
+	      (listp (module-machine-types module))	;if it's not a list, it's :ALL
+	      (not (memq *current-machine-type* (module-machine-types module))))
+	 ;; *CURRENT-MACHINE-TYPE* and the machine-types specified in the
+	 ;; module don't match up, so we don't do anything for this module
+	 nil)
+	(t
+	 (lexpr-funcall #'make-instance 'plan
+					:module module
+					:system (system-name system)
+					:environment (system-environment system)
+					init-options))))
+
+;; We need to bind *SYSTEM* because, when component systems are flattened,
+;; CONSTRUCT-SYSTEM-INTERNAL is not recursively called and *SYSTEM* will not
+;; get rebound.  The manifestation of *SYSTEM* being improperly bound for an
+;; operation over a component system can be, for example, if the top-level
+;; system has a default package, then programs in the component might get
+;; loaded in the wrong package.
+(defmethod (execute-plan plan) (function plan-string incremental keys)
+  (let ((*system* (find-system-named system)))
+    (letf (((system-environment (subsystem-parent-system *system*)) environment))
+      (catch-error-restart-if plan-string ((error) "Skip ~A" plan-string)
+	(error-restart-if plan-string ((error) "Retry ~A" plan-string)
+	  (cond
+	    ((null inputs)
+	     ;; No inputs mean that we should just quit now
+	     nil)
+	    ((null driving-function)
+	     ;; If there was no driving-function, then use the supplied one
+	     (when function
+	       (lexpr-funcall #'map-over-inputs-and-outputs
+			      function inputs outputs module
+			      incremental keys)))
+	    (t
+	     ;; Map the driving-function over the inputs and the outputs
+	     (lexpr-funcall #'map-over-inputs-and-outputs
+			    driving-function inputs outputs module
+			    incremental keys))))))))
+
+(defmethod (describe-plan plan) (function incremental keys)
+  ;; Documentation can either be NIL, a string, or a function, or a list;
+  ;; if it is a list, choose the element which corresponds to the current pass.
+  (let ((*system* (find-system-named system)))
+    (letf (((system-environment (subsystem-parent-system *system*)) environment))
+      (when (null documentation)
+	(setq documentation function))
+      (cond ((stringp documentation)
+	     (format standard-output documentation))
+	    ;; Need to do this before the LISTP check, since the documentation function
+	    ;; might be an interpreted function (which will satisfy LISTP)
+	    ((functionp documentation)
+	     (lexpr-funcall #'map-over-inputs-and-outputs
+			    documentation inputs outputs module
+			    incremental keys))
+	    ((listp documentation)
+	     (describe-plan self (nth *system-pass* documentation) incremental keys))))))
+
+(defmethod (filter-plan plan) (user-filter system-op keys)
+  (when (and inputs (not (typep module 'system-module)))
+    ;; Do this at a deeper level for system-type modules
+    (let ((*system* (find-system-named system)))
+      (letf (((system-environment (subsystem-parent-system *system*)) environment))
+	(flet ((filter (input ignore module &rest keys)
+		 (when (lexpr-funcall user-filter system-op input module keys)
+		   (ncons input))))
+	  ;; Filter all of the inputs and put them back into the plan
+	  (setq inputs (lexpr-funcall #'map-over-inputs-and-outputs
+				      #'filter inputs outputs module
+				      nil keys))))))
+  (if (null inputs) nil self))
+
+(defun filter-plans (filter system-op plans &rest keys)
+  (loop for plan in plans
+	as new-plan = (filter-plan plan filter system-op keys)
+	when (not (null new-plan))
+	  collect new-plan))
+
+;; Map the driving function over the inputs and the outputs; if there
+;; are no outputs, just pass on a value of NIL
+(defun map-over-inputs-and-outputs (function inputs outputs module incremental
+				    &rest keys)
+  ;; What INCREMENTAL means is "just do the first input", so that a higher
+  ;; level can do this incrementally
+  (let ((inputs (if incremental (list (car inputs)) inputs)))
+    (loop with possible-outputs = outputs
+	  for input in inputs
+	  as output = (if (listp possible-outputs)
+			  (car possible-outputs) possible-outputs)
+	  ;; Collect all of the results for the "plan flattener"
+	  nconc (copylist (lexpr-funcall function input output module keys)) into results
+	  do (when (listp possible-outputs)
+	       (setq possible-outputs (cdr possible-outputs)))
+	  finally (return results))))
+
+;; Loop over the inputs and outputs in a plan, querying for each operation,
+;; and collect the ones that the user really wants.  Finally, return the
+;; modified plan.
+(defmethod (query-for-plan plan) (function keys)
+  (when never-query
+    ;; For some things we don't need to ask
+    (return-from query-for-plan self))
+  (let ((*system* (find-system-named system)))
+    (letf (((system-environment (subsystem-parent-system *system*)) environment))
+      ;; Documentation can either be NIL, a string, or a function
+      (when (null documentation)
+	(setq documentation function))
+      (if (listp documentation)
+	  (query-for-plan self (nth *system-pass* documentation) keys)
+	  ;; This code is a conglomeration of MAP-OVER-INPUTS-AND-OUTPUTS and DESCRIBE-PLAN
+	  (cond ((stringp documentation)
+		 (format query-io documentation)
+		 (format query-io "? ")
+		 (when (not (y-or-n-p))
+		   (setq inputs nil)))
+		((functionp documentation)
+		 (loop with real-inputs
+		       with real-outputs
+		       with possible-outputs = outputs
+		       for input in inputs
+		       as output = (if (listp possible-outputs)
+				       (car possible-outputs) possible-outputs)
+		       as choice = (or *proceed-p*
+				       (lexpr-funcall #'query-for-item
+						      documentation input output module keys))
+		       do (when (memq choice '(:include :bypass))
+			    (setq *proceed-p* choice))
+			  (when (memq choice '(t :include))
+			    (push input real-inputs)
+			    (push output real-outputs))
+			  (when (listp possible-outputs)
+			    (setq possible-outputs (cdr possible-outputs)))
+		       finally (setq inputs  (nreverse real-inputs)
+				     outputs (nreverse real-outputs))))))
+      ;; If there are no inputs, there is no plan
+      (if inputs self nil))))
+
+(defun query-for-item (documentation input output module &rest keys)
+  (loop with standard-output = query-io		;make plan descriptions appear on QUERY-IO
+	with answer
+	with choices =
+	  `(:choices (((t "Yes.") #/Y #/SP #/T)
+		      ((nil "No.") #/N #/Rubout)
+		      ((:include "Include the rest.") #/I)
+		      ((:bypass "Bypass the rest.") #/B)
+		      ,@(unless (or (typep module 'system-module)
+				    (typep module 'system-initialization-module))
+			  ;; These are only meaningful for modules with pathnames
+			  '(((:directory "Directory.") #/D)
+			    ((:edit "Edit.") #/E)
+			    ((:source-compare "Source compare.") #/S #/=))))
+	    :fresh-line nil)
+	doing (lexpr-funcall documentation input output module keys)
+	      (setq answer (fquery choices "? "))
+	      (selectq answer
+		((t nil :include :bypass))
+		(:directory 
+		 ;; Show the directory for this group of files
+		 (let ((dirlist (fs:directory-list (send input :new-pathname
+							       :type :wild
+							       :version :wild)
+						   :sorted)))
+		   (format query-io "~&")
+		   (loop for (file . info) in (cdr dirlist)
+			 doing
+		     (dw:with-output-as-presentation
+		         (:stream query-io
+			  :type 'fs:pathname
+			  :object input
+			  :single-box t)
+		       (format query-io "~&~A~30T~D  ~D(~D)~46T"
+			 (send file :string-for-dired)
+			 (cl:getf info :length-in-blocks)
+			 (cl:getf info :length-in-bytes) (cl:getf info :byte-size))
+		       (time:print-universal-time (cl:getf info :creation-date) query-io)
+		       (format query-io "~@[  ~A~]~%" (cl:getf info :author))))))
+		(:edit
+		 ;; Try to edit the source file (the version which corresponds to
+		 ;; binary file if this is a binary file)
+		 (if (destination-file-p input)
+		     (multiple-value-bind (nil other-src)
+			 (source-files-for-module module input output)
+		       (if (null other-src)
+			   (format t
+			       "~&Couldn't find the source file which corresponds to ~A"
+			     input)
+			 (ed other-src)))
+		   (ed input)))
+		(:source-compare
+		 ;; Source compare the newest source against the source which
+		 ;; corresponds to the newest binary
+		 (multiple-value-bind (newest-src other-src)
+		     (source-files-for-module module input output)
+		   (if (or (null newest-src)
+			   (null other-src))
+		       (format t "~&Couldn't find the source files corresponding to ~A"
+			 input)
+		     (srccom:prompted-source-compare newest-src other-src)))))
+	until (memq answer '(t nil :include :bypass))
+	finally (return answer)))
+
+;; For a module, an input file, and an output file, return the newest version
+;; of the input file and the version of the input file which likely corresponds
+;; to the output file
+(defun source-files-for-module (module input output)
+  (let* ((module-type (car (rassq (typep module) *module-type-flavor-alist*)))
+	 (src-type (second (assq module-type *module-type-file-type-alist*)))
+	 (bin-type (third (assq module-type *module-type-file-type-alist*)))
+	 (binlist (fs:directory-list (if output
+					 (send output :new-version :wild)
+				       (send input :new-pathname
+						   :type bin-type
+						   :version :wild))
+				     :sorted))
+	 (srclist (fs:directory-list (if (destination-file-p input)
+					 (send input :new-pathname
+						     :type src-type
+						     :version :wild)
+				       (send input :new-version :wild))
+				     :sorted))
+	 (newest-bin (if (null (second binlist)) nil (car (last binlist))))
+	 (newest-src (if (null (second srclist)) nil (car (last srclist))))
+	 (other-src (when newest-bin
+		      (loop with newest-date =  (cl:getf (cdr newest-bin) :creation-date)
+			    for last = nil then file
+			    for file in (cdr srclist)
+			    until (> (cl:getf (cdr file) :creation-date) newest-date)
+			    finally (return last)))))
+    (values (car newest-src) (car other-src))))
+
+(defun documentation-for-pass (documentation)
+  (if (listp documentation)
+      (nth *system-pass* documentation)
+    documentation))
+
+
+;; Get the correct version number for a component system
+;; *SYSTEM*, *VERSION* and *BRANCH* reflect the state of the parent system
+;; Note that COMPONENT can be the name of a system in the case where the
+;; sysdcl has not been read yet.  We just use the version we can get and
+;; let a later call to RELOAD-SYSTEM-DECLARATION-IF-NECESSARY fix things.
+(defun component-system-version-and-branch (component)
+  (declare (values component-version component-branch))
+  (let* ((component-name (if (typep component 'basic-system)
+			     (system-name component)
+			   (canonicalize-system-name component)))
+	 (info (get-info-for-pathname
+		 component-name (system-files-info (subsystem-parent-system *system*))))
+	 (version (or (first info) :newest))
+	 (component-version
+	   (if (or (numberp version)
+		   (eq version :newest))
+	       version
+	     (or (get-system-major-version-from-directory component version t)
+		 (when (eq version :released)
+		   (sct-inform
+		       "~&No Released version designated for system ~A, will try to use Latest"
+		     component)
+		   (or (get-system-major-version-from-directory
+			 component :latest t)
+		       (prog2 (sct-inform
+				  "~&No Latest version designated for system ~A, will use Newest"
+				component)
+			      :newest))))))
+	 (component-branch (when (system-version-controlled component)
+			     ;; Error handling done during encaching
+			     (second info))))
+    (values component-version component-branch)))
+
+;; Continuation function to carry out a plan for a component system
+(defun make-plan-for-component-systems (module system-op inputs documentation
+					&rest keys
+					&key detailed (include-components t)
+					     no-reload-system-declaration
+					     parent-version
+					&allow-other-keys)
+  (ignore keys)
+  (let ((real-inputs (loop for (system) in inputs
+			   ;; Include component systems only if requested, but
+			   ;; always include subsystems
+			   when (or include-components
+				    (typep (find-system-named system) 'subsystem))
+			     collect system)))
+    (make-plan module *system*
+	       :inputs real-inputs		;these are systems, not pathnames
+	       :driving-function
+	         #'(named-lambda component-system-driver
+				 (system ignore ignore &rest keys)
+		     (si:with-indentation (standard-output 2)
+		       ;; First look up the version of the component, and only then
+		       ;; bind *SYSTEM*.  Don't shuffle the order of the LET*!
+		       (let ((component (find-system-named system t t)))
+			 (multiple-value-bind (component-version component-branch)
+			     (component-system-version-and-branch component)
+			   (let* ((parent-version
+				    (if (typep *system* 'subsystem)
+					(or parent-version *version*)
+				      *version*))
+				  (*system* component)
+				  (*version* (canonicalize-system-version-number
+					       *system* component-version
+					       :ignore-subsystems t))
+				  (*branch* component-branch))
+			     (unless no-reload-system-declaration
+			       (setq *system* (reload-system-declaration-if-necessary
+						*system* *version* *branch*)
+				     *branch* (or *branch*
+						  (system-default-system-branch *system*))))
+			     ;; CONSTRUCT-SYSTEM-INTERNAL can run the additional plan
+			     ;; constructor and the plan filter, if they are present.
+			     ;; Note that #'CONSTRUCT-SYSTEM-INTERNAL might be bound
+			     ;; to #'FLATTEN-COMPONENTS, so watch out!
+			     (si:with-rem-keywords (keys keys '(:version :system-branch
+								:top-level-p))
+			       (lexpr-funcall #'construct-system-internal system-op
+					      :version *version*
+					      :system-branch *branch*
+					      :top-level-p nil
+					      :parent-version parent-version
+					      keys)))))))
+	       :documentation
+	         #'(named-lambda component-system-documentation
+				 (system ignore ignore &rest keys)
+		     (let* ((subsystem-p (typep (find-system-named system) 'subsystem))
+			    (detailed (or detailed subsystem-p))
+			    (component (find-system-named system t t)))
+		       ;; See the comment above
+		       (multiple-value-bind (component-version component-branch)
+			   (component-system-version-and-branch component)
+			 (let* ((parent-version
+				  (if (typep *system* 'subsystem)
+				      (or parent-version *version*)
+				    *version*))
+				(component-version (canonicalize-system-version-number
+						     component component-version
+						     :ignore-subsystems t)))
+			   (format standard-output "~&~A files in ~
+						    ~:[component ~;sub~]system ~A ~
+						    version ~@(~D~)~
+						    ~:[, that is~]"
+			     (documentation-for-pass documentation)
+			     subsystem-p component component-version (not detailed))
+			   (when detailed
+			     (si:with-indentation (standard-output 2)
+			       (let* ((*system* component)
+				      (*version* component-version)
+				      (*branch* component-branch))
+				 (si:with-rem-keywords (keys keys '(:version :system-branch
+								    :top-level-p))
+				   (lexpr-funcall #'describe-system-internal system-op
+						  :version *version*
+						  :system-branch *branch*
+						  :top-level-p nil
+						  :parent-version parent-version
+						  keys))))))))))))
+
+;; This function walks over the plans for component systems and collects
+;; the plans for all of the modules of the component system, in effect,
+;; flattens the tree so that all the operations on component systems take
+;; place at the same level as the rest of the operations.  The effect of
+;; this is that we can do all of the querying at the beginning of the
+;; operation (rather than recursively for each component).  Note that all
+;; of the plan-hacking functions for component systems must bind *SYSTEM*
+;; so that the information lost by flattening does not screw everything up.
+(defvar *real-construct-system-internal* nil)
+(defun flatten-plans-for-components (plans default-driver &rest keys)
+  (flet ((flatten-components (system-op &rest keys
+			      &key original-system-op
+				   plan-filter additional-plan-constructor
+			      &allow-other-keys)
+	   (with-plan-for-system (plans system-op nil keys)
+	     ;; Run the additional constructor and the filter over the component
+	     (when additional-plan-constructor
+	       (multiple-value-bind (prepended-plans appended-plans)
+		   (lexpr-funcall additional-plan-constructor system-op keys)
+		 (setq plans (append prepended-plans plans appended-plans))))
+	     (when plan-filter
+	       (setq plans (lexpr-funcall #'filter-plans
+					  plan-filter system-op plans keys)))
+	     (let* ((default-driver
+		      (operation-driving-function
+			(assq system-op *system-operation-alist*))))
+	       (let ((result (lexpr-funcall #'flatten-plans-for-components
+					    plans default-driver
+					    keys)))
+		 ;; Zap the driving functions for "funny operations"
+		 (when (operation-funny-p
+			 (assq original-system-op *system-operation-alist*))
+		   (loop for plan in plans
+			 do (setf (plan-driving-function plan) nil)
+			    (setf (plan-documentation plan) nil)))
+		 result)))))
+    (loop with new-plans
+	  for plan in plans
+	  as new-plan = (list plan)
+	  do (when (typep (plan-module plan) 'system-module)
+	       ;; "Execute" the plan with the constructor bound to the dummy
+	       ;; function whose job it is to just flatten out the plan.
+	       ;; You might think that this LETF is a kludge, but you should
+	       ;; see what happens when you try to use flags to control this.
+	       (let-if (null *real-construct-system-internal*)
+		       ((*real-construct-system-internal* #'construct-system-internal))
+		 (letf ((#'construct-system-internal #'flatten-components))
+		   (setq new-plan (execute-plan plan default-driver nil nil keys)))))
+	  do (setq new-plans (append new-plans new-plan))
+	  finally (return new-plans))))
+
+(add-initialization "Ensure #'CONSTRUCT-SYSTEM-INTERNAL is correct"
+   '(progn
+      (when (not (null *real-construct-system-internal*))
+	(setf #'construct-system-internal *real-construct-system-internal*)
+	(setq *real-construct-system-internal* nil)))
+   '(:warm))

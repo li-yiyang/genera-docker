@@ -1,0 +1,1303 @@
+;;; -*- Mode: LISP; Syntax: Common-Lisp; Base: 10; Package: FLAVOR -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; This file contains the defining forms for methods, their supporting
+;;; data structures, and their immediate subroutines.
+
+;--- UNDEFMETHOD needs to be implemented, or replaced with something better
+;--- Doesn't worry enough yet about locking, without-interrupts, aborts
+
+
+;;; A METHOD-HOLDER is an object (a list) that contains some information about a method
+;;; (a function) including its name, its definition (if any), and its property list.
+
+(DEFSTRUCT (METHOD-HOLDER :LIST :CONC-NAME (:CONSTRUCTOR NIL) (:ALTERANT NIL) (:COPIER NIL))
+  FUNCTION-SPEC
+  DEFINITION		;Can be DTP-NULL and address of this structure
+  PLIST)
+
+(DEFSUBST METHOD-DEFINED-P (METHOD-HOLDER)
+  (LOCATION-BOUNDP (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER))))
+
+(DEFUN NULLIFY-METHOD-DEFINITION (METHOD-HOLDER)
+  (LOCATION-MAKUNBOUND (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER)) METHOD-HOLDER))
+
+;;--- This is probably the wrong way to do this, and should really work by comparing
+;;--- the set of files the method has ever been defined in against the set of files
+;;--- that have been compiled in the current compilation.
+;; Lacking that, we use the most recent file the method has been compiled in,
+;; but we have to be careful to ignore patch files.  RECORD-SOURCE-FILE-NAME puts
+;; a patch file first on the list and the real source file second.
+;; The reasons this does not call SI:GET-SOURCE-FILE-NAME may be obsolete now.
+;; The case we are trying to detect is recompiling the file from which a method was
+;; loaded and finding that the method is no longer defined in that file, so its
+;; run-time definition should be ignored.
+(DEFUN METHOD-HOLDER-SOURCE-FILE-NAME (METHOD-HOLDER)
+  (LET ((PROPERTY (GETF (METHOD-HOLDER-PLIST METHOD-HOLDER) ':SOURCE-FILE-NAME)))
+    (COND ((ATOM PROPERTY)
+	   PROPERTY)				;Single file or none
+	  ((NULL (CDR (SETQ PROPERTY (CDR (ASSOC 'DEFUN PROPERTY)))))
+	   (CAR PROPERTY))			;Single file in the other format
+	  ((SEND (CAR PROPERTY) :GET ':PATCH-FILE)
+	   (CADR PROPERTY))			;Patched, second file is the real one
+	  (T (CAR PROPERTY)))))			;Moved to a new file
+
+
+;This associates from function-specs to METHOD-HOLDERs for methods that exist,
+;because they have been putprop'ed or because someone has a pointer to
+;their function cell, but which are not known by the flavor system, i.e.
+;are not to be called when a message is sent.
+;For bootstrapping reasons, this is an alist early in the world build
+;and is turned into a hash table later.  Every FDEFINE of a new method
+;creates an entry here and then immediately deletes it, because the
+;source-file-name property is put on before the function definition is set.
+(DEFVAR *UNDEFINED-METHOD-HASH-TABLE* NIL)
+
+
+;List of all method types
+(DEFPARAMETER *ALL-METHOD-TYPES* '(METHOD WRAPPER WHOPPER NCWHOPPER
+				   COMBINED PSEUDO-COMBINED SHARED-COMBINED
+				   READ-INSTANCE-VARIABLE WRITE-INSTANCE-VARIABLE
+				   LOCATE-INSTANCE-VARIABLE SPECIAL-INSTANCE-VARIABLES
+				   DEFUN-IN-FLAVOR))
+
+;List of all method types that can be called by a combined method
+(DEFPARAMETER *CALLABLE-METHOD-TYPES* '(METHOD READ-INSTANCE-VARIABLE WRITE-INSTANCE-VARIABLE
+					LOCATE-INSTANCE-VARIABLE))
+
+;List of method types for instance variable accessors
+(DEFPARAMETER *ACCESSOR-METHOD-TYPES* '(READ-INSTANCE-VARIABLE WRITE-INSTANCE-VARIABLE
+					LOCATE-INSTANCE-VARIABLE))
+
+;List of all method types that have method-holders
+;SHARED-COMBINED is FDEFINABLE, but doesn't work via method-holders.
+(DEFPARAMETER *FDEFINABLE-METHOD-TYPES* '(METHOD WRAPPER WHOPPER NCWHOPPER
+					  COMBINED DEFUN-IN-FLAVOR))
+
+;List of all method types that appear in source code, and hence can be edited
+(DEFPARAMETER *SOURCE-CODE-METHOD-TYPES* '(METHOD WRAPPER WHOPPER NCWHOPPER
+					   SHARED-COMBINED DEFUN-IN-FLAVOR))
+
+;This is an a-list from method type to function to write the code to go
+;in the combined method.  Users can add to this.  The third element of each
+;sublist is the position in method combination; the smaller the number the
+;further "outside" the code goes.  When two specially-combined methods are
+;defined by the same flavor and have equal numbers, then the one earlier in
+;this list goes on the outside.  Thus if a flavor defines both a wrapper and
+;a whopper, the wrapper surrounds the whopper, but otherwise wrappers and
+;whoppers are the same priority.
+;The second element of each sublist is a function that takes three arguments:
+;  The specially-combined method function-spec
+;  The form which is the combined method body so far
+;  The flavor env
+;and returns three values:
+;  The revised form which is the combined method body
+;  Wrapper-source info or NIL (for the combined method derivation)
+;  Whopper function spec or NIL
+
+(DEFPARAMETER *SPECIALLY-COMBINED-METHOD-TYPES*
+    '((SPECIAL-INSTANCE-VARIABLES PUT-SPECIAL-INSTANCE-VARIABLES-INTO-COMBINED-METHOD 10)
+      (WRAPPER PUT-WRAPPER-INTO-COMBINED-METHOD 20)
+      (WHOPPER PUT-WHOPPER-INTO-COMBINED-METHOD 20)
+      (NCWHOPPER PUT-NCWHOPPER-INTO-COMBINED-METHOD 20)))
+
+;List of method types that are generated internally by the flavor system
+;These are invisible to method patterns in DEFINE-METHOD-COMBINATION
+(DEFPARAMETER *INTERNAL-METHOD-TYPES* '(COMBINED PSEUDO-COMBINED
+					SPECIAL-INSTANCE-VARIABLES WRAPPER WHOPPER NCWHOPPER))
+
+;;; A list of the method types that have a FLAVOR-SOURCE property.
+;;; Redefining one of these forces recompilation of the combined method
+;;; if the source has changed.
+(DEFPARAMETER *SOURCE-CODE-SAVING-METHOD-TYPES* '(WRAPPER))
+(DEFPROP FLAVOR-SOURCE T SI:DEBUG-INFO)
+
+;;; An a-list of "exchangable" method types --
+;;;    These are method types that were renamed between releases.
+;;;
+;;;    FIND-METHOD-HOLDER will consider these types to be equivalent.  In other words, if
+;;;    you ask for the method holder of a WHOPPER, FIND-METHOD-HOLDER will return the method
+;;;    holder for an NCWHOPPER if it exists and there isn't a WHOPPER defined.
+;;;
+;;;    The above treatment in FIND-METHOD-HOLDER permits the FDEFINE code in
+;;;    METHOD-FUNCTION-SPEC-HANDLER to replace the old type by a new type transparently.
+;;;    (Otherwise, you'd be left with an NCWHOPPER calling a WHOPPER!)
+;;;
+;;;    Entries should be added to this list in pairs -- (OLD NEW) and (NEW OLD).
+(DEFPARAMETER *EXCHANGEABLE-METHOD-TYPES*
+  '((WHOPPER NCWHOPPER) (NCWHOPPER WHOPPER)))
+
+;;;; DEFMETHOD and his friends
+
+(DEFPROP DEFMETHOD DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+(DEFMACRO DEFMETHOD (NAME ARGLIST &BODY BODY)
+  (DECLARE (ARGLIST (GENERIC-FUNCTION FLAVOR . OPTIONS) ARGLIST &BODY BODY))
+  (MULTIPLE-VALUE-BIND (GENERIC-FUNCTION FLAVOR OPTIONS)
+      (DEFMETHOD-COMPATIBILITY 'DEFMETHOD 'FLAVOR:METHOD NAME T)
+    (CHECK-TYPE GENERIC-FUNCTION GENERIC-FUNCTION-NAME)
+    (SETQ GENERIC-FUNCTION (STANDARDIZE-GENERIC-FUNCTION-NAME GENERIC-FUNCTION 'COMPILE))
+    (CHECK-TYPE FLAVOR SYMBOL)
+    (LET* ((FUNCTION-SPEC `(FLAVOR:METHOD ,GENERIC-FUNCTION ,FLAVOR ,@OPTIONS))
+	   (COMPILER:DEFAULT-WARNING-FUNCTION FUNCTION-SPEC)
+	   (COMPILER:DEFAULT-WARNING-DEFINITION-TYPE 'DEFUN))
+      ;; Complain if flavor name is misspelled
+      (CHECK-FLAVOR-NAME FLAVOR)
+      ;; Note that this method exists in case we compile a combined method that needs
+      ;; to call this method, during this same compilation.
+      (NOTICE-METHOD FUNCTION-SPEC)
+      ;; Check for specifying just the name of a function to call
+      (WHEN (AND (NULL BODY) (SYMBOLP ARGLIST) (NOT (NULL ARGLIST)))
+	(COMPILER:FUNCTION-REFERENCED ARGLIST)
+	(RETURN-FROM DEFMETHOD
+	  (SYS:FEATURE-CASE
+	    (3600. `(FDEFINE ',FUNCTION-SPEC ',ARGLIST T))
+	    (:IMACH
+	      (LET ((GENERIC (FIND-GENERIC-FUNCTION GENERIC-FUNCTION 'CREATE 'COMPILE)))
+		`(PROGN
+		   (FIND-GENERIC-FUNCTION ',GENERIC-FUNCTION 'CREATE)
+		   (DEFUN ,FUNCTION-SPEC (SELF-MAPPING-TABLE SELF &REST ARGS)
+		     (APPLY #',ARGLIST SELF SELF-MAPPING-TABLE
+			    ',(GENERIC-FUNCTION-SELECTOR GENERIC)
+			    ARGS))))))))
+      ;; Normal case
+      (CHECK-TYPE ARGLIST LIST)
+      ;; Massage the method's arguments and body
+      (MULTIPLE-VALUE-BIND (ARGLIST DECLARATIONS BODY ADDITIONAL-FORMS)
+	  (MASSAGE-METHOD-ARGUMENTS FUNCTION-SPEC ARGLIST BODY
+				    (FLAVOR-LEXICAL-ENVIRONMENT FLAVOR 'COMPILE))
+	;; At load time define the method as a function that runs in the right environment
+	;; and evaluate any additional forms (usually there are none)
+	(PROGNIFY
+	  `(,@ADDITIONAL-FORMS
+	    (DEFUN ,FUNCTION-SPEC
+		   ,(FEATURE-CASE
+		      (3600. `(SELF SELF-MAPPING-TABLE .GENERIC. ,@ARGLIST))
+		      (:IMACH `(SELF-MAPPING-TABLE SELF ,@ARGLIST)))
+	      (DECLARE ,@(FLAVOR-LOCAL-DECLARATIONS FLAVOR 'COMPILE NIL))
+	      ,@DECLARATIONS
+	      ;; This IGNORE shields local macros in the body from parse-body-declarations
+	      ,(FEATURE-CASE
+		 (3600. `(IGNORE SELF SELF-MAPPING-TABLE .GENERIC.))
+		 (:IMACH `(IGNORE SELF-MAPPING-TABLE SELF)))
+	      ,@BODY)))))))
+
+(DEFPROP DEFWRAPPER DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+(DEFMACRO DEFWRAPPER (NAME (ARGLIST . COMBINED-METHOD-BODY) &BODY BODY)
+  (DECLARE (ARGLIST (GENERIC-FUNCTION FLAVOR) (ARGLIST . COMBINED-METHOD-BODY) &BODY BODY))
+  (MULTIPLE-VALUE-BIND (GENERIC-FUNCTION FLAVOR)
+      (DEFMETHOD-COMPATIBILITY 'DEFWRAPPER 'WRAPPER NAME NIL)
+    (CHECK-TYPE GENERIC-FUNCTION GENERIC-FUNCTION-NAME)
+    (SETQ GENERIC-FUNCTION (STANDARDIZE-GENERIC-FUNCTION-NAME GENERIC-FUNCTION 'COMPILE))
+    (CHECK-TYPE FLAVOR SYMBOL)
+    (LET* ((FUNCTION-SPEC `(WRAPPER ,GENERIC-FUNCTION ,FLAVOR))
+	   (COMPILER:DEFAULT-WARNING-FUNCTION FUNCTION-SPEC)
+	   (COMPILER:DEFAULT-WARNING-DEFINITION-TYPE 'DEFUN))
+      ;; Complain if flavor name is misspelled
+      (CHECK-FLAVOR-NAME FLAVOR)
+      ;; Massage the method's arguments and body.
+      ;;--- I'm not sure this is right.  We do want to massage the arguments, unless
+      ;;--- ARGLIST is IGNORE, but we don't to mess with the body, a macro-expander.
+      ;; Extract any declarations that belong at top level.  This assumes there are
+      ;; no declarations of the variables in the ARGLIST destructuring pattern.
+      (MULTIPLE-VALUE-BIND (ARGLIST DECLARATIONS BODY ADDITIONAL-FORMS)
+	  (MASSAGE-METHOD-ARGUMENTS FUNCTION-SPEC ARGLIST BODY NIL)
+	;; Construct the body of the wrapper's expander function.
+	(LET ((ARGLIST-VAR
+		;; Use DESTRUCTURING-BIND so an error is signalled if the
+		;; pattern doesn't match the arguments of the combined method.
+		(COND ((EQ ARGLIST 'IGNORE)
+		       'IGNORE)
+		      (T
+		       (SETQ BODY `(`(DESTRUCTURING-BIND ,',ARGLIST ,ARGLIST
+				       ,,@BODY)))
+		       'ARGLIST)))
+	      (BODY-FORM-VAR
+		;; Decide whether the wrapper was written knowing that the
+		;; combined-method-body passed to it will always be a single form,
+		;; which is now true.  This could be simplified if we didn't mind
+		;; being incompatible with the old flavor system.
+		(COND ((AND (LISTP COMBINED-METHOD-BODY)
+			    (NULL (CDR COMBINED-METHOD-BODY))
+			    (SYMBOLP (CAR COMBINED-METHOD-BODY)))
+		       (CAR COMBINED-METHOD-BODY))
+		      ((SYMBOLP COMBINED-METHOD-BODY)
+		       (PUSH `(SETQ ,COMBINED-METHOD-BODY (LIST ,COMBINED-METHOD-BODY)) BODY)
+		       COMBINED-METHOD-BODY)
+		      (T
+		       (WARN "~S is an illegal pattern for a wrapper to bind to
+  the body of the combined method.  Either a symbol or a list of one symbol is required.
+  The pattern has been ignored." COMBINED-METHOD-BODY)
+		       'IGNORE))))
+	  ;; Attach the declarations to the revised body.  The debugging-info declarations
+	  ;; include a copy of the body so when this wrapper appears to be redefined
+	  ;; we can tell if anything has changed; COPYTREE it so we don't get faked out
+	  ;; by displacing macro expansions that haven't happened yet.
+	  (SETQ BODY `((DECLARE (FLAVOR-SOURCE ,@(COPY-TREE BODY)))
+		       ,@DECLARATIONS
+		       ,@BODY))
+	  ;; Make the wrapper's expander function available in the compile-time environment.
+	  (WHEN UNDO-DECLARATIONS-FLAG
+	    (COMPILER:FILE-DECLARE FUNCTION-SPEC
+				   'WRAPPER
+				   (SI:ENCLOSE `(LAMBDA (,ARGLIST-VAR ,BODY-FORM-VAR)
+						  ,@BODY)
+					       NIL FUNCTION-SPEC)))
+	  ;; Note that this wrapper exists in case we compile a combined method that needs
+	  ;; to incorporate this wrapper, during this same compilation.
+	  (NOTICE-METHOD FUNCTION-SPEC)
+	  ;; Make the wrapper's expander function available in the run-time environment.
+	  (PROGNIFY
+	    `(,@ADDITIONAL-FORMS
+	      (DEFUN ,FUNCTION-SPEC (,ARGLIST-VAR ,BODY-FORM-VAR)
+		,@BODY))))))))
+
+(DEFPROP DEFWHOPPER DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+(DEFMACRO DEFWHOPPER (NAME ARGLIST &BODY BODY)
+  (DECLARE (ARGLIST (GENERIC-FUNCTION FLAVOR) ARGLIST &BODY BODY))
+  (MULTIPLE-VALUE-BIND (GENERIC-FUNCTION FLAVOR)
+      (DEFMETHOD-COMPATIBILITY 'DEFWHOPPER 'NCWHOPPER NAME NIL)
+    (CHECK-TYPE GENERIC-FUNCTION GENERIC-FUNCTION-NAME)
+    (SETQ GENERIC-FUNCTION (STANDARDIZE-GENERIC-FUNCTION-NAME GENERIC-FUNCTION 'COMPILE))
+    (CHECK-TYPE FLAVOR SYMBOL)
+    (CHECK-TYPE ARGLIST LIST)
+    (LET* ((FUNCTION-SPEC `(NCWHOPPER ,GENERIC-FUNCTION ,FLAVOR))
+	   (COMPILER:DEFAULT-WARNING-FUNCTION FUNCTION-SPEC)
+	   (COMPILER:DEFAULT-WARNING-DEFINITION-TYPE 'DEFUN)
+	   (CONTINUATION-VAR (GENSYM))
+	   (DEFERRED NIL))
+      ;; Complain if flavor name is misspelled
+      (CHECK-FLAVOR-NAME FLAVOR)
+      ;; Frob the arglist to recognize that the self-mapping-table argument is not a
+      ;; mapping table, but an array containing mapping table and continuation.
+      ;; Parameter defaulting, except to constants, must be deferred until self-mapping-table
+      ;; has been set up, since it might depend on an instance variable or on a
+      ;; defun-in-flavor, or on an earlier parameter that so depended.
+      (UNLESS (MEMBER '&AUX ARGLIST)
+	(SETQ ARGLIST (APPEND ARGLIST '(&AUX))))
+      (SETQ ARGLIST (LOOP FOR ITEM IN ARGLIST WITH FLAG = T
+			  DO (WHEN (AND FLAG
+					(LISTP ITEM)
+					(NOT (CONSTANTP (SECOND ITEM))))
+			       (LET ((VARIABLE (IF (ATOM (CAR ITEM)) (CAR ITEM) (CADAR ITEM)))
+				     (SUPPLIED-P (IF (CDDR ITEM) (THIRD ITEM) (GENSYM))))
+				 (PUSH (LIST VARIABLE (SECOND ITEM) SUPPLIED-P) DEFERRED)
+				 (SETQ ITEM (LIST (CAR ITEM) NIL SUPPLIED-P))))
+			  COLLECT ITEM
+			  WHEN (EQ ITEM '&AUX)
+			    COLLECT `(,CONTINUATION-VAR
+				      (PROG1 SELF-MAPPING-TABLE
+					(SETQ SELF-MAPPING-TABLE (AREF SELF-MAPPING-TABLE 2))
+					,@(LOOP FOR (VARIABLE DEFAULT SUPPLIED-P)
+						    IN (NREVERSE DEFERRED)
+						COLLECT `(UNLESS ,SUPPLIED-P
+							   (SETQ ,VARIABLE ,DEFAULT)))))
+			    AND DO (SETQ FLAG NIL)))
+      ;; Massage the method's arguments and body
+      (MULTIPLE-VALUE-BIND (ARGLIST DECLARATIONS BODY ADDITIONAL-FORMS)
+	  (MASSAGE-METHOD-ARGUMENTS
+	    FUNCTION-SPEC ARGLIST BODY
+	    (FLAVOR-LEXICAL-ENVIRONMENT FLAVOR 'COMPILE T CONTINUATION-VAR))
+	;; Note that this method exists in case we compile a combined method that needs
+	;; to incorporate this whopper, during this same compilation.
+	(NOTICE-METHOD FUNCTION-SPEC)
+	;; Define the method as a function that runs in the right environment
+	;; and evaluate any additional forms (usually there are none)
+	(PROGNIFY
+	  `(,@ADDITIONAL-FORMS
+	    (DEFUN ,FUNCTION-SPEC
+		   ,(FEATURE-CASE
+		      (3600. `(SELF SELF-MAPPING-TABLE .GENERIC. ,@ARGLIST))
+		      (:IMACH `(SELF-MAPPING-TABLE SELF ,@ARGLIST)))
+	      (DECLARE ,@(FLAVOR-LOCAL-DECLARATIONS FLAVOR 'COMPILE NIL))
+	      ,@DECLARATIONS
+	      ;; This IGNORE shields local macros in the body from parse-body-declarations
+	      (IGNORE SELF SELF-MAPPING-TABLE)
+	      ;; Different versions of the CONTINUE-WHOPPER and LEXPR- macros
+	      (MACROLET ((CONTINUE-WHOPPER (&REST ARGS)
+			   (FEATURE-CASE
+			     (3600.
+			       `(FUNCALL (AREF ,',CONTINUATION-VAR 0)
+					 SELF
+					 (AREF ,',CONTINUATION-VAR 1)
+					 .GENERIC.
+					 ,@ARGS))
+			     (:IMACH
+			       `(FUNCALL (AREF ,',CONTINUATION-VAR 0)
+					 (AREF ,',CONTINUATION-VAR 1)
+					 SELF
+					 ,@ARGS))))
+			 (LEXPR-CONTINUE-WHOPPER (&REST ARGS)
+			   (FEATURE-CASE
+			     (3600.
+			       `(APPLY (AREF ,',CONTINUATION-VAR 0)
+				       SELF
+				       (AREF ,',CONTINUATION-VAR 1)
+				       .GENERIC.
+				       ,@ARGS))
+			     (:IMACH
+			       `(APPLY (AREF ,',CONTINUATION-VAR 0)
+				       (AREF ,',CONTINUATION-VAR 1)
+				       SELF
+				       ,@ARGS)))))
+		,@BODY))))))))
+
+(DEFPROP DEFWHOPPER-SUBST DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+;;; Similar to DEFWHOPPER, but the body is expanded in-line in the combined method, giving
+;;; improved time efficiency but decreased space efficiency unless the body is small.
+(DEFMACRO DEFWHOPPER-SUBST (NAME ARGLIST &BODY BODY)
+  (DECLARE (ARGLIST (GENERIC-FUNCTION FLAVOR) ARGLIST &BODY BODY))
+  (MULTIPLE-VALUE-BIND (GENERIC-FUNCTION FLAVOR)
+      (DEFMETHOD-COMPATIBILITY 'DEFWHOPPER-SUBST 'WRAPPER NAME NIL)
+    `(DEFWRAPPER (,GENERIC-FUNCTION ,FLAVOR) (,ARGLIST COMBINED-METHOD-BODY-FORM)
+       (EXPAND-WHOPPER-SUBST COMBINED-METHOD-BODY-FORM
+			     ',(IF (CDR BODY) (CONS 'PROGN BODY) (CAR BODY))))))
+
+(DEFUN EXPAND-WHOPPER-SUBST (COMBINED-METHOD-BODY-FORM BODY-FORM)
+  `(MACROLET ((CONTINUE-WHOPPER (&REST FORMS)
+		(LET ((*COMBINED-METHOD-ARGUMENTS* ',*COMBINED-METHOD-ARGUMENTS*)
+		      (*COMBINED-METHOD-LAMBDA-LIST* ',*COMBINED-METHOD-LAMBDA-LIST*)
+		      (*COMBINED-METHOD-APPLY* ',*COMBINED-METHOD-APPLY*))
+		  (CONTINUE-WHOPPER-SUBST FORMS NIL ',COMBINED-METHOD-BODY-FORM)))
+	      (LEXPR-CONTINUE-WHOPPER (&REST FORMS)
+		(LET ((*COMBINED-METHOD-ARGUMENTS* ',*COMBINED-METHOD-ARGUMENTS*)
+		      (*COMBINED-METHOD-LAMBDA-LIST* ',*COMBINED-METHOD-LAMBDA-LIST*)
+		      (*COMBINED-METHOD-APPLY* ',*COMBINED-METHOD-APPLY*))
+		  (CONTINUE-WHOPPER-SUBST FORMS T ',COMBINED-METHOD-BODY-FORM))))
+     ,BODY-FORM))
+
+(DEFUN CONTINUE-WHOPPER-SUBST (ARGS APPLY COMBINED-METHOD-BODY-FORM)
+  (DECLARE (SPECIAL *COMBINED-METHOD-LAMBDA-LIST*	;Forward reference
+		    *COMBINED-METHOD-ARGUMENTS*
+		    *COMBINED-METHOD-APPLY*))
+  ;; If body is simply an invocation of a method, optimize it
+  (LET ((METHOD (METHOD-CALL-P COMBINED-METHOD-BODY-FORM)))
+    (COND (METHOD
+	   ;; Optimized case, call method with the magic args and then the specified args
+	   (FEATURE-CASE
+	     (3600.
+	       `(,(IF APPLY `APPLY `FUNCALL)
+		 #',METHOD
+		 SELF ,(FOURTH COMBINED-METHOD-BODY-FORM) ,(FIFTH COMBINED-METHOD-BODY-FORM)
+		 ,@ARGS))
+	     (:IMACH
+	       `(,(IF APPLY `APPLY `FUNCALL)
+		 #',METHOD
+		 ,(THIRD COMBINED-METHOD-BODY-FORM) SELF
+		 ,@ARGS)))
+	   )
+	  ;; General case, find most efficient way to bind combined-method-args to args
+	  ((AND (NOT *COMBINED-METHOD-APPLY*) (NOT APPLY))
+	   (IF (= (LIST-LENGTH ARGS) (LIST-LENGTH *COMBINED-METHOD-ARGUMENTS*))
+	       (LT:LET-SUBST *COMBINED-METHOD-ARGUMENTS*
+			     ARGS
+			     COMBINED-METHOD-BODY-FORM)
+	       `((LAMBDA ,*COMBINED-METHOD-LAMBDA-LIST* ,COMBINED-METHOD-BODY-FORM)
+		 ,@ARGS)))
+	  ((NOT APPLY)				;*COMBINED-METHOD-APPLY* is true
+	   (LET ((N-SPREAD (1- (LIST-LENGTH *COMBINED-METHOD-ARGUMENTS*))))
+	     (IF ( (LIST-LENGTH ARGS) N-SPREAD)
+		 (LT:LET-SUBST (BUTLAST *COMBINED-METHOD-ARGUMENTS*)
+			       (SUBSEQ ARGS 0 N-SPREAD)
+			       `(WITH-STACK-LIST (,(CAR (LAST *COMBINED-METHOD-ARGUMENTS*))
+						  ,@(SUBSEQ ARGS N-SPREAD))
+				  ,COMBINED-METHOD-BODY-FORM))
+		 `((LAMBDA ,*COMBINED-METHOD-LAMBDA-LIST* ,COMBINED-METHOD-BODY-FORM)
+		   ,@ARGS))))
+	  ((NOT *COMBINED-METHOD-APPLY*)	;APPLY is true
+	   (LET ((N-PULL (- (LIST-LENGTH *COMBINED-METHOD-ARGUMENTS*)
+			    (1- (LIST-LENGTH ARGS)))))	;Number of args not already spread
+	     (COND (( N-PULL 0)
+		    (LT:LET-SUBST *COMBINED-METHOD-ARGUMENTS*
+				  (NCONC (BUTLAST ARGS)
+					 (LOOP FOR I FROM 0 BELOW N-PULL
+					       COLLECT `(NTH ,I ,(CAR (LAST ARGS)))))
+				  COMBINED-METHOD-BODY-FORM))
+		   (T
+		    ;;--- I guess this signals too many arguments at run time
+		    `(APPLY #'(LAMBDA ,*COMBINED-METHOD-LAMBDA-LIST*
+				,COMBINED-METHOD-BODY-FORM)
+			    ,@ARGS)))))
+	  (T					;Both *COMBINED-METHOD-APPLY* and APPLY
+	   (LET ((N-SPREAD (1- (LIST-LENGTH *COMBINED-METHOD-ARGUMENTS*))))
+	     (COND ((= (LIST-LENGTH ARGS) (1+ N-SPREAD))
+		    (LT:LET-SUBST *COMBINED-METHOD-ARGUMENTS*
+				  ARGS
+				  COMBINED-METHOD-BODY-FORM))
+		   ((> (LIST-LENGTH ARGS) N-SPREAD)
+		    (LT:LET-SUBST (BUTLAST *COMBINED-METHOD-ARGUMENTS*)
+				  (SUBSEQ ARGS 0 N-SPREAD)
+				  `(WITH-STACK-LIST*
+				       (,(CAR (LAST *COMBINED-METHOD-ARGUMENTS*))
+					,@(SUBSEQ ARGS N-SPREAD))
+				     ,COMBINED-METHOD-BODY-FORM)))
+		   (T
+		    `(APPLY #'(LAMBDA ,*COMBINED-METHOD-LAMBDA-LIST*
+				,COMBINED-METHOD-BODY-FORM)
+			    ,@ARGS))))))))
+
+(DEFPROP DEFUN-IN-FLAVOR DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+(DEFMACRO DEFUN-IN-FLAVOR ((FUNCTION-NAME FLAVOR-NAME) ARGLIST &BODY BODY)
+  (DEFUN-IN-FLAVOR-INTERNAL 'DEFUN-IN-FLAVOR FUNCTION-NAME FLAVOR-NAME ARGLIST BODY))
+
+(DEFPROP DEFSUBST-IN-FLAVOR DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+(DEFMACRO DEFSUBST-IN-FLAVOR ((FUNCTION-NAME FLAVOR-NAME) ARGLIST &BODY BODY) 
+  (DEFUN-IN-FLAVOR-INTERNAL 'DEFSUBST-IN-FLAVOR FUNCTION-NAME FLAVOR-NAME ARGLIST BODY))
+
+(DEFPROP DEFMACRO-IN-FLAVOR DEFUN ZWEI:DEFINITION-FUNCTION-SPEC-TYPE)
+
+(DEFMACRO DEFMACRO-IN-FLAVOR ((FUNCTION-NAME FLAVOR-NAME) ARGLIST &BODY BODY)
+  (DEFUN-IN-FLAVOR-INTERNAL 'DEFMACRO-IN-FLAVOR FUNCTION-NAME FLAVOR-NAME ARGLIST BODY))
+
+(DEFUN DEFUN-IN-FLAVOR-INTERNAL (TYPE FUNCTION-NAME FLAVOR-NAME ARGLIST BODY)
+  (CHECK-TYPE FUNCTION-NAME SYMBOL)
+  (CHECK-TYPE FLAVOR-NAME SYMBOL)
+  (UNLESS (EQ TYPE 'DEFMACRO-IN-FLAVOR)
+    (CHECK-TYPE ARGLIST LIST))
+  (LET* ((FUNCTION-SPEC `(DEFUN-IN-FLAVOR ,FUNCTION-NAME ,FLAVOR-NAME))
+	 (COMPILER:DEFAULT-WARNING-FUNCTION FUNCTION-SPEC)
+	 (COMPILER:DEFAULT-WARNING-DEFINITION-TYPE 'DEFUN)
+	 (MACRO NIL))
+    ;; Complain if flavor name is misspelled
+    (CHECK-FLAVOR-NAME FLAVOR-NAME)
+    ;; Strip declarations out of the body
+    (MULTIPLE-VALUE-BIND (DECLARATIONS BODY)
+	(FIND-BODY-DECLARATIONS BODY
+				(FLAVOR-LEXICAL-ENVIRONMENT FLAVOR-NAME 'COMPILE)
+				ARGLIST)
+      ;; Complain if forward references to this function were incorrectly compiled
+      (MAYBE-WARN-ABOUT-DEFUN-IN-FLAVOR-DEFINITION FUNCTION-SPEC TYPE)
+      ;; If this is a macro, develop the macro-expander function for compile-time
+      (WHEN (EQ TYPE 'DEFMACRO-IN-FLAVOR)
+	(SETQ MACRO `(SPECIAL ,(SI:ENCLOSE
+				 (SI:DEFMACRO-1 'SI:NAMED-LAMBDA 'SPECIAL
+						FUNCTION-NAME ARGLIST
+						(APPEND DECLARATIONS BODY))
+				 NIL NIL))))
+      ;; Note that this function exists so we can compile callers of it.
+      (NOTICE-DEFUN-IN-FLAVOR FUNCTION-SPEC MACRO)
+      ;; At load time define the function to run in the right environment
+      (IF (EQ TYPE 'DEFMACRO-IN-FLAVOR)
+	  `(DEFMACRO ,FUNCTION-SPEC ,ARGLIST
+	     ,@DECLARATIONS
+	     (BLOCK ,FUNCTION-NAME
+	       ,@BODY))
+	  `(PROGN
+	     (PROCLAIM '(,(IF (EQ TYPE 'DEFSUBST-IN-FLAVOR) 'INLINE 'NOTINLINE)
+			 ,FUNCTION-SPEC))
+	     (DEFUN ,FUNCTION-SPEC
+		    ,(FEATURE-CASE
+		       (3600. `(SELF SELF-MAPPING-TABLE ,@ARGLIST))
+		       (:IMACH `(SELF-MAPPING-TABLE SELF ,@ARGLIST)))
+	       (DECLARE ,@(FLAVOR-LOCAL-DECLARATIONS FLAVOR-NAME 'COMPILE NIL))
+	       ,@DECLARATIONS
+	       ;; This IGNORE shields local macros in the body from parse-body-declarations
+	       (IGNORE SELF SELF-MAPPING-TABLE)
+	       (BLOCK ,FUNCTION-NAME
+		 ,@BODY)))))))
+
+;Interface to the compiler warnings system
+(DEFUN MAYBE-WARN-ABOUT-DEFUN-IN-FLAVOR-DEFINITION (FUNCTION-SPEC TYPE)
+  ;; If calls to the global definition of this name have been compiled, by
+  ;; callers that should have had this defun-in-flavor in their lexical
+  ;; environment, complain about a forward-reference problem.
+  (LOOP FOR (PATHNAME . ENTRIES) IN (COMPILER:FUNCTION-REFERENCED-P
+				      (METHOD-GENERIC FUNCTION-SPEC))
+	DO (IGNORE PATHNAME)
+	NCONC (LOOP FOR ENTRY IN ENTRIES WITH FL
+		    AS CALLER = (IF (ATOM ENTRY) ENTRY (CAR ENTRY))
+		    WHEN (AND (LISTP CALLER)
+			      (MEMBER (CAR CALLER) *FDEFINABLE-METHOD-TYPES*)
+			      (SETQ FL (FIND-FLAVOR (METHOD-FLAVOR CALLER) NIL 'COMPILE))
+			      (MEMBER (METHOD-FLAVOR FUNCTION-SPEC)
+				      (FLAVOR-ALL-COMPONENTS FL)))
+		      COLLECT CALLER)
+	  INTO CALLERS
+	FINALLY
+	  (WHEN CALLERS
+	    (WARN "~S, which was previously assumed to be a function,
+is being defined as a ~S local to the flavor ~S.
+The caller~[~1; ~{~S~} was~:;s ~{~S~^, ~} were~] compiled incorrectly
+because of the reference to ~5:*~S preceding its definition.  This must be
+corrected by defining ~:*~S earlier in your program or by using the
+:FUNCTIONS option in the DEFFLAVOR ~*~S."
+		  (METHOD-GENERIC FUNCTION-SPEC) TYPE (METHOD-FLAVOR FUNCTION-SPEC)
+		  (LENGTH CALLERS) CALLERS))))
+
+;Get the INSTANCE-VARIABLE and LOCAL-FUNCTIONS declarations for a flavor.
+;The first element of the INSTANCE-VARIABLE declaration is the name of the flavor,
+; the rest are the instance variable names.
+;The LOCAL-FUNCTIONS declaration is an alist from local-function names 
+; to interpreter definition cells and function-specs; it can go right into
+; the functions slot of an interpreter environment.
+;ERROR-P NIL => No error, just a warning, if flavor not defined or not fully defined yet,
+; although you may get a declared-special warning from the compiler, which means you'll
+; have to recompile.  If the flavor is not defined at all, assume caller already warned.
+(DEFUN FLAVOR-LOCAL-DECLARATIONS (FLAVOR-NAME ENV ERROR-P)
+  (IF (OR ERROR-P (FIND-FLAVOR FLAVOR-NAME NIL ENV))
+      (LET ((FL (FIND-FLAVOR FLAVOR-NAME 'CREATE-IN-ENV ENV)))
+	;; Compute the names of the inherited instance variables.
+	;; This will print a warning if any component flavors are undefined, but
+	;; only the first time FLAVOR-LOCAL-DECLARATIONS is called;
+	;; that's why we test FLAVOR-ALL-COMPONENTS instead of FLAVOR-COMPONENTS-COMPOSED.
+	(UNLESS (FLAVOR-ALL-COMPONENTS FL)
+	  (COMPOSE-FLAVOR-COMBINATION FLAVOR-NAME :ENV ENV :ERROR-P ERROR-P))
+	(LET ((IVS (LIST* 'INSTANCE-VARIABLES
+			  FLAVOR-NAME
+			  (APPEND (FLAVOR-ADDITIONAL-INSTANCE-VARIABLES FL)
+				  (FLAVOR-ALL-INSTANCE-VARIABLES FL)))))
+	  (IF (FLAVOR-ALL-LOCAL-FUNCTIONS FL)
+	      `(,IVS (LOCAL-FUNCTIONS ,@(FLAVOR-ALL-LOCAL-FUNCTIONS FL)))
+	      `(,IVS))))
+      ;; No names of instance variables known, nor defun/subst/macro-in-flavors
+      `((INSTANCE-VARIABLES ,FLAVOR-NAME))))
+
+(DEFUN FLAVOR-LEXICAL-ENVIRONMENT (FLAVOR-NAME ENV &OPTIONAL WHOPPER-P CONTINUATION-VAR)
+  (LET ((FL (FIND-FLAVOR FLAVOR-NAME NIL ENV)))
+    ;; Make sure that FLAVOR-ALL-LOCAL-FUNCTIONS has been composed
+    (WHEN FL
+      (UNLESS (FLAVOR-ALL-COMPONENTS FL)
+	(COMPOSE-FLAVOR-COMBINATION FLAVOR-NAME :ENV ENV :ERROR-P NIL))
+      (LET ((LOCAL-FUNCTIONS (FLAVOR-ALL-LOCAL-FUNCTIONS FL)))
+	(IF WHOPPER-P
+	    (LIST
+	      NIL
+	      (LIST* (SI:DIGEST-MACROLET-MACRO
+		       `(CONTINUE-WHOPPER (&REST ARGS)
+					  (FEATURE-CASE
+					    (3600.
+					      `(FUNCALL (AREF ,',CONTINUATION-VAR 0)
+							SELF
+							(AREF ,',CONTINUATION-VAR 1)
+							.GENERIC.
+							,@ARGS))
+					    (:IMACH
+					      `(FUNCALL (AREF ,',CONTINUATION-VAR 0)
+							(AREF ,',CONTINUATION-VAR 1)
+							SELF
+							,@ARGS))))
+		       NIL)
+		     (SI:DIGEST-MACROLET-MACRO
+		       `(LEXPR-CONTINUE-WHOPPER (&REST ARGS)
+						(FEATURE-CASE
+						  (3600.
+						    `(APPLY (AREF ,',CONTINUATION-VAR 0)
+							    SELF
+							    (AREF ,',CONTINUATION-VAR 1)
+							    .GENERIC.
+							    ,@ARGS))
+						  (:IMACH
+						    `(APPLY (AREF ,',CONTINUATION-VAR 0)
+							    (AREF ,',CONTINUATION-VAR 1)
+							    SELF
+							    ,@ARGS))))
+		       NIL)
+		     LOCAL-FUNCTIONS))
+	    (AND LOCAL-FUNCTIONS
+		 (LIST NIL LOCAL-FUNCTIONS)))))))
+
+;Called when a defmethod is compiled.
+;If there is a separate compile-time environment, record that this file contains this method.
+(DEFUN NOTICE-METHOD (FUNCTION-SPEC)
+  (WHEN UNDO-DECLARATIONS-FLAG
+    (LET* ((FLAVOR (METHOD-FLAVOR FUNCTION-SPEC))
+	   (METHODS (SECOND (ASSOC FDEFINE-FILE-PATHNAME
+				   (COMPILER:FILE-DECLARATION-ALIST FLAVOR 'KNOWN-METHODS)))))
+      (UNLESS (MEMBER FUNCTION-SPEC METHODS :TEST #'EQUAL)
+	(COMPILER:FILE-DECLARE FLAVOR 'KNOWN-METHODS (CONS FUNCTION-SPEC METHODS))))))
+
+;Called when a defflavor is compiled.
+;---This probably only is needed for bootstrapping, to cancel out "automatic methods"
+;---created by the old flavor system as a side-effect of defflavor.
+(DEFUN NOTICE-FLAVOR (FLAVOR)
+  (WHEN UNDO-DECLARATIONS-FLAG
+    (UNLESS (ASSOC FDEFINE-FILE-PATHNAME
+		   (COMPILER:FILE-DECLARATION-ALIST FLAVOR 'KNOWN-METHODS))
+      (COMPILER:FILE-DECLARE FLAVOR 'KNOWN-METHODS NIL))))
+
+;Called when a defun-in-flavor is compiled.
+;Make it known in the separate compile-time environment, if there is one.
+;Otherwise make it known in the current environment, so it can call itself recursively.
+(DEFUN NOTICE-DEFUN-IN-FLAVOR (FUNCTION-SPEC MACRO
+			       &OPTIONAL (FL (FIND-FLAVOR (METHOD-FLAVOR FUNCTION-SPEC) T
+							  'COMPILE)))
+  (WHEN UNDO-DECLARATIONS-FLAG
+    (LET* ((FLAVOR (METHOD-FLAVOR FUNCTION-SPEC))
+	   (METHODS (SECOND (ASSOC FDEFINE-FILE-PATHNAME
+				   (COMPILER:FILE-DECLARATION-ALIST
+				      FLAVOR 'KNOWN-LOCAL-FUNCTIONS)))))
+      (UNLESS (MEMBER FUNCTION-SPEC METHODS :TEST #'EQUAL :KEY #'CAR)
+	(COMPILER:FILE-DECLARE FLAVOR 'KNOWN-LOCAL-FUNCTIONS
+			       (CONS (LIST FUNCTION-SPEC MACRO) METHODS)))
+      ;; Update this function into any composed information in the compile-time environment
+      (DEFUN-IN-FLAVOR-ADDED FL 'COMPILE FUNCTION-SPEC MACRO)))
+  (UNLESS (FIND FUNCTION-SPEC (FLAVOR-ALL-LOCAL-FUNCTIONS FL) :KEY #'THIRD :TEST #'EQUAL)
+    (FIND-METHOD-HOLDER FUNCTION-SPEC T FL 'COMPILE)
+    (DEFUN-IN-FLAVOR-ADDED FL 'COMPILE FUNCTION-SPEC MACRO)))
+
+;Called from top level to get around bootstrapping problems, where a method
+;exists in the compile-time environment, but hasn't been loaded yet into the
+;run-time environment at the time a combined-method that calls it is validated
+;by a compile-flavor-methods.  Avoid thinking the combined-method needs to be
+;regenerated to not call this method.
+(DEFUN NOTICE-RUN-TIME-METHOD (FUNCTION-SPEC)
+  (LET ((FDEFINE-FILE-PATHNAME NIL))		;Suppress source file name checking
+    (OR (FDEFINEDP FUNCTION-SPEC)
+	(FDEFINE FUNCTION-SPEC
+		 ;; Store a pseudo method that has the right name, but not the right body
+		 (SI:ENCLOSE `(LAMBDA (&REST ARGS)
+				(APPLY #'RUN-TIME-NOTICED-METHOD ARGS))
+			     NIL FUNCTION-SPEC)
+		 NIL))))
+
+;If this gets called, you goofed
+#+3600
+(DEFUN RUN-TIME-NOTICED-METHOD (SELF IGNORE MESSAGE &REST IGNORE)
+  (ERROR "The method for doing ~S to ~S has not been loaded yet."
+	 (IF (TYPEP MESSAGE 'GENERIC-FUNCTION) (GENERIC-FUNCTION-NAME MESSAGE) MESSAGE)
+	 SELF))
+
+#+IMACH
+(DEFUN RUN-TIME-NOTICED-METHOD (MESSAGE SELF &REST IGNORE)
+  (ERROR "The method for doing ~S to ~S has not been loaded yet."
+	 (IF (TYPEP MESSAGE 'GENERIC-FUNCTION) (GENERIC-FUNCTION-NAME MESSAGE) MESSAGE)
+	 SELF))
+
+;Find or create a METHOD-HOLDER object and a method-table entry for the specified method.
+;CREATE-P is NIL if NIL is to be returned if the method is not already known,
+;or T if the method is to be made known provided the flavor exists,
+;or FORCE if the method-holder is to be created unconditionally but the method
+;is not to be made known to the flavor if it is not already (used e.g. for PUTPROP).
+(DEFUN FIND-METHOD-HOLDER (FUNCTION-SPEC &OPTIONAL CREATE-P FL ENV)
+  (STANDARDIZE-ENV ENV)
+  (LET ((DEFUN-IN-FLAVOR (EQ (METHOD-TYPE FUNCTION-SPEC) 'DEFUN-IN-FLAVOR))
+	(OTHER-METHOD-TYPE (SECOND (ASSOC (METHOD-TYPE FUNCTION-SPEC)
+					  *EXCHANGEABLE-METHOD-TYPES*)))
+	(GENERIC-NAME (METHOD-GENERIC FUNCTION-SPEC))
+	(FLAVOR-NAME (METHOD-FLAVOR FUNCTION-SPEC))
+	(MTE NIL)
+	(GF NIL)
+	(AREA (FLAVOR-AREA ENV)))
+    (WHEN (OR (NOT (MEMBER (METHOD-TYPE FUNCTION-SPEC) *FDEFINABLE-METHOD-TYPES*))
+	      (NOT (IF DEFUN-IN-FLAVOR
+		       (SYMBOLP GENERIC-NAME)
+		       (TYPEP GENERIC-NAME 'GENERIC-FUNCTION-NAME)))
+	      (NULL FLAVOR-NAME) (NOT (SYMBOLP FLAVOR-NAME)))
+      (ERROR "~S is not a valid function-spec for a method" FUNCTION-SPEC))
+    (WITHOUT-ABORTS ("Flavor data structures for ~S are being updated.~@
+		      Aborting now could damage the flavor ~S~
+		      ~@[ and the generic function ~S~]."
+		     FUNCTION-SPEC FLAVOR-NAME (AND (NOT DEFUN-IN-FLAVOR) GENERIC-NAME))
+      (UNLESS FL
+	(SETQ FL (FIND-FLAVOR FLAVOR-NAME NIL ENV)))
+      (WHEN FL
+	(COND (DEFUN-IN-FLAVOR
+	       ;; See if local function is already known
+	       (DOLIST (METHOD-HOLDER (FLAVOR-LOCAL-FUNCTIONS FL))
+		 (WHEN (EQUAL (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER) FUNCTION-SPEC)
+		   (RETURN-FROM FIND-METHOD-HOLDER METHOD-HOLDER)))
+	       ;; New local function, link its abbreviated name to its full name
+	       (WHEN CREATE-P
+		 (PUSHNEW FUNCTION-SPEC (GET GENERIC-NAME 'FLAVOR-LOCAL-FUNCTIONS)
+			  :TEST #'EQUAL)))
+	      (T
+	       (SETQ MTE (ASSOC GENERIC-NAME (FLAVOR-METHOD-TABLE FL))
+		     GF (FIND-GENERIC-FUNCTION GENERIC-NAME
+					       (AND (EQ CREATE-P T) 'CREATE-IN-ENV)
+					       ENV))
+	       ;; If someone has undefined this generic function, put it back
+	       (UNLESS (OR ENV
+			   (NEQ CREATE-P T)
+			   ;; Doesn't define the function definition of its name
+			   (GENERIC-FUNCTION-MESSAGE-P GF)
+			   ;; Generic function object doesn't belong in function definition
+			   (GENERIC-FUNCTION-HAS-DISPATCH-FUNCTION GF))
+		 (INSTALL-GENERIC-FUNCTION GENERIC-NAME GF NIL T))
+	       (WHEN (AND (NULL MTE) (EQ CREATE-P T))
+		 (PUSH (SETQ MTE (NCONS-IN-AREA GENERIC-NAME AREA)) (FLAVOR-METHOD-TABLE FL)
+		       :AREA AREA :LOCALIZE 2))
+	       ;; See if method is already known
+	       (DOLIST (METHOD-HOLDER (CDR MTE))
+		 (WHEN (EQUAL (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER) FUNCTION-SPEC)
+		   (RETURN-FROM FIND-METHOD-HOLDER METHOD-HOLDER)))
+	       ;; This method type used to be known by another name in earlier releases
+	       ;; so we must check for a method defined with either type.  (WHOPPER/NCWHOPPER)
+	       (WHEN OTHER-METHOD-TYPE
+		 (WITH-STACK-LIST* (OTHER-FUNCTION-SPEC OTHER-METHOD-TYPE (CDR FUNCTION-SPEC))
+		   (DOLIST (METHOD-HOLDER (CDR MTE))
+		     (WHEN (EQUAL (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER)
+				  OTHER-FUNCTION-SPEC)
+		       (RETURN-FROM FIND-METHOD-HOLDER METHOD-HOLDER)))))
+	       ;; If the method is going to be made known to the flavor, and is not a
+	       ;; combined method, make sure the generic function knows about it.
+	       (WHEN (AND CREATE-P MTE
+			  (NEQ (METHOD-TYPE FUNCTION-SPEC) 'COMBINED))
+		 (PUSHNEW FLAVOR-NAME (GENERIC-FUNCTION-FLAVORS GF) :AREA AREA :LOCALIZE T))
+	       )))
+      ;; See if method is already known in the undefined-method hash table
+      (LABELS ((CHECK-UNDEFINED (FUNCTION-SPEC)
+		 (LET ((METHOD-HOLDER
+			 (IF (LISTP *UNDEFINED-METHOD-HASH-TABLE*)
+			     (ASSOC FUNCTION-SPEC *UNDEFINED-METHOD-HASH-TABLE*
+				    :TEST #'EQUAL)
+			     (GETHASH FUNCTION-SPEC *UNDEFINED-METHOD-HASH-TABLE*))))
+		   (WHEN METHOD-HOLDER
+		     (WHEN (AND FL (EQ CREATE-P T))
+		       ;; Move method from hash-table to flavor
+		       (IF DEFUN-IN-FLAVOR
+			   (PUSH METHOD-HOLDER (FLAVOR-LOCAL-FUNCTIONS FL) :AREA AREA
+									   :LOCALIZE T)
+			   (PUSH METHOD-HOLDER (CDR MTE) :AREA AREA))
+		       (IF (LISTP *UNDEFINED-METHOD-HASH-TABLE*)
+			   (SETQ *UNDEFINED-METHOD-HASH-TABLE*
+				 (DELETE METHOD-HOLDER *UNDEFINED-METHOD-HASH-TABLE*))
+			   (REMHASH FUNCTION-SPEC *UNDEFINED-METHOD-HASH-TABLE*)))
+		     (RETURN-FROM FIND-METHOD-HOLDER METHOD-HOLDER)))))
+	(CHECK-UNDEFINED FUNCTION-SPEC)
+	;; This method type used to be known by another name in earlier releases
+	;; so we must check for a method defined with either type.  (WHOPPER/NCWHOPPER)
+	(WHEN OTHER-METHOD-TYPE
+	  (WITH-STACK-LIST* (OTHER-FUNCTION-SPEC OTHER-METHOD-TYPE (CDR FUNCTION-SPEC))
+	    (CHECK-UNDEFINED OTHER-FUNCTION-SPEC))))
+      ;; Method not already known, return NIL unless it's time to create it
+      (UNLESS (OR (AND CREATE-P FL) (EQ CREATE-P 'FORCE))
+	(RETURN-FROM FIND-METHOD-HOLDER NIL))
+      ;; Method is not known, but we are supposed to make it known
+      ;; Copy the function spec so it will be on the same page as the method-holder.
+      ;; Don't copy the generic name even if it's a list, because these get interned.
+      (SETQ FUNCTION-SPEC (COPY-LIST FUNCTION-SPEC AREA))
+      (LET ((METHOD-HOLDER (LIST-IN-AREA AREA FUNCTION-SPEC NIL NIL)))
+	(NULLIFY-METHOD-DEFINITION METHOD-HOLDER)
+	(COND (MTE				;Put in hash table or flavor as desired
+	       (PUSH METHOD-HOLDER (CDR MTE) :AREA AREA))
+	      ((AND DEFUN-IN-FLAVOR FL)
+	       (PUSH METHOD-HOLDER (FLAVOR-LOCAL-FUNCTIONS FL) :AREA AREA :LOCALIZE T))
+	      ((LISTP *UNDEFINED-METHOD-HASH-TABLE*)
+	       (PUSH METHOD-HOLDER *UNDEFINED-METHOD-HASH-TABLE*))
+	      (T
+	       (SETF (GETHASH FUNCTION-SPEC *UNDEFINED-METHOD-HASH-TABLE*) METHOD-HOLDER)))
+	(RETURN-FROM FIND-METHOD-HOLDER METHOD-HOLDER)))))
+
+;;;; FUNCTION-SPEC-HANDLER
+
+;;;--- this at least makes m-. of FLAVOR:METHOD find this file. 
+;;;--- without giving function spec handlers their own function spec, i'm not
+;;;--- sure that I can do any better.
+
+(DEFPROP DEFINE-FLAVOR-FUNCTION-SPEC-HANDLERS "Flavor function spec handlers"
+	 SI:DEFINITION-TYPE-NAME)
+(DEFMACRO DEFINE-FLAVOR-FUNCTION-SPEC-HANDLERS ()
+  `(PROGN
+     (DOLIST (METHOD-TYPE *FDEFINABLE-METHOD-TYPES*)
+       (RECORD-SOURCE-FILE-NAME METHOD-TYPE 'DEFINE-FUNCTION-SPEC-HANDLERS)
+       (SETF (GET METHOD-TYPE 'FUNCTION-SPEC-HANDLER) 'METHOD-FUNCTION-SPEC-HANDLER))))
+
+(DEFINE-FLAVOR-FUNCTION-SPEC-HANDLERS)
+
+(DEFUN METHOD-FUNCTION-SPEC-HANDLER (FUNCTION FUNCTION-SPEC &OPTIONAL ARG1 ARG2)
+  (MACROLET ((BARF (&REST ERROR-ARGS)		;So we don't error while validating
+	       `(IF (EQ FUNCTION 'VALIDATE-FUNCTION-SPEC)
+		    (RETURN-FROM METHOD-FUNCTION-SPEC-HANDLER NIL)
+		    (ERROR ,@ERROR-ARGS))))
+    ;; Defense against dotted lists causing an error while taking function-spec apart
+    (UNLESS (AND (LISTP (CDR FUNCTION-SPEC)) (LISTP (CDDR FUNCTION-SPEC)))
+      (BARF "The function spec, ~S, is a dotted list, which is invalid." FUNCTION-SPEC))
+    (LET ((ENV (CASE FUNCTION
+		 (FDEFINITION-LOCATION (AND ARG1 'COMPILE))
+		 (SI:COMPILER-FDEFINEDP 'COMPILE)
+		 (OTHERWISE NIL)))
+	  (METHOD-TYPE (METHOD-TYPE FUNCTION-SPEC))
+	  (GENERIC-NAME (METHOD-GENERIC FUNCTION-SPEC))
+	  (FLAVOR-NAME (METHOD-FLAVOR FUNCTION-SPEC)))
+      ;; Validate the syntax of the function spec
+      (IF (EQ METHOD-TYPE 'DEFUN-IN-FLAVOR)
+	  (UNLESS (SYMBOLP GENERIC-NAME)
+	    (BARF "In the function spec ~S, the function name ~S is invalid."
+		  FUNCTION-SPEC GENERIC-NAME))
+	  (UNLESS (TYPEP GENERIC-NAME 'GENERIC-FUNCTION-NAME)
+	    (BARF "In the function spec ~S, the generic-function name ~S is invalid."
+		  FUNCTION-SPEC GENERIC-NAME)))
+      (WHEN (OR (NULL FLAVOR-NAME) (NOT (SYMBOLP FLAVOR-NAME)))
+	(BARF "In the function spec ~S, the flavor name ~S is invalid."
+	      FUNCTION-SPEC FLAVOR-NAME))
+      (WHEN (AND (NEQ METHOD-TYPE 'METHOD) (METHOD-OPTIONS FUNCTION-SPEC))
+	(BARF "In the function spec ~S, the options ~S are superfluous."
+	      FUNCTION-SPEC (METHOD-OPTIONS FUNCTION-SPEC)))
+      ;; Handle some simple operations now before we start doing page-intensive operations.
+      (CASE FUNCTION
+	(VALIDATE-FUNCTION-SPEC
+	  (RETURN-FROM METHOD-FUNCTION-SPEC-HANDLER T))
+	(SI:DEFINITION-HAS-LOCATION-P
+	  (RETURN-FROM METHOD-FUNCTION-SPEC-HANDLER
+	    ;; Returning T means that it is okay to forward the method-holder's
+	    ;; function cell into the compiled-function that is its definition.
+	    ;; This is needed for defun-in-flavors.
+	    ;; It's not needed for wrappers and combined methods.
+	    ;;--- Right now I'm also doing this for regular methods, because I haven't
+	    ;;--- made combined-methods call directly without going through the function
+	    ;;--- cell.  This is hard on the 3600, if it is made to know
+	    ;;--- the arglist and hence use the CALL-INDIRECT instruction.
+	    ;;--- I'd want to do something or other in FIXUP-METHOD.
+	    (MEMBER METHOD-TYPE '(METHOD WHOPPER NCWHOPPER DEFUN-IN-FLAVOR)))))
+      ;; Use standardized name in method tables and so forth
+      (SETQ GENERIC-NAME (STANDARDIZE-GENERIC-FUNCTION-NAME GENERIC-NAME ENV))
+      (UNLESS (EQ (METHOD-GENERIC FUNCTION-SPEC) GENERIC-NAME)
+	(SETF (METHOD-GENERIC (SETQ FUNCTION-SPEC (COPY-LIST FUNCTION-SPEC)))
+	      GENERIC-NAME))
+      (LET* ((METHOD-HOLDER (FIND-METHOD-HOLDER FUNCTION-SPEC
+						(CASE FUNCTION
+						  (FDEFINE T)
+						  ((SI:PUTPROP FDEFINITION-LOCATION) 'FORCE)
+						  (OTHERWISE NIL))
+						NIL
+						ENV))
+	     (EXCHANGING-TYPES (AND METHOD-HOLDER
+				    (NEQ (METHOD-TYPE
+					   (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER))
+					 METHOD-TYPE))))
+	;; If the method was not found, it could be an error
+	(OR METHOD-HOLDER
+	    (MEMBER FUNCTION '(FDEFINEDP FUNDEFINE SI:COMPILER-FDEFINEDP
+					 ZL:GET FUNCTION-PARENT))
+	    (IF (FIND-FLAVOR FLAVOR-NAME NIL)
+		(ERROR "~S is not a defined method; it is not possible to ~S it"
+		       FUNCTION-SPEC FUNCTION)
+		(ERROR "~S is not the name of a flavor.  It is not possible to ~S ~S."
+		       FLAVOR-NAME FUNCTION FUNCTION-SPEC)))
+	;; Do what we were asked to do
+	(CASE FUNCTION
+	  (FDEFINE
+	    #+IMACH
+	    (WHEN (AND (TYPEP ARG1 'SYMBOL)
+		       (EQ (FIRST FUNCTION-SPEC) 'METHOD))
+	      ;; Old-style "variant" form of DEFMETHOD.  Convert it into the
+	      ;; appropriate function and compile it.
+	      (WARN "The method ~s was compiled incorrectly and should be recompiled.~%
+To enable previously compiled files to continue to load until they are correctly compiled,~%
+the method is being compiled correctly at this time."
+		    FUNCTION-SPEC)
+	      (SETQ ARG1
+		    (COMPILE NIL
+			     `(SYS:NAMED-LAMBDA (,FUNCTION-SPEC)
+						(SELF-MAPPING-TABLE SELF &REST ARGS)
+				(APPLY #',ARG1 SELF SELF-MAPPING-TABLE
+				       ',(GENERIC-FUNCTION-SELECTOR
+					   (FIND-GENERIC-FUNCTION (SECOND FUNCTION-SPEC)))
+				       ARGS)))))
+	    (LET* (;; Check for undefined flavor, which would not have been detected above
+		   ;; if the METHOD-HOLDER was already created by SI:PUTPROP
+		   (FL (OR (FIND-FLAVOR FLAVOR-NAME NIL)
+			   (ERROR "~S is not the name of a flavor.~@
+				    It is not possible to ~S ~S."
+				  FLAVOR-NAME FUNCTION FUNCTION-SPEC)))
+		   (NEW-DEFINITION (NOT (METHOD-DEFINED-P METHOD-HOLDER)))
+		   (OLD-DEFINITION (AND (NOT NEW-DEFINITION)
+					(METHOD-HOLDER-DEFINITION METHOD-HOLDER)))
+		   (FORCE-RECOMPILATION
+		     (AND OLD-DEFINITION
+			  (LET ((NEW (DEBUGGING-INFO ARG1))
+				(OLD (DEBUGGING-INFO OLD-DEFINITION)))
+			    (COND (EXCHANGING-TYPES)
+				  ((MEMBER METHOD-TYPE
+					   *SOURCE-CODE-SAVING-METHOD-TYPES*)
+				   ;; Wrapper and definition has changed
+				   (NOT (EQUAL (ASSOC 'FLAVOR-SOURCE NEW)
+					       (ASSOC 'FLAVOR-SOURCE OLD))))
+				  ((EQ METHOD-TYPE 'DEFUN-IN-FLAVOR)
+				   ;; Propagate new definition if it is a macro
+				   ;; or if it is replacing a macro.
+				   (OR (AND (LISTP ARG1)
+					    (EQ (FIRST ARG1) 'SPECIAL)
+					    ARG1)
+				       (AND (LISTP OLD-DEFINITION)
+					    (EQ (FIRST OLD-DEFINITION) 'SPECIAL)
+					    OLD-DEFINITION)))
+				  ((SETQ OLD (LT:FUNCTION-INLINE-FORM-METHOD
+					       OLD-DEFINITION))
+				   ;; Inlinable method and definition has changed
+				   ;; or new definition is not inlinable
+				   (NOT (EQUALP OLD
+						(LT:FUNCTION-INLINE-FORM-METHOD ARG1))))
+				  ((OR (NOT (EQUAL (FUNCTION-NAME ARG1) FUNCTION-SPEC))
+				       (NOT (EQUAL (FUNCTION-NAME OLD-DEFINITION)
+						   FUNCTION-SPEC)))
+				   ;; UPDATE-METHOD-DEFINITION would be faked out and
+				   ;; would not store the new definition into handler
+				   ;; tables, because the names don't match
+				   T))))))
+	      ;; Now that we are about to start modifying things, protect against abort.
+	      (WITHOUT-ABORTS ("Flavor data structures are being updated to define ~S.~@
+			        Aborting now could damage the flavor ~S and its dependents."
+			       FUNCTION-SPEC FLAVOR-NAME)
+
+		;; Either incrementally recompile this flavor and all its dependents,
+		;; or simply store the new definition into all relevant method tables.
+		;; Never incrementally recompile for COMBINED methods; they are the output
+		;; of compilation, not the input to it.  Don't incrementally recompile if
+		;; simply redefining an old method, unless it is a wrapper and its source
+		;; has actually been changed (heuristic for: its expansion will change).
+		(WHEN (OR NEW-DEFINITION FORCE-RECOMPILATION)
+		  (COND ((EQ METHOD-TYPE 'COMBINED)
+			 (SETF (FLAVOR-HAS-COMBINED-METHODS FL) T))
+			((EQ METHOD-TYPE 'DEFUN-IN-FLAVOR)
+			 ;; Recomposition required
+			 (DEFUN-IN-FLAVOR-ADDED FL NIL FUNCTION-SPEC
+						(AND (LISTP ARG1)
+						     (EQ (FIRST ARG1) 'SPECIAL)
+						     ARG1)))
+			(T
+			 ;; Compilation required.  First install the new definition
+			 ;; so other processes can see it if they call combined methods
+			 ;; that call it.  It's unavoidable that things will be
+			 ;; inconsistent in one way or another for a while.  If the user
+			 ;; aborts out of the recompile-flavor, perhaps because of a
+			 ;; compiler warning, uninstall the new definition so that
+			 ;; recompile-flavor will be called again when he retries.
+			 ;; If he doesn't retry, he will lose but only deservedly,
+			 ;; by having the new method only half there.  This is all
+			 ;; inside a without-aborts, so in any case the user will
+			 ;; be warned.
+			 (LET ((OLD-FSPEC (AND EXCHANGING-TYPES
+					       (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER))
+					  ))
+			   (UNWIND-PROTECT-CASE ()
+			       (PROGN (WHEN EXCHANGING-TYPES
+					;; If we're replacing one method type by another,
+					;; we must make certain that the method holder
+					;; contains the new function spec.
+					(SETF (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER)
+					      FUNCTION-SPEC))
+				      (SETF (METHOD-HOLDER-DEFINITION METHOD-HOLDER) ARG1)
+				      (RECOMPILE-FLAVOR FLAVOR-NAME
+							:GENERIC GENERIC-NAME
+							:IGNORE-EXISTING-METHODS
+							  FORCE-RECOMPILATION))
+			     (:ABORT
+			       (IF OLD-DEFINITION
+				   (PROGN
+				     (WHEN EXCHANGING-TYPES
+				       (SETF (METHOD-HOLDER-FUNCTION-SPEC METHOD-HOLDER)
+					     OLD-FSPEC))
+				     (SETF (METHOD-HOLDER-DEFINITION METHOD-HOLDER)
+					   OLD-DEFINITION))
+				   (NULLIFY-METHOD-DEFINITION METHOD-HOLDER))))))))
+		;; Do some of what FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION
+		;; does, so that the previous definition does not look like the
+		;; current definition by having itself in its function cell.
+		(WHEN (AND (NOT (MEMBER METHOD-TYPE '(METHOD WHOPPER NCWHOPPER
+						      DEFUN-IN-FLAVOR)))
+			   OLD-DEFINITION	;CL:COMPILED-FUNCTION-P not cold loaded,
+					    ;there shouldn't be any recompilations there.
+			   (TYPEP OLD-DEFINITION 'COMPILED-FUNCTION)
+			   (NEQ OLD-DEFINITION ARG1))
+		  (LET ((CELL (LOCF (COMPILED-FUNCTION-FUNCTION-CELL
+				      (COMPILED-FUNCTION-CCA OLD-DEFINITION)))))
+		    (WHEN (AND (= (%P-DATA-TYPE CELL) DTP-COMPILED-FUNCTION)
+			       (EQ (LOCATION-CONTENTS CELL) OLD-DEFINITION))
+		      (WHEN (AND (= (%P-DATA-TYPE (LOCF (METHOD-HOLDER-DEFINITION
+							  METHOD-HOLDER)))
+				    DTP-ONE-Q-FORWARD)
+				 (EQ (%P-CONTENTS-AS-LOCATIVE
+				       (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER)))
+				     CELL))
+			(%P-STORE-CONTENTS (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER))
+					   OLD-DEFINITION))
+		      (%P-STORE-TAG-AND-POINTER CELL DTP-ONE-Q-FORWARD
+						(LOCF (METHOD-HOLDER-DEFINITION
+							METHOD-HOLDER))))))
+		;; Now install the new or updated method for real
+		;; NB: The UPDATE-METHOD-DEFINITION will duplicate a little bit of the
+		;; work that RECOMPILE-FLAVOR may have just done, tough noogies.
+		(SETF (METHOD-HOLDER-DEFINITION METHOD-HOLDER) ARG1)
+		(WHEN (AND NEW-DEFINITION
+			   (MEMBER (METHOD-GENERIC FUNCTION-SPEC) '(MAKE-INSTANCE :INIT))
+			   (FLAVOR-INITIALIZATIONS-COMPOSED FL))
+		  (VALIDATE-CONSTRUCTOR-FUNCTIONS FL))
+		(IF (EQ METHOD-TYPE 'DEFUN-IN-FLAVOR)
+		    ;; If redefining a defmacro-in-flavor -- propagate new definition
+		    ;; to flavor-all-local-functions of dependent flavors
+		    (WHEN (AND (LISTP ARG1)
+			       (EQ (FIRST ARG1) 'SPECIAL)
+			       (LISTP OLD-DEFINITION)
+			       (EQ (FIRST OLD-DEFINITION) 'SPECIAL))
+		      (SETF (SECOND OLD-DEFINITION) (SECOND ARG1))
+		      (SETF (METHOD-HOLDER-DEFINITION METHOD-HOLDER) OLD-DEFINITION))
+		    ;; If redefining a method, update handler tables & combined methods
+		    (UPDATE-METHOD-DEFINITION FLAVOR-NAME FUNCTION-SPEC ARG1))
+		FUNCTION-SPEC)))
+	  (FDEFINITION (METHOD-HOLDER-DEFINITION METHOD-HOLDER))
+	  (FDEFINEDP (AND METHOD-HOLDER (METHOD-DEFINED-P METHOD-HOLDER)))
+;---Probably shouldn't support FDEFINITION-LOCATION, definitions are scattered around
+;---Right now we need it, though, to be able to compile combined methods at all
+;---Nobody better think they can setf location-contents of it
+	  ;; This isn't needed for anything but those specs for which
+	  ;; SI:DEFINITION-HAS-LOCATION-P is true.  The function-cell forwarder
+	  ;; uses this in that case.  --DLA
+	  (FDEFINITION-LOCATION (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER)))
+	  (FUNDEFINE
+	    ;; Check for undefined flavor, which would not have been detected above
+	    ;; if the METHOD-HOLDER was already created by SI:PUTPROP
+	    (UNLESS (FIND-FLAVOR FLAVOR-NAME NIL)
+	      (ERROR "~S is not the name of a flavor.  It is not possible to ~S ~S."
+		     FLAVOR-NAME FUNCTION FUNCTION-SPEC))
+	    (WHEN METHOD-HOLDER
+	      (WITHOUT-ABORTS ("Flavor data structures are being updated to undefine ~S.~@
+			        Aborting now could damage the flavor ~S and its dependents."
+			       FUNCTION-SPEC FLAVOR-NAME)
+		;; Do some of what FORWARD-FUNCTION-CELL-INTO-COMPILED-FUNCTION
+		;; does, so that the previous definition does not look like the
+		;; current definition by having itself in its function cell.
+		(LET ((OLD-DEFINITION (AND (METHOD-DEFINED-P METHOD-HOLDER)
+					   (METHOD-HOLDER-DEFINITION METHOD-HOLDER))))
+		  (WHEN (AND (NOT (MEMBER METHOD-TYPE '(METHOD WHOPPER NCWHOPPER
+							       DEFUN-IN-FLAVOR)))
+			     (TYPEP OLD-DEFINITION 'COMPILED-FUNCTION))
+		    (LET ((CELL (LOCF (COMPILED-FUNCTION-FUNCTION-CELL
+					(COMPILED-FUNCTION-CCA OLD-DEFINITION)))))
+		      (WHEN (AND (= (%P-DATA-TYPE CELL) DTP-COMPILED-FUNCTION)
+				 (EQ (LOCATION-CONTENTS CELL) OLD-DEFINITION))
+			(WHEN (AND (= (%P-DATA-TYPE (LOCF (METHOD-HOLDER-DEFINITION
+							    METHOD-HOLDER)))
+				      DTP-ONE-Q-FORWARD)
+				   (EQ (%P-CONTENTS-AS-LOCATIVE
+					 (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER)))
+				       CELL))
+			  (%P-STORE-CONTENTS (LOCF (METHOD-HOLDER-DEFINITION METHOD-HOLDER))
+					     OLD-DEFINITION))
+			(%P-STORE-TAG-AND-POINTER CELL DTP-ONE-Q-FORWARD
+						  (LOCF (METHOD-HOLDER-DEFINITION
+							  METHOD-HOLDER)))))))
+		;; Move METHOD-HOLDER from flavor to undefined-method table
+		(IF (LISTP *UNDEFINED-METHOD-HASH-TABLE*)
+		    (PUSH METHOD-HOLDER *UNDEFINED-METHOD-HASH-TABLE*)
+		    (SETF (GETHASH FUNCTION-SPEC *UNDEFINED-METHOD-HASH-TABLE*) METHOD-HOLDER))
+		(LET ((FL (FIND-FLAVOR FLAVOR-NAME)))
+		  (COND ((EQ METHOD-TYPE 'DEFUN-IN-FLAVOR)
+			 (SETF (FLAVOR-LOCAL-FUNCTIONS FL)
+			       (DELETE METHOD-HOLDER (FLAVOR-LOCAL-FUNCTIONS FL)))
+			 (DEFUN-IN-FLAVOR-REMOVED FL FUNCTION-SPEC))
+			(T
+			 (LET ((MTE (DELETE METHOD-HOLDER
+					    (ASSOC GENERIC-NAME (FLAVOR-METHOD-TABLE FL))))
+			       (GF (FIND-GENERIC-FUNCTION GENERIC-NAME NIL)))
+			   (WHEN (AND (LOOP FOR MH IN (CDR MTE)
+					    ALWAYS (EQ (METHOD-TYPE
+							 (METHOD-HOLDER-FUNCTION-SPEC MH))
+						       'COMBINED))
+				      (NOT (ASSOC GENERIC-NAME
+						  (FLAVOR-LOCAL-READABLE-INSTANCE-VARIABLES
+						    FL)))
+				      (NOT (ASSOC GENERIC-NAME
+						  (FLAVOR-LOCAL-WRITABLE-INSTANCE-VARIABLES
+						    FL)))
+				      (NOT (ASSOC GENERIC-NAME
+						  (FLAVOR-LOCAL-LOCATABLE-INSTANCE-VARIABLES
+						    FL))))
+			     ;; Nothing left but combined methods
+			     (WHEN GF
+			       ;; DELETE for effect is safe, will be deleting from the cdr.
+			       (SETF (GENERIC-FUNCTION-FLAVORS GF)
+				     (DELETE FLAVOR-NAME (GENERIC-FUNCTION-FLAVORS GF))))
+			     (WHEN (NULL (CDR MTE))
+			       ;; Nothing left at all
+			       (SETF (FLAVOR-METHOD-TABLE FL)
+				     (DELETE MTE (FLAVOR-METHOD-TABLE FL)))))
+			   (WHEN GF
+			     (RECOMPILE-FLAVOR FLAVOR-NAME :GENERIC GENERIC-NAME)
+			     (WHEN (AND (MEMBER (METHOD-GENERIC FUNCTION-SPEC)
+						'(MAKE-INSTANCE :INIT))
+					(FLAVOR-INITIALIZATIONS-COMPOSED FL))
+			       (VALIDATE-CONSTRUCTOR-FUNCTIONS FL)))))))
+		;; In case anyone has their paws on the function cell
+		(NULLIFY-METHOD-DEFINITION METHOD-HOLDER)))
+	      FUNCTION-SPEC)
+	  (SI:COMPILER-FDEFINEDP (NOT (NULL METHOD-HOLDER)))
+	  (ZL:GET (AND METHOD-HOLDER (GETF (METHOD-HOLDER-PLIST METHOD-HOLDER) ARG1)))
+	  (SI:PUTPROP (SETF (GETF (METHOD-HOLDER-PLIST METHOD-HOLDER) ARG2) ARG1))
+	  (SI:REMPROP (REMF (METHOD-HOLDER-PLIST METHOD-HOLDER) ARG1))
+	  (ZL:PLIST (METHOD-HOLDER-PLIST METHOD-HOLDER))
+	  (OTHERWISE
+	    (SI:FUNCTION-SPEC-DEFAULT-HANDLER FUNCTION FUNCTION-SPEC ARG1 ARG2)))))))
+
+(DEFVAR *DEFMETHOD-COMPATIBILITY* :WARN
+  "NIL => Don't allow old-style DEFMETHOD syntax.
+T => Allow old-style DEFMETHOD syntax.
+:WARN => Allow old-style DEFMETHOD syntax but issue a warning when it is seen.")
+
+;;; Kludge to support old flavor system's format of DEFMETHOD for a while
+;;; Also look for defining a method for a message that is really a generic,
+;;; and standardize the name of the method, but don't issue a warning.
+(DEFUN DEFMETHOD-COMPATIBILITY (FUNCTION TYPE NAME ALLOW-OPTIONS)
+  (DECLARE (VALUES GENERIC-FUNCTION FLAVOR-NAME OPTIONS))
+  (UNLESS (AND (LISTP NAME) (CDR NAME))
+    (WARN `(:FUNCTION ,NAME
+	    :FATAL T)
+	  "(~S ~S...) is not valid syntax.~@
+	   The name of a ~@ is a list of a generic function~
+	   ~:[ and~;,~] a flavor~:*~:[.~;, and options.~]"
+	  FUNCTION NAME TYPE ALLOW-OPTIONS))
+  (LET* ((GENERIC-FUNCTION (CAR NAME))
+	 (FLAVOR-NAME (CADR NAME))
+	 (OPTIONS (CDDR NAME))
+	 (REAL-GENERIC GENERIC-FUNCTION)
+	 (REAL-FLAVOR FLAVOR-NAME)
+	 (REAL-OPTIONS OPTIONS)
+	 TEM)
+    (WHEN (AND OPTIONS (NOT ALLOW-OPTIONS))
+      (WARN `(:FUNCTION (,TYPE ,GENERIC-FUNCTION ,FLAVOR-NAME ,@OPTIONS))
+	    "~S does not allow options in the name.  ~{~S ~}will be ignored."
+	    FUNCTION OPTIONS))
+    (COND ((NOT *DEFMETHOD-COMPATIBILITY*)
+	   (RETURN-FROM DEFMETHOD-COMPATIBILITY
+	     (VALUES GENERIC-FUNCTION FLAVOR-NAME OPTIONS)))
+	  ((AND (SYMBOLP GENERIC-FUNCTION) (NOT (NULL GENERIC-FUNCTION))
+		(SYMBOLP FLAVOR-NAME) (NOT (NULL FLAVOR-NAME))
+		(NOT (FIND-FLAVOR FLAVOR-NAME NIL 'COMPILE))
+		(EVERY #'SYMBOLP OPTIONS)
+		(NOT (AND (SETQ TEM (FIND-GENERIC-FUNCTION GENERIC-FUNCTION NIL 'COMPILE))
+			  (GENERIC-FUNCTION-EXPLICIT TEM)))
+		(FIND-FLAVOR GENERIC-FUNCTION NIL 'COMPILE)
+		(IF (EQ FLAVOR-NAME ':CASE) (= (LENGTH OPTIONS) 2) ( (LENGTH OPTIONS) 1)))
+	   ;; Old format with the flavor name first and the message name in the middle
+	   ;; of the options.
+	   (SETQ REAL-FLAVOR GENERIC-FUNCTION
+		 TEM (IF OPTIONS (FIRST OPTIONS) FLAVOR-NAME)
+		 REAL-GENERIC (OR (GETDECL TEM 'COMPATIBLE-GENERIC) TEM)
+		 REAL-OPTIONS (AND OPTIONS
+				   (IF (EQ FLAVOR-NAME ':CASE)
+				       (REST OPTIONS)	;new syntax
+				       (CONS FLAVOR-NAME (REST OPTIONS))))))
+	  ((AND (SYMBOLP GENERIC-FUNCTION)
+		(SETQ TEM (GETDECL GENERIC-FUNCTION 'COMPATIBLE-GENERIC)))
+	   (RETURN-FROM DEFMETHOD-COMPATIBILITY
+	     (VALUES TEM FLAVOR-NAME OPTIONS)))
+	  (T
+	   (RETURN-FROM DEFMETHOD-COMPATIBILITY
+	     (VALUES GENERIC-FUNCTION FLAVOR-NAME OPTIONS))))
+    (WHEN (EQ *DEFMETHOD-COMPATIBILITY* ':WARN)
+      (WARN `(:FUNCTION (,TYPE ,GENERIC-FUNCTION ,FLAVOR-NAME ,@OPTIONS)
+	      :BAD-STYLE T)
+	    "(~S ~S...) is an obsolete syntax.~@
+	     Change it to (~S ~S...)."
+	    FUNCTION `(,GENERIC-FUNCTION ,FLAVOR-NAME ,@OPTIONS)
+	    FUNCTION `(,REAL-GENERIC ,REAL-FLAVOR ,@REAL-OPTIONS)))
+    (VALUES REAL-GENERIC REAL-FLAVOR REAL-OPTIONS)))
+
+;;; Traditional folk function
+(DEFUN PROGNIFY (FORMS &OPTIONAL (OPERATOR 'PROGN))
+  (IF (CDR FORMS) (CONS OPERATOR FORMS) (FIRST FORMS)))
+
+;;; Alist from declaration name to function to process it and return a list
+;;; of forms to be evaluated just before the defmethod.
+(DEFPARAMETER *DEFMETHOD-DECLARATIONS* '((SOLITARY-METHOD EXPAND-SOLITARY-METHOD-OPTION)))
+
+;;; Accepts no arguments
+;;; Sets bit in the generic function and defines the trampoline function
+;;;--- Need to hack declarations of trampoline, e.g. arglist values documentation
+;;;--- or set up some amazing kludge to indirect to the generic-function's debug-info
+;;;--- If the method isn't solitary after all, and then is redefined, this can
+;;;--- clobber the generic function's definition.  Not much I can do about that.
+(DEFUN EXPAND-SOLITARY-METHOD-OPTION (FUNCTION-SPEC DECLARATION ARGLIST)
+  (UNLESS (NULL (CDR DECLARATION))
+    (WARN "~S is an invalid declaration.  ~S will be used instead"
+	  DECLARATION '(SOLITARY-METHOD)))
+  (MULTIPLE-VALUE-BIND (TRAMPOLINE-ARGS METHOD-ARGS APPLY)
+      (IF (LOOP FOR ITEM IN ARGLIST
+		THEREIS (MEMBER ITEM '(&REST &KEY &AUX))
+		THEREIS (AND (LISTP ITEM)
+			     (OR (THIRD ITEM)
+				 (NOT (CONSTANTP (SECOND ITEM))))))
+	  ;; Method arguments are too complicated, just pass an &rest argument
+	  (VALUES '(&REST ARGS) '(ARGS) 'APPLY)
+	  ;; Fast case, receive the same argument as the method.
+	  (VALUES ARGLIST (LT:LAMBDA-LIST-ARGUMENTS ARGLIST) 'FUNCALL))
+    (NOTE-SOLITARY-METHOD (METHOD-GENERIC FUNCTION-SPEC) 'COMPILE)
+    `((NOTE-SOLITARY-METHOD ',(METHOD-GENERIC FUNCTION-SPEC))
+      (DEFUN ,(METHOD-GENERIC FUNCTION-SPEC) (SELF ,@TRAMPOLINE-ARGS)
+	(DECLARE (FUNCTION-PARENT ,FUNCTION-SPEC DEFUN))
+	,(FEATURE-CASE
+	   (3600.
+	     `(,APPLY #',FUNCTION-SPEC SELF
+	       (GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE-CHECK-TYPE
+		 SELF ',(METHOD-FLAVOR FUNCTION-SPEC))
+	       ',(METHOD-GENERIC FUNCTION-SPEC)	;3600 brain damage
+	       ,@METHOD-ARGS))
+	   (:IMACH
+	     `(,APPLY #',FUNCTION-SPEC
+	       (GET-FLAVOR-MAPPING-TABLE-FOR-INSTANCE-CHECK-TYPE
+		 SELF ',(METHOD-FLAVOR FUNCTION-SPEC))
+	       SELF
+	       ,@METHOD-ARGS)))
+	))))
+
+(DEFUN NOTE-SOLITARY-METHOD (GENERIC-FUNCTION-NAME &OPTIONAL ENV)
+  (LET ((GF (FIND-GENERIC-FUNCTION GENERIC-FUNCTION-NAME 'CREATE ENV)))
+    (SETF (GENERIC-FUNCTION-SOLITARY GF) T)
+    (SETF (GENERIC-FUNCTION-HAS-DISPATCH-FUNCTION GF) T)))
+
+;Get the name of the solitary method for a generic.  If there isn't one, return NIL.
+;The method name is retrieved from the function-parent debug-info of the trampoline.
+;---Should this be considered a kludge?  Maybe have an explicit debug-info item just for this?
+(DEFUN GENERIC-FUNCTION-SOLITARY-METHOD (GENERIC-FUNCTION)
+  (AND (GENERIC-FUNCTION-SOLITARY GENERIC-FUNCTION)
+       (LET* ((GENERIC-FUNCTION-NAME (GENERIC-FUNCTION-NAME GENERIC-FUNCTION))
+	      (METHOD (SECOND (ASSOC 'FUNCTION-PARENT
+				     (DEBUGGING-INFO GENERIC-FUNCTION-NAME)))))
+	 (AND (EQUAL (METHOD-GENERIC METHOD) GENERIC-FUNCTION-NAME)
+	      METHOD))))

@@ -1,0 +1,1215 @@
+;;; -*- Mode: LISP; Syntax: ANSI-Common-Lisp; Base: 10; Package: CLOS-INTERNALS -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; This file contains support for dispatch tables.  It is based on the
+;;; handler tables for Flavors, but has been generalized to support
+;;; CLOS.  The names were changed to protect the innocent.
+;;;
+;;; A dispatch table consists of some header information followed by a
+;;; hash table.  Each entry in the hash table consists of three words, a
+;;; key (selector), an extra-argument, and a handler.  The exact format of
+;;; these entries varies according to the architecture.  On a 3600, the
+;;; order is SELECTOR, EXTRA-ARGUMENT, HANDLER.  On Ivory, the order
+;;; is SELECTOR, HANDLER-PC, EXTRA-ARGUMENT.  The order of the slots is known
+;;; about by the microcode, and is built into some of the code.
+;;;
+;;; The microcode performs a dispatch by masking the key with hash mask,
+;;; multiplying by 3, and looking in the dispatch table.  If the key
+;;; matches, then:
+;;;
+;;;    3600:  The handler function is APPLY'd to the extra-argument, object,
+;;;           selector, and remaining arguments.
+;;;
+;;;   Ivory:  The object will already be at FP|2.  FP|3 will be the extra-argument, and
+;;;           the remaining arguments will be as they were at the time of the
+;;;           %GENERIC-DISPATCH or %MESSAGE-DISPATCH instruction.
+;;;
+;;; If the key does not match the selector in the table (a null selector
+;;; will match anything, but the extra-argument will not be taken from the
+;;; table in this case) the next entry in the table is tried, etc.  The
+;;; last entry in the table, as well as unused entries, must have a
+;;; selector of NIL and a handler for a dispatch miss.
+
+;;; This area is used for semipermanent storage.  After a
+;;; full-gc/reorder-memory, existing objects in this area are made
+;;; static.  Other objects in this area are subject to dynamic garbage
+;;; collection.  We assume that the ephemeral garbage collector is in
+;;; use; temporary data and data that are likely to change as
+;;; programming proceeds go in the default area, which is assumed to be
+;;; ephemeral.  Objects created as part of the compile time environment
+;;; go in the default area, not in *CLOS-AREA*.  We assume that no one
+;;; would be fool enough to bind default-cons-area to a temporary area.
+
+(IN-PACKAGE :CLOS-INTERNALS)
+
+;(DEFVAR *CLOS-AREA* (SYS:MAKE-AREA :NAME '*CLOS-AREA* :GC :DYNAMIC))
+#+Genera
+(DEFVAR *CLOS-AREA* FLAVOR::*FLAVOR-AREA*)
+
+;This area is used for things that are guaranteed never to become garbage and that
+;we don't want to have moving around, such as generic-functions keys.
+#+(OR CLOE-Runtime Genera)
+(DEFVAR *CLOS-STATIC-AREA*
+	(PROGN #+Genera (SYS:MAKE-AREA :NAME '*CLOS-STATIC-AREA* :GC :STATIC
+				       :REPRESENTATION :LIST)
+	       #+CLOE-Runtime SYS::AKIND$K-STATIC))
+
+;;; Define the layout of dispatch tables, a specialized type of hash table:
+;;;
+;;; Explanation of the values for GC-DEPENDENCE and GC-GENERATION:
+;;;
+;;; GC Dependence	GC Generation
+;;; -------------	---------------------------------------------------------
+;;; None			NIL (actually, the value is ignored)
+;;; Static		%GC-STATIC-GENERATION-NUMBER when last rehashed,
+;;;			or :DEFAULT, which means that
+;;;			*LAST-REHASH-GC-STATIC-GENERATION-NUMBER* is the
+;;;			value of %GC-STATIC-GENERATION-NUMBER when last rehashed.
+;;; Dynamic		%GC-DYNAMIC-GENERATION-NUMBER when last rehashed
+;;; Ephemeral		%GC-GENERATION-NUMBER when last rehashed
+
+#+Genera (PROGN
+(DEFCONSTANT %GC-DEPENDENCE-NONE 0)
+(DEFCONSTANT %GC-DEPENDENCE-STATIC 1)
+(DEFCONSTANT %GC-DEPENDENCE-DYNAMIC 2)
+(DEFCONSTANT %GC-DEPENDENCE-EPHEMERAL 3)
+(DEFCONSTANT %N-GC-DEPENDENCE-LEVELS 4)
+)
+
+(#+(OR Genera CLOE-Runtime) LISP:DEFSTRUCT
+ #-(OR Genera CLOE-Runtime) DEFSTRUCT
+ (DISPATCH-TABLE
+   (:CONSTRUCTOR NIL)
+   (:COPIER NIL)
+   (:PREDICATE NIL)
+   (:TYPE VECTOR))
+ ;; The GC dependence of this table.
+ GC-DEPENDENCE
+ ;; List of selectors that want to be found with fewer hash probes.
+ SELECTOR-ORDER
+ ;; Handler used when dispatch fails and rehashing doesn't help.
+ DEFAULT-HANDLER
+ ;; Number of valid entries in the table
+ (NUMBER-OF-ENTRIES 0 :TYPE FIXNUM)
+ ;; Mask anded with %pointer of key to get hash probe index.  This is
+ ;; copied into the class wrapper, from whence the microcode gets it.
+ (MASK 0 :TYPE FIXNUM)
+ ;; Handler if microcoded message lookup fails.
+ MISS-HANDLER
+ ;; Value of %GC-GENERATION-NUMBER when rehashed.
+ GC-GENERATION
+ #+Minima
+ GC-DEPENDENCE-2
+ )
+
+;;;These two may need to be deferred until the deftype for DISPATCH-TABLE-ADDRESS
+;;; gets done below:
+(DEFTYPE DISPATCH-TABLE () 'SIMPLE-VECTOR)
+(DECLAIM (FTYPE (FUNCTION (DISPATCH-TABLE) DISPATCH-TABLE-ADDRESS) DISPATCH-TABLE-ADDRESS))
+(DECLAIM (FTYPE (FUNCTION (DISPATCH-TABLE) DISPATCH-TABLE-ADDRESS) DISPATCH-TABLE-LAST-ADDRESS))
+
+(DEFSUBST EQL-NOT-EQ-P (OBJECT)
+  #+(OR |3600| IMACH) (SI:EXTENDED-NUMBER-P OBJECT)
+  #+CLOE-Runtime (SYSTEM::XNUMP OBJECT)
+  #+Minima (IVORY::TYPE-MEMBER OBJECT
+			       (IVORY:DATA-TYPE 'IVORY::DOUBLE-FLOAT)
+			       (IVORY:DATA-TYPE 'IVORY::BIGNUM)
+			       (IVORY:DATA-TYPE 'IVORY::BIG-RATIO)
+			       (IVORY:DATA-TYPE 'IVORY::COMPLEX)
+			       (IVORY:DATA-TYPE 'IVORY::DOUBLE-FIXNUM))			       
+  ;;@@@@
+  #-(OR |3600| IMACH CLOE-Runtime Minima) (TYPEP OBJECT '(OR NUMBER CHARACTER)))
+
+(DEFUN SELECTOR-HASH (SELECTOR)
+  #+(OR |3600| IMACH)
+  (COND ((NOT (EQL-NOT-EQ-P SELECTOR))
+	 (SYS:%POINTER SELECTOR))
+	((TYPEP SELECTOR 'DOUBLE-FLOAT)
+	 (LOGXOR (SYS:DOUBLE-HIGH SELECTOR)
+		 (SYS:DOUBLE-LOW SELECTOR)))
+	((TYPEP SELECTOR 'BIGNUM)
+	 (CLI::BIGNUM-EQL-HASH SELECTOR))
+	((TYPEP SELECTOR 'COMPLEX)
+	 (LOGXOR (SELECTOR-HASH (SYS:COMPLEX-REALPART SELECTOR))
+		 (SYS:ROT (SELECTOR-HASH (SYS:COMPLEX-IMAGPART SELECTOR)) 7.)))
+	(T					;(TYPEP SELECTOR SYS:BIG-RATIO)
+	 #+IMACH
+	 (LOGXOR (SELECTOR-HASH (SYS:BIG-RATIO-NUMERATOR SELECTOR))
+		 (SELECTOR-HASH (SYS:BIG-RATIO-DENOMINATOR SELECTOR)))
+	 #+|3600|
+	 (LOGXOR (SELECTOR-HASH (SYS:RATIONAL-NUMERATOR SELECTOR))
+		 (SELECTOR-HASH (SYS:RATIONAL-DENOMINATOR SELECTOR)))))
+  #+CLOE-Runtime
+  (IF (SYSTEM::XNUMP SELECTOR) (SXHASH SELECTOR) (SYSTEM::ADDRESS-OF SELECTOR))
+  #+Minima
+  (IF (EQL-NOT-EQ-P SELECTOR) (SXHASH SELECTOR) (IVORY:%POINTER SELECTOR))
+  #-(OR |3600| IMACH CLOE-Runtime Minima)
+  (SXHASH SELECTOR))
+
+(DEFMACRO SELECTOR-HASH-INLINE (SELECTOR)
+  #+(OR |3600| IMACH)
+  `(BLOCK SELECTOR-HASH
+     (COMPILER:%ERROR-WHEN (EQL-NOT-EQ-P ,SELECTOR)
+       (RETURN-FROM SELECTOR-HASH
+	 (SELECTOR-HASH ,SELECTOR)))
+     (SYS:%POINTER ,SELECTOR))
+  #+CLOE-Runtime
+  `(IF (SYSTEM::XNUMP ,SELECTOR) (SXHASH ,SELECTOR) (SYSTEM::ADDRESS-OF ,SELECTOR))
+  #+Minima
+  `(IF (EQL-NOT-EQ-P ,SELECTOR) (SXHASH ,SELECTOR) (IVORY:%POINTER ,SELECTOR))
+  #-(OR |3600| IMACH CLOE-Runtime Minima)
+  `(SXHASH ,SELECTOR))
+
+(DEFSUBST SELECTOR-GC-DEPENDENCE (SELECTOR)
+  #+(OR |3600| IMACH)
+  (IF (OR (EQL-NOT-EQ-P SELECTOR)
+	  (NOT (SYS:%POINTER-TYPE-P (SYS:%DATA-TYPE SELECTOR))))
+      %GC-DEPENDENCE-NONE
+      (IF (SYS:%EPHEMERALP SELECTOR)
+	  %GC-DEPENDENCE-EPHEMERAL
+	  (LET ((REGION (SYS:%REGION-NUMBER SELECTOR)))
+	    (IF REGION
+		(SCL:SELECTOR (SYS:LEVEL-TYPE
+				(LDB SYS:%%REGION-LEVEL (SYS:REGION-BITS REGION))) =
+		  (SYS:%LEVEL-TYPE-DYNAMIC %GC-DEPENDENCE-DYNAMIC)
+		  (SYS:%LEVEL-TYPE-STATIC  %GC-DEPENDENCE-STATIC)
+		  (OTHERWISE		      %GC-DEPENDENCE-NONE))
+		%GC-DEPENDENCE-NONE))))		;Probably cannot move
+  #+CLOE-Runtime (IF (SYSTEM::XNUMP SELECTOR)
+		     %GC-DEPENDENCE-NONE	;Not hashed wrt address.
+		     (SYS::GC-DEPENDENCE SELECTOR))
+  #+Minima (MINIMA-INTERNALS::GC-DEPENDENCE SELECTOR)
+  #-(OR |3600| IMACH CLOE-Runtime Minima) (PROGN SELECTOR %GC-DEPENDENCE-NONE))
+
+
+#+Genera
+(PROGN 
+
+(DEFTYPE DISPATCH-TABLE-ADDRESS () 'LOCATIVE)
+
+(DEFCONSTANT DISPATCH-TABLE-DATA-OFFSET 7)
+
+;;; Address of the first entry.
+(DEFSUBST DISPATCH-TABLE-ADDRESS (DT) (LOCF (AREF DT 7)))
+
+;;; Address of last slot, always empty.
+(DEFUN DISPATCH-TABLE-LAST-ADDRESS (DT) (LOCF (AREF DT (- (ARRAY-TOTAL-SIZE DT) 3))))
+
+(DEFMACRO DISPATCH-TABLE-NEXT-ADDRESS (ADDRESS) `(SYS:%POINTER-PLUS ,ADDRESS 3))
+
+(DEFMACRO DISPATCH-TABLE-INITIAL-PROBE-ADDRESS (ADDRESS MASK SELECTOR)
+  `(SYS:%MAKE-POINTER-OFFSET SYS:DTP-LOCATIVE ,ADDRESS	;Initial probe address
+			     (* (LOGAND ,MASK (SELECTOR-HASH-INLINE ,SELECTOR)) 3)))
+
+;;; Another way to get at the same thing, to move it without caring what it is.
+(DEFMACRO DISPATCH-ENTRY-DATA-1 (DT P)
+  (DECLARE (IGNORE DT))
+  `(SYS:%P-CONTENTS-OFFSET ,P 1))
+
+(DEFMACRO DISPATCH-ENTRY-DATA-2 (DT P)
+  (DECLARE (IGNORE DT))
+  `(SYS:%P-CONTENTS-OFFSET ,P 2))
+
+
+;;;Genera does array-total-size best...
+(DEFMACRO DISPATCH-TABLE-SIZE (DT)
+  `(ARRAY-TOTAL-SIZE ,DT))
+);;;#+Genera
+
+#+Minima
+(PROGN 
+
+(DEFTYPE DISPATCH-TABLE-ADDRESS () 'LOCATIVE)
+
+(DEFCONSTANT DISPATCH-TABLE-DATA-OFFSET 8)
+
+;;; Address of the first entry.
+(DEFSUBST DISPATCH-TABLE-ADDRESS (DT) (LOCF (AREF DT 8)))
+
+;;; Address of last slot, always empty.
+(DEFUN DISPATCH-TABLE-LAST-ADDRESS (DT) (LOCF (AREF DT (- (ARRAY-TOTAL-SIZE DT) 3))))
+
+(DEFMACRO DISPATCH-TABLE-NEXT-ADDRESS (ADDRESS) `(IVORY:%POINTER-PLUS ,ADDRESS 3))
+
+(DEFMACRO DISPATCH-TABLE-INITIAL-PROBE-ADDRESS (ADDRESS MASK SELECTOR)
+  `(IVORY:%POINTER-PLUS ,ADDRESS (* (LOGAND ,MASK (SELECTOR-HASH-INLINE ,SELECTOR)) 3)))
+
+;;; Another way to get at the same thing, to move it without caring what it is.
+(DEFMACRO DISPATCH-ENTRY-DATA-1 (DT P)
+  (DECLARE (IGNORE DT))
+  `(LOCATION-CONTENTS (IVORY:%POINTER-PLUS ,P 1)))
+
+(DEFMACRO DISPATCH-ENTRY-DATA-2 (DT P)
+  (DECLARE (IGNORE DT))
+  `(LOCATION-CONTENTS (IVORY:%POINTER-PLUS ,P 2)))
+
+;;;Genera does array-total-size best...
+(DEFMACRO DISPATCH-TABLE-SIZE (DT)
+  `(ARRAY-TOTAL-SIZE ,DT))
+);;;#+Minima
+
+#-(OR Genera Minima)
+(PROGN
+
+(DEFTYPE DISPATCH-TABLE-ADDRESS () 'FIXNUM)
+
+(DEFCONSTANT DISPATCH-TABLE-DATA-OFFSET 7)
+
+(DEFSUBST DISPATCH-TABLE-ADDRESS (DT) DISPATCH-TABLE-DATA-OFFSET)
+
+(DEFSUBST DISPATCH-TABLE-LAST-ADDRESS (DT)
+  (THE FIXNUM (- (ARRAY-DIMENSION (THE DISPATCH-TABLE DT) 0) 3)))
+
+(DEFMACRO DISPATCH-TABLE-NEXT-ADDRESS (ADDRESS)
+  `(THE FIXNUM (+ (THE FIXNUM ,ADDRESS) 3)))
+
+(DEFMACRO DISPATCH-TABLE-INITIAL-PROBE-ADDRESS (ADDRESS MASK SELECTOR)
+  `(THE FIXNUM
+	(+ (THE FIXNUM ,ADDRESS)		;Should always be DISPATCH-TABLE-DATA-OFFSET.
+	   (THE FIXNUM (* (THE FIXNUM (LOGAND (THE FIXNUM ,MASK)
+					      (THE FIXNUM (SELECTOR-HASH-INLINE ,SELECTOR))))
+			  3)))))
+
+;;; Another way to get at the same thing, to move it without caring what it is.
+(DEFMACRO DISPATCH-ENTRY-DATA-1 (DT P)
+  `(SVREF ,DT (+ ,P 1)))
+
+(DEFMACRO DISPATCH-ENTRY-DATA-2 (DT P)
+  `(SVREF ,DT (+ ,P 2)))
+
+
+;;;CLOE can do real real good on the known array dimension of an array of known type.
+(DEFMACRO DISPATCH-TABLE-SIZE (DT)
+  `(ARRAY-DIMENSION (THE DISPATCH-TABLE ,DT) 0))
+);;;#-Genera
+
+#+|3600|
+(PROGN
+
+(DEFMACRO DISPATCH-ENTRY-SELECTOR (DT P)
+  (DECLARE (IGNORE DT))
+  `(LOCATION-CONTENTS ,P))
+
+(DEFSUBST MAKE-INTERPRETER-EXTRA-ARGUMENT (HANDLER EXTRA-ARGUMENT)
+  (SYS:LIST-IN-AREA *CLOS-AREA* HANDLER EXTRA-ARGUMENT))
+
+(DEFSUBST INTERPRETER-EXTRA-ARG-HANDLER (EXTRA-ARGUMENT)
+  (FIRST EXTRA-ARGUMENT))
+
+(DEFSUBST INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT (EXTRA-ARGUMENT)
+  (SECOND EXTRA-ARGUMENT))
+
+(DEFUN REALLY-HANDLE-INTERPRETED-HANDLER (ARG0 EXTRA-ARGUMENT SELECTOR &REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  (APPLY (INTERPRETER-EXTRA-ARG-HANDLER EXTRA-ARGUMENT)
+	 ARG0
+	 (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT EXTRA-ARGUMENT)
+	 SELECTOR ARGS))
+
+;;; Doing it this way makes it a lot easier to change things since PCs don't need to
+;;; be updated all over the place.
+(DEFUN HANDLE-INTERPRETED-HANDLER (ARG0 EXTRA-ARGUMENT SELECTOR &REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  (APPLY #'REALLY-HANDLE-INTERPRETED-HANDLER ARG0 EXTRA-ARGUMENT SELECTOR ARGS))
+
+(DEFSUBST DISPATCH-ENTRY-EXTRA-ARGUMENT (P)
+  (LOCATION-CONTENTS (SYS:%MAKE-POINTER-OFFSET SYS:DTP-LOCATIVE P 1)))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER (P)
+  (LOCATION-CONTENTS (SYS:%MAKE-POINTER-OFFSET SYS:DTP-LOCATIVE P 2)))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER-AND-EXTRA-ARGUMENT (P)
+  (DECLARE (VALUES HANDLER EXTRA-ARGUMENT))
+  (LET ((HANDLER (DISPATCH-ENTRY-HANDLER P))
+	(EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT P)))
+    (IF (EQ HANDLER #'HANDLE-INTERPRETED-HANDLER)
+	(VALUES (INTERPRETER-EXTRA-ARG-HANDLER EXTRA-ARGUMENT)
+		(INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT EXTRA-ARGUMENT))
+	(VALUES HANDLER EXTRA-ARGUMENT))))
+
+(DEFUN SET-DISPATCH-TABLE-ENTRY (DT CELL SELECTOR HANDLER EXTRA-ARGUMENT)
+  DT
+  ;; Don't write if nothing has changed, to keep IDS size down
+  (UNLESS (EQL (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR)
+    (SETF (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR))
+  (LET ((OLD-EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)))
+    (MULTIPLE-VALUE-BIND (H E)
+	(IF (= (SYS:%DATA-TYPE HANDLER) SYS:DTP-LEXICAL-CLOSURE)
+	    (VALUES #'HANDLE-INTERPRETED-HANDLER
+		    (IF (AND (LISTP OLD-EXTRA-ARGUMENT)
+			     (EQ (INTERPRETER-EXTRA-ARG-HANDLER OLD-EXTRA-ARGUMENT)
+				 HANDLER)
+			     (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+				 EXTRA-ARGUMENT))
+			OLD-EXTRA-ARGUMENT
+			(MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))
+	    (VALUES HANDLER EXTRA-ARGUMENT))
+      (UNLESS (EQ (DISPATCH-ENTRY-HANDLER CELL) H)
+	(SETF (DISPATCH-ENTRY-HANDLER CELL) H))
+      (UNLESS (EQ OLD-EXTRA-ARGUMENT E)
+	(SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) E)))))
+
+(DEFSUBST SET-DISPATCH-VECTOR-ELEMENT
+	  (DT HANDLER-CELL EXTRA-ARGUMENT-CELL HANDLER EXTRA-ARGUMENT)
+  (DECLARE (IGNORE DT))
+  (LET ((OLD-EXTRA-ARGUMENT (LOCATION-CONTENTS EXTRA-ARGUMENT-CELL)))
+    (MULTIPLE-VALUE-BIND (F E)
+	(IF (= (SYS:%DATA-TYPE HANDLER) SYS:DTP-LEXICAL-CLOSURE)
+	    (VALUES #'HANDLE-INTERPRETED-HANDLER
+		    (IF (AND (LISTP OLD-EXTRA-ARGUMENT)
+			     (EQ (INTERPRETER-EXTRA-ARG-HANDLER OLD-EXTRA-ARGUMENT)
+				 HANDLER)
+			     (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+				 EXTRA-ARGUMENT))
+			OLD-EXTRA-ARGUMENT
+			(MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))
+	    (VALUES HANDLER EXTRA-ARGUMENT))
+      (UNLESS (EQ (LOCATION-CONTENTS HANDLER-CELL) F)
+	(SETF (LOCATION-CONTENTS HANDLER-CELL) F))
+      (UNLESS (EQ OLD-EXTRA-ARGUMENT E)
+	(SETF (LOCATION-CONTENTS EXTRA-ARGUMENT-CELL) E)))))
+
+(DEFSUBST SET-DISPATCH-ENTRY-EXTRA-ARGUMENT (DT CELL EXTRA-ARGUMENT)
+  (DECLARE (IGNORE DT))
+  (LET ((HANDLER (DISPATCH-ENTRY-HANDLER CELL))
+	(OLD-EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)))
+    (IF (EQ HANDLER #'HANDLE-INTERPRETED-HANDLER)
+	(UNLESS (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+		    EXTRA-ARGUMENT)
+	  (SETF (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT) EXTRA-ARGUMENT))
+	(UNLESS (EQ OLD-EXTRA-ARGUMENT EXTRA-ARGUMENT)
+	  (SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) EXTRA-ARGUMENT)))))
+
+(DEFUN SET-DISPATCH-VECTOR-EXTRA-ARGUMENT (DT HANDLER-CELL EXTRA-ARG-CELL NEW-EXTRA-ARGUMENT)
+  (DECLARE (IGNORE DT))
+  (LET ((HANDLER (LOCATION-CONTENTS HANDLER-CELL))
+	(OLD-EXTRA-ARGUMENT (LOCATION-CONTENTS EXTRA-ARG-CELL)))
+    (IF (EQ HANDLER #'HANDLE-INTERPRETED-HANDLER)
+	(UNLESS (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+		    NEW-EXTRA-ARGUMENT)
+	  (SETF (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT) NEW-EXTRA-ARGUMENT))
+	(UNLESS (EQ OLD-EXTRA-ARGUMENT NEW-EXTRA-ARGUMENT)
+	  (SETF (LOCATION-CONTENTS EXTRA-ARG-CELL) NEW-EXTRA-ARGUMENT)))))
+
+);End #+|3600|
+
+#+IMACH
+(PROGN
+
+(DEFMACRO DISPATCH-ENTRY-SELECTOR (DT P)
+  (DECLARE (IGNORE DT))
+  `(LOCATION-CONTENTS ,P))
+
+;;; On Ivory, we still have a handler and an extra-argument, but we store them differently.
+;;; If the handler is compiled code, we store a PC and the extra-argument.  If the handler
+;;; is something else, we store a PC for a helper function, and a list of the real
+;;; function and the real extra-argument.
+(DEFSUBST HANDLER-PC (HANDLER)
+  (SYS:%MAKE-POINTER SYS:DTP-EVEN-PC HANDLER))
+
+(DEFSUBST HANDLER-PC-NO-ENTRY (HANDLER)
+  (SYS:%MAKE-POINTER-OFFSET SYS:DTP-EVEN-PC HANDLER 1))
+
+(DEFSUBST HANDLER-PC-FUNCTION (PC)
+  (SYS:%MAKE-POINTER SYS:DTP-COMPILED-FUNCTION PC))
+
+(DEFUN REALLY-HANDLE-INTERPRETED-HANDLER (FUNCTION-EXTRA-ARGUMENT &REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  (APPLY (FIRST FUNCTION-EXTRA-ARGUMENT) (SECOND FUNCTION-EXTRA-ARGUMENT) ARGS))
+
+;;; Doing it this way makes it a lot easier to change things since PCs don't need to
+;;; be updated all over the place.
+(DEFUN HANDLE-INTERPRETED-HANDLER (&REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  (APPLY #'REALLY-HANDLE-INTERPRETED-HANDLER ARGS))
+
+(DEFSUBST MAKE-INTERPRETER-EXTRA-ARGUMENT (HANDLER EXTRA-ARGUMENT)
+  (SYS:LIST-IN-AREA *CLOS-AREA* HANDLER EXTRA-ARGUMENT))
+
+(DEFSUBST INTERPRETER-EXTRA-ARG-HANDLER (EXTRA-ARGUMENT)
+  (FIRST EXTRA-ARGUMENT))
+
+(DEFSUBST INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT (EXTRA-ARGUMENT)
+  (SECOND EXTRA-ARGUMENT))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER-PC (P)
+  (LOCATION-CONTENTS (SYS:%MAKE-POINTER-OFFSET SYS:DTP-LOCATIVE P 1)))
+
+(DEFSUBST DISPATCH-ENTRY-EXTRA-ARGUMENT (P)
+  (LOCATION-CONTENTS (SYS:%MAKE-POINTER-OFFSET SYS:DTP-LOCATIVE P 2)))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER-AND-EXTRA-ARGUMENT (P)
+  (DECLARE (VALUES HANDLER EXTRA-ARGUMENT))
+  (LET ((HANDLER-PC (DISPATCH-ENTRY-HANDLER-PC P))
+	(EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT P)))
+    (IF (EQ HANDLER-PC (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER))
+	(VALUES (INTERPRETER-EXTRA-ARG-HANDLER EXTRA-ARGUMENT)
+		(INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT EXTRA-ARGUMENT))
+	(VALUES (HANDLER-PC-FUNCTION HANDLER-PC)
+		EXTRA-ARGUMENT))))
+
+(DEFUN SET-DISPATCH-TABLE-ENTRY (DT CELL SELECTOR HANDLER EXTRA-ARGUMENT)
+  DT						;Not used by macros
+  ;; Don't write if nothing has changed, to keep IDS size down
+  (UNLESS (EQL (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR)
+    (SETF (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR))
+  (LET ((OLD-EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)))
+    (MULTIPLE-VALUE-BIND (H E)
+	(TYPECASE HANDLER
+	  ;; Note:  In ANSI CL, COMPILED-FUNCTION may always be true, so use SYS.
+	  (SYS:COMPILED-FUNCTION
+	    ;; The function cell gets the PC to the method, and the
+	    ;; extra-argument cell gets the extra-argument.
+	    (VALUES (HANDLER-PC HANDLER) EXTRA-ARGUMENT))
+	  ;; On Ivory, we sometimes want to make the handler in a dispatch table be a
+	  ;; PC.  DISPATCH-ENTRY-HANDLER-AND-EXTRA-ARGUMENT doesn't know about this.
+	  (SYS:COMPILED-FUNCTION-PC (VALUES HANDLER EXTRA-ARGUMENT))
+	  (OTHERWISE
+	    ;; The function cell gets the PC for the interpreter, and
+	    ;; the extra-argument is the function to apply.
+	    (VALUES (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER)
+		    (IF (AND (LISTP OLD-EXTRA-ARGUMENT)
+			     (EQ (INTERPRETER-EXTRA-ARG-HANDLER OLD-EXTRA-ARGUMENT)
+				 HANDLER)
+			     (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+				 EXTRA-ARGUMENT))
+			OLD-EXTRA-ARGUMENT
+			(MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))))
+      (UNLESS (EQ (DISPATCH-ENTRY-HANDLER-PC CELL) H)
+	(SETF (DISPATCH-ENTRY-HANDLER-PC CELL) H))
+      (UNLESS (EQ OLD-EXTRA-ARGUMENT E)
+	(SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) E)))))
+
+(DEFUN SET-DISPATCH-VECTOR-ELEMENT (HANDLER-CELL EXTRA-ARG-CELL HANDLER EXTRA-ARGUMENT)
+  (LET ((OLD-EXTRA-ARGUMENT (LOCATION-CONTENTS EXTRA-ARG-CELL)))
+    (MULTIPLE-VALUE-BIND (F E)
+	(TYPECASE HANDLER
+	  ;; Note:  In ANSI CL, COMPILED-FUNCTION may always be true, so use SYS.
+	  (SYS:COMPILED-FUNCTION
+	    ;; The function cell gets the PC to the method, and the
+	    ;; extra-argument cell gets the extra-argument.
+	    (VALUES HANDLER OLD-EXTRA-ARGUMENT))
+	  (OTHERWISE
+	    ;; The function cell gets the interpreter, and
+	    ;; the extra-argument is the function to apply.
+	    (VALUES #'HANDLE-INTERPRETED-HANDLER
+		    (IF (AND (LISTP OLD-EXTRA-ARGUMENT)
+			     (EQ (INTERPRETER-EXTRA-ARG-HANDLER OLD-EXTRA-ARGUMENT) HANDLER)
+			     (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+				 EXTRA-ARGUMENT))
+			OLD-EXTRA-ARGUMENT
+			(MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))))
+      (UNLESS (EQ (LOCATION-CONTENTS HANDLER-CELL) F)
+	(SETF (LOCATION-CONTENTS HANDLER-CELL) F))
+      (UNLESS (EQ OLD-EXTRA-ARGUMENT E)
+	(SETF (LOCATION-CONTENTS EXTRA-ARG-CELL) E)))))
+
+(DEFUN SET-DISPATCH-ENTRY-EXTRA-ARGUMENT (CELL NEW-EXTRA-ARGUMENT)
+  (LET ((HANDLER-PC (DISPATCH-ENTRY-HANDLER-PC CELL))
+	(OLD-EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)))
+    (IF (EQ HANDLER-PC (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER))
+	(UNLESS (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+		    NEW-EXTRA-ARGUMENT)
+	  (SETF (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT) NEW-EXTRA-ARGUMENT))
+	(UNLESS (EQ OLD-EXTRA-ARGUMENT NEW-EXTRA-ARGUMENT)
+	  (SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) NEW-EXTRA-ARGUMENT)))))
+
+(DEFUN SET-DISPATCH-VECTOR-EXTRA-ARGUMENT (HANDLER-CELL EXTRA-ARG-CELL NEW-EXTRA-ARGUMENT)
+  (LET ((HANDLER (LOCATION-CONTENTS HANDLER-CELL))
+	(OLD-EXTRA-ARGUMENT (LOCATION-CONTENTS EXTRA-ARG-CELL)))
+    (IF (EQ HANDLER #'HANDLE-INTERPRETED-HANDLER)
+	(UNLESS (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+		    NEW-EXTRA-ARGUMENT)
+	  (SETF (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT) NEW-EXTRA-ARGUMENT))
+	(UNLESS (EQ OLD-EXTRA-ARGUMENT NEW-EXTRA-ARGUMENT)
+	  (SETF (LOCATION-CONTENTS EXTRA-ARG-CELL) NEW-EXTRA-ARGUMENT)))))
+
+);End #+IMACH
+
+#+Minima
+(PROGN
+
+(DEFMACRO DISPATCH-ENTRY-SELECTOR (DT P)
+  (DECLARE (IGNORE DT))
+  `(LOCATION-CONTENTS ,P))
+
+;;; On Ivory, we still have a handler and an extra-argument, but we store them differently.
+;;; If the handler is compiled code, we store a PC and the extra-argument.  If the handler
+;;; is something else, we store a PC for a helper function, and a list of the real
+;;; function and the real extra-argument.
+(DEFSUBST HANDLER-PC (HANDLER)
+  (IVORY:%SET-TAG HANDLER (IVORY:DATA-TYPE 'IVORY:EVEN-PC)))
+
+(DEFSUBST HANDLER-PC-NO-ENTRY (HANDLER)
+  (IVORY:%POINTER-PLUS (IVORY:%SET-TAG HANDLER (IVORY:DATA-TYPE 'IVORY:EVEN-PC)) 1))
+
+(DEFSUBST HANDLER-PC-FUNCTION (PC)
+  (IVORY:%SET-TAG PC (IVORY:DATA-TYPE 'IVORY:COMPILED-FUNCTION)))
+
+(DEFUN REALLY-HANDLE-INTERPRETED-HANDLER (FUNCTION-EXTRA-ARGUMENT &REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  (APPLY (FIRST FUNCTION-EXTRA-ARGUMENT) (SECOND FUNCTION-EXTRA-ARGUMENT) ARGS))
+
+;;; Doing it this way makes it a lot easier to change things since PCs don't need to
+;;; be updated all over the place.
+(DEFUN HANDLE-INTERPRETED-HANDLER (&REST ARGS)
+  (DECLARE (DYNAMIC-EXTENT ARGS))
+  (APPLY #'REALLY-HANDLE-INTERPRETED-HANDLER ARGS))
+
+(DEFSUBST MAKE-INTERPRETER-EXTRA-ARGUMENT (HANDLER EXTRA-ARGUMENT)
+  (LIST HANDLER EXTRA-ARGUMENT))
+
+(DEFSUBST INTERPRETER-EXTRA-ARG-HANDLER (EXTRA-ARGUMENT)
+  (FIRST EXTRA-ARGUMENT))
+
+(DEFSUBST (SETF INTERPRETER-EXTRA-ARG-HANDLER) (VALUE EXTRA-ARGUMENT)
+  (SETF (FIRST EXTRA-ARGUMENT) VALUE))
+
+(DEFSUBST INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT (EXTRA-ARGUMENT)
+  (SECOND EXTRA-ARGUMENT))
+
+(DEFSUBST (SETF INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT) (VALUE EXTRA-ARGUMENT)
+  (SETF (SECOND EXTRA-ARGUMENT) VALUE))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER-PC (P)
+  (LOCATION-CONTENTS (IVORY:%POINTER-PLUS P 1)))
+
+(DEFSUBST (SETF DISPATCH-ENTRY-HANDLER-PC) (VALUE P)
+  (SETF (LOCATION-CONTENTS (IVORY:%POINTER-PLUS P 1)) VALUE))
+
+(DEFSUBST DISPATCH-ENTRY-EXTRA-ARGUMENT (P)
+  (LOCATION-CONTENTS (IVORY:%POINTER-PLUS P 2)))
+
+(DEFSUBST (SETF DISPATCH-ENTRY-EXTRA-ARGUMENT) (VALUE P)
+  (SETF (LOCATION-CONTENTS (IVORY:%POINTER-PLUS P 2)) VALUE))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER-AND-EXTRA-ARGUMENT (P)
+  (LET ((HANDLER-PC (DISPATCH-ENTRY-HANDLER-PC P))
+	(EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT P)))
+    (IF (EQ HANDLER-PC (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER))
+	(VALUES (INTERPRETER-EXTRA-ARG-HANDLER EXTRA-ARGUMENT)
+		(INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT EXTRA-ARGUMENT))
+	(VALUES (HANDLER-PC-FUNCTION HANDLER-PC)
+		EXTRA-ARGUMENT))))
+
+(DEFUN SET-DISPATCH-TABLE-ENTRY (DT CELL SELECTOR HANDLER EXTRA-ARGUMENT)
+  (DECLARE (IGNORE DT))				;Not used by macros
+  (SETF (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR)
+  (LET ((OLD-EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)))
+    (MULTIPLE-VALUE-BIND (H E)
+	(TYPECASE HANDLER
+	  (IVORY::COMPILED-CODE
+	    ;; The function cell gets the PC to the method, and the
+	    ;; extra-argument cell gets the extra-argument.
+	    (VALUES (HANDLER-PC HANDLER) EXTRA-ARGUMENT))
+	  ;; On Ivory, we sometimes want to make the handler in a dispatch table be a
+	  ;; PC.  DISPATCH-ENTRY-HANDLER-AND-EXTRA-ARGUMENT doesn't know about this.
+	  (IVORY::PC
+	    (VALUES HANDLER EXTRA-ARGUMENT))
+	  (OTHERWISE
+	    ;; The function cell gets the PC for the interpreter, and
+	    ;; the extra-argument is the function to apply.
+	    (VALUES (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER)
+		    (IF (AND (LISTP OLD-EXTRA-ARGUMENT)
+			     (EQ (INTERPRETER-EXTRA-ARG-HANDLER OLD-EXTRA-ARGUMENT)
+				 HANDLER)
+			     (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+				 EXTRA-ARGUMENT))
+			OLD-EXTRA-ARGUMENT
+			(MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))))
+      (SETF (DISPATCH-ENTRY-HANDLER-PC CELL) H)
+      (SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) E))))
+
+(DEFUN SET-DISPATCH-VECTOR-ELEMENT (HANDLER-CELL EXTRA-ARG-CELL HANDLER EXTRA-ARGUMENT)
+  (LET ((OLD-EXTRA-ARGUMENT (LOCATION-CONTENTS EXTRA-ARG-CELL)))
+    (MULTIPLE-VALUE-BIND (F E)
+	(TYPECASE HANDLER
+	  (IVORY::COMPILED-CODE
+	    ;; The function cell gets the PC to the method, and the
+	    ;; extra-argument cell gets the extra-argument.
+	    (VALUES HANDLER OLD-EXTRA-ARGUMENT))
+	  (OTHERWISE
+	    ;; The function cell gets the interpreter, and
+	    ;; the extra-argument is the function to apply.
+	    (VALUES #'HANDLE-INTERPRETED-HANDLER
+		    (IF (AND (LISTP OLD-EXTRA-ARGUMENT)
+			     (EQ (INTERPRETER-EXTRA-ARG-HANDLER OLD-EXTRA-ARGUMENT) HANDLER)
+			     (EQ (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT)
+				 EXTRA-ARGUMENT))
+			OLD-EXTRA-ARGUMENT
+			(MAKE-INTERPRETER-EXTRA-ARGUMENT HANDLER EXTRA-ARGUMENT)))))
+      (SETF (LOCATION-CONTENTS HANDLER-CELL) F)
+      (SETF (LOCATION-CONTENTS EXTRA-ARG-CELL) E))))
+
+(DEFUN SET-DISPATCH-ENTRY-EXTRA-ARGUMENT (CELL NEW-EXTRA-ARGUMENT)
+  (LET ((HANDLER-PC (DISPATCH-ENTRY-HANDLER-PC CELL))
+	(OLD-EXTRA-ARGUMENT (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL)))
+    (IF (EQ HANDLER-PC (HANDLER-PC #'HANDLE-INTERPRETED-HANDLER))
+	(SETF (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT) NEW-EXTRA-ARGUMENT)
+	(SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT CELL) NEW-EXTRA-ARGUMENT))))
+
+(DEFUN SET-DISPATCH-VECTOR-EXTRA-ARGUMENT (HANDLER-CELL EXTRA-ARG-CELL NEW-EXTRA-ARGUMENT)
+  (LET ((HANDLER (LOCATION-CONTENTS HANDLER-CELL))
+	(OLD-EXTRA-ARGUMENT (LOCATION-CONTENTS EXTRA-ARG-CELL)))
+    (IF (EQ HANDLER #'HANDLE-INTERPRETED-HANDLER)
+	(SETF (INTERPRETER-EXTRA-ARG-EXTRA-ARGUMENT OLD-EXTRA-ARGUMENT) NEW-EXTRA-ARGUMENT)
+	(SETF (LOCATION-CONTENTS EXTRA-ARG-CELL) NEW-EXTRA-ARGUMENT))))
+
+);End #+Minima
+
+#-(OR Genera Minima)
+(PROGN
+
+(DEFMACRO DISPATCH-ENTRY-SELECTOR (DT P)
+  `(SVREF ,DT ,P))
+
+(DEFMACRO DISPATCH-ENTRY-EXTRA-ARGUMENT (DT P)
+  `(SVREF ,DT (THE FIXNUM (+ (THE FIXNUM ,P) 1))))
+
+(DEFMACRO DISPATCH-ENTRY-HANDLER (DT P)
+  `(SVREF ,DT (THE FIXNUM (+ (THE FIXNUM ,P) 2))))
+
+(DEFSUBST DISPATCH-ENTRY-HANDLER-AND-EXTRA-ARGUMENT (DT P)
+  #+Genera (DECLARE (VALUES HANDLER EXTRA-ARGUMENT))
+  (VALUES (DISPATCH-ENTRY-HANDLER DT P)
+	  (DISPATCH-ENTRY-EXTRA-ARGUMENT DT P)))
+
+(DEFUN SET-DISPATCH-TABLE-ENTRY (DT CELL SELECTOR HANDLER EXTRA-ARGUMENT)
+  ;; Don't write if nothing has changed, to keep IDS size down
+  (UNLESS (EQL (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR)
+    (SETF (DISPATCH-ENTRY-SELECTOR DT CELL) SELECTOR))
+  (UNLESS (EQ (DISPATCH-ENTRY-EXTRA-ARGUMENT DT CELL) EXTRA-ARGUMENT)
+    (SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT DT CELL) EXTRA-ARGUMENT))
+  (UNLESS (EQ (DISPATCH-ENTRY-HANDLER DT CELL) HANDLER)
+    (SETF (DISPATCH-ENTRY-HANDLER DT CELL) HANDLER)))
+
+;;;@@@@@
+#+Lose
+(DEFSUBST SET-DISPATCH-VECTOR-ELEMENT
+	  (DT HANDLER-CELL EXTRA-ARGUMENT-CELL HANDLER EXTRA-ARGUMENT)
+  (UNLESS (EQ (LOCATION-CONTENTS HANDLER-CELL) HANDLER)
+    (SETF (LOCATION-CONTENTS HANDLER-CELL) HANDLER))
+  (UNLESS (EQ (LOCATION-CONTENTS EXTRA-ARGUMENT-CELL) EXTRA-ARGUMENT)
+    (SETF (LOCATION-CONTENTS EXTRA-ARGUMENT-CELL) EXTRA-ARGUMENT)))
+
+(DEFSUBST SET-DISPATCH-ENTRY-EXTRA-ARGUMENT (DT CELL EXTRA-ARGUMENT)
+  (UNLESS (EQ (DISPATCH-ENTRY-EXTRA-ARGUMENT DT CELL) EXTRA-ARGUMENT)
+    (SETF (DISPATCH-ENTRY-EXTRA-ARGUMENT DT CELL) EXTRA-ARGUMENT)))
+
+;;;@@@@@
+#+Lose
+(DEFSUBST SET-DISPATCH-VECTOR-EXTRA-ARGUMENT
+	  (DT HANDLER-CELL EXTRA-ARGUMENT-CELL EXTRA-ARGUMENT)
+  (UNLESS (EQ (LOCATION-CONTENTS EXTRA-ARGUMENT-CELL) EXTRA-ARGUMENT)
+    (SETF (LOCATION-CONTENTS EXTRA-ARGUMENT-CELL) EXTRA-ARGUMENT)))
+)
+;;; This variable controls how full the hash tables are allowed to get.
+;;; In general they will be less full than this since their size has to
+;;; be a power of two because the microcode does the hashing with LOGAND.
+;;; In some system 243, message handlers generated with .8 fullness, the
+;;; expected search distance was increased from 1.2 to 1.5, but the tables
+;;; went from 2.7M words to 1.5M words.
+;;; For some system 329:
+;;; Average of 1,066 flavors with 85,958 handlers (81 avg/flavor), 54% avg density:
+;;; 2.05 average probes, 82 maximum, 71%  1 probe, 91%  3, 99%  17
+;;; Total of 490,244 words of handler tables.
+;;; In system 362, increasing this from 0.8 to 0.85 saved 377 pages while costing
+;;; only 1/2 microsecond on average and only 2 microseconds at the 95th percentile
+;;; (but 30 microseconds worst case) in increased collisions during method lookup.
+(DEFPARAMETER DISPATCH-TABLE-FULLNESS-THRESHOLD .85S0)
+
+;;; This variable controls how many extra entries after the last probe address
+;;; are initially allowed.  The last entry in the table always has to be unused
+;;; so the search will terminate (it doesn't wrap around).
+;;; This needs to be big enough to eliminate handler table growing in the
+;;; rehash that happens during the disk-save after a reorder-memory, because
+;;; growing a handler table there screws up the careful placement of handler
+;;; tables in virtual address space by reorder-memory.
+(DEFPARAMETER DISPATCH-TABLE-EXTRA-SPACE 5)
+
+;;; This variables control when OPTIMIZE-DISPATCH-TABLES is run.  If a table's GC-DEPENDENCE
+;;; is static, and its generation is :DEFAULT, then this is the generation number which is
+;;; really used.  This keeps down on modified pages when incrementally reordering memory.
+#-Minima
+(DEFVAR *LAST-REHASH-GC-STATIC-GENERATION-NUMBER* %GC-STATIC-GENERATION-NUMBER)
+
+;; When changing the value of the above variable, this variable is used to half mask
+;; its value.  The decision of whether to rehash is based only upon the above variable,
+;; but the decision on what to store into the table is based on this.
+#-Minima
+(DEFVAR *THIS-REHASH-GC-STATIC-GENERATION-NUMBER* NIL)
+
+;;;; Routines for dispatch tables
+
+(DECLAIM (FTYPE (FUNCTION (FIXNUM T T T) DISPATCH-TABLE) MAKE-DISPATCH-TABLE))
+(DECLAIM (FTYPE (FUNCTION (FIXNUM FIXNUM T T T) DISPATCH-TABLE) MAKE-DISPATCH-TABLE-INTERNAL))
+(DECLAIM (FTYPE (FUNCTION (FIXNUM) FIXNUM FIXNUM) DISPATCH-TABLE-OPTIMAL-N-SLOTS))
+(DECLAIM (FTYPE (FUNCTION (FIXNUM) FIXNUM) DISPATCH-TABLE-SIZE-FOR-N-SLOTS))
+(DECLAIM (FTYPE (FUNCTION (FIXNUM) FIXNUM) DISPATCH-TABLE-N-SLOTS-FOR-SIZE))
+(DECLAIM (FTYPE (FUNCTION (DISPATCH-TABLE) FIXNUM) DISPATCH-TABLE-ACTUAL-N-SLOTS))
+
+(DEFUN MAKE-DISPATCH-TABLE (NUMBER-OF-ENTRIES SELECTOR-ORDER DEFAULT-HANDLER MISS-HANDLER)
+  (DECLARE (FIXNUM NUMBER-OF-ENTRIES))
+  (MULTIPLE-VALUE-BIND (SLOTS EXTENSION)
+      (DISPATCH-TABLE-OPTIMAL-N-SLOTS NUMBER-OF-ENTRIES)
+    (DECLARE (FIXNUM SLOTS EXTENSION))
+    (MAKE-DISPATCH-TABLE-INTERNAL (1- SLOTS)
+				  (DISPATCH-TABLE-SIZE-FOR-N-SLOTS (+ SLOTS EXTENSION))
+				  SELECTOR-ORDER DEFAULT-HANDLER
+				  MISS-HANDLER)))
+
+(DEFUN MAKE-DISPATCH-TABLE-INTERNAL (MASK SIZE SELECTOR-ORDER DEFAULT-HANDLER MISS-HANDLER)
+  (DECLARE (FIXNUM SIZE))
+  (LET ((DT #+Genera (SCL:MAKE-ARRAY SIZE :AREA *CLOS-AREA* :INITIAL-VALUE NIL)
+	    #-Genera (MAKE-ARRAY SIZE :INITIAL-ELEMENT NIL)))
+    (DECLARE (TYPE DISPATCH-TABLE DT))
+    (SETF (DISPATCH-TABLE-MASK DT) MASK)
+    (SETF (DISPATCH-TABLE-NUMBER-OF-ENTRIES DT) 0)
+    (SETF (DISPATCH-TABLE-MISS-HANDLER DT) MISS-HANDLER)
+    (SETF (DISPATCH-TABLE-DEFAULT-HANDLER DT) (OR DEFAULT-HANDLER 'HANDLE-REAL-MISS))
+    #-Minima (SETF (DISPATCH-TABLE-GC-GENERATION DT) NIL)
+    #-Minima (SETF (DISPATCH-TABLE-GC-DEPENDENCE DT) %GC-DEPENDENCE-NONE)
+    #+Minima (MINIMA-INTERNALS::INITIALIZE-GC-DEPENDENCE 
+	       (DISPATCH-TABLE-GC-GENERATION DT)
+	       (DISPATCH-TABLE-GC-DEPENDENCE DT)
+	       (DISPATCH-TABLE-GC-DEPENDENCE-2 DT))
+    (SETF (DISPATCH-TABLE-SELECTOR-ORDER DT) SELECTOR-ORDER)
+    (DO ((LIMIT (DISPATCH-TABLE-LAST-ADDRESS DT))
+	 (P (DISPATCH-TABLE-ADDRESS DT) (DISPATCH-TABLE-NEXT-ADDRESS P)))
+	(NIL)
+      (DECLARE (TYPE DISPATCH-TABLE-ADDRESS LIMIT P))
+      (SET-DISPATCH-TABLE-ENTRY DT P NIL MISS-HANDLER NIL)
+      (WHEN (EQL P LIMIT) (RETURN NIL)))
+    DT))
+
+(DEFUN DISPATCH-TABLE-OPTIMAL-N-SLOTS (NUMBER-OF-ENTRIES)
+  #+Genera (DECLARE (VALUES SLOTS EXTENSION))
+  ;; Minimum possible size of table.  Don't make tables smaller than 8 slots;
+  ;; it's pointless given that we have to provide extra space (see DISPATCH-TABLE-EXTRA-SPACE).
+  (LET ((SIZE (MAX 8 (THE FIXNUM (ASH 1 (INTEGER-LENGTH NUMBER-OF-ENTRIES))))))
+    (DECLARE (FIXNUM SIZE))
+    (LOOP UNTIL (>= (* SIZE DISPATCH-TABLE-FULLNESS-THRESHOLD) NUMBER-OF-ENTRIES)
+	  DO (SETQ SIZE (ASH SIZE 1)))
+    (VALUES SIZE DISPATCH-TABLE-EXTRA-SPACE)))
+
+(DEFUN DISPATCH-TABLE-SIZE-FOR-N-SLOTS (N-SLOTS)
+  (DECLARE (FIXNUM N-SLOTS))
+  (THE FIXNUM (+ DISPATCH-TABLE-DATA-OFFSET (THE FIXNUM (* 3 N-SLOTS)))))
+
+(DEFUN DISPATCH-TABLE-N-SLOTS-FOR-SIZE (SIZE)
+  (DECLARE (FIXNUM SIZE))
+  (MULTIPLE-VALUE-BIND (QUOTIENT REMAINDER)
+      (FLOOR (THE FIXNUM (- SIZE DISPATCH-TABLE-DATA-OFFSET)) 3)
+    (DECLARE (FIXNUM QUOTIENT REMAINDER))
+    (UNLESS (AND (ZEROP REMAINDER) (NOT (MINUSP QUOTIENT)))
+      (ERROR "Illegal size for dispatch table:  ~D" SIZE))
+    QUOTIENT))
+
+(DEFUN DISPATCH-TABLE-ACTUAL-N-SLOTS (DISPATCH-TABLE)
+  #+Genera (DECLARE (VALUES SLOTS EXTENSION))
+  (DECLARE (TYPE DISPATCH-TABLE DISPATCH-TABLE))
+  (LET* ((RAW-N-SLOTS (DISPATCH-TABLE-N-SLOTS-FOR-SIZE (DISPATCH-TABLE-SIZE DISPATCH-TABLE)))
+	 (BASE-N-SLOTS (- RAW-N-SLOTS DISPATCH-TABLE-EXTRA-SPACE))
+	 ;; Round this down to the next lower power of 2.
+	 (N-SLOTS (ASH 1 (1- (INTEGER-LENGTH BASE-N-SLOTS)))))
+    (DECLARE (FIXNUM RAW-N-SLOTS BASE-N-SLOTS N-SLOTS))
+    ;; Check DLA's sanity.  Remove this eventually.
+    (UNLESS (AND (<= N-SLOTS BASE-N-SLOTS) (< BASE-N-SLOTS (* 2 N-SLOTS)))
+      (ERROR "Error in handler table size calculation -- shouldn't happen."))
+    (VALUES N-SLOTS (- RAW-N-SLOTS N-SLOTS))))
+
+;; This must be called with GC flips inhibited, and with the handler table current.
+;; Failure to do so may cause the handler table to be marked as not needing a rehash
+;; when it really does.
+#-Minima
+(DEFUN DISPATCH-TABLE-CHECK-GC-DEPENDENCE (DT SELECTOR)
+  (LET ((DEPENDENCE (SELECTOR-GC-DEPENDENCE SELECTOR)))
+    (DECLARE (FIXNUM DEPENDENCE))
+    (WHEN (> DEPENDENCE (DISPATCH-TABLE-GC-DEPENDENCE DT))
+      (SETF (DISPATCH-TABLE-GC-DEPENDENCE DT) DEPENDENCE)
+      (SETF (DISPATCH-TABLE-GC-GENERATION DT)
+	    (COND ((EQL DEPENDENCE %GC-DEPENDENCE-STATIC)
+		   (IF (= %GC-STATIC-GENERATION-NUMBER
+			  (OR *THIS-REHASH-GC-STATIC-GENERATION-NUMBER*
+			      *LAST-REHASH-GC-STATIC-GENERATION-NUMBER*))
+		       :DEFAULT
+		       %GC-STATIC-GENERATION-NUMBER))
+		  ((EQL DEPENDENCE %GC-DEPENDENCE-DYNAMIC) %GC-DYNAMIC-GENERATION-NUMBER)
+		  ((EQL DEPENDENCE %GC-DEPENDENCE-EPHEMERAL) %GC-GENERATION-NUMBER)))
+      #+IMACH
+      (MAYBE-UPDATE-MISS-HANDLER DT))))
+
+#+Minima
+(DEFUN DISPATCH-TABLE-CHECK-GC-DEPENDENCE (DT SELECTOR)
+  (SETF (VALUES (DISPATCH-TABLE-GC-GENERATION DT)
+		(DISPATCH-TABLE-GC-DEPENDENCE DT)
+		(DISPATCH-TABLE-GC-DEPENDENCE-2 DT))
+	(MINIMA-INTERNALS::UPDATE-GC-DEPENDENCE
+	  (DISPATCH-TABLE-GC-GENERATION DT)
+	  (DISPATCH-TABLE-GC-DEPENDENCE DT)
+	  (DISPATCH-TABLE-GC-DEPENDENCE-2 DT)
+	  SELECTOR)))
+
+
+(DEFUN INSERT-IN-DISPATCH-TABLE (DT SELECTOR HANDLER EXTRA-ARGUMENT)
+  #+Genera (DECLARE (VALUES DISPATCH-TABLE))
+  ;; Disable interrupts so GC won't flip and so other processes won't molest the table
+  (WITH-NO-OTHER-PROCESSES
+    (MULTIPLE-VALUE-BIND (FOUND-P CELL)
+	(DISPATCH-TABLE-SEARCH DT SELECTOR)
+      (IF FOUND-P
+	  (COND ((NULL HANDLER)
+		 ;; Remove the entry, and shuffle back any entries we have to
+		 ;; shuffle due to collisions.
+		 (DECF (DISPATCH-TABLE-NUMBER-OF-ENTRIES DT))
+		 (SET-DISPATCH-TABLE-ENTRY DT CELL NIL (DISPATCH-TABLE-MISS-HANDLER DT) NIL)
+		 (SETF (DISPATCH-TABLE-SELECTOR-ORDER DT)
+		       (REMOVE SELECTOR (DISPATCH-TABLE-SELECTOR-ORDER DT)))
+		 ;; Next slot occupied?  May have been occupied due to a hash collision.
+		 (WHEN (DISPATCH-ENTRY-SELECTOR DT (DISPATCH-TABLE-NEXT-ADDRESS CELL))
+		   (SETQ DT (REHASH-DISPATCH-TABLE DT T))))
+		(T
+		 ;; Update the entry
+		 (SET-DISPATCH-TABLE-ENTRY DT CELL SELECTOR HANDLER EXTRA-ARGUMENT)))
+	  (WHEN HANDLER
+	    (LET ((N-ENTRIES (1+ (DISPATCH-TABLE-NUMBER-OF-ENTRIES DT))))
+	      (WHEN (>= N-ENTRIES
+			(* (1+ (DISPATCH-TABLE-MASK DT)) DISPATCH-TABLE-FULLNESS-THRESHOLD))
+		(SETQ DT (REHASH-DISPATCH-TABLE DT T N-ENTRIES))
+		(MULTIPLE-VALUE-SETQ (FOUND-P CELL) (DISPATCH-TABLE-SEARCH DT SELECTOR)))
+	      ;; Add a new entry
+	      (SETF (DISPATCH-TABLE-NUMBER-OF-ENTRIES DT) N-ENTRIES)
+	      ;; When adding an ephemeral key to the table, need to rehash more often
+	      (DISPATCH-TABLE-CHECK-GC-DEPENDENCE DT SELECTOR)
+	      ;; Expand table if necessary to accomodate the new entry
+	      (WHEN (NULL CELL)			;Fell off end of table
+		(MULTIPLE-VALUE-SETQ (DT CELL) (ENLARGE-DISPATCH-TABLE DT SELECTOR)))
+	      (SET-DISPATCH-TABLE-ENTRY DT CELL SELECTOR HANDLER EXTRA-ARGUMENT))))
+      DT)))
+
+;;; Fast version used when building a new dispatch table from scratch.
+;;; We can assume that SELECTOR will not be already present in the table and
+;;; that the table will be big enough almost all the time.
+;;; Returns the table, in case it grows.
+;;; Note that the table is not yet pointed-to.
+;;; Don't have to worry about other processes molesting the table for that reason.
+;;; Note:  We don't worry about GC flipping here.  All callers must ensure
+;;; that GC flipping is inhibited for DISPATCH-TABLE-CHECK-GC-DEPENDENCE to work.
+(DEFUN INSERT-DIRECTLY-IN-DISPATCH-TABLE (DT SELECTOR HANDLER EXTRA-ARGUMENT)
+  ;; Do the equivalent of DISPATCH-TABLE-SEARCH
+  (LET ((CELL (DISPATCH-TABLE-INITIAL-PROBE-ADDRESS
+		(DISPATCH-TABLE-ADDRESS DT) (DISPATCH-TABLE-MASK DT) SELECTOR)))
+    (LOOP
+      (LET ((PROBE (DISPATCH-ENTRY-SELECTOR DT CELL)))
+	(WHEN (NULL PROBE)
+	  (WHEN (EQ (DISPATCH-TABLE-LAST-ADDRESS DT) CELL)
+	    (SETQ DT (ADJUST-ARRAY DT (+ (DISPATCH-TABLE-SIZE DT) 3) ':INITIAL-ELEMENT NIL))
+	    (SET-DISPATCH-TABLE-ENTRY
+	      DT
+	      (DISPATCH-TABLE-LAST-ADDRESS DT)
+	      NIL
+	      (DISPATCH-TABLE-MISS-HANDLER DT)
+	      NIL)
+	    #+Genera (SETQ CELL (SYS:FOLLOW-CELL-FORWARDING CELL NIL))
+	    #+minima (SETQ CELL (DISPATCH-TABLE-LAST-ADDRESS DT)))
+	  (RETURN)))
+      (SETQ CELL (DISPATCH-TABLE-NEXT-ADDRESS CELL)))
+    (INCF (DISPATCH-TABLE-NUMBER-OF-ENTRIES DT))
+    ;; When adding an ephemeral key to the table, need to rehash more often
+    (DISPATCH-TABLE-CHECK-GC-DEPENDENCE DT SELECTOR)
+    (SET-DISPATCH-TABLE-ENTRY DT CELL SELECTOR HANDLER EXTRA-ARGUMENT)
+    DT)) 
+
+;; Grow the handler table only; the caller will take care of installing the new one.
+(DEFUN ENLARGE-DISPATCH-TABLE (DT SELECTOR)
+  #+Genera (DECLARE (VALUES NDT CELL))
+  (DECLARE (TYPE DISPATCH-TABLE DT))
+  (LET ((NDT (ADJUST-ARRAY DT (+ (DISPATCH-TABLE-SIZE DT) 3) ':INITIAL-ELEMENT NIL)))
+    (FILL NDT NIL :START (DISPATCH-TABLE-SIZE DT))
+    (SET-DISPATCH-TABLE-ENTRY
+      NDT
+      (DISPATCH-TABLE-LAST-ADDRESS NDT) NIL (DISPATCH-TABLE-MISS-HANDLER NDT) NIL)
+    (MULTIPLE-VALUE-BIND (IGNORE CELL)
+	(DISPATCH-TABLE-SEARCH-INTERNAL
+	  SELECTOR NDT (DISPATCH-TABLE-MASK NDT) (DISPATCH-TABLE-ADDRESS NDT))
+      (DECLARE (IGNORE IGNORE))
+      (UNLESS CELL
+	(ERROR "Internal error: expanding dispatch table didn't make any room"))
+      (VALUES NDT CELL)))) 
+
+;; This does exactly what the microcode does, but returns extra information.
+(DEFUN DISPATCH-TABLE-SEARCH-INTERNAL (SELECTOR DT MASK ADDRESS)
+  #+Genera (DECLARE (VALUES FOUNDP CELL))
+  (WHEN (NULL ADDRESS)
+    (RETURN-FROM DISPATCH-TABLE-SEARCH-INTERNAL NIL))
+  (SETQ ADDRESS (DISPATCH-TABLE-INITIAL-PROBE-ADDRESS ADDRESS MASK SELECTOR))
+  (LOOP
+    (LET ((PROBE (DISPATCH-ENTRY-SELECTOR DT ADDRESS)))
+      (COND ((EQL PROBE SELECTOR)
+	     (RETURN (VALUES T ADDRESS)))
+	    ((NULL PROBE)
+	     (WHEN (EQL (DISPATCH-TABLE-LAST-ADDRESS DT) ADDRESS)
+	       (RETURN NIL))			;Dropped off end of table
+	     (RETURN (VALUES NIL ADDRESS)))))	;Free slot
+    (SETQ ADDRESS (DISPATCH-TABLE-NEXT-ADDRESS ADDRESS))))
+
+;;; Should be called without interrupts.  REHASH is T if the table needs to be
+;;; rehashed.
+(DEFUN MAP-OVER-DISPATCH-TABLE (FUNCTION DISPATCH-TABLE)
+  (DECLARE (DYNAMIC-EXTENT FUNCTION))
+  (LET ((LAST-ADDRESS (DISPATCH-TABLE-LAST-ADDRESS DISPATCH-TABLE))
+	(ADDRESS (DISPATCH-TABLE-ADDRESS DISPATCH-TABLE))
+	(REHASH-IF-NEXT NIL)
+	(REHASH NIL))
+    (LOOP DOING
+      (LET ((SELECTOR (DISPATCH-ENTRY-SELECTOR DISPATCH-TABLE ADDRESS))
+	    (HANDLER (PROGN
+		       #+(OR IMACH Minima) (DISPATCH-ENTRY-HANDLER-PC ADDRESS)
+		       #+|3600| (DISPATCH-ENTRY-HANDLER ADDRESS)
+		       #-(OR IMACH |3600| Minima) (DISPATCH-ENTRY-HANDLER DISPATCH-TABLE ADDRESS)
+		       ))
+	    (EXTRA-ARGUMENT (PROGN
+			      #+(OR IMACH Minima) (DISPATCH-ENTRY-EXTRA-ARGUMENT ADDRESS)
+			      #+|3600| (DISPATCH-ENTRY-EXTRA-ARGUMENT ADDRESS)
+			      #-(OR IMACH |3600| Minima)
+			      (DISPATCH-ENTRY-EXTRA-ARGUMENT DISPATCH-TABLE ADDRESS)
+			      )))
+	(WHEN (AND SELECTOR REHASH-IF-NEXT)
+	  (SETQ REHASH T))
+	(SETQ REHASH-IF-NEXT NIL)
+	(MULTIPLE-VALUE-BIND (NEW-SELECTOR NEW-HANDLER NEW-EXTRA-ARGUMENT)
+	    (FUNCALL FUNCTION SELECTOR HANDLER EXTRA-ARGUMENT)
+	  (WHEN (AND SELECTOR (NULL NEW-SELECTOR))
+	    (DECF (DISPATCH-TABLE-NUMBER-OF-ENTRIES DISPATCH-TABLE))
+	    (SETF (DISPATCH-TABLE-SELECTOR-ORDER DISPATCH-TABLE)
+		  (REMOVE SELECTOR (DISPATCH-TABLE-SELECTOR-ORDER DISPATCH-TABLE)))
+	    (SETF REHASH-IF-NEXT T))
+	  (UNLESS (AND (EQL SELECTOR NEW-SELECTOR)
+		       (EQ HANDLER NEW-HANDLER)
+		       (EQ EXTRA-ARGUMENT NEW-EXTRA-ARGUMENT))
+	    (SET-DISPATCH-TABLE-ENTRY
+	      DISPATCH-TABLE ADDRESS NEW-SELECTOR NEW-HANDLER NEW-EXTRA-ARGUMENT))))
+      (IF (EQL ADDRESS LAST-ADDRESS)
+	  (RETURN)
+	  (SETQ ADDRESS (DISPATCH-TABLE-NEXT-ADDRESS ADDRESS))))
+    REHASH))
+
+#+IMACH (PROGN
+
+(DEFVAR *EQL-DISPATCH-MISS-HANDLERS* (MAKE-ARRAY %N-GC-DEPENDENCE-LEVELS))
+
+(DEFVAR *EQL-DISPATCH-ALL-MISS-HANDLERS* NIL)
+
+(DEFMACRO DEFINE-EQL-DISPATCH-MISS-HANDLER
+	  (NAME GC-DEPENDENCE LAMBDA-LIST &BODY BODY)
+  `(PROGN
+     (DEFUN ,NAME ,LAMBDA-LIST ,@BODY)
+     (LET ((HANDLER (HANDLER-PC-NO-ENTRY #',NAME)))
+       (SETF (AREF *EQL-DISPATCH-MISS-HANDLERS* ,GC-DEPENDENCE) HANDLER)
+       (PUSH HANDLER *EQL-DISPATCH-ALL-MISS-HANDLERS*))))
+
+(SETF (GET 'DEFINE-EQL-DISPATCH-MISS-HANDLER 'ZWEI:DEFINITION-FUNCTION-SPEC-TYPE) 'DEFUN)
+
+(DEFUN MAYBE-UPDATE-MISS-HANDLER (DT)
+  (LET ((OLD-HANDLER (DISPATCH-TABLE-MISS-HANDLER DT)))
+    (WHEN (MEMBER OLD-HANDLER *EQL-DISPATCH-ALL-MISS-HANDLERS*)
+      (LET ((NEW-HANDLER
+	      (AREF *EQL-DISPATCH-MISS-HANDLERS* (DISPATCH-TABLE-GC-DEPENDENCE DT))))
+	(UNLESS (EQ OLD-HANDLER NEW-HANDLER)
+	  (SETF (DISPATCH-TABLE-MISS-HANDLER DT) NEW-HANDLER)
+	  (MAP-OVER-DISPATCH-TABLE
+	    #'(LAMBDA (SELECTOR HANDLER EXTRA-ARGUMENT)
+		(VALUES SELECTOR
+			(IF SELECTOR
+			    HANDLER
+			    NEW-HANDLER)
+			EXTRA-ARGUMENT))
+	    DT))))))
+)
+
+;;; Should be called with interrupts inhibited
+;;; This imitates what the microcode does, except that it knows how to rehash.
+;;; Returns NIL for the METHOD and MAPPING-TABLE if no entry matching the selector
+;;; is found, and in that case SLOT is the address of the free slot where it could go.
+;;; Can return a SLOT of NIL if it drops off the end of the table or if
+;;; the flavor does not have a handler table.
+(DEFUN DISPATCH-TABLE-SEARCH (DT SELECTOR)
+  #+Genera (DECLARE (VALUES FOUNDP CELL DT))
+  (SETQ DT (OR (REHASH-DISPATCH-TABLE DT) DT))
+  (MULTIPLE-VALUE-BIND (FOUNDP CELL)
+      (DISPATCH-TABLE-SEARCH-INTERNAL
+	SELECTOR DT (DISPATCH-TABLE-MASK DT) (DISPATCH-TABLE-ADDRESS DT))
+    (VALUES FOUNDP CELL DT)))
+
+#-Minima
+(DEFSUBST DISPATCH-TABLE-NEEDS-REHASHING (DT)
+  (LET ((GENERATION (DISPATCH-TABLE-GC-GENERATION DT))
+	(DEPENDENCE (DISPATCH-TABLE-GC-DEPENDENCE DT)))
+    (DECLARE (FIXNUM DEPENDENCE))
+    (COND ((EQL DEPENDENCE %GC-DEPENDENCE-STATIC)
+	   (/= (IF (EQ GENERATION :DEFAULT)
+		   *LAST-REHASH-GC-STATIC-GENERATION-NUMBER*
+		   GENERATION)
+	       %GC-STATIC-GENERATION-NUMBER))
+	  ((EQL DEPENDENCE %GC-DEPENDENCE-NONE) NIL)
+	  ((EQL DEPENDENCE %GC-DEPENDENCE-DYNAMIC)
+	   (/= %GC-DYNAMIC-GENERATION-NUMBER GENERATION))
+	  ((EQL DEPENDENCE %GC-DEPENDENCE-EPHEMERAL)
+	   (/= %GC-GENERATION-NUMBER GENERATION)))))
+
+#+Minima
+(DEFSUBST DISPATCH-TABLE-NEEDS-REHASHING (DT)
+  (MINIMA-INTERNALS::VERIFY-GC-DEPENDENCE
+    (DISPATCH-TABLE-GC-GENERATION DT)
+    (DISPATCH-TABLE-GC-DEPENDENCE DT)
+    (DISPATCH-TABLE-GC-DEPENDENCE-2 DT)))
+
+;;; Must be called with interrupts inhibited, to prevent GC from flipping, also to
+;;; prevent other processes from trying to rehash at same time.
+;;; Returns the dispatch table (which may be different) if it actually rehashed it.
+;;; Note that this must not store into the handler table if no rehashing is required,
+;;; in order to cut down the number of modified pages seen by incremental disk save.
+;;; This can grow the table.
+(DEFUN REHASH-DISPATCH-TABLE (DT &OPTIONAL (FORCE NIL) (GROW-TO-N-ENTRIES NIL))
+  #+Genera (DECLARE (VALUES DISPATCH-TABLE))
+  (WHEN (OR FORCE
+	    ;; Rehash if GC has changed the hash values.
+	    (DISPATCH-TABLE-NEEDS-REHASHING DT))
+    (LET ((DISPATCH-TABLE-SIZE (DISPATCH-TABLE-SIZE DT))
+	  (MASK (DISPATCH-TABLE-MASK DT))
+	  (GREW NIL))
+      (DECLARE (FIXNUM DISPATCH-TABLE-SIZE MASK))
+      ;; If we were requested to grow, then do so if it will make us bigger.
+      (WHEN GROW-TO-N-ENTRIES
+	(MULTIPLE-VALUE-BIND (N-SLOTS EXTENSION)
+	    (DISPATCH-TABLE-OPTIMAL-N-SLOTS GROW-TO-N-ENTRIES)
+	  (DECLARE (FIXNUM N-SLOTS EXTENSION))
+	  (LET ((SIZE (DISPATCH-TABLE-SIZE-FOR-N-SLOTS (+ N-SLOTS EXTENSION))))
+	    (DECLARE (FIXNUM SIZE))
+	    (WHEN (> SIZE DISPATCH-TABLE-SIZE)
+	      (SETQ DISPATCH-TABLE-SIZE SIZE
+		    MASK (1- N-SLOTS)
+		    GREW T)))))
+      ;; NDT is a temporary buffer, unless we have to grow the dispatch table
+      (LET* ((NDT (MAKE-DISPATCH-TABLE-INTERNAL
+		    MASK DISPATCH-TABLE-SIZE
+		    (DISPATCH-TABLE-SELECTOR-ORDER DT)
+		    (DISPATCH-TABLE-DEFAULT-HANDLER DT)
+		    #-IMACH (DISPATCH-TABLE-MISS-HANDLER DT)
+		    #+IMACH
+		    (LET ((HANDLER (DISPATCH-TABLE-MISS-HANDLER DT)))
+		      (IF (MEMBER HANDLER *EQL-DISPATCH-ALL-MISS-HANDLERS*)
+			  (AREF *EQL-DISPATCH-MISS-HANDLERS* %GC-DEPENDENCE-NONE)
+			  HANDLER))))
+	     (NDT-ADDRESS (DISPATCH-TABLE-ADDRESS NDT)))
+	(SETF (DISPATCH-TABLE-NUMBER-OF-ENTRIES NDT) (DISPATCH-TABLE-NUMBER-OF-ENTRIES DT))
+	;; Stick in the ordered selectors first, so that they will almost
+	;; always be hit on the first probe.
+	(DOLIST (SELECTOR (DISPATCH-TABLE-SELECTOR-ORDER DT))
+	  (MULTIPLE-VALUE-BIND (IGNORE CELL)
+	      (DISPATCH-TABLE-SEARCH-INTERNAL SELECTOR NDT MASK NDT-ADDRESS)
+	    (DECLARE (IGNORE IGNORE))
+	    (WHEN (NULL CELL)
+	      (MULTIPLE-VALUE-SETQ (NDT CELL)
+		(ENLARGE-DISPATCH-TABLE NDT SELECTOR))
+	      (SETQ NDT-ADDRESS (DISPATCH-TABLE-ADDRESS NDT)
+		    GREW T))
+	    (SETF (DISPATCH-ENTRY-SELECTOR NDT CELL) SELECTOR)))
+	;; Copy the contents of DT into NDT
+	(DO ((LIMIT (DISPATCH-TABLE-LAST-ADDRESS DT))
+	     (P (DISPATCH-TABLE-ADDRESS DT) (DISPATCH-TABLE-NEXT-ADDRESS P)))
+	    (NIL)
+	  (DECLARE (TYPE DISPATCH-TABLE-ADDRESS LIMIT P))
+	  (LET ((SELECTOR (DISPATCH-ENTRY-SELECTOR DT P)))
+	    (WHEN SELECTOR
+	      (DISPATCH-TABLE-CHECK-GC-DEPENDENCE NDT SELECTOR)
+	      (MULTIPLE-VALUE-BIND (IGNORE CELL)
+		  (DISPATCH-TABLE-SEARCH-INTERNAL SELECTOR NDT MASK NDT-ADDRESS)
+		(DECLARE (IGNORE IGNORE))
+		(WHEN (NULL CELL)
+		  (MULTIPLE-VALUE-SETQ (NDT CELL)
+		    (ENLARGE-DISPATCH-TABLE NDT SELECTOR))
+		  (SETQ NDT-ADDRESS (DISPATCH-TABLE-ADDRESS NDT)
+			GREW T))
+		(SETF (DISPATCH-ENTRY-SELECTOR NDT CELL) SELECTOR)
+		(SETF (DISPATCH-ENTRY-DATA-1 NDT CELL) (DISPATCH-ENTRY-DATA-1 DT P))
+		(SETF (DISPATCH-ENTRY-DATA-2 NDT CELL) (DISPATCH-ENTRY-DATA-2 DT P))))
+	    (WHEN (EQL P LIMIT) (RETURN NIL))))
+	;; Copy back into DT if it fits there or else replace DT with NDT
+	(COND (GREW NDT)
+	      (T (NONMODIFYING-COPY-ARRAY-CONTENTS NDT DT)
+		 #+Genera (SYS:RETURN-ARRAY NDT)	;@@@@ figure out something for this?
+		  DT))))))
+
+
+;; Don't modify pages if we can help it, so IDS file size will be kept down.
+(DEFUN NONMODIFYING-COPY-ARRAY-CONTENTS (FROM TO)
+  (LET ((FROM FROM) (TO TO))
+    (DECLARE #+Genera (SYS:ARRAY-REGISTER FROM TO)
+	     #-Genera (TYPE DISPATCH-TABLE FROM TO))
+    (DOTIMES (I (MIN (DISPATCH-TABLE-SIZE FROM) (DISPATCH-TABLE-SIZE TO)))
+      (LET ((ELEM (AREF FROM I)))
+	(UNLESS (EQ (AREF TO I) ELEM)
+	  (SETF (AREF TO I) ELEM))))))
+
+(DEFUN COPY-DISPATCH-TABLE (DT)
+  (WITH-NO-OTHER-PROCESSES
+    (LET ((NDT (MAKE-DISPATCH-TABLE-INTERNAL
+		 (DISPATCH-TABLE-MASK DT)
+		 (DISPATCH-TABLE-SIZE DT)
+		 (DISPATCH-TABLE-SELECTOR-ORDER DT)
+		 (DISPATCH-TABLE-DEFAULT-HANDLER DT)
+		 (DISPATCH-TABLE-MISS-HANDLER DT))))
+      (NONMODIFYING-COPY-ARRAY-CONTENTS DT NDT)
+      NDT)))

@@ -1,0 +1,677 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: METERING; Base: 10; Lowercase: Yes -*-
+
+;;; Trap-on-call and trap-on-exit (meter function entry and exit) support
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+
+;;; This is NIL or a hash-table (alist on IMach) of frame-pointers to list of
+;;; (continue-signal-flag . functions).  continue-signal-flag says whether to
+;;; continue signalling (i.e. whether the debugger has asked for a trap on this
+;;; frame.  The functions are called on no arguments, and then if continue-signal-flag
+;;; is T, the signal proceeds normally, otherwise we proceed with no action.
+(defvar dbg:*exit-trap-frame-actions* nil)
+
+(defun dbg:debugger-trace-flag (frame)
+  (labels ((frame-traced-p (frame)
+	     #+3600  (not (zerop (sys:frame-trace-bit frame)))
+	     #+imach (dbg:trap-on-exit-client-p frame :debugger)))
+    (if (not dbg:*exit-trap-frame-actions*)
+	(frame-traced-p frame)
+      (and (frame-traced-p frame)
+	   (let ((action #+3600  (gethash frame dbg:*exit-trap-frame-actions*)
+			 #+imach (dbg:trap-on-exit-client-p frame :debugger)))
+	     (or (null action)
+		 #+3600  (car action)
+		 #+imach action))))))
+
+#+3600
+(defun dbg:set-debugger-trace-flag (frame flag)
+  (flet ((trace-frame (frame flag)
+	   (let ((bit (if flag 1 0)))
+	     (setf (sys:frame-trace-bit frame) bit))))
+    (if (not dbg:*exit-trap-frame-actions*)
+	(trace-frame frame flag)
+	(let ((action (gethash frame dbg:*exit-trap-frame-actions*)))
+	  (if (null action)
+	      (trace-frame frame flag)
+	      (setf (car action) flag))))))
+
+#+imach
+(defun dbg:set-debugger-trace-flag (frame flag)
+  (let ((bit (if flag 1 0)))
+    (flet ((create-signal-exit-trap (frame)
+	     (let ((function (sys:frame-function frame)))
+	       #'(lambda ()
+		   (declare (dbg:error-reporter))
+		   ;; Need to squirrel away both FRAME and FUNCTION in this
+		   ;; closure, since when the value-disposition is RETURN
+		   ;; FUNCTION cannot be determined
+		   (catch 'dbg:return-values-from-exit-trap
+		     (dbg:signal-trap-on-exit frame function))))))
+      ;; Check to see whether we need to make any changes.
+      (unless (eql (zerop bit)
+		   (null (dbg:trap-on-exit-client-p frame :debugger)))
+	(dbg:register-trap-on-exit-client frame
+					  (dbg:frame-next-active-frame frame)
+					  sys:%current-stack-group
+					  :debugger
+					  (if flag
+					      (create-signal-exit-trap frame)
+					    #'ignore)
+					  bit)))))
+
+(cl:defsetf dbg:debugger-trace-flag dbg:set-debugger-trace-flag)
+
+(defun dbg:relocate-exit-trap-frame-actions ()
+  #+3600 (when (not (null dbg:*exit-trap-frame-actions*))
+	   (let ((frames
+		   (cli::maptable dbg:*exit-trap-frame-actions*
+				  #'(lambda (k v) (ignore v) k)
+				  'list)))
+	     (loop for frame in frames 
+		   for actions = (gethash frame dbg:*exit-trap-frame-actions*)
+		   do
+	       (let ((new-frame (follow-cell-forwarding frame t)))
+		 (remhash frame dbg:*exit-trap-frame-actions*)
+		 (setf (gethash new-frame dbg:*exit-trap-frame-actions*) actions)))))
+  #+imach (loop for frame-and-actions in dbg:*exit-trap-frame-actions*
+		as (frame) = frame-and-actions
+		as new-frame = (follow-cell-forwarding frame t)
+		do (setf (first frame-and-actions) new-frame)))
+
+
+(defvar *control-test-trap-count* 0)
+
+;; Called directly by the function-call microcode, which knows about this routine by name.
+;; You had better be sure that traps are disabled if you flip compiled-function-area.
+;; You should make sure that you've saved registers and floating point status before
+;; you call this function.
+(defun dbg:meter-function-entry (old-inhibit-scheduling-flag #+imach trap-time)
+  (declare (si:safeguarded-function si:disable-reference-validation))
+  (declare (inline metering::process-metering-overhead))
+  (declare (dbg:error-reporter))
+  (let* ((start-time
+	   (sys:%32-bit-difference #+3600 (sys:%microsecond-clock)
+				   #+imach trap-time
+				   *function-entry-fudge-factor-1*))
+	 #+imach
+	 (trap-frame
+	   (sys:%pointer-plus (sys:%stack-frame-pointer)
+			      (- (ldb sys:%%cr.caller-frame-size
+				      (sys:%read-internal-register
+					sys:%register-control-register)))))
+	 (fp #+3600 (dbg:frame-previous-frame (sys:%stack-frame-pointer))
+	     #+imach
+	     (sys:%pointer-plus
+	       trap-frame
+	       (- (ldb sys:%%cr.caller-frame-size (sys:%saved-control-register)))))
+	 (ancestor-collecting-overhead? *metering-overhead-accounted*)
+	 (*metering-overhead-accounted* t)
+	 (meter-on nil)
+	 (call-trace-handlers (dbg:sg-call-trace-handlers sys:%current-stack-group)))
+    (setf si:inhibit-scheduling-flag old-inhibit-scheduling-flag)
+    #+DEBUG-FUNCTION-CALL-METERING
+    (collect-data *bad-meter-bit-traps* 'TOP-entry FP *METERING-ENABLED*
+		  (NOT ANCESTOR-COLLECTING-OVERHEAD?))
+    (si:incf* *control-test-trap-count*)
+    ;; This frame needs to be metered
+    (when (and *metering-globally-enabled*
+	       *trigger-for-all-function-calls*
+	       *enable-metering-on-function-calls*
+	       (zerop (ldb sys:%%sg-halt-on-error
+			   sys:%current-stack-group-status-bits))
+	       (process-meter-stack process::%real-current-process)
+	       (let ((control (trigger-control *trigger-for-all-function-calls*)))
+		 (and control
+		      (let ((state (control-state control)))
+			;; don't shut off traps, even if this frame isn't metered.
+			(unless (null state) (setq meter-on t))
+			#+DEBUG-FUNCTION-CALL-METERING
+			(collect-data *bad-meter-bit-traps* 'INSIDE-COND-entry
+				      FP STATE)
+			(or (eq state t)
+			    (and state
+				 (metering-enabled? control))))))
+	       *metering-enabled*
+	       ;; don't meter in scheduler for time being, since it screws up overhead
+	       (not process::*in-process-dispatcher*)
+	       (not ancestor-collecting-overhead?)
+	       (or (not si:*inhibit-consing-flag*)
+		   *enable-function-metering-during-scavenge*))
+      #+DEBUG-FUNCTION-CALL-METERING
+      (collect-data *bad-meter-bit-traps* 'INSIDE-WHEN-entry FP)
+      (setq meter-on t)
+      (let* ((*metering-enabled* nil)
+	     (*enable-metering-on-function-calls* nil)
+	     #+imach
+	     (continuation
+	       (let* ((frame (if (ldb-test sys:%%cr.call-started
+					   (sys:frame-caller-control-register trap-frame))
+				 (dbg:spartan-frame-next-open-frame
+				   trap-frame (sys:%stack-frame-pointer))
+				 (sys:%stack-frame-pointer)))
+		      (pc (sys:frame-caller-continuation frame))
+		      #+Ivory-Rev-1 (kludges 0)
+		      )
+		 #+Ivory-Rev1
+		 (loop				;
+		   (when (not (eql pc si:*return-kludge-0-helper-continuation*)) (return))
+		   (decf kludges)
+		   (setf pc (sys:%memory-read (sys:%pointer-plus frame kludges))))
+		 (if (eql pc (si:%make-pointer si:dtp-even-pc
+					       (+ sys:%trap-vector-base
+						  sys:%generic-dispatch-trap-vector)))
+		     ;; can't do find-structure header on this!
+		     #'(:property si:dtp-generic-function si:interpreter-function)
+		     (sys:%find-structure-header pc))))
+	     #+imach
+	     (real-function
+	       (cond ((not
+			(or (eql continuation
+				 #'(:property si:dtp-generic-function si:interpreter-function))
+			    (eql continuation
+				 #'(:property si:dtp-instance si:interpreter-function))))
+		      continuation)
+		     #+ignore
+		     ((= sys:value-disposition-return
+			 (ldb sys:%%cr.value-disposition
+			      (sys:frame-caller-control-register trap-frame)))
+		      )
+		     (t
+		      ;;manually simulate it.
+		      (multiple-value-bind (object operation)
+			  (let* ((object (location-contents (sys:%pointer-plus fp 2)))
+				 (maybe-operation (location-contents (sys:%pointer-plus fp 3)))
+				 ;; if the first arg is a rest arg of any sort, then ...
+				 (operation (if (listp maybe-operation)
+						(first maybe-operation) maybe-operation)))
+			    (if (eql continuation
+				     #'(:property si:dtp-instance si:interpreter-function))
+				(values object operation)
+				(values operation object)))
+			(or (if (and (instancep object) (si:generic-function-p operation))
+				(ignore-errors
+				  (without-interrupts
+				    (flavor::handler-table-function-and-parameter
+				      (si:%instance-flavor object)
+				      (si:generic-function-selector operation))))
+				(ignore-errors (flavor::get-handler-for object operation)))
+			    (and (functionp object) object)
+			    continuation))))))
+	#+DEBUG-FUNCTION-CALL-METERING
+	(let ((open (ldb-test sys:%%cr.call-started
+			      (sys:frame-caller-control-register trap-frame))))
+	  (collect-data *bad-meter-bit-traps* 'inside-function-entry fp
+			open
+			(sys:%stack-frame-pointer)
+			(when open (dbg:spartan-frame-next-open-frame
+				     trap-frame (sys:%stack-frame-pointer)))
+			(sys:frame-caller-continuation (sys:%stack-frame-pointer))
+			(when open
+			  (sys:frame-caller-continuation
+			    (dbg:spartan-frame-next-open-frame
+			      trap-frame (sys:%stack-frame-pointer))))))
+	(metering:push-new-stack-frame
+	  (process-meter-stack process::%real-current-process) fp #+imach real-function)
+	(when (or (null (trigger-filter3 *trigger-for-all-function-calls*))
+		  (funcall (trigger-filter3 *trigger-for-all-function-calls*)
+			   fp #+imach real-function))
+	  #+3600 (setf (sys:frame-meter-bit fp) 1)
+	  ;; no clients of the trap-on-exit bit can have it already set, because the
+	  ;; frame was just entered.  Stack-wiring can, because they have priority over
+	  ;; us.  Set no-update T, so it doesn't have to do an ASSOC.
+	  #+IMach (dbg:meter-on-exit fp trap-frame si:%current-stack-group 1)
+	  (if (trigger-initial-generator-function *trigger-for-all-function-calls*)
+	      (let ((*metering-stack* (process-meter-stack process::%real-current-process)))
+		(funcall (trigger-initial-generator-function *trigger-for-all-function-calls*)
+			 (trigger-initial-collector-function *trigger-for-all-function-calls*)
+			 start-time fp
+			 #+imach real-function))
+	      (when (trigger-initial-collector-function *trigger-for-all-function-calls*)
+		(funcall (trigger-initial-collector-function *trigger-for-all-function-calls*)
+			 fp #+imach real-function))))))
+    (setq meter-on (and meter-on *enable-metering-on-function-calls*))
+    (cond
+      (call-trace-handlers
+       (let* ((si:inhibit-scheduling-flag t)
+	      (*metering-overhead-accounted* ancestor-collecting-overhead?))
+	 ;; make sure that metering a trap-on-call will work, and that overhead is adjusted
+	 ;; appropriately
+	 (unless ancestor-collecting-overhead?
+	   (if process::*in-process-dispatcher*
+	       (si:incf* si:*scheduler-metering-overhead*
+			 (sys:%32-bit-difference (sys:%microsecond-clock) start-time))
+	       (si:incf* (process-metering-overhead process::%real-current-process)
+			 (sys:%32-bit-difference (sys:%microsecond-clock) start-time))))
+	 (setf si:inhibit-scheduling-flag old-inhibit-scheduling-flag)
+	 (si:%check-preempt-pending)
+	 ;; Handle a trap-on-call for this function-entry
+	 (loop for handler in call-trace-handlers
+	       do (send handler :call-trace fp)
+		  ;; Metering should stay on if we need it from above, or if there
+		  ;; are more trap-on-calls waiting in the wings
+	       finally (setq meter-on
+			     (or meter-on
+				 (dbg:sg-call-trace-handlers sys:%current-stack-group))))
+	 (let ((si:inhibit-scheduling-flag t))
+	   (setq start-time (sys:%microsecond-clock))
+	   (setf *metering-overhead-accounted* t))))
+      (t (when (and *metering-enabled* (not meter-on))
+	   ;; Who knows why we got a meter trap -- log the bad entry
+	   #+3600 (setf (sys:frame-meter-bit fp) 0)
+	   (collect-data *bad-meter-bit-traps* 'bad-entry
+			 #+3600 (dbg:frame-function fp)
+			 #+imach
+			 (sys:%find-structure-header
+			   (sys:frame-caller-continuation
+			     (if (ldb-test sys:%%cr.call-started
+					   (sys:frame-caller-control-register trap-frame))
+				 (dbg:spartan-frame-next-open-frame
+				   trap-frame (sys:%stack-frame-pointer))
+				 (sys:%stack-frame-pointer))))))))
+    #+imach
+    (when meter-on
+      (let ((control-register-loc (locf (dbg:frame-caller-control-register trap-frame))))
+	(si:%p-dpb 1 sys:%%cr.call-trace control-register-loc)
+	#||
+	;; this was only done if we metered the function entry.
+	(dbg:meter-on-exit fp trap-frame si:%current-stack-group 1)
+	||#))
+    #+imach (setq si:inhibit-scheduling-flag t)
+    (let (#+3600 (si:inhibit-scheduling-flag 't))
+      (unless ancestor-collecting-overhead?
+	(let ((overflow (if process::*in-process-dispatcher*
+			    si:*scheduler-metering-overhead-overflow*
+			    (process-metering-overhead-overflow process::%real-current-process))))
+	  (decf overflow *function-entry-fudge-fraction*)
+	  (when (minusp overflow)
+	    (setq start-time (sys:%32-bit-difference start-time 1))
+	    (incf overflow *function-trap-fudge-denominator*))
+	  (if process::*in-process-dispatcher*
+	      (setf si:*scheduler-metering-overhead-overflow* overflow)
+	      (setf (process-metering-overhead-overflow process::%real-current-process) overflow)))
+	#+3600  ; for IMACH this is done in trace-trap-handler itself.
+	;; even though this is known to compile in-line, it's not OK to do it after we set
+	;; metering back on, because if we get pre-empted, the stack group switch will
+	;; cause function entry traps to occur inside here
+	(let ((adjusted-start-time
+		(sys:%32-bit-difference start-time *function-entry-fudge-factor-2*)))
+	  (if process::*in-process-dispatcher*
+	      (si:incf*	si:*scheduler-metering-overhead*
+			(sys:%32-bit-difference (sys:%microsecond-clock) adjusted-start-time))
+	      (si:incf* (metering:process-metering-overhead process::%real-current-process)
+			(sys:%32-bit-difference (sys:%microsecond-clock) adjusted-start-time)))))
+      (setf *metering-overhead-accounted* ancestor-collecting-overhead?)
+      #+3600 (when meter-on (sys:%meter-on)))
+    #+3600 nil
+    #+imach (and (not ancestor-collecting-overhead?)
+		 (sys:%32-bit-difference start-time *function-entry-fudge-factor-2*))
+    ))
+
+
+
+#+imach
+(defmacro dbg:%get-local-from-trap (i)
+  `(loop for cont = (sys:%read-internal-register sys:%register-continuation)
+		  then (sys:frame-caller-continuation old-fp)
+	 for old-fp = (sys:%stack-frame-pointer) then fp
+	 for fp = (sys:%pointer-plus
+		    old-fp
+		    (- (ldb sys:%%cr.caller-frame-size
+			    (sys:%read-internal-register sys:%register-control-register))))
+		then (sys:%pointer-plus fp (- (ldb sys:%%cr.caller-frame-size cr)))
+	 as cr = (sys:frame-caller-control-register old-fp)
+	 until (null (location-contents old-fp))
+	 when (eql #'dbg:error-trap-handler (sys:%find-structure-header cont))
+	   do (return (location-contents
+			(sys:%pointer-plus
+			  (sys:%pointer-plus fp (ldb sys:%%cr.argument-size cr))
+			  ,i)))))
+
+#+imach
+;; INLINEd because it is often called together with setting CALL-TRACE, and you don't
+;; want to make any function calls until the state of the world is consistent. (Or you could
+;; do the whole thing at a raised trap mode, but that shouldn't be necessary.
+(defsubst dbg:meter-on-exit (frame next-active-frame sg value &optional no-update)
+  (let ((action (and (not no-update) (assoc frame dbg:*exit-trap-frame-actions*))))
+    (if (zerop value)
+	(if action
+	    (setf (second action) nil)
+	    (si:%funcall-in-aux-stack
+	      #'storage::set-trap-on-exit-flag frame next-active-frame sg 0))
+	(when action (setf (second action) t))
+	(si:%funcall-in-aux-stack
+	  #'storage::set-trap-on-exit-flag frame next-active-frame sg 1))))
+
+#+imach
+(defun dbg:%meter-on-exit-this-frame (value)
+  (let* ((our-fp (sys:%stack-frame-pointer))
+	 (fp (sys:%pointer-plus
+	       our-fp
+	       (- (ldb sys:%%cr.caller-frame-size
+		       (sys:%read-internal-register sys:%register-control-register))))))
+    (dbg:meter-on-exit fp our-fp si:%current-stack-group value)))
+
+#+imach
+;; change synchronization of *exit-trap-frame-actions* to use a lock, after 413 recompile.
+(defun dbg:register-trap-on-exit-client (frame next-active-frame sg uid function value)
+  (let ((action (assoc frame dbg:*exit-trap-frame-actions*)))
+    (cond ((and (zerop value) action)
+	   (without-interrupts (setf (cddr action) (delete uid (cddr action) :key #'first)))
+	   (when (null (cddr action))
+	     (without-interrupts
+	       ;; test again inside without-interrupts
+	       (when (null (cddr action))
+		 (setf dbg:*exit-trap-frame-actions*
+		       (delete action dbg:*exit-trap-frame-actions*))))
+	     (unless (second action)
+	       (si:%funcall-in-aux-stack
+		 #'storage::set-trap-on-exit-flag frame next-active-frame sg 0))))
+	  ((= value 1)
+	   (if action
+	       (without-interrupts
+		 (let ((subaction (assoc uid (cddr action))))
+		   (if subaction
+		       (setf (second subaction) function)
+		       (scl:pushnew (list uid function) (cddr action)))))
+	       (let ((old-value (storage::trap-on-exit-flag frame next-active-frame sg)))
+		 (without-interrupts
+		   (si:%funcall-in-aux-stack
+		     #'storage::set-trap-on-exit-flag frame next-active-frame sg 1)
+		   (let* ((action (assoc frame dbg:*exit-trap-frame-actions*))
+			  (subaction (assoc uid (cddr action))))
+		     (cond (subaction (setf (second subaction) function))
+			   (action (scl:pushnew (list uid function) (cddr action)))
+			   (t 
+			    (push (list frame old-value (list uid function))
+				  dbg:*exit-trap-frame-actions*)))))))))))
+
+#+imach
+;;; Returns the FUNCTION that is registered, if UID is a client for FRAME
+(defun dbg:trap-on-exit-client-p (frame uid)
+  (declare (values function))
+  (let ((action (assoc frame dbg:*exit-trap-frame-actions*)))
+    (and action (second (assoc uid (cddr action))))))
+
+
+
+;; Called directly by the function-call microcode, which knows about this routine by name.
+;; You had better be sure that traps are disabled if you flip compiled-function-area.
+(defun dbg:meter-function-exit (old-inhibit-scheduling-flag)
+  (declare (si:safeguarded-function si:disable-reference-validation))
+  (declare (inline metering:process-metering-overhead))
+  (declare (dbg:error-reporter))
+  (let* ((start-time (sys:%32-bit-difference #+3600 (sys:%microsecond-clock)
+					     #+imach (dbg:%get-local-from-trap 0)
+					     *function-exit-fudge-factor-1*))
+	 #+imach
+	 (trap-on-exit-frame
+	   (sys:%pointer-plus (sys:%stack-frame-pointer)
+			      (- (ldb sys:%%cr.caller-frame-size
+				      (sys:%read-internal-register
+					sys:%register-control-register)))))
+	 #+imach
+	 (trap-frame
+	   (sys:%pointer-plus trap-on-exit-frame
+			      (- (ldb sys:%%cr.caller-frame-size
+				      (sys:%saved-control-register)))))
+	 (fp #+3600 (dbg:frame-previous-frame (sys:%stack-frame-pointer))
+	     #+imach
+	     (sys:%pointer-plus
+	       trap-frame
+	       (- (ldb sys:%%cr.caller-frame-size
+		       (sys:frame-caller-control-register trap-on-exit-frame)))))
+	 (ancestor-collecting-overhead? *metering-overhead-accounted*)
+	 (*metering-overhead-accounted* t)
+	 (meter-on nil))
+    (setf si:inhibit-scheduling-flag old-inhibit-scheduling-flag)
+    ;; This is only necessary on the 3600, on the IMach the trap-handler does it itself.
+    #+3600 (setf (sys:frame-meter-bit fp) 0)
+    #+debug-function-call-metering (collect-data *bad-meter-bit-traps* 'top-of-EXIT FP )
+    (si:incf* *control-test-trap-count*)
+    (let ((stack (process-meter-stack process::%real-current-process)))
+      (when stack
+	(let ((mfp (metering-stack-frame-pointer stack)))
+	  #+3600
+	  ;; avoid recursive metering.
+	  (if *trigger-for-all-function-calls*
+	      (progn
+		(let ((*metering-enabled* nil)
+		      (*enable-metering-on-function-calls* nil))
+		  (loop while (and mfp
+				   (plusp (metering-stack-pointer stack))
+				   ;; stacks can move to higher addresses
+				   ;; (for example, lexpr-funcall of GENERAL-CASE) but never
+				   ;; to lower addresses.  
+				   (si:%pointer-< fp (aref stack (1+ mfp)))) do
+		    (setf mfp (aref stack mfp))
+		    (pop-frame stack))
+		  (when (or (null (trigger-filter1 *trigger-for-all-function-calls*))
+			    (funcall (trigger-filter1 *trigger-for-all-function-calls*) fp))
+		    (let ((*metering-stack* stack))
+		      (funcall (trigger-generator-function *trigger-for-all-function-calls*)
+			       (trigger-compute-differences *trigger-for-all-function-calls*)
+			       (trigger-collector-function *trigger-for-all-function-calls*)
+			       start-time fp))
+		    ;; All instances of a given metering event (represented by a single
+		    ;; trigger) behave identically, by definition.  If one uses the metering
+		    ;; stack, they *all* use the metering stack, so the following test is
+		    ;; legitimate.  I.e. either ALL-FUNCTION-CALLS is using the metering stack,
+		    ;; or it isn't.  If not, there are no frames.  If yes, then we've just
+		    ;; metered, so pop it.
+		    ;; you might think that you need to test for
+		    ;;     (eql fp (aref stack (1+ mfp))))
+		    ;; even if we didn't meter, but that frame will be cleared off by the
+		    ;; loop above before the next frame is metered.
+		    (when mfp (pop-frame stack))))
+		;; only turn it back on if necessary.
+		(when (and *metering-globally-enabled*
+			   *enable-metering-on-function-calls*
+			   (let ((control (trigger-control *trigger-for-all-function-calls*)))
+			     (and control
+				  #+ignore
+				  (let ((state (control-state control)))
+				    (or (eq state t)
+					(and state
+					     (metering-enabled? control))))
+				  #-ignore
+				  (control-state control))))
+		  (setq meter-on t)))
+	    ;; else
+	    (when *metering-enabled*
+	      (collect-data
+		metering:*bad-meter-bit-traps* 'bad-exit (dbg:frame-function fp))))
+	  #+imach
+	  (when *trigger-for-all-function-calls*
+	    (let ((*metering-enabled* nil)
+		  (old-enable *enable-metering-on-function-calls*)
+		  (*enable-metering-on-function-calls* nil)
+		  (real-function
+		    (when (plusp (metering:metering-stack-pointer stack))
+		      (or (aref stack (+ mfp 2))
+			  (si:%find-structure-header
+			    (sys:frame-caller-continuation trap-on-exit-frame))))))
+	      #+DEBUG-FUNCTION-CALL-METERING
+	      (collect-data
+		metering:*bad-meter-bit-traps*
+		'in-exit fp mfp *metering-globally-enabled* old-enable (not ancestor-collecting-overhead?) real-function)
+	      (loop while (and mfp
+			       (plusp (metering-stack-pointer stack))
+			       ;; stacks can move to higher addresses
+			       ;; (for example, lexpr-funcall of GENERAL-CASE) but never
+			       ;; to lower addresses.  
+			       (si:%pointer-< fp (aref stack (1+ mfp)))) do
+		(setf mfp (aref stack mfp))
+		(pop-frame stack))
+	      ;; only turn it back on if necessary.
+	      (when (and *metering-globally-enabled*
+			 old-enable
+			 (zerop (ldb sys:%%sg-halt-on-error
+				     sys:%current-stack-group-status-bits))
+			 (let ((control (trigger-control *trigger-for-all-function-calls*)))
+			   (and control
+				(let ((state (control-state control)))
+				  ;; don't shut off traps, even if this frame isn't metered.
+				  (unless (null state) (setq meter-on t))
+				  #+DEBUG-FUNCTION-CALL-METERING
+				  (collect-data
+				    metering:*bad-meter-bit-traps*
+				    'in-exit-cond fp state (aref stack (1+ mfp))
+				    (sys:frame-caller-continuation trap-on-exit-frame))
+				  (or (eq state t)
+				      (and state
+					   (metering-enabled? control))))))
+			 mfp
+			 (not ancestor-collecting-overhead?)
+			 (or (not si:*inhibit-consing-flag*)
+			     *enable-function-metering-during-scavenge*))
+		;; we can't meter unless the corresponding frame was pushed on the metering
+		;; stack, so that we have a value for REAL-FUNCTION
+		(when (and (eql fp (aref stack (1+ mfp)))
+			   (or (null (trigger-filter1 *trigger-for-all-function-calls*))
+			       (funcall (trigger-filter1 *trigger-for-all-function-calls*)
+					fp real-function)))
+		  (let ((*metering-stack* stack))
+		    (funcall (trigger-generator-function *trigger-for-all-function-calls*)
+			     (trigger-compute-differences *trigger-for-all-function-calls*)
+			     (trigger-collector-function *trigger-for-all-function-calls*)
+			     start-time fp real-function))
+		  ;; All instances of a given metering event (represented by a single
+		  ;; trigger) behave identically, by definition.  If one uses the metering
+		  ;; stack, they *all* use the metering stack, so the following test is
+		  ;; legitimate.  I.e. either ALL-FUNCTION-CALLS is using the metering stack,
+		  ;; or it isn't.  If not, there are no frames.  If yes, then we've just
+		  ;; metered, so pop it.
+		  ;; you might think that you need to test for
+		  ;;     (eql fp (aref stack (1+ mfp))))
+		  ;; even if we didn't meter, but that frame will be cleared off by the
+		  ;; loop above before the next frame is metered.
+		  (when mfp (pop-frame stack)))))))))
+    (setq meter-on (or (and meter-on *enable-metering-on-function-calls*)
+		       (not (null (dbg:sg-call-trace-handlers sys:%current-stack-group)))))
+    #+imach
+    (let ((exit-trap-frame-actions (assoc fp dbg:*exit-trap-frame-actions*)))
+      (cond
+	(exit-trap-frame-actions
+	 (let* ((si:inhibit-scheduling-flag t)
+		(*metering-overhead-accounted* ancestor-collecting-overhead?))
+	   ;; make sure that metering a trap-on-call will work, and that overhead is
+	   ;; adjusted appropriately
+	   (unless ancestor-collecting-overhead?
+	     (if process::*in-process-dispatcher*
+		 (si:incf* si:*scheduler-metering-overhead*
+			   (sys:%32-bit-difference (sys:%microsecond-clock) start-time))
+		 (si:incf* (process-metering-overhead process::%real-current-process)
+			   (sys:%32-bit-difference (sys:%microsecond-clock) start-time))))
+	   (setq si:inhibit-scheduling-flag old-inhibit-scheduling-flag)
+	   (si:%check-preempt-pending)
+	   (when exit-trap-frame-actions
+	     (loop for action in (cddr exit-trap-frame-actions)
+		   doing (funcall (second action)))
+	     (setf dbg:*exit-trap-frame-actions*
+		   (delete exit-trap-frame-actions dbg:*exit-trap-frame-actions*)))
+	   (setq si:inhibit-scheduling-flag t)
+	   (setq start-time (sys:%microsecond-clock))
+	   (setf *metering-overhead-accounted* t)))
+	((not meter-on)  ; we shouldn't have gone off, or we're about to shut off metering
+	 (if (and (zerop (sys:%p-ldb sys:%%cr.call-trace
+				     (locf (dbg:frame-caller-control-register trap-frame))))
+		  (zerop (sys:%p-ldb sys:%%cr.call-trace
+				     (locf (dbg:frame-caller-control-register fp)))))
+	     ;; We go through this branch if metering had nothing to do with setting up
+	     ;; this exit-trap, and no-one else claims responsibility.
+	     (SI:%FUNCALL-IN-AUX-STACK
+	       #'SYS:WIRED-FERROR :PROCEEDABLE-HALT "Spurious trap-on-exit")
+	     ;; metering set this up, we're in the process of metering cleanups
+	     (when *metering-enabled*
+	       ;; Who knows why we got a meter trap -- log the bad entry
+	       (collect-data *bad-meter-bit-traps* 'bad-exit
+			     (sys:%find-structure-header
+			       (sys:frame-caller-continuation trap-on-exit-frame))))))))
+    #+imach
+    (when meter-on
+      (let* ((lcr (locf (dbg:frame-caller-control-register fp)))
+	     (caller-fp (si:%pointer-plus
+			  fp (- (ldb sys:%%cr.caller-frame-size (location-contents lcr))))))
+	(dbg:meter-on-exit caller-fp fp si:%current-stack-group 1)
+	(sys:%p-dpb 1 sys:%%cr.call-trace lcr)))
+    #+imach (setq si:inhibit-scheduling-flag t)
+    (let (#+3600 (si:inhibit-scheduling-flag 't))
+      (unless ancestor-collecting-overhead?
+	(let ((overflow (if process::*in-process-dispatcher*
+			    si::*scheduler-metering-overhead-overflow*
+			    (process-metering-overhead-overflow process::%real-current-process))))
+	  (decf overflow *function-exit-fudge-fraction*)
+	  (when (minusp overflow)
+	    (setq start-time (sys:%32-bit-difference start-time 1))
+	    (incf overflow *function-trap-fudge-denominator*))
+	  (if process::*in-process-dispatcher*
+	      (setf si:*scheduler-metering-overhead-overflow* overflow)
+	      (setf (process-metering-overhead-overflow process::%real-current-process) overflow)))
+	#+3600
+	;; this is known to compile in-line, but same problems as in entry function.
+	(let ((adjusted-start-time
+		(sys:%32-bit-difference start-time *function-exit-fudge-factor-2*)))
+	  (if process::*in-process-dispatcher*
+	      (si:incf* si:*scheduler-metering-overhead*
+			(sys:%32-bit-difference (sys:%microsecond-clock) adjusted-start-time))
+	      (si:incf* (process-metering-overhead process::%real-current-process)
+			(sys:%32-bit-difference (sys:%microsecond-clock) adjusted-start-time)))))
+      (setf *metering-overhead-accounted* ancestor-collecting-overhead?)
+      #+3600 (when meter-on (sys:%meter-on)))
+    #+3600 nil
+    #+imach (and (not ancestor-collecting-overhead?)
+		 (sys:%32-bit-difference start-time *function-exit-fudge-factor-2*))
+    ))
+

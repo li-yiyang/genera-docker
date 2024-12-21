@@ -1,0 +1,659 @@
+;;; -*- Mode: Lisp; Syntax: Zetalisp; Package: Debugger; Base: 10; -*-
+
+;;; Microcode trap dispatching
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;; Trap dispatching.
+
+(DEFVAR *TRAP-DISPATCH-TABLES*)		;Vector of dispatch tables indexed by chip revision
+(DEFVAR *TRAP-DISPATCH-TABLE*)		;Current dispatch table
+
+(DEFVAR *TRAP-ON-EXIT-MICROSTATES*)
+(DEFWIREDVAR *TRAP-ON-EXIT-MICROSTATE* NIL)	;This microstate indicates trap-on-exit.
+
+;; Called by SYSTEM-STARTUP.
+(DEFUN INITIALIZE-ERROR-TRAP-DISPATCH ()
+  (MACROLET ((REVISION () `(%READ-INTERNAL-REGISTER %REGISTER-CHIP-REVISION)))
+    (SETQ *TRAP-ON-EXIT-MICROSTATE* (AREF *TRAP-ON-EXIT-MICROSTATES* (REVISION))
+	  *TRAP-DISPATCH-TABLE* (ALOC (AREF *TRAP-DISPATCH-TABLES* (REVISION)) 0))
+    NIL))
+
+(DEF-TRAP-HANDLER ERROR-TRAP-HANDLER
+		  (%ERROR-TRAP-VECTOR TRAP-MODE-EXTRA-STACK)
+		  (TRAP-VECTOR-INDEX FAULT-PC MICROSTATE VMA)
+  (DECLARE (SYS:WIRED-FUNCTION)
+	   (SYS:SAFEGUARDED-REFERENCE HANDLE-TRAP-ON-EXIT)
+	   (SYS:UNSAFEGUARDED-REFERENCE *TRAP-DISPATCH-TABLE*
+					ERROR-TRAP-HANDLER-1
+					REPORT-CACHE-ERROR)
+	   (IGNORE TRAP-VECTOR-INDEX)
+	   (DBG:ERROR-REPORTER))
+  ;; MICROSECOND-CLOCK must be the first variable in this frame so that metering can examine it
+  (LET ((MICROSECOND-CLOCK (%MICROSECOND-CLOCK))
+	(SAVED-BAR-1 (%READ-INTERNAL-REGISTER %REGISTER-BAR-1))
+	(SAVED-BAR-2 (%READ-INTERNAL-REGISTER %REGISTER-BAR-2))
+	(SAVED-BAR-3 (%READ-INTERNAL-REGISTER %REGISTER-BAR-3))
+	(SAVED-ALUF (%READ-INTERNAL-REGISTER %REGISTER-ALU-AND-ROTATE-CONTROL))
+	(SAVED-ROTATE-LATCH (SI:%ROTATE-LATCH))
+	(TRAP-INDEX (LDB (BYTE 11. 0) MICROSTATE))
+	;; Read this ASAP to catch as many cache errors as possible.
+	(SAVED-PC-CONTENTS (SYS:%MEMORY-READ FAULT-PC :CYCLE-TYPE SYS:%MEMORY-RAW
+						      :SET-CDR-NEXT NIL))
+	(MEASURE-OVERHEAD NIL))
+    MICROSECOND-CLOCK
+    (CLI::WITH-FLOATING-POINT-STATUS-SAVED
+	(COND ((EQ *TRAP-ON-EXIT-MICROSTATE* TRAP-INDEX)
+	       (SETF VMA NIL)			;Assume invalid
+	       (SETF MEASURE-OVERHEAD (HANDLE-TRAP-ON-EXIT)))
+	      (( (LDB %%CR.TRAP-MODE (%SAVED-CONTROL-REGISTER)) TRAP-MODE-EMULATOR)
+	       (UNEXPECTED-TRAP "Error trap ~O not in emulator mode at ~S referencing ~S."
+				MICROSTATE FAULT-PC VMA))
+	      (T
+	       (LET ((TRAP-DESCRIPTOR
+		       (%MEMORY-READ (%POINTER-PLUS *TRAP-DISPATCH-TABLE* TRAP-INDEX)
+				     :FIXNUM-ONLY T))
+		     (TRAPPING-FRAME (%POINTER-PLUS (%STACK-FRAME-POINTER)
+						    (- (LDB %%CR.CALLER-FRAME-SIZE
+							    (%READ-INTERNAL-REGISTER
+							      %REGISTER-CONTROL-REGISTER))))))
+		 ;; If VMA is invalid, make it safe to keep around.
+		 (IF (NOT (LDB-TEST %%TRAP-DESC-VMA-VALID TRAP-DESCRIPTOR))
+		     (SETF VMA (%POINTER VMA))
+		   ;; Check for MacIvory "cache problem".  See BEE for details.
+		   (WHEN (OR (%POINTER-LESSP VMA (%READ-INTERNAL-REGISTER
+						   %REGISTER-STACK-CACHE-LOWER-BOUND))
+			     (%POINTER-LESSP (%POINTER-PLUS
+					       (%READ-INTERNAL-REGISTER
+						 %REGISTER-STACK-CACHE-LOWER-BOUND)
+					       255.)
+					     VMA))
+		     (LET ((SAVED-MEMORY-DATA
+			      (SYS:%MEMORY-READ VMA
+						:CYCLE-TYPE SYS:%MEMORY-RAW :SET-CDR-NEXT NIL))
+			    (SAVED-MEMORY-PHYSICAL-ADDRESS (STORAGE::%VMA-TO-PMA VMA)))
+		       (WHEN (NOT (NULL SAVED-MEMORY-PHYSICAL-ADDRESS))
+			 (LET ((SAVED-UNCACHED-DATA
+				 (SYS:%MEMORY-READ SAVED-MEMORY-PHYSICAL-ADDRESS
+						   :CYCLE-TYPE SYS:%MEMORY-RAW
+						   :SET-CDR-NEXT NIL)))
+			   (UNLESS (AND (EQ SAVED-MEMORY-DATA SAVED-UNCACHED-DATA)
+					;; Check for different cdr-codes, too.
+					(= (%TAG SAVED-MEMORY-DATA)
+					   (%TAG SAVED-UNCACHED-DATA)))
+			     (REPORT-CACHE-ERROR
+			       (%POINTER VMA)
+			       (%POINTER SAVED-MEMORY-PHYSICAL-ADDRESS)
+			       (LOCF SAVED-MEMORY-DATA)
+			       (LOCF SAVED-UNCACHED-DATA))))))))
+		 ;; Check again for MacIvory "cache problem".  See BEE for details.
+		 (LET ((SAVED-PC-PHYSICAL-ADDRESS (STORAGE:%VMA-TO-PMA FAULT-PC)))
+		   (WHEN (NOT (NULL SAVED-PC-PHYSICAL-ADDRESS))
+		     (LET ((SAVED-PC-UNCACHED-CONTENTS
+			     (SYS:%MEMORY-READ SAVED-PC-PHYSICAL-ADDRESS
+					       :CYCLE-TYPE SYS:%MEMORY-RAW :SET-CDR-NEXT NIL)))
+		       (UNLESS (AND (EQ SAVED-PC-CONTENTS SAVED-PC-UNCACHED-CONTENTS)
+				    ;; Check for different cdr-codes, too.
+				    (= (%TAG SAVED-PC-CONTENTS)
+				       (%TAG SAVED-PC-UNCACHED-CONTENTS)))
+			 (REPORT-CACHE-ERROR
+			   (%POINTER FAULT-PC)
+			   (%POINTER SAVED-PC-PHYSICAL-ADDRESS)
+			   (LOCF SAVED-PC-CONTENTS)
+			   (LOCF SAVED-PC-UNCACHED-CONTENTS))))))
+		 ;; Now call the unwired error handler.
+		 (ERROR-TRAP-HANDLER-1 FAULT-PC MICROSTATE VMA TRAP-DESCRIPTOR
+				       TRAPPING-FRAME (%STACK-FRAME-POINTER)))))
+      (SETF (SI:%ROTATE-LATCH) SAVED-ROTATE-LATCH)
+      (SETF (%READ-INTERNAL-REGISTER %REGISTER-BAR-1) SAVED-BAR-1)
+      (SETF (%READ-INTERNAL-REGISTER %REGISTER-BAR-2) SAVED-BAR-2)
+      (SETF (%READ-INTERNAL-REGISTER %REGISTER-BAR-3) SAVED-BAR-3)
+      (SETF (%READ-INTERNAL-REGISTER %REGISTER-ALU-AND-ROTATE-CONTROL) SAVED-ALUF))
+    (WHEN (NOT (NULL MEASURE-OVERHEAD))
+      ;; this is known to compile in-line, but same problems as in entry function.
+      (SI:INCF* PROCESS::*CURRENT-PROCESS-METERING-OVERHEAD*
+		(SYS:%32-BIT-DIFFERENCE (SYS:%MICROSECOND-CLOCK) MEASURE-OVERHEAD)))
+    (%RETURN-KLUDGE 0)))
+
+(DEFUN REPORT-CACHE-ERROR (VMA PMA CACHE-DATA-LOC UNCACHED-DATA-LOC)
+  (DECLARE (DBG:ERROR-REPORTER))
+  (SI:%REVERT-TO-EMULATOR-MODE)
+  (WIRED-FERROR :PROCEEDABLE-HALT
+		"Cache error: ~14TVirtual Address= ~\SI:ADDRESS\~@
+			      ~14TPhysical Address=~\SI:ADDRESS\~@
+			      ~14TCache Data=   ~\DBG:INDIRECT-I-WORD\~@
+			      ~14TUncached Data=~\DBG:INDIRECT-I-WORD\~@
+			      ~14TPlease report this bug."
+		VMA PMA CACHE-DATA-LOC UNCACHED-DATA-LOC))
+
+(DEFUN ERROR-TRAP-HANDLER-1-COLD
+       (FAULT-PC MICROSTATE VMA TRAP-DESCRIPTOR TRAPPING-FRAME TRAP-FRAME)
+  (IGNORE TRAP-DESCRIPTOR TRAPPING-FRAME TRAP-FRAME)
+  (LET* ((OLD-INHIBIT-CONSING-FLAG SI:*INHIBIT-CONSING-FLAG*)
+	 (SG %CURRENT-STACK-GROUP)
+	 (LEVEL (SG-ERROR-TRAP-LEVEL SG)))
+    (COMPILER:%ERROR-WHEN (> LEVEL 20.)
+      (WIRED-FERROR :PROCEEDABLE-HALT "Too many recursive errors"))
+    (UNWIND-PROTECT
+	(PROGN
+	  ;; The recursion level cannot be kept using dynamic binding
+	  ;; due to BINDING-STACK-OVERFLOW.
+	  (SETF (SG-ERROR-TRAP-LEVEL SG) (1+ LEVEL))
+	  (SI:%REVERT-TO-EMULATOR-MODE)
+	  (CATCH '%RETURN-FROM-TRAP
+	    ;; Unconditionally allow consing here since otherwise we'll just
+	    ;; blow out recursively in one of the allocate escapes.
+	    (SETQ SI:*INHIBIT-CONSING-FLAG* NIL)
+	    (FERROR "Error trap ~O at ~S~@[ referencing ~S~]."
+		    MICROSTATE FAULT-PC (AND (LOCATIVEP VMA) VMA))))
+      (COMPILER:%ERROR-WHEN OLD-INHIBIT-CONSING-FLAG
+	(SETQ SI:*INHIBIT-CONSING-FLAG* OLD-INHIBIT-CONSING-FLAG)
+	(SI:CLEAR-CONS-CACHES))
+      (SETF (SG-ERROR-TRAP-LEVEL SG) LEVEL))))
+
+(DEFUN HANDLE-TRAP-ON-EXIT ()
+  (DECLARE (SAFEGUARDED-FUNCTION) (ERROR-REPORTER))
+  (LET* ((TRAP-FRAME
+	   (%POINTER-PLUS (%STACK-FRAME-POINTER)
+			  (- (LDB %%CR.CALLER-FRAME-SIZE
+				  (%READ-INTERNAL-REGISTER %REGISTER-CONTROL-REGISTER)))))
+	 (TRAPPING-FRAME
+	   (%POINTER-PLUS TRAP-FRAME
+			  (- (LDB %%CR.CALLER-FRAME-SIZE (%SAVED-CONTROL-REGISTER)))))
+	 (REAL-TRAP T))
+    (LET* ((SG %CURRENT-STACK-GROUP)
+	   (WIRED-LOW (SG-WIRED-CONTROL-STACK-LOW SG)))
+      (WHEN (EQ (%POINTER-PLUS WIRED-LOW (LDB SG-WIRED-FRAME-OFFSET
+					      (SG-WIRED-FRAME-DESCRIPTOR SG)))
+		TRAPPING-FRAME)
+	(STORAGE::SG-RETURN-FROM-LOW-WIRED-FRAME SG WIRED-LOW)
+	(WHEN (ZEROP (%P-LDB %%CR.TRAP-ON-EXIT-BIT
+			     (LOCF (FRAME-CALLER-CONTROL-REGISTER TRAP-FRAME))))
+	  (SETF REAL-TRAP NIL))))
+    (WHEN REAL-TRAP				; Up til here, real-trap means "take a
+						; non-stack-wiring trap on exit trap".
+						; After here, it means "A real-trap happened,
+						; record the overhead. 
+      (SETF REAL-TRAP NIL)			; Initialize it to NIL until told otherwise
+      #+IGNORE
+      ;; This error check goes off spuriously in an number of cases.
+      ;; For example (sys:%p-ldb 1 1) m-P Abort.
+      ;; Greenwald has an example of the other test failing.
+      ;; So comment it out for now, since continuing always seems to work.
+      (UNLESS (OR (= (LDB %%CR.TRAP-MODE (FRAME-CALLER-CONTROL-REGISTER TRAPPING-FRAME))
+		     TRAP-MODE-EMULATOR)
+		  (= (LDB %%CR.TRAP-MODE (FRAME-CALLER-CONTROL-REGISTER TRAP-FRAME))
+		     TRAP-MODE-EMULATOR))
+	(UNEXPECTED-TRAP "Trap on frame exit while not in emulator mode."))
+      (LET ((OLD-INHIBIT-SCHEDULING-FLAG INHIBIT-SCHEDULING-FLAG))
+	(UNWIND-PROTECT
+	    (PROGN
+	      (SETF INHIBIT-SCHEDULING-FLAG T)
+	      (SI:%REVERT-TO-EMULATOR-MODE)
+	      ;; if we didn't return then either metering is enabled, or
+	      ;; one of the other clients of the trap-on-exit bit is
+	      ;; enabled.  We call metering and eat the cost of a
+	      ;; function call.  There's a high probability that this
+	      ;; isn't a wasted call.
+	      ;; This must return with scheduling inhibited.
+	      (SETF REAL-TRAP (DBG:METER-FUNCTION-EXIT OLD-INHIBIT-SCHEDULING-FLAG)))
+	  ;; this has to be in extra-stack-mode before we clear the inhibit-scheduling-flag,
+	  ;; so that we don't get preempted until the trace bits are restored in the control
+	  ;; register (the function that trapped to error-trap-handler).  This allows metering
+	  ;; to know about the process switch.
+	  (SI:%SET-TRAP-MODE SI:TRAP-MODE-EXTRA-STACK)
+	  ;; Turn off the trap-on-exit bit
+	  (STORAGE::SET-TRAP-ON-EXIT-FLAG TRAPPING-FRAME TRAP-FRAME %CURRENT-STACK-GROUP 0)
+	  (SETF INHIBIT-SCHEDULING-FLAG OLD-INHIBIT-SCHEDULING-FLAG)
+	  (UNLESS INHIBIT-SCHEDULING-FLAG 	
+	    (SI:%CHECK-PREEMPT-PENDING)))))
+    REAL-TRAP))
+
+
+
+;; Miscellaneous traps which have to be in the cold load.
+
+(defconstant si:%vsbc-configuration-register-address
+	     (%logdpb %vma-equals-pma %%vma-equals-pma 1_24.))
+
+;; Always called in extra-stack or interrupt mode
+(defwiredfun unexpected-trap (&rest args)
+  (cl:apply #'wired-ferror :proceedable-halt args)
+  nil)
+
+;; This trap handler is used for all trap vectors that are not filled in explicitly.
+(def-trap-handler unexpected-trap-handler
+		  (t trap-mode-emulator)
+		  (trap-vector-index fault-pc &rest args)
+  (declare (sys:wired-function))
+  (si:saving-registers-for-effect (%register-bar-1 %register-alu-and-rotate-control)
+    (cl:loop
+      (unexpected-trap "Unexpected trap through ~O at ~S:~{ ~S~}"
+		       trap-vector-index fault-pc args))))
+
+(def-trap-handler uncorrectable-memory-error-trap-handler
+		  (%uncorrectable-memory-error-trap-vector trap-mode-emulator)
+  (trap-vector-index fault-pc address)
+  (declare (sys:wired-function) (ignore trap-vector-index))
+  (si:saving-registers-for-trap-for-effect
+    (let ((ecc-log-address (%read-internal-register %register-ecc-log-address))
+	  (ecc-log (%read-internal-register %register-ecc-log))
+	  (old-control (%read-internal-register %register-memory-control))
+	  (physical-address (if (typep address :physical-address)
+				address
+				(storage::%vma-to-pma address))))
+      (unwind-protect
+	  (progn
+	    ;; Turn off ecc checking --- we'd like to just turn it off
+	    ;; while we examine the offending location, but this
+	    ;; doesn't seem to work reliably (handler recurses)
+	    (%write-internal-register (dpb 0 %%MEMORY-CONTROL-ECC-ENABLE old-control)
+				      %register-memory-control)
+	    (let ((reread (%memory-read address :cycle-type %memory-raw :set-cdr-next nil))
+		  (ureread
+		    (and physical-address
+			 (system-case
+			   (MacIvory-1&2
+			     ;; physical not cached on 1&2
+			     (%memory-read physical-address
+					   :cycle-type %memory-raw :set-cdr-next nil))
+			   (Merlin-II
+			     ;; --- with-merlin-II-cache-disabled
+			     (unwind-protect
+				 (progn
+				   (setf (merlin-ii-cache-control-register)
+					 (sys:%logdpbs %merlin-ii-cache-mode-disabled
+						       merlin-ii-cache-control.mode
+						       (merlin-ii-cache-control-register)))
+				   (merlin-ii-cache-control-register)	;complete
+				   (%memory-read physical-address
+						 :cycle-type %memory-raw :set-cdr-next nil))
+			       (setf (merlin-ii-cache-control-register)
+				     (sys:%logdpbs %merlin-ii-cache-mode-enabled
+						   merlin-ii-cache-control.mode
+						   (merlin-ii-cache-control-register)))
+			       (merlin-ii-cache-control-register)	;complete
+			       ))
+			   (MacIvory-3
+			     ;; --- with-MacIvory-cache-disabled
+			     (unwind-protect
+				 (progn
+				   (write-MacIvory-register #x1 0)	;Disable the cache
+				   (compiler:no-op)
+				   (compiler:no-op)
+				   (%memory-read physical-address
+						 :cycle-type %memory-raw :set-cdr-next nil))
+			       (write-MacIvory-register #xA 0)	;Assert Cache Flush
+			       (compiler:no-op)
+			       (compiler:no-op)
+			       (write-MacIvory-register #xB 0)	;Clear Cache Flush
+			       (compiler:no-op)
+			       (compiler:no-op)
+			       (write-MacIvory-register #x0 0)	;Enable the cache
+			       (compiler:no-op)
+			       (compiler:no-op)))
+			   (Domino
+			     ;; --- with-Domino-cache-disabled
+			     (let ((old-cache-state (%p-ldb cli::%%domino-cache-enable
+							    cli::%domino-reset-register)))
+			       (unwind-protect
+				   (progn
+				     (%p-dpb 1 cli::%%domino-cache-enable
+					     cli::%domino-reset-register)
+				     (%memory-read physical-address
+						 :cycle-type %memory-raw :set-cdr-next nil))
+				 (%p-dpb old-cache-state cli::%%domino-cache-enable
+					 cli::%domino-reset-register))))
+			   ((Merlin-I Zora VLM) nil)))))
+	      (unexpected-trap "Uncorrectable memory at ~O in location ~O~@[ (~O physical)~]:
+ECC-LOG-ADDRESS: ~\SI:ADDRESS\; ECC-LOG: ~\SI:ADDRESS\;
+Uncorrected data: ~4,'0O~10,'0O~:[
+Uncached data:    ~4,'0O~10,'0O~]"
+			       fault-pc address physical-address
+			       ecc-log-address ecc-log
+			       (dpb (%tag reread) (byte 8 2)
+				    (%logldb (byte 2 30.) (%pointer reread)))
+			       (%logldb (byte 30. 0) (%pointer reread))
+			       (null physical-address)
+			       (dpb (%tag ureread) (byte 8 2)
+				    (%logldb (byte 2 30.) (%pointer ureread)))
+			       (%logldb (byte 30. 0) (%pointer ureread)))))
+	;; Turn back on ECC checking
+	(%write-internal-register old-control %register-memory-control))
+      ;; record it in the log if the user proceeds
+      (storage::log-memory-ecc ecc-log ecc-log-address)))
+  ;; If the user proceeds, we assume he has bashed the location in the
+  ;; FEP (either to some random value or to the uncorrected value
+  ;; reported above and just retry
+  (%return-kludge 0))
+
+#-VLM
+(defwiredfun get-vme-address-from-physical-address (address)
+  (let ((real-address address)
+	(state sys:*bus-mode*))			D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");State from the stack frame
+0    (setq state (if (type-member state sys:dtp-small-ratio)
+		    (%set-tag state sys:dtp-fixnum)
+		    nil))
+    (setq real-address (%logldb (byte 31 0) (%set-tag address sys:dtp-fixnum)))
+    (system-case
+      (merlin-i    
+	(cond (( #o1776000000 real-address #o1776000011)	;VME Register space
+1	       ;; We probably lost reading a polled address, return the contents of the
+	       ;; Polled Access Address VME Read Request Register
+0	       (cli::merlin-i-vme-polled-read-request-register))
+	      ((= (ldb (byte 9 19) real-address) #b111111110)	1;Slave Buffer Space
+	       ;; Return the address used to create this address paying attention to AMOD
+0	       (lsh (if state
+1			;; Check the AMOD to determine if this is an extended or standard
+			;; address
+0			(%logdpb real-address  (byte 15 0)
+				 (if ( (ldb cli::%%merlin-vme-option-address-modifier state)
+					#x39)	1;Extended Addressing?
+0				     #x40000000 0))
+1			;; No State?  Punt and return the address
+0			real-address) 2))
+	      (t				1;Must be direct access space
+0	       (lsh 
+		 (if state
+		     (%logdpbs 0 (byte 2 30)
+			       (ldb cli::%%merlin-vme-option-window state) (byte 2 28)
+			       real-address)
+1		     ;; Again, if no state, punt.  Somebody is confused
+0		     real-address) 2))))
+      (merlin-ii
+	(if (ldb-test (byte 1 30) real-address)	1;Direct Space
+0	    (lsh (if state
+		     (%logdpbs 0 (byte 2 30)
+			       (ldb cli::%%merlin-vme-option-window state) (byte 2 28)
+			       real-address)
+1		     ;; Again, if no state, punt.  Somebody is confused
+0		     real-address) 2)
+	    1;; Otherwise punt because polled access handles its own errors
+0	    (lsh real-address 2)))	      
+      (otherwise nil))))
+
+(def-trap-handler memory-bus-error-trap-handler
+		  (%memory-bus-error-trap-vector trap-mode-emulator)
+		  (trap-vector-index fault-pc address)
+  (declare (sys:wired-function) (ignore trap-vector-index)
+	   (safeguarded-reference si:stack-overflow-trap-handler)
+	   (unsafeguarded-reference cli::vmebus-error-handler))
+  (si:saving-registers-for-trap-for-effect
+    ;; If this is a VMEbus error, we should signal it as such.
+    (system-case
+      (merlin-I
+	;; All VME addresses have a 1 in <31>
+	(if (and (si:%pointer- address (%make-physical-address #o20000000000))
+		 ;; Check the bus error bit in the VME Interrupt Handler Register
+		 (not (zerop (cli::merlin-i-vme-interrupt-handler.bus-error))))
+	    (progn
+	      ;; Clear the error and reset the error mode send an appropriate message
+	      (cli::clear-merlin-i-VMEbus-error)
+	      ;; Try to signal a real error if we can
+	      (if ( (ldb %%cr.trap-mode (%saved-control-register)) trap-mode-emulator)
+		  (wired-ferror
+		    :proceedable-halt
+		    "VMEBus error reading #o~\SI:ADDRESS\ (error might have been on the ~
+                       previous write).  Continue to Proceed"
+		    (get-vme-address-from-physical-address address))
+		  (si:%revert-to-emulator-mode)
+		  (cli::VMEbus-error-handler
+		    (get-vme-address-from-physical-address address))))
+	    (unexpected-trap "Memory bus error at ~S in location ~S." fault-pc address)
+	    ))
+      (merlin-ii
+	1;; Only trap direct access errors
+0	(let ((error-code (cli::vic-bus-error-status.error-bits)))
+	  (if (and (si:%pointer- address (%make-physical-address 3_30))
+		   (not (zerop error-code)))
+	      (progn
+		1;; Clear the error
+0		(setf (cli::vic-bus-error-status.error-bits) 0)
+		1;; Try to signal a real error
+0		(if ( (ldb %%cr.trap-mode (%saved-control-register)) trap-mode-emulator)
+		    (wired-ferror
+		      :proceedable-halt
+		      "VMEBus error reading #o~\SI:ADDRESS\ (error might have been on the ~
+                       previous write).  Continue to Proceed"
+		      (get-vme-address-from-physical-address address))
+		    (si:%revert-to-emulator-mode)
+		    (cli::VMEbus-error-handler
+		      (get-vme-address-from-physical-address address) error-code)))
+	      (unexpected-trap "Memory bus error at ~S in location ~S." fault-pc address))))
+		
+;	(zora
+;	  (if (si:%pointer- address (%make-physical-address #o20000000000))
+;	      (progn
+;		(if ( (ldb %%cr.trap-mode (%saved-control-register)) trap-mode-emulator)
+;		    (wired-ferror :proceedable-halt
+;				  "Multibus II error reading #o~\SI:ADDRESS\ (error might have been on the previous write).  Continue to Proceed"
+;				  (get-vme-address-from-physical-address address))
+;		    (si:%revert-to-emulator-mode)
+;		    (cli::mbii-error-handler
+;		      (get-mbii-address-from-physical-address address))))
+;	      (unexpected-trap "Memory bus error at ~S in location ~S." fault-pc address)
+;	      ))
+      (otherwise
+	(unexpected-trap "Memory bus error at ~S in location ~S." fault-pc address))))
+  (%return-kludge 0))
+
+(def-trap-handler db-cache-miss-trap-handler
+		  (%db-cache-miss-trap-vector trap-mode-emulator)
+		  (trap-vector-index fault-pc address)
+  (declare (sys:wired-function) (ignore trap-vector-index))
+  (si:saving-registers-for-trap-for-effect
+    (unexpected-trap "Deep binding cache miss at ~S in location ~S." fault-pc address))
+  (%return-kludge 0))
+
+(def-trap-handler db-unwind-frame-trap-handler
+		  (%db-unwind-frame-trap-vector trap-mode-emulator)
+		  (trap-vector-index fault-pc address)
+  (declare (sys:wired-function) (ignore trap-vector-index))
+  (si:saving-registers-for-trap-for-effect
+    (unexpected-trap "Deep binding unwind-frame at ~S in location ~S." fault-pc address))
+  (%return-kludge 0))
+
+(defun breakpoint-p (fault-pc)
+  (declare (dbg:error-reporter))
+  (multiple-value-bind (function relative-pc)
+      (si:decode-pc fault-pc)
+    (any-breakpoint-in-function function relative-pc)))
+
+(def-trap-handler db-unwind-catch-trap-handler
+		  (%db-unwind-catch-trap-vector trap-mode-emulator)
+		  (trap-vector-index fault-pc address)
+  (declare (sys:wired-function) (ignore trap-vector-index))
+  (si:saving-registers-for-trap-for-effect
+    (unexpected-trap "Deep binding unwind-catch at ~S in location ~S." fault-pc address))
+  (%return-kludge 0))
+
+(defun instruction-trace-handler (stack-frame-pointer)
+  (declare (dbg:error-reporter))
+  (condition-bind ((single-step 'generic-breakpoint-handler))
+    (signal 'single-step :frame stack-frame-pointer)))
+
+(si:def-trap-handler trace-trap-handler
+		     (si:%trace-trap-vector si:trap-mode-extra-stack)
+		     (trap-vector-index fault-pc)
+  (declare (si:wired-function)
+	   (safeguarded-reference meter-function-entry si:stack-overflow-trap-handler)
+	   (unsafeguarded-reference instruction-trace-handler)
+	   (unsafeguarded-reference breakpoint-p)
+	   (ignore trap-vector-index))
+  (let* ((start-time (sys:%microsecond-clock))
+	 (control-reg-loc (cli::%saved-control-register-address))
+	 (measure-overhead nil))
+    (si:%p-dpb 0 sys:%%cr.trace-pending control-reg-loc)
+    (si:saving-registers-for-trap-for-effect
+      (cond ((= (%p-ldb %%cr.trap-mode control-reg-loc) trap-mode-emulator)
+	     (let ((old-inhibit-scheduling-flag si:inhibit-scheduling-flag))
+	       (unwind-protect
+		   (progn
+		     (setq si:inhibit-scheduling-flag t)
+		     (cond ((= (si:%p-ldb sys:%%cr.call-trace control-reg-loc) 1)
+			    (si:%p-dpb 0 sys:%%cr.call-trace control-reg-loc)
+			    (si:%revert-to-emulator-mode)
+			    ;; This must return with scheduling inhibited.
+			    (setq measure-overhead
+				  (dbg:meter-function-entry
+				    old-inhibit-scheduling-flag start-time)))
+			   ((= (si:%p-ldb sys:%%cr.instruction-trace control-reg-loc) 1)
+			    (si:%set-trap-mode si:trap-mode-extra-stack)
+			    (setq si:inhibit-scheduling-flag old-inhibit-scheduling-flag)
+			    (si:%p-dpb 0 sys:%%cr.instruction-trace control-reg-loc)
+			    (si:%revert-to-emulator-mode)
+			    ;; if processing call - look down stack for saved control reg
+			    ;; and ensure trace instruction is turned off
+			    (when
+			      (= (si:%p-ldb sys:%%cr.call-started control-reg-loc) 1)
+			      (loop for stack-ptr first (%pointer-plus control-reg-loc -2)
+						  then prev-stack-ptr
+				    for prev-stack-ptr
+					first (%pointer-plus control-reg-loc -3)
+					then (%pointer-plus prev-stack-ptr -1)
+				    until (and (eql (%p-ldb %%q-tag stack-ptr)
+						    (dpb 3 %%q-cdr-code-within-tag
+							 dtp-fixnum))
+					       (eql (%p-ldb (byte 7 33.) prev-stack-ptr)
+						    (ldb (byte 7 1)
+							 (dpb 3 %%q-cdr-code-within-tag
+							      dtp-even-pc))))
+				    finally
+				      (si:%p-dpb 0 sys:%%cr.trace-pending stack-ptr)
+				      (si:%p-dpb 0 sys:%%cr.instruction-trace stack-ptr)))
+			    (unless (breakpoint-p fault-pc)
+			      (instruction-trace-handler (%stack-frame-pointer))))))
+		 ;; this has to be in extra-stack-mode before we clear the
+		 ;; inhibit-scheduling-flag, so that we don't get preempted
+		 ;; until the trace bits are restored in the control register
+		 ;; (the function that trapped to trace-trap-handler).  This
+		 ;; allows metering to know about the process switch.
+		 (si:%set-trap-mode si:trap-mode-extra-stack)
+		 (setq si:inhibit-scheduling-flag old-inhibit-scheduling-flag)
+		 (unless si:inhibit-scheduling-flag
+		   (si:%check-preempt-pending)))))
+	    ;; if caller of trap frame was in emulator mode, then the trap is legal, but
+	    ;; metering has to be a no-op.
+	    ((= (%p-ldb %%cr.trap-mode
+			(locf (frame-caller-control-register
+				(%pointer-plus (%pointer-plus (%stack-frame-pointer)
+							      (- (ldb %%cr.caller-frame-size
+								      (%read-internal-register %register-control-register))))
+					       (- (ldb %%cr.caller-frame-size (%saved-control-register)))))))
+		trap-mode-emulator)
+	     (si:%p-dpb 0 sys:%%cr.call-trace control-reg-loc))
+	    (t (unexpected-trap "Trace trap while not in emulator mode."))))
+    ;; measure overhead is the adjusted start time, so that if meter-function-entry wants
+    ;; to stop counting overhead for some period of time (like trap-on-call), it can.
+    (when measure-overhead
+      (si:incf* process::*current-process-metering-overhead*
+		(sys:%32-bit-difference (sys:%microsecond-clock) measure-overhead))))
+  (sys:%return-kludge 0))
+
+(DEFUN ASSEMBLE-HELPER-FUNCTION
+       (CODE &OPTIONAL (EXTRA-INFO '(#:DEBUGGER-HELPER-FUNCTION (DBG:ERROR-REPORTER))))
+  (MULTIPLE-VALUE-BIND (IGNORE FUNCTION)
+      (MAKE-COMPILED-CODE (+ (LENGTH CODE) (DEFSTORAGE-SIZE COMPILED-FUNCTION) 2) 1
+			  WORKING-STORAGE-AREA)
+    (WITH-BLOCK-REGISTERS (2)
+      (SETF (%BLOCK-REGISTER 2) FUNCTION)
+      ;; Write an entry instruction so as not to confuse too many tools.
+      (%BLOCK-WRITE 2
+	(%SET-TAG (DPBS 2 %%Q-ODD-INSTRUCTION-WITHIN-POINTER
+			ILC:*ENTRY-REST-NOT-ACCEPTED-OPCODE* %%PACKED-INSTRUCTION-OPCODE
+			2)
+		  (DPBS SEQUENCING-PC-EVEN+2-ODD+3 %%Q-CDR-CODE-WITHIN-TAG
+			DTP-PACKED-INSTRUCTION-60)))
+      (LOOP FOR OBJECT IN CODE DO
+	(COND ((ATOM OBJECT)
+	       (%BLOCK-WRITE 2
+		 (%SET-TAG OBJECT
+		   (DPB SEQUENCING-PC-EVEN+2-ODD+3 %%Q-CDR-CODE-WITHIN-TAG
+			(%TAG OBJECT)))))
+	      ((EQ (FIRST OBJECT) 'PUSH-CONSTANT)
+	       (%BLOCK-WRITE 2
+		 (%SET-TAG (SECOND OBJECT)
+		   (DPB SEQUENCING-PC-EVEN+2-ODD+3 %%Q-CDR-CODE-WITHIN-TAG
+			(%TAG (SECOND OBJECT))))))
+	      ((MEMQ (FIRST OBJECT) *DATA-TYPES*)
+	       (%BLOCK-WRITE 2
+		 (%SET-TAG (SECOND OBJECT)
+			   (DPB SEQUENCING-PC-EVEN+2-ODD+3 %%Q-CDR-CODE-WITHIN-TAG
+				(SYMEVAL (FIRST OBJECT))))))
+	      (T (DESTRUCTURING-BIND (OPCODE OPERAND) OBJECT
+		   (MULTIPLE-VALUE-BIND (ADDRESSING-MODE OFFSET)
+		       (IF (ATOM OPERAND)
+			   (VALUES STACK-ADDRESSING-MODE-IMMEDIATE OPERAND)
+			   (CL:ECASE (CAR OPERAND)
+			     (FP (VALUES STACK-ADDRESSING-MODE-FRAME-POINTER (CADR OPERAND)))
+			     (LP (VALUES STACK-ADDRESSING-MODE-LOCAL-POINTER (CADR OPERAND)))
+			     (SP (VALUES STACK-ADDRESSING-MODE-STACK-POINTER
+					 (IF (EQ (CADR OPERAND) 'POP) 0
+					     (- 255. (CADR OPERAND)))))
+			     (:10-BIT-IMMEDIATE (VALUES NIL (CADR OPERAND)))))
+		     (LET ((OPCODE (I-LISP-COMPILER:OPCODE-FOR-INSTRUCTION OPCODE)))
+		       (%BLOCK-WRITE 2
+			 (%SET-TAG
+			   (IF ADDRESSING-MODE
+			       (DPBS OPCODE %%PACKED-INSTRUCTION-OPCODE
+				     ADDRESSING-MODE %%PACKED-INSTRUCTION-ADDRESSING-MODE
+				     OFFSET %%PACKED-INSTRUCTION-8-BIT-OPERAND 0)
+			       (DPBS OPCODE %%PACKED-INSTRUCTION-OPCODE
+				     OFFSET %%PACKED-INSTRUCTION-10-BIT-OPERAND 0))
+			   (DPBS SEQUENCING-PC-EVEN+2-ODD+3 %%Q-CDR-CODE-WITHIN-TAG
+				 DTP-PACKED-INSTRUCTION-60)))))))))
+	;; Write the sequencing fence
+	(%BLOCK-WRITE 2
+	  (%SET-TAG EXTRA-INFO
+		    (DPBS SEQUENCING-FENCE %%Q-CDR-CODE-WITHIN-TAG DTP-LIST)))
+	(%SET-TAG (%POINTER-PLUS FUNCTION 1) DTP-EVEN-PC))))

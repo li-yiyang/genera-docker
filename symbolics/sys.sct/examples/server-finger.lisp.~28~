@@ -1,0 +1,637 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: NETWORK-INTERNALS; Base: 10; Lowercase: Yes; Patch-File: Yes -*-
+;;;> EXAMPLES-MESSAGE
+;;;>
+;;;>******************************************************************************************
+;;;>
+;;;>       Symbolics hereby grants permission to customer to incorporate
+;;;>       the examples in this file in any work belonging to customer.
+;;;>
+;;;>******************************************************************************************
+
+
+
+;;; The NAME server on a machine running this shows users on all machines at its site
+;;; Written by Chris Lindblad at MIT-AI
+;;; Slightly fixed up by David Moon at SCRC
+;;; Further fixed up by Lindblad, versions merged by Moon 7/3/85
+;;; Fixed up a bit more, last seen table added, busy machine display added, Lindblad 4/2/86
+;;; Rel-7 by Margulies @ SCRC 5 May 86 - Merged in by CJL 5/19/86
+;;; Added stuff to maintain an on-disk copy of the last seen hash table
+;;;   so that the last-seen info is retained across reboots. - CJL 7/11/86
+;;; Merged bug fix from SCRC version. -Crawley 9/11/87
+;;; Changed wording of "Finger .All..." to "Try .All" -Crawley 9/15/87
+;;; Fixed so surnames will work and return the right info for current location and last-seen.
+;;;  -Crawley 9/17/87.
+;;; Updated by DLA so that the output isn't truncated to 80 columns, as a user option.
+;;; Reduced the default width to 116 from 132, increased the update-interval to 10 minutes
+;;; and added "Zippy" to the list of "free-machine-user" names. -Crawley 10/3/87.
+;;; Made server-finger-just-enough smarter about strings with leading and/or trailing
+;;;   whitespace, and more parse-idle-time more robust -CJL 10-19-89
+
+(defvar *finger-lispm-cache* ())
+(defvar *finger-free-lispm-cache* ())
+(defvar *finger-host-cache*
+	(cl:make-hash-table :size 1000 :test 'eq))
+(defvar *server-finger-last-seen-htable*
+	(cl:make-hash-table :size 1000. :test 'string-equal))
+(defvar *server-finger-last-seen-database-file-last-update-time* 0)
+(defvar *scan-hosts-for-finger-cache-name* "Scan hosts for finger cache")
+(defvar *update-finger-cache-name* "Update finger cache")
+
+(defconst *server-finger-busy-idle-limit* (* 60. 60.))	;1 hour
+(defconst *update-finger-cache-background-interval* (* 10. 60.))	;10 minutes
+(defconst *server-finger-last-seen-database-pathname*
+	  "local:>File-Server>Server-Finger>Server-Finger-Last-Seen-Database.bin")
+(defconst *server-finger-last-seen-database-file-update-interval*
+	  (* 6. 60. 60.))	;6 hours
+(defconst *usernames-which-really-mean-the-machine-is-free*
+	  '("Lisp-Machine" "CM-Hardware-Test" "Mail-Server" "ID-WORLD" "Zippy"))
+
+;; This variable controls the output width of the finger server, and may be any value
+;; from 80 to 132.  It may be useful to reduce this to 80 if clients have 80-column displays.
+(defconst *finger-output-column-width* 116.)	D,#TD1PsT[Begin using 006 escapes](1 0 (NIL 0) (NIL :ITALIC NIL) "CPTFONTI");132 is a bit too high.
+
+0(defun server-finger-excluded-namespaces ()
+  (let ((str (send neti:*local-site* :user-get :server-finger-excluded-namespaces)))
+    (if str
+	(let ((cl:*package* (pkg-find-package "KEYWORD"))
+	      (cl:*read-base* 10.))
+	  (cl:read-from-string str))
+	(mapcar #'string (cdr *namespace-search-list*)))))
+
+(defun server-finger-namespaces ()
+  (cl:remove-if
+    #'(lambda (namespace)
+	(cl:member namespace (server-finger-excluded-namespaces) :test #'string-equal))
+    *namespace-search-list*))
+
+(defconstant *server-finger-unix-base-universal-time*
+	     #.(time:encode-universal-time 0 0 0 1 1 1970 0))
+
+;;; This is specially crafted to use old data as much as possible, and not to
+;;; put newly consed data in the hash table unless we have to. That way the
+;;; ephemeral gc reclaims the maximim amount of stuff. We even store times in
+;;; the unix style, so they are fixnums, not bignums.
+(defun add-to-last-seen-database (host user)
+  (let* ((24hours (* 24. 60. 60.))
+	 (time (- (time:get-universal-time) *server-finger-unix-base-universal-time*))
+	 (user-name (string user))
+	 (host-name (string host))
+	 (original-alist (cl:gethash user-name *server-finger-last-seen-htable*))
+	 (alist original-alist)
+	 (host-pair (cl:assoc host-name alist :test #'string-equal)))
+    (if (null host-pair)
+	(setf alist (nconc alist (ncons (cons host-name time))))
+	(setf (cdr host-pair) time))
+    (setf alist
+	  (cl:delete-if #'(lambda (elmt-time) (> (- time elmt-time) 24hours))
+			alist :key #'cdr))
+    (unless (eq alist original-alist)
+      (cl:setf (cl:gethash user-name *server-finger-last-seen-htable*) alist))))
+
+(defun last-seen-info-for-user (username)
+  (loop for (hostname . time) in (cl:gethash username *server-finger-last-seen-htable*)
+	;; convert the times back to universal times from unix style fixnum
+	;; times 
+	collect (cons hostname (+ time *server-finger-unix-base-universal-time*))))
+
+(defmacro with-timeout ((time) &body body)
+  `(condition-case (cond)
+	(let ((.timeout-cell. (ncons sys:current-process))
+	      (.timeout-process. nil)
+	      (.timeout. ,time)
+	      (.start-time. (time:time)))
+	  (unwind-protect
+	      (progn 
+		(setq .timeout-process. (sys:make-process "Timeout" :simple-p t))
+		(send .timeout-process. :preset
+		      #'(lambda (timeout-cell)
+			  (when (car timeout-cell)
+			    (process-run-function "Abort"
+			      #'sys:process-abort
+			      (car timeout-cell)
+			      :query nil
+			      :time-out (* 60. 60.)))
+			  (process-kill sys:current-process :force))
+		      .timeout-cell.)
+		(sys:set-process-wait
+		  .timeout-process.
+		  #'(lambda (timeout-cell interval start-time)
+		      (or (null (car timeout-cell))
+			  (time:time-elapsed-p interval start-time)))
+		  (list .timeout-cell. .timeout. .start-time.))
+		(sys:process-enable .timeout-process.)
+		,@body)
+	    (setf (car .timeout-cell.) nil)))
+      (sys:abort nil)))
+
+(defun process-path-for-finger-cache (path buffer)
+  (setf (fill-pointer buffer) 0)
+  (condition-case (err)
+       (with-output-to-string (standard-output buffer)
+	 (neti:invoke-service-access-path path nil))
+     (network-error (setf (fill-pointer buffer) 0)))
+  (with-input-from-string (stream buffer)
+    (loop with host = (service-access-path-host path)
+	  for (line eofp) = (multiple-value-list (send stream :line-in))
+	  unless (or (< (string-length line) 8)	;SPEECH lossage
+		     (string-equal line "No " 0 0 3)	;"No one logged in."
+		     (string-equal line "Login " 0 0 6)	;UNIX header
+		     (string-equal line " User " 0 0 6)	;
+		     (string-equal line "User " 0 0 5)	;VMS
+		     (string-equal line "-User-" 0 0 6)	;ITS & TWENEX
+		     (string-equal line "--User--" 0 0 8)	;Multics
+		     (string-equal line "  " 0 0 2)
+		     (string-equal line "Name " 0 0 5)
+		     (string-equal line "*" 0 0 1))	;Athena lossage
+	    collect (string-append line) into lines
+	    and do (let ((blankpos (string-search-char #\space line)))
+		     (unless (or (null blankpos) (zerop blankpos))
+		       (add-to-last-seen-database host (substring line 0 blankpos))))
+	  until eofp
+	  finally (if lines
+		      (setf (cl:gethash host *finger-host-cache*) lines)
+		      (remhash host *finger-host-cache*)))))
+
+(defun server-finger-show-users-paths (namespace)
+  (let ((*namespace* namespace))
+    (with-stack-list (*namespace-search-list* namespace)
+      (cl:delete-if
+	#'(lambda (host)
+	    (ignore-errors (neti:find-path-to-service-on-host :lispm-finger host)))
+	(neti:find-paths-to-service :show-users)
+	:key #'service-access-path-host))))
+
+(defun scan-hosts-for-finger-cache ()
+  (setf (si:process-priority si:*current-process*) -1)
+  (loop with buffer = (cl:make-array 8192. :element-type 'cl:string-char :fill-pointer 0)
+	for namespace in (server-finger-namespaces)
+	do (loop for path in (server-finger-show-users-paths namespace)
+		 do (process-path-for-finger-cache path buffer))))
+
+(defun *scan-lispms-long-wait (hosts alive-function &optional dead-function refuse-function)
+  (declare (sys:downward-funarg alive-function dead-function refuse-function))
+  (let ((dead-hosts nil))
+    (invoke-multiple-services ((loop for host in hosts
+				     as path = (condition-case (error)
+						   (find-path-to-service-on-host
+						     ':lispm-finger host)
+						 (network-error
+						   (when refuse-function
+						     (funcall refuse-function host error))
+						   nil))
+				     when path collect it)
+			       (* 15. 60.) "Finger")
+			      (host data)
+      (connection-refused
+	(when refuse-function
+	  (funcall refuse-function host data)))
+      (connection-error
+	(when dead-function
+	  (push (list host data) dead-hosts)))
+      (:no-error
+	(funcall alive-function host data)))
+    (when dead-function
+      (loop for (host data) in dead-hosts
+	    doing (funcall dead-function host data)))))
+
+(defun server-finger-lispms (namespace)
+  (let ((*namespace* namespace))
+    (with-stack-list (*namespace-search-list* namespace)
+      (mapcar #'service-access-path-host 
+	      (neti:find-paths-to-service :lispm-finger)))))
+
+(defun scan-lispms-for-finger-cache ()
+  (loop with lispm-info = nil
+	with free-lispm-info = nil
+	for namespace in (server-finger-namespaces)
+	for lispms = (server-finger-lispms namespace)
+	do (*scan-lispms-long-wait
+	     lispms
+	     #'(lambda (host data)
+		 (if (or (equal (first data) "")
+			 (cl:member (first data)
+				    *usernames-which-really-mean-the-machine-is-free*
+				    :test #'string-equal))
+		     (push (cons host data) free-lispm-info)
+		     (push (cons host data) lispm-info)
+		     (add-to-last-seen-database host (first data)))))
+	finally (setq *finger-lispm-cache*
+		      (cl:sort lispm-info #'string-lessp :key #'second))
+		(setq *finger-free-lispm-cache*
+		      (cl:sort free-lispm-info #'string-lessp :key #'third))))
+
+(defun update-disk-copy-of-server-finger-last-seen-database ()
+  (let ((pname (fs:parse-pathname *server-finger-last-seen-database-pathname*)))
+    (sys:dump-forms-to-file 
+      pname
+      `((setq *server-finger-last-seen-htable* ,*server-finger-last-seen-htable*)))
+    (fs:change-file-properties pname nil
+			       :generation-retention-count 2
+			       :dont-dump t))
+  (setq *server-finger-last-seen-database-file-last-update-time*
+	(time:get-universal-time)))
+
+(defun maybe-update-disk-copy-of-server-finger-last-seen-database ()
+  (when (and *server-finger-last-seen-database-pathname*
+	     (ignore-errors (probef *server-finger-last-seen-database-pathname*))
+	     (>= (time:get-universal-time)
+		 (+ *server-finger-last-seen-database-file-last-update-time*
+		    *server-finger-last-seen-database-file-update-interval*
+		    *update-finger-cache-background-interval*)))
+    (update-disk-copy-of-server-finger-last-seen-database)))
+
+(defun load-disk-copy-of-server-finger-last-seen-database ()
+  (load *server-finger-last-seen-database-pathname* nil nil t t)
+  (setq *server-finger-last-seen-database-file-last-update-time*
+	(get (fs:file-properties *server-finger-last-seen-database-pathname*)
+	     :creation-date)))
+
+(defun maybe-load-disk-copy-of-server-finger-last-seen-database ()
+  ;; Wait for services to be enabled before doing anything drastic
+  (process-wait "Services enabled" #'(lambda () *services-enabled*))
+  (when (and *server-finger-last-seen-database-pathname*
+	     (ignore-errors (probef *server-finger-last-seen-database-pathname*))
+	     (> (get (fs:file-properties *server-finger-last-seen-database-pathname*)
+		     :modification-date)
+		*server-finger-last-seen-database-file-last-update-time*))
+    (load-disk-copy-of-server-finger-last-seen-database)))
+
+(defun maybe-load-disk-copy-of-server-finger-last-seen-database-in-background ()
+  (process-run-function (list :name "Load Last Seen Database")
+    #'maybe-load-disk-copy-of-server-finger-last-seen-database))
+
+(defun start-scan-hosts-for-finger-cache ()
+  (loop for process in sys:all-processes
+	when (eq (process-name process) *scan-hosts-for-finger-cache-name*)
+	  return process
+	finally (return (process-run-function *scan-hosts-for-finger-cache-name*
+			  'scan-hosts-for-finger-cache))))
+
+(defun update-finger-cache ()
+  ;; Finger all lispms
+  (setf (si:process-priority si:*current-process*) -1)	1;Slow this down a bit for now.
+0  (scan-lispms-for-finger-cache)
+  ;; Start up a host scanner if the last one hasn't finished yet.
+  (start-scan-hosts-for-finger-cache)
+  ;; And update the disk copy of the last seen database if necessary
+  (maybe-update-disk-copy-of-server-finger-last-seen-database))
+
+(defun update-finger-cache-background-function ()
+  ;; Wait for services to be enabled before doing anything drastic
+  (process-wait "Services enabled" #'(lambda () *services-enabled*))
+  ;; Do the actual cache updating
+  (ignore-errors (update-finger-cache)) 
+  ;; Then schedule a new update
+  (start-server-finger *update-finger-cache-background-interval*))
+
+(defvar *update-finger-cache-timer*
+	(process:create-timer-call
+	  #'update-finger-cache-background-function nil
+	  :name "Update finger cache"))
+
+(defun start-server-finger (interval)
+  (process:reset-timer-relative *update-finger-cache-timer* interval))
+
+
+(defun print-location (host location strlen &optional (stream standard-output))
+  (when (and (not (typep host 'fs:lispm-host))
+	     (send host :machine-type))
+    (let ((str (string-append
+		 "("
+		 (string-upcase (string-capitalize-words (send host :machine-type)))
+		 ")")))
+      (setq location
+	    (if location
+		(string-append location " " str)
+		str))))
+  (when location				;NIL if host returned malformed data
+    (if (< (string-length location) strlen)
+	(send stream :string-out location)
+	;; Truncate line by removing parenthesized guck from end
+	(send stream :string-out location 0 
+	      (loop with parencount = 0
+		    for n downfrom (1- (string-length location))
+		    for char = (aref location n)
+		 when (char= char #\) )
+		   do (incf parencount)
+		 when (char= char #\( )
+		   do (decf parencount)
+		 when (and (<= parencount 0)
+			   (< n strlen)
+			   (not (char= char #\space)))
+		   return n)))))
+
+(defun print-location-1 (host location strlen &optional (stream standard-output))
+  (when (and (not (typep host 'fs:lispm-host))
+	     (send host :machine-type))
+    (let ((str (string-append
+		 "("
+		 (string-upcase (string-capitalize-words (send host :machine-type)))
+		 ")")))
+      (setq location
+	    (if location
+		(string-append location " " str)
+		str))))
+  (when location
+    (princ (if (> (string-length location) strlen)
+	       (substring location 0 strlen)
+	       location)
+	   stream)))
+
+(defun server-finger-idle-lispms (stream)
+  (let* ((host (send-if-handles stream :foreign-host))
+	 (site (and host (send host :site)))
+	 (info (loop for x in *finger-free-lispm-cache*
+		     for host = (first x)
+		     when (or (null site) (eq site (send host :site)))
+		       collect x)))	       
+    (if (null info)
+	(progn (format stream "~&No Free Machines")
+	       (if site (format stream " at site ~A~%" site) (terpri stream))
+	       (format stream "     Try @~A for busy Lisp Machines~%" neti:*local-host*)
+	       (format stream "         .all@~A for all Lisp Machines in use~%~%"
+		       neti:*local-host*))
+	(format stream "~&Free Machines")
+	(if site (format stream " at site ~A~%" site) (terpri stream))
+	(format stream "   Try @~A for busy Machines~%" neti:*local-host*)
+	(format stream "         .all@~A for all Machines in use~%~%" neti:*local-host*)
+	(loop for (host id location idle-time personal-name group) in info		
+	      do (format stream "  ~15A " (server-finger-just-enough host 15))
+		 (print-location-1 host location 60. stream)
+		 (terpri stream)))))
+
+(defun parse-idle-time (idle-time)
+  (let* ((position-of-colon (cl:position #\: idle-time))
+	 (hours
+	   (or (and position-of-colon
+		    (cl:parse-integer idle-time :end position-of-colon :junk-allowed t))
+	       0))
+	 (minutes
+	   (or (cl:parse-integer
+		 idle-time
+		 :start (if position-of-colon (1+ position-of-colon) 0)
+		 :junk-allowed t)
+	       0)))
+    (* (+ (* hours 60.) minutes) 60.)))
+
+(defun server-finger-just-enough (what width)
+  (let* ((what (string what))
+	 (s (string-thin what)))
+    ;; Replace nongraphic characters with spaces.
+    (loop with mod = (neq s what) 
+	  for i below (string-length s)
+	  unless (graphic-char-p (aref s i))
+	    do (unless mod (setq s (substring s 0) mod t))
+	       (setf (aref s i) #\Space))
+    (setq s (string-trim " " s))
+    (if (<= (string-length s) width)
+	s
+      (setq s (substring s 0 width))
+      (setf (aref s (1- width)) #\!))
+    s))
+
+(defun server-finger-display-lispm
+       (host id location idle-time personal-name group stream whois host-prefix-p)
+  (if whois					;must be null for host-prefix-p
+      (progn (condition-case (err)
+		 (net:finger nil stream :user id :host host :whois t)
+	       (error
+		 (cl:fresh-line stream)
+		 (send err :report stream)))
+	     (send stream :force-output))
+      (when host-prefix-p (format stream "~&~A" host))
+      (let* ((id-field-length	     8)		;These are minimum widths, increased
+	     (group-field-length     1)		;if possible below.
+	     (name-field-length     20)
+	     (host-field-length     10)
+	     (idle-field-length      5)
+	     (location-field-length 30)
+	     (number-of-columns      6)
+	     (available-width (- *finger-output-column-width*
+				 id-field-length group-field-length name-field-length
+				 host-field-length idle-field-length location-field-length
+				 number-of-columns)))
+	;; Apportion any unused space between ID, NAME, HOST, and LOCATION.
+	(when (plusp available-width)
+	  (let ((id-chars      (ceiling (* 15/100 available-width)))
+		(name-chars    (ceiling (* 15/100 available-width)))
+		(host-chars    (ceiling (* 20/100 available-width))))
+	    (macrolet ((consider (field chars)
+			 `(let ((n (min ,chars available-width)))
+			    (incf ,field n)
+			    (decf available-width n))))
+	      (consider id-field-length id-chars)
+	      (consider name-field-length name-chars)
+	      (consider host-field-length host-chars)
+	      ;; Give all remaining chars to the location field.
+	      (incf location-field-length available-width))))
+	(format stream "~&~VA ~VA ~VA ~VA ~V@A "
+		id-field-length (server-finger-just-enough id id-field-length)
+		group-field-length (server-finger-just-enough group group-field-length)
+		name-field-length (server-finger-just-enough personal-name name-field-length)
+		host-field-length (server-finger-just-enough
+				    (if ( (string-length host) host-field-length)
+					host
+					(send host :short-name))
+				    host-field-length)
+		idle-field-length (server-finger-just-enough idle-time idle-field-length))
+	(print-location host location location-field-length stream)
+	(when host-prefix-p
+	  (format stream "~&*~%")))))
+
+(defun server-finger-filter-lispms (pred displayer stream whois &optional host-prefix-p)
+  (loop for (host id location idle-time personal-name group)
+	    in *finger-lispm-cache*
+	when (funcall pred host id location idle-time personal-name group)
+	  do (funcall displayer
+		      host id location idle-time personal-name
+		      group stream whois host-prefix-p)
+	  and collect host))
+
+(defun server-finger-try-lispms (user stream whois &optional host-prefix-p)
+  (server-finger-filter-lispms
+    (lambda (host id location idle-time personal-name group)
+      (ignore host location idle-time personal-name group)
+      (equal id user))
+    #'server-finger-display-lispm
+    stream
+    whois
+    host-prefix-p))
+
+(defun server-finger-busy-lispms (stream whois &optional host-prefix-p)
+  (format stream "Busy Machines (those idle less than ~A)~%"
+	  (with-output-to-string (stream)
+	    (time:print-interval-or-never *server-finger-busy-idle-limit* stream)))
+  (format stream "     Try .free@~A for free Machines~%" neti:*local-host*)
+  (format stream "         .all@~A for all Machines in use~%~%" neti:*local-host*)
+  (server-finger-filter-lispms
+    (lambda (host id location idle-time personal-name group)
+      (ignore host id location personal-name group)
+      (< (parse-idle-time idle-time) *server-finger-busy-idle-limit*))
+    #'server-finger-display-lispm
+    stream
+    whois
+    host-prefix-p))
+
+(defun server-finger-all-lispms (stream whois &optional host-prefix-p)
+  (format stream "All Machines in use~%")
+  (format stream "   Try  .free@~A for free Machines~%" neti:*local-host*)
+  (format stream "         @~A for busy Machines~%~%" neti:*local-host*)
+  (server-finger-filter-lispms
+    (lambda (host id location idle-time personal-name group)
+      (ignore host id location idle-time personal-name group)
+      t)
+    #'server-finger-display-lispm
+    stream
+    whois
+    host-prefix-p))
+
+(defun server-finger-try-others (user stream whois &optional host-prefix-p)
+  (unless (or (null user)
+	      (equal user ""))
+    (loop for lines being the hash-elements of *finger-host-cache* with-key host
+	  with uspec = (format nil "~A " user)
+	  with idx = (string-length uspec)
+	  nconc (loop for line in lines
+		      when (and (< idx (string-length line))
+				(equal (substring line 0 idx)
+				       (substring uspec 0 idx)))
+			do (if (not whois)
+			       (if host-prefix-p
+				   (format stream "~&~A~%~A: ~A~%*~%" host host line)
+				   (format stream "~&~A: ~A~%" host line))
+			       (format stream "~&~A:~%" host)
+			       (condition-case (err)
+				    (net:finger nil stream :user user :host host :whois t)
+				  (error
+				    (cl:fresh-line stream)
+				    (send err :report stream)))
+			       (send stream :force-output))
+			and collect host))))
+
+(defun server-finger-finger-user (user stream whois)
+  (let ((user-object (interpret-user-argument user))
+	(need-last-seen t))
+    (block find-user
+      (cond ((errorp user-object)		1;Bogus user-object
+0	     (format stream "~&~A: ~A" user user-object)
+	     (return-from find-user))
+	    ((cl:consp user-object)		1;More than one user-object for this user
+0	     (format stream "~&~A is ambiguous:" user)
+	     (dolist (user user-object)
+	       (let ((mailbox (send user :mail-address)))
+		 (format stream "~&~6A ~22A~:[~;[~A@~A]~]"
+			 user (send user :personal-name)
+			 (not (null mailbox)) (first mailbox) (second mailbox))))
+	     (return-from find-user))
+	    ((neq user-object si:*user*)
+	     1;; Try to see if they are around using their lispm name.
+0	     (let* ((lispm-name (send user-object :lispm-name))
+		    (lispms (server-finger-try-lispms lispm-name stream whois))
+		    (others (server-finger-try-others lispm-name stream whois)))
+	       (if (or lispms others)
+		   (setq need-last-seen nil)
+		   (format stream "~&~6A ~C ~22A not logged in anywhere."
+			   (send user-object :lispm-name)
+			   (let ((affil (send user-object ':affiliation)))
+			     (if (and affil (plusp (string-length affil)))
+				 (aref affil 0)
+				 #\sp))
+			   (send user-object :personal-name))))))
+      (when (and whois (typep user-object 'si:user))
+	(print-whois-internal stream user-object t))
+      (let ((last-seen-info (or (last-seen-info-for-user user)
+			       (last-seen-info-for-user (send user-object :lispm-name)))))
+	(when (and last-seen-info need-last-seen)
+	  (loop initially (format stream "~%          Last seen on  at~%")
+		for (host . time) in
+		    (cl:sort last-seen-info #'> :key #'cdr)
+		for host-name = (string host)
+		do (format stream "  ~20@A  ~A~%"
+			   host
+			   (with-output-to-string (stream)
+			     (time:print-brief-universal-time time stream)))))))))
+
+(def old-name-server-internal)
+
+(add-initialization
+  'name-server-internal
+  '(deff old-name-server-internal #'name-server-internal)
+  '(:once))
+
+(cl:defparameter *return-cached-finger-information* nil)
+
+(defun name-server-internal (stream user whois trusted-p)
+  (if (or (null *return-cached-finger-information*)
+	  (equal user user-id))
+      (old-name-server-internal stream user whois trusted-p)
+      (condition-case (err)
+	  (cond ((or (null user) (equal user ""))
+		  (server-finger-busy-lispms stream whois))
+		((equal user ".free")
+		 (server-finger-idle-lispms stream))
+		((equal user ".all")
+		 (server-finger-all-lispms stream whois))
+		((string-search-set "%@" user)
+		 (let* ((idx (string-reverse-search-set "%@" user))
+			(u (substring user 0 idx))
+			(h (substring user (1+ idx))))
+		   (condition-case (err)
+		       (finger nil stream :user u :host (parse-host h) :whois whois)
+		     (error
+		       (send err :report stream)))))
+		(t
+		 (let ((lispms (server-finger-try-lispms user stream whois))
+		       (others (server-finger-try-others user stream whois)))
+		   (unless (or lispms others)
+		     (server-finger-finger-user user stream whois)))))
+	(sys:remote-network-error))))
+
+(net:define-server :site-names (:medium :byte-stream :stream (stream :accept-p nil))
+   (let ((user
+	   (multiple-value-bind (string start end)
+	       (send stream :read-input-buffer)
+	     (setq start (let ((tem (string-search-char #\space string start end)))
+			   (if tem (1+ tem) end)))
+	     (parse-name-argument string start end))))
+     (send stream :accept)
+     (server-finger-try-lispms user stream nil t)
+     (server-finger-try-others user stream nil t)))
+
+(chaos:add-contact-name-for-protocol :chaos-site-names "SITE-NAMES")
+
+(chaos:define-chaos-protocol :chaos-site-names (:site-names :chaos)
+  (:invoke-with-stream-and-close ((stream :direction :input) &key user)
+    (ignore user)
+    (prog1
+      (loop with results = nil
+	    do
+	(let ((host-name (cl:read-line stream nil 'applesauce)))
+	  (when (eq host-name 'applesauce) (return results))
+	  (push (cons host-name
+		      (cl:with-output-to-string (s)
+			(do () (())
+			  (let ((info (cl:read-line stream nil 'applesauce)))
+			    (when (eq info 'applesauce) (return results))
+			    (when (string-equal info "*")
+			      (return))
+			    (format s "~A~%" info)))))
+		results)))
+      (close stream t)))
+  (:chaos-contact-name (base-contact-name service)
+   (scl:destructuring-bind (&key user)
+      (service-access-path-args service)
+     (if user
+	 (string-append base-contact-name #\space user)
+	 base-contact-name))))
+
+(add-initialization
+  "Start Server-Finger in background if this is a server"
+  '(when (send *local-host* :server-machine)
+     (setq *return-cached-finger-information* t)
+     (start-server-finger (* 15. 60.))
+     (maybe-load-disk-copy-of-server-finger-last-seen-database-in-background))
+  '(:warm :now))
+
+(note-private-patch "Server-Finger patch")

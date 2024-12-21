@@ -1,0 +1,109 @@
+;;;-*- Syntax: Ansi-Common-Lisp; Base: 10; Mode: lisp; Package: http -*-
+
+;;; (C) Copyright 1996-1997, Christopher R. Vincent
+;;;     All Rights Reserved.
+;;; (C) Enhancements 1998, John C. Mallery
+;;;
+;;;------------------------------------------------------------------- 
+;;;
+;;; CL-HTTP PROXY SERVER
+;;;
+
+(in-package :http)
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; PROXY-CACHE
+;;; 
+
+(defun representation-valid-p (rep headers http-version)
+  (declare (ignore http-version))
+  (with-header-values (pragma) headers
+    (let* ((cached-headers (cached-representation-response-headers rep))
+           (cached-expires (get-header :expires cached-headers)))
+      (cond (pragma (not (eql pragma :no-cache)))
+            (cached-expires (>= cached-expires (get-universal-time)))
+            (t t)))))
+
+(defun proxy-respond-with-representation (server rep request-http-version)
+  (proxy-trace "~&;Responding with ~S" rep)
+  (with-slots (stream) server
+    (report-status-success stream)
+    (write-headers stream (compute-proxy-response-headers (cached-representation-response-headers rep) request-http-version) t)
+    (write-representation-entity rep stream)))
+
+; Abstract this further when incorporating additional HTTP/1.1 functionality.
+(defun proxy-respond-with-remote-access (server res rep request-http-version)
+  (let* ((request-url (server-url server))
+         (request-stream (server-stream server))
+         (request-headers (server-headers server))
+         (client-request-headers (cond (rep
+					(proxy-trace "~&;Sending conditional request.")
+					(let ((hdrs (proxy-request-headers server)))
+					  (setf (getf hdrs :if-modified-since) (cached-representation-verified-date rep))
+					  hdrs))
+				       (t (proxy-request-headers server)))))
+    (declare (dynamic-extent client-request-headers))
+    (with-http-request (request-url :get :request-headers client-request-headers)
+      (let* ((client-status (client-status client))
+             (client-response-headers (client-response-headers client))
+             (response-headers (proxy-response-headers client server)))
+        (with-transfer-decoding* (remote-stream request-url http-version :headers client-response-headers :copy-mode :binary)
+          (cond ((= 200 client-status)
+                 (send-status-line request-stream client-status (client-reason client))
+                 (let* ((resource (or res (intern-cached-resource (name-string request-url) *http-proxy-cache* 
+                                                                  :if-does-not-exist :create)))
+                        (representation (or rep (intern-cached-representation resource request-headers :if-does-not-exist :create)))
+                        (response-content-length (get-header :content-length client-response-headers))
+                        (transfer-encoding (proxy-relay-transfer-encoding response-content-length request-http-version))
+                        (response-headers `(,.response-headers ,@(case transfer-encoding
+                                                                   (:chunked '(:transfer-encoding :chunked))))))
+                   (declare (dynamic-extent response-headers))
+                   (proxy-trace "~&;Caching data for ~S" representation)
+                   (with-header-values (date) client-response-headers
+                     (setf (cached-representation-response-headers representation) client-response-headers
+                           (cached-representation-verified-date representation) date))
+                   (write-headers request-stream response-headers t)
+                   (with-transfer-encoding (request-stream transfer-encoding)
+		     (with-open-representation (entity-stream representation :output)
+		       (with-binary-stream (request-stream :output)
+			 (let ((broadcast (make-broadcast-stream request-stream entity-stream)))
+			   (declare (dynamic-extent broadcast))
+			   (stream-copy-until-eof remote-stream broadcast :binary)))))))
+                ((and rep (= client-status 304))
+                 (proxy-trace "~&;Not modified response.")
+                 (setf (cached-representation-verified-date rep) (get-header :date client-response-headers))
+                 (cond ((get-header :if-modified-since request-headers)
+                        (send-status-line request-stream client-status (client-reason client))
+                        (write-headers request-stream response-headers t))
+                       (t (proxy-respond-with-representation server rep request-http-version))))
+                ((response-status-code-implies-entity-p client-status)  ; don't cache other entities
+                 (proxy-trace "~&;Relaying entity for status ~S response." client-status)
+                 (send-status-line request-stream client-status (client-reason client))
+                 (let* ((response-content-length (get-header :content-length client-response-headers))
+                        (transfer-encoding (proxy-relay-transfer-encoding response-content-length request-http-version))
+                        (response-headers `(,.response-headers ,@(case transfer-encoding
+                                                                   (:chunked '(:transfer-encoding :chunked))))))
+                   (declare (dynamic-extent response-headers))
+                   (write-headers request-stream response-headers t)
+                   (with-transfer-encoding (request-stream transfer-encoding)
+                     (stream-copy-until-eof remote-stream request-stream :binary))))
+                (t (send-status-line request-stream client-status (client-reason client))
+                   (write-headers request-stream response-headers t)
+                   (proxy-trace "~&;Relaying headers for status ~S response." client-status))))))))
+
+(define-generic invoke-proxy-cache-service (server method request-http-version)
+  (:documentation "Service a proxy request with caching operations."))
+
+(defmethod invoke-proxy-cache-service ((server proxy-server-mixin) (method (eql :get)) request-http-version)
+  (proxy-trace "~&;Servicing request with access to cache...")
+  (with-slots (stream url url-string headers) server
+    (let* ((resource (intern-cached-resource url-string *http-proxy-cache* :if-does-not-exist :soft))
+           (representation (when resource
+                             (intern-cached-representation resource headers :if-does-not-exist :soft))))
+      (cond ((and representation (representation-valid-p representation headers request-http-version))
+             (proxy-respond-with-representation server representation request-http-version))
+            (t (if representation
+		   (proxy-trace "~&;Representation ~S no longer valid." representation)
+		   (proxy-trace "~&;No matching representation found."))
+             (proxy-respond-with-remote-access server resource representation request-http-version))))))

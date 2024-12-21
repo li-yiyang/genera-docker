@@ -1,0 +1,1624 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: statice-model; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+;;; Definitions for Statice Model Level.
+
+
+ 
+;;; Per-process.  Always NIL at top level, to show that we're not inside
+;;; a transaction.  Bound by with-transaction to a transaction-info structure.
+(defvar *transaction-info* nil)
+
+;;; Per-process.  Always NIL at top level.  T if PCLSR mode is enabled.
+(zl:defvar-standard *restart-testing* nil)
+
+;;; This structure holds per-transaction information.
+(cl:defstruct (transaction-info (:conc-name nil)
+			     (:copier nil)
+			     (:default-pointer *transaction-info*))
+  ;; This is a number that identifies a particular transaction, within
+  ;; one Lisp world, used to make sure that tuple handles are only used
+  ;; in the transaction that they came from.
+  transaction-id
+  
+  ;; Table of all entity handles for entities that were created during
+  ;; this transaction.  They'll get transferred to the individual
+  ;; databases's known-entity-handles table if and when the transaction
+  ;; commits.  Key is (list rid database).
+  (new-entity-handles (cl:make-hash-table :locking nil :test 'equal :size 1))
+  
+  ;; Table of all entity handles for entities that were deleted during
+  ;; this transaction.  They'll get removed from the individual
+  ;; databases's known-entity-handles table if and when the transaction
+  ;; commits.  Same key as new-entity-handles above.
+  (deleted-entity-handles (cl:make-hash-table :locking nil :test 'equal :size 1))
+  
+  ;; Set of all entity handles that are known to be valid to use within
+  ;; this transaction, either because this transaction created the
+  ;; handle, or because a handle from outside was already validated.
+  (checked-entity-handles (cl:make-hash-table :locking nil :number-of-values 0 :size 1))
+  
+  ;; Table of all tuple handles that were generated during this
+  ;; transaction.
+  (tuple-handles (cl:make-hash-table :locking nil :size 1))
+  
+  ;; A list of db-info structure for every database that this
+  ;; transaction references.  The instance is added to this list when
+  ;; the database has been "prepared".  Each structure is implemented as
+  ;; a list, whose first element is a database instance, so that assoc
+  ;; can be used.
+  (db-info-list nil)
+
+  ;; What number call to an entrypoint we should abort on if restart-testing mode
+  ;; is enabled.
+  (entry-number-to-abort-on 0)
+
+  ;; What number call we're on now
+  (current-entry-number 0))
+
+;;; Global, protected by *transaction-info-pool-lock*.  A vector of free
+;;; transaction-info structures.
+(defvar *transaction-info-pool* (cl:make-array 10 :fill-pointer 0))
+
+;;; A lock.  This lock protects the global variable *transaction-info-pool*.
+(defvar *transaction-info-pool-lock* (process:make-lock "Transaction Info Pool"))
+
+(defmacro with-transaction-info-pool-lock (&body body)
+  `(process:with-lock (*transaction-info-pool-lock*)
+     ,@body))
+
+;;; Shared between processes.  This is a counter used to generate new values
+;;; for (transaction-id).  Sharing is managed via store-conditional.
+(defvar *transaction-id-generator* 0)
+
+;;; A lock.  This lock protects *all-unknown-entity-handles*.  This
+;;; lock is "higher" than DBFS page locks, so you must not touch new
+;;; DBFS pages while holding this lock.  However, it is "lower" than
+;;; the database-known-entity-handles-lock of any database.
+(defvar *all-unknown-entity-handles-lock*
+	(process:make-lock "Statice Unknown Entity Table" :recursive t))
+
+(defmacro with-all-unknown-entity-handles-lock (&body body)
+  `(process:with-lock (*all-unknown-entity-handles-lock*)
+     ,@body))
+
+(defmacro with-database-known-entity-handles-lock ((database) &body body)
+  `(process:with-lock ((database-known-entity-handles-lock ,database))
+     ,@body))
+
+;;; Shared between processes.  Protected by entity-handle-lock.  Table
+;;; of all unknown-entity-handles for entities that have been referred
+;;; to in this bootload.  The key is the unique ID of the entity, as a
+;;; three-element list.  Handles are removed from this table if and when
+;;; they become known.  The purpose of this table is to continue to make
+;;; sure that there can be only one handle for a given entity.
+(defvar *all-unknown-entity-handles* (cl:make-hash-table :locking nil))
+
+;;; A lock.  This lock protects the global variables *databases* and
+;;; *databases-by-uid*.  This is a higher lock than the
+;;; all-unknown-entities-handle lock; that is, you can lock this while
+;;; holding that, but not vice versa.  However, it is a lower lock than
+;;; the database-known-entity-handles-lock of a any database.
+(defvar *open-database-lock* (process:make-lock "Statice Open" :recursive t))
+
+(defmacro with-open-database-lock (&body body)
+  `(process:with-lock (*open-database-lock*)
+     ,@body))
+
+
+;;; Shared between processes, protected by *open-database-lock*.  This is a
+;;; table with one entry for each database that has ever been opened in
+;;; this Lisp world.  The key is the dbfs:file-unique-id of the file, and
+;;; the value is the database instance.
+(defvar *databases* (cl:make-hash-table :locking nil))
+
+;;; Shared between processes, protected by *open-database-lock*.  This is a
+;;; table with one entry for each database that has ever been opened in
+;;; this Lisp world.  The key is the database-uid (as a 3-list) of the file, and
+;;; the value is the database instance.
+(defvar *databases-by-uid* (cl:make-hash-table :test #'equal :locking nil))
+
+;;; Per-process.  Bound by with-current-database and with-database.  The top-level
+;;; value is always NIL.  Acts as a default argument value to many entrypoints.
+(defvar *current-database* nil)
+
+;;; Per-process.  Bound by the query processor (guts of do-relation).
+;;; List of all rid-arrays currently being mapped over.  The elements of
+;;; this list come in pairs; the first is a relation-handle and the
+;;; second is a vector of rid values representing tuples in that
+;;; relation.
+(defvar *all-rid-arrays* nil)
+
+;;; builds up the plist of var tuples as we recurse down through the
+;;; join specs.  These are all stack consed.
+(defvar *joined-tuple-rids*)
+
+;;; This is a constant, never bound or set during Statice operation.  This is
+;;; the Lisp object that represents the null value.
+(defvar *null-value* (list "The Null Value"))
+
+;;; Per-process.  This is a special hook for function level.  It affects
+;;; the creation of new entity handles.  The value should be a list of
+;;; alternating keywords and values.  These are passed into the call to
+;;; make-instance that instantiates an entity handle.  This is only
+;;; useful if the entity-flavors instance variable of the relevant
+;;; database is set up to provide some interesting flavor for the entity
+;;; handle to be.  This is a classic use of a special variable as a
+;;; hidden parameter, and maybe we'll fix it to be a real parameter in
+;;; the future.
+(defvar *make-instance-arguments* nil)
+
+;;; Constant.  This is a vector of packages that we expect to often find
+;;; as the home packages of data items of type symbol.  The numeric
+;;; encoding of packages treats these packages specially, so that we can
+;;; avoid storing their names in the database.  See the functions
+;;; encode-package and decode-package for more details.
+(defparameter *commonly-used-packages*
+	      (let ((pkg-list (cl:loop for name in '("COMMON-LISP" "COMMON-LISP-USER" "GLOBAL"
+						  "KEYWORD" "SYMBOLICS-COMMON-LISP"
+						  "SYSTEM" "ZETALISP-USER")
+				    collect (scl:pkg-find-package name))))
+		(cl:make-array (length pkg-list) :initial-contents pkg-list)))
+
+;;; Constant.  See above.
+(defparameter *number-of-commonly-used-packages*
+	      (length *commonly-used-packages*))
+
+(defvar *windy-index-checking* nil "Temporary kluge for checking what indexes are used")
+
+;;; Version 1: Initial version
+;;; Version 2: Header enlarged to hold version-id words.
+;;; Version 3: Some minor storage level changes? (DLW?)
+;;; Version 4: Storage Level and Model Level changes to support areas. -- Lamb
+;;; Version 5: Make mutating b-sets for group indexes. -- Lamb
+;;; Version 6: Segment ID's at storage level, rh0 cache, %%sysnames,
+;;;            entity-flavors iv in database flavor, (make-attr :surrogate-p) -- Lamb
+;;; Version 7: Fat-strings, string integration/consolidation -- Lamb
+;;; Version 8: Consolidation of attribute-xxx-cons records hanging off attributes -- Lamb
+;;; Version 9: Add case insensitive indexes -- Lamb
+;;; Version 10: Extensible types, remove datatype-handles, etc. -- DLW
+;;; Version 11: Remove index header pages. -- DLW
+;;; Version 12: Add maintenance of index depths. -- Lamb
+;;; Version 13: Support larger page sizes (8192 bytes). -- Palter, ptw
+;;; +++ When changing this, be sure to check encache-schema and recache-schema.  They
+;;; +++ have this hardcoded in, as well as v10, v11, and v12.
+(defparameter *statice-model-level-version* 13
+  "Model level version for detecting incompatible database format changes.")
+
+(scl:add-initialization "Statice Model" '(statice-model-warm-init) '(:warm))
+
+(defun statice-model-warm-init ()
+  (setq *transaction-info* nil)
+  (setq *all-rid-arrays* nil)
+  (setq *make-instance-arguments* nil))
+
+;;; They query trace facility is intended only for debugging.  It's so
+;;; that the test suite can detect how a query was resolved, to make
+;;; sure that the optimizer is correctly recognizing certain cases.  It
+;;; should never be used by user programs!
+(defvar *query-trace-p* nil "Whether query tracing is turned on")
+
+(defvar *query-trace-list* nil "List of entries that says how this query was done")
+
+;;; Use this macro to report bugs in Statice model level, as opposed to
+;;; signalling errors from us to our client.
+(defmacro model-bug (format-string &rest args)
+  `(cl:error ,(string-append "Statice model level bug: " format-string) . ,args))
+
+;;; The format of descriptors, as stored in attributes.  This defstruct
+;;; must preceed define-record, because define-record knows how to
+;;; generate macros that build descriptors.
+(cl:defstruct (desc (:type :fixnum))
+  ((bit-offset 0 :byte (byte 5 26))
+   (word-offset 0 :byte (byte 26 0))))
+
+;;; (define-record name parent &body clause-list clause-list ...) defines
+;;; fields in a record.  It's analogous to defstruct, where the
+;;; accessors and setters use the functions read-record-word and
+;;; write-record-word.  (record-size name) expands into the size of the
+;;; defined fields.  Each clause-list refers to a successive word of the
+;;; record.  It's a list of clauses.  Each clause can be any of the
+;;; following:
+;;;   (word field-name)                field-name references the whole word
+;;;   (field field-name size position) field-name references a field in the word
+;;;   (bits n bit-name1 bit-name2 ..)  each bit-name refers to a successive bit, starting
+;;;				       with bit n.  n is like position above.
+;;; parent, if not nil, is the name of a record already defined (not evaluted),
+;;; and the offsets start above the size of parent.  It's like :include.
+;;; The name of the structure, and a hyphen, are prepended to the names.
+
+(eval-when (compile cl:load eval)
+(defvar *statice-model-package* (cl:find-package "statice-model"))
+(defvar *statice-model-syntax* :common-lisp))
+
+(eval-when (compile cl:load eval)
+(defun conc-name (part-1 part-2)
+  (cl:intern (format nil "~S-~S" part-1 part-2) *statice-model-package*)))
+
+(defmacro define-record (name parent &body clause-lists)
+  `(progn
+     (record-source-file-name ',name 'define-record)
+     (eval-when (compile cl:load eval)
+       (define-record-1 ',name ',parent ',clause-lists))
+     .,(cl:loop for clause-list in clause-lists
+	     for offset from (cl:if (null parent) 0 (get parent 'record-size))
+	     appending
+	       (cl:loop for clause in clause-list
+		     nconcing
+		       (case (first clause)
+			 (word
+			   (unless (= (length clause) 2)
+			     (model-bug "The clause ~S in record ~S is poorly-formed"
+					clause name))
+			   (let ((word-name (conc-name name (second clause))))
+			     `((cl:setf (get ',word-name 'word-offset) ',offset)
+			       (defsubst ,word-name (record-handle)
+				 (declare (sys:function-parent ,name define-record))
+				 (read-record-word record-handle ,offset)))))
+			 (bits
+			   (unless ( (length clause) 3)
+			     (model-bug "The clause ~S in record ~S is poorly-formed"
+					clause name))
+			   (cl:loop for bit-name in (cddr clause)
+				 for pos from (cadr clause)
+				 for bit-full-name = (conc-name name bit-name)
+				 collect
+				   `(defsubst ,bit-full-name (record-handle)
+				      (declare (sys:function-parent ,name define-record))
+				      (sys:%logldb (byte 1 ,pos)
+						   (read-record-word record-handle ,offset)))
+				 collect `(cl:setf (get ',bit-full-name 'word-offset) ',offset)
+				 collect `(cl:setf (get ',bit-full-name 'bit-offset) ',pos)))
+			 (field
+			   (unless (= (length clause) 4)
+			     (model-bug "The clause ~S in record ~S is poorly-formed"
+					clause name))
+			   (let ((field-full-name (conc-name name (second clause))))
+			     `((defsubst ,field-full-name (record-handle)
+				 (declare (sys:function-parent ,name define-record))
+				 (sys:%logldb (byte ,(third clause) ,(fourth clause))
+				  (read-record-word record-handle ,offset)))
+			       (cl:setf (get ',field-full-name 'word-offset) ',offset)
+			       (cl:setf (get ',field-full-name 'bit-offset) ',(fourth clause)))))
+			 (otherwise (model-bug "~S is not a valid clause" clause)))))))
+
+(eval-when (compile cl:load eval)
+(defun define-record-1 (name parent clause-lists)
+  (when (and parent (null (get parent 'record-size)))
+    (model-bug "~S, the parent of ~S, is not a defined record" parent name))
+  (cl:setf (get name 'record-size) (+ (length clause-lists) (or (get parent 'record-size) 0)))
+  (cl:setf (get name 'record-clauses-lists)
+	(append (get parent 'record-clauses-lists) clause-lists))))
+
+(defmacro record-size (name)
+  (unless (symbolp name)
+    (model-bug "record-size must be given an unquoted symbol, not ~S" name))
+  (or (get name 'record-size)
+      (model-bug "~S has no record size" name)))
+
+(eval-when (compile cl:load eval)
+(defun word-offset (name)
+  (or (get name 'word-offset)
+      (model-bug "~S has no word offset" name))))
+
+;;; Given the name of a field from a define-record, return a descriptor
+;;; pointing to that field.
+(defun field-desc (field-name)
+  (let ((word-offset (get field-name 'word-offset))
+	(bit-offset (get field-name 'bit-offset)))
+    (unless word-offset
+      (model-bug "~S is not a defined field" field-name))
+    (make-desc :word-offset word-offset :bit-offset bit-offset)))
+
+;;; Definition of records in databases.
+
+;;; The implicit rule here is that the first (zero'th) word in every
+;;; record must be either 0, or a the rid of something that is not a
+;;; relation or domain record.  This is so that while walking through
+;;; areas, we can distinguish between entity and tuple records,
+;;; even though we will also be picking up all other types of record
+;;; which live in that area.  Note that there are only "other" types of
+;;; records in area 1.  "Other" types are anything listed below which
+;;; are not formed from entity or tuple records (e.g. any of the
+;;; -cons records, or the database-header record).
+
+(define-record database-header nil
+  ((word mabz))					;must ALWAYS be zero, (in any version!)
+  ((word domain-domain))
+  ((word list-of-foreign-entities))
+  ((word schema-version-number))		;For debugging only.
+  ((word model-level-version))			;*statice-model-level-version* which created
+						;this database is saved here.
+  ((word list-of-foreign-databases))
+  ((word schema-version-id-1))			;Identifier of the version of the schema.
+  ((word schema-version-id-2))
+  ((word schema-version-id-3))
+
+  ((word package-vector))			;RID of package vector
+  ((word mbz0))					;must be zero
+  ((word mbz1))					;must be zero
+  ((word mbz2))					;must be zero
+  ((word mbz3))					;must be zero
+  )
+
+(define-record entity nil
+  ((word domain))				;zero for foreign entities.
+  ((word uid-word-1))
+  ((word uid-word-2))
+  ((word uid-word-3)))
+
+(define-record local-entity entity
+  ((field version 8 24)				;only meaningful if domain has surrogates
+   (field tuples-present 24 0)))		;ditto.  bit map.
+  ;;; The fields of surrogate optimized tuples start here.
+
+(define-record foreign-entity entity
+  ((word next))
+  ((word previous))				;fe's still need these
+  ((word foreign-database)))			;info re the home database of this entity
+
+;;; If there is any foreign-entity in this database whose home database
+;;; is database D, then there is one foreign-database record containing
+;;; the UID of database D.
+(define-record foreign-database nil
+  ((word mabz))					;must ALWAYS be zero, (in any version!)
+  ((word uid-word-1))				;UID of the database
+  ((word uid-word-2))
+  ((word uid-word-3))
+  ((word reference-count))			;number of foreign-entities referencing us.
+  ((word next))					;next foreign-database in the chain.
+  ((word previous)))				;previous foreign-database in the chain.
+
+(define-record tuple nil
+  ((word relation))				;relation of this tuple
+  ((field version 8 0)))
+  ;;; The fields start here.
+
+(define-record domain local-entity
+  ((word list-of-parent-domains))
+  ;((word unused0))				;Formerly n-fixed-words, ignore it.
+  ((word bset-iid))				;bset-index-identifier, or 0
+  ((word area))
+  ((word name-word)
+   (field short-long 1 31)
+   (field thin-fat 1 30)
+   (field name-n-bytes 12 18)
+   (field name-start-word 18 0))
+  ((word word-of-flags)
+   (field next-layout-version 8 8)
+   (bits 16
+	 new-layout-needed
+	 many-parent-domains			;there's more than one parent, use conses
+	 system-domain-p			;this is a system domain
+	 ))
+  ((word mbz0))					;must be zero
+  ((word mbz1))
+  ((word mbz2))
+  ((word mbz3))
+  )
+  ;;; The bytes of the name start here.
+
+;;; If domain-many-parent-domains is set, then the list of parents is
+;;; a Lisp-like list of these conses.  Otherwise the "list of parents"
+;;; is really the sole parent, or zero if there's no parent at all.
+(define-record parent-domain-cons nil
+  ((word next))
+  ((word parent-domain)))
+
+(define-record relation local-entity
+  ((word list-of-attributes))
+  ((word list-of-indexes))
+  ((word surrogate-optimized-on))		;zero if normal, domain RID if surrogate
+  ((word name-word)
+   (field short-long 1 31)
+   (field thin-fat 1 30)
+   (field name-n-bytes 12 18)
+   (field name-start-word 18 0))
+  ((word bset-iid))				;bset index identifer, or 0 if none
+  ((word entity-bit-map-list))			;only if surrogate
+  ((word area))					;area this relation lives in
+  ((word word-of-flags)
+   (field next-layout-version 8 0)		;only if normal
+   (bits 16
+	 new-layout-needed			;only if normal
+	 entity-domain				;only for Entity-Domain
+	 system-relation-p			;this is a system relation
+	 ))
+  ((word mbz0))					;must be zero
+  ((word mbz1))
+  ((word mbz2))
+  ((word mbz3))
+  )
+  ;;; The bytes of the name start here.
+
+;;; In this structure, the domain word contains the RID of the domain,
+;;; or the special value 1 for the %%entity-domain relation.
+(define-record entity-bit-table-cons nil
+  ((word next))
+  ((word domain))
+  ((word bit-number)))
+
+(define-record attribute local-entity
+  ((word next-attribute-in-relation))		;rid to attribute, zero terminates
+  ((word relation))				;rid to relation
+  ((word type))					;two fixed words of att-type
+  ((word type-word-2))
+  ;; If relation is normal, then descriptor contains descriptor offset
+  ;; and layout-version contains the layout version (-1 if none yet). 
+  ;; If relation is surrogate-optimized, then descriptor points at
+  ;; attribute-desc-and-layout-cons record and layout-version contains
+  ;; 0.
+  ((word descriptor))				;descriptor to tuple or entity
+  ((word layout-version))			;first layout that we were in, -1 = none yet
+  ((word name-word)
+   (field short-long 1 31)
+   (field thin-fat 1 30)
+   (field name-n-bytes 12 18)
+   (field name-start-word 18 0))
+  ((word word-of-flags)
+   (bits 0
+	 unique					;no two tuples may have same value
+	 surrogate-p				;this attribute is the soo-att
+	 delete-nullifies			;t=set to null value on delete-entity
+	 no-nulls)				;If nonzero, null values are forbidden.
+   (field handler-kind 3 5)			;A handler-kind code, if type is an extended.
+   (field handler-info 16 8))			;Meaning depends on the handler-kind.
+  ((word group-index-offset))			;0 if no g. index, else list of offs.
+  ((word group-index-layout-version))
+  ((word group-index-average-size))
+  ((word mbz0))					;must be zero
+  ((word mbz1))
+  ((word mbz2))
+  ((word mbz3))
+  )
+  ;;; The bytes of the name start here.
+
+;;; The named constants for the values of the attribute-handler-kind field.
+(defconstant *handler-kind-builtin* 0)
+(defconstant *handler-kind-fixed* 1)
+(defconstant *handler-kind-variable* 2)
+
+;;; If an attribute is part of a surrogate optimized relation, then the
+;;; descriptor word contains a rid pointing to a list of descriptors
+;;; indexed by domain.  Otherwise, the descriptor word is just the
+;;; offset into the "normal tuple" record.  Same for layout
+;;; version.  In this structure, the domain word contains the RID of
+;;; the domain, or the special value 1 for the %%entity-domain relation.
+(define-record attribute-desc-and-layout-cons nil
+  ((word next))
+  ((word domain))				;rid of domain this descriptor is for
+  ((word descriptor))
+  ((word layout-version)))
+
+;;; List of domain-rids, offsets, and group-index layout versions for
+;;; the group-indexes within entities.
+(define-record attribute-group-index-info-cons nil
+  ((word next))
+  ((word domain))				;rid of domain this offset is for
+  ((word layout-version))
+  ((word offset)))
+
+(define-record index local-entity
+  ((word next-index-in-relation))
+  ((word relation))
+  ((word index-identifier))
+  ((word word-of-flags)
+   (bits 0
+	 unique
+	 case-sensitive))
+  ((word index-depth))
+  ((word mbz1)))				;must be zero
+ ;;; The words holding attribute RID's start here.
+
+(define-record character-encoding tuple
+  ((word epsilon-code))
+  ((word character-set-name-word)
+   (field short-long 1 31)
+   (field thin-fat 1 30)
+   (field cs-name-n-bytes 12 18)
+   (field cs-name-start-word 18 0))
+  ((word family-name-word)
+   (field family-short-long 1 31)
+   (field family-thin-fat 1 30)
+   (field family-name-n-bytes 12 18)
+   (field family-name-start-word 18 0))
+  ((word face-name-word)
+   (field face-short-long 1 31)
+   (field face-thin-fat 1 30)
+   (field face-name-n-bytes 12 18)
+   (field face-name-start-word 18 0))
+  ((word size-name-word)
+   (field size-short-long 1 31)
+   (field size-thin-fat 1 30)
+   (field size-name-n-bytes 12 18)
+   (field size-name-start-word 18 0))
+  ((word bits-word))
+  ((word offset-word)))
+  ;;; the bytes of the names (character set, family, face, size) start here
+
+(define-record package-vector nil		;Name of package; a thin string.
+  ((word mbza))					;Must be zero, always.
+  ((word fill-pointer)))			;Number of active elements.
+
+(define-record package-string nil
+  ((word mbza))					;Must be zero, always.
+  ((word length)))				;Length of string, in bytes.
+  ;;; The bytes of the string follow, here.
+
+
+;;; Base class for all storage handlers.
+
+(defclass storage-handler () ())
+
+(defclass entity-storage-handler-mixin () ())
+
+
+(scl:defflavor database
+	(opening				; a.k.a. opening. The portal to the file.
+	 model-level-version			; Version of model level that made this db.
+	 schema-version-id-1			; Identifier of the version of the schema
+	 schema-version-id-2			;  cache.  If -id-1 is nil, then no encache
+	 schema-version-id-3			;  has been done yet.
+	 rid-of-header				; RID of the database-header record.
+	 (table-of-domains nil)			; Table of all domains in the database.
+	 (table-of-relations nil)		; Table of all relations in the database.
+	 (table-of-character-encodings nil)	; Table of all character encodings in db.
+	 (table-of-character-types nil)		; Inverse mapping of t-o-c-encodings
+	 (deleted-domains nil)			; Domain entities deleted during transaction.
+	 (deleted-relations nil)		; Likewise.
+	 (deleted-attributes nil)		; Likewise.
+	 uid-1					; uid-word-1 of domain-domain entity.
+	 uid-2					; uid-word-2
+	 uid-3					; uid-word-3
+	 (entity-flavors nil)			; Table of domain-handles and flav-names
+	 (package-lock				; Lock on package-structures.
+	   (process:make-lock "Statice Package Lock" :recursive t))
+	 (package-vector nil)			; Vector of packages that we've looked up.
+	 (package-name-vector nil)		; Names of above packages.
+	 (package-name-table nil)		; Inverse of package-name-vector.
+	 (known-entity-handles (cl:make-hash-table :test 'eql :ignore-gc t :locking nil
+						:gc-protect-values nil))
+						; table of all known entity-handles
+	 (known-entity-handles-lock		; lock for above
+	   (process:make-lock "Statice Known Entity Table" :recursive t)))
+	()
+  :initable-instance-variables
+  :writable-instance-variables)
+
+;;; This is included in all classes of handle.
+(defclass handle
+	  ()
+    ((rid :initarg :rid :accessor handle-rid)))	; RID of the record, or :deleted.  For an unknown-entity-handle, NIL. 
+
+(defclass tuple-handle
+	  (handle)
+    ((transaction-id :initform (transaction-id)
+		     :initarg :transaction-id
+		     :accessor tuple-handle-transaction-id)		; Transaction in which handle was created. 
+     (relation :initarg :relation :accessor tuple-handle-relation)))	; Relation handle.
+
+(defun make-tuple-handle (rid relation)
+  (make-instance 'tuple-handle :rid rid :relation relation))
+
+(defclass entity-handle
+	  (handle)
+    ((uid-word-1 :initarg :uid-word-1
+		 :accessor entity-handle-uid-word-1)
+     (uid-word-2 :initarg :uid-word-2
+		 :accessor entity-handle-uid-word-2)
+     (uid-word-3 :initarg :uid-word-3
+		 :accessor entity-handle-uid-word-3)))
+
+(defclass unknown-entity-handle                				;handle-rid is unused!  Could be in many segs.
+	  (entity-storage-handler-mixin storage-handler entity-handle)
+    ((db-uid-word-1 :initarg :db-uid-word-1
+		    :accessor unknown-entity-handle-db-uid-word-1)	; UID of the home database of the entity.
+     (db-uid-word-2 :initarg :db-uid-word-2
+		    :accessor unknown-entity-handle-db-uid-word-2)
+     (db-uid-word-3 :initarg :db-uid-word-3
+		    :accessor unknown-entity-handle-db-uid-word-3)))
+
+(defun make-unknown-entity-handle (rid uid-word-1 uid-word-2 uid-word-3
+				   db-uid-word-1 db-uid-word-2 db-uid-word-3)
+  (make-instance 'unknown-entity-handle
+		 :rid rid
+		 :uid-word-1 uid-word-1
+		 :uid-word-2 uid-word-2
+		 :uid-word-3 uid-word-3
+		 :db-uid-word-1 db-uid-word-1
+		 :db-uid-word-2 db-uid-word-2
+		 :db-uid-word-3 db-uid-word-3))
+
+(defclass known-entity-handle
+	  (entity-handle)
+    ((domain :initarg :domain :accessor known-entity-handle-domain)))	; Domain handle.
+
+(defun make-known-entity-handle (rid domain uid-word-1 uid-word-2 uid-word-3)
+  (make-instance 'known-entity-handle
+		 :rid rid
+		 :domain domain
+		 :uid-word-1 uid-word-1
+		 :uid-word-2 uid-word-2
+		 :uid-word-3 uid-word-3))
+
+(defclass domain-handle
+	  (entity-storage-handler-mixin storage-handler known-entity-handle)
+    ((database :initarg :database :accessor domain-handle-database)		; Database this domain resides in.
+     (name :initarg :name :accessor domain-handle-name)				; Name of this domain.
+     (list-of-parent-domains :initarg :list-of-parent-domains
+			     :accessor domain-handle-list-of-parent-domains)	; Domains from which this domain inherits.
+     (next-layout-version :initarg :next-layout-version
+			  :accessor domain-handle-next-layout-version)		; Next version number, NIL if no surrogates.
+     (new-layout-needed :initarg :new-layout-needed
+			:accessor domain-handle-new-layout-needed)		; Boolean, unused if no surrogates.
+     (system-domain-p :initarg :system-domain-p
+		      :accessor domain-handle-system-domain-p)			; T iff this is one of the system domains.
+     (relations-optimized-on :initarg :relations-optimized-on
+			     :accessor domain-handle-relations-optimized-on)	; Relations that surrogate-optimize here.
+     (allocation-map :initarg :allocation-map
+		     :accessor domain-handle-allocation-map)			; Description of layout of fixed space.
+     (group-indexed-attributes :initarg :group-indexed-attributes
+			       :accessor domain-handle-group-indexed-attributes); List, one element per group index, att-hand.
+     (area :initarg :area :accessor domain-handle-area)				; area number 1  n  *max-area-number*
+     (bset-iid :initarg :bset-iid :accessor domain-handle-bset-iid)))		; index-identifier of bset
+
+(defclass relation-handle
+	  (known-entity-handle)
+    ((database :initarg :database :accessor
+	       relation-handle-database)					; Database this relation resides in.
+     (name :initarg :name :accessor relation-handle-name)			; Name of this database.
+     (list-of-attributes :initarg :list-of-attributes
+			 :accessor relation-handle-list-of-attributes)		; List of attribute handles.
+     (list-of-indexes :initarg :list-of-indexes
+		      :accessor relation-handle-list-of-indexes)		; List of index handles.
+     (surrogate-optimized-on :initarg :surrogate-optimized-on
+			     :accessor relation-handle-surrogate-optimized-on)	; Attribute handle, NIL if normal
+     (next-layout-version :initarg :next-layout-version
+			  :accessor relation-handle-next-layout-version)	; Next version number, unused if surrogate.
+     (new-layout-needed :initarg :new-layout-needed
+			:accessor relation-handle-new-layout-needed)		; Boolean, unused if surrogate.
+     (allocation-map :initarg :allocation-map
+		     :accessor relation-handle-allocation-map)			; Description of layout of fixed space.
+     (system-relation-p :initarg :system-relation-p
+			:accessor relation-handle-system-relation-p)		; T iff this is one of the system relations.
+     (entity-bit-map-number :initarg :entity-bit-map-number
+			    :accessor relation-handle-entity-bit-map-number)	; Number in bit map, only if surrogate
+     (area :initarg :area :accessor relation-handle-area)			; area number 1  n  *max-area-number*
+     (bset-iid :initarg :bset-iid
+	       :accessor relation-handle-bset-iid)))				; index-identifier of bset
+
+(defclass attribute-handle
+	  (known-entity-handle)
+    ((relation :initarg :relation :accessor attribute-handle-relation)	; Relation this is an attribute of.
+     (name :initarg :name :accessor attribute-handle-name)		; Name of this attribute.
+     (type :initarg :type :accessor attribute-handle-type)		; Storage handler instance.
+     (descriptor :initarg :descriptor
+		 :accessor attribute-handle-descriptor)			; Descriptor word, NIL if surrogated on.
+     (layout-version :initarg :layout-version
+		     :accessor attribute-handle-layout-version)		; First version that we were in, nil if none.
+     (unique :initarg :unique :accessor attribute-handle-unique)	; No two tuple may have same value
+     (delete-nullifies :initarg :delete-nullifies
+		       :accessor attribute-handle-delete-nullifies)	; delete-entity semantics
+     (indexed :initarg :indexed :accessor attribute-handle-indexed)	; There's an index on this attribute alone.
+     (group-index-offset :initarg :group-index-offset
+			 :accessor attribute-handle-group-index-offset)	; NIL if no g. index, else offset in ent rec.
+     (group-index-layout-version :initarg :group-index-layout-version
+				 :accessor attribute-handle-group-index-layout-version)	; Like layout-version, for g-i-offset.
+     (group-index-average-size :initarg :group-index-average-size
+			       :accessor attribute-handle-group-index-average-size)	; expected average # elts in g-i
+     (no-nulls :initarg :no-nulls :accessor attribute-handle-no-nulls)))		; If true, null values are forbidden.
+
+(defclass index-handle
+	  (known-entity-handle)
+    ((relation :initarg :relation :accessor index-handle-relation)	; The relation being indexed.
+     (unique :initarg :unique :accessor index-handle-unique)		; T => no duplicates allowed.
+     (list-of-attributes :initarg :list-of-attributes
+			 :accessor index-handle-list-of-attributes)	; List of attribute handles, sorted by name.
+     (index-identifier :initarg :index-identifier
+		       :accessor index-handle-index-identifier)		; IID for Storage Level.
+     (index-depth :initarg :index-depth
+		  :accessor index-handle-index-depth)			; Current depth of the index
+     (case-sensitive :initarg :case-sensitive
+		     :accessor index-handle-case-sensitive)))		; NIL => case insensitive
+
+(scl:define-presentation-type entity-handle ()
+   :no-deftype t
+   :history t
+   :description "an entity handle"
+   :printer ((entity-handle stream &key acceptably)
+	     (if acceptably
+		 (cl:write (acceptable-string entity-handle) :stream stream)
+		 (sys:print-self entity-handle stream nil t)))
+   :parser ((stream)
+	    (let* ((pn (scl:accept 'fs:dbfs-pathname
+			       :stream stream
+			       :provide-default nil
+			       :additional-blip-chars '(#\space)
+			       :prompt nil))
+		   (fid (or (scl:symbol-value-in-instance pn 'dbfs:file-id)
+			    (sys:parse-ferror "Database has not been touched")))
+		   (db (cl:gethash fid *databases*)))
+	      (unless (dw:compare-char-for-accept (dw:read-char-for-accept stream) #\space)
+		(sys:parse-ferror "You must supply a value"))
+	      (or (cl:gethash (scl:accept 'statice-storage::rid :stream stream :prompt nil)
+			   (database-known-entity-handles db))
+		  (sys:parse-ferror "There is no such entity-handle")))))
+
+(defmethod acceptable-string ((entity-handle known-entity-handle))
+  (with-slots (rid) entity-handle
+    (with-standard-io-environment 
+      (format nil "~A ~A" (database-opening (home-database-of entity-handle)) rid))))
+
+(cl:defstruct (db-info (:type :list))
+  database
+  new-schema-version)
+
+
+(scl:defmethod (sys:print-self database) (stream cl:ignore slashify-p)
+  (if slashify-p
+      (sys:printing-random-object (self stream)
+	(format stream "Database ~S" opening))
+      (format stream "Database ~S" opening)))
+
+;;; print-object methods for the handles.
+
+(defmacro define-handle-printer (class (object-var stream-var) &body body)
+  `(defmethod print-object ((,object-var ,class) ,stream-var)
+     (sys:printing-random-object (,object-var ,stream-var)
+	,.body)))
+
+(define-handle-printer tuple-handle (handle stream)
+  (with-slots (relation rid) handle
+    (format stream "Tuple-Handle of ~A ~@\\presentation\\"
+	    (relation-handle-name relation)
+	    rid 'statice-storage::rid)))
+
+(define-handle-printer unknown-entity-handle (handle stream)
+  (with-slots (uid-word-1 uid-word-2 uid-word-3) handle
+    (format stream "Unknown-Entity-Handle ~O ~O ~O" uid-word-1 uid-word-2 uid-word-3)))
+
+(define-handle-printer known-entity-handle (handle stream)
+  (with-slots (domain rid) handle
+    (format stream "Entity-Handle of ~A ~@\\presentation\\"
+	    (domain-handle-name domain)
+	    rid 'statice-storage::rid)))
+
+(define-handle-printer domain-handle (handle stream)
+  (with-slots (name) handle
+    (format stream "Domain ~A" name)))
+
+(define-handle-printer relation-handle (handle stream)
+  (with-slots (name) handle
+    (format stream "Relation ~A" name)))
+
+(define-handle-printer attribute-handle (handle stream)
+  (with-slots (name relation) handle
+    (format stream "Attribute ~A of ~A" name (relation-handle-name relation))))
+
+(define-handle-printer index-handle (handle stream)
+  (with-slots (relation) handle
+    (format stream "Index on ~A" (relation-handle-name relation))))
+
+;;; Allocation maps.
+
+;;; Terminology: a word offset is always relative to the beginning of the record.
+;;; A bit offset is measured from the least significant bit.
+
+;;; There is one allocation map, or none at all yet, for each relation and
+;;; for each domain.  It says how the fixed space of the records of that
+;;; relation or domain are allocated.  start-word is the number of words in
+;;; the record before the beginning of the fixed space, and therefore the
+;;; word offset of the first word of fixed space.  end-word is the word
+;;; offset of the first word after the end of fixed space.
+
+;;; gap-table tells about available space in partially-allocated words.  The
+;;; key of the table is the word offset.  The value is a list of run
+;;; structures, one for each contiguous run of free space in the word.  Each
+;;; run has a run-start and a run-end, being the first and just-after-last
+;;; bit positions of the run.
+
+;;; If there is no table entry for a word, then the word is fully allocated. 
+;;; This is the most common case, and we want to save storage.  Note that
+;;; there is no way to represent a totally-empty word; that's because it
+;;; can't happen.
+
+;;; end-word-by-version is nil if it hasn't been computed yet.  Otherwise it
+;;; is a vector, indexed by version number, that says what the end-word of
+;;; the relation or domain used to be when that (the array index) was the
+;;; version.  Bit offsets of zero mean the least significant bit.
+
+
+;;; A contiguous run within a word of the fixed portion.
+(cl:defstruct (run (:type :list))
+  start
+  end)
+
+;;; The allocation map of a relation or domain.
+(scl:defflavor allocation-map
+	(start-word
+	 end-word
+	 (gap-table (cl:make-hash-table :size 10 :ignore-gc t :locking nil))
+	 (end-word-by-version nil))
+	()
+  (:initable-instance-variables start-word)
+  (:init-keywords :versions))
+
+(scl:defmethod (scl:make-instance allocation-map) (&key versions &allow-other-keys)
+  (setq end-word start-word)
+  (setq end-word-by-version (cl:make-array versions
+					:initial-element start-word
+					:fill-pointer versions)))
+
+;;; Protocol for Statice storage handlers.
+
+;;; Given an object, return T if it is of this type, NIL if it is not.
+(defgeneric statice-typep (handler value))
+
+(defmethod statice-typep :around ((handler storage-handler) value)
+  (if (eql value *null-value*)
+      t
+      (call-next-method handler value)))
+
+;;; The argument is a spec, from do-relation.  Return T if the spec is
+;;; compatible with this handler.  Otherwise, return NIL.  You only need
+;;; to supply this if the handler is comparable.
+(defgeneric check-spec (handler spec)
+  (:method ((handler entity-handle) spec)
+   (declare (ignore spec))
+   nil))
+
+;;; The argument is an operator from do-relation, a symbol such as >
+;;; or eql or string-not-greaterp.  Return T if this operator can be
+;;; used on this handler.  Otherwise, return NIL.   You only need
+;;; to supply this if the handler is comparable.
+(defgeneric check-operator (handler operator)
+  (:method ((handler entity-handle) operator)
+   (declare (ignore operator))
+   nil))
+
+;;; Returns two values.  The first is the amount of fixed space used by
+;;; fields of this handler, in bits.  The second value is the alignment,
+;;; expressed in bits; it means the the bit number at which the space
+;;; starts should be a multiple of this.  A second value of 0 is a
+;;; special case meaning word-aligned.  For example, a handler that means
+;;; thin-string-of-length-5 would return 40 8, to mean 40 bits (five
+;;; 8-bit bytes), aligned on a multiple of eight bits.  Most handlers,
+;;; which only want a single word, return 32 0.  The first value must be
+;;; positive.  The second value must be less than 32 and non-negative.
+(defgeneric fixed-space (handler)
+  (declare (values n-bits alignment)))
+
+;;; This is a rarely-used hook invoked by make-attribute.  It is called
+;;; whenever a new user attribute is being made.  The first argument is
+;;; a record addressor to the attribute record, in :write mode.  The
+;;; second argument is the no-nulls argument to make-attribute.  The
+;;; method can modify the attribute record at this point, but it had
+;;; better know what it is doing!  The returned value from the method
+;;; is ignored.
+(defgeneric make-attribute-hook (handler att no-nulls)
+  (:method ((handler storage-handler) att no-nulls)
+   (declare (ignore att no-nulls))))
+
+;;; Given a handler and a value, returns the number of variable
+;;; words the value would occupy.  If the value is a fat string, return
+;;; the transition table for the string to avoid scanning twice. 
+;;; Otherwise, second value is nil.
+(defgeneric size-of-value (handler value free database)
+  (declare (values size transition-table))
+  (:method ((handler storage-handler) value free database)
+   (declare (ignore value free database))
+   0))
+
+(defmethod size-of-value :around ((handler storage-handler) value free database)
+  (if (eq value *null-value*)
+      0
+      (call-next-method handler value free database)))
+
+;;; Return the number of words occupied by the variable portion of this
+;;; attribute value in this record.  Note that this is the amount of
+;;; space required in the record, not the amount required to put it into
+;;; the lisp world (this is only relevant to strings and fat strings).
+(defgeneric size-of-field (handler addressor descriptor)
+  (:method ((handler storage-handler) addressor descriptor)
+   (declare (ignore addressor descriptor))
+   0))
+
+;;; Only meaningful on arrays, strings, and symbols.  It means the
+;;; number of elements long the array is.  For symbols, this means the
+;;; print-name.  This is primarily for get-string-length, and it's used
+;;; internally by some of the other methods as well.
+(defgeneric length-of-array (handler addressor descriptor)
+  (:method ((handler storage-handler) addressor descriptor)
+   (declare (ignore addressor descriptor))
+   (error "Length-of-array called when it shouldn't have been")))
+
+;;; Return the word number of the first word of the variable portion, or
+;;; zero if there isn't any variable portion.
+(defgeneric start-of-field (handler addressor descriptor)
+  (:method ((handler storage-handler) addressor descriptor)
+   (declare (ignore addressor descriptor))
+   0))
+
+;;; Read the value, which is of the given handler, from the addressed
+;;; record, according to the descriptor.  Remember to check version
+;;; numbers before you call this!  Can return *null-value*.  into-string
+;;; allows for preallocating the string (if you know its length) to save
+;;; some consing.  stack-cons-if-appropriate cause the returned value
+;;; to be stack consed.  Caller must bind the data stack.
+(defgeneric read-value (handler addressor descriptor database &key into-string stack-cons-if-appropriate))
+
+;;; Special entrypoint for vector datatypes which only reads a portion
+;;; of the array out.
+(defgeneric read-value-portion (handler addressor descriptor database
+					&key start end into into-start)
+  (:method ((handler storage-handler) addressor descriptor
+	    database &key start end into into-start)
+   (declare (ignore addressor descriptor database start end into into-start))
+   (error "READ-VALUE-PORTION was called on a type that it shouldn't have been called on")))
+
+;;; Analogous to read-value-portion
+(defgeneric set-value-portion (handler addressor descriptor database
+				       &key start end from from-start)
+  (:method ((handler storage-handler) addressor descriptor
+	    database &key start end from from-start)
+   (declare (ignore addressor descriptor database start end from from-start))
+   (error "SET-VALUE-PORTION was called on a type that it shouldn't have been called on")))
+
+;;; Return T if this storage handler is capable of representing
+;;; entities, NIL if it is is not capable.  This is used for type
+;;; compatibility checking in joins, and to find "hot" attributes during
+;;; deletion.
+(defgeneric entity-type-p (handler)
+  (:method ((handler storage-handler)) nil))
+
+;;; Return T if this is the handler for the string type, otherwise NIL. 
+;;; This is mainly for operations that are only legal on strings, like
+;;; get-string-length.
+(defgeneric string-type-p (handler)
+  (:method ((handler storage-handler)) nil))
+
+;;; Same as string-type-p only for vectors of things.
+(defgeneric array-type-p (handler)
+  (:method ((handler storage-handler)) nil))
+
+;;; Map over the lines in the value.  This applies to string values
+;;; only, and all others will just return nil.  Returns nil when all
+;;; done.  Continuation is called once for each string in the value as
+;;; delimter by delimiter.  create-function is called to create the
+;;; string which the substring is to be read into.  thin-p indicates
+;;; whether the value is short or fat.
+(defgeneric map-over-subvalues
+	    (handler addressor descriptor database delimiter continuation create-function)
+  (:method ((handler storage-handler) addressor descriptor database delimiter continuation create-function)
+   (declare (ignore addressor descriptor database delimiter continuation create-function))
+   (model-bug "map-over-subvalues called for non-string storage handler")))
+
+;;; Write the value, which is of the given handler, into the addressed
+;;; record, according to the descriptor.  free is the first free word to
+;;; use.  database is the database that we're storing into.  Return the
+;;; new value of free.  Remember to upgrade the record before you call
+;;; this!  You can pass in *null-value*, in which case free and database
+;;; are ignored.  The addressor must be in :write mode.
+;;; transition-table is the transition table for fat strings, nil for
+;;; any other handler.  size is the number of words needed to write value,
+;;; as obtained from size-of-value.
+(defgeneric write-value (handler value addressor descriptor free database transition-table size))
+
+;;; If value is equal to the value stored in the addressed record, then
+;;; return T, else NIL.  Remember to check version numbers before you
+;;; call this!  If value is the null value, return NIL in all cases.
+(defgeneric value-equal (handler addressor descriptor value database))
+
+(defmethod value-equal :around ((handler storage-handler) addressor descriptor value database)
+  (unless (eql value *null-value*)
+    (call-next-method handler addressor descriptor value database)))
+
+;;; If the values stored in the two records are equal, return T, else
+;;; return NIL.  If either value is the null value, return NIL.  It's
+;;; required that the two addressors point to records representing
+;;; tuples from the same relation, and hence the same database.
+(defgeneric record-equal (handler addressor-1 addressor-2 descriptor-1 descriptor-2))
+
+;;; If the value is a null value, return T, else return NIL.  This could
+;;; always be done with read-value, but this helps to avoid consing and
+;;; is otherwise somewhat faster.
+(defgeneric value-null-p (handler addressor descriptor))
+
+;;; If case matters during a compare operation, then
+;;; case-insensitive-type-p should return nil.  Every type has
+;;; to implement this, but most just inherit from storage-handler.
+;;; (The method for strings is in datatypes.lisp)
+(defgeneric case-insensitive-type-p (handler)
+  (:method ((handler storage-handler)) t)
+  (:method ((handle known-entity-handle)) t))
+
+
+;;; If it is meaningful to compare two values of this handler, return T.
+;;; Otherwise return NIL.  If the value is T, then the handler must
+;;; provide methods for value-compare, record-compare, check-spec, and
+;;; check-operator.  If you don't supply a method, the default is NIL.
+(defgeneric comparable-p (handler)
+  (:method ((handler storage-handler)) nil))
+
+;;; Compare the value stored in the record to the value supplied as an
+;;; argument.  If record is less than the value supplied, :lessp is
+;;; returned.  Likewise for greater/:greaterp.  :equal is returned if
+;;; they are equal.  Just like record-compare, only second object for
+;;; comparison is a supplied value instead of from a record.  If the
+;;; record's value is the null-value then *null-value* is returned.
+(defgeneric value-compare (handler addressor descriptor value database &key case-sensitive))
+
+;;; If the value stored in the first record is less than the value
+;;; stored in the second record, return :lessp.  If greater, return
+;;; :greaterp.  If equal, return :equal.  Null values are considered to
+;;; be greater than all other values, and two null values are equal to
+;;; each other.  This generic function is only defined for handlers that
+;;; are comparable-p (see above); the caller has to check!
+(defgeneric record-compare (handler addressor-1 addressor-2 descriptor-1 descriptor-2 database-1 database-2))
+
+
+;;; The caller has moved all of the variable words associated with this
+;;; descriptor forward by added-n-fixed-words words, within the record.
+;;; Adjust the contents of the fixed words to point to the new place.
+;;; Note: some of these methods have to be careful to act specially when
+;;; the stored value is the null value, which occupies no words.  addressor
+;;; must be in :write mode.
+(defgeneric adjust-variable-words (handler addressor descriptor added-n-fixed-words)
+  (:method ((handler storage-handler) addressor descriptor added-n-fixed-words)
+   (declare (ignore addressor descriptor added-n-fixed-words))
+   nil))
+
+;;; Consider that value that read-value would return, given this
+;;; addressor and descriptor.  Print the dumper printed representation of
+;;; that value onto the stream.  There are two special cases.  The
+;;; addressor can be NIL, which means the method should print the
+;;; representation of the null value.  The addressor can be an integer,
+;;; which means that the attribute was the soo-att and this value is the
+;;; implicily-stored entity, and the integer is the rid of the entity
+;;; record.  The latter special case, of course, can't happen for value
+;;; types, so most methods can freely ignore it.
+(defgeneric format-data-internal (handler addressor descriptor stream database))
+
+;;; value is a Lisp object that was read from dumper printed representation in
+;;; a file.  Return the Statice Lisp representation to be given to make-tuple,
+;;; except return t as the second value if it's the null value.  If the value
+;;; is the null value, and this is one of those types in which nil works as
+;;; the null value in initialization, then it's OK to just return nil and not
+;;; bother with the second value.  The entity-handle-table argument is only
+;;; used for unformatting entities: keys to the table are integer rid values,
+;;; and values of the table are entity handles.
+(defgeneric unformat-data (storage-handler value entity-handle-table)
+  (declare (values value value-null-p)))
+
+;;; type can store nil as a real value (i.e. nil does not mean
+;;; null value for a type)
+(defgeneric nil-is-valid-value (handler)
+  (:method ((handler storage-handler)) nil))
+
+;;; The argument is the value as it appears externally.  Return the
+;;; internal representation.
+(defgeneric statice-type:encode-value (handler value))
+
+;;; The argument is the value as it appears internally.  Return the
+;;; external representation.
+(defgeneric statice-type:decode-value (handler value))
+
+;;; Same as fixed-space: return two values, the amount of fixed
+;;; space and the alighment.  See fixed-space for details.
+(defgeneric statice-type:fixed-space (handler))
+
+;;; Return the number of variable words the value would occupy.
+(defgeneric statice-type:size-of-value (handler value))
+
+(defgeneric statice-type:read-value (handler addressor word-offset n-words-or-bit-offset))
+
+(defgeneric statice-type:value-equal
+	    (handler value addressor word-offset n-words-or-bit-offset))
+
+(defgeneric statice-type:record-equal
+	    (handler addressor-1 word-offset-1 n-words-or-bit-offset-1
+		     addressor-2 word-offset-2 n-words-or-bit-offset-2))
+
+(defgeneric statice-type:value-null-p (handler addressor word-offset n-words-or-bit-offset))
+
+(defgeneric statice-type:write-value
+	    (handler value addressor word-offset n-words-or-bit-offset))
+
+(defgeneric statice-type:value-compare
+	    (handler value addressor word-offset n-words-or-bit-offset))
+
+(defgeneric statice-type:record-compare
+	    (handler addressor-1 word-offset-1 n-words-or-bit-offset-1
+		     addressor-2 word-offset-2 n-words-or-bit-offset-2))
+
+;;; Utility definitions
+
+;;; Make an art-fixnum 1-d array on the data stack.  This is a little
+;;; function of its own mainly to hide the internalish stuff.
+(defsubst make-stack-vector (n-words)
+  (si:make-stack-array n-words :type 'zl:art-fixnum))
+
+;;; A 32 bit stream which just writes to an array
+(scl:defflavor array-writing-byte-32-stream
+	(buffer)
+	())
+
+(scl:defmethod (:element-type array-writing-byte-32-stream) ()
+  '(unsigned-byte 32))
+
+(scl:defmethod (initialize-array-writing-stream array-writing-byte-32-stream) (array)
+  (setq buffer array))
+
+(scl:defmethod (:get-output-buffer array-writing-byte-32-stream) ()
+  (values buffer 0 (zl:array-length buffer)))
+
+(scl:defmethod (:advance-output-buffer array-writing-byte-32-stream) (&rest cl:ignore)
+  nil)
+
+(scl:defmethod (:tyo array-writing-byte-32-stream) (cl:ignore) nil)
+
+(defresource array-writing-byte-32-stream ()
+  :constructor (scl:make-instance 'array-writing-byte-32-stream))
+
+;;; Three kinds of tables.  Always with :locking nil.
+(defresource tables ()
+  :constructor (cl:make-hash-table :locking nil)
+  :initial-copies 2
+  :initializer (clrhash object))
+
+;;; A complex sort/join is one in which the :order-by specs for any
+;;; given relation are seperated by one or more specs from another
+;;; relation.  If the attributes of a relation are all grouped together,
+;;; then we can sort the rids of that relation by the group of
+;;; attributes and then take the cross product.  For example,
+;;;
+;;;      (:order-by (r1.att1 dir) (r1.att2 dir) (r2.att1 dir) (r2.att2)
+;;;
+;;; is not complex, but
+;;;
+;;;      (:order-by (r1.att1 dir) (r2.att1 dir) (r1.att2 dir) (r2.att2)
+;;;
+;;; is.  In the complex case, we have to create vectors, one for each
+;;; relation involved in the join, which when accessed as rows in a
+;;; table (the columns of which are the individual vectors) form the
+;;; cross product (i.e. the join).  Then, we sort the table by the
+;;; :order-by specs given.  We can improve on the total sort a little
+;;; by creating the table as "chunks".  The chunks are determined by
+;;; sorting each of relations by the first group of attributes in the
+;;; :order-by which apply to that relation.  The rest are then applied
+;;; to the chunks.
+;;;
+;;; The table arrays are taken from the following resource.
+
+(defresource complex-join-tuple-vector ()
+  :initial-copies 5
+  :constructor (cl:make-array 1000 :fill-pointer 0)
+  :initializer (cl:setf (fill-pointer object) 0))
+
+;;; Used for complex joins.  This is used to cache information about
+;;; attributes in the :order-by specs.  We have to cache this since
+;;; the attribute might be from different relations and databases.  It
+;;; seems that this is faster than reaccessing the iv's of the
+;;; attribute-handle each time (3 usecs vs 17.5 usecs), although that
+;;; doesn't take into account the time to cons/allocate/deallocate one
+;;; of these.  I honestly don't know if this is worth the trouble. 
+(cl:defstruct (attribute-info-cache (:type :array) (:conc-name aic-))
+  attribute
+  last-rid
+  type
+  soo-att
+  database
+  opening)
+
+;;; A resource of these caches.
+(defresource attribute-info-cache ()
+  :initial-copies 1
+  :constructor (make-attribute-info-cache))
+
+;;; Macros to abstract out the iteration over database-tables.
+(defmacro do-domains ((var database) &body body)
+  (let ((key (cl:gensym)))
+    `(block nil
+       (maphash #'(cl:lambda (,key ,var)
+		    (declare (cl:ignore ,key))
+		    . ,body)
+		(database-table-of-domains ,database)))))
+
+(defmacro do-relations ((var database) &body body)
+  (let ((key (cl:gensym)))
+    `(block nil
+       (maphash #'(cl:lambda (,key ,var)
+		    (declare (cl:ignore ,key))
+		    . ,body)
+		(database-table-of-relations ,database)))))
+
+;;; Macro for iterating over the descendents of a domain.
+(defmacro do-children ((var ancestor-domain database) &body body &environment env)
+  (let ((key (gensym)))
+    (scl:once-only (ancestor-domain &environment env)
+      `(block nil
+	 (maphash #'(lambda (,key ,var)
+		      (declare (ignore ,key))
+		      (when (child-of-p ,ancestor-domain ,var)
+			. ,body))
+		  (database-table-of-domains ,database))))))
+
+;;; Save a few microseconds from gethash.
+(defsubst fast-gethash (key table)
+  (cli::fast-table-get table key))
+
+;;; Save a great deal of time in clrhash when there's a good
+;;; chance that the table is empty.
+(defsubst fast-clrhash (table)
+  (when (plusp (hash-table-count table))
+    (clrhash table)))
+
+;;; Save a great deal of time in maphash when there's a good
+;;; chance that the table is empty.
+(defsubst fast-maphash (function table)
+  (when (plusp (hash-table-count table))
+    (maphash function table)))
+
+(defsubst fast-string= (x y)
+  (sys:%string= x 0 y 0 nil))
+
+(defun string-really-fat-p (string)
+  (when (scl:string-fat-p string)
+    (let ((string string))
+      (declare (sys:array-register string))
+      (cl:dotimes (i (string-length string))
+	(when (scl:char-fat-p (aref string i))
+	  (return t))))))
+
+;;; Mapping from function level rev canonical operators into
+;;; their inverses.
+;;; Note that *operator-info* is now encompassed into this list.  What that
+;;; means is that if an op is a rev-op, it should be on this list, and if it's
+;;; not, then it shouldn't.
+(defparameter *operator-inverse*
+	      '((eq . eq) (eql . eql) (equal . equal)
+		(= . =) (< . >) (> . <) ( . ) ( . ) (<= . >=) (>= . <=)
+		(string= . string=) (string-equal . string-equal)
+		(string< . string>) (string> . string<)
+		(string . string) (string . string)
+		(string<= . string>=) (string>= . string<=)
+		(string-lessp . string-greaterp)
+		(string-greaterp . string-lessp)
+		(string-not-lessp . string-not-greaterp)
+		(string-not-greaterp . string-not-lessp)
+		(char= . char=) (char-equal . char-equal)
+		(char< . char>) (char> . char<)
+		(char . char) (char . char)
+		(char<= . char>=) (char>= . char<=)
+		(char-lessp . char-greaterp) (char-greaterp . char-lessp)
+		(char-not-lessp . char-not-greaterp) (char-not-greaterp . char-not-lessp)))
+
+;;; These functions and flavors are used to report conditions to the
+;;; client, which we think may be interpreted as errors at the client's
+;;; level of abstraction.  Obviously we cannot know.  For example,
+;;; perhaps the client was fully expecting that a "duplicate key"
+;;; condition might be signalled.  Such conditions are part of the
+;;; contract of model level, and some of these flavor names are
+;;; therefore exported symbols.
+
+;;; Errors in which model level detects an internal inconsistency are
+;;; reported using the model-bug function above.  These are errors at
+;;; our own level of abstraction, so we know for sure that they are
+;;; errors.  They are not part of the contract of model level.
+
+;;; This is the basic flavor on which all model level contractual errors
+;;; are built.  This is an external symbol.
+(scl:defflavor model-error () (cl:error))
+
+;;; This is an internal function that model level uses to signal errors
+;;; that aren't of any particularly interesting flavor.  Please note
+;;; that if we change our minds, and decide that some error is rather
+;;; intersting after all, then we can change to signalling a flavor
+;;; built on model-error and such a change is upward-compatible, because
+;;; the symbol model-ferror is explicitly NOT exported.
+(defun model-error (format-string &rest args)
+  (declare (dbg:error-reporter))
+  (cl:error (scl:make-condition 'model-ferror
+			 :format-string format-string :format-args (cl:copy-seq args))))
+
+;;; Flavor used for signalling boring errors.  See comment at the
+;;; model-error function for philosophy of flavor organization.
+(scl:defflavor model-ferror
+	(format-string
+	 format-args)
+	(model-error)
+  :initable-instance-variables
+  :gettable-instance-variables
+  (:required-init-keywords :format-string :format-args))
+
+(scl:defmethod (dbg:report model-ferror) (stream)
+  (apply #'format stream format-string format-args))
+
+(scl:defflavor uniqueness-violation
+	(relation-handle
+	 (attribute-handle nil)
+	 (index-handle nil)
+	 verb)
+	(model-error)
+  :initable-instance-variables
+  (:readable-instance-variables
+   relation-handle attribute-handle))
+
+(scl:defmethod (uniqueness-violation-attribute-handles uniqueness-violation) ()
+  (cl:if (null index-handle)
+      (list attribute-handle)
+      (cl:copy-list (index-handle-list-of-attributes index-handle))))
+
+(scl:defmethod (dbg:report uniqueness-violation) (stream)
+  (format stream "There was an attempt to ~A a tuple in relation \"~A\",~@
+                  but some other tuple already has the same "
+	  verb
+	  (relation-handle-name relation-handle))
+  (let ((index-atts (cl:if index-handle (index-handle-list-of-attributes index-handle))))
+    (cond ((or (null index-handle) (= (length index-atts) 1))
+	   (format stream "attribute-value for the \"~A\" attribute"
+		   (attribute-handle-name (cl:if index-atts
+					      (first index-atts)
+					      attribute-handle))))
+	  (t
+	   (format stream "set of attribute-values for attributes ")
+	   (scl:format-textual-list
+	     (index-handle-list-of-attributes index-handle)
+	     #'(cl:lambda (a stream) (princ (attribute-handle-name a) stream))
+	     :conjunction "and"
+	     :stream stream)))))
+
+(scl:defflavor foreign-entity-deleted
+	(referencing-database
+	 home-database)
+	(model-error)
+  :initable-instance-variables)
+
+(scl:defmethod (dbg:report foreign-entity-deleted) (stream)
+  (format stream "A foreign entity referenced in database ~S was deleted from database ~S"
+	  referencing-database
+	  home-database))
+
+(scl:defflavor entity-handle-deleted
+	(entity-handle)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report entity-handle-deleted) (stream)
+  (format stream "The entity handle ~S has been deleted" entity-handle))
+
+(scl:defflavor entity-handle-not-committed
+	(entity-handle)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report entity-handle-not-committed) (stream)
+  (format stream
+	  "There was an attempt to use entity handle ~S~@
+           ~:[from database ~A,~@
+           ~]but no entity exists because the transaction that
+           created this entity handle was aborted."
+	  entity-handle
+          (typep entity-handle 'known-entity-handle)
+          (database-opening 
+	    (domain-handle-database (known-entity-handle-domain entity-handle)))))
+
+(scl:defflavor database-deleted
+	(pathname)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report database-deleted) (stream)
+  (format stream "The database in file ~S has been deleted" pathname))
+
+(scl:defflavor database-terminated
+	(function time)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report database-terminated) (stream)
+  (format stream "The database was terminated by ~S at " function)
+  (time:print-universal-time time stream))
+
+(scl:defflavor domain-not-found
+	(database
+	 name)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report domain-not-found) (stream)
+  (format stream "The domain ~S was not found in database ~A" name database))
+
+(scl:defflavor relation-not-found
+	(database
+	 name)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report relation-not-found) (stream)
+  (format stream "The relation ~S was not found in database ~A" name database))
+
+(scl:defflavor attribute-not-found
+	(relation
+	 name)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report attribute-not-found) (stream)
+  (format stream "The attribute ~S was not found in relation ~A" name relation))
+
+(scl:defflavor index-not-found
+	(relation
+	 attribute-handles
+	 case-sensitive)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report index-not-found) (stream)
+  (format stream "An index on attributes ")
+  (format:print-list stream "~A " attribute-handles)
+  (format stream "with case-sensitivity ~S was not found in relation ~A"
+	  case-sensitive relation))
+
+(scl:defflavor domain-already-exists
+	(database
+	 name)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report domain-already-exists) (stream)
+  (format stream "The domain ~S already exists in database ~A" name database))
+
+(scl:defflavor relation-already-exists
+	(database
+	 name)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report relation-already-exists) (stream)
+  (format stream "The relation ~S already exists in database ~A" name database))
+
+(scl:defflavor attribute-already-exists
+	(relation
+	 name)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report attribute-already-exists) (stream)
+  (format stream "The attribute ~S already exists in relation ~A" name relation))
+
+(scl:defflavor index-already-exists
+	(relation
+	 attribute-handles
+	 case-sensitive)
+	(model-error)
+  :initable-instance-variables
+  :readable-instance-variables)
+
+(scl:defmethod (dbg:report index-already-exists) (stream)
+  (format stream "An index on attributes ")
+  (format:print-list stream "~A " attribute-handles)
+  (format stream "with case-sensitivity ~S already exists on relation ~A"
+	  case-sensitive relation))
+
+(scl:defflavor wrong-type-value
+	(value
+	 storage-handler)
+	(model-error)
+  :initable-instance-variables
+  (:readable-instance-variables value))
+
+(scl:defmethod (dbg:report wrong-type-value) (stream)
+  (let ((entity-type-p (typep storage-handler 'entity-handle)))
+    (cond ((and entity-type-p
+		(typep value 'known-entity-handle)
+		(string-equal (domain-handle-name storage-handler)
+			      (domain-handle-name (known-entity-handle-domain value)))
+		(not (eq (domain-handle-database storage-handler)
+			 (domain-handle-database (known-entity-handle-domain value)))))
+	   (format
+	     stream
+	     "The value ~S is not of type ~S~@
+              because they are from different databases.  Perhaps ~S~@
+              is an entity handle left around in your world after you recreated~@
+              your database."
+	     value storage-handler value))	   
+	  (t
+	   (format stream "The value ~S is not of type ~S"
+		   value
+		   (cl:if entity-type-p
+		       storage-handler
+		       (value-storage-handler-original-presentation-type storage-handler)))))))
+
+(scl:defflavor not-inside-transaction () (model-error))
+
+(scl:defmethod (dbg:report not-inside-transaction) (stream)
+  (write-string "Attempt to call Statice from outside of a transaction" stream))
+
+;;; error flavor to signal when we're in restart-testing mode
+(scl:defflavor restart-testing-restartable-abort () (dbfs:restartable-transaction-abort))
+
+(scl:defmethod (dbg:report restart-testing-restartable-abort) (stream)
+  (write-string "A restart-testing mode restartable-abort was signalled." stream))
+
+(scl:defflavor symbol-package-not-found (print-name) (sys:package-not-found)
+  (:initable-instance-variables print-name)
+  (:readable-instance-variables print-name))
+
+(scl:defmethod (symbol-package-not-found-package-name symbol-package-not-found) ()
+  si:name)
+
+(scl:defmethod (:report symbol-package-not-found) (stream)
+  (format stream "Attempt to intern ~A::~A, but~@
+                  ~A is not meaningful as a package name~@[ relative to ~a~]."
+	  si:name print-name si:name si:relative-to))
+
+;;; Same as the inherited one but with an improved prompt message.
+(scl:defmethod (:proceed symbol-package-not-found :new-name)
+	   (&optional (new-name (scl:prompt-and-accept 'string
+						   "Package name to use instead of ~A: "
+						   si:name)))
+  "Supply a different package name to use instead."
+  (values ':new-name (string-trim " " new-name)))
+

@@ -1,0 +1,1218 @@
+;; -*- syntax: common-lisp; Base: 10.; Package: btree; Mode: LISP -*-
+
+;;; (c) Copyright Gavan Duffy, 1985-1991.
+;;;     All Rights Reserved
+
+(in-package :btree)
+
+;;; BALANCING BINARY TREES
+
+(eval-when (load eval)
+  (pushnew :btree *features*))		    
+
+;;; MAJOR FEATURES:
+
+;;; Mix BTREE into any object and your instantiated flavor objects will be
+;;; able to relate to each other as nodes in a binary tree.  The objects
+;;; themselves are the nodes in the tree.
+
+;;; If the special variable *BALANCE-BTREES-ON-INPUT* is non-null (the
+;;; default), then the trees will balance themselves on input using the AVL
+;;; algorithm.   The AVL algorithm runs in constant time, producing a slightly
+;;; suboptimally balanced tree.  This ensures that storage and access in the
+;;; tree will run approximately in logarithmic time.
+
+;;; At any time, whether or not *BALANCE-BTREES-ON-INPUT* is null, you may
+;;; evaluate the BALANCE generic function on the root of the tree.  This will
+;;; produce an optimally balanced tree, but in the worst case it runs in time
+;;; proportional to the size of the tree.
+
+;;; The special variable *PREDICATE-FOR-COMPARING-BTREE-NODES* should be bound
+;;; during any interaction with the BTREEs (except for EXTRACTION) to the
+;;; predicate you want to use for comparing names.   Defaultedly, it's bound
+;;; to #'LESSP.  Use the macro WITH-PREDICATE-FOR-COMPARING-BTREE-NODES to
+;;; bind it in the dynamic scope of BODY.
+
+;;; EXTRACTION is performed by unwinding the trees in the usual manner.  The
+;;; objects themselves are returned.  Evaluate the EXTRACT generic function on
+;;; the ROOT of the tree to extract the whole tree.  REVERSE-EXTRACT does it
+;;; in reverse.  EXTRACT-HIGHER-THAN-YOURSELF and EXTRACT-LOWER-THAN-YOURSELF
+;;; perform extraction with SELF as a lower and upper boundary, respectively.
+
+;;; VALUE-EXTRACT extracts the value of the generic function
+;;; EXTRACTION-FUNCTION applied to nodes with EXTRACTION-ARGUMENTS.  If the
+;;; generic function TEST-FUNCTION is supplied, this will only happen to nodes
+;;; for which TEST-FUNCTION, with TEST-ARGUMENTS returns a non-null value."
+
+;;; APPLY-TO-NODES walks the tree and applies the value of the generic
+;;; function APPLICATION-FUNCTION with APPLICATION-ARGUMENTS.  If the generic
+;;; function TEST-FUNCTION is supplied, this will only happen to nodes for
+;;; which TEST-FUNCTION, with TEST-ARGUMENTS, is non-null.  APPLY-TO-NODES has
+;;; two additional arguments, MINIMUM-VALUE and MAXIMUM-VALUE.  These specify
+;;; the range of the tree over which the procedure walks.  If neither is
+;;; supplied, the entire tree is walked.
+
+;;; BTREE-FIND allows you to find a particular value in the tree (in logN
+;;; time).  It returns the node found with that value, or NIL if it's not
+;;; there.
+
+;;; To STORE a node, use STORE.  Its arguments are a node already in the tree
+;;; (best if this is the root), the node you want to store, the name of the
+;;; node you want to store and, optionally, the comparison predicate (this
+;;; defaults to the value of *PREDICATE-FOR-COMPARING-BTREE-NODES*).  Note
+;;; that you have to create the node before storing it.  This can create
+;;; problems if a node with that name already exists in the tree.  If this is
+;;; the case, the two nodes are said to "collide".  The variable
+;;; *BTREE-NODE-COLLISION-CONDITION* controls what happens when nodes collide.
+;;; Defaultedly, the value of *BTREE-NODE-COLLISION-CONDITION* is :REPLACE.
+;;; In this case, the existing node is replaced by the new node.
+;;; Alternatively, using the macro, WITH-BTREE-NODE-COLLISION-CONDITION you
+;;; can specify a generic function to funcall when nodes collide.  This
+;;; function is called on the existing node with the new node and the
+;;; predicate as additional arguments.
+
+;;; Another way of avoiding collision is to do BTREE-FIND of the name of the
+;;; node you wish to store prior to storage.  You can also do this prior to
+;;; creating the new node, so this option is often preferable.
+
+;;; RETRACT retracts a node from the tree, keeping the tree in balance.  it
+;;; returns two values, the new root of the tree (it may have changed due to
+;;; balance or due to retraction of the root) and the node that was retracted.
+
+;;; Note that STORE, BALANCE, and RETRACT always returns the root of the tree.
+;;; It is your responsibility to maintain a pointer to this root, and you
+;;; should set it whenever you perform one of these operations.
+
+;;; This code has been pretty thoroughly tested.  But in the unlikely event of
+;;; bugs, please report them to Gavan@CMX.NPAC.SYR.EDU
+
+(defmethod set-values
+	   ((self basic-btree) parent left-child right-child node-depth 
+	    number-lower number-higher h-lower h-higher)
+  (with-slots (up left right depth n-lower n-higher height-lower
+		  height-higher) self
+    (setf up parent
+	  left left-child 
+	  right right-child 
+	  depth node-depth 
+	  n-lower number-lower
+	  n-higher number-higher 
+	  height-lower h-lower 
+	  height-higher h-higher)))
+
+#+genera
+(defmacro with-area (area &body body)
+  `(let ((*default-cons-area* ,area))
+     . ,body))
+
+#-genera
+(defmacro with-area (area &body body)
+  `(progn ,area . ,body))
+
+#+genera
+(defvar working-storage-area sys:working-storage-area)
+
+#-genera
+(defvar working-storage-area nil)
+
+
+;;;-------------------------------------------------------------------
+;;;
+;;; For different applications, the predicate for comparing btree nodes will
+;;; differ.   Here is a facility which provides (a) a special variable on
+;;; which to store the predicate (b) a functional interface to the variable,
+;;; and (c) a macro-surrounding-code for binding the predicate within the
+;;; dynamic scope of the body.
+;;;
+
+(defvar *predicate-for-comparing-btree-nodes* #'<
+  "The predicate used to compare two nodes in the BTREE-MIXIN.")
+
+
+(defun predicate-for-comparing-btree-nodes ()
+  "Returns the predicate used to compare two nodes in the BTREE-MIXIN."
+  *predicate-for-comparing-btree-nodes*)
+
+
+(defmacro with-predicate-for-comparing-btree-nodes (predicate &body body)
+  "Binds PREDICATE as The predicate used to compare two nodes in the BTREE-MIXIN
+within the dynamic scope of BODY."
+  `(let ((*predicate-for-comparing-btree-nodes* ,predicate))
+     . ,body))
+
+
+
+;;;-------------------------------------------------------------------
+;;; N-DIMENSIONAL-BTREE-MIXIN METHODS:
+;;;
+;;; Here are some primitive methods for the N-DIMENSIONAL-BTREE-MIXIN.
+;;; Note that they are all defined on the BASIC-N-DIMENSIONAL-BTREE-MIXIN
+;;; flavor which is inherited by the BTREE-MIXIN.
+;;;
+;;; Let's start with the :INIT method.  It gets the NAMEs of
+;;; the instance and its INDEX and POINTER structures.
+;;; The we'll follow with messages that simply put and fetch
+;;; data in the structures.
+;;;
+;;; The following methods should NEVER be sent to SELF.
+;;; Instead, it's faster to invoke the SUBSTs.
+
+;;;-------------------------------------------------------------------
+;;;
+;;;  STORING A NODE IN THE BTREE:
+;;;
+;;;  Any NODE may store any other NODE.
+;;;  
+;;;  If the current node is the incorrect node for storage, the :STORE message
+;;;  is sent recursively to the better candidate.
+;;;
+
+(defvar *balance-btrees-on-input* t
+  "When non-null, BTREEs will be balance whenever a node is stored.")
+
+(defvar *performing-optimal-balance* nil
+  "Non null when performing an optimal balance.")
+
+(defmacro with-btree-balance (balance-p &body body)
+  "If non-null, BTREEs will balance on input. Otherwise, they won't."
+  `(let ((*balance-btrees-on-input* ,balance-p))
+     . ,body))
+
+(defmacro with-optimal-btree-balance (&body body)
+  "Suboptimal balancing is turned off within the scope of BODY."
+  `(let ((*performing-optimal-balance* t))
+     . ,body))
+
+;;; In (BASIC-BTREE-MIXIN :$STORE-HERE), we increment by the total progeny
+;;; because, at intern time, this is zero, but at balance time, it may not be.
+;;; Incrementing by the total progeny ensures the veracity of the indices.
+						
+(defmethod $store-here ((self basic-btree) node direction)
+  "Stores NODE immediately below SELF.  Direction is either :RIGHT or :LEFT."
+  (with-slots (left n-lower height-lower right n-higher
+		    height-higher depth up) self
+    (let ((progeny ($n-of-progeny node)))	;progeny = 0, if a new node.
+      (ecase direction
+	(:left
+	  (setf left node
+		n-lower (+ n-lower (1+ progeny))
+		height-lower (if (zerop progeny) 1 (1+ (maximum-height node)))))
+	(:right
+	  (setf right node
+		n-higher (+ n-higher (1+ progeny))
+		height-higher (if (zerop progeny) 1 (1+ (maximum-height node))))))
+      (setf (btree-up node) self
+	    (btree-depth node) (1+ depth))
+      ;;There's no need to (inefficiently) propagate depth downward at balance
+      ;;time, because nodes below the node being reinterned will adjust their
+      ;;depths just before they balance.  So long as the process isn't aborted
+      ;;during the balance, the tree will be consistent when the stack unwinds.
+      ;;So we'll do it without-interrupts, dangerously.
+      (when up
+	#+genera
+	(without-interrupts
+	  ($increment-from-below up self (1+ progeny) (1+ (maximum-height self))))
+	#-genera
+	($increment-from-below up self (1+ progeny) (1+ (maximum-height self)))))
+    (when (and *balance-btrees-on-input* (not *performing-optimal-balance*))
+      ($input-balance node))
+    node))
+
+(defmethod store
+	   ((self basic-btree) node node-name
+	    &optional (predicate (predicate-for-comparing-btree-nodes)))
+  "Stores NODE in the BTREE according to PREDICATE."
+  (let ((root (root self)))			;always store from the root.
+    (root ($store-1 root node node-name predicate))))	;always return the new root.	
+       
+(defvar *btree-nodes-collision-condition* :replace
+  "If this variable is bound to :REPLACE,
+the default, collisions cause the replacement of the existing node with
+the new on.  If this variable is null, node collisions cause an error.
+Anything else is considered a generic function that will be funcalled
+with the new-node (self), the old-node, and the predicate as arguments.")
+
+(defmacro with-btree-node-collision-condition (generic-function &body body)
+  `(let ((*btree-nodes-collision-condition* ,generic-function))
+     . ,body))
+
+(defmethod $store-1 ((self basic-btree) node node-name predicate)
+  "Finds the correct fork."
+  (with-slots (name) self
+    (cond ((equal name node-name)		;must use EQUAL, obviously.
+						;if the user has defined a message to deal with the condition, then
+						;run it.  Otherwise BARF.
+	   (cond ((eql *btree-nodes-collision-condition* :replace)
+		  ;;Splice NODE in to SELF's position.
+		  ($replace-self-with-node self node)
+		  node)
+		 ((functionp *btree-nodes-collision-condition*)
+		  (funcall *btree-nodes-collision-condition* self node predicate))
+		 (t (error "*BTREE-NODES-COLLISION-CONDITION* is ~S, ~
+                        ~&which is neither :REPLACE nor a function."
+			   *btree-nodes-collision-condition*))))
+	  ((funcall predicate node-name name)
+	   ($store-lower self node node-name predicate))
+	  (t ($store-higher self node node-name predicate)))))
+
+(defmethod $replace-self-with-node ((self basic-btree) node)
+  "Splices NODE into SELF's position."
+  (with-slots (up left right depth n-lower n-higher height-lower
+		  height-higher) self
+    (set-values node up left right depth n-lower n-higher height-lower height-higher)
+    (when left (setf (btree-up left) node))
+    (when right (setf (btree-up right) node))
+    (when (and up (typep up 'basic-btree))
+      ($replace-replacement-in-parent up self node))))
+
+(defmethod $replace-replacement-in-parent
+	   ((self basic-btree) old new)
+  (with-slots (left right) self
+    (cond ((eql old left)
+	   (setf left new))
+	  ((eql old right)
+	   (setf right new))
+	  (t (error "~S is not a child of ~S." old self)))))
+
+(defmethod $store-lower ((self basic-btree) node node-name
+			 predicate)
+  "Store NODE as a value lower than SELF."
+  (with-slots (left) self
+    (if left
+	($store-1 left node node-name predicate)
+	($store-here self node :left))))
+
+(defmethod $store-higher ((self basic-btree) node node-name
+			  predicate)
+  "Store NODE as a value higher than SELF."
+  (with-slots (right) self
+    (if right
+	($store-1 right node node-name predicate)
+	($store-here self node :right))))
+
+
+;;;-------------------------------------------------------------------
+;;;
+;;; MESSAGES FOR COUNTING:
+;;;
+;;; The :INCREMENT-FROM-BELOW message is passed from the node which interns the
+;;; new node.  The :BTREE-COUNT message is not called in this code, but is provided
+;;; in order to get number constraints.  Since one need simply add a number stored
+;;; locally plus some numbers stored on nodes in a vector toward the ROOT, counting
+;;; is maximally fast.
+;;;
+
+(defmethod $increment-from-below
+	   ((self basic-btree) sender &optional (depth-amount 1)
+	    (height-amount 1))
+  "Adds progeny to SELF's parents and ancestors in DIMENSION."
+  (with-slots (left n-lower height-lower n-higher height-higher up)
+	      self
+    (cond ((eql sender left)
+	   (incf n-lower depth-amount)
+	   (setf height-lower height-amount))
+	  (t (incf n-higher depth-amount)
+	     (setf height-higher height-amount)))
+    (when up
+      ($increment-from-below up self depth-amount (1+ (maximum-height self))))
+    t))
+
+(defmethod $decrement-from-below ((self basic-btree) sender
+				  &optional (depth-amount 1))
+  "Subtracts progeny from SELF's parents and ancestors in DIMENSION."
+  (with-slots (left n-lower n-higher up) self
+    (cond ((eql sender left) 
+	   (decf n-lower depth-amount))
+	  (t (decf n-higher depth-amount)))
+    (when up
+      ($decrement-from-below up self depth-amount))
+    t))
+						
+(defmethod btree-count ((self basic-btree) direction)
+  "Returns the number of nodes :LOWER or :HIGHER than SELF."
+  (with-slots (n-higher n-lower up name) self
+    (+ (ecase direction
+	 (:higher n-higher)			;the higher progeny
+	 (:lower  n-lower))			;the lower progeny 
+       (or (and up ($count-1 up direction name))
+	   0))))
+
+(defmethod $count-1
+	   ((self basic-btree) direction oname
+	    &optional (predicate (predicate-for-comparing-btree-nodes)))
+  "Internal to COUNT, this does the counting."
+  (with-slots (name n-higher n-lower up) self
+    (+ (ecase direction
+	 (:higher
+	   (or (and (funcall predicate oname name)	;ONAME is lower than NAME
+		    (1+ n-higher))		;so add self and all higher progeny
+	       0))				;otherwise, add zero.
+	 (:lower
+	   (or (and (funcall predicate name oname)	;NAME is higher than ONAME
+		    (1+ n-lower))		;so add self and all lower progeny
+	       0)))				;otherwise, add zero
+       (or (and up ($count-1 up direction oname predicate))	;if higher exist, count 'em
+	   0))))				;else add zero.
+
+(defmethod count-between
+	   ((self basic-btree) value1 value2
+	    &optional (predicate (predicate-for-comparing-btree-nodes)))
+  "Returns the number of nodes between VALUE1 and VALUE2."
+  (let* ((root (root self))
+	 (node1 ($find-value-1 root value1 predicate :higher))
+	 (node2 ($find-value-1 root value2 predicate :higher)))
+    (abs (- (or (and node2 (btree-count node2 :higher)) 0)
+	    (or (and node1 (btree-count node1 :higher)) 0)))))
+
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; The AVL INPUT BALANCING algorithm.  This is the balancing
+;;; algorithm used when balancing on input.  It creates slightly sub-optimally
+;;; balanced trees, but it does so optimally fast.
+;;;
+
+
+(defmethod $input-balance ((self basic-btree))
+  "Balances the tree in DIMENSION according to the AVL algorithm for suboptimal balancing.
+The algorithm is sub-optimal in the sense that longer pathways result than in the algorithm
+in the :$BALANCE message, defined below, which creates optimally baalanced trees.
+This algorithm creates trees that are `almost balanced', but does so in order of log N time.
+The algorithm in $:BALANCE runs in order of N time.  Therefore, this is the appropriate
+message for run-time balancing, while the :$BALANCE message is appropriate at GC-time
+or COLD-BOOT time."
+  (with-slots (height-higher height-lower up) self
+    (cond ((> (- height-higher height-lower) 1)
+	   ($rotate-right self))
+	  ((< (- height-higher height-lower) -1)
+	   ($rotate-left self))
+	  (up ($input-balance up)))))
+
+
+(defmethod $rotate-right ((self basic-btree))
+  "Decides whether a SINGLE or DOUBLE rotation is needed and dispatches the work."
+  (with-slots (right up) self
+    (cond (right
+	   (let ((lrheight (btree-height-lower right))
+		 (rrheight (btree-height-higher right)))
+	     (cond ((= lrheight rrheight)
+		    ($single-rotate-right self))
+		   ((> lrheight rrheight)
+		    ($double-rotate-right self right :left))
+		   (t ($double-rotate-right self right :right))))
+	   ($input-balance up))
+	  (t (error "Cannot rotate RIGHT because no nodes are to my right.")))))
+
+(defmethod $rotate-left ((self basic-btree))
+  "Decides whether a SINGLE or DOUBLE rotation is needed and dispatches the work."
+  (with-slots (left up) self
+    (cond (left
+	   (let ((llheight (btree-height-lower left))
+		 (rlheight (btree-height-higher left)))
+	     (cond ((= rlheight llheight)	;balanced below so only single rotation.
+		    ($single-rotate-left self))
+		   ((> rlheight llheight)
+		    ($double-rotate-left self left :right))
+		   (t ($double-rotate-left self left :left))))
+	   ($input-balance up))
+	  (t (error "Cannot rotate LEFT because no nodes are to my left.")))))
+
+(defmethod $double-rotate-right ((self basic-btree) right
+				 direction-to-balance-right)
+  (ecase direction-to-balance-right
+    (:left ($single-rotate-left right))
+    (:right ($single-rotate-right right)))
+  ($single-rotate-right self))
+
+(defmethod $double-rotate-left ((self basic-btree) left
+				direction-to-balance-left)
+  (ecase direction-to-balance-left
+    (:right ($single-rotate-right left))
+    (:left  ($single-rotate-left left)))
+  ($single-rotate-left self))
+
+(defmethod $single-rotate-right ((self basic-btree))
+  (with-slots (up right n-higher height-higher n-lower depth) self
+    (let ((old-up up)
+	  (old-right right))
+      (when old-right
+	;;make RIGHT's LEFT your RIGHT.
+	(let ((rleft (btree-left old-right)))
+	  (setf right rleft)
+	  (when rleft (setf (btree-up rleft) self)))
+	;;RIGHT's N-LOWER is now your N-HIGHER.
+	(setf n-higher (btree-n-lower old-right)
+	      ;;RIGHT's HEIGHT-LOWER is now your HEIGHT-LOWER.
+	      height-higher (btree-height-lower old-right)
+	      ;;RIGHT's LEFT is now you.
+	      (btree-left old-right) self
+	      ;;RIGHT's parent is now your parent.
+	      (btree-up old-right) old-up
+	      ;;RIGHT's N-LOWER is now you plus your progeny.
+	      (btree-n-lower old-right) (1+ (+ n-lower n-higher))
+	      ;;RIGHT's HEIGHT-LOWER is now one plus the maximum of your heights
+	      (btree-height-lower old-right) (1+ (maximum-height self)))
+	;;Swap Depths
+	(let ((d depth))			;because psetf is brain damaged.
+	  (setf depth (btree-depth old-right)
+		(btree-depth old-right) d))
+	;;Tell parent to replace you with RIGHT.
+	(and old-up ($replace old-up self old-right))
+	;;Make RIGHT your parent.
+	(setf up old-right)))))
+
+(defmethod $single-rotate-left ((self basic-btree))
+  (with-slots (up left n-lower height-lower n-higher depth) self
+    (let ((old-up up)
+	  (old-left left))
+      (when old-left
+	;;Make LEFT's RIGHT your LEFT.
+	(let ((lright (btree-right old-left)))
+	  (setf left lright)
+	  (when lright (setf (btree-up lright) self)))
+	;;LEFT's N-HIGHER is now your N-LOWER
+	(setf n-lower (btree-n-higher old-left)
+	      ;;LEFT's HEIGHT-HIGHER is now your HEIGHT-LOWER
+	      height-lower (btree-height-higher old-left)
+	      ;;LEFT's RIGHT is now you.
+	      (btree-right old-left) self
+	      ;;LEFT's parent is now your parent.
+	      (btree-up old-left) old-up
+	      ;;LEFT's N-HIGHER is now you plus your progeny.
+	      (btree-n-higher old-left) (1+ (+ n-lower n-higher))
+	      ;;LEFT's HEIGHT-HIGHER is now one plus the maximum of your heights.
+	      (btree-height-higher old-left) (1+ (maximum-height self)))
+	;;Swap Depths
+	(let ((d depth))			;because psetf is brain damaged.
+	  (setf depth (btree-depth old-left)
+		(btree-depth old-left) d))
+	;;Replace yourself with LEFT in the parent.
+	(and old-up ($replace old-up self old-left))
+	;;Make LEFT your parent.
+	(setf up old-left)))))
+
+(defmethod $replace ((self basic-btree) old-child new-child)
+  (with-slots (left n-lower height-lower right n-higher
+		    height-higher) self
+    (cond ((eql old-child left)
+	   (setf left new-child 
+		 n-lower (1+ ($n-of-progeny new-child))
+		 height-lower (1+ (maximum-height new-child))))
+	  ((eql old-child right)
+	   (setf right new-child
+		 n-higher (1+ ($n-of-progeny new-child))
+		 height-higher (1+ (maximum-height new-child))))
+	  (t (error "~S is not the parent of ~S." self old-child)))))
+
+
+;;;-------------------------------------------------------------------
+;;;
+;;;  BALANCING THE TREE TO RESULT IN AN OPTIMAL BALANCE.
+;;;
+;;;  NOTE: This algorithm produces trees that are optimally balanced. 
+;;;        It is NOT an optimal algorithm, however, because it runs in
+;;;        order of N time (although some balances are much cheaper than
+;;;        others due to the root-vector trick embedded in the code below).
+;;;        The :$INPUT-BALANCE method runs in order of logN time, and is
+;;;        thus preferred for balancing on input.
+;;;        
+;;;
+;;;  BALANCE performance is improved by knowing a priori the size of the tree
+;;;  both below left and below right from any node.  We simply use that
+;;;  information to balance top-down rather than bottom-up.
+;;;
+
+
+(defmethod balance
+	   ((self basic-btree) &optional (predicate (predicate-for-comparing-btree-nodes)))
+  "Balances the tree for faster performance."
+  (with-optimal-btree-balance
+    (let ((root-vector ($vector-with-trace-to-root-node self self)))
+      ($balance-1 (caar root-vector) predicate root-vector)	;balance current root
+      (root self))))				;return the new root.
+
+(defmethod $balance-1 ((self basic-btree) predicate
+		       &optional vector)
+  "Dispatches the work for (BASIC-BTREE :BALANCE)."
+  ;;If unbalanced, SELF is spliced out of the tree and the top node on the
+  ;;side which is heaviest takes SELF's place in the hierarchy.  SELF is then
+  ;;re-stored in the tree by the node which replaces it.  SELF will carry
+  ;;along with it all its structure on the lighter side.  Since it is always
+  ;;pushed DOWN the the tree, and since the method works top-down, SELF will
+  ;;receive the message again, until it is balanced and can therefore pass
+  ;;the message along to its progeny.
+  ;;Since an ancenstor may have been re-stored, my depth may not be
+  ;;correct.  Let me fix that right now.
+  (with-slots (up depth n-higher n-lower left right) self
+    (setf depth (or (and up (1+ (btree-depth up))) 0))
+    (cond ((and (zerop n-higher) (zerop n-lower)) nil)	;SELF is a terminal node.
+	  ((zerop n-higher)
+	   (if (> n-lower 1)
+	       ($balance-left self predicate)
+	       (setf (btree-depth left) (1+ depth))))
+	  ((zerop n-lower)
+	   (if (> n-higher 1)
+	       ($balance-right self predicate)
+	       (setf (btree-depth right) (1+ depth))))
+	  ((> 2 (abs (- n-higher n-lower)))	;this is a balanced condition.
+	   ;;neither is empty, so propagate the message to both.
+	   (unless (and (eql self (caar vector)) (eql :right (cadar vector)))
+	     ($balance-1 left predicate (cdr vector)))
+	   (unless (and (eql self (caar vector)) (eql :left (cadar vector)))
+	     ($balance-1 right predicate (cdr vector))))
+	  ;;Neither is empty and we're not in balance,
+	  ;;so lighten the heavy side, then propagate the message
+	  ((> n-higher n-lower)			;The right side is heavier.
+	   ;; Don't worry about the left side.  Since SELF is being propagated
+	   ;; down the tree, we'll get to it later.
+	   ($balance-right self predicate))
+	  ((> n-lower n-higher)			;The left side is heavier.
+	   ;; Don't worry about the right side.  Since SELF is being propagated
+	   ;; down the tree, we'll get to it later.
+	   ($balance-left self predicate))
+	  ;; that exhausts all the possibilities, so . . .
+	  (t (error "Impossible condition.  Please report this error.")))))
+
+(defmethod $balance-left ((self basic-btree) predicate
+			  &optional vector)
+  "Replaces SELF with the LEFT child, and re-stores SELF as its descendent."
+  (with-slots (up left n-higher n-lower height-lower depth name)
+	      self
+    (let ((position (and up ($left-or-right up self))))
+      (case position				;what am I to my parent?
+	(:left  (setf (btree-left  up) left))
+	(:right (setf (btree-right up) left)))
+      ;;splice out self
+      (setf (btree-up left) up)
+      ;;everyone above temporarily loses progeny.
+      (when up
+	($decrement-from-below up left (+ 1 n-higher)))
+      ;;reinitialize the variables that will be changed when we move.
+      (setf left nil 
+	    n-lower 0
+	    height-lower 0
+	    depth 0
+	    up nil)
+      ;;The other variables will be correct.
+      ;;re-store SELF without going to the root.
+      ($store-1 left self name predicate)	
+      ($balance-1 left predicate vector))))
+
+(defmethod $balance-right ((self basic-btree) predicate
+			   &optional vector)
+  "Replaces SELF with the RIGHT child, and re-stores SELF as its descendent."
+  (with-slots (up right n-lower n-higher height-higher depth name)
+	      self
+    (let ((position (and up ($left-or-right up self))))
+						;what am I to my parent?
+      (case position				
+	(:left  (setf (btree-left  up) right))
+	(:right (setf (btree-right up) right)))
+      ;;splice out self
+      (setf (btree-up right) up)
+      ;;everyone above temporarily loses progeny.
+      (when up
+	($decrement-from-below up right (+ 1 n-lower)))
+      ;;reinitialize the variables that will be changed when we move.
+      (setf right nil
+	    n-higher 0
+	    height-higher 0
+	    depth 0
+	    up nil)
+      ;;The other variables will be correct.
+      ;;re-store self here
+      ($store-1 right self name predicate)	;no need to go to the root
+      ($balance-1 right predicate vector))))
+					 
+
+
+;;;-------------------------------------------------------------------
+;;;
+;;; EXTRACTION METHODS:
+;;;
+;;; These methods EXTRACT BTREEs, returning a list in the appropriate order.
+;;;
+
+(defmethod extract ((self basic-btree)
+		    &optional (area working-storage-area))
+  "Extracts the tree in order."
+  (with-area area
+    (%%extract self)))
+
+(defmethod %%extract ((self basic-btree))
+  (with-slots (left right) self
+    (nconc (and left (%%extract left))
+	   (cons self (and right (%%extract right))))))
+
+(defmethod reverse-extract ((self basic-btree)
+			    &optional (area working-storage-area))
+  "Extracts the tree in reverse order."
+  (with-area area
+    (%%reverse-extract self)))
+
+(defmethod %%reverse-extract ((self basic-btree))
+  (with-slots (right left) self
+    (nconc (and right (%%reverse-extract right))
+	   (cons self (and left (%%reverse-extract left))))))
+
+
+(defmethod value-extract ((self basic-btree)
+			  &key (test-function #'identity)
+			  test-arguments
+			  (extraction-function #'identity)
+			  extraction-arguments
+			  (area working-storage-area))
+  "Extracts the value of the generic function EXTRACTION-FUNCTION applied to nodes 
+with EXTRACTION-ARGUMENTS.  If the generic function TEST-FUNCTION is supplied,
+this will only happen to nodes for which TEST-FUNCTION, with TEST-ARGUMENTS returns
+a non-null value."
+  (with-area area
+    (%%value-extract self 
+		     test-function test-arguments
+		     extraction-function extraction-arguments)))
+
+(defmethod %%value-extract ((self basic-btree) 
+			    test-function test-arguments
+			    extraction-function extraction-arguments)
+  (with-slots (left right) self
+    (nconc (and left (%%value-extract left test-function test-arguments
+				      extraction-function extraction-arguments))
+	   (if (apply test-function self test-arguments)
+	       (cons (apply extraction-function self extraction-arguments)
+		     (and right
+			  (%%value-extract right
+					   test-function test-arguments 
+					   extraction-function extraction-arguments)))
+	       (and right
+		    (%%value-extract right
+				     test-function test-arguments 
+				     extraction-function extraction-arguments))))))
+
+(defmethod apply-to-nodes ((self basic-btree)
+			   &key 
+			   test-function
+			   test-arguments
+			   application-function
+			   application-arguments
+			   minimum-value
+			   maximum-value
+			   (predicate *predicate-for-comparing-btree-nodes*))
+  "Walks the tree and applies the value of the generic function APPLICATION-FUNCTION 
+with APPLICATION-ARGUMENTS.  If the generic function TEST-FUNCTION is supplied,
+this will only happen to nodes for which TEST-FUNCTION, with TEST-ARGUMENTS, is non-null."
+  (with-slots (left name right) self
+    (if left
+	(unless (and minimum-value (funcall predicate name minimum-value))
+	  (apply-to-nodes left
+			  :test-function test-function
+			  :test-arguments test-arguments
+			  :application-function application-function
+			  :application-arguments application-arguments
+			  :minimum-value minimum-value
+			  :maximum-value maximum-value
+			  :predicate predicate)))
+    (when (and (or (null minimum-value)
+		   (funcall predicate minimum-value name))
+	       (or (null maximum-value)
+		   (funcall predicate name maximum-value))
+	       (or (null test-function)
+		   (apply test-function self test-arguments)))
+      (apply application-function self application-arguments))
+    (if right
+	(unless (and maximum-value (funcall predicate maximum-value name))
+	  (apply-to-nodes right
+			  :test-function test-function
+			  :test-arguments test-arguments
+			  :application-function application-function
+			  :application-arguments application-arguments
+			  :minimum-value minimum-value
+			  :maximum-value maximum-value
+			  :predicate predicate)))))
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; Methods for extracting in either direction.    
+;;;
+
+;;; Here are the methods for extracting the higher direction.
+
+(defmethod extract-higher-than-yourself ((self basic-btree))
+  "Extracts the BTREE returning a list of all nodes greater than self.
+we are assuming that a less-than predicate was used.  If a greater-than
+predicate was used, then this method extracts nodes in lower than self."
+  (nconc ($extract-higher-below self) ($extract-higher-above self)))
+
+(defmethod $extract-higher-above ((self basic-btree))
+  "Extracts NODES above SELF that are greater in value than SELF."
+  (with-slots (up) self
+    (and up ($extract-higher-above-1 up self))))
+
+(defmethod $extract-higher-above-1 ((self basic-btree) sender)
+  "Does the work for $EXTRACT-HIGHER-ABOVE."
+  (with-slots (left up) self
+    (cond ((eql sender left)
+	   (nconc (cons self ($extract-higher-below self))
+		  (and up ($extract-higher-above-1 up self))))
+	  (up ($extract-higher-above-1 up self)))))
+
+(defmethod $extract-higher-below ((self basic-btree))
+  "Extracts all nodes higher than SELF located below SELF."
+  (with-slots (right) self
+    (and right (extract right))))
+
+;;; Here are the methods for extracting the lower direction.
+
+(defmethod extract-lower-than-yourself ((self basic-btree))
+  "Extracts the BTREE returning a list of all nodes less than self in DIMENSION.
+We are assuming that a less-than predicate was used.  If a greater-than
+predicate was used, then this method extracts nodes in greater than self."
+  (nconc ($extract-lower-below self) ($extract-lower-above self)))
+
+(defmethod $extract-lower-above ((self basic-btree))
+  "Extracts NODES above SELF that are lower in value than SELF."
+  (with-slots (up) self
+    (and up ($extract-lower-above-1 up self))))
+
+(defmethod $extract-lower-above-1 ((self basic-btree) sender)
+  "Does the work for EXTRACT-LOWER-ABOVE."
+  (with-slots (right up) self
+    (cond ((eql sender right)
+	   (nconc (cons self ($extract-lower-below self))
+		  (and up ($extract-lower-above-1 up self))))
+	  (up ($extract-lower-above-1 up self)))))
+
+(defmethod $extract-lower-below ((self basic-btree))
+  "Extracts all nodes higher than SELF located below SELF in the btree."
+  (with-slots (left) self
+    (and left (reverse-extract left))))
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; Finding the median    
+;;;
+
+(defmethod median ((self basic-btree))
+  (median-1 (root self)))
+
+(defmethod median-1 ((self basic-btree) &optional higher lower &aux aux)
+  (with-slots (n-higher n-lower name left right) self
+    (unless higher (setq higher n-higher))
+    (unless lower  (setq lower  n-lower))
+    (let ((diff (- higher lower)))
+      (cond ((<= -1 diff 1) name)
+	    ((> -1 diff)
+	     (setq aux (btree-n-higher left))
+	     (median-1 left (+ higher 1 aux) (- lower 1 aux)))
+	    (t (setq aux (btree-n-lower right))
+	       (median-1 right (- higher 1 aux) (+ lower 1 aux)))))))
+
+
+;;;-------------------------------------------------------------------
+;;;
+;;; UTILITY MESSAGES
+;;;
+;;;
+
+(defmethod btree-find
+	   ((self basic-btree) value &optional
+	    (predicate (predicate-for-comparing-btree-nodes)))
+  "Finds the node of VALUE, or NIL if it's not there."
+  ($find-1 (root self) value predicate))
+
+(defmethod $find-1 ((self basic-btree) value predicate)
+  "Internal to FIND, assumes we're beginning from root."
+  (with-slots (name left right) self
+    (cond ((funcall predicate value name)
+	   (and left ($find-1 left value predicate)))
+	  ((funcall predicate name value)
+	   (and right ($find-1 right value predicate)))
+	  (t self))))
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; Finding a value in the BTREE, or, if it doesn't exist, its next higher 
+;;; or next lower node in the relevant dimension.
+;;;
+
+(defmethod find-value-or-nearest-higher
+	   ((self basic-btree) value &optional
+	    (predicate (predicate-for-comparing-btree-nodes)))
+  "Finds the node of VALUE in DIMENSION or, if not present, the nearest higher node."
+  ($find-value-1 (root self) value predicate :higher))
+
+(defmethod find-value-or-nearest-lower
+	   ((self basic-btree) value &optional
+	    (predicate (predicate-for-comparing-btree-nodes)))
+  "Finds the node of VALUE in DIMENSION or, if not present, the nearest lower node."
+  ($find-value-1 (root self) value predicate :lower))
+
+(defmethod $find-value-1 ((self basic-btree) value predicate
+			  direction)
+  "Internal to FIND-VALUE-OR-NEAREST-HIGHER and FIND-VALUE-OR-NEAREST-LOWER."
+  (with-slots (name left right) self
+    (cond ((eql value name) self)
+	  ((funcall predicate value name)
+	   (cond (left ($find-value-1 left value predicate direction))
+		 ((eql direction :higher) self)
+		 (t (find-highest-lower-above self self))))
+	  (right ($find-value-1 right value predicate direction))
+	  ((eql direction :lower) self)
+	  (t (find-lowest-higher-above self self)))))
+
+(defmethod find-highest-value ((self basic-btree))
+  (with-slots (right) self
+    (if right
+	(find-highest-value right)
+	self)))
+
+(defmethod find-lowest-value ((self basic-btree))
+  (with-slots (left) self
+    (if left
+	(find-lowest-value left)
+	self)))
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; RETRACTION of binary tree nodes.  Returns the ROOT and the retracted node.
+;;; Make sure you SET the root to the first value this returns, since this
+;;; operation may cause the root to change.
+;;;
+
+(defmethod retract
+	   ((self basic-btree) &optional (predicate *predicate-for-comparing-btree-nodes*))
+  (with-slots (up n-lower n-higher) self
+    (let ((role (role-in-parent self up)))
+      (cond ((eql role :left)
+	     ($retract-right self up predicate))
+	    ((eql role :right)			
+	     ($retract-left self up predicate))
+	    ;;else SELF is the root.
+	    ((> n-lower n-higher)
+	     ($retract-left self nil predicate))
+	    (t ($retract-right self nil predicate))))))
+
+(defmethod $retract-left ((self basic-btree) parent predicate)
+  "Retraction method when SELF is PARENT's right child."
+  (with-slots (left right) self
+    (let ((replacement left)
+	  (counterpart right))
+      (when (and (null replacement) counterpart)
+	(setq replacement counterpart counterpart nil))
+      (and parent (setf (btree-right parent) replacement))
+      ($retract-internal self parent predicate replacement counterpart))))
+ 
+(defmethod $retract-right ((self basic-btree) parent predicate)
+  "Retraction method when SELF is PARENT's left child."
+  (with-slots (right left) self
+    (let ((replacement right)
+	  (counterpart left))
+      (when (and (null replacement) counterpart)
+	(setq replacement counterpart counterpart nil))
+      (and parent (setf (btree-left parent) replacement))
+      ($retract-internal self parent predicate replacement counterpart))))
+
+(defmethod $retract-internal ((self basic-btree) parent predicate
+			      replacement counterpart)
+  "Internal to retraction methods."
+  (with-slots (depth) self
+    (cond ((null replacement)
+	   (when (typep parent 'btree)
+	     (adjust-indices-to-root parent nil)
+	     ($input-balance parent)
+	     (values (root parent) self)))
+	  (t (setf (btree-up replacement) parent
+		   (btree-depth replacement) depth)
+	     (if counterpart
+		 ($store-1 replacement counterpart (btree-name counterpart) predicate)
+		 ($input-balance replacement))
+	     (cond (replacement (values (adjust-indices-to-root replacement) self))
+		   (parent (values (adjust-indices-to-root parent) self))
+		   (t (values nil self)))))))
+
+(defmethod adjust-indices-to-root ((self basic-btree)
+				   &optional (return-root-p t))
+  "After retraction, this ensures that indices are correct from the replacement to the root.
+Returns the new root.  If RETURN-ROOT-P is non-null, the root of the tree is returned."
+  (with-slots (left n-lower right n-higher height-lower
+		    height-higher up) self
+    (setf n-lower (if left (1+ ($n-of-progeny left)) 0)
+	  n-higher (if right (1+ ($n-of-progeny right)) 0)
+	  height-lower (if left (1+ ($maximum-height left)) 0)
+	  height-higher (if right (1+ ($maximum-height right)) 0))
+    ($input-balance self)
+    (if (and up (typep up 'btree))
+	(adjust-indices-to-root up return-root-p)
+	(and return-root-p (root self)))))	;must call root, in case of balance.
+
+(defmethod nearest-neighbors
+	   ((self basic-btree) value &key
+	    (predicate *predicate-for-comparing-btree-nodes*)
+	    (key #'identity))
+  "Returns the highest node below VALUE and the lowest node above value,
+according to the PREDICATE.  KEY is applied to the results."
+  (multiple-value-bind (lower higher)
+      (nearest-neighbors-1 (root self) value nil nil nil nil predicate key)
+    (values (funcall key lower) (funcall key higher))))
+
+(defmethod nearest-neighbors-1 
+	   ((self basic-btree) value lower higher lower-name
+	    higher-name predicate key)
+  "Internal to (NEAREST-NEIGHBORS BASIC-BTREE)."
+  (with-slots (name right left) self
+    (if (eql value name)			;exact match.
+	(let ((result (funcall key self)))
+	  (values result result))
+	;;self differs from value, so let's find out how.
+	(cond ((funcall predicate name value)	
+	       ;;self's value is less than value, so we will go right.
+	       ;;check to see whether self is the highest we've seen less than value.
+	       (when (or (null lower-name) (funcall predicate lower-name name))
+		 ;;if so, change the variable bindings.
+		 (setq lower (funcall key self) lower-name name))
+	       ;;and recurse if there's more tree.
+	       (if right
+		   (nearest-neighbors-1 right value lower higher
+					lower-name higher-name predicate key)
+		   ;;otherwise return
+		   (values lower higher)))
+	      ;;otherwise, self's value is less than value, so we will go left.
+	      ;;first check to see whether self is the lowest we've seen greater than value.
+	      (t (when (or (null higher-name) (funcall predicate name higher-name))
+		   ;;if so, change the variable bindings.
+		   (setq higher (funcall key self) higher-name name))
+		 ;;and recurse if there's more tree.
+		 (if left
+		     (nearest-neighbors-1 left value lower higher
+					  lower-name higher-name predicate key)
+		     ;;otherwise return
+		     (values lower higher)))))))
+
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; Utility methods    
+;;;
+						
+(defmethod $vector-to-root-node ((self basic-btree))
+  "Returns a vector of NODEs from SELF's parent (UP) to the ROOT-NODE."
+  (with-slots (up) self
+    (when up
+      (cons up ($vector-to-root-node up)))))
+
+(defmethod $vector-with-trace-to-root-node
+	   ((self basic-btree) sender)
+  "Returns an alist vector of NODEs and branching trace
+from SELF's parent (UP) to the ROOT-NODE."
+  (with-slots (up left) self
+    (if up
+	(nconc ($vector-with-trace-to-root-node up self)
+	       (list (list up (or (and (eql sender left) :right) :left))))
+	(list (list self)))))			;in case we call it on the ROOT.
+
+(defmethod find-lowest-higher-above ((self basic-btree) sender)
+  "Returns the lowest NODE higher than self and higher in the tree than SELF."
+  (with-slots (left up) self
+    (if (eql sender left)
+	self
+	(and up (find-lowest-higher-above up self)))))
+
+(defmethod find-highest-lower-above ((self basic-btree) sender)
+  "Returns the highest NODE lower than SELF and higher in the tree than SELF."
+  (with-slots (right up) self
+    (if (eq sender right)
+	self
+	(and up (find-highest-lower-above up self)))))
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; LOW LEVEL UTILITY MESSAGES 
+;;;
+;;;
+
+(defmethod $maximum-height ((self basic-btree))
+  "Returns SELF's HEIGHT-LOWER or HEIGHT-HIGHER, whichever is greater."
+  (maximum-height self))
+
+(defmethod $n-of-progeny ((self basic-btree))
+  "Returns the number of nodes below SELF."
+  (with-slots (n-lower n-higher) self
+    (+ n-lower n-higher)))
+
+(defmethod tree-size ((self basic-btree))
+  "Returns the number of nodes in the entire tree."
+  (1+ ($n-of-progeny (root self))))
+
+(defmethod root ((self basic-btree))
+  "Returns the ROOT of the tree."
+  (with-slots (up) self
+    (if up (root up) self)))
+
+(defmethod role-in-parent ((self basic-btree)
+			   &optional (parent (with-slots (up) self
+					       up)) (error-p t))
+  "Returns :RIGHT, if SELF is PARENT's right child, :LEFT if the left child, NIL if
+SELF is the root.  Otherwise, if ERROR-P is non-null, an error is signalled."
+  (when (typep parent 'btree)
+    ($left-or-right parent self error-p)))
+
+(defmethod $left-or-right ((self basic-btree) sender
+			   &optional error-p)
+  "Returns :LEFT if SENDER is SELF's LEFT, :RIGHT if RIGHT, or NIL.
+If ERROR-P is non-null, NIL is not returned.  Instead an error is signalled."
+  (with-slots (left right) self
+    (cond ((eql sender left)  :left)
+	  ((eql sender right) :right)
+	  (error-p (error "~S is not a child of ~S." sender self)))))
+
+(defmethod maximum-height ((self basic-btree))
+  "Returns the maximum of HEIGHT-HIGHER and HEIGHT-LOWER."
+  (with-slots (height-higher height-lower) self
+    (max height-higher height-lower)))
+
+
+;;;;-------------------------------------------------------------------
+;;;;
+;;;; Procedures for displaying BTREEs.
+;;;;
+
+#+genera
+(define-presentation-type btree-node ()
+   :no-deftype t
+   :parser ((stream)
+	    (dw:read-standard-token stream))
+   :printer ((object stream)
+	     (princ (btree-name object) stream)))
+
+#+genera
+(cp:define-command (com-graph-binary-tree :command-table "User"
+					  :provide-output-destination-keyword nil)
+    ((root 'btree-node :prompt "root"))
+   (if (typep root 'btree)
+       (graph-yourself root)
+       (format *query-io* "~&You must specify a binary tree node.")))
+
+#+genera
+(cp:define-command (com-graph-binary-tree-from-parent :command-table "User"
+						      :provide-output-destination-keyword nil)
+    ((node 'btree-node :prompt "node"))
+   (if (typep node 'basic-btree)
+       (let ((parent (btree-up node)))
+	 (if (typep parent 'basic-btree)
+	     (graph-yourself parent)
+	     (format *query-io* "~&The root has no parent.")))
+       (format *query-io* "~&You must specify a binary tree node.")))
+
+#+genera
+(define-presentation-to-command-translator 
+  graph-binary-tree
+  (btree-node :gesture :right)
+  (node)
+  (cp:build-command 'com-graph-binary-tree node))
+
+#+genera
+(define-presentation-to-command-translator 
+  graph-binary-tree-from-parent
+  (btree-node :gesture :right)
+  (node)
+  (cp:build-command 'com-graph-binary-tree-from-parent node))
+
+#+genera
+(defmethod graph-yourself ((self basic-btree)
+			   &rest format-graph-from-root-keyword-arguments)
+  (let ((s (getf format-graph-from-root-keyword-arguments :stream)))
+    (format (or s *standard-output*) "~&")
+    (setf (getf format-graph-from-root-keyword-arguments :border) nil)
+    (apply 'format-graph-from-root
+	   self
+	   'print-btree-name
+	   'children
+	   format-graph-from-root-keyword-arguments)
+    self))
+
+#+genera
+(defun print-btree-name (node stream)
+  (if node
+      (present node 'btree-node :stream stream :acceptably t)
+      (princ "." stream)))
+
+#+genera
+(defun children (node)
+  (if (null node) nil (btree-children node)))
+
+#+genera      
+(defmethod btree-children ((self basic-btree))
+  (with-slots (left right) self
+    (list left right)))
+
+
+;;;------------------------------------------------------------------- 
+;;;
+;;; Test code for binary trees.    
+;;;
+
+;(DEFCLASS TEST
+;	  (BTREE)
+;    ())
+;
+;(DEFVAR *TEST* NIL)
+;(DEFVAR *TEST-ITEMS* NIL)
+;
+;(DEFUN TEST (N &KEY CHECK-P)
+;  (WITH-PREDICATE-FOR-COMPARING-BTREE-NODES #'<
+;    (DOTIMES (I N)
+;      (DECLARE (IGNORE I))
+;      (LET ((NUMBER (RANDOM 100)))
+;	(UNLESS (MEMBER NUMBER *TEST-ITEMS* :TEST #'=)
+;	  (PUSH NUMBER *TEST-ITEMS*))
+;	(MAKE-TEST-NODE NUMBER)
+;	(WHEN CHECK-P
+;	  (APPLY-TO-NODES *TEST* :APPLICATION-FUNCTION #'WARRANT-FOR-TEST)))))
+;  *TEST*)
+;
+;(DEFUN REDO (&OPTIONAL (DATA (NREVERSE *TEST-ITEMS*)))
+;  (SETQ *TEST* NIL)  
+;  (DOLIST (X DATA *TEST*)
+;    (MAKE-TEST-NODE X)
+;    (CHECK)
+;    (GRAPH-YOURSELF *TEST*)
+;    (UNLESS (Y-OR-N-P "~%Continue? ")
+;      (RETURN *TEST*))))
+;
+;(CLOS:DEFMETHOD WARRANT-FOR-TEST ((SELF TEST))
+;  (WITH-SLOTS (UP) SELF
+;    (WHEN (AND UP
+;	       (NOT (OR (EQL SELF (BTREE-LEFT UP))
+;			(EQL SELF (BTREE-RIGHT UP)))))
+;      (ERROR "~S is not a child of its parent." SELF))))
+;
+;(DEFUN RESET ()
+;  (SETQ *TEST* NIL *TEST-ITEMS* NIL))
+;
+;(DEFUN MAKE-TEST-NODE (NUMBER)
+;  (LET ((SYS:*DEFAULT-CONS-AREA* SYS:WORKING-STORAGE-AREA))
+;    (LET ((NODE (CLOS:MAKE-INSTANCE 'TEST
+;				    :NAME NUMBER)))
+;      (IF (NULL *TEST*)
+;	  (SETQ *TEST* NODE)
+;	  (SETQ *TEST* (STORE *TEST* NODE (BTREE-NAME NODE) #'<))))))
+;
+;(DEFUN ITERATION-TEST (N-ITERATIONS N-NODES)
+;  (DOTIMES (I N-ITERATIONS :SUCCESS)
+;    (SETQ *TEST* NIL *TEST-ITEMS* NIL)
+;    (TEST N-NODES)
+;    (LET ((COUNT (+ 1. (BTREE-COUNT *TEST* :HIGHER) (BTREE-COUNT *TEST* :LOWER))))
+;      (UNLESS (= COUNT (LENGTH *TEST-ITEMS*))
+;	(RETURN *TEST*)))
+;    (WHEN (INTEGERP (/ I 10))
+;      (FORMAT *STANDARD-OUTPUT* " ~D" I))))
+;
+;(DEFUN CHECK ()
+;  (APPLY-TO-NODES *TEST* :APPLICATION-FUNCTION #'WARRANT-FOR-TEST))
+	

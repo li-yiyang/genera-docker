@@ -1,0 +1,1388 @@
+;;; -*- Mode: LISP; Syntax: Common-lisp; Package: STATICE-INDEX; Base: 10; Lowercase: Yes -*-
+;;;>
+;;;> *****************************************************************************************
+;;;> ** (c) Copyright 1998-1982 Symbolics, Inc.  All rights reserved.
+;;;> ** Portions of font library Copyright (c) 1984 Bitstream, Inc.  All Rights Reserved.
+;;;>
+;;;>    The software, data, and information contained herein are proprietary to,
+;;;> and comprise valuable trade secrets of, Symbolics, Inc., which intends 
+;;;> to keep such software, data, and information confidential and to preserve them
+;;;> as trade secrets.  They are given in confidence by Symbolics pursuant 
+;;;> to a written license agreement, and may be used, copied, transmitted, and stored
+;;;> only in accordance with the terms of such license.
+;;;> 
+;;;> Symbolics, Symbolics 3600, Symbolics 3675, Symbolics 3630, Symbolics 3640,
+;;;> Symbolics 3645, Symbolics 3650, Symbolics 3653, Symbolics 3620, Symbolics 3610,
+;;;> Zetalisp, Open Genera, Virtual Lisp Machine, VLM, Wheels, Dynamic Windows,
+;;;> SmartStore, Semanticue, Frame-Up, Firewall, Document Examiner,
+;;;> Delivery Document Examiner, "Your Next Step in Computing", Ivory, MacIvory,
+;;;> MacIvory model 1, MacIvory model 2, MacIvory model 3, XL400, XL1200, XL1201,
+;;;> Symbolics UX400S, Symbolics UX1200S, NXP1000, Symbolics C, Symbolics Pascal,
+;;;> Symbolics Prolog, Symbolics Fortran, CLOE, CLOE Application Generator,
+;;;> CLOE Developer, CLOE Runtime, Common Lisp Developer, Symbolics Concordia,
+;;;> Joshua, Statice, and Minima are trademarks of Symbolics, Inc.
+;;;> 
+;;;> Symbolics 3670, Symbolics Common Lisp, Symbolics-Lisp, and Genera are registered
+;;;> trademarks of Symbolics, Inc.
+;;;>
+;;;> GOVERNMENT PURPOSE RIGHTS LEGEND
+;;;> 
+;;;>      Contract No.: various
+;;;>      Contractor Name: Symbolics, Inc.
+;;;>      Contractor Address: c/o Ropes & Gray
+;;;> 			 One International Place
+;;;> 			 Boston, Massachusetts 02110-2624
+;;;>      Expiration Date: 2/27/2018
+;;;>      
+;;;> The Government's rights to use, modify, reproduce, release, perform, display or
+;;;> disclose this software are restricted by paragraph (b)(2) of the "Rights in
+;;;> Noncommercial Computer Software and Noncommercial Computer Software Documentation"
+;;;> contained in the above identified contracts.  No restrictions apply after the
+;;;> expiration date shown above.  Any reproduction of the software or portions thereof
+;;;> marked with this legend must also reproduce the markings.  Questions regarding
+;;;> the Government's rights may be referred to the AS&T Contracts Office of the
+;;;> National Reconnaissance Office, Chantilly, Virginia 20151-1715.
+;;;> 
+;;;>      Symbolics, Inc.
+;;;>      c/o Ropes & Gray
+;;;>      One International Place
+;;;>      Boston, Massachusetts 02110-2624
+;;;>      781-937-7655
+;;;>
+;;;> *****************************************************************************************
+;;;>
+
+;;; Scrolls and pagination
+;; Attempts to find boundry records with the smallest key lengths.  
+;; Computes the minimum number of words of key that is required to
+;; distinguish two entries, and then picks boundry records such that
+;; the pages are between half and completely full, and the keys of 
+;; the boundry records are the smallest minimum key lengths.
+;; Some ideas are stolen from McCreight, Bayer, and other smart people. 
+
+;; We can probably figure out a cute way to avoid copying the data into
+;; the scroll, but we can't take the time right now to figure it out.
+
+;; See major bugs listing in SIMULATION.LISP
+
+
+(defconstant *number-of-pages-in-scroll* 5.)
+
+(defmacro define-scroll-slots (slots)
+  `(progn
+     (defconstant *number-of-scroll-slots* ,(length slots))
+     . ,(loop for i from 0
+	      for slot in slots
+	      collect `(defmacro ,slot (header-array index)
+			 `(aref ,header-array ,',i ,index)))))
+
+(define-scroll-slots (scroll-key-start scroll-old-header scroll-size-of-entry))
+
+(defflavor basic-scroll (header-array data-array
+			 destination-disk-pages destination-nodes
+			 ;;1/4/88 Feinberg -- Allow deinitializer to win
+			 ;;on an unused scroll.
+			 (destination-fill-pointer 0)
+			 destination-old-index-start
+			 current-left-index current-right-index header-fill-pointer
+			 heap-lowest-right-index
+			 best-left-index best-right-index best-key-length-sum
+			 heap-lowest-allocated-space key-scroll-index
+			 left-allocated-space main-allocated-space right-allocated-space
+			 right-heap original-node-index page-size
+			 100%-point-of-page) ()
+  :readable-instance-variables
+  :writable-instance-variables
+  (:initable-instance-variables page-size))
+
+(defflavor scroll-leaf-mixin () ()
+  (:required-flavors basic-scroll))
+
+(defflavor scroll-branch-mixin () ()
+  (:required-flavors basic-scroll))
+
+(defflavor leaf-scroll () (scroll-leaf-mixin basic-scroll))
+
+(defflavor branch-scroll () (scroll-branch-mixin basic-scroll))
+
+(defmethod (make-instance basic-scroll) (&rest ignore)
+  (let ((maximum-entries-per-page
+	  (truncate (- *words-per-page* *index-record-header-size*) 2)))
+    (setf 100%-point-of-page (- *words-per-page* *index-record-header-size*))
+    (setf header-array (make-array (list *number-of-scroll-slots*
+					 (* *number-of-pages-in-scroll*
+					    maximum-entries-per-page))))
+    (setf data-array (make-array (* page-size *number-of-pages-in-scroll*)
+				 :element-type '(unsigned-byte 32)
+				 :fill-pointer 0))
+    (setf destination-disk-pages
+	  (make-array *number-of-pages-in-scroll* :fill-pointer 0)
+	  destination-nodes
+	  (make-array *number-of-pages-in-scroll* :fill-pointer 0)
+	  destination-old-index-start
+	  (make-array *number-of-pages-in-scroll* :fill-pointer 0))
+    (setf right-heap (make-heap))))
+
+
+(defmethod (initialize-scroll basic-scroll) ()
+  (setf header-fill-pointer 0)
+  (setf (fill-pointer destination-old-index-start) 0)
+  (setf (fill-pointer destination-disk-pages) 0)
+  (setf (fill-pointer destination-nodes) 0)
+  (setf (fill-pointer data-array) 0)
+  (send right-heap :clear))
+
+
+(defmacro make-scroll-resource-definition (type)
+  `(defresource ,type (size)
+     :constructor
+     (make-instance ',type :page-size size)
+     :deinitializer
+     (clear-scroll object)
+     :matcher (= (basic-scroll-page-size object) size)))
+
+(make-scroll-resource-definition leaf-scroll)
+(make-scroll-resource-definition branch-scroll)
+
+;; Optimize this to setup j (and maybe i) as array register(s)
+;; Probably turn ENTRY-ARRAY and ENTRY-INDEX into using alists instead of
+;; storing them for every element.
+(defmethod (insert-disk-page basic-scroll) (disk-page &optional
+						 (start *index-record-header-size*)
+						 (end (node-header-fill-pointer disk-page)))
+  (loop with data-fill-pointer = (fill-pointer data-array)
+        for i from start below end
+	for j from header-fill-pointer
+	as header = (aref disk-page i)
+	as key-start = (entry-key-start header)
+	as key-length = (entry-key-length header)
+	as number-of-values = (entry-number-of-values header)
+	as entry-data-size = (+ number-of-values key-length) do
+    ;;Copy key and values from source array to scroll's data array
+    (forward-copy-part-of-array disk-page (- key-start number-of-values)
+				data-array data-fill-pointer
+				entry-data-size)
+    (incf data-fill-pointer entry-data-size)
+    ;;Copy header information into scroll, updating key-start information
+    (setf (scroll-old-header header-array j) header)
+    (setf (scroll-size-of-entry header-array j) (size-of-existing-entry header))
+    (setf (scroll-key-start header-array j) (- data-fill-pointer key-length))
+	finally
+	  (setf (fill-pointer data-array) data-fill-pointer))
+  (incf header-fill-pointer (- end start)))
+
+;;Optimize use of data-fill-pointer vs (fill-pointer data-array)
+(defmethod (add-entry basic-scroll) (key-array key-start key-length value key-overflow)
+  (let ((data-fill-pointer (fill-pointer data-array)))
+    (when-debugging-and (> (compute-size-of-entry key-length 1) *50%-point-of-page*)
+      (error "B* Index system bug: Illegal key length supplied to ADD-ENTRY."))
+    ;;insert value and key into scroll
+    (setf (aref data-array data-fill-pointer) value)
+    (forward-copy-part-of-array key-array key-start
+				data-array (1+ data-fill-pointer)
+				key-length)
+    (incf data-fill-pointer (1+ key-length))
+    (setf (fill-pointer data-array) data-fill-pointer)
+    ;;Generate header information and insert into scroll
+    (setf (scroll-old-header header-array header-fill-pointer)
+	  (extended-make-entry :key-length key-length
+			       :number-of-values 1
+			       :key-overflow key-overflow))
+    (setf (scroll-size-of-entry header-array header-fill-pointer)
+	  (compute-size-of-entry key-length 1))
+    (setf (scroll-key-start header-array header-fill-pointer)
+	  (- data-fill-pointer key-length))
+    (incf header-fill-pointer)))
+
+;;We should never be inserting values into branches.
+(defmethod (insert-value scroll-leaf-mixin) (value main-page key-insertion-index)
+  ;;Insert the value into the scroll data area
+  (let ((data-fill-pointer (fill-pointer data-array)))
+    (setf (aref data-array data-fill-pointer) value)
+    (setf (fill-pointer data-array) (1+ data-fill-pointer)))
+  ;;Insert the rest of the values and the key
+  (insert-disk-page self main-page key-insertion-index (1+ key-insertion-index))
+  (let ((header-index (1- header-fill-pointer)))
+    (incf (entry-number-of-values (scroll-old-header header-array header-index)))
+    (incf (scroll-size-of-entry header-array header-index))))
+
+;;Optimize use of data-fill-pointer vs (fill-pointer data-array)
+;;We should probably cache the PARENT-HEADER-INDEX for use when the keys 
+;;are updated.  But then again, repagination might change them.
+(defmethod (insert-parental-key scroll-branch-mixin) (node disk-page ignore)
+  (cond ((not (or (zerop (node-next disk-page)) (zerop (node-parent disk-page))))
+	 (record-test-point insert-parental-key-1)
+	 (with-next-index-record (next-node disk-page :read next-disk-page)
+	   ;;Get information about the parent
+	   (with-node-common-parent (nil parent-disk-page child-address node
+				     next-disk-page (index-record-disk-page-address next-node)
+				     :read)
+	     ;;If this node has a parent, insert the parental key
+	     (let* ((parent-header-index (find-header-index-for-address parent-disk-page
+									child-address))
+		    (key-header (aref parent-disk-page parent-header-index))
+		    (key-start  (entry-key-start key-header))
+		    (key-length (entry-key-length key-header))
+		    (scroll-header-index (1- header-fill-pointer))
+		    (data-fill-pointer (fill-pointer data-array)))
+	       ;;Insert key into scroll
+	       (forward-copy-part-of-array parent-disk-page key-start
+					   data-array data-fill-pointer
+					   key-length)
+	       ;;Merge parent and child header information
+	       (setf (scroll-key-start header-array scroll-header-index)
+		     data-fill-pointer)
+	       (setf (scroll-old-header header-array scroll-header-index)
+		     (extended-make-entry :start-value
+					  (scroll-old-header header-array scroll-header-index)
+					  :key-length key-length
+					  :key-overflow (entry-key-overflow key-header)))
+	       (setf (scroll-size-of-entry header-array scroll-header-index)
+		     ;;We know there is only one child per key of a branch node
+		     (compute-size-of-entry key-length 1))
+	       ;;Adjust data fill pointer
+	       ;;Adjustment of the header fill pointer is not necessary, we just
+	       ;;modified the existing header.
+	       (setf (fill-pointer data-array) (+ data-fill-pointer key-length))
+	       ;;The useful information about change for a branch node is whether
+	       ;;the promoted key has changed.  Remember the scroll index of the
+	       ;;original promoted key
+	       (array-push destination-old-index-start scroll-header-index)))))
+	(t
+	 ;;If this node doesn't have a next neighbor, it is at the right edge of
+	 ;;of the tree.  Use HEADER-FILL-POINTER so that children get updated
+	 ;;properly.
+	 (record-test-point insert-parental-key-2)
+	 (array-push destination-old-index-start header-fill-pointer))))
+  
+;;This is a no-op for leaf nodes, since they don't need information from
+;;the parents in order to paginate correctly.
+;;Make inline somehow someday
+(defmethod (insert-parental-key scroll-leaf-mixin) (&rest ignore))
+  
+;;If the the page is new (empty) to start with, indicate this
+;;by using an invalid index for the DESTINATION-OLD-INDEX-START,
+;;otherwise remember the scroll index of the first entry
+;;in each page.  This is handled a bit differently in INSERT-PARENTAL-KEY
+;;for branch nodes.
+(defmethod (use-node-as-destination scroll-leaf-mixin :before) (ignore page)
+  (array-push destination-old-index-start
+	      (if (node-empty-p page)
+		  -1
+		header-fill-pointer)))
+
+;; For branches, new nodes should remember that they started new, as 
+;; INSERT-PARENTAL-KEY is only called for existing nodes.
+(defmethod (use-node-as-destination scroll-branch-mixin :before) (ignore page)
+  (if (node-empty-p page) (array-push destination-old-index-start -1)))
+
+;;Make this inline somehow somday.
+(defmethod (use-node-as-destination basic-scroll) (node page)
+  (array-push destination-nodes node)
+  (array-push destination-disk-pages page))
+
+
+;;Make this inline some day.  If you do, move it to simulation before
+;;first use.  Neighbors and parent of NIL mean that the node has no
+;;neighbors and/or parent, signified by storing a zero in the disk page.
+;;Neighbors of :UNKNOWN means that we don't know yet, signified by
+;;storing a negative number in the disk page.
+;;
+;; This is all hopelessly kludgy.  Rewrite this into two versions.  One version
+;; has unknown parents but knows both neighbors, and one version knows nothing.
+
+(defun create-new-node (left-neighbor right-neighbor parent &optional (type nil))
+  (when (null type)
+    (let ((neighbor (or left-neighbor right-neighbor)))
+      (if neighbor
+	  (setf type (type-of neighbor))
+	(setf type 'branch-node))))
+  (multiple-value-bind (disk-page address)
+      (allocate-whole-page *current-segment* (index-record-type-code type))
+    (let ((node (allocate-resource type disk-page address)))
+      (initialize-disk-page node
+			    :next (if right-neighbor
+				      (index-record-disk-page-address right-neighbor) 0)
+			    :previous (if left-neighbor
+					  (index-record-disk-page-address left-neighbor) 0)
+			    :parent (if parent
+					(if (eq parent :unknown) -1
+					  (index-record-disk-page-address parent))
+				      0))
+      (when left-neighbor
+	(setf (node-next (index-record-disk-page left-neighbor))
+	      address))
+      (when right-neighbor
+	(setf (node-previous (index-record-disk-page right-neighbor))
+	      address))
+      (values node address))))
+
+;; Maybe make inline
+(defmethod (select-neighbors basic-scroll) (main-node left-node right-node
+					     key-length always-create-empty-page-p)
+  (record-test-point select-neighbors-all)
+  (let ((new-node nil)
+	(left-free-space (or (and left-node (free-space left-node)) 0))
+	(right-free-space (or (and right-node (free-space right-node)) 0)))
+    ;;When there won't be enough room, or pagination has failed before,
+    ;;Substitute an empty page for the page which is most full.  If
+    ;;both neighbors are equally full, use the right node.
+    (when (or (< (+ left-free-space (free-space main-node) right-free-space)
+		 (compute-size-of-entry key-length 1))
+	      always-create-empty-page-p)
+      ;;An :UNKNOWN parent slot means we haven't quite decided which parent will be
+      ;;associated with this new node.  It also indicates that this is a new node.
+      ;;We determine the parent of this node during the update-parent phase, because
+      ;;you can't really know what the parent will be until then.
+      (cond ((or (< right-free-space left-free-space)
+		 (and (null right-node) left-node))
+	     (record-test-point select-neighbor-choose-left-and-main)
+	     (when right-node
+	       (record-test-point select-neighbor-flush-right)
+	       (deallocate-resource (type-of right-node) right-node)
+	       (setq right-node nil))
+	     (when left-node
+	       (write-page *current-segment* (index-record-disk-page-address left-node)))
+	     (setq new-node (create-new-node left-node main-node :unknown)))
+	    (t
+	     (record-test-point select-neighbor-choose-main-and-right)
+	     (when left-node
+	       (record-test-point select-neighbor-flush-left)
+	       (deallocate-resource (type-of left-node) left-node)
+	       (setq left-node nil))
+	     (when right-node
+	       (write-page *current-segment* (index-record-disk-page-address right-node)))
+	     (setq new-node (create-new-node main-node right-node :unknown)))))
+    (values left-node right-node new-node)))
+  
+;;Loads the scroll with the specified node and the available neighbors.
+;;If the neighbors cannot provide enough room, an empty page is used
+;;instead of the most empty node.  An attempt is made to always sandwich the 
+;;new node between two old nodes.  The new node is guarrenteed never to be
+;;the first node, and is only the last node when the main node has no right neighbor.
+;;If the key and value are non-null, insert this new key into the scroll 
+;;relative to the start of MAIN-PAGE with index KEY-INSERTION-INDEX.  If the key is
+;;null, but there is a value, append the value to the existing entry (leaves only).
+;;If both value and key are null, deletion is repaginating, so there is nothing to
+;;insert.
+(defmethod (load-scroll basic-scroll) (main-node main-page key-array key-start key-length
+					value key-insertion-index always-create-empty-page-p
+					&optional (key-overflow 0))
+  (record-test-point load-scroll-all)
+  (initialize-scroll self)
+  (get-node-previous (left-node main-page)
+    (get-node-next (right-node main-page)
+      (multiple-value-bind (left-node right-node new-node)
+	  (select-neighbors self main-node left-node right-node
+		key-length always-create-empty-page-p)
+	(let ((left-page (and left-node (index-record-disk-page left-node)))
+	      (main-page (index-record-disk-page main-node))
+	      (right-page (and right-node (index-record-disk-page right-node)))
+	      (new-page (and new-node (index-record-disk-page new-node))))
+	  ;;When there is a left neighbor, remember to use it for storage of the final
+	  ;;pagination, then insert the left neighbors entries into the scroll.
+	  (when left-page
+	    (record-test-point load-scroll-use-left)
+	    (use-node-as-destination self left-node left-page)
+	    (insert-disk-page self left-page)
+	    (insert-parental-key self left-node left-page T))
+	  (when (and new-page (not (null left-page)))
+	    (record-test-point load-scroll-new-between-left-and-main)
+	    (use-node-as-destination self new-node new-page))
+	  (setf original-node-index (fill-pointer destination-nodes))
+	  ;;Remember to use the main node for storage of the final pagination
+	  ;;into the scroll.
+	  (use-node-as-destination self main-node main-page)
+	  ;;Insert the main page entries before the key, into the scroll.
+	  (insert-disk-page self main-page
+		*index-record-header-size*
+		key-insertion-index)
+	  ;;Insert the key (or value) into the scroll.  If key-array is null, but there
+	  ;;is a value, we are just appending an extra value to the existing entry.
+	  ;;If key-array is not null, this is a new entry.
+	  (unless (and (null key-array) (null value))
+	    (cond ((null key-array)
+		   (record-test-point load-scroll-value-split)
+		   (insert-value self value main-page key-insertion-index)
+		   (incf key-insertion-index))
+		  (t
+		   (record-test-point load-scroll-key-split)
+		   (add-entry self key-array key-start key-length value key-overflow)))
+	    ;;Then insert the rest of the main page entries into the scroll
+	    (insert-disk-page self main-page
+		  key-insertion-index
+		  (node-header-fill-pointer main-page)))
+	  ;;When another page follows the main page, insert the main page's parental key.
+	  (insert-parental-key self main-node main-page
+		(or (and new-page (null left-page))
+		    right-page))
+	  (when (and new-page (null left-page))
+	    (record-test-point load-scroll-new-between-main-and-right)
+	    (use-node-as-destination self new-node new-page))
+	  ;;When there is a right neighbor, remember to use it for storage of the final
+	  ;;pagination, then insert the right neighbors entries into the scroll.
+	  (when right-page
+	    (record-test-point load-scroll-use-right)
+	    (use-node-as-destination self right-node right-page)
+	    (insert-disk-page self right-page)
+	    (insert-parental-key self right-node right-page nil))
+	  (setf destination-fill-pointer (fill-pointer destination-nodes))
+	  ;;To avoid special checks for dealing with three-scrolls which
+	  ;;become two-scrolls (e.g. the best right index = header fill
+	  ;;pointer), we claim that the size and key length of the
+	  ;;entry at header-fill-pointer are zero.  This tends to favor
+	  ;;two-scrolls over three-scrolls.
+	  (setf (scroll-size-of-entry header-array header-fill-pointer) 0)
+	  (setf (scroll-old-header header-array header-fill-pointer) 0)
+	  (and new-node (index-record-disk-page-address new-node)))))))
+
+;;Make this inline somehow eventually
+;;Boundry length is very similar to comparison.
+(defmethod (boundry-key-length scroll-leaf-mixin) (index)
+  (let ((header-1 (scroll-old-header header-array (- index 1)))
+	(header-2 (scroll-old-header header-array index)))
+    (cond ((< index header-fill-pointer)
+	   (cond ((or (overflow-key-p header-1)
+		      (overflow-key-p header-2))
+		  (record-test-point boundry-key-length-for-overflow)
+		  (overflow-optimized-key-length self header-1 header-2
+						 (scroll-key-start header-array (- index 1))
+						 (scroll-key-start header-array index)))
+		 (t
+		  (record-test-point boundry-key-length-normal)
+		  (let ((result (find-first-difference data-array
+						       (scroll-key-start header-array
+									 (- index 1))
+						       (entry-key-length header-1)
+						       data-array
+						       (scroll-key-start header-array index)
+						       (entry-key-length header-2))))
+		    (cond (result result)
+			  (t (+ (min (entry-key-length header-1)
+				     (entry-key-length header-2)) 1)))))))
+	  (t
+	   (record-test-point boundry-key-length-index-equals-fill-pointer)
+	   0))))
+
+;;Branch keys are never optimized
+;;Make this inline somehow eventually
+(defmethod (boundry-key-length scroll-branch-mixin) (promoted-key-index)
+  (if (overflow-key-p (scroll-old-header header-array promoted-key-index))
+      (overflow-record-total-length (read-page *current-segment*
+					       (aref data-array
+						     (scroll-key-start header-array
+								       promoted-key-index))))
+    (entry-key-length (scroll-old-header header-array promoted-key-index))))
+
+(defmethod (overflow-optimized-key-length scroll-leaf-mixin)
+	   (header-1 header-2 scroll-key-start-1 scroll-key-start-2)
+  (cond ((overflow-key-p header-1)
+	 (if (overflow-key-p header-2)
+	     (overflow-overflow-optimized-key-length self scroll-key-start-1
+						          scroll-key-start-2)
+	   (overflow-non-overflow-optimized-key-length self
+	     header-2 scroll-key-start-1 scroll-key-start-2)))
+	(t
+	 (if (overflow-key-p header-2)
+	     (overflow-non-overflow-optimized-key-length self
+	      header-1 scroll-key-start-2 scroll-key-start-1)
+	   (error "B* Index system bug: Overflow code entered with no overflow headers")))))
+
+;;Return the number of words that are required to distinguish ARRAY1
+;;from ARRAY2, starting at ARRAYn-START.   Return NIL ARRAY1 cannot
+;;be distiguished from ARRAY2 within the given ranges.
+(defun find-first-difference (array1 array1-start array1-length
+			      array2 array2-start array2-length)
+  (loop with i = array1-start and 
+	     j = array2-start
+	with array1-end = (+ i array1-length) and
+	     array2-end = (+ j array2-length) do
+	(cond ((not (= (aref array1 i) (aref array2 j)))
+	       (return (+ (- i array1-start) 1)))
+	      (t
+	       (incf i)
+	       (incf j)
+	       (when (or (>= i array1-end) (>= j array2-end))
+		 (return nil))))))
+
+(defmethod (overflow-overflow-optimized-key-length scroll-leaf-mixin)
+	   (scroll-key-start-1 scroll-key-start-2)
+  (loop with words-checked = 0 and
+	  page-1 = (read-page *current-segment*
+			      (aref data-array scroll-key-start-1)) and
+	  page-2 = (read-page *current-segment*
+			      (aref data-array scroll-key-start-2))
+	as words-this-page-1 =  (- (overflow-record-data-fill-pointer page-1)
+				   *overflow-record-header-size*) and
+	   words-this-page-2 =  (- (overflow-record-data-fill-pointer page-2)
+				   *overflow-record-header-size*)
+	as result = (find-first-difference
+		      page-1 *overflow-record-header-size* words-this-page-1
+		      page-2 *overflow-record-header-size* words-this-page-2) do
+	(cond (result
+	       (record-test-point oo-optimized-key-length-dip)
+	       (return (+ words-checked result)))
+	      ((or (zerop (overflow-record-next page-1))
+		   (zerop (overflow-record-next page-2)))
+	       (record-test-point oo-optimized-key-length-dil)
+	       (return (+ words-checked (min words-this-page-1 words-this-page-2) 1)))
+	      (t
+	       (record-test-point oo-optimized-key-length-multi-page)
+	       (when-debugging-and (not (= words-this-page-1 words-this-page-2))
+		 (error "B* Index system bug: Different overflow lengths with no run-out."))
+	       (incf words-checked words-this-page-1)
+	       (setf page-1 (read-page *current-segment* (overflow-record-next page-1)))
+	       (setf page-2 (read-page *current-segment* (overflow-record-next page-2)))))))
+
+;; Theorem: Any comparison between a non-overflow key and an overflow key will always 
+;; involve scanning one page (apiece) or less.
+(defmethod (overflow-non-overflow-optimized-key-length scroll-leaf-mixin)
+	   (non-overflow-header overflow-key-start non-overflow-key-start)
+  (let* ((overflow-page (read-page *current-segment*
+				   (aref data-array overflow-key-start)))
+	 (overflow-words-this-page (- (overflow-record-data-fill-pointer overflow-page)
+				      *overflow-record-header-size*))
+	 (non-overflow-key-length (entry-key-length non-overflow-header))
+	 (result (find-first-difference
+		   overflow-page *overflow-record-header-size* overflow-words-this-page
+		   data-array non-overflow-key-start non-overflow-key-length)))
+    (cond (result
+	   (record-test-point ono-optimized-key-length-dip)
+	   result)
+	  (t (record-test-point ono-optimized-key-length-dil)
+	     (+ (min overflow-words-this-page non-overflow-key-length) 1)))))
+
+;; Initializes the specified index %50 (or less, if the index runs off
+;; the end of the scroll) of the way into the scroll from the specified
+;; starting index.  This is used to setup the left and right indices
+;; before the search for the boundry records begins.
+;; Use array registers, use defmacro-in-flavor
+
+(defmacro initialize-index-variable-for-leaves (index-var best-index-var
+						space-var start-index &environment env)
+  (once-only (start-index &environment env)
+    `(progn
+       (setf ,best-index-var (setf ,index-var header-fill-pointer))
+       (setf ,space-var (scroll-size-of-entry header-array ,start-index))
+       (loop for i from (1+ ,start-index) below header-fill-pointer 
+	     as proposed-space = (+ ,space-var (scroll-size-of-entry header-array i)) do
+	 (cond ((> proposed-space *50%-point-of-page*)
+		(setq ,best-index-var (setq ,index-var i))
+		(return nil))
+	       (t (setf ,space-var proposed-space)))))))
+
+
+;; Similar to above, but works for scrolls containing branch nodes
+(defmacro initialize-index-variable-for-branches (index-var best-index-var
+						  space-var start-index)
+  `(progn
+     (setf ,best-index-var (setq ,index-var header-fill-pointer))
+     (setf ,space-var (+ (scroll-size-of-entry header-array ,start-index) 2))
+     (loop for i from (1+ ,start-index) below header-fill-pointer
+	   as proposed-space = (+ ,space-var (scroll-size-of-entry header-array i)) do	
+       (cond ((> ,space-var *50%-point-of-page*)
+	      (setq ,best-index-var
+		    (setq ,index-var
+			  (if (>= i header-fill-pointer)
+			      header-fill-pointer
+			    (1+ i))))
+	      (return nil))
+	     (t
+	      (setf ,space-var proposed-space))))))
+
+
+;; Initializes the scroll variables used to search for the optimial boundry records.
+;; the left pointer starts 50% of the way into the first page (less if the scroll is 
+;; smaller than 50% of a page).  The right pointer starts at least 50% of the way after
+;; the left point, (less only if the scroll is smaller than one page), and at most so
+;; that the right page is at or just under 100% full.
+(defmethod (find-boundry-records scroll-leaf-mixin :before) ()
+  (initialize-index-variable-for-leaves current-left-index best-left-index
+					left-allocated-space 0)
+  (initialize-index-variable-for-leaves current-right-index best-right-index 
+					main-allocated-space current-left-index)
+  (when-debugging-and (eq *debug* :find-boundry) (dbg:dbg))
+  ;;Advance right boundry so that the right page is less than one page in size.
+  ;;Use array registers
+  (setf right-allocated-space			
+	(loop for i from current-right-index below header-fill-pointer
+	      summing (scroll-size-of-entry header-array i)))
+  (loop for i from current-right-index to header-fill-pointer
+	as entry-size = (scroll-size-of-entry header-array i) do
+	(cond ((> right-allocated-space 100%-point-of-page)
+	       (incf main-allocated-space entry-size)
+	       (decf right-allocated-space entry-size))
+	      (t
+	       (setq heap-lowest-right-index
+		     (setq current-right-index i))
+	       (return nil))))
+  (setq best-key-length-sum +1e
+	heap-lowest-allocated-space main-allocated-space))
+
+;; Same as above, except for branches
+
+(defmethod (find-boundry-records scroll-branch-mixin :before) ()
+  (initialize-index-variable-for-branches current-left-index best-left-index
+					  left-allocated-space 0)
+  (initialize-index-variable-for-branches current-right-index best-right-index 
+					  main-allocated-space current-left-index)
+  ;;Advance right boundry so that the right page is less than one page in size.
+  ;;Use array registers
+  (setf right-allocated-space 
+	(loop for i from current-right-index below header-fill-pointer
+	      summing (scroll-size-of-entry header-array i)))
+  (when-debugging-and (eq *debug* :find-boundry) (dbg:dbg))
+  (loop for i from current-right-index to header-fill-pointer
+	for prev-entry-size first (scroll-size-of-entry header-array (1- i)) then entry-size
+	as entry-size = (scroll-size-of-entry header-array i) do
+	(cond ((> right-allocated-space 100%-point-of-page)
+	       ;;Grow middle page by length of key which would have been promoted
+	       (incf main-allocated-space prev-entry-size)
+	       ;;Shrink right page by length of key which is proposed to be promoted
+	       (decf right-allocated-space entry-size))
+	      (t
+	       (setq heap-lowest-right-index
+		     (setq current-right-index i))
+	       (return nil))))
+  (setq best-key-length-sum +1e
+	heap-lowest-allocated-space main-allocated-space))
+
+
+(defsubst-in-flavor (remove-invalid-entries-from-right-heap scroll-leaf-mixin) ()
+  (loop until (or (>= heap-lowest-allocated-space *50%-point-of-page*)
+		  (send right-heap :empty-p)) do
+    (when-debugging-and (eq *debug* :find-boundry)
+      (format t "~%Before delete:")
+      (print-heap right-heap))
+    (send right-heap :delete-by-item heap-lowest-right-index)
+    (incf heap-lowest-allocated-space
+	  (scroll-size-of-entry header-array heap-lowest-right-index))
+    (incf heap-lowest-right-index)))
+
+(defsubst-in-flavor (remove-invalid-entries-from-right-heap scroll-branch-mixin) ()
+  (loop until (or (>= heap-lowest-allocated-space *50%-point-of-page*)
+		  (send right-heap :empty-p)) do
+    (when-debugging-and (eq *debug* :find-boundry)
+      (format t "~%Before delete:")
+      (print-heap right-heap))
+    (send right-heap :delete-by-item heap-lowest-right-index)
+    (incf heap-lowest-allocated-space
+	  (scroll-size-of-entry header-array (1- heap-lowest-right-index)))
+    (incf heap-lowest-right-index)))
+
+
+
+;;Optimize out entry-size variable
+(defsubst-in-flavor (add-new-valid-entries-to-right-heap scroll-leaf-mixin) ()
+  (when (<= main-allocated-space 100%-point-of-page)
+    (loop until (> current-right-index header-fill-pointer)
+	  as entry-size = (scroll-size-of-entry header-array current-right-index)
+	  as boundry-key-length = (boundry-key-length self current-right-index) do
+      (when-debugging-and (eq *debug* :find-boundry)
+	(format t "~%Before insert:  L: ~D, R: ~D, LAS: ~D, MAS: ~D, HLAS: ~D"
+		current-left-index current-right-index
+		left-allocated-space main-allocated-space
+		heap-lowest-allocated-space))
+      (record-test-point add-new-valid-entries-hlas-normal-leaf)
+      (send right-heap :insert current-right-index boundry-key-length)
+      (incf main-allocated-space entry-size)
+      (incf current-right-index)
+	  until (> main-allocated-space 100%-point-of-page))))
+
+;;Same as above, except for branches instead of leaves
+(defsubst-in-flavor (add-new-valid-entries-to-right-heap scroll-branch-mixin) ()
+  ;;Unless we have run out of valid right entries
+  (when (<= main-allocated-space 100%-point-of-page)
+    (loop until (> current-right-index header-fill-pointer)
+	  as entry-size = (scroll-size-of-entry header-array (1- current-right-index)) 
+	  as boundry-key-length = (boundry-key-length self (1- current-right-index)) do
+      (when-debugging-and (eq *debug* :find-boundry)
+	(format t "~%L: ~D, R: ~D, LAS: ~D, MAS: ~D, HLAS: ~D"
+		current-left-index current-right-index
+		left-allocated-space main-allocated-space
+		heap-lowest-allocated-space)
+	(dbg:dbg))
+      ;;Promoted key is one entry to the left of the first key in the next node.
+      ;;Use the promoted key length to compute the desirability
+      (record-test-point add-new-valid-entries-hlas-normal-branch)
+      (send right-heap :insert current-right-index boundry-key-length)
+      (incf main-allocated-space entry-size)
+      (incf current-right-index)
+      (when-debugging-and (eq *debug* :find-boundry)
+	(format t "~%After add (CRI= ~D):" current-right-index)
+	(print-heap right-heap))
+      	  until (> main-allocated-space 100%-point-of-page))))
+
+(def-multi-flavor subst-in-flavor (get-best-in-heap (scroll-leaf-mixin scroll-branch-mixin))
+		  ()
+  ;;Figure out how to handle two destination scrolls
+  ;;more elegantly later.
+  (cond ((> destination-fill-pointer 2)
+	 (send right-heap :top))
+	(t
+	 (send right-heap :find-by-item-no-error header-fill-pointer))))
+
+(def-multi-flavor subst-in-flavor (possibly-update-best-entry-info
+				    (scroll-leaf-mixin scroll-branch-mixin)) ()
+  (multiple-value-bind (right-index right-optimized-key-length)
+      ;;Call (get-best-in-heap) when defsubst-in-flavor works
+      ;;Figure out how to handle two destination scrolls
+      ;;more elegantly later.
+      (cond ((> destination-fill-pointer 2)
+	     (send right-heap :top))
+	    (t
+	     (send right-heap :find-by-item-no-error header-fill-pointer)))
+    (unless (null right-index)
+      (let ((optimized-key-length-sum
+	      (+ (boundry-key-length self current-left-index)
+		 right-optimized-key-length)))
+	(when-debugging-and (eq *debug* :find-boundry) (dbg:dbg))
+	(when (<= optimized-key-length-sum best-key-length-sum)
+	  (setq best-left-index current-left-index
+		best-right-index right-index
+		best-key-length-sum optimized-key-length-sum))))))
+
+;;Make this inline somehow eventually (defsubst-in-flavor)
+(defsubst-in-flavor (move-left-boundry-one-over scroll-leaf-mixin) ()
+  (let ((entry-size (scroll-size-of-entry header-array current-left-index)))
+    (incf left-allocated-space entry-size)
+    (decf main-allocated-space entry-size)
+    (decf heap-lowest-allocated-space entry-size)
+    (incf current-left-index)))
+
+(defsubst-in-flavor (move-left-boundry-one-over scroll-branch-mixin) ()
+  (let ((entry-size (scroll-size-of-entry header-array current-left-index)))
+    ;;Left page size grows by the size of the entry which would have been promoted
+    (incf left-allocated-space (scroll-size-of-entry header-array (1- current-left-index)))
+    ;;Middle page shrinks by the size of the entry which is proposed to be promoted
+    (decf main-allocated-space entry-size)
+    (decf heap-lowest-allocated-space entry-size)
+    (incf current-left-index)))
+
+(def-multi-flavor method (find-boundry-records (scroll-leaf-mixin scroll-branch-mixin)) ()
+  (when-debugging-and (eq *debug* :find-boundry) (dbg:dbg))
+  (record-test-point find-boundry-records-main)
+  (loop until (or (> left-allocated-space 100%-point-of-page)
+		  (> current-left-index header-fill-pointer)) do
+    (when-debugging-and (eq *debug* :find-boundry)
+      (format t "~%Before  L: ~D, R: ~D, LAS: ~D, MAS: ~D, HLAS: ~D"
+	      current-left-index current-right-index
+	      left-allocated-space main-allocated-space
+	      heap-lowest-allocated-space))
+    (remove-invalid-entries-from-right-heap)
+    (add-new-valid-entries-to-right-heap)
+    (possibly-update-best-entry-info)
+    (move-left-boundry-one-over)
+    (when-debugging-and (eq *debug* :find-boundry)
+      (format t "~%After  L: ~D, R: ~D, LAS: ~D, MAS: ~D, HLAS: ~D"
+	      current-left-index current-right-index
+	      left-allocated-space main-allocated-space
+	      heap-lowest-allocated-space))
+	finally (return (values best-left-index
+				best-right-index
+				(if (= best-key-length-sum +1e)
+				    :failure
+				  :success)))))
+
+
+(defmethod (copy-record-to-length overflow-record) (cutoff-length parent-address)
+  (record-test-point copy-record-to-length)
+  (let ((root-address (create-overflow-record parent-address :total-length cutoff-length)))
+    (loop with i = 0
+	  for previous-destination-address first 0 then current-destination-address
+	  for current-destination-address
+	      first root-address
+	      then (create-overflow-record parent-address
+					   :total-length cutoff-length
+					   :previous previous-destination-address)
+	  as current-destination-page = (write-page *current-segment*
+						    current-destination-address)
+	  for current-source-address first disk-page-address
+				     then next-source-address
+	  as current-source-page = (read-page *current-segment* current-source-address)
+	  as next-source-address = (overflow-record-next current-source-page)
+	  as words-remaining = (- cutoff-length i)
+	  as words-this-page = (min (- *words-per-page* *overflow-record-header-size*)
+				    words-remaining) do
+      (forward-copy-part-of-array current-source-page *overflow-record-header-size*
+				  current-destination-page *overflow-record-header-size*
+				  words-this-page)
+      (unless (zerop previous-destination-address)
+	(with-disk-page-at-address (previous-disk-page previous-destination-address :write)
+	  (setf (overflow-record-next previous-disk-page) current-destination-address)))
+      (setf (overflow-record-data-fill-pointer current-destination-page)
+	    (+ *overflow-record-header-size* words-this-page))
+      (incf i words-this-page)
+      until (= i cutoff-length)
+	  finally (return root-address))))
+
+;; It would be nice if we could figure out how to remodularize insert...scroll
+;; and replace...scroll to be the same body of code.  Fix when there is time.
+
+;;If we are inserting an overflow record into a branch from a leaf, we must
+;;make a copy which is truncated to the minimal length necessary.  The copying
+;;is important, because the leaf might get deleted (and its overflow records freed) 
+;;before the branch's entry goes away.
+;;Make inline someday.
+(defmethod (insert-overflow-key-from-scroll scroll-leaf-mixin)
+	   (node header-index key-array key-start key-length value)
+  (record-test-point insert-overflow-key-from-scroll-leaf)
+  (when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+  (let ((copy-address (with-record-at (overflow-record (aref key-array key-start) :read)
+			(copy-record-to-length overflow-record key-length
+					       (index-record-disk-page-address node)))))
+    (with-record-at (copy-record copy-address :read copy-disk-page)
+      (let ((total-length (overflow-record-total-length copy-disk-page)))
+	(cond ((> (compute-size-of-entry total-length 1)
+		  *50%-point-of-page*)
+	       (with-resource (temp-page 'temp-page)
+		 (setf (aref temp-page 0) copy-address)	
+		 (insert-key-subseq node header-index temp-page 0 1 value 1)))
+	      (t (insert-key-subseq node header-index copy-disk-page
+				    *overflow-record-header-size* total-length
+				    value 0)
+		 (free-overflow-records copy-record)))))))
+
+;;Since keys are only allowed to live in one branch node at a time, no copying
+;;is needed.  This degenerates to a normal insert-key-subseq.
+;;Make inline some day.
+(defmethod (insert-overflow-key-from-scroll scroll-branch-mixin)
+	   (node header-index key-array key-start key-length value)
+  (record-test-point insert-overflow-key-from-scroll-branch)
+  (ignore key-length)
+  (when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+  (insert-key-subseq node header-index key-array key-start 1 value 1))
+
+;;If we are replacing an overflow record into a branch from a leaf, we must
+;;make a copy which is truncated to the minimal length necessary.  The copying
+;;is important, because the leaf might get deleted (and its overflow records freed) 
+;;before the branch's entry goes away.
+;;Make inline someday.
+(defmethod (replace-overflow-key-from-scroll scroll-leaf-mixin)
+	   (branch-node child-address boundry-disk-page boundry-key-start
+			boundry-key-length repagination-prohibited-p)
+  (record-test-point replace-overflow-key-from-scroll-leaf)
+  (when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+  (let ((copy-address (with-record-at (overflow-record (aref boundry-disk-page
+							     boundry-key-start) :read)
+			(copy-record-to-length overflow-record boundry-key-length
+					       (index-record-disk-page-address
+						 branch-node)))))
+    (with-resource (temp-page 'temp-page)
+      (setf (aref temp-page 0) copy-address)
+      (replace-key branch-node child-address temp-page 0 1 repagination-prohibited-p 1))))
+
+;;Since keys are only allowed to live in one branch node at a time, no copying
+;;is needed.  This degenerates to a normal replace-key.
+;;Make inline some day.
+(defmethod (replace-overflow-key-from-scroll scroll-branch-mixin)
+	   (branch-node child-address boundry-disk-page boundry-key-start
+			boundry-key-length repagination-prohibited-p)
+  (record-test-point replace-overflow-key-from-scroll-branch)
+  (when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+  (ignore boundry-key-length)
+  (replace-key branch-node child-address boundry-disk-page boundry-key-start
+	       1 repagination-prohibited-p 1))
+
+(defmethod (create-new-root basic-scroll)
+	   (destination-disk-page destination-page-address next-disk-page
+				  next-page-address separator-index)
+  (multiple-value-bind (new-node new-page-address) (create-new-node nil nil nil)
+    ;;This error check should eventually be removed for speed.
+    (if (or (new-destination-p destination-disk-page)
+	    (not (new-destination-p next-disk-page)))
+	(error "B* Index system bug: Creating new root with unusual childen.")
+      ;;Insert the two elements of this new root
+      (cond ((zerop (entry-key-overflow (scroll-old-header header-array separator-index)))
+	     (record-test-point create-overflow-key-root)
+	     (insert-key-subseq new-node
+				*index-record-header-size*
+				data-array
+				(scroll-key-start header-array separator-index)
+				(boundry-key-length self separator-index)
+				destination-page-address))
+	    (t
+	     (record-test-point create-non-overflow-key-root)
+	     (insert-overflow-key-from-scroll self
+					      new-node
+					      *index-record-header-size*
+					      data-array
+					      (scroll-key-start header-array separator-index)
+					      (boundry-key-length self separator-index)
+					      destination-page-address)))
+      (insert-last-entry new-node next-page-address)
+      ;;Teach the children about the new root
+      (write-page *current-segment* destination-page-address)
+      (write-page *current-segment* next-page-address)
+      (setf (node-parent destination-disk-page) new-page-address)
+      (setf (node-parent next-disk-page) new-page-address)	
+      ;;Update global notion of the root
+      ;;We'll probably have to change this for real model level
+      (set-index-root *current-index* new-page-address)
+      (deallocate-resource (type-of new-node) new-node))))
+
+;; This will all need to be remodularized when we get the chance.
+;; For leaves the separator index points to the first entry in the next page,
+;; for branches the separator index is the last entry in the current page.  Therefore, 
+;; the separator index for the last node is header-fill-pointer minus one.
+(defsubst-in-flavor (last-destination-p scroll-leaf-mixin) (separator-index)
+  (= separator-index header-fill-pointer))
+
+(defsubst-in-flavor (last-destination-p scroll-branch-mixin) (separator-index)
+  (= separator-index (1- header-fill-pointer)))
+
+
+;; This is called by GET-NEXT-KEY below to clear the next node's parental
+;; overflow key flag so that the overflow key is not GCed, as 
+;; update-old-last-parent hangs on to a "pointer" to the overflow key.
+(defmethod (clear-next-key-overflow basic-scroll) (current-node current-disk-page)
+  (record-test-point clear-next-key-overflow)
+  (with-next-index-record (next-node current-disk-page :read next-disk-page)
+    (with-node-common-parent (nil common-parent-disk-page child-address
+				  current-node next-disk-page
+				  (index-record-disk-page-address next-node) :write)
+      ;;Clear the overflow bit
+      (setf (entry-key-overflow
+	      (aref common-parent-disk-page
+		    (find-header-index-for-address common-parent-disk-page child-address)))
+	    0)
+      ;;When we are debugging, set the key value to the phone number
+      ;;of the beast as the entry should be deleted right away, and
+      ;;if it isn't we want to know about it.
+      (when-debugging-and t			
+	(let ((header (aref common-parent-disk-page
+			    (find-header-index-for-address common-parent-disk-page
+							   child-address))))
+	  (setf (aref common-parent-disk-page (entry-key-start header))
+		-6666666))))))
+
+;; Given a node, store the parental key of the next node in KEY-PAGE,
+;; and return the length and whether the key is an overflow key.  As a
+;; fun side effect, if the key's overflow bit is set, clear it so that
+;; when the node is deleted it's parental key will not be GCed.  Rethink
+;; the modularity here some day.
+
+(defmethod (get-next-key scroll-branch-mixin) (current-node current-disk-page
+							    key-page separator-index)
+  (ignore current-node current-disk-page)
+  (record-test-point get-next-key-branch)
+  (let* ((old-header (scroll-old-header header-array separator-index))
+	 (key-length (entry-key-length old-header)))
+    (forward-copy-part-of-array data-array (scroll-key-start header-array separator-index)
+				key-page 0 key-length)
+    (when (overflow-key-p old-header)
+      (clear-next-key-overflow self current-node current-disk-page))
+    (values key-length (entry-key-overflow old-header))))
+
+;; See comments above for branch-mixin
+(defmethod (get-next-key scroll-leaf-mixin) (current-node current-disk-page
+					     key-page separator-index)
+  (ignore separator-index)
+  (record-test-point get-next-key-leaf)
+  (cond ((zerop (node-next current-disk-page))
+	 0)
+	(t
+	 (with-next-index-record (next-node current-disk-page :read next-disk-page)
+	   (with-node-common-parent (nil common-parent-disk-page child-address
+					 current-node next-disk-page
+					 (index-record-disk-page-address next-node) :read)
+	     (let* ((header (aref common-parent-disk-page
+				  (find-header-index-for-address common-parent-disk-page
+								 child-address)))
+		    (key-length (entry-key-length header)))
+	       (forward-copy-part-of-array common-parent-disk-page
+					   (entry-key-start header)
+					   key-page 0 key-length)
+	       (when (overflow-key-p header)
+		 (clear-next-key-overflow self current-node current-disk-page))
+	       (values key-length (entry-key-overflow header))))))))
+
+;;;If this is an old node, and the last in the scroll, and it
+;;;needs parental updating, it must be because the next node is being
+;;;compressed off the end.  Snarf the the next node's key, and
+;;;replace our key with it.
+(defmethod (update-old-last-parent basic-scroll)
+	   (destination-node destination-disk-page destination-disk-page-index
+			     separator-index next-node next-disk-page)
+  (with-node-common-parent (nil common-parent-disk-page
+			    nil destination-node next-disk-page
+			    (index-record-disk-page-address next-node) :read)
+    (with-resource (temp-page 'temp-page)
+      (multiple-value-bind (key-length overflow-key)
+	  (get-next-key self next-node next-disk-page temp-page separator-index)
+	;;Flush any pages we aren't going to use
+	(loop for i from (1+ destination-disk-page-index)
+		    below destination-fill-pointer
+	      do
+	  (delete-node (aref destination-nodes i)))
+	(when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+	(cond ((zerop (node-next destination-disk-page))
+	       (record-test-point update-old-last-parent-no-next)
+	       ;;If there is no next node, we are all done.
+	       T)
+	      (t
+	       (record-test-point update-old-last-parent-with-next)
+	       ;;The common parent may have changed due to repaginations
+	       ;;during deletes.
+	       (with-next-index-record (new-next-node destination-disk-page :read
+					new-next-disk-page)
+		 (with-node-common-parent
+		   (new-common-parent-node new-common-parent-disk-page
+		    new-child-address destination-node new-next-disk-page
+		    (index-record-disk-page-address new-next-node) :write)
+		   (replace-key new-common-parent-node new-child-address
+				temp-page 0 key-length nil overflow-key)))))))))
+
+(def-multi-flavor method (update-parent-node (scroll-leaf-mixin scroll-branch-mixin))
+	   (destination-node destination-disk-page destination-disk-page-index
+			     separator-index)
+  (with-next-index-record (next-node destination-disk-page :read next-disk-page)
+    ;;If this is the root, create the root and insert this node and the next into it.
+    (if (and (node-parent destination-disk-page)
+	     (zerop (node-parent destination-disk-page)))
+	(create-new-root self destination-disk-page
+			 (index-record-disk-page-address destination-node)
+			 next-disk-page
+			 (index-record-disk-page-address next-node) separator-index)
+      (cond ((new-destination-p destination-disk-page)
+	     ;;If this node is new, take the next page's parent as our own.
+	     (setf (node-parent destination-disk-page) (node-parent next-disk-page))
+	     (cond ((last-destination-p separator-index)
+		    (record-test-point update-parent-node-of-last-new-destination)
+		    ;;If this node is new, and is the last in the scroll, it must be
+		    ;;because the next node is being compressed (flushed) off the end.
+		    ;;Simply replace the next nodes address with the destination
+		    ;;page's address, and remember not to bother to delete the node
+		    ;;later.  [REPLACE-NODE takes care of the WRITE-PAGE]
+		    (replace-node
+		      (aref destination-nodes (1+ destination-disk-page-index))
+		      (index-record-disk-page-address destination-node))
+		    ;;Flush any pages we aren't going to use.  We already flushed the next
+		    ;;one with REPLACE-NODE.  This code would only run when three nodes
+		    ;;were being compressed down to one, an unlikely occurance.  Maybe
+		    ;;we can prove it will never happen, then we can remove this code.
+		    ;;Remeber the parents of these guys some day, and repaginate
+		    ;;them if they need it afterwards.
+		    (loop for i from (+ destination-disk-page-index 2)
+				below destination-fill-pointer
+			  do
+		      (delete-node (aref destination-nodes i))))
+		   (t
+		    ;;If this is a new node, but not last in the scroll, we just
+		    ;;insert the node's parental pointer just before the next node's.
+		    (with-parent-index-record (parent-node next-disk-page :write
+							       parent-disk-page)
+		      (cond ((zerop (entry-key-overflow (scroll-old-header header-array
+									   separator-index)))
+			     (record-test-point update-parent-node-normal-new-not-last)
+			     (insert-key-subseq parent-node
+						(find-header-index-for-address
+						  parent-disk-page
+						  (index-record-disk-page-address next-node))
+						data-array
+						(scroll-key-start header-array
+								  separator-index)
+						(boundry-key-length self separator-index)
+						(index-record-disk-page-address
+						  destination-node)))
+			    (t
+			     (record-test-point update-parent-node-overflow-new-not-last)
+			     (insert-overflow-key-from-scroll
+			       self parent-node
+			       (find-header-index-for-address parent-disk-page
+							      (index-record-disk-page-address
+								next-node))
+			       data-array
+			       (scroll-key-start header-array separator-index)
+			       (boundry-key-length self separator-index)
+			       (index-record-disk-page-address destination-node))))))))
+	    (t
+	     ;;This node already is part of the tree.
+	     ;;Find the common parent between this node and the next one (could be
+	     ;;the immediate parent, could be further up the tree if destination
+	     ;;node is on the right edge of its parent branch).
+	     (cond ((last-destination-p separator-index)
+		    (record-test-point update-parent-node-old-last)
+		    (update-old-last-parent self destination-node destination-disk-page
+					    destination-disk-page-index
+					    separator-index next-node next-disk-page))
+		   (t
+		    (with-node-common-parent
+		      (common-parent-node common-parent-disk-page
+					  child-address destination-node next-disk-page
+					  (index-record-disk-page-address next-node) :write)
+		      (cond ((zerop (entry-key-overflow
+				      (scroll-old-header header-array separator-index)))
+			     (record-test-point update-parent-node-old-not-last-normal)
+			     (replace-key common-parent-node child-address
+					  data-array
+					  (scroll-key-start header-array separator-index)
+					  (boundry-key-length self separator-index) nil))
+			    (t
+			     (record-test-point update-parent-node-old-not-last-overflow)
+			     (replace-overflow-key-from-scroll
+			       self common-parent-node child-address
+			       data-array
+			       (scroll-key-start header-array separator-index)
+			       (boundry-key-length self separator-index) nil)))))))))))
+
+
+
+;; The separator between nodes n and n+1 for leaves is found at
+;; destination-old-index-start(n+1), for branches is found at
+;; destination-old-index-start(n).  With branches it is not starting
+;; index of the next node that matters, it is the index of the parental key.
+(defsubst-in-flavor (separator-changed-p scroll-leaf-mixin)
+		    (destination-disk-page-index separator-index)
+  (not (or (= destination-disk-page-index (- destination-fill-pointer 1))
+	   (= (aref destination-old-index-start (1+ destination-disk-page-index))
+	      separator-index))))
+
+(defsubst-in-flavor (separator-changed-p scroll-branch-mixin)
+		    (destination-disk-page-index separator-index)
+  (not (= (aref destination-old-index-start destination-disk-page-index)
+	  separator-index)))
+
+;; Assuming that reading a disk page twice results in EQ buffers.
+
+;;Before we do anything, if this is the last node, delete all the nodes
+;;following this one, if any.  The right edge case is then handled correctly when
+;;we have compressed a node off the right edge.
+
+(def-multi-flavor method (update-parent-if-necessary (scroll-leaf-mixin scroll-branch-mixin))
+		  (destination-disk-page-index separator-index)
+  (let ((destination-disk-page (aref destination-disk-pages destination-disk-page-index)))
+    (when-debugging-and (eq *debug* :update-parent) (dbg:dbg))
+    ;;When there is something to update...
+    (when (or (separator-changed-p destination-disk-page-index
+				   separator-index)
+	      (new-destination-p destination-disk-page))
+      ;;If the node has a right neighbor, update the parent,
+      ;;otherwise this node is on the right edge, so there is 
+      ;;nothing to do.  If this is a new node, something
+      ;;is rotten in Denmark.
+      (cond ((not (zerop (node-next destination-disk-page)))
+	     (update-parent-node self
+		   (aref destination-nodes destination-disk-page-index)
+		   destination-disk-page destination-disk-page-index separator-index))
+	    ((new-destination-p destination-disk-page)
+	     (error "B* Index system bug: Attempting to update parent of a
+ 		    new node with no next.")))
+      ;;In theory this COND falls through only when the root is being created, and thus
+      ;;no action is necessary.
+      (record-test-point update-parent-if-necessary-fall-through)
+      )))
+
+(defmethod (update-parent-if-necessary scroll-branch-mixin :after)
+	   (destination-disk-page-index separator-index)
+  ;; For every n keys, each branch node has n+1 pointers.  Insert the n+1 pointer,
+  ;; which falls at the end of the node, and has no key associated with it, whether
+  ;; or not the separator has changed.  
+  (insert-last-entry	
+	(aref destination-nodes destination-disk-page-index)
+	(aref data-array
+	      (- (scroll-key-start header-array separator-index) 1))))
+
+
+(defmacro cross-check (disk-page &environment env)
+  (once-only (disk-page &environment env)
+    `(when (> (node-header-fill-pointer ,disk-page)
+	      (node-data-fill-pointer ,disk-page))
+       (error "B* Index system bug: Crossed fill pointers in disk page ~S" ,disk-page))))
+
+;; end-index is exclusive
+(defmethod (move-page-from-scroll-to-node basic-scroll) (start-index end-index
+						    destination-disk-page-index)
+  (let* ((disk-page (aref destination-disk-pages destination-disk-page-index))
+	 (start-old-header (scroll-old-header header-array start-index))
+	 (end-old-header (scroll-old-header header-array (1- end-index)))
+	 (data-start (- (scroll-key-start header-array start-index)
+			(entry-number-of-values start-old-header)))
+	 (data-end (+ (scroll-key-start header-array (1- end-index))
+		      (entry-key-length end-old-header)))
+	 (data-length (- data-end data-start))
+	 (data-destination-start (- (node-data-fill-pointer disk-page) data-length))
+	 (key-start-relocation-offset (- data-destination-start data-start)))
+    ;;Copy key and values into page
+    (forward-copy-part-of-array data-array data-start
+				disk-page data-destination-start
+				data-length)
+    ;;Adjust data fill pointer
+    (setf (node-data-fill-pointer disk-page) data-destination-start)
+    (cross-check disk-page)
+    ;;Generate a new header based on the old one, changing the start of the
+    ;;key its new value.
+    (loop for i from start-index below end-index
+	  for j from *index-record-header-size* do
+	  (setf (aref disk-page j)
+		(set-entry-key-start (scroll-old-header header-array i)
+				     (+ (scroll-key-start header-array i)
+					  key-start-relocation-offset)))
+	  ;;Remove this some day
+	  (when (zerop (entry-key-length (aref disk-page j)))
+	    (error "B* Index system bug: Copying zero length key from scroll.")))
+    ;;Update header fill pointer
+    (setf (node-header-fill-pointer disk-page) (+ *index-record-header-size*
+						  (- end-index start-index)))
+    (cross-check disk-page)))
+
+
+(defmethod (update-children scroll-branch-mixin)
+	   (start-index end-index destination-disk-page-index)
+  (let ((old-index (aref destination-old-index-start destination-disk-page-index)))
+    (if (< old-index 0)
+	(update-children-at-index self start-index end-index
+	      destination-disk-page-index)
+      (let* ((old-start (if (zerop destination-disk-page-index)
+			    0
+			  (1+ (aref destination-old-index-start
+				    (- destination-disk-page-index 1)))))
+	     (old-end (if (= destination-disk-page-index destination-fill-pointer)
+			  header-fill-pointer
+			old-index)))
+	(when-debugging-and (eq *debug* :update-children) (dbg:dbg))
+	(unless (< old-end old-start)
+	  (update-children-at-index self start-index (min old-start end-index)
+		destination-disk-page-index)
+	  ;;Be sure not to update the promoted 
+	  (update-children-at-index self (max old-end start-index) end-index
+				    destination-disk-page-index))))))
+
+	  
+(defmethod (update-children-at-index scroll-branch-mixin) (from-index below-index
+							    destination-disk-page-index)
+  (record-test-point update-children-at-index-branch)
+  (loop for i from from-index below below-index
+	as key-start = (scroll-key-start header-array i)
+	as child-address = (aref data-array (- key-start 1)) and
+	as entry-header = (scroll-old-header header-array i)
+	as new-parent-address = (index-record-disk-page-address
+				  (aref destination-nodes destination-disk-page-index))
+	do
+    (when (overflow-key-p entry-header)
+      (with-disk-page-at-address (overflow-disk-page (aref data-array key-start) :write)
+	(setf (overflow-record-parent overflow-disk-page) new-parent-address)))
+    (with-record-at (NIL child-address :write child-disk-page)
+      (when-debugging-and (eq *debug* :update-children)
+	(format t "~%Telling child ~D that its parent is now ~D instead of ~D."
+		child-address new-parent-address (node-parent child-disk-page)))
+      (write-page *current-segment* child-address)
+      (setf (node-parent child-disk-page) new-parent-address))))
+
+(defmethod (update-children scroll-leaf-mixin)
+	   (start-index end-index destination-disk-page-index)
+  (let ((old-start (aref destination-old-index-start destination-disk-page-index)))
+    (if (< old-start 0)
+	(update-children-at-index self start-index end-index
+	      destination-disk-page-index)
+      (let* ((old-end (if (= destination-disk-page-index (- destination-fill-pointer 1))
+			  header-fill-pointer
+			(aref destination-old-index-start
+			      (+ destination-disk-page-index 1)))))
+	(when-debugging-and (eq *debug* :update-children) (dbg:dbg))
+	(unless (< old-end old-start)
+	  (update-children-at-index self start-index (min old-start end-index)
+		destination-disk-page-index)
+	  (update-children-at-index self (max old-end start-index) end-index
+				    destination-disk-page-index))))))
+
+(defmethod (update-children-at-index scroll-leaf-mixin) (from-index below-index
+							    destination-disk-page-index)
+  (record-test-point update-children-at-index-leaf)
+  (loop for i from from-index below below-index
+	as key-start = (scroll-key-start header-array i)
+	as entry-header = (scroll-old-header header-array i)
+	as new-parent-address = (index-record-disk-page-address
+				  (aref destination-nodes destination-disk-page-index))
+	do
+    (when (overflow-key-p entry-header)
+      (with-disk-page-at-address (overflow-disk-page (aref data-array key-start) :write)
+	(setf (overflow-record-parent overflow-disk-page) new-parent-address)))
+    (when (overflow-values-p entry-header)
+      (with-disk-page-at-address (overflow-disk-page (aref data-array (- key-start 1)) :write)
+	(setf (overflow-record-parent overflow-disk-page) new-parent-address)))))
+
+
+
+;;Make the destination nodes be empty
+(defmethod (move-entries-from-scroll-to-nodes basic-scroll :before) (ignore ignore)
+  (loop for i from 0 below destination-fill-pointer
+	as node = (aref destination-nodes i) do
+    (write-page *current-segment* (index-record-disk-page-address node))
+    (reset-fill-pointers node)))
+
+(defmacro move-range-to-leaf ((start-index end-index) &environment env &body continuation)
+  (once-only (start-index end-index &environment env)
+    `(when (< ,start-index header-fill-pointer)
+       (when-debugging-and (eq *debug* :s-to-n)
+	 (format t "~%Moving entries ~D-~D from ~S to destination ~D: ~S"
+		 ,start-index ,end-index self destination-disk-page-index
+		 (aref destination-nodes destination-disk-page-index)))
+       (move-page-from-scroll-to-node self ,start-index ,end-index
+				      destination-disk-page-index)
+       (update-parent-if-necessary self destination-disk-page-index ,end-index)
+       (update-children self ,start-index ,end-index destination-disk-page-index)
+       (incf destination-disk-page-index)
+       . ,continuation)))
+
+;;Resolve and optimize SEPARATOR-INDEX vs END-INDEX
+(defmacro move-range-to-branch ((start-index end-index) &environment env &body continuation)
+  (once-only (start-index end-index &environment env)
+    `(when (< ,start-index header-fill-pointer)
+       (let ((separator-index (1- ,end-index)))
+	 (when-debugging-and (eq *debug* :s-to-n)
+	   (format t "~%Moving entries ~D-~D from ~S to destination ~D: ~S"
+		   ,start-index ,end-index self destination-disk-page-index
+		   (aref destination-nodes destination-disk-page-index)))
+	 (move-page-from-scroll-to-node self ,start-index separator-index
+	     destination-disk-page-index)
+	 (update-parent-if-necessary self destination-disk-page-index separator-index)
+	 (update-children self ,start-index ,end-index destination-disk-page-index)
+	 (incf destination-disk-page-index)
+	 . ,continuation))))
+
+(defmethod (move-entries-from-scroll-to-nodes scroll-leaf-mixin) (left-boundry right-boundry)
+  (when-debugging-and (eq *debug* :s-to-n) (dbg:dbg))
+  (let ((destination-disk-page-index 0))
+    ;;Move entries to the first page, if the scroll has any entries in it
+    (move-range-to-leaf (0 left-boundry)
+      ;;Move entries to the second page, if the scroll is larger than one page
+      (move-range-to-leaf (left-boundry right-boundry)
+	;;Move entries to the third page, if the scroll is larger than two pages
+	(move-range-to-leaf (right-boundry header-fill-pointer))))))
+
+
+;; This should be EQUAL to the method above.  Combind these when it is clear that
+;; this is the right thing.
+
+(defmethod (move-entries-from-scroll-to-nodes scroll-branch-mixin)
+	   (left-boundry right-boundry)
+  (when-debugging-and (eq *debug* :s-to-n) (dbg:dbg))
+  (let ((destination-disk-page-index 0))
+    ;;Move entries to the first page, if the scroll has any entries in it.
+    (move-range-to-branch (0 left-boundry)
+      ;;Move entries to the second page, if the scroll is larger than one page
+      (when-debugging-and (eq *debug* :s-to-n) (dbg:dbg))
+      (move-range-to-branch (left-boundry right-boundry)
+	;;Move entries to the third page, if the scroll is larger than two pages
+	(move-range-to-branch (right-boundry header-fill-pointer))))))
+
+
+;; Combine these with macrology some day (like when defmacro-in-flavor works).
+
+(defmethod (clear-scroll scroll-leaf-mixin) ()
+  (record-test-point clear-scroll-leaf)
+  (loop for i from 0 below destination-fill-pointer
+	as node = (aref destination-nodes i) do
+    (unless (or (= i original-node-index) (null node))
+      (setf (aref destination-nodes i) nil)
+      (deallocate-resource 'leaf-node node))))
+
+(defmethod (clear-scroll scroll-branch-mixin) ()
+  (record-test-point clear-scroll-branch)
+  (loop for i from 0 below destination-fill-pointer
+	as node = (aref destination-nodes i) do
+    (unless (or (= i original-node-index) (null node))
+      (setf (aref destination-nodes i) nil)
+      (deallocate-resource 'branch-node node))))
+      
