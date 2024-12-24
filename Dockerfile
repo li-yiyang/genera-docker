@@ -32,6 +32,9 @@ RUN mkdir rel-8-6 && ln -s /var/lib/symbolics/sys.sct rel-8-6/sys.sct
 RUN chmod -R 777 /var/lib/symbolics/sys.sct/*
 RUN chmod -R 777 /var/lib/symbolics/LISP-MACHINE/*
 
+# telnetd should set root with a password for Terminal login
+RUN echo 'root:genera' | chpasswd
+
 COPY ./dockerfiles/entrypoint.sh     /bin/entrypoint.sh
 RUN  chmod a+x /bin/entrypoint.sh
 
