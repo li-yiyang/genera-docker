@@ -17,38 +17,12 @@ VOL  = symbolics
 build:
 	docker build --platform linux/x86_64 -t $(IMG) .
 
-# prepare all files under symbolics:
-# + .VLM file
-# + *.vlod
-# + VLM_debugger
-# + genera
-# + sys.sct
-volume:
-	docker volume create $(VOL)
-	docker run -it \
-		--platform linux/x86_64 \
-		-v $(VOL):/var/lib/symbolics \
-		-v $(TOP)/symbolics:/symbolics \
-		--rm $(IMG) \
-		bash -c "cp -r /symbolics/{.VLM,*.vlod,VLM_debugger,genera,sys.sct} /var/lib/symbolics"
-
-# copy files into volume
-# + .VLM file
-update_VLM:
-	docker run -it \
-		--platform linux/x86_64 \
-		-v $(VOL):/var/lib/symbolics \
-		-v $(TOP)/symbolics:/symbolics \
-		--rm $(IMG) \
-		bash -c "cp /symbolics/{.VLM} /var/lib/symbolics"
-
 # Run Genera
+# xhost +127.0.0.1
 run:
-	# xhost +127.0.0.1
 	docker run -dt \
 		--name $(IMG) \
 		--privileged=true \
-		-v $(VOL):/var/lib/symbolics \
 		--platform linux/x86_64 \
 		--hostname genera-host \
 		--add-host genera-host:10.0.0.1 \
@@ -56,9 +30,11 @@ run:
 		--rm $(IMG)
 
 # Attach to bash for debug usage
+# or you can in Open Genera use Terminal (telnet)
+# for interacting with docker debian system
 bash:
 	docker exec -it $(IMG) bash
 
-# Stop Genera
+# Stop Genera (Force)
 stop:
 	docker stop $(IMG)
